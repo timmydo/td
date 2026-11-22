@@ -4561,7 +4561,7 @@ one active attempt and at most one retained failure continuation. It reserves
 two ordinary PostgreSQL read slots, two independent body-source slots and
 one separate settlement slot. Renewal
 uses a separate bounded database call and cannot consume a body-source slot.
-POSTGRES.md section 212 owns the work-meter ceilings and lifecycle. These
+POSTGRES.md, [Relay worker lifecycle and resources](POSTGRES.md#relay-worker-lifecycle-and-resources) owns the work-meter ceilings and lifecycle. These
 explicit active-worker reservations are additional to the planned resource
 ledger; whole-process RSS and maximum-body throughput remain unqualified.
 
@@ -4569,11 +4569,11 @@ ledger; whole-process RSS and maximum-body throughput remain unqualified.
 The relay's local-notice turn additionally retains at most 10 MiB of report
 text, 16 MiB of encoded MIME and one 100-recipient SQL page. It runs serially
 with SMTP attempts using one ordinary slot, with a five-second deadline and
-at most one turn every five seconds. POSTGRES.md section 213 records its
+at most one turn every five seconds. POSTGRES.md, [Failure-notice work bounds](POSTGRES.md#failure-notice-work-bounds) records its
 separate aggregate database framing and composition work ceilings. The
 shared account body/blob quotas include generated notices; compact notices
 (at most 16 KiB each) may pass them by up to 16 KiB and one blob per
-configured `queue_submissions` (POSTGRES.md section 213). Failure retains only the database Pending marker; no unbounded
+configured `queue_submissions` (POSTGRES.md, [Compact failure notices and the quota margin](POSTGRES.md#compact-failure-notices-and-the-quota-margin)). Failure retains only the database Pending marker; no unbounded
 local retry queue is added.
 
 

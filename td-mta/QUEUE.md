@@ -314,15 +314,17 @@ scan/scheduler work ceilings. Persisting/rebuilding an index cannot itself
 change these authoritative times.
 
 A UTC discontinuity exceeding five minutes, whatever F, relative to
-monotonic elapsed time pauses new dispatch and expiry before any more terminal transitions.
-At startup terminal expiry waits for F of stable samples and continuity
-with a clean relay checkpoint (POSTGRES.md section 116). If the clock
-cannot be established across restarts, verify database UTC and request
-`queue-clock-confirm` after F. A detected discontinuity in a running
-relay needs the same explicit confirmation. Every new process observes F
-again before retrying attempted deliveries or publishing expiry.
-Process at most one 100-recipient expiry batch per monotonic second,
-yielding to interactive work; expiry is not one unbounded catch-up sweep.
+monotonic elapsed time pauses new dispatch and expiry before any more
+terminal transitions. At startup terminal expiry waits for F of stable
+samples and continuity with a clean relay checkpoint (POSTGRES.md, [Queue
+clock checkpoint and
+confirmation](POSTGRES.md#queue-clock-checkpoint-and-confirmation)). If the
+clock cannot be established across restarts, verify database UTC and request
+`queue-clock-confirm` after F. A detected discontinuity in a running relay
+needs the same explicit confirmation. Every new process observes F again
+before retrying attempted deliveries or publishing expiry. Process at most
+one 100-recipient expiry batch per monotonic second, yielding to interactive
+work; expiry is not one unbounded catch-up sweep.
 
 Manual retry may move an eligible pending recipient earlier only after the
 route and recipient minimum intervals; it cannot resend Accepted, bypass
@@ -364,39 +366,43 @@ worker result with an old attempt/fence is rejected before writing state.
 completedAt is set once every recipient has no future dispatch obligation;
 it is a wall-clock observation and can precede sendAt after a clock step.
 Once present, preserve that exact timestamp in every subsequent submission
-update, including cancellation and failure-notice updates.
-Retain completed submission records and their blobs for at least 30 days
-after completion by default, whatever their recipients' outcomes; the relay
-then retires them, with their attempts and receipts (POSTGRES.md section
-216). At the default limits, even promptly delivered mail can use an
-account's 1,000 submission slots or 256 MiB of distinct transmitted blobs
-within a rolling 30-day period. The first exhausted limit blocks new
-submissions until retirement releases capacity. Pending submissions and
-completed records awaiting cleanup also count.
-Retired delivery attempts and their receipts of any submission are
-reclaimed sooner, at a later attempt publication (POSTGRES.md section 218);
-each recipient keeps its own attempt count, replies and uncertainty. Failed
-and terminal OutcomeUnknown records retire once their failure notice is
-stored, so an outcome-unknown record's evidence is kept for that window
-only. Ordinary retention never deletes pending responsibility: an
-uncompleted record, a pending notice, an active attempt or a final
-reservation.
-Manual JMAP destruction is forbidden for all submission records; record
-destruction does not mean cancellation (RFC 8621 §7.5).
+update, including cancellation and failure-notice updates. Retain completed
+submission records and their blobs for at least 30 days after completion by
+default, whatever their recipients' outcomes; the relay then retires them,
+with their attempts and receipts (POSTGRES.md, [Retention of settled
+submissions](POSTGRES.md#retention-of-settled-submissions)). At the default
+limits, even promptly delivered mail can use an account's 1,000 submission
+slots or 256 MiB of distinct transmitted blobs within a rolling 30-day
+period. The first exhausted limit blocks new submissions until retirement
+releases capacity. Pending submissions and completed records awaiting
+cleanup also count. Retired delivery attempts and their receipts of any
+submission are reclaimed sooner, at a later attempt publication
+(POSTGRES.md, [Reclamation of retired
+attempts](POSTGRES.md#reclamation-of-retired-attempts)); each recipient
+keeps its own attempt count, replies and uncertainty. Failed and terminal
+OutcomeUnknown records retire once their failure notice is stored, so an
+outcome-unknown record's evidence is kept for that window only. Ordinary
+retention never deletes pending responsibility: an uncompleted record, a
+pending notice, an active attempt or a final reservation. Manual JMAP
+destruction is forbidden for all submission records; record destruction does
+not mean cancellation (RFC 8621 §7.5).
 
 When a submission becomes terminal with any Failed/OutcomeUnknown recipient,
 set notification Pending in the same transaction. A local account-only
 failure email and notification Stored + notificationEmail are committed in
-one later transaction; retry Pending on local storage failure. Its Email ID is
-historical after user deletion, so a deleted notice is not generated again.
-The foreground PostgreSQL publisher implements these notices as unread Inbox
-mail, with bounded publication and restart semantics in POSTGRES.md section
-213. It never schedules a notice for SMTP delivery.
-Never notify an external inbound reverse path. Retention retires a Failed or
-OutcomeUnknown record only after its notice is stored. A full account still
-stores it as a compact report, charged within a fixed margin past the quota
-(POSTGRES.md section 213), so while that margin lasts the notice does not
-hold the record and its quota back.
+one later transaction; retry Pending on local storage failure. Its Email ID
+is historical after user deletion, so a deleted notice is not generated
+again. The foreground PostgreSQL publisher implements these notices as
+unread Inbox mail, with bounded publication and restart semantics in
+POSTGRES.md, [Local terminal-delivery
+notices](POSTGRES.md#local-terminal-delivery-notices). It never schedules a
+notice for SMTP delivery. Never notify an external inbound reverse path.
+Retention retires a Failed or OutcomeUnknown record only after its notice is
+stored. A full account still stores it as a compact report, charged within a
+fixed margin past the quota (POSTGRES.md, [Compact failure notices and the
+quota margin](POSTGRES.md#compact-failure-notices-and-the-quota-margin)), so
+while that margin lasts the notice does not hold the record and its quota
+back.
 
 ## 5. Standard JMAP projection
 

@@ -624,20 +624,23 @@ client. Retry uses bounded backoff and fresh authentication.
 
 ## Operator copy commands
 
-Prepare a fresh schema and bind it with `postgres replica-source-init` first.
-`postgres replica-account-init` takes the owner connection, local epoch,
-source origin/epoch, preserved account ID, username, protected password file,
-optional CA file and explicit positive `--body-bytes`, `--blobs`, `--emails`
-and `--receipts` quotas. Each live Email and each distinct live Blob uses
-one receipt. A td source's account may hold up to its
-`queue_submissions` × 16 KiB of body and that many blobs past its own caps
-in compact failure notices (POSTGRES.md section 213); replica quotas equal
-to the source caps stall on such an account. It authenticates discovery and obtains the initial
-inventory and mailbox graph before atomically creating the account. Existing
-matching source/account/quotas are reported without reseeding, resetting work
-or asserting that a newly fetched seed matches an older request. Inspect an
-indeterminate initialization with `postgres replica-progress`; do not infer
-absence from a lost command response. No credentials or routing are copied.
+Prepare a fresh schema and bind it with `postgres replica-source-init`
+first. `postgres replica-account-init` takes the owner connection, local
+epoch, source origin/epoch, preserved account ID, username, protected
+password file, optional CA file and explicit positive `--body-bytes`,
+`--blobs`, `--emails` and `--receipts` quotas. Each live Email and each
+distinct live Blob uses one receipt. A td source's account may hold up to
+its `queue_submissions` × 16 KiB of body and that many blobs past its own
+caps in compact failure notices (POSTGRES.md, [Compact failure notices and
+the quota
+margin](POSTGRES.md#compact-failure-notices-and-the-quota-margin)); replica
+quotas equal to the source caps stall on such an account. It authenticates
+discovery and obtains the initial inventory and mailbox graph before
+atomically creating the account. Existing matching source/account/quotas are
+reported without reseeding, resetting work or asserting that a newly fetched
+seed matches an older request. Inspect an indeterminate initialization with
+`postgres replica-progress`; do not infer absence from a lost command
+response. No credentials or routing are copied.
 
 `postgres replica-discover --source-origin HTTPS_ORIGIN --username USER
 --password-file PATH [--ca-file PATH]` authenticates source discovery and one

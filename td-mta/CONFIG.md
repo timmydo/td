@@ -1851,20 +1851,22 @@ version identifiers, deadlines and redacted errors.
 
 ## Foreground PostgreSQL service
 
-`td-mta serve --connection-file PATH --profile NAME --runtime PATH
---scratch PATH` starts the named database profile. Each of those options is
-required once. Optional `--read-only` serves restricted local mail reading,
-and optional `--minimum-retry-seconds N`, at most once with N a decimal in
+`td-mta serve --connection-file PATH --profile NAME --runtime PATH --scratch
+PATH` starts the named database profile. Each of those options is required
+once. Optional `--read-only` serves restricted local mail reading, and
+optional `--minimum-retry-seconds N`, at most once with N a decimal in
 1..300 (default 300), sets the relay's minimum retry interval (QUEUE.md
-section 4, POSTGRES.md section 219); a profile without the relay role
-ignores it. It exists so fixtures need not wait five real minutes; a
-shorter production interval retries more often and shortens the clock
-observation before retries, confirmation and retention. The old `--config`, `--smtp-only` and `--mailbox-access` serving forms
-are removed. POSTGRES.md owns connection-file protection, primary/schema
-qualification and profile selection. Serving uses a dedicated non-owner
-runtime login and refuses the owner credential, maintenance barriers,
-unsupported schemas, unavailable databases and invalid profiles before
-opening listeners. It never creates or upgrades the schema.
+section 4, POSTGRES.md, [Minimum retry interval (schema
+42)](POSTGRES.md#minimum-retry-interval-schema-42)); a profile without the
+relay role ignores it. It exists so fixtures need not wait five real
+minutes; a shorter production interval retries more often and shortens the
+clock observation before retries, confirmation and retention. The old
+`--config`, `--smtp-only` and `--mailbox-access` serving forms are removed.
+POSTGRES.md owns connection-file protection, primary/schema qualification
+and profile selection. Serving uses a dedicated non-owner runtime login and
+refuses the owner credential, maintenance barriers, unsupported schemas,
+unavailable databases and invalid profiles before opening listeners. It
+never creates or upgrades the schema.
 
 Receive and JMAP roles use the PostgreSQL SMTP, authentication, read and
 mutation adapters. A JMAP-only instance needs no SMTP listener and advertises
@@ -1878,16 +1880,18 @@ For managed certificate renewal under the same selection, existing sessions
 and listeners stay open while fresh handshakes use the newly verified
 certificate generation (ACME.md).
 
-`queue-clock-status --runtime PATH` reports `held` during startup. A
-clean restart with matching clock evidence reports `confirmed` after the
-minimum retry interval of stable database UTC/monotonic progress. First
-activation, a missing checkpoint, a crash, or an ambiguous clock requires
-the operator to verify database UTC and use `queue-clock-confirm --runtime
-PATH`. Preserve the relay's private runtime directory between service
-restarts. POSTGRES.md section 116 specifies the clock evidence. A request before a stable interval
-returns `refused`. An admitted request reports `requested` until the
-worker samples database UTC again. Check clock status for its outcome.
-The interval defaults to five minutes and follows `--minimum-retry-seconds`.
+`queue-clock-status --runtime PATH` reports `held` during startup. A clean
+restart with matching clock evidence reports `confirmed` after the minimum
+retry interval of stable database UTC/monotonic progress. First activation,
+a missing checkpoint, a crash, or an ambiguous clock requires the operator
+to verify database UTC and use `queue-clock-confirm --runtime PATH`.
+Preserve the relay's private runtime directory between service restarts.
+POSTGRES.md, [Queue clock checkpoint and
+confirmation](POSTGRES.md#queue-clock-checkpoint-and-confirmation) specifies
+the clock evidence. A request before a stable interval returns `refused`. An
+admitted request reports `requested` until the worker samples database UTC
+again. Check clock status for its outcome. The interval defaults to five
+minutes and follows `--minimum-retry-seconds`.
 
 `queue-route-repair --runtime PATH` explicitly requests release of a TLS or
 authentication pause after selecting a newer repaired configuration and

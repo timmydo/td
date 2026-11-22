@@ -76,7 +76,7 @@ References give each mechanism's rules; use these entry points:
 | Account administration and identities | [Account administration workflow](#account-administration-workflow) |
 | Account-scoped HTTP authentication | [HTTPS account selection](#https-account-selection) |
 | Incoming mail across accounts | [Transactional incoming delivery](#transactional-incoming-delivery-across-accounts) |
-| Relay scheduling and retained sessions | [Foreground relay scheduling](#foreground-relay-scheduling-across-accounts) |
+| Submission queue, relay scheduling, route health and retention | [15. Submission queue, relay scheduling and route health](#15-submission-queue-relay-scheduling-and-route-health) |
 | Durable list summaries | [Persistent common-header summaries](#persistent-common-header-summaries-schema-33) |
 | MIME evidence and selective body verification | [Persistent MIME interpretation](#persistent-mime-interpretation-schema-34) |
 | Whole-body audit and progress | [Scheduled integrity scrubbing](#scheduled-whole-body-integrity-scrubbing) |
@@ -87,7 +87,11 @@ Comments in td-mta's source still cite some former section numbers:
 | Former section | Now |
 | --- | --- |
 | 35 | [Expired upload lease reclamation](#expired-upload-lease-reclamation) |
+| 120 | [Expiry receipt retention](#expiry-receipt-retention) |
+| 123 | [Route-health receipt retention and the lease window](#route-health-receipt-retention-and-the-lease-window) |
+| 213 | [Compact failure notices and the quota margin](#compact-failure-notices-and-the-quota-margin) |
 | 217 | [Receipt retention for HTTP writes](#receipt-retention-for-http-writes) |
+| 218 | [Reclamation of retired attempts](#reclamation-of-retired-attempts) |
 
 ## 1. Bootstrap and profiles
 
@@ -299,10 +303,11 @@ different processes may deliver different accounts concurrently.
 
 A short transaction locks a due route and eligible recipient batch, installs
 an owner boot ID, fresh attempt ID, increasing fencing generation (restarting
-only after its owner row retired, section 52) and database
-lease expiry, and commits Prepared before any SMTP work. Bounded due scans
-may use FOR UPDATE SKIP LOCKED for competing workers; ordinary mail reads
-must not skip locked rows. Heartbeats renew only the exact current unexpired
+only after its owner row retired, [Retirement of idle route owner and health
+rows](#retirement-of-idle-route-owner-and-health-rows)) and database lease
+expiry, and commits Prepared before any SMTP work. Bounded due scans may use
+FOR UPDATE SKIP LOCKED for competing workers; ordinary mail reads must not
+skip locked rows. Heartbeats renew only the exact current unexpired
 owner/fence. Every phase or result update compares that fence under lock;
 stale workers cannot overwrite a replacement's result or renew an old claim.
 
@@ -885,7 +890,7 @@ startup with a fixed redacted category before listeners open. The process
 then publishes its TLS generation, binds its private control endpoint and
 starts the selected roles' workers. CONFIG.md owns syntax and local
 runtime/scratch placement; the minimum retry interval is specified in
-section 219.
+[Minimum retry interval (schema 42)](#minimum-retry-interval-schema-42).
 
 Receive, JMAP and relay roles are all served, through the PostgreSQL SMTP
 storage, HTTPS authentication, JMAP and relay adapters, including a
@@ -1169,7 +1174,7 @@ validator. The typed transactions that publish into them verify contiguous
 chunks, exact length and digest, mailbox graphs, immutable fields,
 recipient/receipt coverage, retained history, authorization, quotas and
 operation receipts before COMMIT. Upload leases are not delivery ownership:
-route and attempt ownership use their own tables and fences (section 52).
+route and attempt ownership use their own tables and fences ([Route-owner leases and fencing (schema 16)](#route-owner-leases-and-fencing-schema-16)).
 
 ### Instance roles and role-aware profile loading
 
@@ -3632,7 +3637,7 @@ Schema version 10 adds `account_usage` and `upload_receipts`. Migration derives
 one usage row per account from existing bodies, leases and submissions in the
 same transaction as its ledger entry. Expired leases and completed submissions
 remain charged while retained (the account's next upload or relay retention
-reclaims expired leases, [Expired upload lease reclamation](#expired-upload-lease-reclamation); section 216 releases retired
+reclaims expired leases, [Expired upload lease reclamation](#expired-upload-lease-reclamation); [Retention of settled submissions](#retention-of-settled-submissions) releases retired
 submissions); a body shared by submissions is charged once for queue bytes.
 New account bootstrap writes an all-zero usage row atomically.
 
@@ -3813,7 +3818,7 @@ underflow or inconsistency refuses the entire transaction. Blob identity
 tombstones remain, preventing ID reuse. Existing repeatable-read snapshots
 retain deleted metadata and body bytes. Expired upload leases are reclaimed
 by the next upload or relay retention ([Expired upload lease reclamation](#expired-upload-lease-reclamation)), settled submissions
-retire under section 216 and HTTP write receipts expire under
+retire under [Retention of settled submissions](#retention-of-settled-submissions) and HTTP write receipts expire under
 [Receipt retention for HTTP writes](#receipt-retention-for-http-writes).
 
 HTTP `Email/set` destroy uses this transaction through the same Email
@@ -3929,7 +3934,7 @@ sample, oldest expiry first, stopping before one would take the batch past
 body length leaves `upload_bytes` (the key admits one lease per body). A
 body no Email, lease or submission still reaches is then deleted with its
 chunks and released from `body_bytes` and `blob_count`, by the same
-statement Email deletion and section 216 use; a body still referenced
+statement Email deletion and [Retention of settled submissions](#retention-of-settled-submissions) use; a body still referenced
 elsewhere stays and is charged only there. Guards refuse with Integrity
 rather than underflow. `blob_ids` rows stay, so no Blob ID is reused. No
 change row or sequence step is written: leases and bodies carry no JMAP
@@ -3944,21 +3949,22 @@ repeats it, and small uploads still drain a backlog. Reclamation is
 idempotent.
 
 Expired leases already refuse downloads and draft attachment use
-([Authenticated blob downloads](#authenticated-blob-downloads) and [Draft attachments](#draft-attachments)); deleting them changes neither, and a historical
-upload receipt still answers its own replay inside its minute. Relay
-retention (section 216) also runs the same batch, in a transaction of its
-own, on each retention turn, so an account a relay route serves recovers
-expired leases, and the body bytes and blob count they hold, without
-another upload: typically within ten minutes of expiry while the relay
-runs with a stable queue clock, and within about twenty minutes even while
-submission retirement keeps failing (section 216), and a backlog drains a
-batch per round. An account no relay worker serves keeps them until its
-next upload. Their bytes never exceed the upload quota, though zero-length
-uploads can hold blob count. The candidate scan reads the account's leases
-(no expiry index), which the upload and blob-count quotas bound. Deleting
-leases needs the runtime DELETE grant ([Runtime database
-logins](#runtime-database-logins), [Shared runtime login
-privileges](#shared-runtime-login-privileges)).
+([Authenticated blob downloads](#authenticated-blob-downloads) and [Draft
+attachments](#draft-attachments)); deleting them changes neither, and a
+historical upload receipt still answers its own replay inside its minute.
+Relay retention ([Relay retention cycle](#relay-retention-cycle)) also runs
+the same batch, in a transaction of its own, on each retention turn, so an
+account a relay route serves recovers expired leases, and the body bytes and
+blob count they hold, without another upload: typically within ten minutes of
+expiry while the relay runs with a stable queue clock, and within about twenty
+minutes even while submission retirement keeps failing ([Relay retention
+cycle](#relay-retention-cycle)), and a backlog drains a batch per round. An
+account no relay worker serves keeps them until its next upload. Their bytes
+never exceed the upload quota, though zero-length uploads can hold blob count.
+The candidate scan reads the account's leases (no expiry index), which the
+upload and blob-count quotas bound. Deleting leases needs the runtime DELETE
+grant ([Runtime database logins](#runtime-database-logins), [Shared runtime
+login privileges](#shared-runtime-login-privileges)).
 
 ### HTTPS upload ingress
 
@@ -4348,16 +4354,19 @@ old route destinations belonging to the same account and needs no
 cross-process socket control or database request queue.
 
 Publication changes the whole group to Canceled, retires a route owner's
-locally fenced attempt, advances the account sequence once and records CHANGE and settlement in the same transaction.
-An untouched `Prepared` attempt of a matching remote owner retains
-settlement custody as described in section 123; a fenced or progressed
-attempt becomes inactive in the cancellation transaction. Actual replies,
-attempt history, diagnostic text, existing completion time and
-failure-notice state are preserved. Cancellation creates no notice. A
-wholly canceled group retains a no-change receipt without closing
-transport or advancing sequence. Ownership and deadline are checked again
-before COMMIT; unknown COMMIT resolves the same operation. Receipts age
-from their publication, not the group's completion ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)).
+locally fenced attempt, advances the account sequence once and records CHANGE
+and settlement in the same transaction. An untouched `Prepared` attempt of a
+matching remote owner retains settlement custody as described in [Route-health
+capacity and dispatch
+admission](#route-health-capacity-and-dispatch-admission); a fenced or
+progressed attempt becomes inactive in the cancellation transaction. Actual
+replies, attempt history, diagnostic text, existing completion time and
+failure-notice state are preserved. Cancellation creates no notice. A wholly
+canceled group retains a no-change receipt without closing transport or
+advancing sequence. Ownership and deadline are checked again before COMMIT;
+unknown COMMIT resolves the same operation. Receipts age from their
+publication, not the group's completion ([Receipt retention for HTTP
+writes](#receipt-retention-for-http-writes)).
 
 Every later relay phase/terminator admission uses that same account fence,
 so a stale or remote worker cannot publish AcceptancePossible after
@@ -4479,7 +4488,7 @@ before inspection. A missing receipt then cannot distinguish rollback
 from expired evidence. The owner never republishes and the reply already
 sent stands. A restart releases every owner. No other reader exists: the
 upload lease, not its receipt, governs downloads and upload expiry; the
-relay and section 216 address submissions by ID; a cancellation receipt
+relay and [Retention of settled submissions](#retention-of-settled-submissions) address submissions by ID; a cancellation receipt
 ages from its publication, not the group's completion. After expiry an
 operation is not replayable, and no owner republishes one.
 
@@ -4670,178 +4679,6 @@ FROM traces CROSS JOIN LATERAL regexp_matches(prefix,
 GROUP BY 1, 2, 3 ORDER BY 4 DESC, 2, 3, 1;
 ```
 
-## 49. Selected named-route evidence
-
-`postgres_routes` builds bounded, redacted route evidence from a validated
-profile. Whole-generation preparation rejects conflicting definitions of a
-shared name; profile loading retains the selected route in its binding.
-`serves_route` is only passive eligibility evidence and requires the relay
-role plus matching name and destination. It grants no lease or continuing
-policy authority. Section 50 supplies queue persistence; worker ownership remains subsequent
-work. The production single-process backend is unchanged.
-
-## 50. Submission route persistence
-
-Schema version 15 adds owner-private `submission_routes`, one account-bound
-mapping per queued submission. New enqueue transactions write the submitting
-profile, selected route name and destination fingerprint atomically with
-outgoing bytes, recipients, quota charges, history and the operation receipt.
-The retained request digest explicitly binds the route and destination.
-Failures while inserting either route or receipt roll back the entire enqueue.
-
-The mapping has no foreign key to the current configuration: removal or
-replacement of a profile cannot rewrite an already queued destination.
-Source Email deletion leaves it intact; submission retirement cascades its
-mapping. Migration preserves older inert queue fixtures without inventing a
-route. A queue row lacking a mapping is ineligible for dispatch and requires
-explicit repair; workers must never infer a default from their own profile.
-This increment still enables no worker or client endpoint.
-
-## 51. Route-scoped outgoing body snapshots
-
-The inert `postgres_delivery_body::with_submission` worker requires a selected
-relay role and opens a finite read-only primary snapshot. It rechecks epoch
-and configuration selection, then joins the queued submission's stored route
-name and destination to the worker's selected route. Missing mappings, wrong
-routes and different destinations cannot expose an outgoing body. Account
-state, changed sequences, manifest and chunk coverage must be valid.
-
-The shared body verifier checks the entire bounded outgoing blob before the
-callback receives its reader. Verification and replay share the original
-snapshot and deadline. No Email or device credential is needed: queued
-responsibility survives source deletion and device revocation. The database
-credential and selected relay profile authorize this internal read. A read
-is passive evidence, including after a policy change during its snapshot; it
-grants no attempt ownership or right to transmit. Fenced claim and phase
-publication remain required before SMTP work.
-
-## 52. Inert route-owner coordination
-
-Schema version 16 introduces `route_owners` and retained
-`route_owner_receipts`. `postgres_route_owners` coordinates one owner per
-account and route name, even across destination changes. Fresh claims
-require a selected relay role. Acquisition locks configuration, account and
-route in that order, rejects an unexpired owner, and increments a nonzero
-64-bit fencing generation without wrapping. A retained random operation and
-digest make uncertain acquisition inspectable and replayable without a new
-claim. The serialized receipt recheck precedes current-policy rejection,
-so a concurrently committed acquisition remains resolvable after selection
-changes. Route rows and acquisition receipts each have a 1024-per-account cap.
-
-Acquisition receipts are retained for a bounded time, not for life. An
-acquisition that passes its replay, policy, Busy and Clock checks first
-deletes, under the account write lock, the account's receipts whose recorded
-first lease ended more than one hour before its locked database time; a
-later refusal rolls that back. Renewal does not extend a receipt, and none is
-needed then: a claim replays its receipt only to settle its own acquisition
-while it holds no grant. The relay retries ungranted slots each round,
-subject to the five-second wait after a capacity refusal. A claim retried more than an hour after its lease ended may find its
-receipt swept by another acquisition and then acquires afresh under a higher
-generation; the unused earlier generation was never live authority, since
-every fence compares the owner row's generation, boot and operation.
-Otherwise the old receipt replays, observation reports it stale and the relay
-replaces the claim. Inspect-only settlement of an acquisition (section 191)
-after that hour may read an expired receipt as absent; it then releases
-custody, and the retried acquisition takes a fresh generation as above.
-
-The cap therefore bounds acquisitions in any hour plus one lease, not per
-account lifetime. The relay releases on every exit and acquires once per
-start, so a supervisor restarting it more than about 1024 times in an hour
-for one account can exhaust claim capacity. That account waits until
-receipts age out. A route at the maximum fencing generation also waits on
-capacity and cannot acquire another generation.
-
-Route rows are retired, not kept for life. A selected configuration may
-have several relay profiles, each serving its own route for every account,
-so retirement asks whether any relay still uses a row, not whether the
-acquiring claim does. The same acquisition, under the same locks and before
-its capacity check, deletes the account's owner rows of other route names
-that hold no lease and have not been acquired, renewed or released for seven
-days (`IDLE_OWNER_MS`); a running relay renews within seconds and a stopping
-one releases at once, so neither is touched. It then deletes health rows that
-no remaining owner row holds at that route name and destination, other than
-its own route name at its own destination, together with those destinations'
-repair receipts. A row stays while an active attempt names its route
-(owners) or its route and destination (health), and a health row also while
-an uncompleted submission names it, while it holds a repair latch (section
-124), or while its backoff has not elapsed. Rows therefore grow only with
-configuration churn. A route no relay uses retires at the account's first
-acquisition a week after its last use; the acquiring route's own old
-destination retires at its next acquisition; and a latched row stays until
-an explicit repair clears its latch, so abandoning a latched destination
-without repairing it keeps one row. A route used again after that starts afresh: its
-owner at generation 1 with a new clock floor, which fences nothing old
-because every fence also compares the random claim operation and boot, and
-its health at revision 1 with no failure history. The backward-clock check
-of the retired row is lost with it.
-
-A fixed 30-second database-time lease binds the process boot identity, claim
-operation, route destination and generation. Renewal checks every field,
-current selected policy and unexpired ownership under lock. Release compares
-the same owner and fence but can clear an expired lease or removed policy;
-its caller must first close its SMTP transport. Release retains the
-fencing counter until the row retires, a week after its last use. Historical acquisition receipts are never live authority: `observe`
-checks current policy, identity, fence and database expiry. Unknown renewal
-or release responses remain indeterminate; fresh primary observation resolves
-whether that owner remains live. Internal coordination does not advance JMAP
-state or mutate recipient responsibility.
-
-Database time earlier than the last recorded owner clock refuses. This is a
-local row check, not complete failover/clock-jump qualification. Runtime
-heartbeat scheduling, monotonic transport deadlines and conservative clock
-validation remain activation work. No lease enables SMTP by itself; atomic
-recipient Prepared publication and every subsequent phase still need the
-same route-owner fence. Takeover recovery must preserve AcceptancePossible
-uncertainty before any replacement attempt. These workers remain inert.
-
-## 53. Inert first-attempt publication
-
-Schema 17 retains `submission_attempts`: one historical receipt per random
-attempt, with a unique active attempt per account and route name. The inert
-`postgres_attempts` worker rechecks selected policy, route destination and
-current unexpired owner fence under configuration/account/route locks. It
-selects at most 100 due, never-attempted Queued recipients from one supplied
-submission in ascending ordinal order. Expired, completed, mismatched and
-already attempted responsibility cannot enter this first-attempt path.
-
-Recipient InFlight/Prepared state, attempt identity, timestamp and count,
-submission/account sequence, change history and the retained attempt commit
-atomically. Receipt resolution precedes fresh policy checks; lost COMMIT
-responses resolve with the same retained Dispatch. Historical outcomes do
-not authorize transport. At most 1024 attempt receipts are retained per
-account; reclamation remains later maintenance work.
-
-An active attempt blocks another batch even after owner replacement. This
-increment never clears that block, resumes retries or opens SMTP. Fenced
-phase/result publication and conservative takeover recovery must resolve it
-before another attempt. Clock validation and monotonic retry guards remain
-runtime activation requirements. The supplied submission is selected by a
-future bounded scheduler; no unbounded due-queue scan is introduced here.
-
-## 54. Inert abandoned-attempt recovery
-
-Schema 18 adds retained `attempt_recovery_receipts`. A current route owner
-may recover an active attempt only from a strictly older fencing generation
-with the same route and destination. Account/route locks exclude stale phase
-writes. Up to 100 remaining InFlight recipients resolve atomically with
-submission/account history, active-attempt retirement and one receipt.
-Historical replay precedes current policy and ownership checks.
-
-Prepared and Body recover with Network reason, preserving prior uncertainty.
-AcceptancePossible always becomes uncertain OutcomeUnknown with Uncertain
-reason. No recovery produces Accepted or erases replies, attempt count or
-attempt identity. Retry times use the queue contract's clipped uniform jitter
-with at most 32 entropy draws; failure rolls back. Recipient updates use one
-bounded SQL array batch rather than one protocol exchange per recipient.
-
-This path preserves near-expiry/overdue responsibility using the QUEUE.md
-expiry-wait marker and retires the active attempt without declaring terminal
-failure. Clock-guarded expiry remains a
-separate activation prerequisite. A backwards last-attempt timestamp refuses.
-Runtime clock discontinuity validation and the monotonic restart guard of
-the minimum retry interval still precede any actual retry. Receipt storage has a 1024-per-account
-cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
-
 ## 103. Caller-funded receiving preparation
 
 `postgres_receiving::prepare_with_meter` prepares completed DATA under the
@@ -4986,565 +4823,6 @@ name and does not change production trust, client authentication or gateway
 policy. This is prepared PostgreSQL integration evidence; production backend
 selection and deployment qualification remain unchanged.
 
-## 110. Durable outgoing DATA phases
-
-Schema 19 retains one phase receipt per account, attempt and target phase.
-Fresh initialization uses the bounded schema transport described in the owner
-migration contract; byte and individual-frame ceilings stay unchanged.
-The prepared phase publisher checks current configuration, account and route
-ownership in their existing lock order, then the exact active attempt's boot,
-claim, destination and fencing generation. Body publication accepts one
-ordered subset of at most 100 original attempt ordinals with bounded positive
-RCPT replies. It clears older DATA replies for that subset. AcceptancePossible
-requires exactly the entire stored Body subset and preserves those RCPT
-replies. Other prepared recipients remain untouched. Neither transition
-retires the attempt, invents a remote result or clears prior uncertainty.
-
-Recipient, submission and account sequences, change history and the digest-
-bound receipt commit atomically. A second request for the same phase with
-different input refuses. Historical receipt inspection precedes fresh policy
-checks and excludes an in-progress publisher through the account lock;
-unknown COMMIT requires closing transport, not transmitting on guessed state.
-Receipt storage has a 2048-per-account ceiling; a retired attempt's receipts
-are reclaimed with it (section 218).
-
-These are durable facts, not continuing permission to transmit. The runtime
-must retain current ownership and its monotonic transport fence, and reserve
-final-outcome capacity before allowing a terminator. This increment enables no
-SMTP relay. PostgreSQL fixtures cover invalid subsets/replies, stale ownership,
-known rollback, phase ordering, exact Body membership, retained replies,
-100 distinct maximum-length replies, conflicting replay, delayed COMMIT
-and historical settlement after a policy
-change. Schema upgrade tests include the version-18 boundary.
-
-## 111. Durable positive SMTP outcomes
-
-Schema 20 adds acceptance receipts, bounded to 1024 per account. The prepared
-attempt publisher records a genuine positive final DATA reply for exactly the
-AcceptancePossible subset under the same current policy, boot, claim and route
-fence. It preserves positive RCPT replies, attempt history and any earlier
-uncertainty latch. A positive result records smart-host handoff, not final
-mailbox delivery. Passing the message expiry time cannot discard a received
-positive reply; current owner and clock checks still apply.
-
-Accepted rows, reply text, submission/account change history and one digest-
-bound receipt commit atomically. The attempt retires only when no recipient
-remains InFlight under it. If the complete ordinal set has no future delivery
-obligation, completion time is published once; terminal failures retain their
-failure-notice obligation. Historical replay neither advances time nor changes
-replies. Unknown COMMIT settles through the original receipt without inventing
-a second remote result. No connection or SMTP relay is activated here.
-
-The PostgreSQL fixture covers ordering and exact-subset refusal, maximum-length
-final replies, rollback, delayed COMMIT, duplicate-risk preservation, attempt
-retirement, exclusion of Accepted recipients from subsequent dispatch, and
-final-batch completion after expiry. Negative outcomes, final-outcome capacity
-admission and runtime recovery/scheduling remain separate prerequisites.
-
-## 112. Durable final DATA refusals
-
-Schema 21 adds at most 1024 digest-bound final-refusal receipts per account.
-The prepared publisher accepts one actual 4xx/5xx final DATA reply for the
-exact AcceptancePossible subset under its current boot, claim and route
-fence. It preserves positive RCPT history and earlier uncertainty. A definite
-negative final reply does not introduce uncertainty merely because the
-current attempt had reached AcceptancePossible.
-
-Temporary refusals schedule each recipient using the shared bounded jitter
-policy; earlier uncertainty yields OutcomeUnknown, otherwise RetryWait.
-A retry that cannot precede expiry records expires_at as the nonterminal
-expiry-wait marker for the separate clock-guarded expiry path. Permanent refusals terminate retries, retaining
-OutcomeUnknown for prior uncertainty and Failed otherwise; a genuine refusal
-can be retained after expiry. Result rows, submission completion and pending
-failure notice, attempt retirement, history and receipt commit together.
-Historical replay preserves the original random retry times.
-
-The runtime-role fixture exercises ordering, exact subsets, maximum replies,
-expiry-wait marker, rollback, delayed COMMIT settlement, conflicting replay,
-retry bounds, uncertainty preservation and final completion after expiry.
-This prepares final DATA results only. RCPT/MAIL/DATA-command refusals,
-transport failures, retry dispatch, capacity reservation and production
-activation remain separate work.
-
-## 113. Durable negative RCPT subsets
-
-Schema 22 adds at most 1024 RCPT-result receipts per account. The prepared
-publisher retains one ordered set of negative RCPT replies per attempt, at
-most 100 distinct 4096-byte replies. Each selected recipient must still be
-Prepared under the exact current attempt fence. Its new RCPT reply replaces
-prior RCPT history and clears prior DATA history. Temporary/permanent states,
-retry jitter, uncertainty preservation, expiry hold and completion follow the
-final-refusal rules above, independently for each reply.
-
-Unselected Prepared recipients remain in the active attempt and can enter
-Body as the accepted RCPT subset. An all-refused batch retires the attempt;
-a partially refused batch retires only after the remaining recipients finish.
-One receipt binds the complete refused subset, so the worker must collect its
-negative RCPT replies before publication instead of publishing one per call.
-Historical replay preserves retry times and never repeats account changes.
-
-The runtime-role fixture checks mixed temporary/permanent replies with and
-without prior uncertainty, retained-reply replacement, a partially accepted
-batch proceeding through DATA, 100 distinct maximum-length refusals,
-rollback, delayed COMMIT settlement, conflicting replay, attempt retirement
-and final completion. MAIL and DATA-command refusals, transport failures,
-retry dispatch and final-outcome capacity admission remain separate work.
-
-## 114. Durable MAIL and DATA-command refusals
-
-Schema 23 adds at most 1024 command-refusal receipts per account. A negative
-MAIL reply covers the complete original Prepared batch, clears prior RCPT
-history and stores the real refusal as DATA history. It cannot follow a
-partially settled RCPT batch. A negative DATA-command reply instead binds the
-accepted RCPT subset and its actual positive replies; it replaces both prior
-reply fields without claiming that Body or AcceptancePossible occurred.
-Other Prepared recipients remain owned until separately settled. Body and
-DATA-command refusal are mutually exclusive for the entire attempt, even
-after the Body recipients finish; outstanding RCPT refusals may still settle.
-
-Both operations reuse the current policy/route/attempt fence, temporary retry
-jitter and expiry hold, prior uncertainty latch, terminal completion and
-failure-notice handling. Exact retained input binds the receipt, including
-positive RCPT text. Neither command refusal introduces uncertainty or permits
-another SMTP transmission. Unknown COMMIT settles historically.
-
-The PostgreSQL fixture exercises temporary and permanent outcomes for both
-commands, maximum reply sizes, stale owners, MAIL subset refusal, old-reply
-replacement, partial RCPT settlement, rollback, expiry holds, permanent
-results after expiry, delayed COMMIT, conflicting replay and completion.
-Transport failures, retry dispatch, capacity reservation and production relay
-activation remain separate work.
-
-## 115. Current-owner transport interruption
-
-The attempt recovery publisher also prepares a domain-separated current-owner
-interruption. Unlike abandoned-attempt recovery, it requires the exact current
-generation, boot and owner operation recorded in the active attempt. The caller
-must close or fence transport before publication and cannot resume it from a
-receipt. Unknown COMMIT settles the retained operation historically.
-
-All still-InFlight recipients end together. Prepared and Body become RetryWait
-unless earlier uncertainty is latched; AcceptancePossible latches uncertainty
-and becomes retryable OutcomeUnknown. Genuine replies remain unchanged, and
-already settled RCPT recipients are excluded. Bounded jitter, expiry-wait marker,
-account history and attempt retirement reuse the existing recovery transaction
-and its bounded receipts. This operation does not pause a route, certify TLS
-or credentials, reserve final-outcome capacity, or activate production relay.
-
-The PostgreSQL fixture covers each durable phase, mixed remaining Prepared
-recipients, earlier uncertainty, stale owners, refusal of abandoned recovery
-for the current owner, retained replies, exact replay and retry timestamps,
-rollback, expiry hold, delayed COMMIT and exclusion of settled RCPT results.
-
-## 116. Conservative runtime queue clock guard
-
-The prepared `queue_clock::Guard` pairs database UTC with samples from one
-process-local monotonic domain. Startup permits fresh dispatch but holds
-attempted recipients for the minimum retry interval of monotonic time (five
-minutes by default, section 219). Expiry opens after that interval when
-the relay can establish continuity with its last clean clock checkpoint.
-The caller must check database due times, ownership and route
-health separately; a status snapshot is neither a permit nor historical
-transport authority.
-
-A cumulative UTC/monotonic discrepancy greater than five minutes in either
-direction pauses all new dispatch and expiry, resets the stable interval and
-revokes confirmation. Individual sample-to-sample discontinuities are checked separately so that a
-jump cannot hide by canceling prior drift. Smaller observations do not move
-the comparison anchor.
-An explicitly signaled primary change forces the same hold even when its
-clock matches. The serving relay pins the configured endpoint and cannot
-distinguish a primary replaced behind that endpoint with agreeing clocks.
-
-The relay's exclusively locked private runtime directory holds its
-mode-0600 `queue-clock` checkpoint. A checksum binds its clock evidence
-to the database epoch, profile, database name, verified endpoint and
-server name, Linux boot ID and time namespace. Only trusted directory
-writers may replace it. Before even attempting to acquire or renew a
-route lease, the relay replaces the clean checkpoint with a dirty record,
-syncing the file and parent directory. A failed owner operation therefore
-cannot leave clean evidence to admit a later restart. After successful
-worker drain and lease release it may publish a clean checkpoint.
-
-For explicit confirmation the relay starts a database sample after the
-request. A hold before acceptance cancels the request. Under the guard,
-the relay accepts the fresh sample and immediately uses it as the trusted
-clock anchor. It then saves that UTC as a dirty cleanup cutoff outside
-the guard. Status stays `requested` until the save completes. A later
-hold reports `held` and bases cleanup on the last trusted observation.
-Finishing the save leaves that hold or a newer request intact. A save
-error invalidates the guard and stops the worker. A crash before atomic
-replacement can recover the previous cutoff. After replacement it can
-recover the accepted cutoff. Either dirty record still holds expiry.
-
-Each running relay checks UTC against its own monotonic ticks. Across
-processes the seconds in `/proc/uptime` bound elapsed awake time from
-above because they include suspend. The checkpoint carries both ends of
-the UTC projection. On restart they allow any elapsed awake time from zero
-through the boot-time difference, including centisecond rounding and
-sampling latency. Both extremes must agree with database UTC within five
-minutes and the upper bound on this individual gap must be at most five
-minutes. The range carries across clean restarts, so many short shutdowns
-can also exhaust the margin. Fresh confirmation resets the range. Process
-ticks and live expiry tokens are never carried across generations.
-
-Missing, damaged, dirty or differently bound evidence, unreadable boot
-time, an excessive gap or ambiguous clock discrepancy leaves overdue
-recipients pending until explicit confirmation. Fresh dispatch and
-guarded retry can continue. A discontinuity observed while running
-still pauses dispatch.
-
-## 117. Prepared due-retry publication
-
-The attempt publisher has a separate domain-separated retry preparation.
-It selects at most 100 due RetryWait or retryable OutcomeUnknown recipients
-from one supplied submission, in ordinal order. It excludes fresh Queued
-work, Accepted, Failed, terminal OutcomeUnknown and future retry timestamps.
-The first-attempt preparation continues to select only fresh Queued work.
-
-The transaction validates final phase, attempt identity/count, uncertainty
-and retry reason, a due timestamp at least the lowest permitted minimum
-retry interval (one second, section 219) after the previous attempt, and checked count increment. InFlight/Prepared publication preserves
-uncertainty and genuine prior replies, replaces attempt identity and timestamp,
-and clears only next-attempt time, failure reason and local diagnostic.
-Immutable transmitted content and envelope remain unchanged. Active-route
-exclusion, current-owner fencing, history and receipt replay use the same
-atomic publisher as first attempts; receipt replay never increments twice.
-
-This is a prepared storage operation, not a retry scheduler. Runtime callers
-supply the persistent queue clock guard; publication enforces it along with
-shared route backoff and repair generation. Current transport authority and
-bounded due scanning remain separate runtime requirements.
-No runtime route or retry loop is activated here. The PostgreSQL fixture seeds
-elapsed due times and covers both states, bounded batches, terminal/future
-exclusion, overflow, minimum interval, expiry, rollback, unknown COMMIT,
-historical replay and the separate fresh-recipient path.
-
-## 118. Clock-guarded expiry admission
-
-The queue clock guard admits one expiry batch per monotonic second after
-a stable startup with clock continuity, or after explicit confirmation.
-Each batch remains limited to 100 recipients by
-the storage publisher. A failed or abandoned attempt consumes its admission;
-there is no refund or catch-up burst. Runtime expiry workers must share one
-guard for their admitted queue and preserve the database-wide owner fences.
-
-The retained token fixes a UTC cutoff and a nonrenewable ten-second maximum
-publication deadline. The publisher must check it again before commit with
-fresh paired database UTC and local monotonic time. Clock holds, confirmation
-replacement, backward UTC and elapsed deadlines permanently retire the token.
-A process-unique checked validation identity prevents transfer to another
-guard; these ephemeral tokens and identities are never persisted. Every
-observed UTC regression advances a checked expiry generation, including
-subthreshold steps seen by another user of the shared guard. Recovery of UTC
-does not restore an older token. The token admits only terminal expiry.
-
-## 119. Prepared queue expiry storage
-
-Schema version 24 adds retained expiry-operation receipts and one database-wide
-expiry progress row. A receipt binds an account/operation to its request digest,
-submission, one-to-100 recipient count, fixed nonnegative UTC cutoff, publication
-time and old/new account sequence. It has no foreign key to the
-submission; section 216 deletes a retired submission's receipts with it, and
-section 120 expires them after an hour.
-The publisher must cap retained receipts and verify exact sequence adjacency.
-
-The progress row starts with no publication time. Its singleton key and nullable
-nonnegative timestamp prepare serialization of expiry batches across accounts
-and instances. A future publisher must lock this row after configuration,
-account and route-owner locks, require at least one database UTC second since
-the previous committed batch, and update it atomically with recipients, history
-and receipt. Missing progress is an integrity failure, never permission to reset
-the rate limit. Local monotonic admission remains separately mandatory; the
-persisted timestamp is neither clock confirmation nor transport authority.
-
-Both tables are private to the schema owner at initialization and require the
-mail runtime's ordinary DML grants. Upgrade preserves the epoch and earlier
-material, rolls back all new DDL on obstruction, and includes the prior version
-23 in the migration fixture. This schema preparation expires no recipients and
-starts no scheduler; the fenced publisher and runtime wiring remain work.
-
-## 120. Fenced clock-guarded expiry publisher
-
-The prepared expiry publisher binds a random operation to one submission,
-route-owner claim and generation. Historical receipt inspection precedes
-fresh admission: a completed operation settles after clock holds or owner
-replacement without expiring more recipients. Changed digests conflict.
-Uncertain COMMIT results require settlement of that same retained operation.
-
-New publication requires current policy and unexpired ownership under the
-configuration/account/route locks. Database UTC is paired with the supplied
-runtime clock's monotonic domain and admitted by its shared clock guard.
-The database-wide progress row serializes publishers and requires a UTC
-second since its previous publication sample. That persisted bound supplements
-the guard's monotonic interval; neither enables catch-up or clears a discontinuity hold. The retained cutoff never advances during the operation.
-
-For an overdue submission, one transaction selects at most 100 pending rows
-in ordinal order. Fresh Queued becomes Failed/Expired with no attempt phase.
-Attempted certain rows become Failed/Expired/Final; an existing uncertainty
-latch or AcceptancePossible instead becomes terminal OutcomeUnknown/Expired.
-No retry time remains. Actual replies, attempt history, transmitted bytes and
-envelope survive. Terminal rows are excluded. Exact ordinal coverage is
-checked before updating completion; the final batch sets completedAt and
-Pending failure notice together. Retired attempts, account sequence, CHANGE,
-receipt and global progress commit with those recipient changes. Each account
-holds at most 1024 expiry receipts younger than an hour.
-
-Expiry receipts are keyed by submission, not attempt, and section 216 removes
-them only a month after the submission completes. Every admission of the
-expiry receipt kind, by an expiry publication or by an AcceptancePossible
-reservation (section 142), first deletes, under the account write lock, that
-account's expiry receipts published more than an hour (`RECEIPT_RETENTION_MS`,
-section 123's margin) before the database clock, then counts the rest with
-outstanding claims against the 1,024 ceiling: a per-hour flood bound, not a
-lifetime one, and expiry publication is already serialized at one per database
-second across accounts. While an account's ceiling is full, its further
-expiries and every AcceptancePossible reservation (so every delivery reaching
-DATA) refuse Capacity until receipts age past the hour. A receipt serves only
-replay inside publication and settlement of that operation's uncertain COMMIT.
-A relay process holds one Pending for every route and account it serves, and
-refuses every expiry and phase publication while it is held, so no sweep in
-the owner's process can remove the receipt it is settling. Another relay
-process serving another route of the account sweeps only receipts older than
-the hour; a settlement that outlives it reads absent and releases custody,
-losing only the passive outcome, since the expiry itself is durable in the
-recipients and the next turn rederives from them. Capacity inspection counts
-only receipts inside the hour. The queue expiry fixture fills the ledger with
-young receipts and expects Capacity, backdates them a literal 61 minutes, then
-requires the next expiry to succeed, every expired receipt of the account to
-go, a 30-minute receipt, another account's expired one and the replayed
-operation's own receipt to stay, and capacity inspection to count only live
-receipts.
-
-The publisher rechecks ownership and the nonrenewable clock token before
-COMMIT; late clock failure rolls back staged changes. A COMMIT handed to the
-server is inherently indeterminate on connection/deadline failure and settles
-through the receipt, never a replacement result. Runtime callers must close
-and fence the route's transport first, including an interrupted current-owner
-attempt, share the process guard and detect primary changes. This API starts
-no transport, scan, scheduler or administrator clock-confirm endpoint.
-
-## 121. Prepared shared route health storage
-
-Schema version 25 prepares route health keyed by account, route name and
-immutable destination fingerprint, plus independently retained operation
-receipts. Separate destination keys keep a changed endpoint from inheriting
-or erasing the prior endpoint's backoff; retirement (section 52) removes
-an endpoint's row only once its backoff has elapsed and it holds no repair
-latch. Each health revision is nonzero;
-receipt revisions increase and the future publisher must check exact adjacency.
-Receipts capture the resulting state and one of failure, repair or success,
-so later state changes cannot rewrite an earlier operation's settlement.
-
-The stored consecutive failure count is bounded by u32. A zero count is the
-healthy state, with no failure/retry timestamp or repair latch. A nonzero count
-retains failure UTC and a next-attempt time between the lowest permitted
-minimum retry interval (one second, section 219) and one hour later. Reasons are None, Network, Tls, Auth or Protocol. A repair latch, when
-present, names a nonzero configuration-selection generation and is permitted
-only for TLS/authentication failures. Explicit repair may clear that latch
-while preserving the failure count and minimum retry time; successful transport
-may reset the count without resetting the increasing revision. No stored
-field or receipt itself authorizes a send or proves a successful transport.
-
-The future publisher must compare current policy and ownership, use bounded
-shared retry jitter with checked count/revision increments, retain repair
-holds across ownership changes, and cap health rows and receipts per account.
-Clock guards and due times remain separate dispatch requirements. Both tables
-use the runtime's ordinary mail DML grant set and private owner initialization.
-This schema preparation changes no dispatch behavior or runtime admission.
-
-## 123. Shared route failure publication and dispatch checks
-
-The route-health publisher records Network, TLS, authentication or protocol
-failure for a retained attempt of the exact current owner, route and destination.
-The attempt ID is the operation key: preparing it again cannot double-count a
-failure or replace its classification. The request digest binds the claim,
-fence, route, attempt and failure. Historical settlement precedes current-owner
-checks. It remains available after takeover or subsequent health changes while
-its attempt is active or holds a final reservation. Once the attempt retires
-and releases any final reservation, settlement lasts only until the
-route's next publication (on another route, up to an hour after the attempt
-was prepared; see below).
-
-Under the current configuration/account/route lock, publication checks attempt
-identity and time, requires the attempt to remain active, refuses reports
-from before the latest route failure, and
-increments checked failure count and revision. Shared bounded retry jitter
-sets the next time. TLS/authentication failures also latch the selected
-configuration generation; ordinary later failure reports cannot clear that
-hold. Health and receipt publish atomically, with 1024-row per-account caps,
-and recheck current ownership before COMMIT. Unknown COMMIT must settle this
-same attempt operation. Route health changes no recipient or account sequence;
-recipient settlement remains a separate fenced operation after transport closes.
-Publish a fresh route failure before that settlement retires the attempt. This
-prevents delayed reports for retired attempts from undoing a later success;
-the single active attempt per account/route keeps that ordering across new dispatch.
-
-Receipt retention is bounded, not a lifetime ledger. Every failure, success
-and repair publication, holding the account write lock and its route, first
-deletes failure and success receipts whose attempt is gone. It deletes
-failure receipts of retired attempts on the publishing route and on other
-routes where the attempt was prepared more than one hour before the locked
-database time. It keeps the four newest repair receipts of each route
-destination before adding its own. Active attempts and attempts
-with a final reservation retain their failure and success receipts during
-every sweep, including pre-dispatch reclamation under capacity pressure.
-Only the route's current owner, holding an unexpired lease, sweeps it
-without margin, and that single-threaded owner settles each operation
-(Pending barrier, FailedPrepared continuation or the success and repair
-retry) before it publishes the next. An owner superseded on its route can
-lose a pending receipt. This relies on the relay stopping on any lease
-renewal error and renewing at least every five seconds with a ten-second
-deadline, well inside the thirty-second lease: a takeover can only follow
-renewal failures that already stopped it, and every settle loop then exits.
-A paused process can resume superseded without a failed renewal; until its
-next renewal fails Stale, within about fifteen seconds, `check_locked`
-refuses its publications, so it can only inspect. A change to that renewal
-policy must keep this property. Another relay
-process serving a different route keeps its settlement for the hour.
-Attempt rows on another route must outlive that hour after preparation;
-section 218 reclaims the publishing route's retired attempts at once and
-another route's only after it.
-
-A route-success receipt stays with its accepted attempt until both are
-reclaimed. A live owner that has committed acceptance keeps its evidence
-and its reserved slot until it records the reset. Failure needs an active
-attempt of the current owner, so a retired attempt never records a failure again. The worker reports
-no failure for an accepted attempt; the database does not check that, but a
-later failure refuses success for every attempt prepared before it.
-
-Fresh and retry attempt publication reserve space for a health state and
-receipt before SMTP. Under the account write lock, each attempt of a matching route owner
-that is active or has committed final acceptance counts as one receipt
-keyed by its attempt ID, and attempts sharing a
-route name and destination count as one state. A published row with the
-same key occupies that reservation. Explicit repair also counts reserved
-receipts when admitting its own write. When capacity is tight, admission
-reclaims abandoned custody and expires receipts before recounting. An
-account still at capacity waits for room before
-creating an attempt. A full owner ledger delays that account's next claim;
-the relay continues scheduling and renewing other accounts. The ordinary
-failure, success and uncertain-commit settlement run inline while the
-worker still holds custody. If a frontend cancels while a connection is
-in Prepared, submission completion immediately fences its transport. The
-untouched Prepared attempt stays active solely for the connection's
-route-health result and recovery. Recovery releases it after checking the fully canceled group;
-it leaves the cancellation sequence and recipients intact. A replacement
-owner releases the same custody if the original process stopped. Account
-maintenance clears expired owner operations before releasing abandoned
-reservations and canceled custody, including on removed route names.
-
-Fresh and retry attempt publication inspect durable route health under
-those same locks. Backward database time, an outstanding repair latch or a
-future shared retry time refuses new dispatch. Receipt replay remains historical
-and does not acquire new transport authority. The local queue-clock guard and
-recipient due times remain separate requirements. No scheduler or transport is
-activated; explicit configuration repair and successful-route reset are the
-next publication operations, and no timer silently clears a repair latch;
-route retirement never deletes a latched row.
-
-## 124. Explicit shared route repair
-
-A prepared route-repair operation binds a random retained operation ID to its
-current owner, route, destination and selected configuration generation. It
-requires a TLS/authentication repair latch from a strictly older selection.
-Reselecting validated configuration and resolving a new profile still does
-not clear the latch: the explicit repair publication is separately required.
-The same selection cannot clear its own failure, and a route without a latch
-refuses a new repair. Historical replay can settle after owner release.
-
-Under the configuration/account/route locks, repair increments the checked
-health revision and clears only repair_generation. Failure count, reason,
-failure timestamp and next-attempt timestamp remain byte-for-byte unchanged.
-Dispatch therefore remains blocked until the existing shared minimum interval
-and the separate recipient/clock guards permit it. Receipt action 2 captures
-that repaired state atomically, with the shared 1024-receipt account limit;
-each publication first keeps only the four newest repair receipts of each
-destination (section 123); an acquisition retires the receipts of
-destinations whose health row has retired (section 52).
-Backward UTC, stale ownership, overflow and write failure refuse publication;
-unknown COMMIT settles the retained operation without applying another repair.
-
-This is an explicit prepared storage operation, not an authenticated operator
-endpoint or a configuration-load side effect. Runtime integration must bind
-operator authorization to this operation. Successful-route counter reset is
-a separate operation; repair does not claim that transport has succeeded.
-
-## 125. Shared route success reset
-
-The success publisher requires a retired attempt of the exact current owner,
-route and destination, plus its durable positive final-DATA acceptance receipt.
-A Prepared/Body/AcceptancePossible attempt or merely asserted transport
-success cannot reset health. The attempt ID is the shared operation key;
-while its receipt is retained, one attempt publishes one classification.
-Fresh failure publication requires an active attempt, so a delayed unreported
-failure from an older retired attempt cannot undo this reset. Once section 123
-expires the receipt, repeating this success at most resets a healthy route
-again. Historical settlement survives owner release only for that retention.
-
-Under current policy/account/route locks, success refuses a repair latch or
-an attempt prepared before the latest route failure. It increments the checked
-revision and resets the consecutive count, reason and failure/retry times to
-the healthy state. Action-3 settlement captures that state in the same commit,
-with the shared health/receipt caps and a final owner/time check. Recipient
-results and account sequence are unchanged. Unknown COMMIT settles the original
-operation. A successful SMTP handoff does not prove final mailbox delivery;
-this operation starts no scheduler or transport and cannot authorize a send.
-
-## 134. Bounded route candidate discovery
-
-The prepared route-owner scanner returns at most 64 due submission hints per
-page, separately for fresh and retry recipients. It holds the current policy,
-account and route-owner locks while checking ownership, route health and the
-absence of an active route attempt. Candidates match the immutable route and
-destination, have a live uncompleted submission, and have eligible recipient
-states due at the database observation time. Each hint carries the minimum
-due time among those recipients. No attempt, receipt or sequence is written.
-
-Pages order by due time then submission ID. An opaque continuation binds the
-last returned key to the same claim, generation and candidate kind; one extra
-row establishes whether more candidates existed at that observation. Pages
-are independent bounded reads, not one stable snapshot. A scheduling pass
-must restart from the beginning to discover newly due or moved earlier work.
-The original absolute connection deadline and existing protocol ceilings
-bound each scan; database query work can still grow with the stored queue.
-
-Hints reserve nothing and grant no permission to transmit. Full recipient
-validation, queue-clock admission, current policy, route health and ownership
-remain required by the attempt owner and publication path. The final owner
-check also refuses a scan that outlives its lease. No scheduler, SMTP driver
-or production backend is activated by this API. The real PostgreSQL scenario
-covers multi-page discovery, eligibility filtering, separate retry discovery,
-stale generations, cursor-kind binding, active-attempt refusal and unchanged
-account state during read-only scans.
-
-## 135. Expiry discovery during delivery pauses
-
-The route candidate scanner also supplies expiry hints ordered by submission
-expiry time and ID under the same page, cursor, policy and ownership bounds.
-It selects uncompleted expired submissions matching the immutable route and
-destination that still have Queued, InFlight or Deferred recipients, or
-OutcomeUnknown recipients with a retained retry time. Terminal unknown,
-Accepted and Canceled recipients do not make a submission expiry-eligible.
-Recipient retry times and send times do not postpone expiry discovery.
-
-Expiry discovery bypasses delivery backoff, repair pauses and active-attempt
-refusal: those delivery conditions must not hide expired responsibility.
-This differs from fresh/retry discovery only; the read writes no state and
-still refuses a stale owner. An expired InFlight hint grants no authority to
-change its recipients or continue its transport. The expiry publisher still
-requires closed/fenced transport, confirmed queue-clock admission, current
-ownership and policy, exact recipient validation and its global rate limit.
-In particular a forward database clock jump may produce a hint while the
-clock guard correctly refuses expiry publication.
-
-The real PostgreSQL scenario covers expired hints during route backoff,
-repair and active attempts; expiry despite a future retry time; supported
-recipient states; and exclusion of terminal unknown, Accepted, Canceled,
-completed, live and destination-mismatched submissions. Pagination retains
-its independent-observation semantics and must restart for each scheduling
-pass. No background scheduler or transport is activated.
-
 ## 136. Verified active-attempt transmitted bytes
 
 The prepared attempt API can admit its immutable transmitted body through a
@@ -5552,10 +4830,10 @@ bounded read-only repeatable-read snapshot. The opaque Dispatch binds the
 account, route, destination, owner, generation, attempt and request digest.
 Fresh primary admission checks current policy, unexpired route ownership and
 that exact active attempt before snapshot work. Pre-MAIL classification
-(section 212) and post-354 DATA each open and verify a separate snapshot.
-Each snapshot binds the live
-submission and blob manifest; the shared blob reader verifies contiguous
-chunks, total length and SHA-256 before exposing any bytes to the callback.
+([Relay scheduling turn](#relay-scheduling-turn)) and post-354 DATA each open
+and verify a separate snapshot. Each snapshot binds the live submission and
+blob manifest; the shared blob reader verifies contiguous chunks, total length
+and SHA-256 before exposing any bytes to the callback.
 
 A second fresh primary admission after verification refuses cancellation,
 retirement, ownership loss or policy change observed before that check. Both
@@ -5616,7 +4894,7 @@ database sample reaches the guard before owner-clock or lease refusal, so a
 failed ownership check cannot hide a discontinuity from the persistent hold.
 Fresh work is
 allowed at startup; retries require the minimum retry interval of stable
-monotonic time (section 219). A clock
+monotonic time ([Minimum retry interval (schema 42)](#minimum-retry-interval-schema-42)). A clock
 discontinuity or primary-change hold continues to refuse dispatch until the
 existing explicit confirmation rules are satisfied. The adapter's UTC field
 is never used for queue decisions.
@@ -6131,7 +5409,7 @@ Large-body throughput requires explicit qualification before activation.
 
 The native observed-envelope reader shares the untouched Prepared validation
 with the passive envelope reader. Retried Prepared rows retain the previous
-attempt's replies as required by section 117; neither reader treats those
+attempt's replies as required by [Due-retry publication](#due-retry-publication); neither reader treats those
 historical replies as progress in the new attempt. It additionally observes database UTC through
 the caller's shared queue-clock guard before reading the envelope and again
 under the final owner check. Clock failure, a discontinuity or a retained hold
@@ -6386,20 +5664,24 @@ receipt; an error retains custody, and a found receipt or proven absence
 clears it. Settlement never republishes or creates continuing SMTP authority.
 
 Absence is proof because of lock order. Every publication this barrier holds
-(attempt, phase, recovery, route failure, route acquisition, expiry) takes
-the account row FOR UPDATE before it writes its receipt and sends COMMIT,
-and every inspection takes that row FOR SHARE before it reads the receipt
-under a fresh READ COMMITTED snapshot. Settlement starts only after the
-uncertain call returned, so its share lock waits until the uncertain
-transaction committed or rolled back, and a missing receipt then means it
-rolled back; a receipt kind with bounded retention (sections 52, 120, 123
-and 218) can also read absent once it expired. Either way the operation is
-not retained, and holding the barrier would only wedge the worker while it
-keeps renewing its lease. The caller then publishes the same passive change afresh, under
-the same fences as any first publication, or rederives from durable state:
-the scheduler's next turn finds a committed attempt through active-attempt
-discovery and otherwise dispatches anew. The relay's route success and
-repair loop treats absence the same way.
+(attempt, phase, recovery, route failure, route acquisition, expiry) takes the
+account row FOR UPDATE before it writes its receipt and sends COMMIT, and
+every inspection takes that row FOR SHARE before it reads the receipt under a
+fresh READ COMMITTED snapshot. Settlement starts only after the uncertain call
+returned, so its share lock waits until the uncertain transaction committed or
+rolled back, and a missing receipt then means it rolled back; a receipt kind
+with bounded retention ([Route-owner acquisition receipt
+retention](#route-owner-acquisition-receipt-retention), [Expiry receipt
+retention](#expiry-receipt-retention), [Route-health receipt retention and the
+lease window](#route-health-receipt-retention-and-the-lease-window) and
+[Reclamation of retired attempts](#reclamation-of-retired-attempts)) can also
+read absent once it expired. Either way the operation is not retained, and
+holding the barrier would only wedge the worker while it keeps renewing its
+lease. The caller then publishes the same passive change afresh, under the
+same fences as any first publication, or rederives from durable state: the
+scheduler's next turn finds a committed attempt through active-attempt
+discovery and otherwise dispatches anew. The relay's route success and repair
+loop treats absence the same way.
 
 The fixed HTTPS worker's owners obey the same order and treat absence the
 same way: Email update, deletion and filing, folder, draft, upload,
@@ -6420,15 +5702,20 @@ account during the one-minute inspection window. Releasing the local
 slot leaves the original result indeterminate.
 
 The proof needs four things this design must keep: every publisher of these
-kinds locks the account row FOR UPDATE before COMMIT and every inspector
-locks it FOR SHARE before reading the receipt; lock and statement timeouts
-surface as errors, which retain custody; all of them use the single pinned
-primary, and an HTTP owner inspects only the endpoint it
-published to; and no path deletes such a receipt while its operation can
-still be pending, beyond the bounded sweeps of sections 52, 120, 123, 216
-and 218 and the HTTP families' sweeps by another instance serving the same
-account ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)). Any further sweep of attempt, phase, recovery,
-expiry or HTTP-family receipts must respect that.
+kinds locks the account row FOR UPDATE before COMMIT and every inspector locks
+it FOR SHARE before reading the receipt; lock and statement timeouts surface
+as errors, which retain custody; all of them use the single pinned primary,
+and an HTTP owner inspects only the endpoint it published to; and no path
+deletes such a receipt while its operation can still be pending, beyond the
+bounded sweeps of [Route-owner acquisition receipt
+retention](#route-owner-acquisition-receipt-retention), [Fenced expiry
+publication](#fenced-expiry-publication), [Route failure
+publication](#route-failure-publication), [Retention of settled
+submissions](#retention-of-settled-submissions) and [Reclamation of retired
+attempts](#reclamation-of-retired-attempts) and the HTTP families' sweeps by
+another instance serving the same account ([Receipt retention for HTTP
+writes](#receipt-retention-for-http-writes)). Any further sweep of attempt,
+phase, recovery, expiry or HTTP-family receipts must respect that.
 
 This is a bounded settlement job, not a renewal of any expired transport owner.
 No production scheduler or backend is activated.
@@ -7312,19 +6599,21 @@ definite failure clear custody; an unknown COMMIT retains the exact claim.
 No further scan, attempt, phase or acquisition can pass that barrier.
 
 Pending::identity replaces its attempt-only accessor with a closed identity
-sum: Attempt, RouteClaim or Expiry. Existing attempt publication, recovery and route
-failure identities are unchanged. Pending::settle uses independently admitted
-capacity to inspect the retained claim receipt, with no acquisition replay.
-Errors preserve custody; a matching receipt clears it and returns
+sum: Attempt, RouteClaim or Expiry. Existing attempt publication, recovery and
+route failure identities are unchanged. Pending::settle uses independently
+admitted capacity to inspect the retained claim receipt, with no acquisition
+replay. Errors preserve custody; a matching receipt clears it and returns
 Settlement::RouteClaim, and proven absence (section 165) clears it without a
-settlement. The receipt is retained only for section 52's hour after its
-lease, so absence settled later may also mean an expired receipt; the
-caller's retried acquisition then takes a fresh generation, which is safe
-under section 52. This path has only test callers. The
-grant is historical evidence only, even when returned by a known
-acquisition. Fresh current-owner and attempt admission
-must still precede SMTP, and an expired or released receipt cannot revive an
-owner. Known committed results are not converted into deadline refusals.
+settlement. The receipt is retained only for [Route-owner acquisition receipt
+retention](#route-owner-acquisition-receipt-retention)'s hour after its lease,
+so absence settled later may also mean an expired receipt; the caller's
+retried acquisition then takes a fresh generation, which is safe under
+[Route-owner acquisition receipt
+retention](#route-owner-acquisition-receipt-retention). This path has only
+test callers. The grant is historical evidence only, even when returned by a
+known acquisition. Fresh current-owner and attempt admission must still
+precede SMTP, and an expired or released receipt cannot revive an owner. Known
+committed results are not converted into deadline refusals.
 
 The native route-owner fixture exercises short and nonrenewing budgets,
 expired input/meter deadlines, mode refusal, ordinary/settlement slot pressure,
@@ -7353,7 +6642,7 @@ absence (section 165) clears it for the next expiry turn to rederive.
 Settlement never retries publication or changes recipient state.
 
 The underlying expiry transaction retains fresh policy and owner fencing,
-the queue-clock admission rules of sections 116 and 118,
+the queue-clock admission rules of [Runtime queue clock guard](#runtime-queue-clock-guard) and [Clock-guarded expiry admission](#clock-guarded-expiry-admission),
 process-local and database-wide spacing, at most 100 recipients, current
 attempt reservation handling, uncertainty preservation and one account
 sequence change. Admission does not confirm or replace the shared clock
@@ -7785,147 +7074,6 @@ corrupt sequences, deliberate event-completeness exclusions and a concurrent
 commit after snapshot capture. The authenticated changes fixture qualifies
 the shared decoder through normal transaction-aligned paging.
 
-## 212. Foreground relay scheduling
-
-A relay profile runs one fixed SMTP worker and one lease-renewal worker.
-It pins the startup primary address and published configuration/TLS generation;
-there is no transparent primary fallback or configuration reload. Every SMTP
-phase retains the existing current-policy, route-generation and attempt fences.
-Renewal failure stops the service, and the original bounded SMTP attempt closes
-before joining workers and releasing the lease. Busy ownership is standby.
-
-The worker reserves two ordinary database slots, two independent body-source
-slots, one separate settlement slot, and two reusable TLS wire buffers. It polls bounded candidate pages, alternating
-fresh and retry work, and admits at most one attempt per turn. The existing
-100-recipient batch and ten-second initial admission cap remain in force; a
-120-second outer budget cannot extend that shorter cap. Wire, database and
-source meters each have bounded 1-GiB I/O/output and two-million-record budgets;
-these are work ceilings, not resident allocations. Exhaustion refuses work.
-
-Passive active-attempt discovery is fenced to the current account, route and
-destination and reads at most two rows, refusing multiple active owners.
-Restart recovery uses the previous generation; locally abandoned Prepared
-attempts use current-owner interruption after transport closure. Possible
-acceptance remains uncertain. Known MAIL/DATA/final refusal and RCPT evidence
-are settled before generic recovery. Unknown COMMIT retains the exact Pending
-owner and blocks subsequent work until its receipt is observed or proven
-absent (section 165). Absence authorizes no SMTP replay: the step republishes
-the same durable change or rederives from durable state, and active-attempt
-discovery still finds any committed attempt. A requested stop may abandon
-unresolved custody; durable phase recovery on restart remains conservative.
-
-The process starts its retry guard of the minimum retry interval from database UTC and its one
-monotonic clock. New mail may dispatch while retries wait. Expiry scans precede
-dispatch. With validated clock evidence, a stable relay can process at
-most one 100-recipient expiry batch per second. CONFIG.md describes how
-to confirm the clock when startup evidence is ambiguous or a jump is observed. Authentication and TLS failures publish a route pause;
-network failures, including DNS idle timeout while the original cap remains
-live, publish route backoff. A local exhausted cap does not diagnose the route.
-Durably accepted final DATA resets consecutive route failures. Success and
-repair retain exact operations and inspect unknown COMMIT before further work;
-a receipt proven absent (section 165) returns them to publication, and a
-lock timeout on the configuration, account or route owner row, as while
-the uncertain COMMIT still runs, or a statement failure in the owner or
-schema checks is retried like a lost connection until stop is requested
-rather than stopping the relay; a lasting one also fails lease renewal,
-which stops it. Other errors still stop it at once.
-After selecting a repaired configuration and restarting, an explicit private
-`queue-route-repair` request releases the configuration-bound pause only if
-the database confirms a newer selected generation. Mere restart never repairs.
-Under the original Prepared cap, the worker inspects each transmitted chunk
-for non-ASCII octets while computing its digest. It selects SevenBit or
-EightBit before MAIL only after full verification and fresh attempt admission.
-EightBit requires the matching EHLO capability. The worker prepays three
-maximum-body extents plus database validation overhead and reserves one record
-per 4096 bytes of actual body length, rounded up, before scanning. Classification
-uses the existing verification batch.
-
-## 213. Local terminal-delivery notices
-
-The shared foreground relay worker attempts at most one pending local notice
-per account every five seconds, independently of route backoff, repair holds and expiry clock
-confirmation. Only already completed submissions with notification Pending
-qualify. Each turn picks one of them at random, so a notice whose storage
-keeps failing delays the others only in proportion, never indefinitely. The
-current selected relay profile and live route lease authorize
-its account; an older submission destination does not strand local notices
-when the smart host changes. No notice enters the outgoing submission queue.
-
-The publisher holds the configuration, account and route fences while it
-reads up to 1000 terminal recipients in pages of 100 and builds one plain-text
-report with the shared compose_text MIME writer. The report identifies the
-submission and original Email, gives each recipient's outcome/reason, and
-includes retained RCPT/message replies and diagnostics. Unknown outcomes say
-that delivery may have occurred. Peer control characters are replaced with
-question marks in the text body; no peer text becomes a header. The generated
-message uses a local system sender, its own Message-ID and a fresh thread.
-
-That full report is attempted only within a day of completion, longer
-than a maximal burst of notices takes at one per five seconds. A compact
-report replaces it when the submission completed earlier, when the full
-report's work or size bound refuses it, or when the shared body/blob quota
-refuses its charge. The compact report keeps the identifying heading, counts
-recipients by outcome and names at most the first eight Failed or unknown
-recipients with their reasons, without replies; its text is at most 4 KiB
-and its message at most 16 KiB. It makes the full report's per-recipient
-integrity checks in one aggregate query. Late notices, including restored
-ones released more than a day before the relay runs, are compact. A notice
-stored more than 30 days after completion lets retention retire its record,
-replies included, at the next turn; the compact text says the delivery
-status may already be retired. Its charge is checked against body/blob caps raised by a fixed
-margin: 16 KiB of body and one blob per configured `queue_submissions`, so
-one queue's worth of failures still stores its notices in a full account,
-whose submissions can then retire and release their quota. Usage stays
-exact. Past the margin a notice stays Pending until the owner deletes mail;
-16 KiB of room then suffices. Every charge refuses only a column it grows
-past its cap, so a column already past a cap (an operator lowered it, or
-this margin was used) does not refuse a charge that leaves it unchanged; a
-lowered queue cap therefore cannot hold back a notice either. A replica of
-the account (REPLICATION.md) refuses such a source unless its own body/blob
-limits allow the same margin.
-
-One transaction writes the immutable blob, unread Inbox Email, membership,
-thread/anchor, quota charge and CHANGE rows for Email, Thread, Mailbox and
-Submission, then changes Pending to Stored with its historical Email ID.
-It preserves completedAt, recipients, their replies and uncertainty. Account
-sequence admission preserves outstanding final-result reservations. A
-missing Inbox, an exhausted quota margin, a storage failure or a deadline
-leaves Pending for a later turn and does not stop SMTP scheduling. Errors are redacted fixed enums in the
-service log.
-
-Stored is the durable receipt. Every subsequent scan first obtains the same
-account lock, so it waits for any older commit/rollback before selecting
-Pending again. A crash or lost COMMIT response therefore cannot create a
-second notice. The marker retains the Email ID after JMAP deletion, so missing
-Email bytes are not a reason to republish. No extra receipt table, schema
-upgrade or file-backed continuation is introduced.
-
-Each turn uses one ordinary database slot and a five-second absolute deadline.
-Raw report text is capped at 10 MiB and the MIME message at 16 MiB; each SQL
-page holds at most 100 rows of schema-bounded recipient fields. The private
-wire adapter bounds aggregate input at 12 MiB/4096 frames, retains the existing
-128-KiB per-frame/authentication limits, and bounds output at 20 MiB. Composition
-has one 128-MiB I/O, 64-MiB output and two-million-record meter, never refreshed
-inside a turn. These are work ceilings; the report/message and bounded SQL
-page are additional transient memory, released before the next SMTP attempt.
-
-Lease renewal permits an eight-second database lock/statement wait inside
-its original ten-second client deadline, so a five-second notice turn can
-outlast the ordinary one-second lock timeout. It still checks the current
-owner and unexpired lease under the acquired locks before extending it;
-waiting never authorizes renewal of an expired or replaced owner. Storage
-that exceeds this tolerance still stops the service under the existing
-lease-loss policy.
-
-After a notice error, including an indeterminate COMMIT, the scheduling
-worker also performs
-that bounded renewal before ordinary queue reads. Its account lock waits
-behind the notice transaction (COMMIT or rollback) and establishes
-settlement while rechecking
-ownership. A pending COMMIT therefore cannot trip the next candidate
-read's shorter lock timeout. Failure to establish current ownership still
-stops the service; the next notice scan uses the durable Stored marker.
-
 ## Application diagnostic retention (schema 29)
 
 `postgres_logs.sql` adds `application_log_state` and `application_logs`.
@@ -7951,246 +7099,6 @@ a physical high-water stop in addition to live-row bounds; PostgreSQL WAL,
 archive/replication retention, backups and whole-volume headroom still require
 normal operational limits and monitoring. A stopped diagnostic sink must not
 be treated as a reason to resend mail.
-
-## 216. Retention of settled submissions
-
-Nothing else removes a submission, so without retention the per-account
-submission caps (1,024 receipts and the configured `queue_submissions`
-quota) would be a lifetime limit on sent mail. Attempts and their receipts
-are also reclaimed independently, at attempt publication (section 218), so
-submissions still retrying or inside retention do not hold the attempt
-caps.
-Submission and cancellation receipts expire a minute after publication on
-their own ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)) and expiry receipts an hour after (section 120), so
-the deletes below usually find none of them; the rest wait for this
-retention.
-The submission retirement step deletes, in one transaction, the
-oldest submissions QUEUE.md lets ordinary retention reclaim: completed more
-than 30 days ago (`RETENTION_MS`, against the database clock), whatever
-their recipients' outcomes (Accepted, Failed, Canceled or OutcomeUnknown,
-uncertain or not), no Pending failure notice, and no active attempt or
-final reservation. Pending notices and anything not yet completed stay. A
-Failed, OutcomeUnknown or Restored record therefore keeps its replies and
-uncertainty for 30 days after completion, retiring only once its notice is
-stored and the account owner was told; an operator who needs it longer must
-copy it out first. A full account does not hold a notice back while its
-quota margin lasts: past a day, or on a quota refusal, it is stored compact
-(section 213). A completed group canceled later keeps its
-completedAt.
-
-A batch holds at most 64 submissions, 2,048 recipients and 64 MiB of
-transmitted blobs, admitting its first submission whatever its size, so
-the statement that cascades blob chunks stays far inside the 5 s statement
-timeout and other writers' 1 s lock timeout rarely meets the account lock.
-Attempt IDs stay in the database: an account may hold 1,024, more rows than
-the mutation connection's frame budget admits.
-
-It runs under the relay's route claim: `owners::begin` takes the account row
-FOR UPDATE, and the owner fence is checked before selection and again before
-COMMIT. The batch is selected oldest first and locked; then every receipt
-keyed by its attempts or submissions (phase, acceptance, refusal, RCPT,
-command, recovery, route-health failure and success, submission,
-cancellation and expiry), the attempts, recipients and submissions are
-deleted; `submission_routes` cascades. A transmitted blob another
-submission still references stays queued; one no Email, lease or
-submission reaches is deleted with its chunks, as Email deletion does.
-`blob_ids` rows stay, so a retired blob or submission ID cannot be reused.
-The same transaction decrements `queue_submissions`, `queue_bytes`,
-`body_bytes` and `blob_count` exactly, under guards that refuse with
-Integrity rather than underflow, writes a Destroyed EmailSubmission change
-per submission and advances the account sequence, so state strings change
-and the submission ID collision check still finds the ID.
-
-The relay also reclaims expired upload leases as upload publication does
-([Expired upload lease reclamation](#expired-upload-lease-reclamation)), releases abandoned route owners and canceled custody
-(section 123), and reclaims idle attempts and their receipts (section 218).
-Each step uses its own transaction with the same claim, fence and clock
-check. An empty batch rolls back. A corrupt upload counter can refuse a
-lease batch while the other three transactions still commit.
-
-The relay waits for the minimum retry interval of stable samples after
-startup and each observed clock discontinuity before running cleanup.
-A dispatch hold still permits cleanup after that interval. Until explicit
-confirmation the cleanup cutoff is the earlier of current database UTC
-and the last pre-hold UTC advanced by monotonic elapsed time. This cap
-protects records timestamped against the previously trusted clock. A
-record stamped during a backward excursion can become eligible early
-when database UTC returns to its former value. Each transaction
-checks ownership and refuses a database clock more than a minute from
-the observation. On an ambiguous restart the relay advances the last saved
-trusted cutoff by local monotonic progress, including after a host reboot
-when the database binding still matches. A first activation or a
-checkpoint without a matching cutoff requires one clock confirmation
-before time-based cleanup.
-
-On idle and active account turns the four transactions share one ten-second
-deadline within the 30-second owner lease. Each cycle runs the steps in the
-order above. A step with less than one second left starts on the next
-account turn with a fresh deadline. Success and failure both advance the
-cycle. After all four ran, any committed progress schedules another cycle
-on the next round; otherwise the account waits ten minutes. Without a
-connection slot the cursor stays put for ten minutes. A failure or a step
-deferred at the deadline records `relay_step_failed` at `retention`; the
-relay renews its lease to serialize behind any interrupted transaction.
-Only a failed renewal stops the relay. The steps are idempotent so an
-uncertain COMMIT needs no Pending custody. A first pass over a long
-history drains up to 64 submissions per cycle. The candidate scan
-reads all of the account's submissions (no completed_at index), bounded
-by the `queue_submissions` quota, once per pass.
-
-Deleting attempt-family receipts is one of the bounded sweeps section 165
-admits. Relay operations on these kinds are settled before the worker does
-anything else, and none targets a submission completed 30 days earlier; a
-settlement that outlived that would read absence, release custody, and its
-republication would find the attempt or submission Missing. An HTTP
-submission settlement that outlived it reads absence and releases the
-owner, which never republishes, so only the fence lifts. A cancellation
-of an old Failed group whose COMMIT response was lost, settled after the
-group retired, reads absence and its retry reports notFound, although the
-cancellation took effect.
-
-The `real_postgres_submissions_publish_queue_and_retained_outcomes` fixture
-builds accepted, uncertain-accepted, canceled, refused-then-canceled,
-failed, mixed, OutcomeUnknown, unfinished and notice-pending groups with
-every receipt kind, shared, leased and 32 MiB blobs, 900 attempts on one
-submission, a group inside retention, groups held by an active attempt or a
-final reservation and released, and three 1,000-recipient groups that need
-two batches; Failed, mixed and OutcomeUnknown groups with stored notices
-retire. An expired lease on a retiring submission's blob keeps the body
-through retirement; reclamation then retires it with a standalone expired
-lease's body, releasing exactly their upload bytes, body bytes and blob
-count while a live lease stays, and once nothing remains to retire a lease
-that expires is still reclaimed and committed alone. It checks the
-stale-owner, clock and released-owner refusals of both steps, exactly which
-rows, blobs and receipts go and stay, the Destroyed changes, the sequence
-advance and the usage audit. A unit test pins the batch bounds.
-
-## 218. Reclamation of retired attempts
-
-Section 216 retires submissions only a month after completion, so it
-alone would leave the per-account caps on attempts
-(1,024), phase receipts (2,048) and RCPT, command, acceptance, refusal and
-recovery receipts (1,024 each) as lifetime limits: ordinary sending, or a
-few submissions retrying for days, would fill them and refuse every later
-dispatch with Capacity. Attempts are therefore reclaimed on their own.
-
-Fresh and retry attempt publication first calls
-`postgres_attempt_reclamation::reclaim` in the same transaction. One statement
-deletes at most 64 (`RECLAIM_ATTEMPTS`) of the account's retired attempts,
-oldest prepared first: any retired attempt on the publishing route, and
-another route's prepared more than an hour (`RECEIPT_RETENTION_MS`, section
-123) before the locked database time. Active attempts and any attempt holding
-a final reservation stay. It deletes every receipt keyed by those attempts:
-phase, RCPT, command, acceptance, refusal and recovery receipts and their
-route-health failure and success receipts. Submission, cancellation and expiry
-receipts, recipients and submissions stay; attempts are not JMAP objects, so
-no change row is written and the sequence does not advance. Attempt ID lists
-stay in the database, never sent to the client; a reclaimed attempt ID is not
-reserved against reuse (fresh IDs are random). The attempt cap is counted
-afterwards, so an account already full recovers on its next publication, and
-each publication reclaims more than it adds, so a backlog drains. A
-publication refused later rolls its reclaim back. Under receipt pressure,
-repair also reclaims eligible attempts before admitting its write. Account
-maintenance commits a bounded batch independently from repair or dispatch.
-Maintenance applies the one-hour window to every route. A live owner that
-still owes a health reset keeps its acceptance evidence (section 123),
-including during the longer submission-retention sweep.
-
-Lock order is unchanged: configuration selection FOR SHARE and the account
-row FOR UPDATE (`owners::begin`), the route owner fence, route-health
-admission and the busy check, then the reclaim, which locks only this
-account's retired attempt rows, then the sequence, submission and
-recipients.
-
-A deleted receipt reads absent, which section 165 treats as settled; a
-republication then finds the attempt Missing, which the relay's phase,
-recovery and route-health loops treat as done. Reclaiming is therefore safe
-only while nothing pending can still settle against the attempt. Route
-owners are keyed by account and route name, so the publishing owner owns
-every attempt on its route. Its worker publishes only with nothing Pending
-(`Dispatches::publish_with` refuses Busy) and settles phase, recovery and
-route failure or success before its next dispatch, so the route's retired
-attempts have nothing pending at any age. A failed Prepared continuation
-(section 184) can still be inspecting its recovery after generic
-settlement cleared Pending; the relay steps it to completion inline, a
-caller must not publish another attempt before it completes, and its loop
-treats a recovery that finds the attempt Missing as complete. That is
-section 123's argument for
-the route's own health receipts, with the same reliance on a superseded
-owner stopping when its lease renewal fails. Another route's owner may
-still be settling, so its retired attempts keep the hour section 123 gives
-their health receipts, measured from preparation as there: an attempt
-retired late becomes reclaimable sooner, losing at most a passive outcome
-(only committed retirement makes an attempt reclaimable, so an absent
-receipt with a Missing republication always means its effect is
-durable). A final reservation is outcome-unknown custody
-(section 142) and keeps its attempt.
-
-Every other reader of attempt rows reads only active ones (phase and recovery
-publication, active-attempt discovery, route failure, cancellation, queue
-expiry, failure notices and candidate discovery) or reserved ones (final
-capacity); route success reads the retired attempt it just accepted, before
-the next publication. A settled recipient keeps its attempt ID, count, replies
-and uncertainty on its own row, which has no foreign key to the attempt, so
-retry publication, the JMAP projection and failure notices lose nothing.
-Section 216 then finds fewer attempts to delete with a submission. The attempt
-row is also its publication receipt, so a reclaimed attempt's dispatch no
-longer replays; no caller republishes a committed dispatch (each prepares a
-fresh attempt ID, and a Pending one is only inspected).
-
-Residual risks: a settlement on another route that outlives the hour reads
-absent and loses only its passive outcome, as its health receipt already
-does (section 123); capacity inspection counts reclaimable attempts until
-the account's next publication; and the scan reads the account's retired
-attempts without a prepared_at index, which the cap keeps small.
-
-The `real_postgres_submissions_publish_queue_and_retained_outcomes` fixture
-fills an account with 1,024 retired attempts, under a Failed and an
-OutcomeUnknown submission, with every receipt kind, beside a reserved one,
-an active one, another account's and another route's 30 and 61 minutes
-old. While they sit on another route inside the margin, publication refuses
-Capacity; moved to the owner's route, the next publication succeeds,
-removes exactly the 61-minute attempt and the 63 oldest with their
-receipts, keeps the rest and the recipients' rows unchanged, and leaves a
-reclaimed attempt's phase settlement absent and its republication Missing.
-Repeated publications drain the backlog.
-
-## 219. Configurable minimum retry interval (schema 42)
-
-`td-mta serve --minimum-retry-seconds N`, N in 1..300, sets the serving
-process's minimum retry interval F; without it F stays five minutes. The
-option exists so fixtures need not wait five real minutes. F is:
-
-- the base and floor of every automatic retry delay and route backoff
-  (QUEUE.md section 4). The exponent stays capped at four doublings, so
-  the largest delay is 16F plus jitter: the one-hour cap is reached only
-  when F is at least 225 seconds, and at F of one second a failing
-  recipient retries every 14.4 to 17.6 seconds until expiry;
-- the stable monotonic interval the queue clock guard requires after
-  startup or a hold before an attempted recipient is redispatched, before
-  queue clock confirmation, and before the relay's unattended retention
-  (section 216: submission retirement and upload-lease reclamation),
-  which runs only on that stable status.
-
-F is local process policy, carried on the relay worker's route claims and
-guard, never published configuration; processes serving one route may
-differ. The clock discontinuity bound stays five minutes whatever F, so a
-shorter F never tolerates more clock disagreement, but it shortens the
-observation window before retries, confirmation and retention to F.
-
-Persisted times are checked against the lowest permitted interval, one
-second, not against the writing process's own: rows a shorter interval
-wrote stay valid for any process that reads them later, including one
-started with the default. Schema 42 relaxes the route-health and
-route-health receipt CHECKs from at least 300000 to at least 1000
-milliseconds between failure and next attempt; recipient retry admission
-(section 117) takes the same bound. Schema-41 binaries cannot serve
-schema 42; the upgrade only widens constraints, so no existing row needs
-repair. The native serving fixture checks that no route-health CHECK
-keeps the old bound, and runs its profiles at 60 seconds, so its real
-restart guard and persisted retry floor take 60 seconds; fresh delivery and the route reset must
-finish within that hold, which the fixture asserts by elapsed time before
-it checks the earlier failure is still held.
 
 ## 8.121 Native ACME state and certificate pairs
 
@@ -8303,161 +7211,6 @@ The DATA
 worker's output meter includes the separate 2-MiB fanout metadata reservation,
 including when the configured message ceiling is smaller than that metadata.
 
-## Foreground relay scheduling across accounts
-
-One foreground worker rotates through at most sixteen configured accounts.
-A separate expiry cursor retains an account’s turn across local or database
-rate-limit refusals, advancing after an admitted attempt or no due work.
-Accounts without a live lease are skipped. This prevents a busy account from
-repeatedly consuming the shared expiry allowance ahead of later accounts.
-Each turn settles prior custody, checks periodic local failure notices and
-explicit repair work, checks expiry and interrupted attempts, and selects at
-most one SMTP attempt. Fresh/retry selection alternates independently for each
-account. Busy leases and paused routes advance the cursor. A complete empty
-pass backs off its following pause from 250 ms through 500 ms and one second
-to a two-second cap. Any observed candidate, interrupted attempt, pending
-settlement, explicit repair, published notice or notice failure restores the
-250-ms pause for that pass. This is a polling hint, never cached queue absence
-or delivery authority. Fresh/retry alternation can require two idle passes
-to discover newly queued work; database work and other accounts add latency.
-Lease renewal keeps its independent five-second schedule, and shutdown still
-checks at most every 50 ms during a pause. An SMTP attempt retains its existing 120-second
-bound, so another account may wait behind a slow peer. This is bounded rotation,
-not a per-account latency guarantee. Unsettled publication prevents rotation.
-
-After settlement, a turn without pending custody or an explicit repair request
-first makes one owner-qualified absence read. It checks unfinished submissions
-and active attempts for that account, route and destination, plus completed
-pending failure notices anywhere in the account. An empty result replaces the
-separate notice, expiry, recovery and candidate reads for that turn only. Its
-fresh database UTC still feeds the queue-clock guard and explicit confirmation;
-the empty expiry turn advances and fresh/retry selection alternates. No absence
-survives into the next turn. A positive result uses the existing fenced paths
-and does not itself mark the round active: delayed or paused work must not pin
-polling at its shortest interval. Notice scheduling is unchanged until an actual
-notice check occurs. New work committed after the hint waits for another turn.
-
-When every configured account has a renewed owner lease and its absence read
-finds no unfinished submissions, attempts or pending notices, the next pause
-uses a thirty-second fallback instead of the ordinary two-second cap. The
-retained reader autocommits `LISTEN td_mta_relay` before its first absence read.
-Submission publication executes `NOTIFY td_mta_relay` inside the same transaction
-as its rows and receipt, before the existing COMMIT outcome marker. PostgreSQL
-delivers the hint only on commit. A notification failure never permits an
-acknowledgement without durable publication, and uncertain COMMIT retains the
-existing settlement rules. No schema migration or new privileges are required.
-
-The channel has an empty payload: every subscribed relay profile may wake,
-then uses its own bounded account rotation and current authorization. Driver
-polls coalesce matching notifications into one boolean, including those read
-during SQL. Unrelated channels and nonempty payloads are ignored. Existing
-finite input frame/byte budgets still apply; no notification queue is allocated.
-An idle pause blocks on the existing socket in at most fifty-millisecond slices
-and issues no SQL. Stop, repair and queue-clock confirmation requests interrupt
-it. A disconnect, missing subscription or finite session retirement also ends
-the pause; replacement subscribes before scanning again. Only a complete
-rotation on one subscription admits the extended pause, so a reconnect between
-account scans cannot hide work from an earlier account behind that pause. A complete lost hint
-is recovered by the thirty-second fallback, even without another submission.
-The database scan remains authoritative and no hint authorizes delivery.
-An observed notification or subscription-recovery wake resets the ordinary
-backoff to 250 ms without changing fresh/retry alternation. A fresh arrival
-during a retry turn therefore avoids retaining a two-second empty-queue delay
-before the next fresh turn. Empty socket slices do not reset the backoff.
-
-Any delayed retry, paused or unfinished submission, active attempt, pending
-notice, Busy read or account without a renewed lease keeps the original
-250-ms-to-two-second polling schedule. Thus notifications do not postpone
-scheduled retry/expiry work or owner acquisition. Lease renewal remains on its
-independent five-second schedule. A notification storm can cause extra scans,
-but each round retains its bounded account work and protocol input limits.
-
-The process retains one claim operation, boot identity and owner generation per
-account instead of acquiring and releasing on each turn. Historical acquisition
-receipts require fresh owner observation and successful renewal before dispatch.
-Capacity on one route-owner acquisition leaves other accounts eligible
-for acquisition, renewal and dispatch.
-Newly acquired accounts enter a bounded registry and wait for renewal acknowledgement.
-The renewal worker snapshots that registry without holding its mutex over SQL,
-then renews all registered leases in one transaction every five seconds or when
-new claims arrive. It locks configuration, sorted accounts and then owner rows,
-samples database UTC after locks, and validates all generations before updating.
-A stale member rolls the batch back. All I/O shares one ten-second deadline;
-uncertain renewal stops the process. Lock contention on one account can therefore
-affect this process's availability. It cannot grant stale transport authority.
-
-The foreground worker retains one qualified idle-reader connection across
-account turns and empty-round pauses. It holds one existing ordinary read
-permit until connection close. The shared finite read-session implementation
-also backs HTTPS authentication: at most 64 jobs in sixty seconds, immutable
-TLS lifetime, finite cumulative/per-job wire windows, one owning thread and
-ten-second job deadlines. Connection admission qualifies schema and runtime
-role once and holds the migration lock until close. Each idle job begins a
-fresh READ COMMITTED transaction, checks epoch and maintenance, locks current
-configuration/account/owner rows, and acknowledges ROLLBACK before returning.
-No account lock, transaction or absence observation survives the job. Idle
-checks retain no authority to send. Failure retires the session; an observable
-idle disconnect can reconnect before a job, never replay an admitted one.
-
-A lock timeout on the idle job's configuration/account lock is a Busy
-observation, not evidence of work or permission to send. The failed read
-retires its session and releases its permit. The foreground worker defers
-that account until a later bounded scheduling round and yields any owned
-expiry turn so other accounts can progress, with the same empty-round backoff; it records `relay_poll_deferred` with `storage_busy`. Other idle
-failures still stop the worker and record `relay_step_failed` at `idle_poll`.
-Lease-renewal errors remain fail-stop and are recorded at `lease_renewal`;
-no renewal, publication or uncertain COMMIT is replayed by this policy.
-
-The worker closes this reader before pending settlement, explicit repair,
-positive-hint processing, delivery custody and final lease release. Rotation,
-shutdown and error cleanup close the connection before releasing its permit;
-clean idle cleanup has the existing bounded termination allowance. Each loop
-also retires exhausted or near-expiry idle sessions even when no account owns
-a usable lease; this local maintenance issues no SQL. Account
-count does not multiply retained sessions or extend any allowance.
-
-The standalone absence helper, initial foreground renewal and final release
-consume callback-scoped clients. Periodic renewal retains one qualified mutation
-session on the renewal thread, sharing the SMTP mutation lifecycle but not its
-publication wire allowance. Its sixteen-turn, sixty-second lifetime has finite
-cumulative bounds and the existing per-job limits: 128 KiB output, 1 MiB input
-and 1088 input frames. No account or transaction is retained between renewals;
-the migration lock remains held until connection close. Each new READ COMMITTED
-transaction checks epoch and maintenance before the existing fresh configuration,
-sorted account and owner checks. Lock and statement timeouts are transaction-local
-and remain eight seconds within the original ten-second operation deadline.
-
-Observable idle failure or exhausted lifetime permits replacement only before
-SQL admission, under the same deadline. Any admitted error retires the connection
-and preserves the worker's fail-stop path; no renewal is replayed. COMMIT is
-marked immediately before its attempt. An unknown outcome remains Indeterminate;
-a positively acknowledged COMMIT survives later cleanup failure, which retires
-the session. Exhausted, retired or near-expiry sessions close after the job,
-before the renewal worker waits again. Shutdown closes the thread-owned session
-before joining. Initial
-renewal is deliberately one-shot so a retained session never crosses threads.
-Preparation connections still inspect the schema at transaction entry.
-
-Registry acknowledgements match the exact claim operation and generation.
-Published slots are never replaced while the worker runs. One fresh database
-UTC sample initializes the shared queue-clock guard; historical receipt time
-and later account acquisition never reset it. Renewal timestamps do not feed
-that guard out of order. Existing restart/retry rules of the minimum retry
-interval and expiry admission rules apply across the entire process.
-
-An explicit route-repair request remains pending until every configured account
-has been visited. An account without a repair hold completes a fresh observation;
-a held account still requires the existing newer-configuration and receipt
-fences. A busy account leaves the request pending, and a refusal is visible.
-A request serial prevents completion of an earlier refused request from finishing
-a newer request. No timer clears a repair hold.
-
-Shutdown closes foreground custody and joins renewal before one bounded
-multi-account release transaction. Expiring leases remain the fallback if cleanup
-cannot complete. Claim receipt counts do not grow with idle scheduling turns.
-Account-scoped route ownership and health match the existing database keys;
-there is no schema migration or global smart-host concurrency promise.
-
 ## Legacy message storage (schema 32)
 
 Owner-authorized migration may preserve raw messages up to 64 MiB. Schema 32
@@ -8492,30 +7245,6 @@ ceiling. The 64 MiB publication took about two seconds on an idle host and
 exceeded the former ten-second cap under heavy load. Receipt inspection,
 connection establishment and mailbox publication keep ten seconds, and a
 caller deadline above the scaled allowance is refused before any work.
-
-## Per-account submission routes
-
-An account's optional `outbound_profile` selects the route of a configured
-profile with the relay role. Complete candidate preparation refuses an unknown
-profile or one without relay capability. The account field belongs to shared
-configuration and is identical across profiles. Omitting it preserves the
-submitting profile's route. This selects only a named route and its destination
-evidence; no relay credentials are copied into the account or JMAP binding.
-
-Each binding retains separate submission and worker routes. New authenticated
-submissions bind and persist the account-selected route under the existing
-configuration/device fences. A relay worker retains its own profile's route,
-credentials and TLS policy, including when the same process also serves JMAP.
-Changing the account selection does not rewrite previously queued routes;
-retain workers for those routes until their accepted mail is settled. Native
-route ownership, destination matching and account isolation remain in force.
-An account route never grants a sending identity or unauthenticated relay.
-
-`postgres account-update --outbound-profile NAME` changes the selection through
-the retained operation workflow. An explicitly empty NAME removes the override
-and restores inheritance. `account-list` includes any explicit selection. All
-mail instances must restart after configuration publication, as for other
-account edits. These commands do not configure provider credentials or DNS.
 
 ## Retained SMTP worker session
 
@@ -8769,3 +7498,1413 @@ explicit 256-folder union capacity boundary. The operation never removes Email
 memberships to force a folder deletion or claims completeness while retirement
 is pending. A schema-38 binary cannot serve schema 39; retain a consistent
 backup and use the fenced upgrade procedure. No replica service is activated.
+
+## 15. Submission queue, relay scheduling and route health
+
+This chapter specifies how queued EmailSubmission responsibility reaches a
+smart host. It covers the route each submission is bound to, the
+database-wide route-owner lease, attempt publication and every durable
+SMTP phase and outcome, recovery of interrupted attempts, the queue clock
+guard and clock-guarded expiry, shared route health, the foreground relay
+worker that schedules all of this across accounts, local terminal-delivery
+notices, and the retention that keeps every per-account cap a rate bound
+rather than a lifetime limit. Section 4 states the ownership model these
+mechanisms implement; QUEUE.md owns the recipient state machine and retry
+policy. The relay's bounded SMTP exchange, phase custody and final-result
+capacity are specified in section 136 through section 192.
+
+### Named-route evidence
+
+`postgres_routes` builds bounded, redacted route evidence from a validated
+profile: a route name and a destination fingerprint over canonical host,
+port, transport and authentication identity (section 4). Whole-generation
+preparation rejects conflicting definitions of a shared name; profile
+loading retains the selected route in its binding. `serves_route` is only
+passive eligibility evidence and requires the relay role plus matching
+name and destination. It grants no lease or continuing policy authority:
+a worker's authority comes only from the route-owner fence below.
+
+### Per-account submission routes
+
+An account's optional `outbound_profile` selects the route of a configured
+profile with the relay role. Complete candidate preparation refuses an
+unknown profile or one without relay capability. The account field belongs
+to shared configuration and is identical across profiles. Omitting it
+preserves the submitting profile's route. This selects only a named route
+and its destination evidence; no relay credentials are copied into the
+account or JMAP binding.
+
+Each binding retains separate submission and worker routes. New
+authenticated submissions bind and persist the account-selected route
+under the existing configuration/device fences. A relay worker retains its
+own profile's route, credentials and TLS policy, including when the same
+process also serves JMAP. Changing the account selection does not rewrite
+previously queued routes; retain workers for those routes until their
+accepted mail is settled. Native route ownership, destination matching and
+account isolation remain in force. An account route never grants a sending
+identity or unauthenticated relay.
+
+`postgres account-update --outbound-profile NAME` changes the selection
+through the retained operation workflow. An explicitly empty NAME removes the
+override and restores inheritance. `account-list` includes any explicit
+selection. Serving instances apply it by draining and reloading, as for other
+account edits. These commands do not configure provider credentials or DNS.
+
+### Submission route mappings (schema 15)
+
+Schema version 15 adds owner-private `submission_routes`, one
+account-bound mapping per queued submission. Every enqueue transaction
+writes the selected route name and destination fingerprint, together with
+the submitting profile, atomically with outgoing bytes, recipients, quota
+charges, history and the operation receipt. The retained request digest
+explicitly binds the route and destination. Failures while inserting
+either route or receipt roll back the entire enqueue.
+
+The mapping has no foreign key to the current configuration: removal or
+replacement of a profile cannot rewrite an already queued destination.
+Source Email deletion leaves it intact; submission retirement cascades its
+mapping. Migration preserved older queue rows without inventing a route. A
+queue row lacking a mapping is ineligible for dispatch and expiry (every
+candidate, attempt and expiry query joins it) and requires explicit
+repair; workers must never infer a default from their own profile.
+
+### Route-scoped outgoing body reads
+
+`postgres_delivery_body::with_submission` requires a selected relay role
+and opens a finite read-only primary snapshot. It rechecks epoch and
+configuration selection, then joins the queued submission's stored route
+name and destination to the worker's selected route. Missing mappings,
+wrong routes and different destinations cannot expose an outgoing body.
+Account state, changed sequences, manifest and chunk coverage must be
+valid.
+
+The shared body verifier checks the entire bounded outgoing blob before
+the callback receives its reader. Verification and replay share the
+original snapshot and deadline. No Email or device credential is needed:
+queued responsibility survives source deletion and device revocation. The
+database credential and selected relay profile authorize this internal
+read. A read is passive evidence, including after a policy change during
+its snapshot; it grants no attempt ownership or right to transmit. The
+relay itself reads transmitted bytes through the attempt-scoped read of
+section 136, which additionally binds the active attempt; this
+route-scoped read has no runtime caller.
+
+### Route-owner leases and fencing (schema 16)
+
+Schema version 16 introduces `route_owners` and retained
+`route_owner_receipts`. `postgres_route_owners` coordinates one owner per
+account and route name, even across destination changes. Fresh claims
+require a selected relay role. Acquisition locks configuration, account
+and route in that order, rejects an unexpired owner, and increments a
+nonzero 64-bit fencing generation without wrapping. A retained random
+operation and digest make uncertain acquisition inspectable and replayable
+without a new claim. The serialized receipt recheck precedes
+current-policy rejection, so a concurrently committed acquisition remains
+resolvable after selection changes. Route rows and acquisition receipts
+each have a 1024-per-account cap.
+
+A fixed 30-second database-time lease (`LEASE_MS`) binds the process boot
+identity, claim operation, route destination and generation. Renewal
+checks every field, current selected policy and unexpired ownership under
+lock. Release compares the same owner and fence but can clear an expired
+lease or removed policy; its caller must first close its SMTP transport.
+Release retains the fencing counter until the row retires, a week after
+its last use. Historical acquisition receipts are never live authority:
+`observe` checks current policy, identity, fence and database expiry.
+Unknown renewal or release responses remain indeterminate; fresh primary
+observation resolves whether that owner remains live. Internal
+coordination does not advance JMAP state or mutate recipient
+responsibility.
+
+Database time earlier than the last recorded owner clock refuses. This is
+a local row check, not complete failover/clock-jump qualification; the
+queue clock guard below supplies the process's conservative clock
+validation, and the relay bounds every network step with monotonic
+deadlines. No lease enables SMTP by itself; atomic recipient `Prepared`
+publication and every subsequent phase still need the same route-owner
+fence. Takeover recovery preserves AcceptancePossible uncertainty before
+any replacement attempt ([Abandoned-attempt recovery (schema 18)](#abandoned-attempt-recovery-schema-18)).
+
+### Route-owner acquisition receipt retention
+
+Acquisition receipts are retained for a bounded time, not for life. An
+acquisition that passes its replay, policy, Busy and Clock checks first
+deletes, under the account write lock, the account's receipts whose
+recorded first lease ended more than one hour (`RECEIPT_RETENTION_MS`)
+before its locked database time; a later refusal rolls that back. Renewal
+does not extend a receipt, and none is needed then: a claim replays its
+receipt only to settle its own acquisition while it holds no grant. The
+relay retries ungranted slots each round, subject to the five-second wait
+after a capacity refusal. A claim retried more than an hour after its
+lease ended may find its receipt swept by another acquisition and then
+acquires afresh under a higher generation; the unused earlier generation
+was never live authority, since every fence compares the owner row's
+generation, boot and operation. Otherwise the old receipt replays,
+observation reports it stale and the relay replaces the claim.
+Inspect-only settlement of an acquisition (section 191) after that hour
+may read an expired receipt as absent; it then releases custody, and the
+retried acquisition takes a fresh generation as above.
+
+The cap therefore bounds acquisitions in any hour plus one lease, not per
+account lifetime. The relay releases on every exit and acquires once per
+start, so a supervisor restarting it more than about 1024 times in an hour
+for one account can exhaust claim capacity. That account waits until
+receipts age out. A route at the maximum fencing generation also waits on
+capacity and cannot acquire another generation.
+
+### Retirement of idle route owner and health rows
+
+Route rows are retired, not kept for life. A selected configuration may
+have several relay profiles, each serving its own route for every account,
+so retirement asks whether any relay still uses a row, not whether the
+acquiring claim does. The same acquisition, under the same locks and
+before its capacity check, deletes the account's owner rows of other route
+names that hold no lease and have not been acquired, renewed or released
+for seven days (`IDLE_OWNER_MS`); a running relay renews within seconds
+and a stopping one releases at once, so neither is touched. It then
+deletes health rows that no remaining owner row holds at that route name
+and destination, other than its own route name at its own destination,
+together with those destinations' repair receipts. A row stays while an
+active attempt names its route (owners) or its route and destination
+(health), and a health row also while an uncompleted submission names it,
+while it holds a repair latch ([Explicit route repair](#explicit-route-repair)), or while its backoff has not
+elapsed. Rows therefore grow only with configuration churn.
+
+A route no relay uses retires at the account's first acquisition a week
+after its last use; the acquiring route's own old destination retires at
+its next acquisition; and a latched row stays until an explicit repair
+clears its latch, so abandoning a latched destination without repairing it
+keeps one row. A route used again after that starts afresh: its owner at
+generation 1 with a new clock floor, which fences nothing old because
+every fence also compares the random claim operation and boot, and its
+health at revision 1 with no failure history. The backward-clock check of
+the retired row is lost with it.
+
+### First-attempt publication (schema 17)
+
+Schema 17 retains `submission_attempts`: one historical receipt per random
+attempt, with a unique active attempt per account and route name.
+`postgres_attempts` rechecks selected policy, route destination and
+current unexpired owner fence under configuration/account/route locks. It
+selects at most 100 due, never-attempted Queued recipients from one
+supplied submission in ascending ordinal order. Expired, completed,
+mismatched and already attempted responsibility cannot enter this
+first-attempt path. The relay supplies the submission from bounded
+candidate discovery ([Fresh and retry candidate discovery](#fresh-and-retry-candidate-discovery)); publication scans no due queue itself.
+
+Recipient InFlight/`Prepared` state, attempt identity, timestamp and
+count, submission/account sequence, change history and the retained
+attempt commit atomically. Receipt resolution precedes fresh policy
+checks; lost COMMIT responses resolve with the same retained Dispatch.
+Historical outcomes do not authorize transport. At most 1024 attempt rows
+are retained per account; publication first reclaims retired attempts
+([Reclamation of retired attempts](#reclamation-of-retired-attempts)) and counts the cap afterwards.
+
+An active attempt blocks another batch even after owner replacement. Fenced
+phase/result publication, current-owner interruption, conservative takeover
+recovery, expiry, cancellation, release of abandoned or canceled custody and
+restore quarantine retire it; the relay resolves any active attempt it
+discovers before it dispatches again ([Relay scheduling
+turn](#relay-scheduling-turn)). Publication also requires the queue clock
+guard, route-health admission and route-health capacity reservation described
+below ([Runtime queue clock guard](#runtime-queue-clock-guard), [Route-health
+capacity and dispatch
+admission](#route-health-capacity-and-dispatch-admission)).
+
+### Due-retry publication
+
+The attempt publisher has a separate domain-separated retry preparation.
+It selects at most 100 due RetryWait or retryable OutcomeUnknown
+recipients from one supplied submission, in ordinal order. It excludes
+fresh Queued work, Accepted, Failed, terminal OutcomeUnknown and future
+retry timestamps. The first-attempt preparation continues to select only
+fresh Queued work.
+
+The transaction validates final phase, attempt identity/count, uncertainty
+and retry reason, a due timestamp at least the lowest permitted minimum
+retry interval (one second, [Minimum retry interval (schema 42)](#minimum-retry-interval-schema-42)) after the previous attempt, and
+checked count increment. InFlight/`Prepared` publication preserves
+uncertainty and genuine prior replies, replaces attempt identity and
+timestamp, and clears only next-attempt time, failure reason and local
+diagnostic. Immutable transmitted content and envelope remain unchanged.
+Active-route exclusion, current-owner fencing, history and receipt replay
+use the same atomic publisher as first attempts; receipt replay never
+increments twice.
+
+Retry publication requires the process's persistent queue clock guard to
+permit retries, along with shared route backoff and repair generation. The
+relay supplies due submissions from retry candidate discovery and holds
+current transport authority through its route lease; neither replaces the
+publication checks.
+
+### Durable outgoing DATA phases (schema 19)
+
+Schema 19 retains one phase receipt per account, attempt and target phase.
+Fresh initialization uses the bounded schema transport described in the
+owner migration contract; byte and individual-frame ceilings stay
+unchanged. The phase publisher checks current configuration, account and
+route ownership in their existing lock order, then the exact active
+attempt's boot, claim, destination and fencing generation. Body
+publication accepts one ordered subset of at most 100 original attempt
+ordinals with bounded positive RCPT replies. It clears older DATA replies
+for that subset. AcceptancePossible requires exactly the entire stored
+Body subset and preserves those RCPT replies. Other `Prepared` recipients
+remain untouched. Neither transition retires the attempt, invents a remote
+result or clears prior uncertainty.
+
+Recipient, submission and account sequences, change history and the
+digest-bound receipt commit atomically. A second request for the same
+phase with different input refuses. Historical receipt inspection precedes
+fresh policy checks and excludes an in-progress publisher through the
+account lock; unknown COMMIT requires closing transport, not transmitting
+on guessed state. Receipt storage has a 2048-per-account ceiling; a
+retired attempt's receipts are reclaimed with it ([Reclamation of retired attempts](#reclamation-of-retired-attempts)).
+
+These are durable facts, not continuing permission to transmit. The relay
+must retain current ownership and its monotonic transport fence, and
+reserve final-outcome capacity (section 142) before allowing a terminator.
+
+### Positive final DATA outcomes (schema 20)
+
+Schema 20 adds acceptance receipts, bounded to 1024 per account. The
+attempt publisher records a genuine positive final DATA reply for exactly
+the AcceptancePossible subset under the same current policy, boot, claim
+and route fence. It preserves positive RCPT replies, attempt history and
+any earlier uncertainty latch. A positive result records smart-host
+handoff, not final mailbox delivery. Passing the message expiry time
+cannot discard a received positive reply; current owner and clock checks
+still apply.
+
+Accepted rows, reply text, submission/account change history and one
+digest-bound receipt commit atomically. The attempt retires only when no
+recipient remains InFlight under it. If the complete ordinal set has no
+future delivery obligation, completion time is published once; terminal
+failures retain their failure-notice obligation. Historical replay neither
+advances time nor changes replies. Unknown COMMIT settles through the
+original receipt without inventing a second remote result. Accepted
+recipients are never selected for dispatch again.
+
+### Final DATA refusals (schema 21)
+
+Schema 21 adds at most 1024 digest-bound final-refusal receipts per
+account. The publisher accepts one actual 4xx/5xx final DATA reply for the
+exact AcceptancePossible subset under its current boot, claim and route
+fence. It preserves positive RCPT history and earlier uncertainty. A
+definite negative final reply does not introduce uncertainty merely
+because the current attempt had reached AcceptancePossible.
+
+Temporary refusals schedule each recipient using the shared bounded jitter
+policy; earlier uncertainty yields OutcomeUnknown, otherwise RetryWait. A
+retry that cannot precede expiry records expires_at as the nonterminal
+expiry-wait marker for clock-guarded expiry. Permanent refusals terminate
+retries, retaining OutcomeUnknown for prior uncertainty and Failed
+otherwise; a genuine refusal can be retained after expiry. Result rows,
+submission completion and pending failure notice, attempt retirement,
+history and receipt commit together. Historical replay preserves the
+original random retry times.
+
+### Negative RCPT subsets (schema 22)
+
+Schema 22 adds at most 1024 RCPT-result receipts per account. The
+publisher retains one ordered set of negative RCPT replies per attempt, at
+most 100 distinct 4096-byte replies. Each selected recipient must still be
+`Prepared` under the exact current attempt fence. Its new RCPT reply
+replaces prior RCPT history and clears prior DATA history.
+Temporary/permanent states, retry jitter, uncertainty preservation, expiry
+hold and completion follow the final-refusal rules above, independently
+for each reply.
+
+Unselected `Prepared` recipients remain in the active attempt and can
+enter Body as the accepted RCPT subset. An all-refused batch retires the
+attempt; a partially refused batch retires only after the remaining
+recipients finish. One receipt binds the complete refused subset, so the
+worker must collect its negative RCPT replies before publication instead
+of publishing one per call. Historical replay preserves retry times and
+never repeats account changes.
+
+### MAIL and DATA-command refusals (schema 23)
+
+Schema 23 adds at most 1024 command-refusal receipts per account. A
+negative MAIL reply covers the complete original `Prepared` batch, clears
+prior RCPT history and stores the real refusal as DATA history. It cannot
+follow a partially settled RCPT batch. A negative DATA-command reply
+instead binds the accepted RCPT subset and its actual positive replies; it
+replaces both prior reply fields without claiming that Body or
+AcceptancePossible occurred. Other `Prepared` recipients remain owned
+until separately settled. Body and DATA-command refusal are mutually
+exclusive for the entire attempt, even after the Body recipients finish;
+outstanding RCPT refusals may still settle.
+
+Both operations reuse the current policy/route/attempt fence, temporary
+retry jitter and expiry hold, prior uncertainty latch, terminal completion
+and failure-notice handling. Exact retained input binds the receipt,
+including positive RCPT text. Neither command refusal introduces
+uncertainty or permits another SMTP transmission. Unknown COMMIT settles
+historically.
+
+### Abandoned-attempt recovery (schema 18)
+
+Schema 18 adds retained `attempt_recovery_receipts`. A current route owner
+may recover an active attempt only from a strictly older fencing
+generation with the same route and destination. Account/route locks
+exclude stale phase writes. Up to 100 remaining InFlight recipients
+resolve atomically with submission/account history, active-attempt
+retirement and one receipt. Historical replay precedes current policy and
+ownership checks.
+
+`Prepared` and Body recover with Network reason, preserving prior
+uncertainty. AcceptancePossible always becomes uncertain OutcomeUnknown
+with Uncertain reason. No recovery produces Accepted or erases replies,
+attempt count or attempt identity. Retry times use the queue contract's
+clipped uniform jitter with at most 32 entropy draws; failure rolls back.
+Recipient updates use one bounded SQL array batch rather than one protocol
+exchange per recipient.
+
+This path preserves near-expiry/overdue responsibility using the QUEUE.md
+expiry-wait marker and retires the active attempt without declaring
+terminal failure; clock-guarded expiry ([Fenced expiry publication](#fenced-expiry-publication)) later terminates it.
+A backwards last-attempt timestamp refuses. Retrying the recovered
+recipients still requires the queue clock guard's discontinuity
+validation and the restart guard of the minimum retry interval. Receipt
+storage has a 1024-per-account cap.
+
+### Current-owner transport interruption
+
+The attempt recovery publisher also has a domain-separated current-owner
+interruption. Unlike abandoned-attempt recovery, it requires the exact
+current generation, boot and owner operation recorded in the active
+attempt. The caller must close or fence transport before publication and
+cannot resume it from a receipt. Unknown COMMIT settles the retained
+operation historically. The relay uses it for an attempt its own
+generation left active, such as a `Prepared` commit whose response was
+lost, a connection failure after `Prepared`, or a stopped exchange with no
+more specific evidence.
+
+All still-InFlight recipients end together. `Prepared` and Body become
+RetryWait unless earlier uncertainty is latched; AcceptancePossible
+latches uncertainty and becomes retryable OutcomeUnknown. Genuine replies
+remain unchanged, and already settled RCPT recipients are excluded.
+Bounded jitter, expiry-wait marker, account history and attempt
+retirement reuse the existing recovery transaction and its bounded
+receipts. This operation does not pause a route, certify TLS or
+credentials, or reserve final-outcome capacity; route health is published
+separately ([Route failure publication](#route-failure-publication)).
+
+### Runtime queue clock guard
+
+The relay's `queue_clock::Guard` pairs database UTC with samples from one
+process-local monotonic domain. Startup permits fresh dispatch but holds
+attempted recipients for the minimum retry interval of monotonic time
+(five minutes by default, [Minimum retry interval (schema 42)](#minimum-retry-interval-schema-42)). Expiry opens after that interval
+when the relay can establish continuity with its last clean clock
+checkpoint. The caller must check database due times, ownership and route
+health separately; a status snapshot is neither a permit nor historical
+transport authority.
+
+A cumulative UTC/monotonic discrepancy greater than five minutes in either
+direction pauses all new dispatch and expiry, resets the stable interval
+and revokes confirmation. Individual sample-to-sample discontinuities are
+checked separately so that a jump cannot hide by canceling prior drift.
+Smaller observations do not move the comparison anchor. An explicitly
+signaled primary change forces the same hold even when its clock matches.
+The serving relay pins the configured endpoint and raises no such signal:
+it cannot distinguish a primary replaced behind that endpoint with
+agreeing clocks.
+
+Missing, damaged, dirty or differently bound evidence, unreadable boot
+time, an excessive gap or ambiguous clock discrepancy leaves overdue
+recipients pending until explicit confirmation. Fresh dispatch and
+guarded retry can continue. A discontinuity observed while running still
+pauses dispatch. CONFIG.md describes `queue-clock-status` and
+`queue-clock-confirm`.
+
+### Queue clock checkpoint and confirmation
+
+The relay's exclusively locked private runtime directory holds its
+mode-0600 `queue-clock` checkpoint. A checksum binds its clock evidence
+to the database epoch, profile, database name, verified endpoint and
+server name, Linux boot ID and time namespace. Only trusted directory
+writers may replace it. Before even attempting to acquire or renew a
+route lease, the relay replaces the clean checkpoint with a dirty record,
+syncing the file and parent directory. A failed owner operation therefore
+cannot leave clean evidence to admit a later restart. After successful
+worker drain and lease release it may publish a clean checkpoint.
+
+For explicit confirmation the relay starts a database sample after the
+request. A hold before acceptance cancels the request. Under the guard,
+the relay accepts the fresh sample and immediately uses it as the trusted
+clock anchor. It then saves that UTC as a dirty cleanup cutoff outside
+the guard. Status stays `requested` until the save completes. A later
+hold reports `held` and bases cleanup on the last trusted observation.
+Finishing the save leaves that hold or a newer request intact. A save
+error invalidates the guard and stops the worker. A crash before atomic
+replacement can recover the previous cutoff. After replacement it can
+recover the accepted cutoff. Either dirty record still holds expiry.
+
+Each running relay checks UTC against its own monotonic ticks. Across
+processes the seconds in `/proc/uptime` bound elapsed awake time from
+above because they include suspend. The checkpoint carries both ends of
+the UTC projection. On restart they allow any elapsed awake time from
+zero through the boot-time difference, including centisecond rounding and
+sampling latency. Both extremes must agree with database UTC within five
+minutes and the upper bound on this individual gap must be at most five
+minutes. The range carries across clean restarts, so many short shutdowns
+can also exhaust the margin. Fresh confirmation resets the range. Process
+ticks and live expiry tokens are never carried across generations.
+
+### Clock-guarded expiry admission
+
+The queue clock guard admits one expiry batch per monotonic second after
+a stable startup with clock continuity, or after explicit confirmation.
+Each batch remains limited to 100 recipients by the storage publisher. A
+failed or abandoned attempt consumes its admission; there is no refund or
+catch-up burst. Every expiry caller in a process shares the relay's one
+guard and preserves the database-wide owner fences.
+
+The retained token fixes a UTC cutoff and a nonrenewable ten-second
+maximum publication deadline. The publisher must check it again before
+commit with fresh paired database UTC and local monotonic time. Clock
+holds, confirmation replacement, backward UTC and elapsed deadlines
+permanently retire the token. A process-unique checked validation
+identity prevents transfer to another guard; these ephemeral tokens and
+identities are never persisted. Every observed UTC regression advances a
+checked expiry generation, including subthreshold steps seen by another
+user of the shared guard. Recovery of UTC does not restore an older
+token. The token admits only terminal expiry.
+
+### Queue expiry storage (schema 24)
+
+Schema version 24 adds retained expiry-operation receipts and one
+database-wide expiry progress row. A receipt binds an account/operation to its
+request digest, submission, one-to-100 recipient count, fixed nonnegative UTC
+cutoff, publication time and old/new account sequence. It has no foreign key
+to the submission; submission retirement ([Retention of settled
+submissions](#retention-of-settled-submissions)) deletes a retired
+submission's receipts with it, and expiry-receipt retention ([Expiry receipt
+retention](#expiry-receipt-retention)) expires them after an hour. The
+publisher caps retained receipts and verifies exact sequence adjacency.
+
+The progress row starts with no publication time. Its singleton key and
+nullable nonnegative timestamp serialize expiry batches across accounts
+and instances. The publisher locks this row after configuration, account
+and route-owner locks, requires at least one database UTC second since the
+previous committed batch, and updates it atomically with recipients,
+history and receipt. Missing progress is an integrity failure, never
+permission to reset the rate limit. Local monotonic admission remains
+separately mandatory; the persisted timestamp is neither clock
+confirmation nor transport authority.
+
+Both tables are private to the schema owner at initialization and require
+the mail runtime's ordinary DML grants.
+
+### Fenced expiry publication
+
+The expiry publisher binds a random operation to one submission,
+route-owner claim and generation. Historical receipt inspection precedes
+fresh admission: a completed operation settles after clock holds or owner
+replacement without expiring more recipients. Changed digests conflict.
+Uncertain COMMIT results require settlement of that same retained
+operation.
+
+New publication requires current policy and unexpired ownership under the
+configuration/account/route locks. Database UTC is paired with the
+supplied runtime clock's monotonic domain and admitted by its shared clock
+guard. The database-wide progress row serializes publishers and requires
+a UTC second since its previous publication sample. That persisted bound
+supplements the guard's monotonic interval; neither enables catch-up or
+clears a discontinuity hold. The retained cutoff never advances during
+the operation.
+
+For an overdue submission, one transaction selects at most 100 pending
+rows in ordinal order. Fresh Queued becomes Failed/Expired with no attempt
+phase. Attempted certain rows become Failed/Expired/Final; an existing
+uncertainty latch or AcceptancePossible instead becomes terminal
+OutcomeUnknown/Expired. No retry time remains. Actual replies, attempt
+history, transmitted bytes and envelope survive. Terminal rows are
+excluded. Exact ordinal coverage is checked before updating completion;
+the final batch sets completedAt and Pending failure notice together.
+Retired attempts, account sequence, CHANGE, receipt and global progress
+commit with those recipient changes.
+
+The publisher rechecks ownership and the nonrenewable clock token before
+COMMIT; late clock failure rolls back staged changes. A COMMIT handed to the
+server is inherently indeterminate on connection/deadline failure and settles
+through the receipt, never a replacement result. Callers must close and fence
+the route's transport first, including an interrupted current-owner attempt,
+share the process guard and report any primary change they detect. The relay
+meets this by expiring only at the start of a scheduling turn, when it holds
+no SMTP transport, and through `Dispatches::expire` (section 192).
+
+### Expiry receipt retention
+
+Each account holds at most 1024 expiry receipts younger than an hour. Expiry
+receipts are keyed by submission, not attempt, and submission retirement
+([Retention of settled submissions](#retention-of-settled-submissions))
+removes them only a month after the submission completes. Every admission of
+the expiry receipt kind, by an expiry publication or by an AcceptancePossible
+reservation (section 142), first deletes, under the account write lock, that
+account's expiry receipts published more than an hour (`RECEIPT_RETENTION_MS`,
+the route-health receipt margin of [Route-health receipt retention and the
+lease window](#route-health-receipt-retention-and-the-lease-window)) before
+the database clock, then counts the rest with outstanding claims against the
+1,024 ceiling: a per-hour flood bound, not a lifetime one, and expiry
+publication is already serialized at one per database second across accounts.
+While an account's ceiling is full, its further expiries and every
+AcceptancePossible reservation (so every delivery reaching DATA) refuse
+Capacity until receipts age past the hour.
+
+A receipt serves only replay inside publication and settlement of that
+operation's uncertain COMMIT. A relay process holds one Pending for every
+route and account it serves, and refuses every expiry and phase
+publication while it is held, so no sweep in the owner's process can
+remove the receipt it is settling. Another relay process serving another
+route of the account sweeps only receipts older than the hour; a
+settlement that outlives it reads absent and releases custody, losing only
+the passive outcome, since the expiry itself is durable in the recipients
+and the next turn rederives from them. Capacity inspection counts only
+receipts inside the hour.
+
+### Route health state (schema 25)
+
+Schema version 25 adds route health keyed by account, route name and immutable
+destination fingerprint, plus independently retained operation receipts.
+Separate destination keys keep a changed endpoint from inheriting or erasing
+the prior endpoint's backoff; retirement ([Retirement of idle route owner and
+health rows](#retirement-of-idle-route-owner-and-health-rows)) removes an
+endpoint's row only once its backoff has elapsed and it holds no repair latch.
+Each health revision is nonzero; receipt revisions increase and the publisher
+checks exact adjacency. Receipts capture the resulting state and one of
+failure, repair or success, so later state changes cannot rewrite an earlier
+operation's settlement.
+
+The stored consecutive failure count is bounded by u32. A zero count is
+the healthy state, with no failure/retry timestamp or repair latch. A
+nonzero count retains failure UTC and a next-attempt time between the
+lowest permitted minimum retry interval (one second, [Minimum retry interval (schema 42)](#minimum-retry-interval-schema-42)) and one
+hour later. Reasons are None, Network, Tls, Auth or Protocol. A repair
+latch, when present, names a nonzero configuration-selection generation
+and is permitted only for TLS/authentication failures. Explicit repair may
+clear that latch while preserving the failure count and minimum retry
+time; successful transport may reset the count without resetting the
+increasing revision. No stored field or receipt itself authorizes a send
+or proves a successful transport.
+
+Every health publication compares current policy and ownership, uses
+bounded shared retry jitter with checked count/revision increments,
+retains repair holds across ownership changes, and caps health rows and
+receipts per account. Clock guards and due times remain separate dispatch
+requirements. Both tables use the runtime's ordinary mail DML grant set
+and private owner initialization.
+
+### Route failure publication
+
+The route-health publisher records Network, TLS, authentication or
+protocol failure for a retained attempt of the exact current owner, route
+and destination. The attempt ID is the operation key: preparing it again
+cannot double-count a failure or replace its classification. The request
+digest binds the claim, fence, route, attempt and failure. Historical
+settlement precedes current-owner checks. It remains available after
+takeover or subsequent health changes while its attempt is active or
+holds a final reservation. Once the attempt retires and releases any final
+reservation, settlement lasts only until the route's next publication (on
+another route, up to an hour after the attempt was prepared; see the
+receipt retention below).
+
+Under the current configuration/account/route lock, publication checks
+attempt identity and time, requires the attempt to remain active, refuses
+reports from before the latest route failure, and increments checked
+failure count and revision. Shared bounded retry jitter sets the next
+time. TLS/authentication failures also latch the selected configuration
+generation; ordinary later failure reports cannot clear that hold. Health
+and receipt publish atomically, with 1024-row per-account caps, and
+recheck current ownership before COMMIT. Unknown COMMIT must settle this
+same attempt operation. Route health changes no recipient or account
+sequence; recipient settlement remains a separate fenced operation after
+transport closes. Publish a fresh route failure before that settlement
+retires the attempt. This prevents delayed reports for retired attempts
+from undoing a later success; the single active attempt per account/route
+keeps that ordering across new dispatch.
+
+The relay publishes a route pause for authentication and TLS failures and
+route backoff for network failures, including a DNS idle timeout while
+the original cap remains live. A local exhausted cap does not diagnose the
+route.
+
+### Route-health receipt retention and the lease window
+
+Receipt retention is bounded, not a lifetime ledger. Every failure,
+success and repair publication, holding the account write lock and its
+route, first deletes failure and success receipts whose attempt is gone.
+It deletes failure receipts of retired attempts on the publishing route
+and on other routes where the attempt was prepared more than one hour
+(`RECEIPT_RETENTION_MS`) before the locked database time. It keeps the
+four newest repair receipts of each route destination before adding its
+own. Active attempts and attempts with a final reservation retain their
+failure and success receipts during every sweep, including pre-dispatch
+reclamation under capacity pressure.
+
+Only the route's current owner, holding an unexpired lease, sweeps it
+without margin, and that single-threaded owner settles each operation
+(Pending barrier, FailedPrepared continuation or the success and repair
+retry) before it publishes the next. An owner superseded on its route can
+lose a pending receipt. This relies on the relay stopping on any lease
+renewal error and renewing at least every five seconds with a ten-second
+deadline, well inside the thirty-second lease: a takeover can only follow
+renewal failures that already stopped it, and every settle loop then
+exits. A paused process can resume superseded without a failed renewal;
+until its next renewal fails Stale, within about fifteen seconds,
+`check_locked` refuses its publications, so it can only inspect. A change
+to that renewal policy must keep this property. Another relay process
+serving a different route keeps its settlement for the hour. Attempt rows
+on another route must outlive that hour after preparation; retired-attempt
+reclamation ([Reclamation of retired attempts](#reclamation-of-retired-attempts)) reclaims the publishing route's retired
+attempts at once and another route's only after it.
+
+A route-success receipt stays with its accepted attempt until both are
+reclaimed. A live owner that has committed acceptance keeps its evidence
+and its reserved slot until it records the reset. Failure needs an active
+attempt of the current owner, so a retired attempt never records a
+failure again. The worker reports no failure for an accepted attempt; the
+database does not check that, but a later failure refuses success for
+every attempt prepared before it.
+
+### Route-health capacity and dispatch admission
+
+Fresh and retry attempt publication reserve space for a health state and
+receipt before SMTP. Under the account write lock, each attempt of a
+matching route owner that is active or has committed final acceptance
+counts as one receipt keyed by its attempt ID, and attempts sharing a
+route name and destination count as one state. A published row with the
+same key occupies that reservation. Explicit repair also counts reserved
+receipts when admitting its own write. When capacity is tight, admission
+reclaims abandoned custody and expires receipts before recounting. An
+account still at capacity waits for room before creating an attempt: the
+relay defers that account's dispatch for five seconds and logs
+`relay_step_failed` at the health-capacity stage. A full owner ledger
+delays that account's next claim; the relay continues scheduling and
+renewing other accounts.
+
+The ordinary failure, success and uncertain-commit settlement run inline
+while the worker still holds custody. If a frontend cancels while a
+connection is in `Prepared`, submission completion immediately fences its
+transport. The untouched `Prepared` attempt stays active solely for the
+connection's route-health result and recovery. Recovery releases it after
+checking the fully canceled group; it leaves the cancellation sequence and
+recipients intact. A replacement owner releases the same custody if the
+original process stopped. Account maintenance clears expired owner
+operations before releasing abandoned reservations and canceled custody,
+including on removed route names.
+
+Fresh and retry attempt publication inspect durable route health under
+those same locks. Backward database time, an outstanding repair latch or a
+future shared retry time refuses new dispatch. Receipt replay remains
+historical and does not acquire new transport authority. The local
+queue-clock guard and recipient due times remain separate requirements.
+No timer silently clears a repair latch; route retirement never deletes a
+latched row.
+
+### Explicit route repair
+
+A route-repair operation binds a random retained operation ID to its
+current owner, route, destination and selected configuration generation.
+It requires a TLS/authentication repair latch from a strictly older
+selection. Reselecting validated configuration and resolving a new
+profile still does not clear the latch: the explicit repair publication
+is separately required. The same selection cannot clear its own failure,
+and a route without a latch refuses a new repair. Historical replay can
+settle after owner release.
+
+Under the configuration/account/route locks, repair increments the checked
+health revision and clears only repair_generation. Failure count, reason,
+failure timestamp and next-attempt timestamp remain byte-for-byte unchanged.
+Dispatch therefore remains blocked until the existing shared minimum interval
+and the separate recipient/clock guards permit it. Receipt action 2 captures
+that repaired state atomically, with the shared 1024-receipt account limit;
+each publication first keeps only the four newest repair receipts of each
+destination ([Route-health receipt retention and the lease
+window](#route-health-receipt-retention-and-the-lease-window)); an acquisition
+retires the receipts of destinations whose health row has retired ([Retirement
+of idle route owner and health
+rows](#retirement-of-idle-route-owner-and-health-rows)). Backward UTC, stale
+ownership, overflow and write failure refuse publication; unknown COMMIT
+settles the retained operation without applying another repair.
+
+Repair is never a configuration-load side effect. The relay prepares and
+publishes it only for an explicit `queue-route-repair` request on the
+process's private runtime control socket ([Relay route repair
+requests](#relay-route-repair-requests)). Successful-route counter reset is a
+separate operation; repair does not claim that transport has succeeded.
+
+### Route success reset
+
+The success publisher requires a retired attempt of the exact current
+owner, route and destination, plus its durable positive final-DATA
+acceptance receipt. A `Prepared`/Body/AcceptancePossible attempt or merely
+asserted transport success cannot reset health. The attempt ID is the
+shared operation key; while its receipt is retained, one attempt publishes
+one classification. Fresh failure publication requires an active attempt,
+so a delayed unreported failure from an older retired attempt cannot undo
+this reset. Once route-health receipt retention expires the receipt,
+repeating this success at most resets a healthy route again. Historical
+settlement survives owner release only for that retention.
+
+Under current policy/account/route locks, success refuses a repair latch or an
+attempt prepared before the latest route failure. It increments the checked
+revision and resets the consecutive count, reason and failure/retry times to
+the healthy state. Action-3 settlement captures that state in the same commit,
+with the shared health/receipt caps and a final owner/time check. Recipient
+results and account sequence are unchanged. Unknown COMMIT settles the
+original operation. The relay attempts it after an exchange that reached its
+final DATA result and after a stopped attempt; it applies only to one that
+durably accepted final DATA. A successful SMTP handoff does not prove final
+mailbox delivery, and this operation cannot authorize a send.
+
+### Fresh and retry candidate discovery
+
+The route-owner scanner returns at most 64 due submission hints per page,
+separately for fresh and retry recipients. It holds the current policy,
+account and route-owner locks while checking ownership, route health and
+the absence of an active route attempt. Candidates match the immutable
+route and destination, have a live uncompleted submission, and have
+eligible recipient states due at the database observation time. Each hint
+carries the minimum due time among those recipients. No attempt, receipt
+or sequence is written.
+
+Pages order by due time then submission ID. An opaque continuation binds
+the last returned key to the same claim, generation and candidate kind;
+one extra row establishes whether more candidates existed at that
+observation. Pages are independent bounded reads, not one stable snapshot.
+A scheduling pass must restart from the beginning to discover newly due or
+moved earlier work; the relay reads only a first page on each turn. The
+original absolute connection deadline and existing protocol ceilings bound
+each scan; database query work can still grow with the stored queue.
+
+Hints reserve nothing and grant no permission to transmit. Full recipient
+validation, queue-clock admission, current policy, route health and
+ownership remain required by the attempt owner and publication path. The
+final owner check also refuses a scan that outlives its lease.
+
+### Expiry discovery during delivery pauses
+
+The route candidate scanner also supplies expiry hints ordered by
+submission expiry time and ID under the same page, cursor, policy and
+ownership bounds. It selects uncompleted expired submissions matching the
+immutable route and destination that still have Queued, InFlight or
+Deferred recipients, or OutcomeUnknown recipients with a retained retry
+time. Terminal unknown, Accepted and Canceled recipients do not make a
+submission expiry-eligible. Recipient retry times and send times do not
+postpone expiry discovery.
+
+Expiry discovery bypasses delivery backoff, repair pauses and
+active-attempt refusal: those delivery conditions must not hide expired
+responsibility. This differs from fresh/retry discovery only; the read
+writes no state and still refuses a stale owner. An expired InFlight hint
+grants no authority to change its recipients or continue its transport.
+The expiry publisher still requires closed/fenced transport, confirmed
+queue-clock admission, current ownership and policy, exact recipient
+validation and its global rate limit. In particular a forward database
+clock jump may produce a hint while the clock guard correctly refuses
+expiry publication. Pagination retains its independent-observation
+semantics and must restart for each scheduling pass.
+
+### Relay worker lifecycle and resources
+
+A serving process with the relay role runs one foreground relay worker
+for every configured account of its profile, at most sixteen, plus one
+lease-renewal thread. Within one serving generation it pins the startup
+primary address and published configuration/TLS generation; there is no
+transparent primary fallback. A newly selected configuration reaches the
+relay only through the process's drain and reload (section 2), which
+starts a new worker with a fresh boot identity, claims and retry guard.
+Every SMTP phase retains the existing current-policy, route-generation and
+attempt fences. Renewal failure stops the service, and the original
+bounded SMTP attempt closes before joining workers and releasing the
+lease. Busy ownership is standby: the account retries acquisition on
+later rounds.
+
+The worker reserves two ordinary database slots, two independent
+body-source slots, one separate settlement slot, and two reusable TLS wire
+buffers. It admits at most one attempt per account turn. The existing
+100-recipient batch and ten-second initial admission cap remain in force;
+a 120-second outer budget cannot extend that shorter cap. Wire, database
+and source meters each have bounded 1-GiB I/O/output and
+two-million-record budgets; these are work ceilings, not resident
+allocations. Exhaustion refuses work.
+
+The process starts its retry guard of the minimum retry interval from one
+fresh database UTC sample and its one monotonic clock. New mail may
+dispatch while retries wait. With validated clock evidence, a stable relay
+can process at most one 100-recipient expiry batch per second. CONFIG.md
+describes how to confirm the clock when startup evidence is ambiguous or a
+jump is observed.
+
+### Relay scheduling turn
+
+Each account turn runs, in order: settlement of any prior Pending custody; the
+owner-qualified absence read when nothing is pending; at most one local
+failure notice when its five-second interval has elapsed; any explicit
+route-repair request; one expiry page; due retention work; when this account
+holds the expiry turn and the clock guard admits expiry, one expiry batch;
+recovery of an active attempt; and, unless the account's dispatch is deferred,
+one fresh or retry candidate page whose first hint may become one SMTP
+attempt. Fresh and retry selection alternates independently for each account.
+A route-health refusal of the candidate read (a paused or backed-off route)
+ends the turn. Expiry scans always precede dispatch.
+
+Passive active-attempt discovery is fenced to the current account, route
+and destination and reads at most two rows, refusing multiple active
+owners. An attempt from an earlier generation is recovered as abandoned
+([Abandoned-attempt recovery (schema 18)](#abandoned-attempt-recovery-schema-18)); one this generation left active, including a `Prepared`
+commit whose response or deadline was lost locally, uses current-owner
+interruption after transport closure. Possible acceptance remains
+uncertain. Known MAIL/DATA/final refusal and RCPT evidence are settled
+before generic recovery. Unknown COMMIT retains the exact Pending owner and
+blocks subsequent work until its receipt is observed or proven absent
+(section 165). Absence authorizes no SMTP replay: the step republishes the
+same durable change or rederives from durable state, and active-attempt
+discovery still finds any committed attempt. A requested stop may abandon
+unresolved custody; durable phase recovery on restart remains
+conservative.
+
+Authentication and TLS failures publish a route pause; network failures
+publish route backoff ([Route failure publication](#route-failure-publication)). Durably accepted final DATA resets
+consecutive route failures. Success and repair retain exact operations and
+inspect unknown COMMIT before further work; a receipt proven absent
+(section 165) returns them to publication, and a lock timeout on the
+configuration, account or route owner row, as while the uncertain COMMIT
+still runs, or a statement failure in the owner or schema checks is
+retried like a lost connection until stop is requested rather than
+stopping the relay; a lasting one also fails lease renewal, which stops
+it. Other errors still stop it at once.
+
+Under the original `Prepared` cap, the worker inspects each transmitted
+chunk for non-ASCII octets while computing its digest. It selects
+SevenBit or EightBit before MAIL only after full verification and fresh
+attempt admission. EightBit requires the matching EHLO capability. The
+worker prepays three maximum-body extents plus database validation
+overhead and reserves one record per 4096 bytes of actual body length,
+rounded up, before scanning. Classification uses the existing
+verification batch.
+
+### Account rotation and idle backoff
+
+One foreground worker rotates through its configured accounts, one bounded
+turn per account. A separate expiry cursor retains an account's turn
+across local or database rate-limit refusals, advancing after an admitted
+attempt or no due work. Accounts without a live lease are skipped. This
+prevents a busy account from repeatedly consuming the shared expiry
+allowance ahead of later accounts. Busy leases and paused routes advance
+the cursor.
+
+A complete empty pass backs off its following pause from 250 ms through 500 ms
+and one second to a two-second cap. Any observed candidate, interrupted
+attempt, pending settlement, explicit repair, published notice or notice
+failure restores the 250-ms pause for that pass. This is a polling hint, never
+cached queue absence or delivery authority. Fresh/retry alternation can
+require two idle passes to discover newly queued work; database work and other
+accounts add latency. Lease renewal keeps its independent five-second
+schedule, and shutdown still checks at most every 50 ms during a pause. An
+SMTP attempt runs under the ten-second admission cap within the 120-second
+outer bound, and settlement, phase and recovery retries after a stopped
+attempt end only when the service stops, so another account may wait behind a
+slow peer. This is bounded rotation, not a per-account latency guarantee.
+Unsettled publication prevents rotation.
+
+### Owner-qualified absence reads
+
+After settlement, a turn without pending custody or an explicit repair
+request first makes one owner-qualified absence read. It checks
+unfinished submissions and active attempts for that account, route and
+destination, plus completed pending failure notices anywhere in the
+account. An empty result replaces the separate notice, expiry, recovery
+and candidate reads for that turn only. Its fresh database UTC still feeds
+the queue-clock guard, explicit confirmation and due retention; the empty
+expiry turn advances and fresh/retry selection alternates. No absence
+survives into the next turn. A positive result uses the existing fenced
+paths and does not itself mark the round active: delayed or paused work
+must not pin polling at its shortest interval. Notice scheduling is
+unchanged until an actual notice check occurs. New work committed after
+the hint waits for another turn.
+
+### Submission notifications and the extended idle pause
+
+When every configured account has a renewed owner lease and its absence
+read finds no unfinished submissions, attempts or pending notices, the
+next pause uses a thirty-second fallback instead of the ordinary
+two-second cap. A fully empty rotation may therefore wait up to thirty
+seconds for a committed submission notification. The retained reader
+autocommits `LISTEN td_mta_relay` before its first absence read.
+Submission publication executes `NOTIFY td_mta_relay` inside the same
+transaction as its rows and receipt, before the existing COMMIT outcome
+marker. PostgreSQL delivers the hint only on commit. A notification
+failure never permits an acknowledgement without durable publication, and
+uncertain COMMIT retains the existing settlement rules. No schema
+migration or new privileges are required.
+
+The channel has an empty payload: every subscribed relay profile may wake,
+then uses its own bounded account rotation and current authorization.
+Driver polls coalesce matching notifications into one boolean, including
+those read during SQL. Unrelated channels and nonempty payloads are
+ignored. Existing finite input frame/byte budgets still apply; no
+notification queue is allocated. An idle pause blocks on the existing
+socket in at most fifty-millisecond slices and issues no SQL. Stop, repair
+and queue-clock confirmation requests interrupt it. A disconnect, missing
+subscription or finite session retirement also ends the pause; replacement
+subscribes before scanning again. Only a complete rotation on one
+subscription admits the extended pause, so a reconnect between account
+scans cannot hide work from an earlier account behind that pause. A
+complete lost hint is recovered by the thirty-second fallback, even
+without another submission. The database scan remains authoritative and
+no hint authorizes delivery. An observed notification or
+subscription-recovery wake resets the ordinary backoff to 250 ms without
+changing fresh/retry alternation. A fresh arrival during a retry turn
+therefore avoids retaining a two-second empty-queue delay before the next
+fresh turn. Empty socket slices do not reset the backoff.
+
+Any delayed retry, paused or unfinished submission, active attempt,
+pending notice, Busy read or account without a renewed lease keeps the
+original 250-ms-to-two-second polling schedule. Thus notifications do not
+postpone scheduled retry/expiry work or owner acquisition. Lease renewal
+remains on its independent five-second schedule. A notification storm can
+cause extra scans, but each round retains its bounded account work and
+protocol input limits.
+
+### Account leases and batch renewal
+
+The process retains one claim operation, boot identity and owner
+generation per account instead of acquiring and releasing on each turn.
+Historical acquisition receipts require fresh owner observation and
+successful renewal before dispatch. Capacity on one route-owner
+acquisition leaves other accounts eligible for acquisition, renewal and
+dispatch. Newly acquired accounts enter a bounded registry and wait for
+renewal acknowledgement. The renewal worker snapshots that registry
+without holding its mutex over SQL, then renews all registered leases in
+one transaction every five seconds or when new claims arrive. It locks
+configuration, sorted accounts and then owner rows, samples database UTC
+after locks, and validates all generations before updating. A stale member
+rolls the batch back. All I/O shares one ten-second deadline; uncertain
+renewal stops the process. Lock contention on one account can therefore
+affect this process's availability. It cannot grant stale transport
+authority.
+
+Registry acknowledgements match the exact claim operation and generation.
+Published slots are never replaced while the worker runs. One fresh
+database UTC sample initializes the shared queue-clock guard; historical
+receipt time and later account acquisition never reset it. Renewal
+timestamps do not feed that guard out of order. Existing restart/retry
+rules of the minimum retry interval and expiry admission rules apply
+across the entire process. Claim receipt counts do not grow with idle
+scheduling turns. Account-scoped route ownership and health match the
+existing database keys; there is no global smart-host concurrency promise.
+
+Lease renewal permits an eight-second database lock/statement wait inside
+its original ten-second client deadline, so a five-second notice turn can
+outlast the ordinary one-second lock timeout. It still checks the current
+owner and unexpired lease under the acquired locks before extending it;
+waiting never authorizes renewal of an expired or replaced owner. Storage
+that exceeds this tolerance still stops the service under the existing
+lease-loss policy.
+
+### Retained relay idle reader
+
+The foreground worker retains one qualified idle-reader connection across
+account turns and empty-round pauses. It holds one existing ordinary read
+permit until connection close. The shared finite read-session
+implementation also backs HTTPS authentication: at most 64 jobs in sixty
+seconds, immutable TLS lifetime, finite cumulative/per-job wire windows,
+one owning thread and ten-second job deadlines. Connection admission
+qualifies schema and runtime role once and holds the migration lock until
+close. Each idle job begins a fresh READ COMMITTED transaction, checks
+epoch and maintenance, locks current configuration/account/owner rows, and
+acknowledges ROLLBACK before returning. No account lock, transaction or
+absence observation survives the job. Idle checks retain no authority to
+send. Failure retires the session; an observable idle disconnect can
+reconnect before a job, never replay an admitted one.
+
+A lock timeout on the idle job's configuration/account lock is a Busy
+observation, not evidence of work or permission to send. The failed read
+retires its session and releases its permit. The foreground worker defers
+that account until a later bounded scheduling round and yields any owned
+expiry turn so other accounts can progress, with the same empty-round
+backoff; it records `relay_poll_deferred` with `storage_busy`. Other idle
+failures still stop the worker and record `relay_step_failed` at
+`idle_poll`. Lease-renewal errors remain fail-stop and are recorded at
+`lease_renewal`; no renewal, publication or uncertain COMMIT is replayed by
+this policy.
+
+The worker closes this reader before pending settlement, explicit repair,
+positive-hint processing, delivery custody, due retention and final lease
+release. Rotation, shutdown and error cleanup close the connection before
+releasing its permit; clean idle cleanup has the existing bounded
+termination allowance. Each loop also retires exhausted or near-expiry
+idle sessions even when no account owns a usable lease; this local
+maintenance issues no SQL. Account count does not multiply retained
+sessions or extend any allowance.
+
+### Retained relay renewal session
+
+The standalone absence helper, initial foreground renewal and final
+release consume callback-scoped clients. Periodic renewal retains one
+qualified mutation session on the renewal thread, sharing the SMTP
+mutation lifecycle but not its publication wire allowance. Its
+sixteen-turn, sixty-second lifetime has finite cumulative bounds and the
+existing per-job limits: 128 KiB output, 1 MiB input and 1088 input
+frames. No account or transaction is retained between renewals; the
+migration lock remains held until connection close. Each new READ
+COMMITTED transaction checks epoch and maintenance before the existing
+fresh configuration, sorted account and owner checks. Lock and statement
+timeouts are transaction-local and remain eight seconds within the
+original ten-second operation deadline.
+
+Observable idle failure or exhausted lifetime permits replacement only
+before SQL admission, under the same deadline. Any admitted error retires
+the connection and preserves the worker's fail-stop path; no renewal is
+replayed. COMMIT is marked immediately before its attempt. An unknown
+outcome remains Indeterminate; a positively acknowledged COMMIT survives
+later cleanup failure, which retires the session. Exhausted, retired or
+near-expiry sessions close after the job, before the renewal worker waits
+again. Shutdown closes the thread-owned session before joining. Initial
+renewal is deliberately one-shot so a retained session never crosses
+threads. Preparation connections still inspect the schema at transaction
+entry.
+
+### Relay route repair requests
+
+After selecting a repaired configuration, which serving instances load by reloading, an explicit
+private `queue-route-repair` request releases the configuration-bound
+pause only if the database confirms a newer selected generation
+([Explicit route repair](#explicit-route-repair)). Mere restart never repairs. The request remains pending
+until every configured account has been visited. An account without a
+repair hold completes a fresh observation; a held account still requires
+the existing newer-configuration and receipt fences. A busy account leaves
+the request pending, and a refusal is visible through `queue-route-status`.
+A request serial prevents completion of an earlier refused request from
+finishing a newer request. No timer clears a repair hold.
+
+### Relay shutdown and lease release
+
+Shutdown closes foreground custody and joins renewal before one bounded
+multi-account release transaction. Expiring leases remain the fallback if
+cleanup cannot complete. After a successful drain and release the relay
+may publish a clean queue-clock checkpoint ([Queue clock checkpoint and confirmation](#queue-clock-checkpoint-and-confirmation)).
+
+### Local terminal-delivery notices
+
+The shared foreground relay worker attempts at most one pending local
+notice per account every five seconds, independently of route backoff,
+repair holds and expiry clock confirmation. Only already completed
+submissions with notification Pending qualify. Each turn picks one of them
+at random, so a notice whose storage keeps failing delays the others only
+in proportion, never indefinitely. The current selected relay profile and
+live route lease authorize its account; an older submission destination
+does not strand local notices when the smart host changes. No notice
+enters the outgoing submission queue.
+
+The publisher holds the configuration, account and route fences while it
+reads up to 1000 terminal recipients in pages of 100 and builds one
+plain-text report with the shared compose_text MIME writer. The report
+identifies the submission and original Email, gives each recipient's
+outcome/reason, and includes retained RCPT/message replies and
+diagnostics. Unknown outcomes say that delivery may have occurred. Peer
+control characters are replaced with question marks in the text body; no
+peer text becomes a header. The generated message uses a local system
+sender, its own Message-ID and a fresh thread.
+
+### Compact failure notices and the quota margin
+
+A failure notice always stores: in full while recent and within quota,
+otherwise compact, past the quota if needed. The full report is attempted
+only within a day of completion, longer than a maximal burst of notices
+takes at one per five seconds. A compact report replaces it when the
+submission completed earlier, when the full report's work or size bound
+refuses it, or when the shared body/blob quota refuses its charge. The
+compact report keeps the identifying heading, counts recipients by outcome
+and names at most the first eight Failed or unknown recipients with their
+reasons, without replies; its text is at most 4 KiB and its message at
+most 16 KiB. It makes the full report's per-recipient integrity checks in
+one aggregate query. Late notices, including restored ones released more
+than a day before the relay runs, are compact. A notice stored more than
+30 days after completion lets retention retire its record, replies
+included, at the next turn; the compact text says the delivery status may
+already be retired.
+
+A compact notice's charge is checked against body/blob caps raised by a
+fixed margin: 16 KiB of body and one blob per configured
+`queue_submissions`, so at most one compact notice per configured queued
+submission passes the caps, and one queue's worth of failures still stores
+its notices in a full account, whose submissions can then retire and
+release their quota. Usage stays exact. Past the margin a notice stays
+Pending until the owner deletes mail; 16 KiB of room then suffices. Every
+charge refuses only a column it grows past its cap, so a column already
+past a cap (an operator lowered it, or this margin was used) does not
+refuse a charge that leaves it unchanged; a lowered queue cap therefore
+cannot hold back a notice either. A replica of the account
+(REPLICATION.md) refuses such a source unless its own body/blob limits
+allow the same margin.
+
+### Failure-notice publication and receipt
+
+One transaction writes the immutable blob, unread Inbox Email, membership,
+thread/anchor, quota charge and CHANGE rows for Email, Thread, Mailbox and
+Submission, then changes Pending to Stored with its historical Email ID.
+It preserves completedAt, recipients, their replies and uncertainty.
+Account sequence admission preserves outstanding final-result
+reservations. A missing Inbox, an exhausted quota margin, a storage
+failure or a deadline leaves Pending for a later turn and does not stop
+SMTP scheduling. Errors are redacted fixed enums in the service log.
+
+Stored is the durable receipt. Every subsequent scan first obtains the
+same account lock, so it waits for any older commit/rollback before
+selecting Pending again. A crash or lost COMMIT response therefore cannot
+create a second notice. The marker retains the Email ID after JMAP
+deletion, so missing Email bytes are not a reason to republish. No extra
+receipt table or file-backed continuation exists.
+
+After a notice error, including an indeterminate COMMIT, the scheduling
+worker also performs the bounded lease renewal before ordinary queue
+reads. Its account lock waits behind the notice transaction (COMMIT or
+rollback) and establishes settlement while rechecking ownership. A pending
+COMMIT therefore cannot trip the next candidate read's shorter lock
+timeout. Failure to establish current ownership still stops the service;
+the next notice scan uses the durable Stored marker.
+
+### Failure-notice work bounds
+
+Each turn uses one ordinary database slot and a five-second absolute
+deadline. Raw report text is capped at 10 MiB and the MIME message at
+16 MiB; each SQL page holds at most 100 rows of schema-bounded recipient
+fields. The private wire adapter bounds aggregate input at 12 MiB/4096
+frames, retains the existing 128-KiB per-frame/authentication limits, and
+bounds output at 20 MiB. Composition has one 128-MiB I/O, 64-MiB output
+and two-million-record meter, never refreshed inside a turn. These are
+work ceilings; the report/message and bounded SQL page are additional
+transient memory, released before the next SMTP attempt.
+
+### Retention of settled submissions
+
+Nothing else removes a submission, so without retention the per-account
+submission caps (1,024 receipts and the configured `queue_submissions` quota)
+would be a lifetime limit on sent mail. Attempts and their receipts are also
+reclaimed independently, at attempt publication ([Reclamation of retired
+attempts](#reclamation-of-retired-attempts)), so submissions still retrying or
+inside retention do not hold the attempt caps. Submission and cancellation
+receipts expire a minute after publication on their own ([Receipt retention
+for HTTP writes](#receipt-retention-for-http-writes)) and expiry receipts an
+hour after ([Expiry receipt retention](#expiry-receipt-retention)), so the
+deletes below usually find none of them; the rest wait for this retention.
+
+The submission retirement step deletes, in one transaction, the oldest
+submissions QUEUE.md lets ordinary retention reclaim: completed more than 30
+days ago (`RETENTION_MS`, against the database clock), whatever their
+recipients' outcomes (Accepted, Failed, Canceled or OutcomeUnknown, uncertain
+or not), no Pending failure notice, and no active attempt or final
+reservation. Pending notices and anything not yet completed stay. A Failed,
+OutcomeUnknown or Restored record therefore keeps its replies and uncertainty
+for 30 days after completion, retiring only once its notice is stored and the
+account owner was told; an operator who needs it longer must copy it out
+first. A full account does not hold a notice back while its quota margin
+lasts: past a day, or on a quota refusal, it is stored compact ([Compact
+failure notices and the quota
+margin](#compact-failure-notices-and-the-quota-margin)). A completed group
+canceled later keeps its completedAt.
+
+A batch holds at most 64 submissions, 2,048 recipients and 64 MiB of
+transmitted blobs, admitting its first submission whatever its size, so
+the statement that cascades blob chunks stays far inside the 5 s statement
+timeout and other writers' 1 s lock timeout rarely meets the account lock.
+Attempt IDs stay in the database: an account may hold 1,024, more rows
+than the mutation connection's frame budget admits.
+
+It runs under the relay's route claim: `owners::begin` takes the account
+row FOR UPDATE, and the owner fence is checked before selection and again
+before COMMIT. The batch is selected oldest first and locked; then every
+receipt keyed by its attempts or submissions (phase, acceptance, refusal,
+RCPT, command, recovery, route-health failure and success, submission,
+cancellation and expiry), the attempts, recipients and submissions are
+deleted; `submission_routes` cascades. A transmitted blob another
+submission still references stays queued; one no Email, lease or
+submission reaches is deleted with its chunks, as Email deletion does.
+`blob_ids` rows stay, so a retired blob or submission ID cannot be reused.
+The same transaction decrements `queue_submissions`, `queue_bytes`,
+`body_bytes` and `blob_count` exactly, under guards that refuse with
+Integrity rather than underflow, writes a Destroyed EmailSubmission change
+per submission and advances the account sequence, so state strings change
+and the submission ID collision check still finds the ID.
+
+Deleting attempt-family receipts is one of the bounded sweeps
+section 165 admits. Relay operations on these kinds are settled before the
+worker does anything else, and none targets a submission completed 30
+days earlier; a settlement that outlived that would read absence, release
+custody, and its republication would find the attempt or submission
+Missing. An HTTP submission settlement that outlived it reads absence and
+releases the owner, which never republishes, so only the fence lifts. A
+cancellation of an old Failed group whose COMMIT response was lost,
+settled after the group retired, reads absence and its retry reports
+notFound, although the cancellation took effect.
+
+### Relay retention cycle
+
+Besides submission retirement, the relay reclaims expired upload leases as
+upload publication does ([Expired upload lease reclamation](#expired-upload-lease-reclamation)), releases abandoned route owners and
+canceled custody ([Route-health capacity and dispatch admission](#route-health-capacity-and-dispatch-admission)), and reclaims idle attempts and their
+receipts ([Reclamation of retired attempts](#reclamation-of-retired-attempts)). Each step uses its own transaction with the same
+claim, fence and clock check. An empty batch rolls back. A corrupt upload
+counter can refuse a lease batch while the other three transactions still
+commit.
+
+On idle and active account turns the four transactions share one
+ten-second deadline within the 30-second owner lease. Each cycle runs the
+steps in the order above: submission retirement, upload leases, abandoned
+owners, idle attempts. A step with less than one second left starts on the
+next account turn with a fresh deadline. Success and failure both advance
+the cycle. After all four ran, any committed progress schedules another
+cycle on the next round; otherwise the account waits ten minutes. Without
+a connection slot the cursor stays put for ten minutes. A failure or a
+step deferred at the deadline records `relay_step_failed` at `retention`;
+the relay renews its lease to serialize behind any interrupted
+transaction. Only a failed renewal stops the relay. The steps are
+idempotent so an uncertain COMMIT needs no Pending custody. A first pass
+over a long history drains up to 64 submissions per cycle. The candidate
+scan reads all of the account's submissions (no completed_at index),
+bounded by the `queue_submissions` quota, once per pass.
+
+### Retention clock cutoff
+
+The relay waits for the minimum retry interval of stable samples after
+startup and each observed clock discontinuity before running cleanup. A
+dispatch hold still permits cleanup after that interval. Until explicit
+confirmation the cleanup cutoff is the earlier of current database UTC and
+the last pre-hold UTC advanced by monotonic elapsed time. This cap
+protects records timestamped against the previously trusted clock. A
+record stamped during a backward excursion can become eligible early when
+database UTC returns to its former value. Each transaction checks
+ownership and refuses a database clock more than a minute
+(`CLOCK_SLACK_MS`) from the observation. On an ambiguous restart the relay
+advances the last saved trusted cutoff by local monotonic progress,
+including after a host reboot when the database binding still matches. A
+first activation or a checkpoint without a matching cutoff requires one
+clock confirmation before time-based cleanup.
+
+### Reclamation of retired attempts
+
+Submission retirement ([Retention of settled
+submissions](#retention-of-settled-submissions)) happens only a month after
+completion, so it alone would leave the per-account caps on attempts (1,024),
+phase receipts (2,048) and RCPT, command, acceptance, refusal and recovery
+receipts (1,024 each) as lifetime limits: ordinary sending, or a few
+submissions retrying for days, would fill them and refuse every later dispatch
+with Capacity. Attempts are therefore reclaimed on their own.
+
+Fresh and retry attempt publication first calls
+`postgres_attempt_reclamation::reclaim` in the same transaction. One statement
+deletes at most 64 (`RECLAIM_ATTEMPTS`) of the account's retired attempts,
+oldest prepared first: any retired attempt on the publishing route, and
+another route's prepared more than an hour (`RECEIPT_RETENTION_MS`,
+[Route-health receipt retention and the lease
+window](#route-health-receipt-retention-and-the-lease-window)) before the
+locked database time. Active attempts and any attempt holding a final
+reservation stay. It deletes every receipt keyed by those attempts: phase,
+RCPT, command, acceptance, refusal and recovery receipts and their
+route-health failure and success receipts. Submission, cancellation and expiry
+receipts, recipients and submissions stay; attempts are not JMAP objects, so
+no change row is written and the sequence does not advance. Attempt ID lists
+stay in the database, never sent to the client; a reclaimed attempt ID is not
+reserved against reuse (fresh IDs are random). The attempt cap is counted
+afterwards, so an account already full recovers on its next publication, and
+each publication reclaims more than it adds, so a backlog drains. A
+publication refused later rolls its reclaim back. Under receipt pressure,
+repair also reclaims eligible attempts before admitting its write. Account
+maintenance (the relay retention cycle's idle-attempt step) commits a bounded
+batch independently from repair or dispatch and applies the one-hour window to
+every route. A live owner that still owes a health reset keeps its acceptance
+evidence ([Route-health receipt retention and the lease
+window](#route-health-receipt-retention-and-the-lease-window)), including
+during the longer submission-retention sweep.
+
+Lock order is unchanged: configuration selection FOR SHARE and the account
+row FOR UPDATE (`owners::begin`), the route owner fence, route-health
+admission and the busy check, then the reclaim, which locks only this
+account's retired attempt rows, then the sequence, submission and
+recipients.
+
+### Safety of retired-attempt reclamation
+
+A deleted receipt reads absent, which section 165 treats as settled; a
+republication then finds the attempt Missing, which the relay's phase,
+recovery and route-health loops treat as done. Reclaiming is therefore safe
+only while nothing pending can still settle against the attempt. A delayed
+route-failure report for a reclaimed attempt finds it Missing, so it cannot
+undo a later success reset of the route. Route owners are keyed by account and
+route name, so the publishing owner owns every attempt on its route. Its
+worker publishes only with nothing Pending (`Dispatches::publish_with` refuses
+Busy) and settles phase, recovery and route failure or success before its next
+dispatch, so the route's retired attempts have nothing pending at any age. A
+failed `Prepared` continuation (section 184) can still be inspecting its
+recovery after generic settlement cleared Pending; the relay steps it to
+completion inline, a caller must not publish another attempt before it
+completes, and its loop treats a recovery that finds the attempt Missing as
+complete. That is the lease-window argument of [Route-health receipt retention
+and the lease window](#route-health-receipt-retention-and-the-lease-window)
+for the route's own health receipts, with the same reliance on a superseded
+owner stopping when its lease renewal fails. Another route's owner may still
+be settling, so its retired attempts keep the hour [Route-health receipt
+retention and the lease
+window](#route-health-receipt-retention-and-the-lease-window) gives their
+health receipts, measured from preparation as there: an attempt retired late
+becomes reclaimable sooner, losing at most a passive outcome (only committed
+retirement makes an attempt reclaimable, so an absent receipt with a Missing
+republication always means its effect is durable). A final reservation is
+outcome-unknown custody (section 142) and keeps its attempt; a reservation
+therefore holds its attempt against reclamation.
+
+Every other reader of attempt rows reads only active ones (phase and
+recovery publication, active-attempt discovery, route failure,
+cancellation, queue expiry, failure notices and candidate discovery) or
+reserved ones (final capacity); route success reads the retired attempt it
+just accepted, before the next publication. A settled recipient keeps its
+attempt ID, count, replies and uncertainty on its own row, which has no
+foreign key to the attempt, so retry publication, the JMAP projection and
+failure notices lose nothing. Submission retirement then finds fewer
+attempts to delete with a submission. The attempt row is also its
+publication receipt, so a reclaimed attempt's dispatch no longer replays;
+no caller republishes a committed dispatch (each prepares a fresh attempt
+ID, and a Pending one is only inspected).
+
+Residual risks: a settlement on another route that outlives the hour reads
+absent and loses only its passive outcome, as its health receipt already
+does ([Route-health receipt retention and the lease window](#route-health-receipt-retention-and-the-lease-window)); capacity inspection counts reclaimable attempts until
+the account's next publication; and the scan reads the account's retired
+attempts without a prepared_at index, which the cap keeps small.
+
+### Minimum retry interval (schema 42)
+
+`td-mta serve --minimum-retry-seconds N`, N in 1..300, sets the serving
+process's minimum retry interval F; without it F stays five minutes. The
+option exists so fixtures need not wait five real minutes. F is:
+
+- the base and floor of every automatic retry delay and route backoff
+  (QUEUE.md section 4). The exponent stays capped at four doublings, so
+  the largest delay is 16F plus jitter: the one-hour cap is reached only
+  when F is at least 225 seconds, and at F of one second a failing
+  recipient retries every 14.4 to 17.6 seconds until expiry;
+- the stable monotonic interval the queue clock guard requires after
+  startup or a hold before an attempted recipient is redispatched, before
+  queue clock confirmation, and before the relay's unattended retention
+  ([Relay retention cycle](#relay-retention-cycle): submission retirement and upload-lease reclamation),
+  which runs only on that stable status.
+
+F is local process policy, carried on the relay worker's route claims and
+guard, never published configuration; processes serving one route may
+differ. The clock discontinuity bound stays five minutes whatever F, so a
+shorter F never tolerates more clock disagreement, but it shortens the
+observation window before retries, confirmation and retention to F.
+
+Persisted times are checked against the lowest permitted interval, one
+second, not against the writing process's own: rows a shorter interval
+wrote stay valid for any process that reads them later, including one
+started with the default. Schema 42 relaxes the route-health and
+route-health receipt CHECKs from at least 300000 to at least 1000
+milliseconds between failure and next attempt; recipient retry admission
+([Due-retry publication](#due-retry-publication)) takes the same bound. Schema-41 binaries cannot serve
+schema 42; the upgrade only widens constraints, so no existing row needs
+repair.

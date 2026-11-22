@@ -830,13 +830,14 @@ reclamation releases counters before charging:
 GRANT DELETE ON td_mta.leases TO td_mta_runtime;
 ```
 
-Rolling back to an older binary requires
-`REVOKE DELETE ON td_mta.leases FROM td_mta_runtime;` with the services
-stopped, before starting the previous executable. Leave the replica reader's
-grants unchanged. An account whose upload quota filled under an older binary
-recovers as it uploads again (each attempt, even one refused for quota,
-reclaims one batch) and, from relay retention turns, on its own while a relay
-route serves it (POSTGRES.md section 216). Do not delete leases by hand.
+Rolling back to an older binary requires `REVOKE DELETE ON td_mta.leases
+FROM td_mta_runtime;` with the services stopped, before starting the
+previous executable. Leave the replica reader's grants unchanged. An account
+whose upload quota filled under an older binary recovers as it uploads again
+(each attempt, even one refused for quota, reclaims one batch) and, from
+relay retention turns, on its own while a relay route serves it
+(POSTGRES.md, [Relay retention cycle](POSTGRES.md#relay-retention-cycle)).
+Do not delete leases by hand.
 
 ## Inbound SMTP commit replies (schema 43)
 
