@@ -75,6 +75,7 @@ References give each mechanism's rules; use these entry points:
 | JMAP writes, uploads, drafts, submission and cancellation | [13. JMAP writes and submission requests](#13-jmap-writes-and-submission-requests) |
 | Account administration and identities | [Account administration workflow](#account-administration-workflow) |
 | Account-scoped HTTP authentication | [HTTPS account selection](#https-account-selection) |
+| SMTP receiving into PostgreSQL | [14. SMTP receiving](#14-smtp-receiving) and [46. Atomic inbound SMTP publication](#46-atomic-inbound-smtp-publication) |
 | Incoming mail across accounts | [Transactional incoming delivery](#transactional-incoming-delivery-across-accounts) |
 | Submission queue, relay scheduling, route health and retention | [15. Submission queue, relay scheduling and route health](#15-submission-queue-relay-scheduling-and-route-health) |
 | One relay attempt from `Prepared` to final result | [16. Relay attempt execution and custody](#16-relay-attempt-execution-and-custody) |
@@ -4516,14 +4517,194 @@ cannot serve schema 41; upgrade with the fenced procedure, so no owner of the
 older binary survives to settle against them. Each publication scans at most
 the account's ledger (no stamp index), which the ceiling keeps small.
 
-## 45. Shared receiving header preparation
+## 14. SMTP receiving
 
-The storage-independent `receiving_headers` module owns the existing bounded
-root-header retention, Return-Path removal, supplied trace insertion and
-Message-ID/References/In-Reply-To selection used by receiving. Its
-64 KiB output turns, source bounds, deadline checks and original work-meter
-charges are unchanged. The module grants no recipient, gateway or publication
-authority and performs no database access. PostgreSQL receiving owns publication and runtime authorization.
+This chapter covers direct-MX SMTP receiving into PostgreSQL: the boundary
+between the SMTP network loop and its fixed storage worker, DATA admission
+and resident memory, receiving readiness, preparation of the stored message
+and its local trace, the storage worker's retained database session, and
+the SMTP replies that follow known and unknown outcomes. Publication itself
+and delivery to several accounts are the two sections after this chapter,
+[46. Atomic inbound SMTP publication](#46-atomic-inbound-smtp-publication)
+and [Transactional incoming delivery across
+accounts](#transactional-incoming-delivery-across-accounts). DESIGN.md,
+CONFIG.md and RESOURCES.md own the SMTP protocol, peer admission and the
+process memory plan.
+
+### SMTP storage boundary
+
+SMTP receiving accesses storage through `smtp_storage`. When the selected
+profile enables the receive role, `serve` constructs the PostgreSQL adapter
+(`postgres_smtp_storage` over the `postgres_smtp_receiving` owner) behind
+this interface; there is no other storage adapter. The fixed storage worker
+admits a job from the trusted connection's session, account, configuration
+generation and observed peer/TLS facts, and performs preparation and
+publication. The network loop copies one decoded DATA chunk into admitted
+memory per connection turn, under the same slot ownership and original
+deadline. `Job::write` is bounded and performs no database, filesystem or
+peer I/O; it does not wait on another slot's publication. Routing, TLS,
+retry, fail-stop and shutdown behavior keep the SMTP runtime's fences.
+
+The trusted connection owner supplies routing and observed peer/TLS facts
+and must already have admitted the peer, gateway and recipient routes; no
+gateway authority is inferred from message content, and direct-MX receipts
+record no gateway. A known durable result remains separate from
+cleanup/accounting stop flags. A committed account set the reply cannot
+represent still stops the service and closes the connection.
+
+### SMTP DATA admission and resident buffers
+
+The adapter's constructor pins the receiving owner, one shared runtime clock
+and the local TLS/policy generation. Begin checks that every routed account
+is bound to this owner, the generation and the configured
+message/header/recipient bounds, takes one of four ingress permits (at most
+two per SMTP peer key, which CONFIG.md defines) and
+observes fresh receiving readiness for the envelope's accounts before
+admitting DATA. The permit and resident buffer survive worker turns without
+a database transaction or mutex guard spanning peer input. Dropping the job
+releases that capacity. The shared bound is independent of listener and
+account counts. Exhaustion retries before 354 under the original queued
+admission deadline and then refuses with 451; it allocates no extra
+buffer. A sender waiting in DATA does not hold another sender's permit or
+the storage worker.
+
+The original absolute deadline and profile work allowance cover bounded DATA
+copies, receipt metadata, preparation and publication. Admission prepays one
+incoming buffer of at most 32 MiB per admitted job; preparation may retain one
+additional filtered body under the same meter. The single storage worker
+serializes preparation and publication. Four full-capacity incoming buffers
+plus that filtered body have a 160-MiB payload ceiling; allocator capacity and
+native protocol buffers are additional. This finite bound is not an RSS
+measurement; RESOURCES.md records that measured concurrent large messages
+exceed the earlier 128 MiB goal.
+
+Each decoded chunk is at most 1000 bytes and may split a physical line or
+CRLF. Preparation revalidates framing across those boundaries without
+wrapping or truncating long lines. The network loop performs its bounded
+memory copy and refuses further copies after service failure. A failed
+write remains failed, and publication can be attempted only once.
+
+### Receiving readiness
+
+Before its workers start, SMTP receiving checks readiness for every bound
+account through a bounded, runtime-qualified one-shot primary connection;
+Busy retries within the admission deadline and any other error fails
+startup. Before 354, DATA admission repeats the check on the storage
+worker's retained session ([Retained receiving database
+session](#retained-receiving-database-session)) for the accounts in the
+accepted envelope only. The check validates schema epoch and selection, then
+holds the account share lock while checking sequence/floor coherence and one
+Inbox with a valid ID and change sequence. Publication uses the same Inbox
+validator under its account write lock. Readiness writes no mail or receipt
+and does not replace fresh publication authorization or reserve quota.
+
+The one-shot check reserves foreground capacity before endpoint resolution
+and retains one ten-second phase under the caller's deadline. Errors remain
+typed; there is no local fallback.
+
+### Receiving header and trace preparation
+
+The storage-independent `receiving_headers` module owns bounded root-header
+retention, Return-Path removal, supplied trace insertion and
+Message-ID/References/In-Reply-To selection used by receiving. It uses
+64 KiB output turns, source bounds, deadline checks and the caller's work
+meter. The module grants no recipient, gateway or publication authority and
+performs no database access. PostgreSQL receiving owns publication and
+runtime authorization.
+
+### Receiving preparation work accounting
+
+Receiving preparation (`postgres_receiving::prepare_with_meter`, and the
+fanout preparation the storage worker uses) runs under the connection
+owner's original meter and runtime clock. Header filtering, identifier
+copies and body hashing share that allowance. A bounded phase clock cannot
+extend its deadline. The cold owner entry point `postgres_receiving::prepare`
+wraps the same path with profile work limits and a bounded body plus 1 MiB
+metadata output allowance; it does not admit network peers.
+
+Before metadata validation and copying, preparation prepays four 64 KiB
+metadata passes and two 64 KiB retained metadata extents plus trace scratch.
+Line discovery charges at most one 1000-byte window and a record per turn,
+retaining no unused credit; a missing newline cannot cause a whole-body
+scan. Header and output accounting are charged separately. Exhaustion stays
+sticky across retries. The caller still owns body and scratch memory
+admission, gateway and recipient authority and publication.
+
+### Retained receiving database session
+
+The fixed SMTP storage worker retains at most one PostgreSQL connection
+for admission and publication, shared across its configured account registry.
+The backend mutex refuses another thread and never queues a waiter. Jobs carry
+resident DATA and a backend reference, not the connection. Startup readiness
+uses the one-shot path before worker startup. Idle maintenance and shutdown
+retire the connection on the owning worker; its read-slot permit is released
+only after disposal. The network and TLS workers never own or retire it.
+
+Admission fully qualifies schema, Runtime privileges and the shared session
+migration lock once. Each SQL job begins a fresh READ COMMITTED transaction,
+checks epoch and the current maintenance barrier, and uses the current
+configuration, account and Inbox checks. Startup checks every bound account.
+Before 354, the worker checks only accounts in the accepted envelope.
+Publication preserves sorted account
+locks, rejects stale selections, enforces quotas and uses synchronous
+COMMIT. No transaction
+or account/policy lock survives between jobs or while DATA arrives.
+
+A session lasts at most 60 seconds and 16 SQL jobs, counting readiness and
+publication separately. Every job retains its original deadline and ten-second
+ceiling. Each job admits only its actual account count: input is one MiB,
+output 40 MiB and frame count 1088 per account. Session totals are sixteen
+times those allowances at the configured maximum account count.
+Qualification shares the first window; idle bytes retain their preceding
+charge, fragmented framing and sticky failures survive windows, and
+cumulative budgets never replenish.
+These wire-work allowances do not allocate equivalent resident buffers.
+
+Only an observed idle failure before starting a new job may replace the
+connection transparently. Once a job starts, failure does not replay its SQL.
+If the worker cannot confirm COMMIT, it discards the connection and returns
+451. The next job can open a fresh connection. A confirmed COMMIT remains
+success even if subsequent connection cleanup fails. Ordinary refused jobs
+conservatively retire it. The next job reuses a connection only after
+acknowledged transaction termination and successful deadline and
+protocol-window checks. Expiry maintenance and clean idle retirement use the
+bounded termination allowance; an unfinished or failed job never gains time
+through cleanup.
+
+### Receiving publication outcomes and replies
+
+`postgres_smtp_receiving` publishes completed, caller-admitted DATA under the
+original work meter. It validates the receiving profile and configured
+header/recipient bounds, reserves a foreground connection before resolution
+(the storage worker's retained session holds that slot; see [Retained
+receiving database session](#retained-receiving-database-session)), and uses
+runtime-qualified primary connections. A ten-second phase and original
+deadline cover preparation and publication; publication is prepaid using the
+final filtered body's extent and recipient count. Known outcomes survive later
+time/accounting refusal. Connection failures before publication may try the
+next bounded resolved address; unknown COMMIT is never replayed.
+
+Known publication yields the account, epoch and sequence required for SMTP's
+final success reply. A known database rollback produces 451; the worker stays
+ready and the connection can complete a later transaction. An unconfirmed
+COMMIT gets 451 and the serving process continues. Another admitted job can
+use the worker and a fresh connection. Each subsequent delivery checks its
+own policy, obtains its own account locks, and publishes under its own
+deadline. The sender controls any retry.
+
+Shutdown lets the storage worker claim work for the five-second SMTP drain, then discards DATA jobs still unfinished without publishing them and joins the workers; unfinished DATA receives no final reply, and an encrypted
+connection may end without close_notify.
+
+### Receiving over plaintext and STARTTLS
+
+Plaintext and STARTTLS connections share the same storage worker, adapter,
+rollback, unknown-outcome and shutdown behavior. STARTTLS refuses an
+active envelope; after RSET it upgrades and requires a fresh EHLO before
+MAIL. A committed message's receipt retains the negotiated TLS version and
+the post-upgrade EHLO and reverse path; a plaintext delivery records Plain.
+The upgrade changes no production trust, client authentication or gateway
+policy. Native fixtures run the production worker and adapter over both
+transports; they are not a deployment or provider qualification.
 
 ## 46. Atomic inbound SMTP publication
 
@@ -4691,150 +4872,6 @@ FROM traces CROSS JOIN LATERAL regexp_matches(prefix,
 GROUP BY 1, 2, 3 ORDER BY 4 DESC, 2, 3, 1;
 ```
 
-## 103. Caller-funded receiving preparation
-
-`postgres_receiving::prepare_with_meter` prepares completed DATA under the
-connection owner's original meter and runtime clock. Header filtering,
-identifier copies and body hashing share that
-allowance. A bounded phase clock cannot extend its deadline. The cold owner
-entry point wraps the same path with profile work limits and a bounded body
-plus 1 MiB metadata output allowance; it does not admit network peers.
-
-Before metadata validation and copying, preparation prepays four 64 KiB
-metadata passes and two 64 KiB retained metadata extents plus trace scratch.
-Line discovery prepays at most 1001 bytes and a record per turn, retaining
-no unused credit; a missing newline cannot cause a whole-body scan. Existing
-header and output accounting remains separate. Exhaustion stays sticky across
-retries. The caller still owns body and scratch memory admission, gateway and
-recipient authority and publication.
-The real PostgreSQL receiving fixture exercises shared-meter exhaustion,
-expiry and successful publication with unchanged provenance and threading.
-
-## 104. Fixed-worker receiving publication ownership
-
-`postgres_smtp_receiving` publishes completed, caller-admitted DATA under
-the original work meter. It validates the receiving
-profile and configured header/recipient bounds, reserves a foreground
-connection before resolution, and uses runtime-qualified primary connections.
-A ten-second phase and original deadline cover preparation and publication;
-publication is prepaid using the final filtered body's extent and recipient
-count. Known outcomes
-survive later time/accounting refusal. Connection failures before publication
-may try the next bounded resolved address; unknown COMMIT is never replayed.
-
-An unconfirmed COMMIT gets 451 and the serving process continues. Each
-subsequent delivery checks its own policy, obtains its own account locks,
-and publishes under its own deadline. The sender controls any retry.
-
-## 105. SMTP worker storage boundary
-
-SMTP receiving accesses storage through `smtp_storage`. The fixed worker
-admits a job from the trusted connection's session, account, configuration
-generation and observed peer/TLS facts, and performs preparation and
-publication. The network loop copies one decoded DATA chunk into admitted
-memory per connection turn, under the same slot ownership and original
-deadline. `Job::write` is bounded and performs no database, filesystem or
-peer I/O; it does not wait on another slot's publication. Routing, TLS,
-retry, fail-stop and shutdown behavior retain their existing fences. A known durable result remains
-separate from cleanup/accounting stop flags. A committed account set the
-reply cannot represent still stops the service and closes the connection.
-The adapter keeps one cached mutation session and its foreground slot
-across successful jobs. A publication error discards that session.
-
-The foreground service constructs the PostgreSQL adapter behind this
-interface. Its readiness, ingress capacity, authorization fences, contention
-mappings and completion behavior are exercised by the PostgreSQL worker and
-executable fixtures. The old local storage adapter is removed.
-
-## 106. Fresh receiving readiness
-
-The prepared SMTP owner checks readiness through a bounded, runtime-qualified
-primary connection before reporting that its selected receiving profile and
-Inbox are available. The check validates schema epoch and selection, then
-holds the account share lock while checking sequence/floor coherence and one
-Inbox with a valid ID and change sequence. Publication uses the same Inbox
-validator under its account write lock. Readiness writes no mail or receipt
-and does not replace fresh publication authorization or reserve quota.
-
-The owner reserves
-foreground capacity before endpoint resolution and retains one ten-second phase
-under the caller's deadline. Errors remain typed; no local fallback or listener
-activation is introduced. The runtime-role PostgreSQL fixture covers success,
-missing Inbox, incoherent Inbox history, stale selection,
-including unchanged account state and absent publication effects.
-
-## 107. Prepared SMTP DATA storage
-
-`postgres_smtp_storage` implements the fixed worker's storage boundary for
-direct SMTP. Its constructor pins the receiving owner, one shared runtime
-clock and the local policy generation. Begin checks the routed account,
-generation and configured message/header/recipient bounds, takes one of four
-ingress permits and observes fresh receiving readiness before admitting DATA.
-The permit and resident buffer survive worker turns without a database transaction
-or mutex guard spanning peer input. Dropping the job releases that capacity.
-The shared bound is independent of listener and account counts. Exhaustion
-retries before 354 under the original queued admission deadline. A sender
-waiting in DATA does not hold another sender's permit or the storage worker.
-
-The original absolute deadline and profile work allowance cover bounded DATA
-copies, receipt metadata, preparation and publication. Admission prepays one
-incoming buffer of at most 32 MiB per admitted job; preparation may retain one
-additional filtered body under the same meter. The single storage worker serializes preparation and publication. Four full-capacity
-incoming buffers plus that filtered body have a 160-MiB payload ceiling;
-allocator capacity and native protocol buffers are additional. This finite
-bound is not qualification of the provisional 128-MiB workload RSS goal.
-Each decoded chunk is at most 1000 bytes and may split a physical line or
-CRLF. Preparation revalidates framing across those boundaries without
-wrapping or truncating long lines. The network loop performs its
-bounded memory copy and refuses further copies after service failure. A
-failed write remains failed, and publication can be attempted only once.
-The trusted connection owner still supplies routing and observed peer/TLS
-facts; no gateway authority is inferred from message content.
-
-Known publication yields the account, epoch and sequence required for SMTP's
-final success reply. An unknown COMMIT receives 451. Another admitted job
-can use the worker and a fresh connection (section 104).
-
-## 108. Real SMTP worker qualification
-
-The explicit PostgreSQL fixture runs the production SMTP receiving worker and
-prepared PostgreSQL storage adapter together on an ephemeral TCP listener.
-Its database-loaded profile supplies routing, resource limits and retained
-TLS policy. The runtime database role supplies readiness and publication.
-The fixture checks the SMTP greeting, envelope admission, DATA and final
-success reply against committed Email rows. A known
-database rollback produces 451, preserves the ready worker and permits a
-later successful transaction on that connection. A partial DATA sender stays
-paused until another connection has received final success, with exactly that
-second delivery durable before the paused sender completes. Shutdown discards
-two unfinished same-peer DATA jobs, joins the workers and leaves no additional message. A third same-peer DATA attempt receives 451 without 354 while
-the two unfinished jobs remain admitted. These concurrency regressions run
-over plaintext and STARTTLS. Another
-regression holds one admitted job immediately before publication and proves
-that a second job consumes its DATA line before that gate is released. Both final successes must correspond to durable deliveries.
-
-This qualifies the plaintext direct-SMTP transport path in the prepared
-runtime. It does not activate a production PostgreSQL listener, qualify a new
-STARTTLS path or replace the existing native TLS and shutdown fixtures.
-
-## 109. PostgreSQL receiving over STARTTLS
-
-The explicit STARTTLS worker fixture upgrades the same real SMTP listener
-using td-crypto's verified localhost client and the fixture's private trust
-root. It checks that STARTTLS refuses an active envelope, then upgrades
-after RSET and requires a fresh EHLO before MAIL. Both committed
-messages retain the negotiated TLS version and post-upgrade EHLO/reverse
-path in PostgreSQL; the plaintext variant checks Plain receipt provenance.
-The same rollback/recovery and open-DATA shutdown cases run over both
-transports. Abrupt shutdown may end encrypted input without close_notify;
-the fixture distinguishes that closure from a timeout and accepts no final
-message receipt for unfinished DATA.
-
-The test uses bounded TLS wire buffers and per-I/O waits, verifies the server
-name and does not change production trust, client authentication or gateway
-policy. This is prepared PostgreSQL integration evidence; production backend
-selection and deployment qualification remain unchanged.
-
 ## Transactional incoming delivery across accounts
 
 An accepted SMTP envelope retains each address's pinned local account. The
@@ -4867,45 +4904,6 @@ per-frame, authentication, TLS and ten-second connection limits remain intact.
 The DATA
 worker's output meter includes the separate 2-MiB fanout metadata reservation,
 including when the configured message ceiling is smaller than that metadata.
-
-## Retained SMTP worker session
-
-The fixed non-TLS SMTP storage worker retains at most one PostgreSQL connection
-for admission and publication, shared across its configured account registry.
-The backend mutex refuses another thread and never queues a waiter. Jobs carry
-resident DATA and a backend reference, not the connection. Startup readiness
-uses the one-shot path before worker startup. Idle maintenance and shutdown
-retire the connection on the owning worker; its read-slot permit is released
-only after disposal.
-
-Admission fully qualifies schema, Runtime privileges and the shared session
-migration lock once. Each SQL job begins a fresh READ COMMITTED transaction,
-checks epoch and the current maintenance barrier, and uses the existing current
-configuration, account and Inbox checks. Startup checks every bound account.
-Before 354, the worker checks only accounts in the accepted envelope.
-Publication preserves sorted account
-locks, rejects stale selections, enforces quotas and uses synchronous
-COMMIT. No transaction
-or account/policy lock survives between jobs or while DATA arrives.
-
-A session lasts at most 60 seconds and 16 SQL jobs, counting readiness and
-publication separately. Every job retains its original deadline and ten-second
-ceiling. Each job admits only its actual account count: input is one MiB,
-output 40 MiB and frame count 1088 per account. Session totals are sixteen times
-those allowances at the configured maximum account count. Qualification shares
-the first window; idle bytes retain their preceding charge, fragmented framing
-and sticky failures survive windows, and cumulative budgets never replenish.
-These wire-work allowances do not allocate equivalent resident buffers.
-
-Only an observed idle failure before starting a new job may replace the
-connection transparently. Once a job starts, failure does not replay its SQL.
-If the worker cannot confirm COMMIT, it discards the connection and returns
-451. The next job can open a fresh connection. A confirmed COMMIT remains
-success even if subsequent connection cleanup fails. Ordinary refused jobs conservatively retire it. The
-next job reuses a connection only after acknowledged transaction termination
-and successful deadline and protocol-window checks. Expiry maintenance and
-clean idle retirement use the existing bounded termination allowance; an
-unfinished or failed job never gains time through cleanup.
 
 ## 15. Submission queue, relay scheduling and route health
 
@@ -5103,13 +5101,13 @@ mismatched and already attempted responsibility cannot enter this
 first-attempt path. The relay supplies the submission from bounded
 candidate discovery ([Fresh and retry candidate discovery](#fresh-and-retry-candidate-discovery)); publication scans no due queue itself.
 
-Recipient InFlight/`Prepared` state, attempt identity, timestamp and
-count, submission/account sequence, change history and the retained
-attempt commit atomically. Receipt resolution precedes fresh policy
-checks; lost COMMIT responses resolve with the same retained Dispatch.
-Historical outcomes do not authorize transport. At most 1024 attempt rows
-are retained per account; publication first reclaims retired attempts
-([Reclamation of retired attempts](#reclamation-of-retired-attempts)) and counts the cap afterwards.
+Recipient InFlight/`Prepared` state, attempt identity, timestamp and count,
+submission/account sequence, change history and the retained attempt commit
+atomically. Receipt resolution precedes fresh policy checks; lost COMMIT
+responses resolve with the same retained Dispatch. Historical outcomes do not
+authorize transport. At most 1024 attempt rows are retained per account;
+publication first reclaims retired attempts ([Reclamation of retired
+attempts](#reclamation-of-retired-attempts)) and counts the cap afterwards.
 
 An active attempt blocks another batch even after owner replacement. Fenced
 phase/result publication, current-owner interruption, conservative takeover
@@ -5482,16 +5480,15 @@ receipts inside the hour.
 
 ### Route health state (schema 25)
 
-Schema version 25 adds route health keyed by account, route name and immutable
-destination fingerprint, plus independently retained operation receipts.
-Separate destination keys keep a changed endpoint from inheriting or erasing
-the prior endpoint's backoff; retirement ([Retirement of idle route owner and
-health rows](#retirement-of-idle-route-owner-and-health-rows)) removes an
-endpoint's row only once its backoff has elapsed and it holds no repair latch.
-Each health revision is nonzero; receipt revisions increase and the publisher
-checks exact adjacency. Receipts capture the resulting state and one of
-failure, repair or success, so later state changes cannot rewrite an earlier
-operation's settlement.
+Schema version 25 adds route health keyed by account, route name and
+immutable destination fingerprint, plus independently retained operation
+receipts. Separate destination keys keep a changed endpoint from
+inheriting or erasing the prior endpoint's backoff; retirement
+([Retirement of idle route owner and health rows](#retirement-of-idle-route-owner-and-health-rows)) removes an endpoint's row only once its backoff has elapsed
+and it holds no repair latch. Each health revision is nonzero; receipt
+revisions increase and the publisher checks exact adjacency. Receipts
+capture the resulting state and one of failure, repair or success, so
+later state changes cannot rewrite an earlier operation's settlement.
 
 The stored consecutive failure count is bounded by u32. A zero count is
 the healthy state, with no failure/retry timestamp or repair latch. A
@@ -5647,9 +5644,9 @@ settles the retained operation without applying another repair.
 
 Repair is never a configuration-load side effect. The relay prepares and
 publishes it only for an explicit `queue-route-repair` request on the
-process's private runtime control socket ([Relay route repair
-requests](#relay-route-repair-requests)). Successful-route counter reset is a
-separate operation; repair does not claim that transport has succeeded.
+process's private runtime control socket ([Relay route repair requests](#relay-route-repair-requests)). Successful-route
+counter reset is a separate operation; repair does not claim that
+transport has succeeded.
 
 ### Route success reset
 
@@ -5756,16 +5753,14 @@ jump is observed.
 
 ### Relay scheduling turn
 
-Each account turn runs, in order: settlement of any prior Pending custody; the
-owner-qualified absence read when nothing is pending; at most one local
-failure notice when its five-second interval has elapsed; any explicit
-route-repair request; one expiry page; due retention work; when this account
-holds the expiry turn and the clock guard admits expiry, one expiry batch;
-recovery of an active attempt; and, unless the account's dispatch is deferred,
-one fresh or retry candidate page whose first hint may become one SMTP
-attempt. Fresh and retry selection alternates independently for each account.
-A route-health refusal of the candidate read (a paused or backed-off route)
-ends the turn. Expiry scans always precede dispatch.
+Each account turn runs, in order: settlement of any prior Pending custody;
+the owner-qualified absence read when nothing is pending; at most one
+local failure notice when its five-second interval has elapsed; any explicit route-repair request; one expiry page; due retention work; when this account holds the expiry turn and the clock guard admits expiry, one expiry batch; recovery of an active attempt; and, unless the
+account's dispatch is deferred, one fresh or retry candidate page whose
+first hint may become one SMTP attempt. Fresh and retry selection
+alternates independently for each account. A route-health refusal of the
+candidate read (a paused or backed-off route) ends the turn. Expiry scans
+always precede dispatch.
 
 Passive active-attempt discovery is fenced to the current account, route and
 destination and reads at most two rows, refusing multiple active owners. An
@@ -5990,24 +5985,24 @@ entry.
 
 ### Relay route repair requests
 
-After selecting a repaired configuration, which serving instances load by reloading, an explicit
-private `queue-route-repair` request releases the configuration-bound
-pause only if the database confirms a newer selected generation
-([Explicit route repair](#explicit-route-repair)). Mere restart never repairs. The request remains pending
-until every configured account has been visited. An account without a
-repair hold completes a fresh observation; a held account still requires
-the existing newer-configuration and receipt fences. A busy account leaves
-the request pending, and a refusal is visible through `queue-route-status`.
-A request serial prevents completion of an earlier refused request from
-finishing a newer request. No timer clears a repair hold.
+After selecting a repaired configuration, which serving instances load by
+reloading, an explicit private `queue-route-repair` request releases the
+configuration-bound pause only if the database confirms a newer selected
+generation ([Explicit route repair](#explicit-route-repair)). Mere restart
+never repairs. The request remains pending until every configured account has
+been visited. An account without a repair hold completes a fresh observation;
+a held account still requires the existing newer-configuration and receipt
+fences. A busy account leaves the request pending, and a refusal is visible
+through `queue-route-status`. A request serial prevents completion of an
+earlier refused request from finishing a newer request. No timer clears a
+repair hold.
 
 ### Relay shutdown and lease release
 
 Shutdown closes foreground custody and joins renewal before one bounded
 multi-account release transaction. Expiring leases remain the fallback if
-cleanup cannot complete. After a successful drain and release the relay may
-publish a clean queue-clock checkpoint ([Queue clock checkpoint and
-confirmation](#queue-clock-checkpoint-and-confirmation)).
+cleanup cannot complete. After a successful drain and release the relay
+may publish a clean queue-clock checkpoint ([Queue clock checkpoint and confirmation](#queue-clock-checkpoint-and-confirmation)).
 
 ### Local terminal-delivery notices
 
@@ -6168,15 +6163,12 @@ effect.
 ### Relay retention cycle
 
 Besides submission retirement, the relay reclaims expired upload leases as
-upload publication does ([Expired upload lease
-reclamation](#expired-upload-lease-reclamation)), releases abandoned route
-owners and canceled custody ([Route-health capacity and dispatch
-admission](#route-health-capacity-and-dispatch-admission)), and reclaims idle
-attempts and their receipts ([Reclamation of retired
-attempts](#reclamation-of-retired-attempts)). Each step uses its own
-transaction with the same claim, fence and clock check. An empty batch rolls
-back. A corrupt upload counter can refuse a lease batch while the other three
-transactions still commit.
+upload publication does ([Expired upload lease reclamation](#expired-upload-lease-reclamation)), releases abandoned route owners and
+canceled custody ([Route-health capacity and dispatch admission](#route-health-capacity-and-dispatch-admission)), and reclaims idle attempts and their
+receipts ([Reclamation of retired attempts](#reclamation-of-retired-attempts)). Each step uses its own transaction with the same
+claim, fence and clock check. An empty batch rolls back. A corrupt upload
+counter can refuse a lease batch while the other three transactions still
+commit.
 
 On idle and active account turns the four transactions share one
 ten-second deadline within the 30-second owner lease. Each cycle runs the
@@ -6213,12 +6205,13 @@ clock confirmation before time-based cleanup.
 
 ### Reclamation of retired attempts
 
-Submission retirement ([Retention of settled submissions](#retention-of-settled-submissions)) happens only a month after
-completion, so it alone would leave the per-account caps on attempts
-(1,024), phase receipts (2,048) and RCPT, command, acceptance, refusal and
-recovery receipts (1,024 each) as lifetime limits: ordinary sending, or a
-few submissions retrying for days, would fill them and refuse every later
-dispatch with Capacity. Attempts are therefore reclaimed on their own.
+Submission retirement ([Retention of settled
+submissions](#retention-of-settled-submissions)) happens only a month after
+completion, so it alone would leave the per-account caps on attempts (1,024),
+phase receipts (2,048) and RCPT, command, acceptance, refusal and recovery
+receipts (1,024 each) as lifetime limits: ordinary sending, or a few
+submissions retrying for days, would fill them and refuse every later dispatch
+with Capacity. Attempts are therefore reclaimed on their own.
 
 Fresh and retry attempt publication first calls
 `postgres_attempt_reclamation::reclaim` in the same transaction. One statement
@@ -6467,14 +6460,13 @@ specified under "Unknown-COMMIT settlement and proof of absence" below.
 Fresh and retry `Prepared` publication, new Body publication, new
 AcceptancePossible publication and the observed-envelope reader all require
 the caller's persistent process queue-clock Guard and the runtime monotonic
-clock; there is no unguarded fresh or retry attempt publication entry point.
-Under current policy and the route-owner lock, each pairs authoritative
-PostgreSQL UTC with the monotonic tick and checks the applicable guard status
-before selecting recipients or reading the envelope. The locked database
-sample reaches the guard before owner-clock or lease refusal, so a failed
-ownership check or rolled-back transaction cannot hide a discontinuity from
-the persistent hold. The adapter's UTC field is never used for queue
-decisions.
+clock; there is no unguarded fresh or retry attempt publication entry point. Under current policy
+and the route-owner lock, each pairs authoritative PostgreSQL UTC with the
+monotonic tick and checks the applicable guard status before selecting
+recipients or reading the envelope. The locked database sample reaches the
+guard before owner-clock or lease refusal, so a failed ownership check or
+rolled-back transaction cannot hide a discontinuity from the persistent
+hold. The adapter's UTC field is never used for queue decisions.
 
 Fresh work is allowed at startup; retries require the minimum retry interval
 of stable monotonic time ([Minimum retry interval (schema
@@ -6566,15 +6558,15 @@ ownership are separate prerequisites of terminator handoff.
 
 ### Verified transmitted-body snapshots
 
-An attempt admits its immutable transmitted body through a bounded read-only
-repeatable-read snapshot. The opaque Dispatch binds the account, route,
-destination, owner, generation, attempt and request digest. Fresh primary
-admission checks current policy, unexpired route ownership and that exact
-active attempt before snapshot work. Pre-MAIL classification ([Relay
-scheduling turn](#relay-scheduling-turn)) and post-354 DATA each open and
-verify a separate snapshot. Each snapshot binds the live submission and blob
-manifest; the shared blob reader verifies contiguous chunks, total length and
-SHA-256 before exposing any bytes to the callback.
+An attempt admits its immutable transmitted body through a bounded
+read-only repeatable-read snapshot. The opaque Dispatch binds the account,
+route, destination, owner, generation, attempt and request digest. Fresh
+primary admission checks current policy, unexpired route ownership and that
+exact active attempt before snapshot work. Pre-MAIL classification
+([Relay scheduling turn](#relay-scheduling-turn)) and post-354 DATA each open and verify a separate snapshot.
+Each snapshot binds the live submission and blob manifest; the shared blob
+reader verifies contiguous chunks, total length and SHA-256 before exposing
+any bytes to the callback.
 
 A second fresh primary admission after verification refuses cancellation,
 retirement, ownership loss or policy change observed before that check. Both
@@ -7686,12 +7678,10 @@ committed results are not converted into deadline refusals.
 
 `Dispatches::expire` brings one prepared queue-expiry operation under the
 worker's Runtime, original-deadline, work-meter, ordinary-slot and Pending
-admission; in each turn where the account holds the shared expiry turn and the
-clock guard admits expiry, the foreground worker runs it before candidate
-dispatch ([Relay scheduling turn](#relay-scheduling-turn)). The route's SMTP
-transport, including the current owner's attempt, is closed before expiry; the
-worker never expires while it holds an attempt's transport. The entry point
-grants no transport authority.
+admission; in each turn where the account holds the shared expiry turn and the clock guard admits expiry, the foreground worker runs it before candidate dispatch ([Relay scheduling turn](#relay-scheduling-turn)). The route's SMTP
+transport, including the current owner's attempt, is closed before expiry;
+the worker never expires while it holds an attempt's transport. The entry
+point grants no transport authority.
 
 Admission prepays the 2 MiB + 192 KiB receipt-inspection and
 possible-publication allowance. Pending takes the exact owned Expiry before
@@ -7800,14 +7790,13 @@ administrative connection access, not a device password. `blob-audit`
 verifier; it is never a download or device authorization path. It returns
 only public manifest metadata and the snapshot account sequence/floor.
 
-The body reader checks manifest bounds, changed sequence, exact chunk count,
-ordered contiguous ordinals, chunk extents and the complete SHA-256, including
-the empty body digest. It uses the 64-MiB stored-body ceiling and eight-chunk
-batches, not a message-sized buffer. The original connection budgets and
-deadline cover metadata, all body reads and an acknowledged ROLLBACK; a final
-deadline check precedes success. Missing rows, wrong epochs, corrupt
-manifests/bytes, database failures and timeouts refuse. Failure closes the
-private worker and never repairs any row.
+The body reader checks manifest bounds, changed sequence, exact
+chunk count, ordered contiguous ordinals, chunk extents and the complete
+SHA-256, including the empty body digest. It uses the 64-MiB stored-body ceiling and eight-chunk batches, not a message-sized buffer. The original
+connection budgets and deadline cover metadata, all body reads and an
+acknowledged ROLLBACK; a final deadline check precedes success. Missing rows,
+wrong epochs, corrupt manifests/bytes, database failures and timeouts refuse.
+Failure closes the private worker and never repairs any row.
 
 A successful result certifies only this body's historical snapshot. It does
 not check counters, owning Email/submission/lease references, other metadata,
@@ -7979,8 +7968,7 @@ has no repair, download or profile option.
 
 Address resolution and body verification share the original ten-second
 deadline. Only pre-connection transport failure permits another resolved
-address; database or body failures do not renew work. The 64-MiB stored-body
-ceiling, bounded chunk batches and worker byte/frame ceilings apply.
+address; database or body failures do not renew work. The 64-MiB stored-body ceiling, bounded chunk batches and worker byte/frame ceilings apply.
 
 Success JSON schema 1 identifies the epoch, account, blob, captured account
 sequence/history floor, verified byte count and manifest creation time.
@@ -8069,14 +8057,12 @@ refuses with the distinct maintenance error; query/type failures also refuse.
 
 This check applies to each new ordinary Runtime connection and retained
 validators' runtime qualification. HTTPS authentication performs a fresh
-maintenance fence in each job snapshot, and the retained SMTP storage session,
-retained mutation sessions and the replica publisher session check the barrier
-at the start of each job ([Replica publisher
-session](#replica-publisher-session)). Neither check revokes already-admitted
-network I/O or makes a previously captured snapshot see newer rows. Operations
-retain their original finite limits and migration locks. Owner Preparation
-schema inspection remains available while the barrier is set; `runtime-check`
-remains a runtime qualification and refuses maintenance.
+maintenance fence in each job snapshot, and the retained SMTP storage session, retained mutation sessions and the replica publisher session check the barrier at the start of each job ([Replica publisher session](#replica-publisher-session)). Neither check revokes
+already-admitted network I/O or makes a previously captured snapshot see
+newer rows. Operations retain their original finite limits and migration
+locks. Owner Preparation schema inspection remains available while the
+barrier is set; `runtime-check` remains a runtime qualification and refuses
+maintenance.
 
 Runtime qualification performs no entry, release, epoch renewal, delivery
 quarantine or recovery approval. Owner entry ([Owner maintenance
@@ -8421,8 +8407,7 @@ binding can be inspected or repeated; a conflicting binding refuses. COMMIT
 uncertainty is retained explicitly. No source credentials or source
 operational configuration are stored in the identity row.
 
-Core mail tables are those of primary mode, and source and local JMAP state
-stay separate. A schema-35 binary cannot serve schema 36; use the documented
+Core mail tables are those of primary mode, and source and local JMAP state stay separate. A schema-35 binary cannot serve schema 36; use the documented
 fenced upgrade and consistent backup.
 
 ### Replica account tables (schema 37)
