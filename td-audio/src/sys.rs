@@ -182,6 +182,8 @@ pub const EPIPE: i32 = 32;
 /// `ESTRPIPE`: the device was suspended. Recovery is `PREPARE`, same as `EPIPE`,
 /// because this crate never asks for `RESUME`.
 pub const ESTRPIPE: i32 = 86;
+/// `ENODEV`: the node is gone, as an ioctl on an unplugged card answers.
+pub const ENODEV: i32 = 19;
 
 /// `struct snd_pcm_info` as opaque bytes.
 ///

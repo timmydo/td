@@ -1,4 +1,4 @@
-//! Playback-device discovery: `/proc/asound/pcm`, and nothing else.
+//! Playback-device discovery: `/proc/asound/pcm`, and each card's id beside it.
 //!
 //! §K.4 names the wrong file and says exactly why it is wrong. `/proc/asound/
 //! cards` lists CARDS — one entry per adapter, with no playback device or
@@ -181,6 +181,126 @@ fn sanitise(text: &str) -> String {
         .collect()
 }
 
+/// One output: a playback PCM the daemon may drive, under a key that follows
+/// the card rather than the number plug order gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    pub playback: Playback,
+    /// `<card id>:<device>`, e.g. `PCH:0`, from `/proc/asound/card<N>/id`.
+    /// Two identical cards are told apart only by the ids the kernel gives
+    /// them in plug order (`Device`, `Device_1`); td reads no USB topology.
+    pub key: String,
+    /// The Pulse sink name the key gives, e.g. `pch-0`: the id lowercased,
+    /// `_` as `-`, then the device number.
+    pub name: String,
+}
+
+/// Every output, preferred first: the one `wanted` names, else the one
+/// `select` would choose, then the rest by card and device. The test
+/// loopback is an output only when it is the one named. Card ids are read
+/// from `card<N>/id` beside `pcm`; a card with none is keyed `card<N>`. A
+/// sink name an earlier output already took, which folding case and `_`
+/// can make, gains `.<card>`: no derived name holds a `.`, and a card's
+/// number is its own.
+pub fn outputs(pcm: &Path, wanted: Option<(u32, u32)>) -> io::Result<Vec<Output>> {
+    let mut devices = read(pcm)?;
+    let first = select(&devices, wanted).map(|first| (first.card, first.device))?;
+    devices.sort_unstable_by_key(|playback| {
+        (
+            (playback.card, playback.device) != first,
+            playback.card,
+            playback.device,
+        )
+    });
+    let root = pcm.parent().unwrap_or(Path::new("/"));
+    let mut found = crate::allocation::with_capacity(devices.len()).map_err(refused)?;
+    for playback in devices {
+        let chosen = (playback.card, playback.device) == first;
+        if !chosen && is_test_loopback(&playback) {
+            continue;
+        }
+        let id = card_id(root, playback.card)?;
+        let key =
+            crate::allocation::format(format_args!("{id}:{}", playback.device)).map_err(refused)?;
+        let mut name =
+            crate::allocation::format(format_args!("{}-{}", SinkId(&id), playback.device))
+                .map_err(refused)?;
+        if found.iter().any(|earlier: &Output| earlier.name == name) {
+            name = crate::allocation::format(format_args!("{name}.{}", playback.card))
+                .map_err(refused)?;
+        }
+        crate::allocation::push(
+            &mut found,
+            Output {
+                playback,
+                key,
+                name,
+            },
+        )
+        .map_err(refused)?;
+    }
+    Ok(found)
+}
+
+/// A card's id as the kernel keeps it, or `card<N>` when it keeps none or
+/// it cannot be read. Only `[A-Za-z0-9_-]`, the characters the kernel
+/// itself allows in an id, survive, so a key can carry nothing else.
+fn card_id(root: &Path, card: u32) -> io::Result<String> {
+    // One formatted path rather than a join: a root that is not UTF-8,
+    // which only a diagnostic `--proc` can give, finds no id and is keyed
+    // `card<N>`.
+    let file = crate::allocation::format(format_args!("{}/card{card}/id", root.display()))
+        .map_err(refused)?;
+    // The kernel's id is at most 15 bytes and a newline; a longer file is
+    // not one, and only its first bytes are read.
+    let mut text = [0u8; CARD_ID_BYTES];
+    let length = fs::File::open(file)
+        .and_then(|mut file| io::Read::read(&mut file, &mut text))
+        .unwrap_or(0);
+    let mut id = String::new();
+    crate::allocation::reserve_string(&mut id, length).map_err(refused)?;
+    let mut encoded = [0u8; 4];
+    for byte in text.get(..length).unwrap_or_default() {
+        let character = char::from(*byte);
+        if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+            crate::allocation::push_str(&mut id, character.encode_utf8(&mut encoded))
+                .map_err(refused)?;
+        }
+    }
+    if id.is_empty() {
+        return crate::allocation::format(format_args!("card{card}")).map_err(refused);
+    }
+    Ok(id)
+}
+
+/// The most of `card<N>/id` that is read.
+const CARD_ID_BYTES: usize = 64;
+
+/// A card id as a sink name's first part: lowercase, `_` as `-`.
+struct SinkId<'a>(&'a str);
+
+impl fmt::Display for SinkId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for character in self.0.chars() {
+            let character = match character {
+                '_' => '-',
+                other => other.to_ascii_lowercase(),
+            };
+            fmt::Write::write_char(f, character)?;
+        }
+        Ok(())
+    }
+}
+
+/// An allocation td-alloc refused, as the I/O error discovery reports.
+fn refused<E>(_: E) -> io::Error {
+    io::Error::from(io::ErrorKind::OutOfMemory)
+}
+
+fn is_test_loopback(playback: &Playback) -> bool {
+    playback.id == TEST_LOOPBACK_PCM && playback.name == TEST_LOOPBACK_PCM
+}
+
 /// Read and parse the kernel's table.
 pub fn read(path: &Path) -> io::Result<Vec<Playback>> {
     let text = fs::read_to_string(path).map_err(|e| {
@@ -218,7 +338,7 @@ pub fn select(devices: &[Playback], wanted: Option<(u32, u32)>) -> io::Result<&P
     }
     devices
         .iter()
-        .filter(|playback| playback.id != TEST_LOOPBACK_PCM || playback.name != TEST_LOOPBACK_PCM)
+        .filter(|playback| !is_test_loopback(playback))
         .min_by_key(|p| (p.card, p.device))
         .ok_or_else(|| {
             io::Error::new(
@@ -257,6 +377,132 @@ mod tests {
 00-00: Loopback PCM : Loopback PCM : playback 8 : capture 8
 00-01: Loopback PCM : Loopback PCM : playback 8 : capture 8
 ";
+
+    /// A `/proc/asound` for `outputs`: the PCM table, and each card's id.
+    fn proc_tree(name: &str, pcm: &str, ids: &[(u32, &str)]) -> td_fs::TempDir {
+        let dir = td_fs::TempDir::new(name).unwrap();
+        fs::write(dir.path().join("pcm"), pcm).unwrap();
+        for (card, id) in ids {
+            let card = dir.path().join(format!("card{card}"));
+            fs::create_dir(&card).unwrap();
+            fs::write(card.join("id"), id).unwrap();
+        }
+        dir
+    }
+
+    fn shown(outputs: &[Output]) -> Vec<(u32, u32, &str, &str)> {
+        outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.playback.card,
+                    output.playback.device,
+                    output.key.as_str(),
+                    output.name.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every playback PCM is an output under its card's id, the one
+    /// `select` picks first and the rest by card and device; naming one
+    /// puts it first.
+    #[test]
+    fn outputs_are_keyed_by_card_id_and_the_chosen_one_is_first() {
+        let dir = proc_tree("outputs-real", REAL, &[(0, "HDMI\n"), (1, "PCH\n")]);
+        let pcm = dir.path().join("pcm");
+        assert_eq!(
+            shown(&outputs(&pcm, None).unwrap()),
+            [
+                (0, 3, "HDMI:3", "hdmi-3"),
+                (0, 7, "HDMI:7", "hdmi-7"),
+                (1, 0, "PCH:0", "pch-0"),
+                (1, 1, "PCH:1", "pch-1"),
+            ]
+        );
+        assert_eq!(
+            shown(&outputs(&pcm, Some((1, 0))).unwrap()),
+            [
+                (1, 0, "PCH:0", "pch-0"),
+                (0, 3, "HDMI:3", "hdmi-3"),
+                (0, 7, "HDMI:7", "hdmi-7"),
+                (1, 1, "PCH:1", "pch-1"),
+            ]
+        );
+        assert!(outputs(&pcm, Some((1, 2))).is_err(), "capture-only");
+    }
+
+    /// The test loopback is an output only when named; an id the kernel
+    /// would not write is cut to the characters it would, the second of two
+    /// identical cards keeps its plug-order suffix, and a card with no id, or
+    /// one that cannot be read as a file, is `card<N>`.
+    #[test]
+    fn the_loopback_stays_out_and_card_ids_are_cut_to_the_kernels_alphabet() {
+        let table = format!(
+            "{ALOOP}01-00: USB Audio : USB Audio : playback 1\n\
+             02-00: USB Audio : USB Audio : playback 1\n\
+             03-00: ALC262 Analog : ALC262 Analog : playback 1\n\
+             04-00: ALC262 Analog : ALC262 Analog : playback 1\n"
+        );
+        let dir = proc_tree(
+            "outputs-ids",
+            &table,
+            &[
+                (0, "Loopback\n"),
+                (1, "Device\n"),
+                (2, "Dev ice\u{1b}[2J_1\n"),
+            ],
+        );
+        // A directory where the id would be: not readable as one.
+        fs::create_dir_all(dir.path().join("card4/id")).unwrap();
+        let pcm = dir.path().join("pcm");
+        assert_eq!(
+            shown(&outputs(&pcm, None).unwrap()),
+            [
+                (1, 0, "Device:0", "device-0"),
+                (2, 0, "Device2J_1:0", "device2j-1-0"),
+                (3, 0, "card3:0", "card3-0"),
+                (4, 0, "card4:0", "card4-0"),
+            ]
+        );
+        let named = outputs(&pcm, Some((0, 1))).unwrap();
+        assert_eq!(
+            shown(&named).first(),
+            Some(&(0, 1, "Loopback:1", "loopback-1")),
+            "the loopback, named, is the one output it is"
+        );
+        assert_eq!(named.len(), 5, "and the other loopback device is not one");
+    }
+
+    /// Ids the kernel keeps apart can fold to one sink name, by case or by
+    /// `_` and `-`; the later output's name gains its card, so every output
+    /// can be named. The kernel's own `-` survives into the key.
+    #[test]
+    fn folded_sink_names_stay_distinct() {
+        let table = "00-00: A : A : playback 1\n\
+                     01-00: B : B : playback 1\n\
+                     02-00: C : C : playback 1\n\
+                     03-00: D : D : playback 1\n";
+        let dir = proc_tree(
+            "outputs-folded",
+            table,
+            &[
+                (0, "PCH\n"),
+                (1, "pch\n"),
+                (2, "USB_Dac\n"),
+                (3, "USB-Dac\n"),
+            ],
+        );
+        assert_eq!(
+            shown(&outputs(&dir.path().join("pcm"), None).unwrap()),
+            [
+                (0, 0, "PCH:0", "pch-0"),
+                (1, 0, "pch:0", "pch-0.1"),
+                (2, 0, "USB_Dac:0", "usb-dac-0"),
+                (3, 0, "USB-Dac:0", "usb-dac-0.3"),
+            ]
+        );
+    }
 
     #[test]
     fn a_real_table_yields_only_the_playback_devices() {

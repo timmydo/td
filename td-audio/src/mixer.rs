@@ -29,6 +29,7 @@
 //! is bookkeeping against `out_frames_mixed` and the device delay — see
 //! `drain_mark`.
 
+use crate::output::OutputSet;
 use crate::sink::{is_underrun, AudioSink, Spec, Wait, SAMPLE_BYTES};
 use std::collections::VecDeque;
 use std::fmt;
@@ -325,17 +326,18 @@ pub struct Mixer {
     /// daemon cannot discard them without also discarding every peer's mix,
     /// and retaining its vanished start blocker would strand the ring forever.
     retired_priming_contributed: bool,
+    /// The device was switched while playing, and the new one may start on
+    /// whatever the playing streams had left (`ready_to_resume`).
+    resuming: bool,
     /// End frame of a removed stream's contribution still in `pending`.
     retired_pending_contribution_end: usize,
     /// The next id `open` will issue. Monotonic and never reused, so a stream
     /// that has been removed cannot be confused with a later one.
     next_id: u64,
-    /// The output's level, in protocol volume units, and its mute: applied
-    /// to the summed mix, after every stream's own gain and before
-    /// saturation. Mute is a flag beside the level, as a stream's is, so
-    /// unmuting restores what was set.
-    master_volume: u32,
-    master_muted: bool,
+    /// Every output and which one plays. The active one's level and mute
+    /// are applied to the summed mix, after every stream's own gain and
+    /// before saturation.
+    outputs: OutputSet,
 }
 
 impl Mixer {
@@ -355,29 +357,42 @@ impl Mixer {
             out_frames_written: 0,
             device_delay: 0,
             retired_priming_contributed: false,
+            resuming: false,
             retired_pending_contribution_end: 0,
             next_id: 0,
-            master_volume: VOLUME_NORM,
-            master_muted: false,
+            outputs: OutputSet::default(),
         }
     }
 
-    /// Set the output's level. Takes effect on the next mixed period; what
-    /// the device ring already holds plays at the old level.
+    /// Set the active output's level. Takes effect on the next mixed period;
+    /// what the device ring already holds plays at the old level.
+    #[cfg(test)]
     pub fn set_master_volume(&mut self, volume: u32) {
-        self.master_volume = volume.min(VOLUME_MAX);
+        let active = self.outputs.active_position();
+        self.outputs.set_volume(active, volume);
     }
 
+    #[cfg(test)]
     pub fn set_master_mute(&mut self, muted: bool) {
-        self.master_muted = muted;
+        let active = self.outputs.active_position();
+        self.outputs.set_muted(active, muted);
     }
 
     pub fn master_volume(&self) -> u32 {
-        self.master_volume
+        self.outputs.active().volume
     }
 
     pub fn master_muted(&self) -> bool {
-        self.master_muted
+        self.outputs.active().muted
+    }
+
+    /// Every output, and which plays.
+    pub fn outputs(&self) -> &OutputSet {
+        &self.outputs
+    }
+
+    pub fn outputs_mut(&mut self) -> &mut OutputSet {
+        &mut self.outputs
     }
 
     pub fn target_floor_frames(&self) -> u64 {
@@ -888,18 +903,38 @@ impl Mixer {
                 .streams
                 .iter()
                 .all(|stream| !stream.priming_blocks_short_start);
-        let no_mixable_audio = !self.has_threshold_ready_audio()
+        self.device_delay > 0
+            && (self.device_delay.saturating_add(period_frames) > buffer_frames
+                || (released_finite_tail && self.nothing_more_to_mix(period_frames)))
+    }
+
+    /// After a switch from a playing device, whether the new one may start
+    /// short of primed on what the streams had left: continuous or not, they
+    /// were playing, and a full new ring may never come. Only the caller can
+    /// tell a finished tail from a stream between writes, by waiting.
+    pub fn ready_to_resume(&self, period_frames: u64) -> bool {
+        self.resuming && self.device_delay > 0 && self.nothing_more_to_mix(period_frames)
+    }
+
+    /// What the device holds; what a resumption watches for growth.
+    pub fn ring_frames(&self) -> u64 {
+        self.device_delay
+    }
+
+    /// No stream can give the stopped device another frame, and nothing
+    /// mixed waits to be accepted.
+    fn nothing_more_to_mix(&self, period_frames: u64) -> bool {
+        !self.has_threshold_ready_audio()
             && usize::try_from(period_frames)
                 .ok()
                 .filter(|period| *period > 0 && *period <= MAX_PERIOD_FRAMES)
-                .is_some_and(|period| self.mix_plan(period, true).frames == 0);
-        self.device_delay > 0
-            && (self.device_delay.saturating_add(period_frames) > buffer_frames
-                || (released_finite_tail && no_mixable_audio && self.pending_frames() == 0))
+                .is_some_and(|period| self.mix_plan(period, true).frames == 0)
+            && self.pending_frames() == 0
     }
 
     /// Forget the priming interval after a successful device START.
     pub fn note_started(&mut self) {
+        self.resuming = false;
         self.reset_priming_contributions();
         for stream in &mut self.streams {
             stream.threshold_start_released = false;
@@ -1072,10 +1107,10 @@ impl Mixer {
         self.pending.clear();
         self.pending_at = 0;
         self.pending.reserve(samples.saturating_mul(SAMPLE_BYTES));
-        let master = if self.master_muted {
+        let master = if self.master_muted() {
             0.0
         } else {
-            gain(self.master_volume)
+            gain(self.master_volume())
         };
         for sample in &self.accumulator {
             // The master multiplies the SUM, before saturation: two loud
@@ -1166,6 +1201,12 @@ impl Mixer {
     /// accepted endpoint. A refill accepted first extends that endpoint; a
     /// peer can advance the clock across it without a hardware XRUN.
     fn settle_played_underflows(&mut self) {
+        self.settle_underflows(false);
+    }
+
+    /// Settle every candidate the playhead has reached; `forgiven` retires
+    /// them without counting, as a switch does.
+    fn settle_underflows(&mut self, forgiven: bool) {
         let played = self.frames_played();
         let accepted = self.out_frames_written;
         for stream in &mut self.streams {
@@ -1174,6 +1215,7 @@ impl Mixer {
                     break;
                 }
                 if !candidate.suppress
+                    && !forgiven
                     && !stream.corked
                     && stream.underflow_events.len() >= MAX_UNDERFLOW_RECORDS
                 {
@@ -1189,6 +1231,12 @@ impl Mixer {
                     if played >= candidate.run_end {
                         stream.draining = false;
                     }
+                } else if forgiven {
+                    // Still running: its next audio goes to the new device,
+                    // which is not playing until it is primed, so nothing
+                    // starved. A later run's own candidates report a real
+                    // underflow there.
+                    continue;
                 } else if !stream.corked {
                     stream.underflows = stream.underflows.saturating_add(1);
                     stream.underflow_events.push_back(candidate.stream_end);
@@ -1224,9 +1272,44 @@ impl Mixer {
     /// everything mixed but unaccepted is still ahead of it.
     pub fn recover<S: AudioSink>(&mut self, sink: &mut S) -> io::Result<()> {
         sink.recover()?;
+        self.rebase();
+        // A resumption is one switch's; an underrun since ends it.
+        self.resuming = false;
+        Ok(())
+    }
+
+    /// Begin a new device epoch on another output, whose ring is empty and
+    /// not started: the old ring and everything in it are gone.
+    ///
+    /// This is `recover`'s rebase without a sink to recover, because the
+    /// sink is a different one. Mixed output the old device never accepted
+    /// is still ahead, and goes to the new one first; what the old ring held
+    /// is credited as played, so a `DRAIN` or `UNDERFLOW` that was waiting on
+    /// it resolves against the epoch that ended, as one waiting on an
+    /// underrun's discarded ring does.
+    ///
+    /// Every underflow candidate's endpoint was in the discarded ring, and
+    /// is forgiven: the stream was cut off, not starved, and the new device
+    /// is not playing until it is primed. It stays running, so its next
+    /// write is no new STARTED; if it never writes again, it stays running
+    /// until it is corked, drained or deleted, with no UNDERFLOW.
+    ///
+    /// A switch from a device that has not started since the last switch
+    /// keeps that switch's resumption: the streams' tail is still the one
+    /// the playing device was cut off from.
+    pub fn rebase_epoch(&mut self, was_running: bool) {
+        self.rebase_forgiving(true);
+        self.resuming = was_running || self.resuming;
+    }
+
+    fn rebase(&mut self) {
+        self.rebase_forgiving(false);
+    }
+
+    fn rebase_forgiving(&mut self, forgiven: bool) {
         self.device_delay = 0;
         self.reset_priming_contributions();
-        self.settle_played_underflows();
+        self.settle_underflows(forgiven);
         // The ring's contents are GONE — `PREPARE` discards them — so frames
         // this mixer had handed over and not yet counted as played were never
         // heard. `frames_played()` is `out_frames_written - device_delay`, and
@@ -1239,7 +1322,6 @@ impl Mixer {
         // the listener missed that audio; reporting it as still pending would
         // hold a `DRAIN` open for frames no device will ever play.
         self.retire_played_runs();
-        Ok(())
     }
 
     /// Run the device until every stream has drained, or `max_passes` passes
@@ -2022,6 +2104,132 @@ mod tests {
             mixer.ready_to_start(12, 4),
             "the released pending tail was stranded after PREPARE"
         );
+    }
+
+    /// A switch rebases onto a device the old ring never touched. Caught
+    /// with the old ring primed and not yet started, the mixer must not
+    /// call the new, empty ring primed, or a START plays it on nothing. What
+    /// was mixed and not accepted goes to the new device first, and the
+    /// stream's queue follows it in order: nothing replayed, nothing skipped.
+    #[test]
+    fn a_rebased_epoch_plays_on_a_fresh_device() {
+        let spec = Spec::fixed();
+        let mut old = MemorySink::new(spec, 12, 4);
+        let mut mixer = Mixer::new(spec);
+        let id = mixer.open(64).unwrap();
+        let frames: Vec<i16> = (1..=32).collect();
+        mixer.write(id, &stereo(&frames)).unwrap();
+        mixer.set_prebuffer(id, 0, false).unwrap();
+        for _ in 0..3 {
+            assert_eq!(mixer.pump(&mut old).unwrap().frames_written, 4);
+        }
+        old.limit_writes_to(Some(0));
+        assert_eq!(mixer.pump(&mut old).unwrap().frames_pending, 4);
+        assert!(mixer.ready_to_start(12, 4), "the old ring is primed");
+
+        let _ = old.stop();
+        let mut new = MemorySink::new(spec, 12, 4);
+        mixer.rebase_epoch(false);
+        assert!(
+            !mixer.ready_to_start(12, 4),
+            "the new ring is empty, whatever the old one held"
+        );
+        for _ in 0..3 {
+            assert_eq!(mixer.pump(&mut new).unwrap().frames_written, 4);
+        }
+        assert!(mixer.ready_to_start(12, 4));
+        let expected: Vec<i16> = (13..=24).flat_map(|frame| [frame, frame]).collect();
+        assert_eq!(new.samples(), expected);
+    }
+
+    /// A stream whose queue ran out exactly as a switch threw the old ring
+    /// away was cut off, not starved: the new device is not playing, so its
+    /// next write plays on with no UNDERFLOW and no prebuffer to fill again.
+    #[test]
+    fn a_switch_is_no_underflow() {
+        let spec = Spec::fixed();
+        let mut old = MemorySink::new(spec, 12, 4);
+        let mut mixer = Mixer::new(spec);
+        let id = mixer.open(64).unwrap();
+        mixer.set_prebuffer(id, 8, false).unwrap();
+        mixer.write(id, &stereo(&[300; 12])).unwrap();
+        for _ in 0..3 {
+            assert_eq!(mixer.pump(&mut old).unwrap().frames_written, 4);
+        }
+        old.start().unwrap();
+        mixer.note_started();
+        assert!(mixer.is_running(id).unwrap());
+
+        let _ = old.stop();
+        let mut new = MemorySink::new(spec, 12, 4);
+        mixer.rebase_epoch(true);
+        mixer.write(id, &stereo(&[400; 4])).unwrap();
+        mixer.observe_playhead(&mut new).unwrap();
+        assert_eq!(mixer.underflows(id).unwrap(), 0);
+        assert!(mixer.is_running(id).unwrap());
+        assert_eq!(
+            mixer.pump(&mut new).unwrap().frames_written,
+            4,
+            "no prebuffer to fill again"
+        );
+    }
+
+    /// A switch from a playing device lets the new ring resume on what the
+    /// streams had left once nothing more can be mixed, though it is short
+    /// of full; the server decides when. A START ends the resumption.
+    #[test]
+    fn a_switched_tail_starts_the_new_device() {
+        let spec = Spec::fixed();
+        let mut old = MemorySink::new(spec, 12, 4);
+        let mut mixer = Mixer::new(spec);
+        let id = mixer.open(64).unwrap();
+        mixer.set_prebuffer(id, 8, false).unwrap();
+        mixer.write(id, &stereo(&[500; 20])).unwrap();
+        for _ in 0..3 {
+            assert_eq!(mixer.pump(&mut old).unwrap().frames_written, 4);
+        }
+        old.start().unwrap();
+        mixer.note_started();
+
+        let _ = old.stop();
+        let mut new = MemorySink::new(spec, 12, 4);
+        mixer.rebase_epoch(true);
+        for _ in 0..2 {
+            assert_eq!(mixer.pump(&mut new).unwrap().frames_written, 4);
+        }
+        assert!(
+            mixer.ready_to_resume(4),
+            "the stream's last eight frames would wait for audio never coming"
+        );
+        new.start().unwrap();
+        mixer.note_started();
+        assert!(!mixer.ready_to_resume(4), "a start ends the resumption");
+    }
+
+    /// A resumption is one switch's: an underrun recovered since ends it, so
+    /// the stream's later audio primes the ring as ever.
+    #[test]
+    fn an_underrun_ends_a_resumption() {
+        let spec = Spec::fixed();
+        let mut old = MemorySink::new(spec, 12, 4);
+        let mut mixer = Mixer::new(spec);
+        let id = mixer.open(64).unwrap();
+        mixer.write(id, &stereo(&[500; 16])).unwrap();
+        for _ in 0..3 {
+            assert_eq!(mixer.pump(&mut old).unwrap().frames_written, 4);
+        }
+        old.start().unwrap();
+        mixer.note_started();
+
+        let _ = old.stop();
+        let mut new = MemorySink::new(spec, 12, 4);
+        mixer.rebase_epoch(true);
+        assert_eq!(mixer.pump(&mut new).unwrap().frames_written, 4);
+        assert!(mixer.ready_to_resume(4));
+        mixer.recover(&mut new).unwrap();
+        mixer.write(id, &stereo(&[600; 4])).unwrap();
+        assert_eq!(mixer.pump(&mut new).unwrap().frames_written, 4);
+        assert!(!mixer.ready_to_resume(4), "the underrun ended it");
     }
 
     /// Once a shorter stream's whole contribution was accepted, PREPARE must

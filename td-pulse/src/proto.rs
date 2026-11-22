@@ -215,6 +215,10 @@ pub mod command {
     /// `channel`.
     pub const TRIGGER_PLAYBACK_STREAM: u32 = 43;
 
+    /// A string: the sink's name, which `pactl` sends even for a numbered
+    /// sink. Captured in both forms from the pinned runtime's libpulse 17.0.
+    pub const SET_DEFAULT_SINK: u32 = 44;
+
     /// `channel`.
     pub const PREBUF_PLAYBACK_STREAM: u32 = 60;
 
@@ -301,6 +305,9 @@ pub fn error_name(code: u32) -> Option<&'static str> {
 pub mod subscription {
     pub const MASK_SINK: u32 = 0x0001;
     pub const MASK_SINK_INPUT: u32 = 0x0004;
+    /// The server's own facility: `PA_SUBSCRIPTION_MASK_SERVER`, inside the
+    /// captured `MASK_ALL`, under which a default-sink change is announced.
+    pub const MASK_SERVER: u32 = 0x0080;
     /// Every facility a client can ask about. This server only ever raises the
     /// two above, but a client subscribing to everything is the ordinary case
     /// and the mask it sends has to be understood rather than refused.
@@ -308,6 +315,7 @@ pub mod subscription {
 
     pub const EVENT_SINK: u32 = 0x0000;
     pub const EVENT_SINK_INPUT: u32 = 0x0002;
+    pub const EVENT_SERVER: u32 = 0x0007;
     pub const EVENT_FACILITY_MASK: u32 = 0x000F;
 
     pub const EVENT_NEW: u32 = 0x0000;
@@ -360,6 +368,7 @@ pub fn command_name(command: u32) -> Option<&'static str> {
         command::CORK_PLAYBACK_STREAM => "CORK_PLAYBACK_STREAM",
         command::FLUSH_PLAYBACK_STREAM => "FLUSH_PLAYBACK_STREAM",
         command::TRIGGER_PLAYBACK_STREAM => "TRIGGER_PLAYBACK_STREAM",
+        command::SET_DEFAULT_SINK => "SET_DEFAULT_SINK",
         command::PREBUF_PLAYBACK_STREAM => "PREBUF_PLAYBACK_STREAM",
         command::SET_SINK_INPUT_MUTE => "SET_SINK_INPUT_MUTE",
         command::UPDATE_PLAYBACK_STREAM_PROPLIST => "UPDATE_PLAYBACK_STREAM_PROPLIST",
@@ -460,6 +469,10 @@ pub(crate) mod tests {
         pub const GET_CLIENT_INFO_LIST: &str = "4c0000001c4c00000002";
         /// `pa_context_get_client_info(3)`, tag 2: the client's index.
         pub const GET_CLIENT_INFO: &str = "4c0000001b4c000000024c00000003";
+        /// `pactl set-default-sink pch-3`, tag 2: the name alone.
+        pub const SET_DEFAULT_SINK_BY_NAME: &str = "4c0000002c4c00000002747063682d3300";
+        /// `pactl set-default-sink 2`, tag 2: the number, as a name.
+        pub const SET_DEFAULT_SINK_BY_NUMBER_NAME: &str = "4c0000002c4c00000002743200";
     }
 
     /// Every fixture's first value is the command number this module pins. This
@@ -499,6 +512,14 @@ pub(crate) mod tests {
             ),
             (captured_17::GET_CLIENT_INFO, command::GET_CLIENT_INFO),
             (
+                captured_17::SET_DEFAULT_SINK_BY_NAME,
+                command::SET_DEFAULT_SINK,
+            ),
+            (
+                captured_17::SET_DEFAULT_SINK_BY_NUMBER_NAME,
+                command::SET_DEFAULT_SINK,
+            ),
+            (
                 captured::GET_PLAYBACK_LATENCY,
                 command::GET_PLAYBACK_LATENCY,
             ),
@@ -537,6 +558,22 @@ pub(crate) mod tests {
                 expected,
                 "captured packet {hex} is not command {expected}"
             );
+        }
+    }
+
+    /// `SET_DEFAULT_SINK` carries a name and nothing else, a number included.
+    #[test]
+    fn the_default_sink_is_set_by_name_alone() {
+        for (hex, name) in [
+            (captured_17::SET_DEFAULT_SINK_BY_NAME, "pch-3"),
+            (captured_17::SET_DEFAULT_SINK_BY_NUMBER_NAME, "2"),
+        ] {
+            let bytes = unhex(hex);
+            let mut reader = tag::Reader::new(&bytes);
+            assert_eq!(reader.u32().unwrap(), command::SET_DEFAULT_SINK);
+            assert_eq!(reader.u32().unwrap(), 2);
+            assert_eq!(reader.string().unwrap().as_deref(), Some(name));
+            reader.finish().unwrap();
         }
     }
 
@@ -796,6 +833,7 @@ pub(crate) mod tests {
             command::CORK_PLAYBACK_STREAM,
             command::FLUSH_PLAYBACK_STREAM,
             command::TRIGGER_PLAYBACK_STREAM,
+            command::SET_DEFAULT_SINK,
             command::PREBUF_PLAYBACK_STREAM,
             command::SET_SINK_INPUT_MUTE,
             command::UPDATE_PLAYBACK_STREAM_PROPLIST,

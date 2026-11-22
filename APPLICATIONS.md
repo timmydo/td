@@ -8704,6 +8704,47 @@ successful playback inaudible. Tests that need the capture oracle name its
 card and device explicitly, while a loopback-only machine has no implicit
 audible sink.
 
+**Every non-loopback playback PCM is an output.** Each is keyed by its
+card's `/proc/asound/card<N>/id` and the device (`PCH:0`), cut to the
+`[A-Za-z0-9_-]` the kernel allows in an id (a card whose id is missing
+or unreadable is `card<N>`). Its sink name is that id lowercased with
+`_` as `-` and the device appended (`pch-0`); a name an earlier output
+already took, which that folding can make of ids the kernel keeps apart,
+gains `.<card>`, which no derived name otherwise holds. Its description
+is the PCM line's name. The list is read once, at start: the key is what
+follows an adapter across the renumbering of a restart, and an adapter
+plugged in later is an output only after one. Hotplug is a later rung.
+The implicit choice, or the named `--card`/`--device`, is first and the
+rest follow by card and device; a named loopback is an output, an
+unnamed one is not. Only the active output is open. At start the daemon
+opens the first that will (a named one must; another that will not is
+reported and passed over), and every output plays in the one shape and
+ring geometry the first was given, so the target each session negotiated
+holds whichever plays. A switch opens the new PCM first and refuses,
+with the old one still playing, a device that will not open (`ACCESS`
+for a refused node, `NOTSUPPORTED` otherwise) or will not take that
+shape and ring (`NOTSUPPORTED`). Only then is the old ring stopped, its
+unplayed tail lost, and the mixer's output axis rebased onto the new
+ring without touching any device, exactly as recovery rebases it after
+`PREPARE`; the new device starts once primed. Streams, their queues and
+every connection carry on; a stream whose queue ran out with the old
+ring was cut off, not starved, so it is sent no `UNDERFLOW` and keeps
+its prebuffer released. Losing the active output, whether a poll or an
+ioctl (`ENODEV`) finds it gone, switches to the first other output that
+opens, in that order; losing it with none left ends the daemon as losing
+its one device always has. So does losing every output in turn without
+one taking a frame, which would otherwise switch between them forever
+with the supervisor never told. Every switch, asked for or forced, is
+logged naming both outputs. After a switch from a playing device the new
+one starts on a full ring as ever, or, once what the streams had left
+has stopped growing for one 100 ms idle wake, on that: a client between
+writes keeps it growing, and a finished tail starts that much late
+rather than never. An underrun since, or the start, ends that allowance;
+a second switch before the new device starts keeps it. A stream whose
+queue ran out with the old ring and that never writes again stays
+running, and owed no `UNDERFLOW`, until it is corked, drained or
+deleted: dropping it would send a second `STARTED` when it did write.
+
 **OSS emulation is refused, and the reason matters.** It survives in
 `linux-7.3.1` (`CONFIG_SND_PCM_OSS`, `sound/core/oss/pcm_oss.c`,
 including `SNDCTL_DSP_GETODELAY`) and would be genuinely smaller — plain
@@ -8960,8 +9001,33 @@ is an amplitude by the cube of its fraction of unity, libpulse's own
 applies before sending, and nothing is amplified above unity. A sink
 named by its decimal index resolves as the index: `pactl` sends
 `pactl get-sink-volume 0` as the name `"0"`.
+A controller or the compositor is shown every output (§K.4) as its own
+sink, indexed from zero in that order: the active one in the mixer's
+state, the others `SUSPENDED`, each with its own level and mute, and the
+active one as the server's default sink; `@DEFAULT_SINK@` and `td-audio`
+name the active one. A controller is told every stream plays on the
+active output, in stream info and in the reply to its own create; its
+create may name that output, and naming another is `NOTSUPPORTED`, since
+this server places every stream on the one that plays. Each output keeps
+its level across switches, and the
+mix plays at the active one's. A player is shown the one sink it always
+was, index 0 named `td-audio` at unity, whichever output plays, and hears
+nothing of a switch. A controller switches with `SET_DEFAULT_SINK`,
+captured from the pinned `pactl` naming the output by name and by number;
+a NULL name is `INVALID` (upstream reads it as "the automatic default";
+td has no automatic choice to return to after a switch, so it refuses
+rather than guess), one no output has is `NOENTITY`, and the active one,
+or one another controller switched to in the same pass, is answered at
+once without reopening it. The compositor and a player are answered
+`NOTIMPLEMENTED`. A switch, asked for or forced by a loss, is a server
+change event, a sink change event for each of the two outputs and a
+sink-input change event for every stream, to whoever hears them. The
+compositor hears only the sink events, and reads the default sink again
+on each. Commands pipelined after a switch are answered after
+it, so a server info asked behind it names the new default.
 A final readable AF_UNIX queue is consumed before a simultaneous hangup;
-device loss queues `PLAYBACK_STREAM_KILLED` for one nonblocking attempt and
+losing the last output queues `PLAYBACK_STREAM_KILLED` for one
+nonblocking attempt and
 then closes, so a backpressured client may observe EOF instead of that
 best-effort event.
 

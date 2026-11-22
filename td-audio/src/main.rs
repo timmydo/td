@@ -22,10 +22,16 @@ mod app_policy;
 #[path = "../../engine/src/workload_accounts.rs"]
 mod workload_accounts;
 
+// td-alloc's fallible growth, for the output list's text.
+#[allow(dead_code, reason = "the daemon uses a few of td-alloc's helpers")]
+#[path = "../../td-alloc/src/lib.rs"]
+mod allocation;
+
 mod alsa;
 mod control;
 mod device;
 mod mixer;
+mod output;
 mod pcm;
 mod serve;
 mod session;
@@ -159,19 +165,35 @@ fn parse_probe(arguments: &[OsString]) -> io::Result<PathBuf> {
 /// from `--output-uid`.
 fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
     let options = parse(arguments)?;
-    let found = device::read(&options.proc_pcm)?;
     let wanted = options.card.zip(options.device);
-    let playback = device::select(&found, wanted)?;
-    let sink = AlsaSink::open(playback, Request::default())?;
-    let spec = sink.spec();
-    let policy = options.admit(serve::Policy::for_deployment(current_uid()?)?);
-    let mut server = serve::Server::bind(&options.socket, sink, policy)?;
+    let outputs = device::outputs(&options.proc_pcm, wanted)?;
     let mut stdout = io::stdout();
+    let (active, sink) = open_first(&outputs, wanted.is_some(), open_alsa, &mut io::stderr())?;
+    for (position, output) in outputs.iter().enumerate() {
+        writeln!(
+            stdout,
+            "output {position} {} {} {}{}",
+            output.name,
+            output.key,
+            output.playback.name,
+            if position == active { " (active)" } else { "" }
+        )?;
+    }
+    let spec = sink.spec();
+    let node = outputs
+        .get(active)
+        .map(|output| output.playback.node())
+        .unwrap_or_default();
+    // Everything that can fail is done before the socket exists.
+    let set = output::OutputSet::discovered(outputs, active)?;
+    let policy = options.admit(serve::Policy::for_deployment(current_uid()?)?);
+    let mut server =
+        serve::Server::bind(&options.socket, sink, policy)?.with_outputs(set, open_alsa);
     writeln!(
         stdout,
         "{}: serving {} at {} Hz, {} channels, for uid(s) {:?}",
         options.socket.display(),
-        playback.node().display(),
+        node.display(),
         spec.rate,
         spec.channels,
         server.policy_uids()
@@ -181,10 +203,43 @@ fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
     match stopped? {
         serve::Stopped::DeviceGone => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
-            format!("{} went away", playback.node().display()),
+            "every output went away",
         )),
         serve::Stopped::Finished => Ok(()),
     }
+}
+
+/// Open an output's device in the daemon's fixed shape.
+fn open_alsa(playback: &device::Playback) -> io::Result<AlsaSink> {
+    AlsaSink::open(playback, Request::default())
+}
+
+/// The first output that opens, and where it is in `outputs`. A named one
+/// must open; otherwise one that will not is reported to `err` and passed
+/// over.
+fn open_first<S>(
+    outputs: &[device::Output],
+    named: bool,
+    open: serve::Open<S>,
+    err: &mut dyn Write,
+) -> io::Result<(usize, S)> {
+    for (position, output) in outputs.iter().enumerate() {
+        match open(&output.playback) {
+            Ok(sink) => return Ok((position, sink)),
+            Err(failure) if !named => {
+                writeln!(
+                    err,
+                    "td-audio: {} would not open, so it is passed over: {failure}",
+                    output.playback.node().display()
+                )?;
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no output would open",
+    ))
 }
 
 /// This process's real uid, from `/proc/self/status`.
@@ -704,6 +759,46 @@ mod tests {
 
     use super::*;
 
+    /// The daemon starts on the first output that opens. One that will not
+    /// is named on stderr and passed over; one the command line named must
+    /// open, or the daemon does not start.
+    #[test]
+    fn the_daemon_starts_on_the_first_output_that_opens() {
+        let output = |card: u32, name: &str| device::Output {
+            playback: device::Playback {
+                card,
+                device: 0,
+                id: name.to_owned(),
+                name: name.to_owned(),
+                subdevices: 1,
+                capture_subdevices: 0,
+            },
+            key: format!("C{card}:0"),
+            name: name.to_owned(),
+        };
+        let outputs = [output(7, "locked-0"), output(0, "pch-0")];
+        let open = crate::serve::tests::memory_output;
+        let mut err = Vec::new();
+        let (position, sink) = open_first(&outputs, false, open, &mut err).unwrap();
+        assert_eq!(position, 1);
+        assert_eq!(sink.buffer_frames(), 8_192);
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains("/dev/snd/pcmC7D0p would not open, so it is passed over"),
+            "{err}"
+        );
+        let refused = open_first(&outputs, true, open, &mut Vec::new()).err();
+        assert_eq!(
+            refused.map(|error| error.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+        let none = open_first(&outputs[..1], false, open, &mut Vec::new()).err();
+        assert_eq!(
+            none.map(|error| error.kind()),
+            Some(io::ErrorKind::NotFound)
+        );
+    }
+
     /// `--output-uid` reaches the policy `serve` runs with, and only then is
     /// the compositor admitted; a missing or non-numeric value is refused.
     #[test]
@@ -754,6 +849,7 @@ mod tests {
     fn sources() -> Vec<(&'static str, &'static str)> {
         vec![
             ("main.rs", include_str!("main.rs")),
+            ("allocation.rs", include_str!("../../td-alloc/src/lib.rs")),
             (
                 "app_policy.rs",
                 include_str!("../../td-busd/src/app_policy.rs"),
@@ -762,6 +858,7 @@ mod tests {
             ("control.rs", include_str!("control.rs")),
             ("device.rs", include_str!("device.rs")),
             ("mixer.rs", include_str!("mixer.rs")),
+            ("output.rs", include_str!("output.rs")),
             ("pcm.rs", include_str!("pcm.rs")),
             ("serve.rs", include_str!("serve.rs")),
             ("session.rs", include_str!("session.rs")),
@@ -883,9 +980,10 @@ mod tests {
                 "{file} declares a submodule, which no scan here reads"
             );
         }
-        // Two shared sources are inventoried above and staged by the recipe.
+        // Three shared sources are inventoried above and staged by the recipe.
         let mut rest = squeezed();
         for shared in [
+            concat!("#[pa", "th=\"../../td-alloc/src/lib.rs\"]"),
             concat!("#[pa", "th=\"../../td-busd/src/app_policy.rs\"]"),
             concat!("#[pa", "th=\"../../engine/src/workload_accounts.rs\"]"),
         ] {
@@ -927,7 +1025,9 @@ mod tests {
         }
         let mut scanned: Vec<String> = sources()
             .into_iter()
-            .filter(|(file, _)| !["app_policy.rs", "workload_accounts.rs"].contains(file))
+            .filter(|(file, _)| {
+                !["allocation.rs", "app_policy.rs", "workload_accounts.rs"].contains(file)
+            })
             .map(|(file, _)| file.to_string())
             .collect();
         on_disk.sort();
@@ -1083,6 +1183,7 @@ mod tests {
             let expected = match file {
                 "sys.rs" => KEYWORD_USES_IN_SYS,
                 "main.rs" => KEYWORD_USES_IN_MAIN,
+                "allocation.rs" => KEYWORD_USES_IN_ALLOCATION,
                 _ => 0,
             };
             assert_eq!(
@@ -1119,6 +1220,9 @@ mod tests {
     const KEYWORD_USES_IN_SYS: usize = 2;
     /// This file: the crate-level denial, and nothing else.
     const KEYWORD_USES_IN_MAIN: usize = 1;
+    /// td-alloc's own module-level `forbid`, which a region could not sit
+    /// under, and nothing else.
+    const KEYWORD_USES_IN_ALLOCATION: usize = 1;
     /// The conditional-attribute form, assembled so this scan does not match
     /// its own source.
     const CFG_ATTR: &str = concat!("#[cfg_", "attr(");

@@ -1093,7 +1093,7 @@ td-audio/src/device.rs	allocation-macro	5
 td-audio/src/device.rs	unchecked-growth-or-clone	1
 td-audio/src/main.rs	allocating-constructor	1
 td-audio/src/main.rs	allocating-conversion	3
-td-audio/src/main.rs	allocation-macro	20
+td-audio/src/main.rs	allocation-macro	19
 td-audio/src/main.rs	unchecked-growth-or-clone	11
 td-audio/src/mixer.rs	allocating-conversion	1
 td-audio/src/mixer.rs	allocation-macro	4

@@ -14,9 +14,10 @@
 //! so a client that writes and a device that drains are the same event loop.
 
 use crate::mixer::Mixer;
-use crate::proto::subscription;
+use crate::output::OutputSet;
+use crate::proto::{error, subscription};
 use crate::session::{Disconnect, GlobalRequest, Session};
-use crate::sink::{is_underrun, AudioSink, Spec};
+use crate::sink::{is_gone, is_underrun, AudioSink, Spec};
 use crate::sys::{self, Interest, PollSet};
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -80,6 +81,11 @@ pub const FRAME_DEADLINE: Duration = Duration::from_secs(5);
 /// How long one wait may block. A period at 48 kHz is about 21 ms, so this is
 /// generous enough to be a backstop rather than a poll rate.
 pub const WAIT_MS: i32 = 100;
+
+/// How long a resumed ring must stop growing before it starts short of
+/// primed: one idle wake, five periods, and well under the 170 ms a full
+/// ring would have held.
+const SWITCH_SETTLE: Duration = Duration::from_millis(WAIT_MS as u64);
 
 /// The most bytes read from one client per pass.
 const READ_CHUNK: usize = 64 * 1024;
@@ -406,6 +412,9 @@ pub enum Stopped {
     Finished,
 }
 
+/// Opens an output's device, in the fixed shape, for a switch.
+pub type Open<S> = fn(&crate::device::Playback) -> io::Result<S>;
+
 /// The daemon.
 pub struct Server<S: AudioSink> {
     listener: UnixListener,
@@ -416,6 +425,13 @@ pub struct Server<S: AudioSink> {
     app_levels: [(u32, bool); PLAYER_APPLICATIONS.len()],
     mixer: Mixer,
     sink: S,
+    /// How another output is opened; `None` for a daemon given one device
+    /// and no list, which has nothing to switch to.
+    open: Option<Open<S>>,
+    /// Fallbacks since an output last took a frame.
+    fallbacks_without_audio: usize,
+    /// A resumption's ring fill, and since when it has not grown.
+    resume_held: Option<(u64, Instant)>,
     policy: Policy,
     spec: Spec,
     poll: PollSet,
@@ -457,6 +473,9 @@ impl<S: AudioSink> Server<S> {
             app_levels: [UNITY_LEVEL; PLAYER_APPLICATIONS.len()],
             mixer: Mixer::with_target_floor(spec, target_floor_frames),
             sink,
+            open: None,
+            fallbacks_without_audio: 0,
+            resume_held: None,
             policy,
             spec,
             poll: PollSet::new(),
@@ -466,6 +485,15 @@ impl<S: AudioSink> Server<S> {
             disconnected: 0,
             diagnostics: Vec::new(),
         })
+    }
+
+    /// Offer every output in `outputs`, the active one being the device
+    /// `bind` was given, and open the others with `open` when one is asked
+    /// for or the active one is lost.
+    pub fn with_outputs(mut self, outputs: OutputSet, open: Open<S>) -> Self {
+        *self.mixer.outputs_mut() = outputs;
+        self.open = Some(open);
+        self
     }
 
     /// The most any one client is owed and has not taken.
@@ -537,7 +565,7 @@ impl<S: AudioSink> Server<S> {
         // Order the device clock before commands delivered by this poll wake.
         // A CORK/UNCORK or DRAIN cannot retroactively change whether an
         // already-crossed stream endpoint was intentional.
-        if self.observe_device()? {
+        if self.observe_device()? && !self.fall_back() {
             self.finish_device_gone();
             return Ok(true);
         }
@@ -550,7 +578,7 @@ impl<S: AudioSink> Server<S> {
         self.route_global_requests();
         self.broadcast_session_events();
         self.drop_output_overflows();
-        let gone = self.drive_device()?;
+        let gone = self.drive_device()? && !self.fall_back();
         self.service_clients();
         self.write_clients();
         if gone {
@@ -781,6 +809,16 @@ impl<S: AudioSink> Server<S> {
                 GlobalRequest::ClientList { tag, version } => {
                     self.reply_clients(requester, tag, version, None);
                 }
+                GlobalRequest::DefaultSink { tag, position } => {
+                    let from = self.mixer.outputs().active_position();
+                    let outcome = self.switch_to(position);
+                    if let Some(client) = self.clients.get_mut(requester) {
+                        client.session.finish_default_sink(tag, outcome);
+                    }
+                    if outcome.is_ok() && position != from {
+                        self.announce_switch(from, "asked for");
+                    }
+                }
                 GlobalRequest::ClientInfo {
                     tag,
                     index,
@@ -847,7 +885,8 @@ impl<S: AudioSink> Server<S> {
             | GlobalRequest::Mute { index, .. } => *index,
             GlobalRequest::SinkInputList { .. }
             | GlobalRequest::ClientInfo { .. }
-            | GlobalRequest::ClientList { .. } => {
+            | GlobalRequest::ClientList { .. }
+            | GlobalRequest::DefaultSink { .. } => {
                 if let Some(client) = self.clients.get_mut(requester) {
                     client.session.reject_global_request(request);
                 }
@@ -1101,9 +1140,148 @@ impl<S: AudioSink> Server<S> {
         self.drop_clients(&indexes);
     }
 
+    /// Make the output at `position` the one that plays, or answer the
+    /// protocol error why not with the old one still playing.
+    ///
+    /// The new device is opened first, so a refusal costs nothing. It must
+    /// take the shape and ring geometry the old one had, because every
+    /// session's target was negotiated against that ring; one that cannot
+    /// is unusable rather than a reason to renegotiate live streams. Only
+    /// then is the old ring stopped, its unplayed tail lost, and the mixer
+    /// rebased onto the new, empty one, which starts once it is primed. The
+    /// streams, their queues and every connection carry on.
+    fn switch_to(&mut self, position: usize) -> Result<(), u32> {
+        // Two controllers asking for one output in a pass: the second is
+        // already answered, and re-opening a playing device would only fail
+        // busy or throw its ring away.
+        if position == self.mixer.outputs().active_position() {
+            return Ok(());
+        }
+        let Some(playback) = self
+            .mixer
+            .outputs()
+            .entries()
+            .get(position)
+            .and_then(|entry| entry.playback.as_ref())
+        else {
+            return Err(error::NOENTITY);
+        };
+        let Some(open) = self.open else {
+            return Err(error::NOTSUPPORTED);
+        };
+        let new = match open(playback) {
+            Ok(sink) => sink,
+            Err(failure) => {
+                diagnostic(
+                    &mut self.diagnostics,
+                    format_args!("{} would not open: {failure}", playback.node().display()),
+                );
+                return Err(if failure.kind() == io::ErrorKind::PermissionDenied {
+                    error::ACCESS
+                } else {
+                    error::NOTSUPPORTED
+                });
+            }
+        };
+        if new.spec() != self.spec
+            || new.buffer_frames() != self.sink.buffer_frames()
+            || new.period_frames() != self.sink.period_frames()
+        {
+            diagnostic(
+                &mut self.diagnostics,
+                format_args!(
+                    "{} would not take the {}-frame ring of {}-frame periods",
+                    playback.node().display(),
+                    self.sink.buffer_frames(),
+                    self.sink.period_frames()
+                ),
+            );
+            return Err(error::NOTSUPPORTED);
+        }
+        let mut old = std::mem::replace(&mut self.sink, new);
+        let was_running = old.is_running();
+        // Discards what the old ring held. A lost device answers with an
+        // error, and is dropped all the same.
+        let _ = old.stop();
+        drop(old);
+        self.mixer.rebase_epoch(was_running);
+        // The hold watched the old ring; the new one's fill starts anew.
+        self.resume_held = None;
+        self.mixer.outputs_mut().set_active(position);
+        Ok(())
+    }
+
+    /// The active output is gone: play on the first other output that opens,
+    /// in preference order. `false` when none does, which ends the daemon as
+    /// losing its one device always has (§K.5: no silent fake sink).
+    ///
+    /// Outputs that open and are then lost before taking a frame would be
+    /// switched between forever, and the supervisor never told; so once
+    /// every output has had its turn without taking one, the daemon ends.
+    fn fall_back(&mut self) -> bool {
+        let outputs = self.mixer.outputs().entries().len();
+        if self.fallbacks_without_audio >= outputs {
+            return false;
+        }
+        self.fallbacks_without_audio = self.fallbacks_without_audio.saturating_add(1);
+        let lost = self.mixer.outputs().active_position();
+        for position in 0..outputs {
+            if position != lost && self.switch_to(position).is_ok() {
+                self.announce_switch(lost, "fell back from a lost output");
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Tell whoever hears it that another output plays: the server's
+    /// default sink changed, so did the state of the two outputs, and every
+    /// stream is now on the new one. A player hears none of it; its one sink
+    /// never changes. The log says it too, as nothing else would.
+    fn announce_switch(&mut self, from: usize, why: &str) {
+        let outputs = self.mixer.outputs();
+        let to = outputs.active();
+        let from = outputs.entries().get(from).unwrap_or(to);
+        let _ = writeln!(
+            io::stderr(),
+            "td-audio: {why}, {} plays on {}",
+            from.name,
+            to.name
+        );
+        let (from, to) = (from.index, to.index);
+        self.notify_others(
+            None,
+            subscription::EVENT_SERVER | subscription::EVENT_CHANGE,
+            crate::tag::INVALID_INDEX,
+        );
+        for index in [from, to] {
+            self.notify_others(
+                None,
+                subscription::EVENT_SINK | subscription::EVENT_CHANGE,
+                index,
+            );
+        }
+        for at in 0..self.clients.len() {
+            let Some(client) = self.clients.get(at) else {
+                continue;
+            };
+            for index in client.session.sink_input_indexes() {
+                self.notify_others(
+                    None,
+                    subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+                    index,
+                );
+            }
+        }
+    }
+
     /// Settle the device timeline before applying this wake's client commands.
-    /// `true` means the device is gone.
+    /// `true` means the device is gone, whichever ioctl found it so.
     fn observe_device(&mut self) -> io::Result<bool> {
+        gone_or(self.observe_device_once())
+    }
+
+    fn observe_device_once(&mut self) -> io::Result<bool> {
         if !self.mixer.sink_is_running() {
             return Ok(false);
         }
@@ -1127,9 +1305,40 @@ impl<S: AudioSink> Server<S> {
         }
     }
 
+    /// Whether the stopped device may start: primed, or a released tail;
+    /// or, after a switch from a playing device, what the streams had left
+    /// once it has stopped growing for `SWITCH_SETTLE`. A client between
+    /// writes grows it again and primes the ring as ever; a finished tail
+    /// starts that much late instead of never.
+    fn may_start(&mut self) -> bool {
+        let period = self.sink.period_frames();
+        if self.mixer.ready_to_start(self.sink.buffer_frames(), period) {
+            return true;
+        }
+        if !self.mixer.ready_to_resume(period) {
+            self.resume_held = None;
+            return false;
+        }
+        let held = self.mixer.ring_frames();
+        let now = Instant::now();
+        match self.resume_held {
+            Some((frames, since)) if frames == held => {
+                now.saturating_duration_since(since) >= SWITCH_SETTLE
+            }
+            _ => {
+                self.resume_held = Some((held, now));
+                false
+            }
+        }
+    }
+
     /// Hand at most one period of real audio to the device.
     /// `true` means the device is gone.
     fn drive_device(&mut self) -> io::Result<bool> {
+        gone_or(self.drive_device_once())
+    }
+
+    fn drive_device_once(&mut self) -> io::Result<bool> {
         match self.sink.wait(0)? {
             crate::sink::Wait::Gone => return Ok(true),
             crate::sink::Wait::Underrun => {
@@ -1149,7 +1358,11 @@ impl<S: AudioSink> Server<S> {
             crate::sink::Wait::Writable => {}
         }
         match self.mixer.pump(&mut self.sink) {
-            Ok(_) => {}
+            Ok(pumped) => {
+                if pumped.frames_written > 0 {
+                    self.fallbacks_without_audio = 0;
+                }
+            }
             Err(error) if is_underrun(&error) => {
                 self.mixer.recover(&mut self.sink)?;
                 // Deliberately NOT started here. `PREPARE` left the ring empty
@@ -1167,13 +1380,10 @@ impl<S: AudioSink> Server<S> {
         // sets `start_threshold` to the boundary so the device never starts
         // itself, which is what keeps the first sound aligned with the first
         // audio instead of with the silence before it.
-        if !self.sink.is_running()
-            && self
-                .mixer
-                .ready_to_start(self.sink.buffer_frames(), self.sink.period_frames())
-        {
+        if !self.sink.is_running() && self.may_start() {
             self.sink.start()?;
             self.mixer.note_started();
+            self.resume_held = None;
         }
         Ok(false)
     }
@@ -1351,6 +1561,15 @@ fn diagnostic(diagnostics: &mut Vec<String>, message: fmt::Arguments<'_>) {
         return;
     }
     diagnostics.push(message.to_string());
+}
+
+/// A device result, with an error that means the device went away read as
+/// its going away.
+fn gone_or(outcome: io::Result<bool>) -> io::Result<bool> {
+    match outcome {
+        Err(error) if is_gone(&error) => Ok(true),
+        other => other,
+    }
 }
 
 fn report_disconnect(
@@ -1570,6 +1789,14 @@ pub(crate) mod tests {
             }
         }
         out
+    }
+
+    /// Every control packet's command, in order.
+    fn commands_in(bytes: &[u8]) -> Vec<u32> {
+        control_packets(bytes)
+            .iter()
+            .filter_map(|packet| wire::command_and_tag(packet).ok().map(|(c, _)| c))
+            .collect()
     }
 
     fn first_command(bytes: &[u8]) -> Option<u32> {
@@ -2395,6 +2622,7 @@ pub(crate) mod tests {
         index: u32,
         name: String,
         client: u32,
+        sink: u32,
         volume: Vec<u32>,
         muted: bool,
         properties: Vec<tag::Property>,
@@ -2410,7 +2638,8 @@ pub(crate) mod tests {
             let name = reader.string().unwrap().unwrap_or_default();
             reader.skip().unwrap();
             let client = reader.u32().unwrap();
-            for _ in 0..3 {
+            let sink = reader.u32().unwrap();
+            for _ in 0..2 {
                 reader.skip().unwrap();
             }
             let volume = reader.cvolume().unwrap();
@@ -2426,6 +2655,7 @@ pub(crate) mod tests {
                 index,
                 name,
                 client,
+                sink,
                 volume,
                 muted,
                 properties,
@@ -2939,8 +3169,10 @@ pub(crate) mod tests {
         }));
         probes.extend(named_create_request(15, "a chime"));
         compositor.write_all(&probes).unwrap();
-        server.pass().unwrap();
-        server.pass().unwrap();
+        // Each routed probe holds the ones behind it to the next pass.
+        for _ in 0..4 {
+            server.pass().unwrap();
+        }
         let answers = drain_socket(&mut compositor);
         for probe in [10, 11, 14, 15] {
             assert_eq!(
@@ -3098,8 +3330,10 @@ pub(crate) mod tests {
             writer.u32(foreign).boolean(true);
         }));
         player.write_all(&probes).unwrap();
-        server.pass().unwrap();
-        server.pass().unwrap();
+        // Each routed probe holds the ones behind it to the next pass.
+        for _ in 0..4 {
+            server.pass().unwrap();
+        }
         let answers = drain_socket(&mut player);
         for probe in [30, 31, 32] {
             assert_eq!(
@@ -3122,8 +3356,9 @@ pub(crate) mod tests {
             writer.u32(absent).boolean(true);
         }));
         player.write_all(&probes).unwrap();
-        server.pass().unwrap();
-        server.pass().unwrap();
+        for _ in 0..4 {
+            server.pass().unwrap();
+        }
         assert_eq!(drain_socket(&mut player), answers);
 
         owner
@@ -4018,6 +4253,870 @@ pub(crate) mod tests {
         let (mut server, path) = server("limit");
         assert_eq!(server.run(Some(3)).unwrap(), Stopped::Finished);
         assert!(path.exists());
+        server.shutdown();
+    }
+
+    /// The test opener: card 7 refuses as a node still being handed to
+    /// audio would, card 8 offers a smaller ring than the daemon drives,
+    /// card 9 the ring at another rate, card 10 a device that is gone as it
+    /// opens, card 11 a device that counts its opens for the one test that
+    /// uses it, and any other opens the production geometry, stopped, as a
+    /// fresh PCM is.
+    static CARD_11_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub(crate) fn memory_output(playback: &crate::device::Playback) -> io::Result<MemorySink> {
+        match playback.card {
+            7 => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            8 => Ok(MemorySink::new(Spec::fixed(), 4_096, 1_024)),
+            11 => {
+                CARD_11_OPENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(MemorySink::new(Spec::fixed(), 8_192, 1_024))
+            }
+            10 => {
+                let mut gone = MemorySink::new(Spec::fixed(), 8_192, 1_024);
+                gone.unplug();
+                Ok(gone)
+            }
+            9 => Ok(MemorySink::new(
+                Spec {
+                    rate: 44_100,
+                    ..Spec::fixed()
+                },
+                8_192,
+                1_024,
+            )),
+            _ => Ok(MemorySink::new(Spec::fixed(), 8_192, 1_024)),
+        }
+    }
+
+    /// A daemon offering `outputs`, `(card, sink name, description)`, the
+    /// first of which is the device `server` bound.
+    fn server_with_outputs(
+        name: &str,
+        outputs: &[(u32, &str, &str)],
+    ) -> (Server<MemorySink>, PathBuf) {
+        let (server, path) = server(name);
+        let found = outputs
+            .iter()
+            .map(|(card, name, description)| crate::device::Output {
+                playback: crate::device::Playback {
+                    card: *card,
+                    device: 0,
+                    id: (*description).to_owned(),
+                    name: (*description).to_owned(),
+                    subdevices: 1,
+                    capture_subdevices: 0,
+                },
+                key: format!("C{card}:0"),
+                name: (*name).to_owned(),
+            })
+            .collect();
+        let set = OutputSet::discovered(found, 0).unwrap();
+        (server.with_outputs(set, memory_output), path)
+    }
+
+    /// Each sink in a sink-info reply: index, name, description, level,
+    /// mute and state, after which the reply must be exhausted.
+    fn sinks_in(reply: &[u8], count: usize) -> Vec<(u32, String, String, u32, bool, u32)> {
+        let mut reader = tag::Reader::new(reply);
+        reader.u32().unwrap();
+        reader.u32().unwrap();
+        let mut sinks = Vec::new();
+        for _ in 0..count {
+            let index = reader.u32().unwrap();
+            let name = reader.string().unwrap().unwrap();
+            let description = reader.string().unwrap().unwrap();
+            reader.sample_spec().unwrap();
+            reader.channel_map().unwrap();
+            reader.u32().unwrap();
+            let volume = reader.cvolume().unwrap()[0];
+            let muted = reader.boolean().unwrap();
+            reader.u32().unwrap();
+            reader.string().unwrap();
+            reader.usec().unwrap();
+            reader.string().unwrap();
+            reader.u32().unwrap();
+            let properties = reader.proplist().unwrap();
+            assert_eq!(
+                property_value(&properties, "device.description").as_deref(),
+                Some(description.as_str())
+            );
+            reader.usec().unwrap();
+            reader.volume().unwrap();
+            let state = reader.u32().unwrap();
+            reader.u32().unwrap();
+            reader.u32().unwrap();
+            reader.u32().unwrap();
+            reader.string().unwrap();
+            reader.u8().unwrap();
+            reader.format_info().unwrap();
+            sinks.push((index, name, description, volume, muted, state));
+        }
+        reader.finish().unwrap();
+        sinks
+    }
+
+    /// The default sink a server-info reply names.
+    fn default_sink_in(reply: &[u8]) -> String {
+        let mut reader = tag::Reader::new(reply);
+        for _ in 0..7 {
+            reader.skip().unwrap();
+        }
+        reader.string().unwrap().unwrap()
+    }
+
+    fn set_default(tag_number: u32, name: Option<&str>) -> Vec<u8> {
+        build(command::SET_DEFAULT_SINK, tag_number, |writer| match name {
+            Some(name) => {
+                writer.string(name);
+            }
+            None => {
+                writer.null_string();
+            }
+        })
+    }
+
+    fn passes(server: &mut Server<MemorySink>, count: usize) {
+        for _ in 0..count {
+            server.pass().unwrap();
+        }
+    }
+
+    /// Interleaved stereo at one level: `frames` frames of `level`, on the
+    /// stream channel `channel`.
+    fn audio(channel: u32, frames: usize, level: i16) -> Vec<u8> {
+        let mut pcm = Vec::new();
+        for _ in 0..frames * 2 {
+            pcm.extend_from_slice(&level.to_le_bytes());
+        }
+        let mut framed = wire::Descriptor::encode(pcm.len() as u32, channel, 0, 0).to_vec();
+        framed.extend_from_slice(&pcm);
+        framed
+    }
+
+    /// A controller is shown every output, the active one in the mixer's
+    /// state and the rest suspended, each at its own level, and the active
+    /// one as the server's default; a player is shown its one sink and
+    /// nothing of the outputs. A level set on an output that does not play
+    /// is that output's, announced under its index, and leaves the mix alone.
+    #[test]
+    fn a_controller_sees_every_output_and_a_player_one_sink() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-view",
+            &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+        );
+        server.policy = browser_policy(own_uid());
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut controller = UnixStream::connect(&path).unwrap();
+        for socket in [&mut player, &mut controller] {
+            socket.write_all(&auth_packet()).unwrap();
+            socket
+                .write_all(&build(command::SUBSCRIBE, 2, |writer| {
+                    writer.u32(subscription::MASK_ALL);
+                }))
+                .unwrap();
+        }
+        passes(&mut server, 2);
+        for socket in [&mut player, &mut controller] {
+            let _ = drain_socket(socket);
+        }
+        let mut asks = build(command::GET_SINK_INFO_LIST, 3, |_| {});
+        asks.extend(build(command::GET_SERVER_INFO, 4, |_| {}));
+        asks.extend(build(command::GET_SINK_INFO, 5, |writer| {
+            writer.u32(tag::INVALID_INDEX).string("device-0");
+        }));
+        for socket in [&mut player, &mut controller] {
+            socket.write_all(&asks).unwrap();
+        }
+        passes(&mut server, 2);
+        let norm = crate::mixer::VOLUME_NORM;
+        let idle = crate::session::SINK_STATE_IDLE;
+        let suspended = crate::session::SINK_STATE_SUSPENDED;
+        let seen = drain_socket(&mut controller);
+        assert_eq!(
+            sinks_in(&reply_packet(&seen, 3).unwrap(), 2),
+            [
+                (0, "pch-0".into(), "ALC892 Analog".into(), norm, false, idle),
+                (
+                    1,
+                    "device-0".into(),
+                    "USB Audio".into(),
+                    norm,
+                    false,
+                    suspended
+                ),
+            ]
+        );
+        assert_eq!(default_sink_in(&reply_packet(&seen, 4).unwrap()), "pch-0");
+        assert_eq!(sinks_in(&reply_packet(&seen, 5).unwrap(), 1)[0].0, 1);
+        let seen = drain_socket(&mut player);
+        assert_eq!(
+            sinks_in(&reply_packet(&seen, 3).unwrap(), 1),
+            [(0, "td-audio".into(), "td audio".into(), norm, false, idle)]
+        );
+        assert_eq!(
+            default_sink_in(&reply_packet(&seen, 4).unwrap()),
+            "td-audio"
+        );
+        assert_eq!(error_code(&seen, 5), Some(crate::proto::error::NOENTITY));
+
+        let half = norm / 2;
+        controller
+            .write_all(&build(command::SET_SINK_VOLUME, 6, |writer| {
+                writer.u32(1).null_string().cvolume(&[half, half]);
+            }))
+            .unwrap();
+        passes(&mut server, 2);
+        let seen = drain_socket(&mut controller);
+        assert_eq!(error_code(&seen, 6), None);
+        assert_eq!(
+            subscription_events(&seen),
+            [(subscription::EVENT_SINK | subscription::EVENT_CHANGE, 1)]
+        );
+        assert_eq!(
+            server.mixer.master_volume(),
+            norm,
+            "the mix plays at pch-0's"
+        );
+        assert_eq!(server.mixer.outputs().entries()[1].volume, half);
+        assert_eq!(subscription_events(&drain_socket(&mut player)), []);
+        server.shutdown();
+    }
+
+    /// Switching opens the new output, keeps every connection and stream,
+    /// plays the stream on at the new output's level, and is announced to a
+    /// controller as the server's default and both outputs changing; a
+    /// player hears nothing and its one sink is the same sink.
+    #[test]
+    fn a_controller_switches_outputs_and_every_stream_plays_on() {
+        const COMPOSITOR_UID: u32 = 993;
+        let (mut server, path) = server_with_outputs(
+            "outputs-switch",
+            &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+        );
+        server.policy = browser_policy(own_uid()).with_output_uid(COMPOSITOR_UID);
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut compositor = admit_as(&mut server, COMPOSITOR_UID, 8);
+        let mut controller = UnixStream::connect(&path).unwrap();
+        for socket in [&mut player, &mut compositor, &mut controller] {
+            socket.write_all(&auth_packet()).unwrap();
+            socket
+                .write_all(&build(command::SUBSCRIBE, 2, |writer| {
+                    writer.u32(subscription::MASK_ALL);
+                }))
+                .unwrap();
+        }
+        passes(&mut server, 2);
+        player.write_all(&create_request(3, false)).unwrap();
+        passes(&mut server, 2);
+        player.write_all(&audio(0, 19_200, 900)).unwrap();
+        passes(&mut server, 4);
+        assert!(server.sink.frames_written() > 0, "pch-0 played first");
+        for socket in [&mut player, &mut compositor, &mut controller] {
+            let _ = drain_socket(socket);
+        }
+        let half = crate::mixer::VOLUME_NORM / 2;
+        let mut asks = build(command::SET_SINK_VOLUME, 4, |writer| {
+            writer.u32(1).null_string().cvolume(&[half, half]);
+        });
+        asks.extend(set_default(5, Some("device-0")));
+        asks.extend(build(command::GET_SERVER_INFO, 6, |_| {}));
+        controller.write_all(&asks).unwrap();
+        passes(&mut server, 4);
+        let seen = drain_socket(&mut controller);
+        assert_eq!(error_code(&seen, 5), None);
+        assert!(reply_packet(&seen, 5).is_some());
+        assert_eq!(
+            default_sink_in(&reply_packet(&seen, 6).unwrap()),
+            "device-0"
+        );
+        let change = subscription::EVENT_CHANGE;
+        assert_eq!(
+            subscription_events(&seen),
+            [
+                (subscription::EVENT_SINK | change, 1),
+                (subscription::EVENT_SERVER | change, tag::INVALID_INDEX),
+                (subscription::EVENT_SINK | change, 0),
+                (subscription::EVENT_SINK | change, 1),
+                (subscription::EVENT_SINK_INPUT | change, 0),
+            ]
+        );
+        assert_eq!(
+            subscription_events(&drain_socket(&mut compositor)),
+            [
+                (subscription::EVENT_SINK | change, 0),
+                (subscription::EVENT_SINK | change, 1),
+                (subscription::EVENT_SINK | change, 1),
+            ],
+            "the compositor hears its outputs, the switch before the level the \
+             controller's session raised in the same pass, and no server event"
+        );
+        assert_eq!(server.mixer.outputs().active().name, "device-0");
+        assert_eq!(server.mixer.master_volume(), half, "the new output's level");
+        assert_eq!(server.stream_count(), 1);
+        let mut heard = drain_socket(&mut player);
+        assert_eq!(subscription_events(&heard), []);
+
+        player.write_all(&audio(0, 19_200, 900)).unwrap();
+        // The fresh device starts only on a ring the stream primed again:
+        // the old ring's priming was the old device's, and is gone with it.
+        let mut started_with = None;
+        for _ in 0..12 {
+            server.pass().unwrap();
+            if server.sink.is_running() {
+                started_with.get_or_insert(server.sink.frames_written());
+            }
+        }
+        assert_eq!(started_with, Some(8_192), "started on a full ring");
+        // Across the switch the player was told nothing about its stream:
+        // not killed, not starved, not started again.
+        // Its queue is far above target, so it is owed nothing else either;
+        // a_short_queue_across_a_switch_still_primes_the_new_ring is where a
+        // player that is asked for audio is checked.
+        heard.extend(drain_socket(&mut player));
+        let told_now = commands_in(&heard);
+        for told in [
+            command::PLAYBACK_STREAM_KILLED,
+            command::UNDERFLOW,
+            command::STARTED,
+        ] {
+            assert!(!told_now.contains(&told), "the player was sent {told}");
+        }
+        assert!(
+            server.sink.frames_written() > 0,
+            "device-0 plays the stream"
+        );
+        let samples = server.sink.samples();
+        assert!(
+            samples
+                .iter()
+                .take(64)
+                .all(|sample| *sample > 0 && *sample < 900),
+            "at device-0's level: {:?}",
+            &samples[..8.min(samples.len())]
+        );
+        player
+            .write_all(&build(command::GET_SINK_INFO, 7, |writer| {
+                writer.u32(0).null_string();
+            }))
+            .unwrap();
+        passes(&mut server, 2);
+        let norm = crate::mixer::VOLUME_NORM;
+        let shown = sinks_in(&reply_packet(&drain_socket(&mut player), 7).unwrap(), 1);
+        assert_eq!(
+            (shown[0].0, shown[0].1.as_str(), shown[0].3),
+            (0, "td-audio", norm)
+        );
+
+        // A controller is told the stream plays on device-0, and may place
+        // a stream there but not on an output that is not playing.
+        let mut asks = build(command::GET_SINK_INPUT_INFO_LIST, 8, |_| {});
+        asks.extend(named_sink_create(9, "pch-0"));
+        asks.extend(named_sink_create(10, "device-0"));
+        controller.write_all(&asks).unwrap();
+        passes(&mut server, 4);
+        let seen = drain_socket(&mut controller);
+        let streams = sink_input_entries(&reply_packet(&seen, 8).unwrap());
+        assert_eq!(
+            streams.iter().map(|entry| entry.sink).collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(
+            error_code(&seen, 9),
+            Some(crate::proto::error::NOTSUPPORTED)
+        );
+        assert_eq!(error_code(&seen, 10), None);
+        assert!(reply_packet(&seen, 10).is_some());
+        server.shutdown();
+    }
+
+    /// A create naming its sink by name.
+    fn named_sink_create(tag_number: u32, sink: &str) -> Vec<u8> {
+        build(command::CREATE_PLAYBACK_STREAM, tag_number, |writer| {
+            writer
+                .sample_spec(tag::SampleSpec {
+                    format: crate::proto::format::SAMPLE_S16LE,
+                    channels: 2,
+                    rate: 48_000,
+                })
+                .channel_map(&crate::session::CHANNEL_MAP)
+                .u32(tag::INVALID_INDEX)
+                .string(sink)
+                .u32(tag::INVALID_INDEX)
+                .boolean(true)
+                .u32(tag::INVALID_INDEX)
+                .u32(tag::INVALID_INDEX)
+                .u32(tag::INVALID_INDEX)
+                .u32(0)
+                .cvolume(&[crate::mixer::VOLUME_NORM, crate::mixer::VOLUME_NORM]);
+            for _ in 0..9 {
+                writer.boolean(false);
+            }
+            writer.proplist(&[]);
+            for _ in 0..7 {
+                writer.boolean(false);
+            }
+            writer.u8(0);
+        })
+    }
+
+    /// Two controllers asking for one output in one pass: one switch, both
+    /// answered, one announcement, and the playing device not reopened.
+    #[test]
+    fn two_asks_for_one_output_are_one_switch() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-twice",
+            &[(0, "pch-0", "ALC892 Analog"), (11, "device-0", "USB Audio")],
+        );
+        let mut first = UnixStream::connect(&path).unwrap();
+        let mut second = UnixStream::connect(&path).unwrap();
+        for socket in [&mut first, &mut second] {
+            socket.write_all(&auth_packet()).unwrap();
+            socket
+                .write_all(&build(command::SUBSCRIBE, 2, |writer| {
+                    writer.u32(subscription::MASK_ALL);
+                }))
+                .unwrap();
+        }
+        passes(&mut server, 2);
+        for socket in [&mut first, &mut second] {
+            let _ = drain_socket(socket);
+        }
+        for socket in [&mut first, &mut second] {
+            socket.write_all(&set_default(3, Some("device-0"))).unwrap();
+        }
+        passes(&mut server, 3);
+        assert_eq!(server.mixer.outputs().active_position(), 1);
+        assert_eq!(
+            CARD_11_OPENS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the playing device was opened again"
+        );
+        let change = subscription::EVENT_CHANGE;
+        for socket in [&mut first, &mut second] {
+            let seen = drain_socket(socket);
+            assert!(reply_packet(&seen, 3).is_some());
+            assert_eq!(
+                subscription_events(&seen),
+                [
+                    (subscription::EVENT_SERVER | change, tag::INVALID_INDEX),
+                    (subscription::EVENT_SINK | change, 0),
+                    (subscription::EVENT_SINK | change, 1),
+                ]
+            );
+        }
+        server.shutdown();
+    }
+
+    /// A stream's DRAIN, outstanding when a switch throws the old ring's
+    /// audio away, completes once the new device plays what the stream had
+    /// left, rather than waiting on frames no device will play.
+    #[test]
+    fn a_drain_outstanding_across_a_switch_completes() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-drain",
+            &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+        );
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&auth_packet()).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&create_request(2, false)).unwrap();
+        passes(&mut server, 2);
+        let _ = drain_socket(&mut client);
+        client.write_all(&audio(0, 9_600, 900)).unwrap();
+        passes(&mut server, 10);
+        client
+            .write_all(&build(command::DRAIN_PLAYBACK_STREAM, 3, |writer| {
+                writer.u32(0);
+            }))
+            .unwrap();
+        passes(&mut server, 2);
+        assert!(reply_packet(&drain_socket(&mut client), 3).is_none());
+
+        assert_eq!(server.switch_to(1), Ok(()));
+        passes(&mut server, 4);
+        assert!(
+            server.sink.is_running(),
+            "the drained tail started device-0"
+        );
+        let written = server.sink.frames_written();
+        assert!(written > 0);
+        server.sink.advance(written);
+        passes(&mut server, 2);
+        assert!(
+            reply_packet(&drain_socket(&mut client), 3).is_some(),
+            "the drain waits on a ring that is gone"
+        );
+        server.shutdown();
+    }
+
+    /// A stream's last periods, still queued when a switch takes the old
+    /// ring, are not stranded in a new one that never starts: once nothing
+    /// more has come from the stream for `SWITCH_SETTLE`, device-0 starts
+    /// on what it had.
+    #[test]
+    fn a_tail_queued_across_a_switch_plays_on_the_new_device() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-stranded",
+            &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+        );
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&auth_packet()).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&create_request(2, false)).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&audio(0, 8_192 + 4_096, 900)).unwrap();
+        passes(&mut server, 12);
+        assert!(server.sink.is_running(), "pch-0 plays");
+
+        assert_eq!(server.switch_to(1), Ok(()));
+        // A period a pass until the tail is in. Idle passes each wait out a
+        // poll, so the settle may already pass here; the sleep makes sure.
+        passes(&mut server, 6);
+        assert_eq!(server.sink.frames_written(), 4_096);
+        std::thread::sleep(SWITCH_SETTLE + Duration::from_millis(20));
+        passes(&mut server, 2);
+        assert!(
+            server.sink.is_running(),
+            "the tail is stranded in device-0's ring"
+        );
+        server.shutdown();
+    }
+
+    /// A stream with little queued when the switch comes, whose client is
+    /// merely between writes, primes device-0's ring as ever: the device
+    /// does not start on the one period it had, underrun before the next
+    /// write, and send the player an UNDERFLOW.
+    #[test]
+    fn a_short_queue_across_a_switch_still_primes_the_new_ring() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-short",
+            &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+        );
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&auth_packet()).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&create_request(2, false)).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&audio(0, 8_192 + 1_024, 900)).unwrap();
+        passes(&mut server, 12);
+        assert!(server.sink.is_running(), "pch-0 plays");
+
+        assert_eq!(server.switch_to(1), Ok(()));
+        server.pass().unwrap();
+        assert!(!server.sink.is_running(), "started on its one period");
+        client.write_all(&audio(0, 9_216, 900)).unwrap();
+        let mut started_with = None;
+        for _ in 0..12 {
+            server.pass().unwrap();
+            if server.sink.is_running() {
+                started_with.get_or_insert(server.sink.frames_written());
+            }
+        }
+        assert_eq!(started_with, Some(8_192), "started on a primed ring");
+        let told = commands_in(&drain_socket(&mut client));
+        assert!(told.contains(&command::REQUEST), "{told:?}");
+        assert_eq!(
+            told.iter()
+                .filter(|told| **told == command::STARTED)
+                .count(),
+            1,
+            "pch-0's STARTED, and none for device-0: {told:?}"
+        );
+        assert!(
+            !told.contains(&command::UNDERFLOW),
+            "the player was told of an underrun: {told:?}"
+        );
+        server.shutdown();
+    }
+
+    /// A second switch before the first's device has started keeps the
+    /// resumption: the tail is still the one the playing device was cut off
+    /// from, and the third device starts on it.
+    #[test]
+    fn a_switch_before_the_new_device_starts_keeps_the_resumption() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-twice-over",
+            &[
+                (0, "pch-0", "ALC892 Analog"),
+                (1, "device-0", "USB Audio"),
+                (2, "hdmi-3", "HDMI 0"),
+            ],
+        );
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&auth_packet()).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&create_request(2, false)).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&audio(0, 8_192 + 4_096, 900)).unwrap();
+        passes(&mut server, 12);
+        assert!(server.sink.is_running(), "pch-0 plays");
+
+        assert_eq!(server.switch_to(1), Ok(()));
+        server.pass().unwrap();
+        assert!(!server.sink.is_running(), "device-0 has not started");
+        assert_eq!(server.switch_to(2), Ok(()));
+        passes(&mut server, 6);
+        std::thread::sleep(SWITCH_SETTLE + Duration::from_millis(20));
+        passes(&mut server, 2);
+        assert!(server.sink.frames_written() > 0);
+        assert!(
+            server.sink.is_running(),
+            "the tail is stranded in hdmi-3's ring"
+        );
+        server.shutdown();
+    }
+
+    /// An ioctl that finds the node gone, not only a poll that does, is the
+    /// active output lost: the daemon falls back rather than failing.
+    #[test]
+    fn a_vanished_node_answering_an_ioctl_is_a_lost_output() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-enodev",
+            &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+        );
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&auth_packet()).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&create_request(2, false)).unwrap();
+        passes(&mut server, 2);
+        client.write_all(&audio(0, 19_200, 900)).unwrap();
+        passes(&mut server, 10);
+        assert!(server.sink.is_running());
+        server.sink.fail_delay_with(Some(19));
+        assert!(!server.pass().unwrap(), "the daemon plays on");
+        assert_eq!(server.mixer.outputs().active().name, "device-0");
+        server.shutdown();
+    }
+
+    /// Outputs that open and are lost before they take a frame are not
+    /// switched between forever: once each has had its turn, the daemon
+    /// ends and its supervisor hears of it.
+    #[test]
+    fn outputs_lost_as_they_open_end_the_daemon() {
+        let (mut server, _path) = server_with_outputs(
+            "outputs-flapping",
+            &[
+                (10, "a-0", "Gone"),
+                (10, "b-0", "Gone"),
+                (10, "c-0", "Gone"),
+            ],
+        );
+        // The bound device, a-0's, is lost; every device opened after it is
+        // lost as it opens.
+        server.sink.unplug();
+        let mut ended = None;
+        for pass in 0..12 {
+            if server.pass().unwrap() {
+                ended = Some(pass);
+                break;
+            }
+        }
+        assert_eq!(ended, Some(3), "a fallback per output, then the end");
+        server.shutdown();
+    }
+
+    /// An output that will not open, or will not take the ring every session
+    /// was negotiated against, is refused with the old output still playing
+    /// and nothing announced; so is a name no output has, and a NULL one.
+    /// The active output answers at once. Only a controller may switch: the
+    /// compositor and a player are answered as for a command they lack.
+    #[test]
+    fn a_refused_switch_leaves_the_old_output_playing() {
+        const COMPOSITOR_UID: u32 = 993;
+        let (mut server, path) = server_with_outputs(
+            "outputs-refused",
+            &[
+                (0, "pch-0", "ALC892 Analog"),
+                (7, "locked-0", "Locked"),
+                (8, "small-0", "Small Ring"),
+                (9, "cd-0", "CD Rate"),
+            ],
+        );
+        server.policy = browser_policy(own_uid()).with_output_uid(COMPOSITOR_UID);
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut compositor = admit_as(&mut server, COMPOSITOR_UID, 8);
+        let mut controller = UnixStream::connect(&path).unwrap();
+        for socket in [&mut player, &mut compositor, &mut controller] {
+            socket.write_all(&auth_packet()).unwrap();
+        }
+        controller
+            .write_all(&build(command::SUBSCRIBE, 2, |writer| {
+                writer.u32(subscription::MASK_ALL);
+            }))
+            .unwrap();
+        passes(&mut server, 2);
+        for socket in [&mut player, &mut compositor, &mut controller] {
+            let _ = drain_socket(socket);
+        }
+        server.sink.advance(0);
+        let mut asks = set_default(3, Some("locked-0"));
+        asks.extend(set_default(4, Some("small-0")));
+        asks.extend(set_default(5, Some("hdmi-3")));
+        asks.extend(set_default(10, Some("cd-0")));
+        asks.extend(set_default(6, None));
+        asks.extend(set_default(7, Some("pch-0")));
+        asks.extend(set_default(8, Some("@DEFAULT_SINK@")));
+        controller.write_all(&asks).unwrap();
+        for socket in [&mut player, &mut compositor] {
+            socket.write_all(&set_default(9, Some("small-0"))).unwrap();
+        }
+        passes(&mut server, 8);
+        let error = crate::proto::error::ACCESS;
+        let seen = drain_socket(&mut controller);
+        assert_eq!(error_code(&seen, 3), Some(error));
+        assert_eq!(
+            error_code(&seen, 4),
+            Some(crate::proto::error::NOTSUPPORTED)
+        );
+        assert_eq!(error_code(&seen, 5), Some(crate::proto::error::NOENTITY));
+        assert_eq!(error_code(&seen, 6), Some(crate::proto::error::INVALID));
+        assert_eq!(
+            error_code(&seen, 10),
+            Some(crate::proto::error::NOTSUPPORTED)
+        );
+        for tag_number in [7, 8] {
+            assert!(reply_packet(&seen, tag_number).is_some(), "{tag_number}");
+        }
+        assert_eq!(subscription_events(&seen), []);
+        for socket in [&mut player, &mut compositor] {
+            assert_eq!(
+                error_code(&drain_socket(socket), 9),
+                Some(crate::proto::error::NOTIMPLEMENTED)
+            );
+        }
+        assert_eq!(server.mixer.outputs().active_position(), 0);
+        assert_eq!(server.sink.buffer_frames(), 8_192, "still pch-0's device");
+        assert!(server.sink.is_running(), "and still started");
+        assert!(server
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("would not open")));
+        assert!(server
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("would not take the 8192-frame ring")));
+        server.shutdown();
+    }
+
+    /// A switch rebases the mixer onto the new device. A released short
+    /// tail the old ring accepted was what let the old device start; it
+    /// went with that ring, so the new device, empty, does not start on it.
+    #[test]
+    fn a_switch_does_not_start_the_new_device_on_the_old_rings_tail() {
+        let (mut server, _path) = server_with_outputs(
+            "outputs-tail",
+            &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+        );
+        let id = server.mixer.open(4096).unwrap();
+        server.mixer.write(id, &[0u8; 4 * 512]).unwrap();
+        server.mixer.set_prebuffer(id, 0, false).unwrap();
+        server.pass().unwrap();
+        assert!(server.sink.is_running(), "the released tail started pch-0");
+
+        assert_eq!(server.switch_to(1), Ok(()));
+        server.pass().unwrap();
+        assert!(
+            !server.sink.is_running(),
+            "device-0 started on a ring nothing was written to"
+        );
+        server.shutdown();
+    }
+
+    /// The packets pactl 17.0 sends for `set-default-sink pch-3` and
+    /// `set-default-sink 2`, captured off the wire: a controller's switch by
+    /// name, and by the number, which libpulse sends as a name.
+    #[test]
+    fn the_captured_set_default_sink_switches_by_name_and_by_number() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-captured",
+            &[
+                (0, "pch-0", "ALC892 Analog"),
+                (1, "device-0", "USB Audio"),
+                (2, "pch-3", "HDMI 0"),
+            ],
+        );
+        let mut controller = UnixStream::connect(&path).unwrap();
+        controller.write_all(&auth_packet()).unwrap();
+        passes(&mut server, 2);
+        let _ = drain_socket(&mut controller);
+        for (hex, label) in [
+            ("4c0000002c4c00000002747063682d3300", "by name"),
+            ("4c0000002c4c00000002743200", "by number"),
+        ] {
+            controller
+                .write_all(&set_default(1, Some("pch-0")))
+                .unwrap();
+            passes(&mut server, 2);
+            assert_eq!(server.mixer.outputs().active_position(), 0, "{label}");
+            controller.write_all(&control(&unhex(hex))).unwrap();
+            passes(&mut server, 2);
+            let seen = drain_socket(&mut controller);
+            assert!(reply_packet(&seen, 2).is_some(), "{label}");
+            assert_eq!(server.mixer.outputs().active().name, "pch-3", "{label}");
+        }
+        server.shutdown();
+    }
+
+    /// Losing the active output plays on the next that opens, with the
+    /// stream still there and the change announced; losing it with none
+    /// that opens ends the daemon, as losing its only device always has.
+    #[test]
+    fn losing_the_active_output_falls_back_until_none_is_left() {
+        let (mut server, path) = server_with_outputs(
+            "outputs-lost",
+            &[
+                (0, "pch-0", "ALC892 Analog"),
+                (7, "locked-0", "Locked"),
+                (1, "device-0", "USB Audio"),
+            ],
+        );
+        let mut controller = UnixStream::connect(&path).unwrap();
+        controller.write_all(&auth_packet()).unwrap();
+        controller
+            .write_all(&build(command::SUBSCRIBE, 2, |writer| {
+                writer.u32(subscription::MASK_ALL);
+            }))
+            .unwrap();
+        passes(&mut server, 2);
+        controller.write_all(&create_request(3, false)).unwrap();
+        passes(&mut server, 2);
+        let _ = drain_socket(&mut controller);
+        controller.write_all(&audio(0, 19_200, 900)).unwrap();
+        passes(&mut server, 4);
+        assert!(server.sink.frames_written() > 0);
+
+        server.sink.unplug();
+        assert!(!server.pass().unwrap(), "the daemon plays on");
+        assert_eq!(server.mixer.outputs().active().name, "device-0");
+        assert_eq!(server.stream_count(), 1);
+        passes(&mut server, 1);
+        let change = subscription::EVENT_CHANGE;
+        assert_eq!(
+            subscription_events(&drain_socket(&mut controller)),
+            [
+                (subscription::EVENT_SERVER | change, tag::INVALID_INDEX),
+                (subscription::EVENT_SINK | change, 0),
+                (subscription::EVENT_SINK | change, 2),
+                (subscription::EVENT_SINK_INPUT | change, 0),
+            ]
+        );
+        controller.write_all(&audio(0, 19_200, 900)).unwrap();
+        passes(&mut server, 6);
+        assert!(
+            server.sink.frames_written() > 0,
+            "device-0 plays the stream"
+        );
+
+        // pch-0 is gone and locked-0 will not open: memory_output opens card
+        // 0 again, so this fixture's last loss is the bound one's alone.
+        let (mut alone, _path) = server_with_outputs(
+            "outputs-last",
+            &[(0, "pch-0", "ALC892 Analog"), (7, "locked-0", "Locked")],
+        );
+        alone.sink.unplug();
+        assert!(alone.pass().unwrap(), "no output is left");
+        alone.shutdown();
         server.shutdown();
     }
 }

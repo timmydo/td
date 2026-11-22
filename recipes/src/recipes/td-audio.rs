@@ -15,6 +15,7 @@ use crate::types::{Recipe, Step};
 // account before its unit selects and starts this output.
 const MAIN_RS: &str = include_str!("../../../td-audio/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("allocation", include_str!("../../../td-alloc/src/lib.rs")),
     (
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),
@@ -23,6 +24,7 @@ const MODULES: &[(&str, &str)] = &[
     ("control", include_str!("../../../td-audio/src/control.rs")),
     ("device", include_str!("../../../td-audio/src/device.rs")),
     ("mixer", include_str!("../../../td-audio/src/mixer.rs")),
+    ("output", include_str!("../../../td-audio/src/output.rs")),
     ("pcm", include_str!("../../../td-audio/src/pcm.rs")),
     ("serve", include_str!("../../../td-audio/src/serve.rs")),
     ("session", include_str!("../../../td-audio/src/session.rs")),
@@ -52,9 +54,10 @@ const PULSE: &[(&str, &str)] = &[
 /// `#[path]` attributes name, td-pulse's in its own tree, the rest beside
 /// `main.rs`.
 fn staged_path(name: &str) -> String {
-    // The two shared paths stay literal: the affected self-test finds each
+    // The three shared paths stay literal: the affected self-test finds each
     // `#[path]` source's staging in this text.
     match name {
+        "allocation" => "{src}/td-alloc/src/lib.rs".into(),
         "app_policy" => "{src}/td-busd/src/app_policy.rs".into(),
         "workload_accounts" => "{src}/engine/src/workload_accounts.rs".into(),
         _ => {
@@ -221,7 +224,7 @@ mod tests {
         declared.sort_unstable();
         written.sort_unstable();
         assert_eq!(written, declared);
-        assert_eq!(written.len(), 13);
+        assert_eq!(written.len(), 15);
 
         let mut pulse_declared = declared_in(PULSE_LIB_RS);
         let mut pulse_written: Vec<_> = PULSE
@@ -402,6 +405,7 @@ mod tests {
                 "td-audio/src/main.rs" => KEYWORD_USES_IN_MAIN,
                 "td-audio/src/sys.rs" => KEYWORD_USES_IN_SYS,
                 "td-pulse/src/lib.rs" => KEYWORD_USES_IN_PULSE_ROOT,
+                "td-alloc/src/lib.rs" => KEYWORD_USES_IN_ALLOCATION,
                 _ => 0,
             };
             assert_eq!(
@@ -458,6 +462,9 @@ mod tests {
     /// And the codec crate's root: its crate-level prohibition, and nothing
     /// else. Its modules name the keyword nowhere.
     const KEYWORD_USES_IN_PULSE_ROOT: usize = 1;
+    /// And td-alloc's source, staged as a module: its own module-level
+    /// prohibition, and nothing else.
+    const KEYWORD_USES_IN_ALLOCATION: usize = 1;
 
     /// The two §K.4 refusals that would be invisible in a passing build: the
     /// mmap machinery, and the card control device.

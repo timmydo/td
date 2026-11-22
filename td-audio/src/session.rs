@@ -15,6 +15,7 @@
 //! connection, so "the client parsed it" is a real oracle.
 
 use crate::mixer::{Mixer, StreamId, VOLUME_NORM};
+use crate::output::Entry;
 use crate::proto::{command, error, format, subscription};
 use crate::sink::Spec;
 use crate::tag::{self, Property, SampleSpec};
@@ -39,6 +40,8 @@ pub const OWNER_MODULE: u32 = tag::INVALID_INDEX;
 /// is distinct: an empty/prebuffering server must not claim it is playing.
 pub const SINK_STATE_RUNNING: u32 = 0;
 pub const SINK_STATE_IDLE: u32 = 1;
+/// An output that is not the one playing: `PA_SINK_SUSPENDED`.
+pub const SINK_STATE_SUSPENDED: u32 = 2;
 
 /// How much audio a stream may keep queued, by default, in milliseconds.
 /// This is Pulse's `tlength`, and the grant loop keeps the queue near it.
@@ -266,6 +269,12 @@ pub enum GlobalRequest {
         tag: u32,
         version: u32,
     },
+    /// A controller's switch to the output at `position` in the output set,
+    /// which is not the one playing.
+    DefaultSink {
+        tag: u32,
+        position: usize,
+    },
 }
 
 impl GlobalRequest {
@@ -277,7 +286,8 @@ impl GlobalRequest {
             | Self::Mute { tag, .. }
             | Self::SinkInputList { tag, .. }
             | Self::ClientInfo { tag, .. }
-            | Self::ClientList { tag, .. } => *tag,
+            | Self::ClientList { tag, .. }
+            | Self::DefaultSink { tag, .. } => *tag,
         }
     }
 }
@@ -586,7 +596,8 @@ impl Session {
             }
             GlobalRequest::SinkInputList { tag, .. }
             | GlobalRequest::ClientInfo { tag, .. }
-            | GlobalRequest::ClientList { tag, .. } => {
+            | GlobalRequest::ClientList { tag, .. }
+            | GlobalRequest::DefaultSink { tag, .. } => {
                 // Daemon-wide; never routed to one owner.
                 self.error(tag, error::INTERNAL);
             }
@@ -621,6 +632,14 @@ impl Session {
 
     pub fn reject_global_request(&mut self, request: GlobalRequest) {
         self.error(request.tag(), error::NOENTITY);
+    }
+
+    /// Answer a switch the daemon made, or the error code it failed with.
+    pub fn finish_default_sink(&mut self, tag: u32, outcome: Result<(), u32>) {
+        match outcome {
+            Ok(()) => self.reply(tag, |_| {}),
+            Err(code) => self.error(tag, code),
+        }
     }
 
     /// Describe another connection's stream to this controller, at `level`
@@ -693,7 +712,11 @@ impl Session {
     /// complete.
     #[cfg(test)]
     pub fn feed(&mut self, bytes: &[u8], mixer: &mut Mixer) -> Result<(), Disconnect> {
-        let _ = self.feed_limited(bytes, mixer, usize::MAX)?;
+        let mut processed = self.feed_limited(bytes, mixer, usize::MAX)?;
+        // A routed request stops a feed; nothing routes here, so go on.
+        while processed > 0 && self.input_deferred {
+            processed = self.feed_limited(&[], mixer, usize::MAX)?;
+        }
         Ok(())
     }
 
@@ -723,8 +746,15 @@ impl Session {
                 } => self.data(channel, seek, offset, &pcm, mixer)?,
             }
             processed = processed.saturating_add(1);
+            // A request routed to the daemon is answered after this read.
+            // The commands behind it wait for the next pass, so their replies
+            // follow its, as a client that pipelined them expects: a server
+            // info asked after a switch names the output switched to.
+            if !self.global_requests.is_empty() {
+                break;
+            }
         }
-        self.input_deferred = processed == limit;
+        self.input_deferred = processed == limit || !self.global_requests.is_empty();
         Ok(processed)
     }
 
@@ -929,7 +959,7 @@ impl Session {
         reader.u32().map_err(Disconnect::Schema)?;
         match command {
             command::SET_CLIENT_NAME => self.set_client_name(reader, tag, version),
-            command::GET_SERVER_INFO => self.server_info(reader, tag, version),
+            command::GET_SERVER_INFO => self.server_info(reader, tag, version, mixer),
             command::GET_SINK_INFO => self.sink_info(reader, tag, version, mixer),
             command::GET_SINK_INFO_LIST => self.sink_info_list(reader, tag, version, mixer),
             command::GET_SOURCE_INFO_LIST => self.source_info_list(reader, tag),
@@ -968,6 +998,9 @@ impl Session {
                     version,
                 });
                 Ok(())
+            }
+            command::SET_DEFAULT_SINK if self.controller => {
+                self.set_default_sink(reader, tag, mixer)
             }
             command::UPDATE_PLAYBACK_STREAM_PROPLIST => self.update_proplist(reader, tag),
             _ => {
@@ -1052,9 +1085,17 @@ impl Session {
         reader: tag::Reader<'_>,
         tag: u32,
         version: u32,
+        mixer: &Mixer,
     ) -> Result<(), Disconnect> {
         reader.finish().map_err(Disconnect::Schema)?;
         let spec = self.sample_spec();
+        // The default sink is the active output to whoever sees outputs, and
+        // the one sink to a player, whose view never changes.
+        let default_sink = if self.output {
+            &*mixer.outputs().active().name
+        } else {
+            SINK_NAME
+        };
         self.reply(tag, |writer| {
             writer
                 .string("pulseaudio")
@@ -1062,7 +1103,7 @@ impl Session {
                 .string("td")
                 .string("td")
                 .sample_spec(spec)
-                .string(SINK_NAME)
+                .string(default_sink)
                 .string("")
                 .u32(0);
             if version >= 15 {
@@ -1084,16 +1125,26 @@ impl Session {
         let index = reader.u32().map_err(Disconnect::Schema)?;
         let name = reader.string().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
+        let spec = self.sample_spec();
+        if self.output {
+            let outputs = mixer.outputs();
+            let Some(entry) = outputs
+                .resolve(index, name.as_deref())
+                .and_then(|position| outputs.entries().get(position))
+            else {
+                self.error(tag, error::NOENTITY);
+                return Ok(());
+            };
+            let shown = Shown::of(entry, mixer);
+            self.reply(tag, |writer| write_sink_info(writer, spec, version, &shown));
+            return Ok(());
+        }
         if !sink_lookup_matches(index, name.as_deref()) {
             self.error(tag, error::NOENTITY);
             return Ok(());
         }
-        let spec = self.sample_spec();
-        let state = sink_state(mixer);
-        let view = self.output_view(mixer);
-        self.reply(tag, |writer| {
-            write_sink_info(writer, spec, version, state, view);
-        });
+        let shown = Shown::player(mixer);
+        self.reply(tag, |writer| write_sink_info(writer, spec, version, &shown));
         Ok(())
     }
 
@@ -1106,11 +1157,16 @@ impl Session {
     ) -> Result<(), Disconnect> {
         reader.finish().map_err(Disconnect::Schema)?;
         let spec = self.sample_spec();
-        let state = sink_state(mixer);
-        let view = self.output_view(mixer);
-        self.reply(tag, |writer| {
-            write_sink_info(writer, spec, version, state, view);
-        });
+        if self.output {
+            self.reply(tag, |writer| {
+                for entry in mixer.outputs().entries() {
+                    write_sink_info(writer, spec, version, &Shown::of(entry, mixer));
+                }
+            });
+            return Ok(());
+        }
+        let shown = Shown::player(mixer);
+        self.reply(tag, |writer| write_sink_info(writer, spec, version, &shown));
         Ok(())
     }
 
@@ -1171,6 +1227,12 @@ impl Session {
         view: View<'_>,
     ) {
         let client = self.client_index;
+        // The sink as the asker is shown it: a controller's view is of the
+        // outputs, whoever owns the stream; the owner sees its own view.
+        let sink = match view {
+            View::Controller { .. } => mixer.outputs().active().index,
+            View::Own => self.stream_sink(mixer).0,
+        };
         let spec = stream.sample_spec;
         let queued_usec = mixer
             .timing(stream.id)
@@ -1195,7 +1257,7 @@ impl Session {
             .string(name)
             .u32(OWNER_MODULE)
             .u32(client)
-            .u32(SINK_INDEX)
+            .u32(sink)
             .sample_spec(spec)
             .channel_map(&CHANNEL_MAP)
             .cvolume(&[volume, volume])
@@ -1236,6 +1298,39 @@ impl Session {
         self.subscribed = mask;
         self.reply(tag, |_| {});
         Ok(())
+    }
+
+    /// The sink this connection is told a stream plays on: for one shown the
+    /// outputs, the output playing; for a player, its one sink.
+    fn stream_sink<'m>(&self, mixer: &'m Mixer) -> (u32, &'m str) {
+        if self.output {
+            let active = mixer.outputs().active();
+            (active.index, &active.name)
+        } else {
+            (SINK_INDEX, SINK_NAME)
+        }
+    }
+
+    /// Whether a stream may be created on the sink a create names. Every
+    /// stream plays on the active output, so one shown the outputs may name
+    /// that one, and naming another is a placement this server does not do.
+    fn create_sink(&self, index: u32, name: Option<&str>, mixer: &Mixer) -> Result<(), u32> {
+        if !self.output {
+            return if sink_create_matches(index, name) {
+                Ok(())
+            } else {
+                Err(error::NOENTITY)
+            };
+        }
+        if (index, name) == (tag::INVALID_INDEX, None) {
+            return Ok(());
+        }
+        let outputs = mixer.outputs();
+        match outputs.resolve(index, name) {
+            Some(position) if position == outputs.active_position() => Ok(()),
+            Some(_) => Err(error::NOTSUPPORTED),
+            None => Err(error::NOENTITY),
+        }
     }
 
     fn create_stream(
@@ -1300,8 +1395,8 @@ impl Session {
             self.error(tag, error::INVALID);
             return Ok(());
         }
-        if !sink_create_matches(sink_index, sink_name.as_deref()) {
-            self.error(tag, error::NOENTITY);
+        if let Err(code) = self.create_sink(sink_index, sink_name.as_deref(), mixer) {
+            self.error(tag, code);
             return Ok(());
         }
         if variable_rate
@@ -1459,6 +1554,7 @@ impl Session {
             bytes(prebuffer_frames),
             bytes(minreq_frames),
         );
+        let (sink_index, sink_name) = self.stream_sink(mixer);
         self.reply(tag, |writer| {
             writer.u32(channel).u32(sink_input_index).u32(missing);
             if version >= 9 {
@@ -1472,8 +1568,8 @@ impl Session {
                 writer
                     .sample_spec(spec)
                     .channel_map(&CHANNEL_MAP)
-                    .u32(SINK_INDEX)
-                    .string(SINK_NAME)
+                    .u32(sink_index)
+                    .string(sink_name)
                     .boolean(false);
             }
             if version >= 13 {
@@ -1797,27 +1893,54 @@ impl Session {
             self.error(tag, error::INVALID);
             return Ok(());
         }
-        if !sink_lookup_matches(index, name.as_deref()) {
+        let Some(position) = mixer.outputs().resolve(index, name.as_deref()) else {
             self.error(tag, error::NOENTITY);
             return Ok(());
-        }
-        let before = (mixer.master_volume(), mixer.master_muted());
+        };
         let volume = volumes.iter().copied().max().unwrap_or(VOLUME_NORM);
-        mixer.set_master_volume(volume);
+        let changed = mixer.outputs_mut().set_volume(position, volume);
         self.reply(tag, |_| {});
-        self.announce_output_change(before, mixer);
+        self.announce_output_change(changed, position, mixer);
         Ok(())
     }
 
-    /// One sink CHANGE event when a write changed the output, and none when
-    /// it set what was already there.
-    fn announce_output_change(&mut self, before: (u32, bool), mixer: &Mixer) {
-        if (mixer.master_volume(), mixer.master_muted()) != before {
+    /// One sink CHANGE event, for the output written, when a write changed
+    /// it, and none when it set what was already there.
+    fn announce_output_change(&mut self, changed: bool, position: usize, mixer: &Mixer) {
+        if let Some(entry) = mixer.outputs().entries().get(position).filter(|_| changed) {
             self.announce(
                 subscription::EVENT_SINK | subscription::EVENT_CHANGE,
-                SINK_INDEX,
+                entry.index,
             );
         }
+    }
+
+    /// `SET_DEFAULT_SINK` from a controller: a sink's name, or its number as
+    /// a name. Switching opens a device, which is the daemon's to do; the
+    /// output already playing is answered here and announces nothing.
+    fn set_default_sink(
+        &mut self,
+        mut reader: tag::Reader<'_>,
+        tag: u32,
+        mixer: &Mixer,
+    ) -> Result<(), Disconnect> {
+        let name = reader.string().map_err(Disconnect::Schema)?;
+        reader.finish().map_err(Disconnect::Schema)?;
+        let Some(name) = name else {
+            self.error(tag, error::INVALID);
+            return Ok(());
+        };
+        let outputs = mixer.outputs();
+        let Some(position) = outputs.resolve(tag::INVALID_INDEX, Some(&name)) else {
+            self.error(tag, error::NOENTITY);
+            return Ok(());
+        };
+        if position == outputs.active_position() {
+            self.reply(tag, |_| {});
+            return Ok(());
+        }
+        self.route(GlobalRequest::DefaultSink { tag, position });
+        Ok(())
     }
 
     /// `SET_SINK_MUTE` from a controller or the compositor: the same selector,
@@ -1836,26 +1959,14 @@ impl Session {
             self.error(tag, error::INVALID);
             return Ok(());
         }
-        if !sink_lookup_matches(index, name.as_deref()) {
+        let Some(position) = mixer.outputs().resolve(index, name.as_deref()) else {
             self.error(tag, error::NOENTITY);
             return Ok(());
-        }
-        let before = (mixer.master_volume(), mixer.master_muted());
-        mixer.set_master_mute(muted);
+        };
+        let changed = mixer.outputs_mut().set_muted(position, muted);
         self.reply(tag, |_| {});
-        self.announce_output_change(before, mixer);
+        self.announce_output_change(changed, position, mixer);
         Ok(())
-    }
-
-    /// The output's level and mute as this connection may see them: as they
-    /// are for a controller or the compositor, and unity and unmuted for a
-    /// player, whose view of the one sink never changes.
-    fn output_view(&self, mixer: &Mixer) -> (u32, bool) {
-        if self.output {
-            (mixer.master_volume(), mixer.master_muted())
-        } else {
-            (VOLUME_NORM, false)
-        }
     }
 
     fn apply_volume(&mut self, index: u32, volumes: &[u32], mixer: &mut Mixer) -> bool {
@@ -1909,6 +2020,7 @@ impl Session {
         let mask = match facility {
             subscription::EVENT_SINK => subscription::MASK_SINK,
             subscription::EVENT_SINK_INPUT => subscription::MASK_SINK_INPUT,
+            subscription::EVENT_SERVER => subscription::MASK_SERVER,
             _ => 0,
         };
         // A word with no type bits is NEW, which is the zero value — so the
@@ -2104,8 +2216,6 @@ fn sink_create_matches(index: u32, name: Option<&str>) -> bool {
     }
 }
 
-/// The sink-info payload, shared by the single and list forms because they are
-/// the same bytes — a list of one.
 fn sink_state(mixer: &Mixer) -> u32 {
     if mixer.sink_is_running() {
         SINK_STATE_RUNNING
@@ -2114,17 +2224,64 @@ fn sink_state(mixer: &Mixer) -> u32 {
     }
 }
 
-fn write_sink_info(
-    writer: &mut tag::Writer,
-    spec: SampleSpec,
-    version: u32,
+/// One sink as a connection is shown it.
+struct Shown<'a> {
+    index: u32,
+    name: &'a str,
+    description: &'a str,
     state: u32,
-    (volume, muted): (u32, bool),
-) {
+    volume: u32,
+    muted: bool,
+}
+
+impl<'a> Shown<'a> {
+    /// An output, to a connection that sees outputs: the active one in the
+    /// mixer's state, any other suspended, each at its own level.
+    fn of(entry: &'a Entry, mixer: &Mixer) -> Self {
+        let active = mixer.outputs().active().index == entry.index;
+        Self {
+            index: entry.index,
+            name: &entry.name,
+            description: &entry.description,
+            state: if active {
+                sink_state(mixer)
+            } else {
+                SINK_STATE_SUSPENDED
+            },
+            volume: entry.volume,
+            muted: entry.muted,
+        }
+    }
+
+    /// The one sink a player sees: whichever output plays, at unity and
+    /// unmuted, under the same name and index whatever the output.
+    fn player(mixer: &Mixer) -> Self {
+        Self {
+            index: SINK_INDEX,
+            name: SINK_NAME,
+            description: SINK_DESCRIPTION,
+            state: sink_state(mixer),
+            volume: VOLUME_NORM,
+            muted: false,
+        }
+    }
+}
+
+/// The sink-info payload, shared by the single and list forms because they are
+/// the same bytes for each sink.
+fn write_sink_info(writer: &mut tag::Writer, spec: SampleSpec, version: u32, shown: &Shown<'_>) {
+    let Shown {
+        index,
+        name,
+        description,
+        state,
+        volume,
+        muted,
+    } = *shown;
     writer
-        .u32(SINK_INDEX)
-        .string(SINK_NAME)
-        .string(SINK_DESCRIPTION)
+        .u32(index)
+        .string(name)
+        .string(description)
         .sample_spec(spec)
         .channel_map(&CHANNEL_MAP)
         .u32(OWNER_MODULE)
@@ -2144,7 +2301,7 @@ fn write_sink_info(
     if version >= 13 {
         writer
             .proplist(&[
-                tag::text_property("device.description", SINK_DESCRIPTION),
+                tag::text_property("device.description", description),
                 tag::text_property("device.class", "sound"),
             ])
             .usec(0);

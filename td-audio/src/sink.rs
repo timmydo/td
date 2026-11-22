@@ -149,6 +149,14 @@ pub fn is_underrun(error: &io::Error) -> bool {
     )
 }
 
+/// Whether `error` says the device went away rather than underran: a
+/// closed PCM, or an ioctl on an unplugged node.
+pub fn is_gone(error: &io::Error) -> bool {
+    !is_underrun(error)
+        && (error.kind() == io::ErrorKind::BrokenPipe
+            || error.raw_os_error() == Some(crate::sys::ENODEV))
+}
+
 /// An `AudioSink` that keeps every frame it is given, with a device clock the
 /// test advances by hand.
 ///

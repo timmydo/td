@@ -2599,7 +2599,8 @@ room and how the daemon waits on its clients and its device together; and
 `getsockopt(2)`, pinned to `SOL_SOCKET`/`SO_PEERCRED` with a 12-byte
 `struct ucred`, which is how §K.5 authorizes a peer. Everything else rides
 `std`: the PCM node is an ordinary `std::fs::File` opened
-`O_WRONLY|O_NONBLOCK`, `/proc/asound/pcm` is an ordinary read, and the
+`O_WRONLY|O_NONBLOCK`, `/proc/asound/pcm` and each card's `id` are
+ordinary reads, and the
 socket is a `std::os::unix::net::UnixListener`. There is no descriptor
 adoption and no mapping — this is the plain shape §§1–5 and 7–9 have.
 
