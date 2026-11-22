@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use super::{closed, pass, refused, Job};
 use crate::plain::{Bytes, Text};
 use crate::protocol::{
-    Answer, Ask, Change, Command, EntryId, Failure, Item, KeyLabel, Keys, Op, PinUse, Reply, Role,
+    Answer, Ask, Change, Command, EntryId, Failure, Item, KeyKind, KeyLabel, Keys, Op, PinUse,
+    Reply, Role,
 };
 
 /// Where the case's journal and controls are.
@@ -138,7 +139,7 @@ pub(super) fn serve(
             Command::BindMail { op, .. } | Command::Apply { op, .. } => closed(op),
             Command::Create { op, .. }
             | Command::Unlock { op, .. }
-            | Command::AddKey { op }
+            | Command::AddKey { op, .. }
             | Command::ReplaceKeys { op, .. }
             | Command::Export { op, .. }
             | Command::ReadCopy { op, .. }
@@ -203,6 +204,7 @@ impl Vault<'_> {
             role: Role::Primary,
             key: Some(FINGERPRINT.to_owned()),
             pin: None,
+            computer: false,
         };
         let Answer::Proceed = self.ask(op, tag, ask.clone())? else {
             return Err(cancelled());
@@ -398,6 +400,7 @@ const SWAP: &str = "/dev/test-swap";
 fn keys() -> Vec<KeyLabel> {
     vec![KeyLabel {
         role: Role::Primary,
+        kind: KeyKind::SecurityKey,
         fingerprint: FINGERPRINT.to_owned(),
     }]
 }

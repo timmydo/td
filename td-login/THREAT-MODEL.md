@@ -62,8 +62,17 @@ enrolled login key, human-account code that can read the td-pass process
 or imitate its prompt learns the PIN that guards boot, login and the
 session lock; with the key stolen as well, a person at the locked
 machine (A4) holds both factors. Use a separate key for the notebook, or
-the machine's TPM once the notebook accepts it as a key, rather than a
-login key.
+this computer's TPM (td-secret/PORTABLE.md, "This computer's TPM as a
+key") under a PIN other than the disk's, rather than a login key. A
+TPM key's PIN learned the same way needs no touch: code that can also
+drive a trusted notebook step on this machine can unlock with it. Code
+that can drive the td-pass window can, without a touch, spend the TPM's
+dictionary-attack counter, which the disk's TPM PIN shares, wrong PIN by
+wrong PIN, down to the eight tries root leaves the disk: a notebook step
+is refused below that headroom, so the notebook alone cannot lock the
+disk's TPM PIN out, though it can leave the disk eight tries until the
+counter recovers (one every ten minutes). A mistyped confirmation of a
+new notebook PIN costs one try.
 
 ## 1. Assets and adversaries
 

@@ -134,6 +134,52 @@ format alone does not supply synchronization, merge, or rollback protection.
 A token is not a backup of the notebook bytes. Losing all enrolled keys or
 all complete vault copies loses access.
 
+### This computer's TPM as a key
+
+On td, and only there, a key may be this computer's TPM instead of a
+security key: a primary, a backup, an addition or a replacement. Its
+secret is 32 kernel-random bytes root seals with td-tpm's
+`seal_device_pin` under the storage primary the boot proved
+(`/run/td-admit/td-passkey-primary`, td-install/ENCRYPTION.md, "Passkey
+storage primary"), its authValue derived from a 6–63 byte printable PIN
+and a fresh salt through td-tpm's `device_pin` codec in its own domain,
+`td-secret/portable/tpm-pin/v1`. The sealed object is the slot's
+credential: ASCII `TDNBTPM1`, the 34-byte primary Name, the 32-byte salt,
+then the public and private areas, each a nonempty u16-counted blob, the
+whole within 1024 bytes. An enrollment seals, then proves the new PIN by
+unsealing it again, a second typing of it, so a mistyped confirmation
+costs one of the TPM's tries; an unlock or an authorization unseals.
+A vault holds at most one key of one computer's TPM, by primary Name:
+the envelope's decode refuses two computer slots naming one primary,
+reading only computer-kind slots, and another computer may add its own.
+An enrollment names the retained computer keys' primaries in its
+sealing request (`32`), so root refuses this computer before the new
+key's PIN when it already holds one, though an addition's or a
+replacement's authorizing keys have been asked for their PINs by then;
+a revoked key's computer may enroll its
+replacement, and the service refuses a creation whose primary and
+backup are both this computer before anything is sealed.
+
+The TPM limits wrong PINs with its dictionary-attack counter, which the
+disk's TPM PIN (td-protector) and passkeys share: a wrong notebook PIN
+counts against the disk's, and a lockout refuses all three until it
+recovers. Root refuses a computer step before any PIN is asked for when
+this boot proved no primary, the TPM cannot be reached, its lockout
+policy is weaker than td's (td-tpm `device_pin::DA_PARAMETERS`), the
+key's sealed object does not carry td's device PIN policy, or fewer
+than eight tries remain before the lockout: the notebook leaves those
+to the disk, so it cannot by itself lock the disk's TPM PIN out. Code
+that can drive the td-pass window can still spend the shared counter
+without a touch, down to that headroom, wrong PIN by wrong PIN. Root
+holds the PIN only to derive the authValue, as it does a security key's.
+This is device binding plus a PIN, not a portable factor: an exported
+copy's computer slot opens only on this computer, and clearing the TPM,
+replacing the board or a primary the boot can no longer prove loses that
+key. td-pass says so when it offers one, and a security key backup is
+the recovery path; a vault whose only key is this computer's is the
+explicit unrecoverability decision above, with that loss added.
+Standalone mode refuses a computer key.
+
 ## Storage and resource limits
 
 The initial bound is 1024 entries, 512 UTF-8 bytes per nonempty title, 64 KiB
@@ -216,19 +262,27 @@ hardware vault was published by version 1. Version 2 is:
 | Sealed notebook length | u32, 20 through 4 MiB + 16 |
 | Sealed notebook | Ciphertext followed by the 16-byte AEAD tag |
 
-Each slot contains role u8 (1 primary, 2 backup), credential length u16
-(1 through 1024), credential bytes, a fixed 77-byte public COSE key,
-32-byte hmac-secret salt, 12-byte random wrapping nonce and 48 bytes of
-encrypted vault key plus tag. Exactly one slot is
+Each slot contains a role byte, credential length u16 (1 through 1024),
+credential bytes, for a security key a fixed 77-byte public COSE key and
+32-byte hmac-secret salt, then a 12-byte random wrapping nonce and 48
+bytes of encrypted vault key plus tag. The role byte's low nibble is the
+role (1 primary, 2 backup) and its high nibble the kind: 0 a security
+key, 1 this computer's TPM ("This computer's TPM as a key"), so a vault
+of security keys alone keeps its exact bytes. A computer slot's
+credential is its sealed object, decoded and bounded on every read.
+Exactly one slot is
 primary; all other slots are backups. The maximum envelope is 4 MiB + 16 +
-65 + 8 * 1196 bytes. Duplicate or unordered credentials, unknown roles,
-truncation and trailing bytes are refused before cryptographic work.
+65 + 8 * 1196 bytes. Duplicate or unordered credentials, unknown roles or
+kinds, truncation and trailing bytes are refused before cryptographic
+work.
 
-The wrapping key is HKDF-SHA256 with the UV hmac-secret result as input,
-vault ID as salt and ASCII `td-secret/portable/wrap/v2` as info. Its AEAD
-associated data is ASCII `td-secret/portable/slot/v2`, a zero byte, vault ID,
-and the slot's encoded role, credential length/bytes, canonical public COSE
-key and hmac-secret salt.
+The wrapping key is HKDF-SHA256 with the UV hmac-secret result, or a
+computer key's unsealed secret, as input, vault ID as salt and ASCII
+`td-secret/portable/wrap/v2` as info. Its AEAD associated data is ASCII
+`td-secret/portable/slot/v2`, a zero byte, vault ID, and the slot's
+encoded role byte, credential length/bytes and, for a security key, its
+canonical public COSE key and hmac-secret salt; the kind is bound with
+the role.
 The body key is HKDF-SHA256 with the vault key as input, vault ID as salt
 and ASCII `td-secret/portable/body/v2` followed by a zero byte as info. Body
 associated data is that same info followed by every envelope byte before the
@@ -1505,16 +1559,31 @@ so that root decides a step's end and relays it. Its initial frame holds a lengt
 consent description and length-prefixed service token request. Presentation
 `40` holds the description; acknowledgement `41` must repeat it exactly.
 PIN `42` holds that same description and a bounded 4–63 byte printable
-ASCII PIN. Step zero requires explicit approval, then an assertion has
-step one, or enrollment has step two followed by proof step three. No
-repeat, skip or substitution is accepted. Every phase retains the nonce,
+ASCII PIN, 6–63 for a computer step. Step zero requires explicit
+approval, then an assertion has step one, or enrollment has step two
+followed by proof step three. A computer key's sealing (method `32`,
+enrollment purposes only) has step two alone and its unsealing (`33`)
+step one; root acknowledges their step zero itself, so the PIN's prompt
+is the window's one question. No repeat, skip or substitution is
+accepted. Every phase retains the nonce,
 owner, method, action, purpose, role and both digests. Enrollment purposes
 retain their labels through the independent repeat assertion; the method
 selects its assertion PIN step. PINs remain in clearing
 buffers and never enter diagnostics or the notebook service.
 
 Only the existing root-admitted FIDO transport and portable lifecycle
-transaction perform device I/O. There must be exactly one admitted key.
+transaction perform device I/O, and for a computer step td-tpm's client
+on `/dev/tpmrm0`. A security key step requires exactly one admitted key.
+A computer step's refusals are codes `30` through `3a`: standalone, no
+proved primary, TPM unreachable, weak lockout policy, lockout, another
+computer's key, a PIN outside 6–63, this computer already holding a
+retained key, fewer than eight tries left, a TPM whose storage primary
+is no longer the one this boot proved (td-tpm's `OTHER_PRIMARY`, or a
+seal under another policy than asked, `CHANGED_POLICY`), and a sealed
+object without td's policy; a wrong PIN is the token's `25`. A sealing
+request carries, after its head, one field of at most eight 34-byte
+SHA-256 primary Names end to end, each named once, all bound by the
+token digest.
 Successful `44` carries the verified service result as one length-prefixed
 field. A token's refusal, or no key or several connected, is `45` and the
 refusal's code, which root relays to the service as `3f`; any other error

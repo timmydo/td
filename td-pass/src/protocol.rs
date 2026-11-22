@@ -40,11 +40,36 @@ impl Role {
     }
 }
 
-/// An enrolled key as a person tells it apart: its role and fingerprint.
+/// What holds a key's secret: a security key, or a computer's TPM,
+/// which only td's trusted notebook offers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyKind {
+    SecurityKey,
+    Computer,
+}
+
+/// An enrolled key as a person tells it apart: its role, its kind and
+/// its fingerprint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyLabel {
     pub role: Role,
+    pub kind: KeyKind,
     pub fingerprint: String,
+}
+
+/// The key as the window names it.
+impl std::fmt::Display for KeyLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            KeyKind::SecurityKey => write!(f, "{} key {}", self.role.name(), self.fingerprint),
+            KeyKind::Computer => write!(
+                f,
+                "{} key {}, a computer's TPM",
+                self.role.name(),
+                self.fingerprint
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,13 +88,15 @@ pub struct Keys {
 }
 
 /// A token presentation the operation waits on: `pin` is `None` while it
-/// asks for the key to be connected, then the PIN's use.
+/// asks for the key to be connected, then the PIN's use. `computer` is a
+/// step of this computer's TPM, which asks only for its PIN.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ask {
     pub operation: &'static str,
     pub role: Role,
     pub key: Option<String>,
     pub pin: Option<PinUse>,
+    pub computer: bool,
 }
 
 /// An entry as the list shows it.
@@ -124,11 +151,13 @@ pub enum Command {
     /// Open again, the person having accepted the swap the last `Swap`
     /// reply named, for this process.
     AcceptSwap,
-    /// Create a notebook, with a backup key or, when `backup` is false,
-    /// the primary alone, as the person chose.
+    /// Create a notebook with a primary of `primary`'s kind and a backup
+    /// of `backup`'s or, when it is `None`, the primary alone, as the
+    /// person chose.
     Create {
         op: Op,
-        backup: bool,
+        primary: KeyKind,
+        backup: Option<KeyKind>,
     },
     Unlock {
         op: Op,
@@ -141,15 +170,17 @@ pub enum Command {
         op: Op,
         change: Change,
     },
-    /// Enroll another backup key.
+    /// Enroll another backup key of `kind`.
     AddKey {
         op: Op,
+        kind: KeyKind,
     },
     /// Revoke the unlocked notebook's keys `revoked` and enroll one
-    /// replacement; the vault key rotates.
+    /// replacement of `kind`; the vault key rotates.
     ReplaceKeys {
         op: Op,
         revoked: Vec<usize>,
+        kind: KeyKind,
     },
     /// Write the unlocked notebook's encrypted copy, as a new file, into
     /// `folder`.

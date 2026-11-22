@@ -9,10 +9,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use td_fido::web_request::{Create, Get};
 use td_primitives::{chacha20_poly1305 as aead, random};
-use td_protector::{
-    lockout::DA_PARAMETERS,
-    pin::{Pin, SALT_LEN},
-};
+use td_protector::pin::{Pin, SALT_LEN};
 use td_tpm::{Client, Transport};
 
 const MAGIC: &[u8; 8] = b"TDPASSK1";
@@ -113,13 +110,7 @@ pub struct Vault {
 
 fn policy<T: Transport>(client: &mut Client<T>) -> Result<()> {
     let da = client.dictionary_attack().map_err(|_| Error::Refused)?;
-    if !da.lockout_auth_set
-        || da.in_lockout
-        || da.counter >= da.max_tries
-        || da.max_tries > DA_PARAMETERS.max_tries
-        || da.interval < DA_PARAMETERS.recovery_time
-        || da.recovery < DA_PARAMETERS.lockout_recovery
-    {
+    if !da.holds_td_policy() {
         return Err(Error::Refused);
     }
     Ok(())

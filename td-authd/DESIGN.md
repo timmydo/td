@@ -5088,12 +5088,22 @@ exact service token request. Actions 1 and 2 create without or with a
 backup, 3 unlocks, 4 imports, 5 adds a key, and 6 replaces keys. Purposes
 are td-secret/PORTABLE.md's lifecycle purposes (1, 2, 3, 5–9); the codec
 rejects mismatched action/purpose pairs. Roles are primary 1 and backup 2.
-Methods are enrollment 0x30 and assertion 0x31. Enrollment purposes also
-permit assertion, for the lifecycle’s independent repeatability proof.
-Step zero requires the window's explicit approval; assertion step 1 or
-creation step 2 and proof step 3 take the PIN the window sends. All
+Methods are enrollment 0x30 and assertion 0x31, and for a key of this
+computer's TPM (td-secret/PORTABLE.md, "This computer's TPM as a key")
+sealing 0x32, for enrollment purposes only, and unsealing 0x33.
+Enrollment purposes also permit assertion or unsealing, for the
+lifecycle’s independent repeatability proof. Step zero requires the
+window's explicit approval; assertion or unsealing step 1, creation step
+2 and proof step 3, or sealing step 2 take the PIN the window sends. All
 immutable arguments must remain identical between steps, and no step
-repeats or skips.
+repeats or skips. A computer method's step zero is the binding root
+acknowledges itself, with no prompt: its PIN step is the window's one
+question and the person's approval. The description renders a sealing's
+key as THIS COMPUTER'S TPM and an unsealing's as A COMPUTER'S TPM, since
+an imported copy's slot may be another's, and its PIN lines name
+neither a touch nor a credential: CHOOSE A PIN FOR THIS COMPUTER'S TPM,
+ENTER THE NEW PIN AGAIN for the repeat, ENTER THIS COMPUTER'S NOTEBOOK
+PIN otherwise.
 
 The description binds the notebook, the operation, key role, and whether
 it authorizes with an existing key or enrolls a new one; the attention
@@ -5131,15 +5141,20 @@ operation, once admitted, takes the slot from a running step, which
 fails as superseded, and a failed revocation's reboot waits for the
 operation, at most its ceiling. Each presentation the worker sends
 becomes a prompt to the window, `7d`, a fresh u64 prompt number, the
-step's purpose, role and step, and a flag with the first four bytes of
-the named credential's SHA-256 when the request names one. The window
+step's purpose, role and step, whether it is this computer's TPM (`00`
+or `01`), and a flag with the first four bytes of the named credential's
+SHA-256 when the request names one. The window
 answers `7c`, the number, and `00` to proceed, `01` and a PIN field, or
 `02` to decline, naming no prompt (zero) or the one shown; a decline
 naming another is dropped. Root acknowledges step zero's presentation
 on proceed, and a PIN step's when it sends the prompt, since the prompt
 is that step's presentation; it gives the worker the PIN only within a
 PIN's profile (four to 63 printable ASCII bytes) and declines one
-outside it. An answer naming another prompt is dropped, its PIN
+outside it; the worker holds a computer step's PIN to the device PIN's
+six. The window's request names each key's kind: creation `2`, the
+backup flag, the primary's kind and the backup's (`00` without one),
+addition `9` and its kind, replacement `10`, its kind, then the revoked
+keys. An answer naming another prompt is dropped, its PIN
 cleared; one naming the current prompt but another kind of step ends
 the bridge.
 

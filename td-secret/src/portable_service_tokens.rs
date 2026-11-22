@@ -1,9 +1,11 @@
 //! Token results arrive only from the worker's private root authority.
 
 use super::lifecycle::{
-    AssertRequest, Asserted, EnrollRequest, Enrolled, Presented, TokenError, Tokens,
+    AssertRequest, Asserted, Computer, EnrollRequest, Enrolled, Presented, TokenError, Tokens,
 };
-use super::{Secret32, VerificationKey, MAX_CREDENTIAL, MAX_SLOTS};
+use super::{
+    Computers, Factor, Kind, Sealed, Secret32, VerificationKey, MAX_CREDENTIAL, MAX_SLOTS,
+};
 use crate::fido_device::Interruption;
 use crate::fido_transaction::{Error as Transaction, Status};
 use crate::notebook_wire::{field, Bytes, Reader, Wire};
@@ -56,6 +58,19 @@ pub(super) fn refusal(error: &TokenError) -> u8 {
                 Status::Other(_) => 0x2d,
             },
         },
+        TokenError::Computer(computer) => match computer {
+            Computer::Standalone => 0x30,
+            Computer::Unadmitted => 0x31,
+            Computer::Unreachable => 0x32,
+            Computer::Policy => 0x33,
+            Computer::Lockout => 0x34,
+            Computer::Foreign => 0x35,
+            Computer::PinLength => 0x36,
+            Computer::Held => 0x37,
+            Computer::Headroom => 0x38,
+            Computer::Changed => 0x39,
+            Computer::Object => 0x3a,
+        },
     }
 }
 
@@ -90,6 +105,17 @@ pub(super) fn refused(code: u8) -> TokenError {
         0x2b => status(Status::PinPolicy),
         0x2c => status(Status::ActionTimeout),
         0x2d => status(Status::Other(0)),
+        0x30 => TokenError::Computer(Computer::Standalone),
+        0x31 => TokenError::Computer(Computer::Unadmitted),
+        0x32 => TokenError::Computer(Computer::Unreachable),
+        0x33 => TokenError::Computer(Computer::Policy),
+        0x34 => TokenError::Computer(Computer::Lockout),
+        0x35 => TokenError::Computer(Computer::Foreign),
+        0x36 => TokenError::Computer(Computer::PinLength),
+        0x37 => TokenError::Computer(Computer::Held),
+        0x38 => TokenError::Computer(Computer::Headroom),
+        0x39 => TokenError::Computer(Computer::Changed),
+        0x3a => TokenError::Computer(Computer::Object),
         _ => TokenError::Host("the security key operation failed"),
     }
 }
@@ -132,7 +158,10 @@ impl Tokens for Remote<'_> {
         presented: Presented<'_>,
         request: EnrollRequest<'_>,
     ) -> Result<Enrolled, TokenError> {
-        let mut out = Bytes(vec![0x30, presented.purpose as u8, presented.role as u8]);
+        if request.kind == Kind::Computer {
+            return self.seal(presented, request.computers);
+        }
+        let mut out = step(0x30, presented);
         out.extend(&request.challenge).map_err(invalid)?;
         out.extend(&request.proof_challenge).map_err(invalid)?;
         out.extend(&request.user).map_err(invalid)?;
@@ -151,7 +180,7 @@ impl Tokens for Remote<'_> {
             if input.byte()? != 0x30 {
                 return Err("token enrollment refused".into());
             }
-            let credential = input.field(MAX_CREDENTIAL)?.to_vec();
+            let credential = credential(&mut input)?;
             let key = VerificationKey::from_cose(input.field(77)?)?;
             let salt = input.array()?;
             let secret = Secret32(input.array()?);
@@ -159,8 +188,7 @@ impl Tokens for Remote<'_> {
             input.finish()?;
             Ok(Enrolled {
                 credential,
-                key,
-                salt,
+                factor: Factor::SecurityKey { key, salt },
                 secret,
                 counter,
             })
@@ -174,10 +202,13 @@ impl Tokens for Remote<'_> {
         presented: Presented<'_>,
         request: AssertRequest<'_>,
     ) -> Result<Asserted, TokenError> {
-        let mut out = Bytes(vec![0x31, presented.purpose as u8, presented.role as u8]);
+        let Factor::SecurityKey { key, salt } = request.factor else {
+            return self.unseal(presented, request.credential);
+        };
+        let mut out = step(0x31, presented);
         field(&mut out, request.credential).map_err(invalid)?;
-        field(&mut out, request.key.cose()).map_err(invalid)?;
-        out.extend(request.salt).map_err(invalid)?;
+        field(&mut out, key.cose()).map_err(invalid)?;
+        out.extend(salt).map_err(invalid)?;
         out.extend(&request.challenge).map_err(invalid)?;
         let reply = self.exchange(&out)?;
         let decode = || -> Result<Asserted, String> {
@@ -196,5 +227,75 @@ impl Tokens for Remote<'_> {
     }
     fn revoked(&self) -> bool {
         self.failed
+    }
+}
+
+/// A step request's head: its method, the step's purpose and role.
+fn step(method: u8, presented: Presented<'_>) -> Bytes {
+    Bytes(vec![method, presented.purpose as u8, presented.role as u8])
+}
+
+/// An enrolled credential, bounded and owned for the vault's slot.
+fn credential(input: &mut Reader<'_>) -> Result<Vec<u8>, String> {
+    Ok(input.field(MAX_CREDENTIAL)?.to_vec())
+}
+
+impl Remote<'_> {
+    /// `32`, then one field of the vault's retained computer keys'
+    /// primary Names, end to end: root refuses this computer before its
+    /// PIN when it is among them, else seals a fresh secret in its TPM
+    /// under a PIN the window gives it, and returns the sealed object and
+    /// the secret.
+    fn seal(
+        &mut self,
+        presented: Presented<'_>,
+        computers: &Computers,
+    ) -> Result<Enrolled, TokenError> {
+        let mut out = step(0x32, presented);
+        field(&mut out, computers.names().as_flattened()).map_err(invalid)?;
+        let reply = self.exchange(&out)?;
+        let decode = || -> Result<Enrolled, String> {
+            let mut input = Reader::new(&reply.0);
+            if input.byte()? != 0x32 {
+                return Err("computer sealing refused".into());
+            }
+            let credential = credential(&mut input)?;
+            Sealed::decode(&credential)?;
+            let secret = Secret32(input.array()?);
+            input.finish()?;
+            Ok(Enrolled {
+                credential,
+                factor: Factor::Computer,
+                secret,
+                counter: 0,
+            })
+        };
+        let result = decode().map_err(invalid);
+        self.failed |= result.is_err();
+        result
+    }
+
+    /// `33`: root unseals `credential`, a computer key's sealed object,
+    /// with the PIN the window gives it.
+    fn unseal(
+        &mut self,
+        presented: Presented<'_>,
+        credential: &[u8],
+    ) -> Result<Asserted, TokenError> {
+        let mut out = step(0x33, presented);
+        field(&mut out, credential).map_err(invalid)?;
+        let reply = self.exchange(&out)?;
+        let decode = || -> Result<Asserted, String> {
+            let mut input = Reader::new(&reply.0);
+            if input.byte()? != 0x33 {
+                return Err("computer unsealing refused".into());
+            }
+            let secret = Secret32(input.array()?);
+            input.finish()?;
+            Ok(Asserted { secret, counter: 0 })
+        };
+        let result = decode().map_err(invalid);
+        self.failed |= result.is_err();
+        result
     }
 }

@@ -189,10 +189,7 @@ impl Composition for Frame<'_> {
                     sink,
                 );
                 if let (Some(keys), Some(view)) = (keys, layout::keys(surface)) {
-                    let labels: Vec<String> = keys
-                        .iter()
-                        .map(|key| format!("{} key {}", key.role.name(), key.fingerprint))
-                        .collect();
+                    let labels: Vec<String> = keys.iter().map(|key| format!("{key}")).collect();
                     let window = list.window(view);
                     list.emit(
                         view,
@@ -236,10 +233,7 @@ impl Composition for Frame<'_> {
                     sink,
                 );
                 if let Some(view) = layout::copy_keys(surface) {
-                    let labels: Vec<String> = keys
-                        .iter()
-                        .map(|key| format!("{} key {}", key.role.name(), key.fingerprint))
-                        .collect();
+                    let labels: Vec<String> = keys.iter().map(|key| format!("{key}")).collect();
                     let window = list.window(view);
                     list.emit(
                         view,
@@ -369,7 +363,7 @@ impl Frame<'_> {
             .keys
             .labels
             .iter()
-            .map(|key| format!("{} key {}", key.role.name(), key.fingerprint))
+            .map(|key| format!("{key}"))
             .collect();
         let window = view.list.window(list);
         let first = window.start;

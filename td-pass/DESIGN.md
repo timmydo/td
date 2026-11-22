@@ -174,9 +174,14 @@ run standalone. No refusal falls back to another mode.
   question says that only an enrolled key and its PIN open the notebook,
   with no password or reset, and that with one key losing it or blocking
   its PIN loses the notebook for good; the question is tall enough that
-  all of it shows at 800x600 without scrolling. A notebook with one key
+  all of it shows at 800x600 without scrolling, on td the body's whole
+  height for its five actions. A notebook with one key
   says so when it opens, and its keys view says Insert adds a backup;
-  Replace on the only key refuses and says to add a backup first.
+  Replace on the only key refuses and says to add a backup first. On td
+  the question also offers Computer and backup and Computer only, this
+  computer's TPM as the primary ("Trusted td backend"), and says that
+  such a key opens only on this computer and shares the disk's TPM PIN
+  limit; standalone mode offers security keys alone.
 - **Keys.** Keys (Ctrl+K) shows the notebook's enrolled keys in place
   of the panes, naming the one that authorizes adding a key: the key it
   was unlocked with, or that key's replacement; the open entry and its
@@ -184,11 +189,14 @@ run standalone. No refusal falls back to another mode.
   and a drag ends, and putting the view away returns the focus it had,
   or the one an operation that ended under the view gave. Add backup
   (Insert) enrolls one more backup through the prompt, authorized by
-  that key. Replace (Delete) revokes the keys marked with Space or Shift
+  that key; on td it first asks whether that is a security key or this
+  computer. Replace (Delete) revokes the keys marked with Space or Shift
   and a press, or else the selected one, after a question naming them:
   every kept key is asked for, and one new key is enrolled, as the
-  primary when a primary is revoked. The window refuses to revoke every
-  key. It names keys by
+  primary when a primary is revoked, on td a security key or, With this
+  computer, its TPM. The window refuses to revoke every key. A computer
+  key is listed as "a computer's TPM" after its fingerprint, since an
+  imported copy's may be another computer's. It names keys by
   their place in the list the vault thread last gave it; the thread
   holds their credentials.
 - **Keyboard.** `F1` shows td-ui's key list over the window
@@ -283,7 +291,8 @@ run standalone. No refusal falls back to another mode.
   title's, and a text cut short ends in an ellipsis. The status line
   carries the instruction and the operation. Escape or Cancel declines,
   which the vault reports as cancelled. A PIN outside 4 to 63 printable
-  ASCII characters keeps the prompt open, saying so, and is not sent.
+  ASCII characters, or 6 to 63 for this computer's TPM, keeps the prompt
+  open, saying so, and is not sent.
   In trusted mode the same prompt
   shows each step root presents ("Trusted td backend"). A failed or
   declined step leaves the window on the view it was on, saying why: a
@@ -557,6 +566,29 @@ key or a token's output. These operations use the same lifecycle as
 standalone mode. Encrypted import/export file access stays in the
 human's GUI process. The shell-based password-store importer is
 unavailable in trusted mode.
+
+On td a key may instead be this computer's TPM (td-secret/PORTABLE.md,
+"This computer's TPM as a key"). Its steps ask only for its PIN, 6 to 63
+characters: an enrollment's new PIN then, as its proof, the same PIN
+again, and an unlock's or authorization's PIN. Root's prompt (`7d`)
+carries a kind byte after the step that marks them, and the request
+frames name each key's kind: create `2`, backup flag, primary kind,
+backup kind; add `9`, kind; replace `10`, kind, then the revoked keys.
+The keys reply sets a computer key's role byte's high nibble. Such a key
+opens only on this computer and shares the TPM's wrong-PIN limit with
+the disk; the create and add questions say both. The PIN reaches root
+as a security key's does, and the exposure below is the same, except
+that no touch is needed: code that learns the PIN through the window and
+can drive a trusted notebook step on this machine can unlock with it,
+and code that only drives the window can spend wrong PINs against the
+TPM's shared counter. Root refuses a computer step with fewer than eight
+tries left, so the notebook cannot by itself lock the disk's TPM PIN
+out, and a mistyped confirmation of a new PIN costs one try. Adding this
+computer, or replacing a key with it, when the vault already holds a
+retained key of it is refused before the new key's PIN is asked for;
+the keys that authorize the change have been asked for theirs by then.
+Creating with this computer as both primary and backup is refused
+before anything is asked.
 
 What this mode protects and what it does not: root alone opens the
 key's USB device, holds the slot, and binds each step to the exact

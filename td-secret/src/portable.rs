@@ -79,6 +79,190 @@ impl Role {
     }
 }
 
+/// What recovers a key's secret: a security key's hmac-secret, or the
+/// sealed object of one computer's TPM (td trusted mode only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    SecurityKey = 0,
+    Computer = 1,
+}
+
+impl Kind {
+    pub fn decode(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::SecurityKey),
+            1 => Ok(Self::Computer),
+            _ => Err("invalid portable key kind".into()),
+        }
+    }
+}
+
+/// A slot's public means to its secret: a security key's credential key
+/// and hmac-secret salt, or nothing beyond the credential, which for a
+/// computer is its TPM's sealed object (`Sealed`).
+#[derive(Clone)]
+pub(super) enum Factor {
+    SecurityKey {
+        key: VerificationKey,
+        salt: [u8; 32],
+    },
+    Computer,
+}
+
+impl Factor {
+    pub fn kind(&self) -> Kind {
+        match self {
+            Self::SecurityKey { .. } => Kind::SecurityKey,
+            Self::Computer => Kind::Computer,
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::SecurityKey { key: a, salt: x }, Self::SecurityKey { key: b, salt: y }) => {
+                a.cose() == b.cose() && x == y
+            }
+            (Self::Computer, Self::Computer) => true,
+            _ => false,
+        }
+    }
+}
+
+/// A computer key's credential: its TPM's sealed object under the storage
+/// primary the boot selector proved, with the salt of the PIN's authValue.
+const COMPUTER: &[u8; 8] = b"TDNBTPM1";
+pub(super) const PRIMARY_NAME: usize = 34;
+
+/// A computer key's credential, parsed: borrowed, holding no secret.
+pub(super) struct Sealed<'a> {
+    pub primary: &'a [u8; PRIMARY_NAME],
+    pub salt: &'a [u8; 32],
+    pub public: &'a [u8],
+    pub private: &'a [u8],
+}
+
+impl<'a> Sealed<'a> {
+    pub fn decode(credential: &'a [u8]) -> Result<Self> {
+        if credential.len() > MAX_CREDENTIAL {
+            return Err("oversized computer key".into());
+        }
+        let mut reader = Reader(credential);
+        if reader.take(8)? != COMPUTER {
+            return Err("invalid computer key".into());
+        }
+        let primary: &[u8; PRIMARY_NAME] = reader
+            .take(PRIMARY_NAME)?
+            .try_into()
+            .map_err(|_| "short computer key primary")?;
+        if primary.get(..2) != Some(&[0, 11]) {
+            return Err("invalid computer key primary".into());
+        }
+        let salt: &[u8; 32] = reader
+            .take(32)?
+            .try_into()
+            .map_err(|_| "short computer key salt")?;
+        let public = sealed_blob(&mut reader)?;
+        let private = sealed_blob(&mut reader)?;
+        reader.end()?;
+        Ok(Self {
+            primary,
+            salt,
+            public,
+            private,
+        })
+    }
+
+    /// The encoding's length: each object present and counted in two
+    /// bytes, the whole within a credential's bound.
+    pub fn encoded_len(&self) -> Result<usize> {
+        let mut len = COMPUTER.len() + PRIMARY_NAME + self.salt.len();
+        for blob in [self.public, self.private] {
+            sealed_size(blob)?;
+            len += 2 + blob.len();
+        }
+        if len > MAX_CREDENTIAL {
+            return Err("oversized computer key".into());
+        }
+        Ok(len)
+    }
+
+    /// Hands the encoding, `encoded_len` bytes, to `put` in order, so the
+    /// caller owns where it goes.
+    pub fn write(&self, put: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.encoded_len()?;
+        put(COMPUTER)?;
+        put(self.primary)?;
+        put(self.salt)?;
+        for blob in [self.public, self.private] {
+            put(&sealed_size(blob)?.to_be_bytes())?;
+            put(blob)?;
+        }
+        Ok(())
+    }
+}
+
+/// The storage primary Names of a vault's computer keys, on the stack: a
+/// vault holds at most one key of each computer's TPM.
+#[derive(Clone, Copy)]
+pub(super) struct Computers {
+    names: [[u8; PRIMARY_NAME]; MAX_SLOTS],
+    count: usize,
+}
+
+impl Computers {
+    pub const NONE: Self = Self {
+        names: [[0; PRIMARY_NAME]; MAX_SLOTS],
+        count: 0,
+    };
+
+    /// Adds the primary of a key of `kind`, a computer's sealed object;
+    /// a security key adds nothing. A second key of one computer, or a
+    /// ninth computer, is refused.
+    pub fn add(&mut self, kind: Kind, credential: &[u8]) -> Result<()> {
+        if kind != Kind::Computer {
+            return Ok(());
+        }
+        self.hold(Sealed::decode(credential)?.primary)
+    }
+
+    /// Adds one computer's primary Name, refusing it a second time.
+    pub fn hold(&mut self, name: &[u8; PRIMARY_NAME]) -> Result<()> {
+        if self.contains(name) {
+            return Err("a vault holds one key of each computer's TPM".into());
+        }
+        let slot = self
+            .names
+            .get_mut(self.count)
+            .ok_or("a vault holds at most eight keys")?;
+        *slot = *name;
+        self.count += 1;
+        Ok(())
+    }
+
+    pub fn contains(&self, name: &[u8; PRIMARY_NAME]) -> bool {
+        self.names().contains(name)
+    }
+
+    pub fn names(&self) -> &[[u8; PRIMARY_NAME]] {
+        self.names.get(..self.count).unwrap_or_default()
+    }
+}
+
+fn sealed_size(blob: &[u8]) -> Result<u16> {
+    u16::try_from(blob.len())
+        .ok()
+        .filter(|size| *size != 0)
+        .ok_or_else(|| "invalid computer key object".into())
+}
+
+fn sealed_blob<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8]> {
+    let size = usize::from(u16::from_be_bytes(reader.array()?));
+    if size == 0 {
+        return Err("empty computer key object".into());
+    }
+    reader.take(size)
+}
+
 pub(super) struct Entry {
     pub id: [u8; 16],
     pub revision: u64,
@@ -379,16 +563,14 @@ impl VerificationKey {
 pub(super) struct UnlockHint<'a> {
     pub role: Role,
     pub credential: &'a [u8],
-    pub key: &'a VerificationKey,
-    pub salt: &'a [u8; 32],
+    pub factor: &'a Factor,
 }
 
 // Produced only by the future proved enrollment adapter, never an app API.
 pub(super) struct Protector {
     pub role: Role,
     pub credential: Vec<u8>,
-    pub key: VerificationKey,
-    pub salt: [u8; 32],
+    pub factor: Factor,
     pub secret: Secret32,
 }
 
@@ -397,8 +579,7 @@ pub(super) struct Protector {
 struct Slot {
     role: Role,
     credential: Vec<u8>,
-    key: VerificationKey,
-    salt: [u8; 32],
+    factor: Factor,
     nonce: [u8; 12],
     wrapped: [u8; 48],
 }
@@ -413,8 +594,7 @@ impl Slot {
         let mut slot = Self {
             role: protector.role,
             credential: protector.credential.clone(),
-            key: protector.key.clone(),
-            salt: protector.salt,
+            factor: protector.factor.clone(),
             nonce: random_array(random)?,
             wrapped: [0; 48],
         };
@@ -450,17 +630,21 @@ impl Slot {
         Ok(out)
     }
 
+    // A security key's slot is unchanged; a computer's sets the role
+    // byte's high nibble and carries neither key nor salt.
     fn metadata(&self, out: &mut Vec<u8>) -> Result<()> {
         if self.credential.is_empty() || self.credential.len() > MAX_CREDENTIAL {
             return Err("invalid portable credential length".into());
         }
-        out.push(self.role as u8);
+        out.push(self.role as u8 | ((self.factor.kind() as u8) << 4));
         let size = u16::try_from(self.credential.len())
             .map_err(|_| "portable credential length overflow")?;
         out.extend_from_slice(&size.to_be_bytes());
         out.extend_from_slice(&self.credential);
-        out.extend_from_slice(self.key.cose());
-        out.extend_from_slice(&self.salt);
+        if let Factor::SecurityKey { key, salt } = &self.factor {
+            out.extend_from_slice(key.cose());
+            out.extend_from_slice(salt);
+        }
         Ok(())
     }
 }
@@ -494,7 +678,11 @@ impl LockedVault {
         // Sort references so token secrets remain in their clearing owners.
         let mut ordered: Vec<&Protector> = protectors.iter().collect();
         ordered.sort_by(|a, b| a.credential.cmp(&b.credential));
-        validate_keys(ordered.iter().map(|p| (p.role, p.credential.as_slice())))?;
+        validate_keys(
+            ordered
+                .iter()
+                .map(|p| (p.role, p.factor.kind(), p.credential.as_slice())),
+        )?;
         let id = random_array(random)?;
         let master = Secret32(random_array(random)?);
         let slots = ordered
@@ -551,22 +739,37 @@ impl LockedVault {
         }
         let mut slots = Vec::new();
         for _ in 0..count {
-            let [role] = reader.array()?;
-            let role = Role::decode(role)?;
+            let [byte] = reader.array()?;
+            let role = Role::decode(byte & 0x0f)?;
+            let kind = Kind::decode(byte >> 4)?;
             let size = usize::from(u16::from_be_bytes(reader.array()?));
             if size == 0 || size > MAX_CREDENTIAL {
                 return Err("invalid portable credential length".into());
             }
+            let credential = reader.take(size)?.to_vec();
+            let factor = match kind {
+                Kind::SecurityKey => Factor::SecurityKey {
+                    key: VerificationKey::from_cose(reader.take(KEY_BYTES)?)?,
+                    salt: reader.array()?,
+                },
+                Kind::Computer => {
+                    Sealed::decode(&credential)?;
+                    Factor::Computer
+                }
+            };
             slots.push(Slot {
                 role,
-                credential: reader.take(size)?.to_vec(),
-                key: VerificationKey::from_cose(reader.take(KEY_BYTES)?)?,
-                salt: reader.array()?,
+                credential,
+                factor,
                 nonce: reader.array()?,
                 wrapped: reader.array()?,
             });
         }
-        validate_keys(slots.iter().map(|s| (s.role, s.credential.as_slice())))?;
+        validate_keys(
+            slots
+                .iter()
+                .map(|s| (s.role, s.factor.kind(), s.credential.as_slice())),
+        )?;
         let nonce = reader.array()?;
         let size = reader.count(MAX_PLAIN + 16)?;
         if size < 20 {
@@ -595,8 +798,7 @@ impl LockedVault {
         self.slots.iter().map(|slot| UnlockHint {
             role: slot.role,
             credential: &slot.credential,
-            key: &slot.key,
-            salt: &slot.salt,
+            factor: &slot.factor,
         })
     }
 
@@ -714,7 +916,11 @@ impl LockedVault {
         let mut slots = self.slots.clone();
         slots.push(Slot::wrap(&self.id, &opened.master, protector, random)?);
         slots.sort_by(|a, b| a.credential.cmp(&b.credential));
-        validate_keys(slots.iter().map(|s| (s.role, s.credential.as_slice())))?;
+        validate_keys(
+            slots
+                .iter()
+                .map(|s| (s.role, s.factor.kind(), s.credential.as_slice())),
+        )?;
         Self::seal(
             &self.id,
             revision,
@@ -740,7 +946,11 @@ impl LockedVault {
         }
         let mut ordered: Vec<&Protector> = protectors.iter().collect();
         ordered.sort_by(|a, b| a.credential.cmp(&b.credential));
-        validate_keys(ordered.iter().map(|p| (p.role, p.credential.as_slice())))?;
+        validate_keys(
+            ordered
+                .iter()
+                .map(|p| (p.role, p.factor.kind(), p.credential.as_slice())),
+        )?;
         let mut retained = 0usize;
         for protector in &ordered {
             let Some(slot) = self
@@ -750,10 +960,7 @@ impl LockedVault {
             else {
                 continue;
             };
-            if slot.role != protector.role
-                || slot.key.cose() != protector.key.cose()
-                || slot.salt != protector.salt
-            {
+            if slot.role != protector.role || !slot.factor.same(&protector.factor) {
                 return Err("retained portable key metadata changed".into());
             }
             if !equal32(&slot.unwrap(&self.id, &protector.secret)?, &opened.master) {
@@ -791,16 +998,20 @@ pub(super) fn equal32(a: &Secret32, b: &Secret32) -> bool {
     td_tpm::equal(&a.0, &b.0)
 }
 
-fn validate_keys<'a>(keys: impl Iterator<Item = (Role, &'a [u8])>) -> Result<()> {
+/// Exactly one primary, ordered distinct credentials, and at most one key
+/// of each computer's TPM, by its sealed objects' primary Names.
+fn validate_keys<'a>(keys: impl Iterator<Item = (Role, Kind, &'a [u8])>) -> Result<()> {
     let mut previous: Option<&[u8]> = None;
     let mut primary = 0;
-    for (role, credential) in keys {
+    let mut computers = Computers::NONE;
+    for (role, kind, credential) in keys {
         if credential.is_empty()
             || credential.len() > MAX_CREDENTIAL
             || previous.is_some_and(|p| p >= credential)
         {
             return Err("invalid, duplicate or unordered portable credentials".into());
         }
+        computers.add(kind, credential)?;
         primary += usize::from(role == Role::Primary);
         previous = Some(credential);
     }
@@ -967,6 +1178,150 @@ mod tests {
         }
     }
 
+    pub(super) fn fido(key: VerificationKey, salt: [u8; 32]) -> Factor {
+        Factor::SecurityKey { key, salt }
+    }
+
+    fn key_of(factor: &Factor) -> &VerificationKey {
+        match factor {
+            Factor::SecurityKey { key, .. } => key,
+            Factor::Computer => panic!("a computer key has no verification key"),
+        }
+    }
+
+    fn salt_of(factor: &Factor) -> &[u8; 32] {
+        match factor {
+            Factor::SecurityKey { salt, .. } => salt,
+            Factor::Computer => panic!("a computer key has no salt"),
+        }
+    }
+
+    /// A sealed object of computer `machine`'s TPM, its `serial`th.
+    pub(super) fn computer_credential(machine: u8, serial: u8) -> Vec<u8> {
+        let mut primary = [machine; PRIMARY_NAME];
+        primary[..2].copy_from_slice(&[0, 11]);
+        sealed_bytes(&Sealed {
+            primary: &primary,
+            salt: &[serial; 32],
+            public: &device_pin_public(serial, td_tpm::DA_SEALED_ATTRIBUTES),
+            private: &[serial ^ 0xff; 90],
+        })
+        .unwrap()
+    }
+
+    /// A sealed object's public area as td-tpm's `seal_device_pin` makes
+    /// one: a SHA-256 keyed-hash object with `attributes`, td's device PIN
+    /// policy and a unique field of `serial`.
+    pub(super) fn device_pin_public(serial: u8, attributes: u32) -> Vec<u8> {
+        let mut public = vec![0, 8, 0, 11];
+        public.extend_from_slice(&attributes.to_be_bytes());
+        public.extend_from_slice(&[0, 32]);
+        public.extend_from_slice(&td_tpm::device_pin_policy_digest());
+        public.extend_from_slice(&[0, 0x10, 0, 32]);
+        public.extend_from_slice(&[serial; 32]);
+        public
+    }
+
+    /// A sealed object's encoding, as a test holds it.
+    pub(super) fn sealed_bytes(sealed: &Sealed<'_>) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        sealed.write(&mut |part| {
+            out.extend_from_slice(part);
+            Ok(())
+        })?;
+        assert_eq!(out.len(), sealed.encoded_len()?);
+        Ok(out)
+    }
+
+    #[test]
+    fn a_security_key_only_envelope_keeps_its_exact_bytes() {
+        let vault = fixture();
+        assert_eq!(vault.bytes().len(), 523);
+        let digest: String = crypto::digest(vault.bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            digest,
+            "917ec5d5516825e3dbda703c7a242cf5832edbac7fac7c5a8bba57182afb4845"
+        );
+    }
+
+    #[test]
+    fn a_computer_slot_round_trips_beside_security_keys_and_binds_its_kind() {
+        let computer = computer_credential(0x5c, 0x5c);
+        let mut keys = protectors();
+        keys.push(Protector {
+            role: Role::Backup,
+            credential: computer.clone(),
+            factor: Factor::Computer,
+            secret: Secret32([0x44; 32]),
+        });
+        let vault = LockedVault::create(&notebook(), &keys, &mut random()).unwrap();
+        let decoded = LockedVault::decode(vault.bytes()).unwrap();
+        let hint = decoded.unlock_hint(&computer).unwrap();
+        assert_eq!(hint.factor.kind(), Kind::Computer);
+        assert_eq!(hint.role, Role::Backup);
+        let opened = decoded.open(&computer, &Secret32([0x44; 32])).unwrap();
+        assert_eq!(opened.notebook.entries.len(), 1);
+        assert!(decoded.open(&computer, &Secret32([0x45; 32])).is_err());
+        let sealed = Sealed::decode(&computer).unwrap();
+        assert_eq!(sealed.salt, &[0x5c; 32]);
+        assert_eq!(
+            sealed.public,
+            device_pin_public(0x5c, td_tpm::DA_SEALED_ATTRIBUTES).as_slice()
+        );
+        assert_eq!(sealed.private, &[0xa3; 90]);
+        // Its role byte carries the kind; an older reader's role 0x12 is
+        // invalid, and clearing the kind leaves a slot no reader accepts.
+        let bytes = vault.bytes();
+        let at = bytes
+            .windows(computer.len())
+            .position(|w| w == computer.as_slice())
+            .unwrap();
+        assert_eq!(bytes[at - 3], 0x12);
+        assert!(Role::decode(0x12).is_err());
+        let mut cleared = bytes.to_vec();
+        cleared[at - 3] = 0x02;
+        assert!(LockedVault::decode(&cleared).is_err());
+        let mut unknown = bytes.to_vec();
+        unknown[at - 3] = 0x22;
+        assert!(LockedVault::decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn a_computer_credential_is_a_bounded_sealed_object() {
+        let good = computer_credential(1, 1);
+        assert!(Sealed::decode(&good).is_ok());
+        let mut magic = good.clone();
+        magic[0] ^= 1;
+        assert!(Sealed::decode(&magic).is_err());
+        let mut name = good.clone();
+        name[9] = 12;
+        assert!(Sealed::decode(&name).is_err());
+        assert!(Sealed::decode(&good[..good.len() - 1]).is_err());
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(Sealed::decode(&trailing).is_err());
+        let primary = [0u8; PRIMARY_NAME];
+        assert!(Sealed {
+            primary: &primary,
+            salt: &[0; 32],
+            public: &[],
+            private: &[1],
+        }
+        .encoded_len()
+        .is_err());
+        assert!(Sealed {
+            primary: &primary,
+            salt: &[0; 32],
+            public: &[1; 1000],
+            private: &[1],
+        }
+        .encoded_len()
+        .is_err());
+    }
+
     fn verification_key(backup: bool) -> VerificationKey {
         let x = hex_bytes("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296");
         let y = hex_bytes(if backup {
@@ -996,15 +1351,13 @@ mod tests {
             Protector {
                 role: Role::Primary,
                 credential: b"primary".to_vec(),
-                key: verification_key(false),
-                salt: [0xa1; 32],
+                factor: fido(verification_key(false), [0xa1; 32]),
                 secret: Secret32([0x11; 32]),
             },
             Protector {
                 role: Role::Backup,
                 credential: b"backup".to_vec(),
-                key: verification_key(true),
-                salt: [0xb2; 32],
+                factor: fido(verification_key(true), [0xb2; 32]),
                 secret: Secret32([0x22; 32]),
             },
         ]
@@ -1055,8 +1408,7 @@ mod tests {
         Protector {
             role,
             credential: b"third".to_vec(),
-            key: verification_key(true),
-            salt: [0xc3; 32],
+            factor: fido(verification_key(true), [0xc3; 32]),
             secret: Secret32([0x33; 32]),
         }
     }
@@ -1072,7 +1424,7 @@ mod tests {
         keys[1].secret = Secret32([0x23; 32]);
         assert!(vault.rotate(&opened, &keys, &mut random()).is_err());
         let mut keys = protectors();
-        keys[1].salt = [0xb3; 32];
+        keys[1].factor = fido(verification_key(true), [0xb3; 32]);
         assert!(vault.rotate(&opened, &keys, &mut random()).is_err());
         let mut keys = protectors();
         keys[0].role = Role::Backup;
@@ -1177,12 +1529,15 @@ mod tests {
             };
             let hint = imported.unlock_hint(id).unwrap();
             assert_eq!(hint.credential, id);
-            assert_eq!(hint.key.cose(), verification_key(backup).cose());
+            assert_eq!(key_of(hint.factor).cose(), verification_key(backup).cose());
             assert_eq!(
-                hint.key.public_key().unwrap().coordinates(),
+                key_of(hint.factor).public_key().unwrap().coordinates(),
                 verification_key(backup).public_key().unwrap().coordinates()
             );
-            assert_eq!(*hint.salt, [if backup { 0xb2 } else { 0xa1 }; 32]);
+            assert_eq!(
+                *salt_of(hint.factor),
+                [if backup { 0xb2 } else { 0xa1 }; 32]
+            );
         }
         assert!(imported.unlock_hint(b"missing").is_err());
         let opened = imported.open(b"backup", &Secret32([0x22; 32])).unwrap();
@@ -1191,8 +1546,8 @@ mod tests {
             .unwrap();
         for slot in &imported.slots {
             let hint = revised.unlock_hint(&slot.credential).unwrap();
-            assert_eq!(hint.key.cose(), slot.key.cose());
-            assert_eq!(hint.salt, &slot.salt);
+            assert_eq!(key_of(hint.factor).cose(), key_of(&slot.factor).cose());
+            assert_eq!(salt_of(hint.factor), salt_of(&slot.factor));
         }
     }
 
@@ -1250,14 +1605,14 @@ mod tests {
         let mut offset = 49;
         for slot in &vault.slots {
             let replacement = verification_key(slot.role == Role::Primary);
-            assert_ne!(replacement.cose(), slot.key.cose());
+            assert_ne!(replacement.cose(), key_of(&slot.factor).cose());
             let start = offset + 3 + slot.credential.len();
             let mut tampered = vault.bytes().to_vec();
             tampered[start..start + KEY_BYTES].copy_from_slice(replacement.cose());
             // A valid replacement remains only untrusted unlock metadata.
             let parsed = LockedVault::decode(&tampered).unwrap();
             assert_eq!(
-                parsed.unlock_hint(&slot.credential).unwrap().key.cose(),
+                key_of(parsed.unlock_hint(&slot.credential).unwrap().factor).cose(),
                 replacement.cose()
             );
             let modified = parsed
@@ -1370,12 +1725,75 @@ mod tests {
         }
         assert!(validate_keys(
             [
-                (Role::Primary, b"z".as_slice()),
-                (Role::Backup, b"a".as_slice())
+                (Role::Primary, Kind::SecurityKey, b"z".as_slice()),
+                (Role::Backup, Kind::SecurityKey, b"a".as_slice())
             ]
             .into_iter()
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_vault_holds_one_key_of_each_computer() {
+        // Two sealed objects of computer 5, distinct credentials.
+        let (a, b) = (computer_credential(5, 1), computer_credential(5, 2));
+        let other = computer_credential(6, 3);
+        let mut keys = protectors();
+        for credential in [a.clone(), b] {
+            keys.push(Protector {
+                role: Role::Backup,
+                credential,
+                factor: Factor::Computer,
+                secret: Secret32([0x44; 32]),
+            });
+        }
+        let refused = LockedVault::create(&notebook(), &keys, &mut random());
+        assert_eq!(
+            refused.err().as_deref(),
+            Some("a vault holds one key of each computer's TPM")
+        );
+        // Another computer's key beside the first is a vault, and the same
+        // primary as a security key's credential bytes is not a computer.
+        keys.pop();
+        keys.push(Protector {
+            role: Role::Backup,
+            credential: other,
+            factor: Factor::Computer,
+            secret: Secret32([0x44; 32]),
+        });
+        let vault = LockedVault::create(&notebook(), &keys, &mut random()).unwrap();
+        assert!(LockedVault::decode(vault.bytes()).is_ok());
+        assert!(validate_keys(
+            [
+                (Role::Primary, Kind::SecurityKey, a.as_slice()),
+                (
+                    Role::Backup,
+                    Kind::Computer,
+                    computer_credential(5, 9).as_slice()
+                ),
+            ]
+            .into_iter()
+        )
+        .is_ok());
+        // An envelope naming one computer twice is refused on decode.
+        let doubled = vault
+            .bytes()
+            .windows(PRIMARY_NAME)
+            .position(|w| w.get(..2) == Some(&[0, 11]) && w.get(2) == Some(&6))
+            .unwrap();
+        let mut bytes = vault.bytes().to_vec();
+        bytes[doubled + 2..doubled + PRIMARY_NAME].fill(5);
+        assert_eq!(
+            LockedVault::decode(&bytes).err().as_deref(),
+            Some("a vault holds one key of each computer's TPM")
+        );
+        let mut held = Computers::NONE;
+        held.add(Kind::Computer, &a).unwrap();
+        assert!(held
+            .add(Kind::Computer, &computer_credential(5, 7))
+            .is_err());
+        held.add(Kind::SecurityKey, &a).unwrap();
+        assert_eq!(held.names().len(), 1);
     }
 
     #[test]
@@ -1543,8 +1961,7 @@ mod tests {
             keys.push(Protector {
                 role: Role::Backup,
                 credential: vec![number as u8; MAX_CREDENTIAL],
-                key: verification_key(false),
-                salt: [number as u8; 32],
+                factor: fido(verification_key(false), [number as u8; 32]),
                 secret: Secret32([number as u8; 32]),
             });
         }

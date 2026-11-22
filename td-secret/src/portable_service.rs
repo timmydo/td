@@ -4,7 +4,7 @@
 use super::host::{self, Entropy};
 use super::lifecycle::{self, Directory, Session, Tokens};
 use super::notebook::{Change, Text};
-use super::{MAX_BODY, MAX_CREDENTIAL, MAX_ENVELOPE, MAX_PASSWORD, MAX_TITLE};
+use super::{Kind, MAX_BODY, MAX_CREDENTIAL, MAX_ENVELOPE, MAX_PASSWORD, MAX_TITLE};
 use crate::notebook_wire::{
     field, put_binding, read_binding as binding, Bytes, Reader, Wire, IDLE,
 };
@@ -75,8 +75,9 @@ impl Backend {
                 if lifecycle::exists(&self.directory).map_err(reason)? {
                     let keys = lifecycle::keys(&self.directory).map_err(reason)?;
                     out.push(u8::try_from(keys.len()).map_err(|_| "too many notebook keys")?)?;
+                    // The role, a computer's with its high nibble set.
                     for key in keys {
-                        out.push(key.role as u8)?;
+                        out.push(key.role as u8 | ((key.kind as u8) << 4))?;
                         field(&mut out, &key.credential)?;
                     }
                 } else {
@@ -91,10 +92,26 @@ impl Backend {
             }
             2 => {
                 let backup = input.boolean()?;
+                let primary = Kind::decode(input.byte()?)?;
+                let backup_kind = Kind::decode(input.byte()?)?;
                 input.finish()?;
+                if !backup && backup_kind != Kind::SecurityKey {
+                    return Err("a notebook without a backup names no backup kind".into());
+                }
+                // One computer holds one key of a vault: refused here,
+                // before any PIN, rather than after its first sealing.
+                if backup && primary == Kind::Computer && backup_kind == Kind::Computer {
+                    return Err("a notebook's backup is another key than this computer".into());
+                }
                 self.lock();
-                let session =
-                    lifecycle::create(&self.directory, tokens, random, backup).map_err(reason)?;
+                let session = lifecycle::create(
+                    &self.directory,
+                    tokens,
+                    random,
+                    primary,
+                    backup.then_some(backup_kind),
+                )
+                .map_err(reason)?;
                 self.opened(session)?;
             }
             3 => {
@@ -158,13 +175,15 @@ impl Backend {
                 self.opened(session)?;
             }
             9 => {
+                let kind = Kind::decode(input.byte()?)?;
                 input.finish()?;
                 self.session()?;
                 let session = self.session.as_mut().ok_or("notebook is locked")?;
-                let result = session.add_key(&self.directory, tokens, random);
+                let result = session.add_key(&self.directory, kind, tokens, random);
                 self.saved(result)?;
             }
             10 => {
+                let kind = Kind::decode(input.byte()?)?;
                 let count = input.byte()?;
                 if count == 0 || count > 7 {
                     return Err("invalid revoked key count".into());
@@ -176,7 +195,7 @@ impl Backend {
                 input.finish()?;
                 self.session()?;
                 let session = self.session.as_mut().ok_or("notebook is locked")?;
-                let result = session.replace_keys(&self.directory, &revoked, tokens, random);
+                let result = session.replace_keys(&self.directory, &revoked, kind, tokens, random);
                 self.saved(result)?;
             }
             11 => {
@@ -495,7 +514,9 @@ mod tests {
             .request(&retrieve.0, &mut tokens, &mut random)
             .is_err());
         tokens.present(&[0, 0, 1, 1]);
-        backend.request(&[2, 1], &mut tokens, &mut random).unwrap();
+        backend
+            .request(&[2, 1, 0, 0], &mut tokens, &mut random)
+            .unwrap();
         let backup = backend
             .session()
             .unwrap()
@@ -582,13 +603,25 @@ mod tests {
     #[test]
     fn malformed_creation_has_no_token_or_disk_effect_and_uncertainty_locks() {
         let (temp, mut backend, mut tokens, mut random) = fixture();
-        for request in [&[][..], &[2], &[2, 2], &[2, 1, 0], &[255]] {
+        for request in [
+            &[][..],
+            &[2],
+            &[2, 2],
+            &[2, 1, 0],
+            &[2, 0, 0, 1],
+            &[2, 1, 2, 0],
+            &[2, 1, 1, 1],
+            &[2, 1, 0, 0, 0],
+            &[255],
+        ] {
             assert!(backend.request(request, &mut tokens, &mut random).is_err());
         }
         assert!(tokens.calls.is_empty());
         assert!(!temp.join("vault").exists());
         tokens.present(&[0, 0]);
-        backend.request(&[2, 0], &mut tokens, &mut random).unwrap();
+        backend
+            .request(&[2, 0, 0, 0], &mut tokens, &mut random)
+            .unwrap();
         let before = std::fs::read(temp.join("vault")).unwrap();
         let mut create = Bytes(vec![6, 1]);
         field(&mut create, b"entry").unwrap();

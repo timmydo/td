@@ -10,10 +10,9 @@ use td_tpm::{
     put32, Client, PcrPolicy, PcrReadError, PcrSelection, Reader, Refusal, SealedObject, Transport,
 };
 
-/// The shortest PIN the codec admits.
-pub const MIN_PIN_LEN: usize = 6;
-/// The longest PIN the codec admits.
-pub const MAX_PIN_LEN: usize = 63;
+/// The shortest and longest PIN the codec admits (td-tpm's
+/// `device_pin`, the one codec every device PIN object shares).
+pub use td_tpm::device_pin::{AuthValue, PinError, MAX_PIN_LEN, MIN_PIN_LEN};
 /// The HMAC message prefix of a PIN's authValue; a zero byte follows it.
 pub const PIN_DOMAIN: &[u8] = b"td/disk-protector/pin/v1";
 /// A tpm-pin object's salt, random per object and public in its token.
@@ -42,82 +41,24 @@ pub const POLICY_AUTH_VALUE: u32 = 0x16b;
 pub const PROTECTED_ATTRIBUTES: u32 = 0x92;
 const KEYED_HASH: u16 = 0x0008;
 
-/// Why the codec refused an entry. Neither variant carries a byte of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PinError {
-    /// The entry is not `MIN_PIN_LEN` to `MAX_PIN_LEN` bytes long.
-    Length { len: usize },
-    /// The byte at this one-based offset is not printable ASCII (0x20 to
-    /// 0x7e).
-    Character { position: usize },
-}
-impl fmt::Display for PinError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Length { len } => write!(
-                f,
-                "a PIN has {MIN_PIN_LEN} to {MAX_PIN_LEN} bytes, not {len}"
-            ),
-            Self::Character { position } => {
-                write!(f, "byte {position} of the PIN is not printable ASCII")
-            }
-        }
-    }
-}
-impl std::error::Error for PinError {}
-
-/// A TPM PIN as typed: 6 to 63 bytes, each 0x20 to 0x7e. It lives in one
-/// heap allocation of exactly its length, zeroed on drop, and is
-/// deliberately neither `Debug`, `Display` nor `Clone`.
-pub struct Pin(Box<[u8]>);
-impl Drop for Pin {
-    fn drop(&mut self) {
-        td_tpm::zero(&mut self.0);
-    }
-}
+/// A TPM PIN as typed: 6 to 63 bytes, each 0x20 to 0x7e, held by the
+/// shared codec, zeroed on drop and deliberately neither `Debug`,
+/// `Display` nor `Clone`.
+pub struct Pin(td_tpm::device_pin::Pin);
 impl Pin {
     /// The only constructor. The length is judged first, then each byte;
     /// the caller zeroes `entry`, which is copied.
     pub fn parse(entry: &[u8]) -> Result<Self, PinError> {
-        if !(MIN_PIN_LEN..=MAX_PIN_LEN).contains(&entry.len()) {
-            return Err(PinError::Length { len: entry.len() });
-        }
-        if let Some(index) = entry.iter().position(|byte| !(0x20..=0x7e).contains(byte)) {
-            return Err(PinError::Character {
-                position: index + 1,
-            });
-        }
-        Ok(Self(entry.into()))
+        td_tpm::device_pin::Pin::parse(entry).map(Self)
     }
 
     /// The tpm-pin object's authValue under `salt`: HMAC-SHA256 keyed with
     /// the salt over `PIN_DOMAIN`, a zero byte and the PIN. All 32 bytes;
     /// removing trailing zero bytes where TPM 2.0 does is td-tpm's.
     pub fn auth_value(&self, salt: &[u8; SALT_LEN]) -> AuthValue {
-        let mut value = AuthValue(Box::new([0; AUTH_VALUE_LEN]));
-        let mut mac = hmac_sha256(salt, &[PIN_DOMAIN, &[0], &self.0]);
-        value.0.copy_from_slice(&mac);
-        td_tpm::zero(&mut mac);
-        value
+        self.0.auth_value(PIN_DOMAIN, salt)
     }
 }
-
-/// A tpm-pin object's authValue, zeroed on drop and deliberately neither
-/// `Debug`, `Display` nor `Clone`.
-pub struct AuthValue(Box<[u8; AUTH_VALUE_LEN]>);
-impl Drop for AuthValue {
-    fn drop(&mut self) {
-        td_tpm::zero(self.0.as_mut_slice());
-    }
-}
-impl AuthValue {
-    /// The bytes, lent to the TPM command that seals or unseals with them.
-    pub fn expose(&self) -> &[u8; AUTH_VALUE_LEN] {
-        &self.0
-    }
-}
-
-use crate::hmac::hmac_sha256;
 
 /// Which PCRs a tpm-pin policy names besides the literal-zero PCR 12: the
 /// token's `pcrs`, `4,9` or `4,7,9`.
@@ -406,6 +347,15 @@ mod tests {
         }
     }
 
+    // What the codec holds, seen through the authValue it gives.
+    fn held(pin: &Pin) -> [u8; 32] {
+        *pin.auth_value(&[9; SALT_LEN]).expose()
+    }
+
+    fn stored(entry: impl AsRef<[u8]>) -> [u8; 32] {
+        crate::hmac::hmac_sha256(&[9; SALT_LEN], &[PIN_DOMAIN, &[0], entry.as_ref()])
+    }
+
     fn refused(entry: &[u8]) -> PinError {
         match Pin::parse(entry) {
             Ok(_) => panic!("admitted {entry:?}"),
@@ -418,25 +368,25 @@ mod tests {
         assert_eq!((MIN_PIN_LEN, MAX_PIN_LEN), (6, 63));
         assert_eq!(refused(b""), PinError::Length { len: 0 });
         assert_eq!(refused(b"12345"), PinError::Length { len: 5 });
-        assert_eq!(parsed(b"123456").0.as_ref(), b"123456");
+        assert_eq!(held(&parsed(b"123456")), stored(b"123456"));
         let longest = [b'~'; 63];
-        assert_eq!(parsed(&longest).0.as_ref(), longest);
+        assert_eq!(held(&parsed(&longest)), stored(longest));
         assert_eq!(refused(&[b'7'; 64]), PinError::Length { len: 64 });
         // The length is judged before the bytes.
         assert_eq!(refused(b"\x1f\x7f\x00"), PinError::Length { len: 3 });
         assert_eq!(refused(&[0; 64]), PinError::Length { len: 64 });
         // Space admitted, at either end and inside.
-        assert_eq!(parsed(b"pass phrase").0.as_ref(), b"pass phrase");
-        assert_eq!(parsed(b" 12345").0.as_ref(), b" 12345");
-        assert_eq!(parsed(b"12345 ").0.as_ref(), b"12345 ");
-        assert_eq!(parsed(b"      ").0.as_ref(), b"      ");
+        assert_eq!(held(&parsed(b"pass phrase")), stored(b"pass phrase"));
+        assert_eq!(held(&parsed(b" 12345")), stored(b" 12345"));
+        assert_eq!(held(&parsed(b"12345 ")), stored(b"12345 "));
+        assert_eq!(held(&parsed(b"      ")), stored(b"      "));
         // Every printable byte is admitted and every other refused, at its
         // one-based offset.
         for byte in 0..=u8::MAX {
             let mut entry = *b"abcdefg";
             entry[3] = byte;
             if (0x20..=0x7e).contains(&byte) {
-                assert_eq!(parsed(&entry).0.as_ref(), entry);
+                assert_eq!(held(&parsed(&entry)), stored(entry));
             } else {
                 assert_eq!(refused(&entry), PinError::Character { position: 4 });
             }

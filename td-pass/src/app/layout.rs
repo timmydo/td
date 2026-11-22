@@ -264,6 +264,10 @@ pub const DIALOG_ROWS: i64 = 7;
 /// the dialog's widest and its three actions, so what one key risks shows
 /// without scrolling.
 pub const CREATE_ROWS: i64 = 13;
+/// The create question's rows on td, with this computer's TPM among its
+/// five actions: at 800x600 the body's height, so what a computer key
+/// binds shows without scrolling too.
+pub const CREATE_ROWS_ON_TD: i64 = 22;
 /// The swap question's rows: at 800x600 the body's height, so all it says
 /// shows without scrolling.
 pub const SWAP_ROWS: i64 = 22;

@@ -2098,7 +2098,16 @@ Name. td-kexec carries it in a separate mode-0400 archive member,
 deployments. During `admit`, a matching primary TPM admission allows the
 deployment to publish the Name in root's private /run/td-admit directory.
 The optional member carries no key, PIN or lockout authorization. Its
-absence affects only the availability of the TPM passkey vault.
+absence affects only the availability of the TPM passkey vault and of
+notebook keys of this computer's TPM (td-secret/PORTABLE.md, "This
+computer's TPM as a key"), which seal under the same Name: without it
+td-secret refuses their sealing and unsealing before asking for a PIN.
+td-tpm's `device_pin` module owns the Name's admission, the device PIN
+codec and the lockout policy both consumers require. The passkey vault
+derives its authValue in the volume PIN's domain under its own salt, a
+notebook key in td-secret's domain; both share this TPM's
+dictionary-attack counter with the volume's TPM PIN, and a notebook step
+leaves the last eight tries to the volume.
 
 ### Verified account handoff
 

@@ -187,12 +187,14 @@ pub(crate) struct Bridge {
 }
 
 fn action(bytes: &[u8]) -> Option<u8> {
+    // Creation names its backup and each key's kind; adding and replacing
+    // name the new key's kind.
     match bytes {
-        [2, 0] => Some(1),
-        [2, 1] => Some(2),
+        [2, 0, _, _] => Some(1),
+        [2, 1, _, _] => Some(2),
         [3, ..] => Some(3),
         [8, ..] => Some(4),
-        [9] => Some(5),
+        [9, _] => Some(5),
         [10, ..] => Some(6),
         _ => None,
     }
@@ -448,7 +450,7 @@ impl Bridge {
                 self.gui.wire.queue(reply)?;
                 self.heartbeat = Instant::now();
             }
-            Some(0x30 | 0x31) => {
+            Some(0x30..=0x33) => {
                 if ceremony.token.is_some() {
                     return Err("notebook service asked for two token steps".into());
                 }
@@ -460,7 +462,9 @@ impl Bridge {
                 let method = input.byte()?;
                 let purpose = input.byte()?;
                 let role = input.byte()?;
-                ceremony.key = if method == 0x31 {
+                // An assertion or unseal names its key, a security key's
+                // credential or a computer's sealed object.
+                ceremony.key = if matches!(method, 0x31 | 0x33) {
                     let mut hash = crate::sha256::Sha256::new();
                     hash.update(input.field(1024)?);
                     let digest = hash.finalize();
@@ -516,6 +520,12 @@ impl Bridge {
                 let Operation::Notebook(step) = request.operation() else {
                     return Err("notebook step names another operation".into());
                 };
+                // A computer key has no device to connect: its PIN, asked
+                // next, is the person's approval.
+                if step.computer() && step.step == 0 {
+                    let _ = token.presented(&request);
+                    return Ok(());
+                }
                 let asked = if request.asks_pin() {
                     Asked::Pin
                 } else {
@@ -524,7 +534,12 @@ impl Bridge {
                 self.prompts = self.prompts.wrapping_add(1);
                 let mut prompt = frame(&[0x7d])?;
                 prompt.extend(&self.prompts.to_be_bytes())?;
-                prompt.extend(&[step.purpose, step.role, step.step])?;
+                prompt.extend(&[
+                    step.purpose,
+                    step.role,
+                    step.step,
+                    u8::from(step.computer()),
+                ])?;
                 match ceremony.key {
                     Some(key) => {
                         prompt.push(1)?;
@@ -750,7 +765,7 @@ pub(crate) mod tests {
     /// A bridge whose creation holds the token slot.
     pub(crate) fn ceremony() -> (Bridge, [u32; 2]) {
         let (mut bridge, pids) = bridge();
-        bridge.pending = Some(Bytes(vec![2, 0]));
+        bridge.pending = Some(Bytes(vec![2, 0, 0, 0]));
         bridge.pending_deadline = Some(Instant::now() + crate::consent::NOTEBOOK_CEILING);
         bridge.begin().unwrap();
         (bridge, pids)
@@ -1010,10 +1025,17 @@ pub(crate) mod tests {
         request.0.clone()
     }
 
+    /// The service's `method` request for an unlock with the primary,
+    /// naming the enrolled credential.
+    fn unlocking(method: u8) -> Bytes {
+        let mut request = Bytes(vec![method, 3, 1]);
+        crate::notebook_wire::field(&mut request, CREDENTIAL).unwrap();
+        request
+    }
+
     /// The service's assertion request for an unlock with the primary.
     fn assertion() -> Vec<u8> {
-        let mut request = Bytes(vec![0x31, 3, 1]);
-        crate::notebook_wire::field(&mut request, CREDENTIAL).unwrap();
+        let mut request = unlocking(0x31);
         request.extend(&[7; 96]).unwrap();
         request.0.clone()
     }
@@ -1056,8 +1078,8 @@ pub(crate) mod tests {
         hash.update(CREDENTIAL);
         let fingerprint = hash.finalize();
         assert_eq!(prompt[0], 0x7d);
-        assert_eq!(&prompt[9..14], [3, 1, 0, 1, fingerprint[0]]);
-        assert_eq!(&prompt[14..], &fingerprint[1..4]);
+        assert_eq!(&prompt[9..14], [3, 1, 0, 0, 1]);
+        assert_eq!(&prompt[14..], &fingerprint[..4]);
         send(&mut peers.gui, &answer(&prompt[1..9], 0, None));
         let pin = next(&mut bridge, true, &mut peers.gui);
         assert_eq!(&pin[9..12], [3, 1, 1]);
@@ -1075,6 +1097,49 @@ pub(crate) mod tests {
         assert!(bridge.ceremony.is_none());
         assert!(!bridge.busy());
         assert!(bridge.was_unlocked);
+    }
+
+    /// A computer key's unseal asks for no approval: root acknowledges
+    /// step zero itself, and the window's one prompt, for the PIN, names
+    /// this computer and the sealed object's fingerprint.
+    #[test]
+    fn a_computer_unlock_prompts_once_for_its_pin() {
+        let (mut bridge, _) = bridge();
+        let mut peers = wired(&mut bridge);
+        send(&mut peers.gui, &unlock_request());
+        assert_eq!(
+            next(&mut bridge, true, &mut peers.service),
+            unlock_request()
+        );
+        send(&mut peers.service, &unlocking(0x33).0);
+        let prompt = next(&mut bridge, true, &mut peers.gui);
+        let mut hash = crate::sha256::Sha256::new();
+        hash.update(CREDENTIAL);
+        let fingerprint = hash.finalize();
+        assert_eq!(prompt[0], 0x7d);
+        assert_eq!(&prompt[9..14], [3, 1, 1, 1, 1]);
+        assert_eq!(&prompt[14..], &fingerprint[..4]);
+        send(&mut peers.gui, &answer(&prompt[1..9], 1, Some(b"123456")));
+        assert_eq!(next(&mut bridge, true, &mut peers.service), [0x33; 37]);
+        send(&mut peers.service, &[0]);
+        assert_eq!(next(&mut bridge, true, &mut peers.gui), [0]);
+        assert!(!bridge.busy());
+    }
+
+    #[test]
+    fn creation_names_each_kind_and_additions_name_theirs() {
+        for (request, expected) in [
+            (&[2, 0, 1, 0][..], Some(1)),
+            (&[2, 1, 1, 0], Some(2)),
+            (&[2, 1, 0, 1], Some(2)),
+            (&[2, 0], None),
+            (&[2, 1], None),
+            (&[9, 1], Some(5)),
+            (&[9], None),
+            (&[10, 1, 1], Some(6)),
+        ] {
+            assert_eq!(action(request), expected, "{request:?}");
+        }
     }
 
     /// A wrong PIN fails the operation with the token's own code, and

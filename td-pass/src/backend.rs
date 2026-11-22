@@ -16,9 +16,12 @@ use td_secret::pass;
 
 use crate::plain::{Bytes, Text};
 use crate::protocol::{
-    Answer, Ask, Change, Command, EntryId, Failure, HostEvent, Item, KeyLabel, Keys, Op, PinUse,
-    Reply, Role,
+    Answer, Ask, Change, Command, EntryId, Failure, HostEvent, Item, KeyKind, KeyLabel, Keys, Op,
+    PinUse, Reply, Role,
 };
+
+/// Standalone mode holds security keys only.
+const STANDALONE_COMPUTER: &str = "this computer's TPM holds a notebook key only on td";
 
 #[cfg(feature = "test-vault")]
 mod fixture;
@@ -83,7 +86,7 @@ impl Client {
         | Command::Unlock { op, .. }
         | Command::BindMail { op, .. }
         | Command::Apply { op, .. }
-        | Command::AddKey { op }
+        | Command::AddKey { op, .. }
         | Command::ReplaceKeys { op, .. }
         | Command::Export { op, .. }
         | Command::ReadCopy { op, .. }
@@ -264,22 +267,31 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                 let accepted = risk.take();
                 open(accepted, &mut host, &mut keys, &mut risk)
             }
-            Command::Create { op, backup } => {
+            Command::Create {
+                op,
+                primary,
+                backup,
+            } if primary == KeyKind::Computer || backup == Some(KeyKind::Computer) => {
+                refused(op, STANDALONE_COMPUTER)
+            }
+            Command::Create { op, backup, .. } => {
                 let mut asker = Asker {
                     op,
                     replies,
                     answers,
                 };
                 match host.as_mut() {
-                    Some(host) => match host.create(creation(backup), &mut asker, &cancel) {
-                        Ok(created) => {
-                            let entries = items(&created);
-                            let keys = listing(&created, &mut enrolled);
-                            vault = Some(created);
-                            Reply::Unlocked { op, entries, keys }
+                    Some(host) => {
+                        match host.create(creation(backup.is_some()), &mut asker, &cancel) {
+                            Ok(created) => {
+                                let entries = items(&created);
+                                let keys = listing(&created, &mut enrolled);
+                                vault = Some(created);
+                                Reply::Unlocked { op, entries, keys }
+                            }
+                            Err(failure) => failed(op, &failure),
                         }
-                        Err(failure) => failed(op, &failure),
-                    },
+                    }
                     None => closed(op),
                 }
             }
@@ -329,7 +341,16 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                 },
                 _ => closed(op),
             },
-            Command::AddKey { op } => {
+            Command::AddKey {
+                op,
+                kind: KeyKind::Computer,
+            }
+            | Command::ReplaceKeys {
+                op,
+                kind: KeyKind::Computer,
+                ..
+            } => refused(op, STANDALONE_COMPUTER),
+            Command::AddKey { op, .. } => {
                 let mut asker = Asker {
                     op,
                     replies,
@@ -346,7 +367,7 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                     _ => closed(op),
                 }
             }
-            Command::ReplaceKeys { op, revoked } => {
+            Command::ReplaceKeys { op, revoked, .. } => {
                 let mut asker = Asker {
                     op,
                     replies,
@@ -566,6 +587,10 @@ fn listing(vault: &pass::Vault, enrolled: &mut Vec<pass::Key>) -> Keys {
 fn label(key: &pass::Key) -> KeyLabel {
     KeyLabel {
         role: role(key.role()),
+        kind: match key.kind() {
+            pass::KeyKind::SecurityKey => KeyKind::SecurityKey,
+            pass::KeyKind::Computer => KeyKind::Computer,
+        },
         fingerprint: key.fingerprint().to_string(),
     }
 }
@@ -772,6 +797,7 @@ impl Asker<'_> {
             role: role(request.role),
             key: request.key.map(|key| key.to_string()),
             pin,
+            computer: false,
         };
         self.replies
             .send(Reply::Ask { op: self.op, ask })
@@ -885,10 +911,14 @@ mod tests {
         let (_answers, answer_rx) = mpsc::channel();
         let (reply_tx, replies) = mpsc::channel();
         for command in [
-            Command::AddKey { op: 1 },
+            Command::AddKey {
+                op: 1,
+                kind: KeyKind::SecurityKey,
+            },
             Command::ReplaceKeys {
                 op: 2,
                 revoked: vec![0],
+                kind: KeyKind::SecurityKey,
             },
         ] {
             jobs.send(Job {

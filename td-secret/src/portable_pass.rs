@@ -7,11 +7,11 @@
 use super::events;
 use super::host::{self, Entropy, Protected, Refusal};
 use super::lifecycle::{
-    self, AssertRequest, Asserted, Directory, EnrollRequest, Enrolled, Error, Hardware, KeyInfo,
-    Presented, Session, TokenError, Tokens,
+    self, AssertRequest, Asserted, Computer, Directory, EnrollRequest, Enrolled, Error, Hardware,
+    KeyInfo, Presented, Session, TokenError, Tokens,
 };
 use super::notebook::{self, EntryError, Text};
-use super::{LockedVault, Role};
+use super::{Kind, LockedVault, Role};
 use crate::fido_device::{self, Cancellation, Interruption};
 use crate::fido_pin::Pin;
 use crate::fido_transaction::{Error as Transaction, PinPurpose, Status};
@@ -58,21 +58,41 @@ impl std::fmt::Display for Fingerprint {
     }
 }
 
-/// One enrolled key: its role and the public credential identity that
-/// names it to a token. It holds no secret.
+/// What holds a key's secret: a security key, or this computer's TPM,
+/// which only td's trusted notebook uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    SecurityKey,
+    Computer,
+}
+
+impl From<Kind> for KeyKind {
+    fn from(kind: Kind) -> Self {
+        match kind {
+            Kind::SecurityKey => Self::SecurityKey,
+            Kind::Computer => Self::Computer,
+        }
+    }
+}
+
+/// One enrolled key: its role, its kind and the public credential
+/// identity that names it to a token or, for a computer, its TPM's sealed
+/// object. It holds no secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
     role: KeyRole,
+    kind: KeyKind,
     credential: Vec<u8>,
 }
 
 impl Key {
-    pub fn from_credential(role: KeyRole, credential: &[u8]) -> Result<Self, String> {
+    pub fn from_parts(role: KeyRole, kind: KeyKind, credential: &[u8]) -> Result<Self, String> {
         if credential.is_empty() || credential.len() > super::MAX_CREDENTIAL {
             return Err("invalid notebook credential metadata".into());
         }
         Ok(Self {
             role,
+            kind,
             credential: credential.to_vec(),
         })
     }
@@ -85,6 +105,10 @@ impl Key {
         self.role
     }
 
+    pub fn kind(&self) -> KeyKind {
+        self.kind
+    }
+
     pub fn fingerprint(&self) -> Fingerprint {
         Fingerprint::of(&self.credential)
     }
@@ -94,6 +118,7 @@ impl From<KeyInfo> for Key {
     fn from(info: KeyInfo) -> Self {
         Self {
             role: info.role.into(),
+            kind: info.kind.into(),
             credential: info.credential,
         }
     }
@@ -267,6 +292,31 @@ pub(super) fn token_text(error: &TokenError) -> &'static str {
                     "the security key refused the operation"
                 }
             },
+        },
+        TokenError::Computer(computer) => match computer {
+            Computer::Standalone => "this computer's TPM holds a notebook key only on td",
+            Computer::Unadmitted => {
+                "this computer's TPM can hold a notebook key only when the disk was unlocked with the TPM and a PIN"
+            }
+            Computer::Unreachable => "this computer's TPM could not be reached",
+            Computer::Policy => {
+                "this computer's TPM does not limit wrong PINs as td requires, so it cannot hold a notebook key"
+            }
+            Computer::Lockout => {
+                "this computer's TPM refuses PINs for now after too many wrong ones; try again later"
+            }
+            Computer::Foreign => "that key belongs to another computer's TPM",
+            Computer::PinLength => {
+                "a PIN for this computer's TPM is 6 to 63 printable ASCII characters"
+            }
+            Computer::Held => "this computer's TPM already holds a key of this notebook",
+            Computer::Headroom => {
+                "this computer's TPM has few PIN tries left; wait or use your security key"
+            }
+            Computer::Changed => {
+                "this computer's TPM no longer matches what this boot proved; restart before using it"
+            }
+            Computer::Object => "that key's sealed object is not one td made",
         },
     }
 }
@@ -523,6 +573,7 @@ pub fn keys_of(copy: &[u8]) -> Result<Vec<Key>, Failure> {
         .unlock_hints()
         .map(|hint| Key {
             role: hint.role.into(),
+            kind: hint.factor.kind().into(),
             credential: hint.credential.to_vec(),
         })
         .collect())
@@ -623,9 +674,15 @@ impl Host {
             random,
             tokens,
         } = self;
-        let backup = matches!(keys, Creation::PrimaryAndBackup);
+        let backup = matches!(keys, Creation::PrimaryAndBackup).then_some(Kind::SecurityKey);
         with_tokens(protected, tokens, prompt, cancel, |hardware| {
-            lifecycle::create(directory, hardware, &mut Random(random), backup)
+            lifecycle::create(
+                directory,
+                hardware,
+                &mut Random(random),
+                Kind::SecurityKey,
+                backup,
+            )
         })
         .map(Vault)
     }
@@ -700,7 +757,9 @@ impl Host {
             tokens,
         } = self;
         with_tokens(protected, tokens, prompt, cancel, |hardware| {
-            vault.0.add_key(directory, hardware, &mut Random(random))
+            vault
+                .0
+                .add_key(directory, Kind::SecurityKey, hardware, &mut Random(random))
         })
     }
 
@@ -722,9 +781,13 @@ impl Host {
             tokens,
         } = self;
         with_tokens(protected, tokens, prompt, cancel, |hardware| {
-            vault
-                .0
-                .replace_keys(directory, &revoked, hardware, &mut Random(random))
+            vault.0.replace_keys(
+                directory,
+                &revoked,
+                Kind::SecurityKey,
+                hardware,
+                &mut Random(random),
+            )
         })
     }
 
@@ -1171,6 +1234,7 @@ mod tests {
         assert_ne!(Fingerprint::of(b"one"), Fingerprint::of(b"two"));
         let key = Key {
             role: KeyRole::Backup,
+            kind: KeyKind::SecurityKey,
             credential: credential.to_vec(),
         };
         assert_eq!(key.fingerprint(), Fingerprint::of(credential));

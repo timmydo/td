@@ -63,8 +63,14 @@ fn typed(app: &mut App, board: &mut Board, text: &str) {
 fn label(role: Role, fingerprint: &str) -> KeyLabel {
     KeyLabel {
         role,
+        kind: KeyKind::SecurityKey,
         fingerprint: fingerprint.to_owned(),
     }
+}
+
+/// What the open question says, its title, details and buttons.
+fn dialog_text(app: &App) -> String {
+    format!("{:?}", app.dialog.as_ref().map(|(dialog, _)| dialog))
 }
 
 fn item(id: u8, title: &str) -> Item {
@@ -82,7 +88,7 @@ fn op_of(out: &[Out]) -> Op {
                 Command::Unlock { op, .. }
                 | Command::Create { op, .. }
                 | Command::Apply { op, .. }
-                | Command::AddKey { op }
+                | Command::AddKey { op, .. }
                 | Command::ReplaceKeys { op, .. }
                 | Command::Export { op, .. }
                 | Command::ReadCopy { op, .. }
@@ -118,6 +124,7 @@ fn unlocked(board: &mut Board, entries: Vec<Item>) -> App {
             role: Role::Primary,
             key: Some("0a0b0c0d".to_owned()),
             pin: None,
+            computer: false,
         },
     });
     key(&mut app, board, "Return");
@@ -129,6 +136,7 @@ fn unlocked(board: &mut Board, entries: Vec<Item>) -> App {
             role: Role::Primary,
             key: Some("0a0b0c0d".to_owned()),
             pin: Some(PinUse::Authorize),
+            computer: false,
         },
     });
     // A PIN too short keeps the prompt and sends nothing.
@@ -521,7 +529,10 @@ fn declining_the_prompt_answers_decline_and_a_cancel_reads_as_cancelled() {
     let out = app.take_out();
     assert!(matches!(
         out[..],
-        [Out::Send(Command::Create { backup: true, .. })]
+        [Out::Send(Command::Create {
+            backup: Some(KeyKind::SecurityKey),
+            ..
+        })]
     ));
     let op = op_of(&out);
     app.reply(Reply::Ask {
@@ -531,6 +542,7 @@ fn declining_the_prompt_answers_decline_and_a_cancel_reads_as_cancelled() {
             role: Role::Primary,
             key: None,
             pin: None,
+            computer: false,
         },
     });
     key(&mut app, &mut board, "Escape");
@@ -565,6 +577,7 @@ fn the_pin_field_is_masked_and_refuses_copy() {
             role: Role::Primary,
             key: Some("0a0b0c0d".to_owned()),
             pin: Some(PinUse::Authorize),
+            computer: false,
         },
     });
     typed(&mut app, &mut board, "1234");
@@ -829,6 +842,7 @@ fn add_ask(pin: Option<PinUse>) -> Ask {
         role: Role::Primary,
         key: Some("0a0b0c0d".to_owned()),
         pin,
+        computer: false,
     }
 }
 
@@ -1026,6 +1040,7 @@ fn a_paste_goes_only_where_it_was_asked() {
         role: Role::Primary,
         key: Some("0a0b0c0d".to_owned()),
         pin,
+        computer: false,
     };
     app.reply(Reply::Ask {
         op,
@@ -1141,6 +1156,7 @@ fn adding_a_key_goes_through_the_prompt_and_lists_the_new_key() {
             role: Role::Backup,
             key: None,
             pin: Some(PinUse::Enroll),
+            computer: false,
         },
     });
     assert!(app.prompt.is_some());
@@ -1158,6 +1174,7 @@ fn adding_a_key_goes_through_the_prompt_and_lists_the_new_key() {
         role: Role::Backup,
         key: Some("01020304".to_owned()),
         pin: None,
+        computer: false,
     })
     .starts_with("Connect the backup key 01020304, to "));
     assert_eq!(notebook(&app).keys.marked, vec![false; 3]);
@@ -1202,7 +1219,7 @@ fn replacing_asks_first_revokes_the_marked_keys_and_keeps_one() {
     assert_eq!(notebook(&app).keys.marked, vec![false, false]);
     assert!(app
         .status
-        .starts_with("Replaced: the new primary key is 0e0e0e0e"));
+        .starts_with("Replaced: the new key is the primary key 0e0e0e0e"));
     // With nothing marked, the selected key is the one asked about.
     key(&mut app, &mut board, "Home");
     key(&mut app, &mut board, "Delete");
@@ -1748,6 +1765,7 @@ fn import_reads_the_chosen_copy_then_places_it_with_one_of_its_keys() {
             role: Role::Backup,
             key: Some("01020304".to_owned()),
             pin: Some(PinUse::Authorize),
+            computer: false,
         },
     });
     typed(&mut app, &mut board, "1234");
@@ -2107,6 +2125,7 @@ fn a_host_lock_during_an_unlock_has_the_thread_lock_as_well() {
             role: Role::Primary,
             key: Some("0a0b0c0d".to_owned()),
             pin: None,
+            computer: false,
         },
     });
     assert!(app.prompt.is_some());
@@ -2235,7 +2254,10 @@ fn unlocking_waits_until_the_host_s_lock_is_watched() {
     key(&mut app, &mut board, "Return");
     assert!(matches!(
         app.take_out()[..],
-        [Out::Send(Command::Create { backup: true, .. })]
+        [Out::Send(Command::Create {
+            backup: Some(KeyKind::SecurityKey),
+            ..
+        })]
     ));
 }
 
@@ -2368,6 +2390,7 @@ fn a_warning_waits_behind_a_prompt() {
             role: Role::Primary,
             key: Some("0a0b0c0d".to_owned()),
             pin: None,
+            computer: false,
         },
     });
     let asking = app.status.clone();
@@ -2451,7 +2474,7 @@ fn the_swap_question_names_the_devices_and_what_they_risk() {
     app.reply(Reply::Swap {
         devices: vec!["/dev/sda2".to_owned()],
     });
-    let text = format!("{:?}", app.dialog.as_ref().map(|(dialog, _)| dialog));
+    let text = dialog_text(&app);
     for said in [
         "/dev/sda2",
         "the PIN you type, the key that opens the vault and entry text",
@@ -2502,7 +2525,7 @@ fn any_swap_table_can_be_asked_about() {
     app.reply(Reply::Swap {
         devices: vec!["/swap\u{7}one".to_owned()],
     });
-    let text = format!("{:?}", app.dialog.as_ref().map(|(dialog, _)| dialog));
+    let text = dialog_text(&app);
     assert!(text.contains(r"/swap\\u{7}one"), "{text}");
     assert_eq!(shown("/swap\\040one"), "/swap\\040one");
     assert_eq!(shown("/a\u{7}\u{a0}b"), "/a\\u{7}\u{a0}b");
@@ -2592,6 +2615,7 @@ fn a_prompt_shows_its_words_and_keeps_its_field_and_buttons_on_the_window() {
                         role,
                         key: key.clone(),
                         pin,
+                        computer: false,
                     });
                 }
             }
@@ -2656,6 +2680,7 @@ fn a_prompt_shows_its_words_and_keeps_its_field_and_buttons_on_the_window() {
         role,
         key: key.map(str::to_owned),
         pin,
+        computer: false,
     };
     for (asked, said) in [
         (
@@ -2704,7 +2729,7 @@ fn create_asks_which_keys_and_one_key_is_an_explicit_choice() {
     // focus it opens on, creates nothing.
     key(&mut app, &mut board, "Return");
     assert!(app.take_out().is_empty());
-    let text = format!("{:?}", app.dialog.as_ref().map(|(dialog, _)| dialog));
+    let text = dialog_text(&app);
     for said in [
         "Create a notebook with which keys?",
         "no password and no reset",
@@ -2740,7 +2765,7 @@ fn create_asks_which_keys_and_one_key_is_an_explicit_choice() {
     let out = app.take_out();
     assert!(matches!(
         out[..],
-        [Out::Send(Command::Create { backup: false, .. })]
+        [Out::Send(Command::Create { backup: None, .. })]
     ));
     assert_eq!(app.status, "Creating the notebook with one key");
     let op = op_of(&out);
@@ -3639,6 +3664,7 @@ mod scrollbars {
                 role: Role::Backup,
                 key: None,
                 pin: None,
+                computer: false,
             },
         });
         assert!(app.prompt.is_some());
@@ -3736,4 +3762,127 @@ mod scrollbars {
             assert!(app.take_out().is_empty());
         }
     }
+}
+
+/// On td, the create question offers this computer's TPM as the primary,
+/// with a security key backup or alone, and says what binds it; its PIN
+/// is the device PIN's 6 to 63 characters.
+#[test]
+fn on_td_this_computer_can_be_the_primary_and_takes_a_device_pin() {
+    let mut board = Board::default();
+    let mut app = watched();
+    app.on_td = true;
+    app.take_out();
+    app.reply(Reply::Opened { keys: None });
+    key(&mut app, &mut board, "Return");
+    let text = dialog_text(&app);
+    for said in [
+        "a security key, or this computer's TPM",
+        "opens only on this computer",
+        "the disk's TPM PIN shares",
+        "Computer and backup",
+        "Computer only",
+    ] {
+        assert!(text.contains(said), "{said}: {text}");
+    }
+    // Every row of the longer td question shows in an 800x600 window,
+    // without scrolling.
+    assert_eq!((app.surface.width, app.surface.height), (800, 600));
+    let (dialog, _) = app.dialog.as_ref().unwrap();
+    let shown = i64::from(dialog.details_rect().height) / layout::row(app.surface);
+    assert!(
+        dialog.detail_rows() as i64 <= shown,
+        "{} rows in {shown}",
+        dialog.detail_rows()
+    );
+    assert_eq!(dialog.first(), 0);
+    // Cancel, One key only, Computer and backup.
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Return");
+    let out = app.take_out();
+    assert!(
+        matches!(
+            out[..],
+            [Out::Send(Command::Create {
+                primary: KeyKind::Computer,
+                backup: Some(KeyKind::SecurityKey),
+                ..
+            })]
+        ),
+        "{out:?}"
+    );
+    let op = op_of(&out);
+    app.reply(Reply::Ask {
+        op,
+        ask: Ask {
+            operation: "create",
+            role: Role::Primary,
+            key: None,
+            pin: Some(PinUse::Enroll),
+            computer: true,
+        },
+    });
+    assert!(app.status.starts_with("Choose a PIN of 6 to 63 characters"));
+    // A security key's 4 is too short for the TPM.
+    typed(&mut app, &mut board, "12345");
+    key(&mut app, &mut board, "Return");
+    assert!(app.take_out().is_empty());
+    assert!(app
+        .status
+        .starts_with("A PIN for this computer's TPM has 6"));
+    typed(&mut app, &mut board, "6");
+    key(&mut app, &mut board, "Return");
+    assert!(matches!(app.take_out()[..], [Out::Answer(o, Answer::Pin(_))] if o == op));
+}
+
+/// Off td, the create question offers security keys alone.
+#[test]
+fn standalone_creation_offers_no_computer_key() {
+    let mut board = Board::default();
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Opened { keys: None });
+    key(&mut app, &mut board, "Return");
+    let text = dialog_text(&app);
+    assert!(!text.contains("Computer"), "{text}");
+    assert!(!text.contains("TPM"), "{text}");
+}
+
+/// On td, Insert asks which kind of backup to add, and a computer key is
+/// listed as this computer's.
+#[test]
+fn on_td_a_backup_is_a_security_key_or_this_computer() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    app.on_td = true;
+    key(&mut app, &mut board, "Insert");
+    assert!(app.take_out().is_empty());
+    assert!(app.dialog.is_some());
+    // Cancel, This computer.
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Return");
+    let out = app.take_out();
+    assert!(
+        matches!(
+            out[..],
+            [Out::Send(Command::AddKey {
+                kind: KeyKind::Computer,
+                ..
+            })]
+        ),
+        "{out:?}"
+    );
+    let op = op_of(&out);
+    // The computer key took the old backup's place.
+    let mut keys = two_keys();
+    keys.labels[1] = KeyLabel {
+        kind: KeyKind::Computer,
+        ..label(Role::Backup, "0f0f0f0f")
+    };
+    app.reply(Reply::Keys { op, keys });
+    assert_eq!(
+        app.status,
+        "Added the backup key 0f0f0f0f, a computer's TPM"
+    );
 }

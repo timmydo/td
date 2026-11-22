@@ -126,7 +126,11 @@ pub fn validate_auth_sealed_public(public: &[u8], policy: &[u8; 32]) -> Result<u
 
 /// Refuse an authValue longer than the session hash, or one that is empty
 /// once its trailing zeros are trimmed: the TPM would then check nothing.
-const OTHER_PRIMARY: &str = "TPM storage primary is not the one recorded";
+/// A seal or unseal found the TPM's storage primary is not the Name the
+/// caller recorded; nothing secret was sent to it.
+pub const OTHER_PRIMARY: &str = "TPM storage primary is not the one recorded";
+/// A seal's Create returned an object whose policy is not the one asked.
+pub const CHANGED_POLICY: &str = "TPM changed the sealed object's policy";
 
 fn bounded_auth(auth: &[u8]) -> Result<(), String> {
     if auth.len() > MAX_AUTH_VALUE {
@@ -266,7 +270,7 @@ impl<T: Transport> Client<T> {
         creation(&mut reader)?;
         reader.end()?;
         if sealed_policy(&public, attributes)? != digest {
-            return Err("TPM changed the sealed object's policy".into());
+            return Err(CHANGED_POLICY.into());
         }
         Ok(AuthSealed {
             object: SealedObject { public, private },

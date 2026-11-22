@@ -16,16 +16,13 @@ use td_tpm::{DaParameters, LockoutAuth};
 /// follow it.
 pub const LOCKOUT_DOMAIN: &[u8] = b"td/disk-protector/lockout/v1";
 /// td's dictionary-attack parameters, which a take sets and a proof
-/// repairs: 32 tries, one more every 600 seconds, and a day before a
+/// repairs (td-tpm's `device_pin`, which every device PIN object's user
+/// shares): 32 tries, one more every 600 seconds, and a day before a
 /// wrong lockout authorization may be tried again.
-pub const DA_MAX_TRIES: u32 = 32;
-pub const DA_RECOVERY_SECS: u32 = 600;
-pub const DA_LOCKOUT_RECOVERY_SECS: u32 = 86400;
-pub const DA_PARAMETERS: DaParameters = DaParameters {
-    max_tries: DA_MAX_TRIES,
-    recovery_time: DA_RECOVERY_SECS,
-    lockout_recovery: DA_LOCKOUT_RECOVERY_SECS,
-};
+pub const DA_PARAMETERS: DaParameters = td_tpm::device_pin::DA_PARAMETERS;
+pub const DA_MAX_TRIES: u32 = DA_PARAMETERS.max_tries;
+pub const DA_RECOVERY_SECS: u32 = DA_PARAMETERS.recovery_time;
+pub const DA_LOCKOUT_RECOVERY_SECS: u32 = DA_PARAMETERS.lockout_recovery;
 /// A LUKS2 UUID's bytes.
 pub const VOLUME_UUID_LEN: usize = 16;
 /// Blocks until the kernel CSPRNG is initialized: two writes under one

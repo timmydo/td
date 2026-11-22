@@ -4,8 +4,8 @@
 use super::notebook::EntryError;
 use super::storage::{PublishError, Snapshot, Store};
 use super::{
-    equal32, LockedVault, Notebook, OpenVault, Protector, Role, Secret32, UnlockHint,
-    VerificationKey, MAX_SLOTS,
+    equal32, Computers, Factor, Kind, LockedVault, Notebook, OpenVault, Protector, Role, Sealed,
+    Secret32, UnlockHint, VerificationKey, MAX_SLOTS,
 };
 use crate::crypto;
 use crate::fido_pin::Pin;
@@ -84,25 +84,32 @@ fn binding(vault: &LockedVault, detail: &[u8]) -> Vec<u8> {
 }
 
 pub(super) struct EnrollRequest<'a> {
+    /// A security key, or this computer's TPM, which takes none of the
+    /// fields below but `computers`.
+    pub kind: Kind,
     pub challenge: [u8; 32],
     pub proof_challenge: [u8; 32],
     pub user: [u8; 32],
     pub salt: [u8; 32],
+    /// Every credential the vault holds, revoked ones included, which a
+    /// new security key must not be.
     pub excluded: &'a [&'a [u8]],
+    /// The primary Names of the retained computer keys: a computer among
+    /// them is refused before its PIN is asked for.
+    pub computers: &'a Computers,
 }
 
 pub(super) struct AssertRequest<'a> {
     pub credential: &'a [u8],
-    pub key: &'a VerificationKey,
-    pub salt: &'a [u8; 32],
+    pub factor: &'a Factor,
     pub challenge: [u8; 32],
 }
 
-/// One verified creation plus proof; the secret is the UV hmac-secret output.
+/// One verified creation plus proof; the secret is the UV hmac-secret
+/// output, or the computer's sealed secret, whose counter is zero.
 pub(super) struct Enrolled {
     pub credential: Vec<u8>,
-    pub key: VerificationKey,
-    pub salt: [u8; 32],
+    pub factor: Factor,
     pub secret: Secret32,
     pub counter: u32,
 }
@@ -123,6 +130,40 @@ pub(super) enum TokenError {
     /// The host adapter refused before discovering a token.
     Host(&'static str),
     Failed(transaction::Error),
+    /// This computer's TPM refused or cannot hold a notebook key.
+    Computer(Computer),
+}
+
+/// Why this computer's TPM gave no secret. A wrong PIN is the security
+/// keys' `Status::PinInvalid`, so both read alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Computer {
+    /// Standalone mode, which holds only security keys.
+    Standalone,
+    /// No storage primary was proved this boot: the disk was not unlocked
+    /// with the TPM and a PIN.
+    Unadmitted,
+    /// The TPM device could not be opened or answered otherwise.
+    Unreachable,
+    /// The TPM does not hold td's dictionary-attack policy.
+    Policy,
+    /// The TPM refuses PINs until its lockout recovers.
+    Lockout,
+    /// The key was sealed under another computer's storage primary.
+    Foreign,
+    /// This computer's TPM already holds a retained key of this vault.
+    Held,
+    /// Fewer than `HEADROOM` tries remain before the TPM's lockout, which
+    /// the disk's TPM PIN shares; the notebook leaves them to the disk.
+    Headroom,
+    /// The TPM's storage primary is not the one this boot proved, or it
+    /// sealed an object under another policy than asked.
+    Changed,
+    /// The key's sealed object does not carry td's device PIN policy.
+    Object,
+    /// The PIN is outside the device PIN profile, 6 to 63 printable
+    /// ASCII characters.
+    PinLength,
 }
 
 /// What the operator is asked to present: the operation, the role of the
@@ -188,6 +229,9 @@ where
         presented: Presented<'_>,
         request: EnrollRequest<'_>,
     ) -> Result<Enrolled, TokenError> {
+        if request.kind == Kind::Computer {
+            return Err(TokenError::Computer(Computer::Standalone));
+        }
         let channel = (self.open)(presented)?;
         let prompt = &mut self.prompt;
         let enrolled = Transaction::new(channel)
@@ -214,8 +258,10 @@ where
         }
         Ok(Enrolled {
             credential: enrolled.id().to_vec(),
-            key,
-            salt: request.salt,
+            factor: Factor::SecurityKey {
+                key,
+                salt: request.salt,
+            },
             secret: secret(enrolled.output().bytes())?,
             counter: enrolled.output().info.counter,
         })
@@ -226,8 +272,10 @@ where
         presented: Presented<'_>,
         request: AssertRequest<'_>,
     ) -> Result<Asserted, TokenError> {
-        let key = request
-            .key
+        let Factor::SecurityKey { key, salt } = request.factor else {
+            return Err(TokenError::Computer(Computer::Standalone));
+        };
+        let key = key
             .public_key()
             .map_err(|error| TokenError::Failed(transaction::Error::Protocol(error)))?;
         let channel = (self.open)(presented)?;
@@ -239,7 +287,7 @@ where
                         credential: request.credential,
                         key,
                         challenge: request.challenge,
-                        salt: *request.salt,
+                        salt: *salt,
                     },
                     &mut |pin| prompt(presented, pin),
                     &mut self.entropy,
@@ -319,12 +367,14 @@ impl Directory {
 /// Public metadata of an enrolled key, for selecting which token to present.
 pub(super) struct KeyInfo {
     pub role: Role,
+    pub kind: Kind,
     pub credential: Vec<u8>,
 }
 
 fn key_info(hint: UnlockHint<'_>) -> KeyInfo {
     KeyInfo {
         role: hint.role,
+        kind: hint.factor.kind(),
         credential: hint.credential.to_vec(),
     }
 }
@@ -357,15 +407,21 @@ fn advanced(before: u32, after: u32) -> bool {
 }
 
 /// Creation and proof, then an independent repeat assertion that must
-/// recover the identical secret with an advancing counter.
+/// recover the identical secret with an advancing counter. A computer's
+/// repeat is an unseal with its PIN typed again, which also confirms it.
 fn enroll_proved(
     tokens: &mut impl Tokens,
+    kind: Kind,
     purpose: Purpose,
     role: Role,
     detail: &[u8],
-    excluded: &[&[u8]],
+    existing: Existing<'_>,
     random: &mut impl Read,
 ) -> Result<(Protector, u32), Error> {
+    let Existing {
+        excluded,
+        computers,
+    } = existing;
     let salt = random32(random)?;
     let enrolled = tokens.enroll(
         Presented {
@@ -374,14 +430,23 @@ fn enroll_proved(
             credential: None,
         },
         EnrollRequest {
+            kind,
             challenge: challenge(purpose, Phase::Create, detail, random)?,
             proof_challenge: challenge(purpose, Phase::Prove, detail, random)?,
             user: random32(random)?,
             salt,
             excluded,
+            computers,
         },
     )?;
-    if enrolled.salt != salt || excluded.contains(&enrolled.credential.as_slice()) {
+    let fresh = match &enrolled.factor {
+        Factor::SecurityKey { salt: used, .. } => kind == Kind::SecurityKey && *used == salt,
+        Factor::Computer => {
+            another_computer(&enrolled, computers)?;
+            kind == Kind::Computer
+        }
+    };
+    if !fresh || excluded.contains(&enrolled.credential.as_slice()) {
         return Err(Error::Refused("enrolled portable key is not fresh".into()));
     }
     let repeat = tokens.assert(
@@ -392,8 +457,7 @@ fn enroll_proved(
         },
         AssertRequest {
             credential: &enrolled.credential,
-            key: &enrolled.key,
-            salt: &enrolled.salt,
+            factor: &enrolled.factor,
             challenge: challenge(purpose, Phase::Repeat, detail, random)?,
         },
     )?;
@@ -411,12 +475,44 @@ fn enroll_proved(
         Protector {
             role,
             credential: enrolled.credential,
-            key: enrolled.key,
-            salt: enrolled.salt,
+            factor: enrolled.factor,
             secret: enrolled.secret,
         },
         repeat.counter,
     ))
+}
+
+/// Whether a newly sealed computer key is a sealed object of a computer
+/// no retained key names: one computer holds one key of a vault, which a
+/// copy carried to another td computer may add there. A revoked key's
+/// computer may enroll its replacement. Root refused it before the PIN;
+/// this holds the lifecycle to it whatever the adapter.
+fn another_computer(enrolled: &Enrolled, computers: &Computers) -> Result<(), Error> {
+    let sealed = Sealed::decode(&enrolled.credential).map_err(Error::Refused)?;
+    if computers.contains(sealed.primary) {
+        return Err(Error::Token(TokenError::Computer(Computer::Held)));
+    }
+    Ok(())
+}
+
+/// What a new key must not be: every credential the vault holds, for a
+/// security key, and the retained computer keys' primaries, for a
+/// computer.
+#[derive(Clone, Copy)]
+struct Existing<'a> {
+    excluded: &'a [&'a [u8]],
+    computers: &'a Computers,
+}
+
+/// The retained computer keys' primary Names among `keys`.
+fn retained_computers<'a>(
+    keys: impl Iterator<Item = (Kind, &'a [u8])>,
+) -> Result<Computers, Error> {
+    let mut computers = Computers::NONE;
+    for (kind, credential) in keys {
+        computers.add(kind, credential).map_err(Error::Refused)?;
+    }
+    Ok(computers)
 }
 
 /// An unlocked browsing session. Holds the vault key; never given to an app.
@@ -440,7 +536,8 @@ pub(super) fn create(
     directory: &Directory,
     tokens: &mut impl Tokens,
     random: &mut impl Read,
-    backup: bool,
+    primary: Kind,
+    backup: Option<Kind>,
 ) -> Result<Session, Error> {
     let place = directory.place()?;
     let snapshot = directory.snapshot()?;
@@ -449,23 +546,33 @@ pub(super) fn create(
     }
     let (primary, primary_counter) = enroll_proved(
         tokens,
+        primary,
         Purpose::CreatePrimary,
         Role::Primary,
         b"",
-        &[],
+        Existing {
+            excluded: &[],
+            computers: &Computers::NONE,
+        },
         random,
     )?;
-    let backup = if backup {
-        Some(enroll_proved(
+    let backup = match backup {
+        Some(kind) => Some(enroll_proved(
             tokens,
+            kind,
             Purpose::CreateBackup,
             Role::Backup,
             b"",
-            &[&primary.credential],
+            Existing {
+                excluded: &[&primary.credential],
+                computers: &retained_computers(std::iter::once((
+                    primary.factor.kind(),
+                    primary.credential.as_slice(),
+                )))?,
+            },
             random,
-        )?)
-    } else {
-        None
+        )?),
+        None => None,
     };
     let empty = Notebook {
         entries: Vec::new(),
@@ -578,8 +685,7 @@ pub(super) fn unlock(
         },
         AssertRequest {
             credential,
-            key: hint.key,
-            salt: hint.salt,
+            factor: hint.factor,
             challenge: challenge(
                 Purpose::Unlock,
                 Phase::Assert,
@@ -627,8 +733,7 @@ pub(super) fn import(
         },
         AssertRequest {
             credential,
-            key: hint.key,
-            salt: hint.salt,
+            factor: hint.factor,
             challenge: challenge(
                 Purpose::Import,
                 Phase::Assert,
@@ -721,7 +826,7 @@ impl Session {
             .baseline
             .unlock_hint(credential)
             .map_err(|_| Error::State("that key is not enrolled in this vault"))?;
-        let (role, key, salt) = (hint.role, hint.key.clone(), *hint.salt);
+        let (role, factor) = (hint.role, hint.factor.clone());
         let challenge = challenge(
             purpose,
             Phase::Assert,
@@ -736,8 +841,7 @@ impl Session {
             },
             AssertRequest {
                 credential,
-                key: &key,
-                salt: &salt,
+                factor: &factor,
                 challenge,
             },
         )?;
@@ -755,8 +859,7 @@ impl Session {
             Protector {
                 role,
                 credential: credential.to_vec(),
-                key,
-                salt,
+                factor,
                 secret: asserted.secret,
             },
             asserted.counter,
@@ -824,11 +927,12 @@ impl Session {
         self.commit(directory, snapshot, proposed, opened, random)
     }
 
-    /// Adds a backup after authorization by the session key, then proves
-    /// creation and an independent repeat on the new key.
+    /// Adds a backup of `kind` after authorization by the session key, then
+    /// proves creation and an independent repeat on the new key.
     pub fn add_key(
         &mut self,
         directory: &Directory,
+        kind: Kind,
         tokens: &mut impl Tokens,
         random: &mut impl Read,
     ) -> Result<(), Error> {
@@ -844,12 +948,21 @@ impl Session {
             .unlock_hints()
             .map(|hint| hint.credential)
             .collect();
+        let computers = retained_computers(
+            self.baseline
+                .unlock_hints()
+                .map(|hint| (hint.factor.kind(), hint.credential)),
+        )?;
         let (added, counter) = enroll_proved(
             tokens,
+            kind,
             Purpose::AddKey,
             Role::Backup,
             &binding(&self.baseline, b""),
-            &excluded,
+            Existing {
+                excluded: &excluded,
+                computers: &computers,
+            },
             random,
         )?;
         let added_id = added.credential.clone();
@@ -867,14 +980,15 @@ impl Session {
         Ok(())
     }
 
-    /// Revokes every key in `revoked` together and enrolls one replacement,
-    /// which becomes primary when the primary is revoked. Every retained key
-    /// participates, the vault key rotates and the notebook is re-encrypted;
-    /// no revoked key can open the result.
+    /// Revokes every key in `revoked` together and enrolls one replacement
+    /// of `kind`, which becomes primary when the primary is revoked. Every
+    /// retained key participates, the vault key rotates and the notebook is
+    /// re-encrypted; no revoked key can open the result.
     pub fn replace_keys(
         &mut self,
         directory: &Directory,
         revoked: &[&[u8]],
+        kind: Kind,
         tokens: &mut impl Tokens,
         random: &mut impl Read,
     ) -> Result<(), Error> {
@@ -919,13 +1033,25 @@ impl Session {
             observed.push((key.credential.clone(), counter));
             protectors.push(protector);
         }
+        // A new security key must be none of the vault's credentials, the
+        // revoked ones included; only a retained computer key holds its
+        // computer back, so a revoked one's computer may replace it.
         let excluded: Vec<&[u8]> = keys.iter().map(|key| key.credential.as_slice()).collect();
+        let computers = retained_computers(
+            keys.iter()
+                .filter(|key| !revoked.contains(&key.credential.as_slice()))
+                .map(|key| (key.kind, key.credential.as_slice())),
+        )?;
         let (replacement, counter) = enroll_proved(
             tokens,
+            kind,
             Purpose::ReplaceKey,
             role,
             &binding(&self.baseline, &detail),
-            &excluded,
+            Existing {
+                excluded: &excluded,
+                computers: &computers,
+            },
             random,
         )?;
         let replacement_id = replacement.credential.clone();
@@ -1024,10 +1150,18 @@ pub(in crate::portable) mod tests {
         }
     }
 
+    fn hint_salt<'a>(vault: &'a LockedVault, credential: &[u8]) -> &'a [u8; 32] {
+        match vault.unlock_hint(credential).unwrap().factor {
+            Factor::SecurityKey { salt, .. } => salt,
+            Factor::Computer => panic!("a computer key has no hmac-secret salt"),
+        }
+    }
+
     struct Credential {
         id: Vec<u8>,
         key: VerificationKey,
         seed: [u8; 32],
+        kind: Kind,
     }
     struct Token {
         name: u8,
@@ -1051,6 +1185,8 @@ pub(in crate::portable) mod tests {
         pub(in crate::portable) calls: Vec<Call>,
         challenges: Vec<[u8; 32]>,
         excluded: Vec<Vec<Vec<u8>>>,
+        // Each enrollment's retained computer primary Names.
+        pub(in crate::portable) computers: Vec<Vec<[u8; crate::portable::PRIMARY_NAME]>>,
         pub(in crate::portable) fail: Option<(usize, TokenError)>,
         corrupt: Option<usize>,
         frozen: bool,
@@ -1134,10 +1270,12 @@ pub(in crate::portable) mod tests {
                 .extend([request.challenge, request.proof_challenge]);
             self.excluded
                 .push(request.excluded.iter().map(|id| id.to_vec()).collect());
-            if self.tokens[token]
-                .credentials
-                .iter()
-                .any(|c| request.excluded.contains(&c.id.as_slice()))
+            self.computers.push(request.computers.names().to_vec());
+            if request.kind == Kind::SecurityKey
+                && self.tokens[token]
+                    .credentials
+                    .iter()
+                    .any(|c| request.excluded.contains(&c.id.as_slice()))
             {
                 return Err(TokenError::Failed(transaction::Error::Status(
                     Status::CredentialExcluded,
@@ -1146,17 +1284,39 @@ pub(in crate::portable) mod tests {
             let name = self.tokens[token].name;
             let serial = self.tokens[token].credentials.len() as u8;
             let seed = crypto::digest(&[name, serial]);
+            // A computer is a token whose credentials are sealed objects
+            // under its one primary, named after it; its counter stays 0.
+            let (id, factor_salt) = match request.kind {
+                Kind::SecurityKey => (
+                    format!("token-{name}-credential-{serial}").into_bytes(),
+                    request.salt,
+                ),
+                Kind::Computer => {
+                    let id = crate::portable::tests::computer_credential(name, serial);
+                    let salt = *Sealed::decode(&id).unwrap().salt;
+                    (id, salt)
+                }
+            };
             let credential = Credential {
-                id: format!("token-{name}-credential-{serial}").into_bytes(),
+                id,
                 key: cose(&seed),
                 seed,
+                kind: request.kind,
             };
             let enrolled = Enrolled {
                 credential: credential.id.clone(),
-                key: credential.key.clone(),
-                salt: request.salt,
-                secret: self.secret(index, &seed, &request.salt),
-                counter: self.tick(token),
+                factor: match request.kind {
+                    Kind::SecurityKey => Factor::SecurityKey {
+                        key: credential.key.clone(),
+                        salt: request.salt,
+                    },
+                    Kind::Computer => Factor::Computer,
+                },
+                secret: self.secret(index, &seed, &factor_salt),
+                counter: match request.kind {
+                    Kind::SecurityKey => self.tick(token),
+                    Kind::Computer => 0,
+                },
             };
             self.tokens[token].credentials.push(credential);
             Ok(enrolled)
@@ -1185,16 +1345,30 @@ pub(in crate::portable) mod tests {
                     Status::NoCredential,
                 )));
             };
-            if credential.key.cose() != request.key.cose() {
-                return Err(TokenError::Failed(transaction::Error::Protocol(
-                    "signature".into(),
-                )));
-            }
             let seed = credential.seed;
-            Ok(Asserted {
-                secret: self.secret(index, &seed, request.salt),
-                counter: self.tick(token),
-            })
+            match (request.factor, credential.kind) {
+                (Factor::SecurityKey { key, salt }, Kind::SecurityKey) => {
+                    if credential.key.cose() != key.cose() {
+                        return Err(TokenError::Failed(transaction::Error::Protocol(
+                            "signature".into(),
+                        )));
+                    }
+                    Ok(Asserted {
+                        secret: self.secret(index, &seed, salt),
+                        counter: self.tick(token),
+                    })
+                }
+                (Factor::Computer, Kind::Computer) => {
+                    let salt = *Sealed::decode(request.credential).unwrap().salt;
+                    Ok(Asserted {
+                        secret: self.secret(index, &seed, &salt),
+                        counter: 0,
+                    })
+                }
+                _ => Err(TokenError::Failed(transaction::Error::Protocol(
+                    "another kind of key".into(),
+                ))),
+            }
         }
 
         fn revoked(&self) -> bool {
@@ -1212,7 +1386,14 @@ pub(in crate::portable) mod tests {
         random: &mut Random,
     ) -> Session {
         bench.present(&[0, 0, 1, 1]);
-        create(&place.1, bench, random, true).unwrap()
+        create(
+            &place.1,
+            bench,
+            random,
+            Kind::SecurityKey,
+            Some(Kind::SecurityKey),
+        )
+        .unwrap()
     }
 
     fn entry(title: &str, body: &[u8]) -> Notebook {
@@ -1273,12 +1454,190 @@ pub(in crate::portable) mod tests {
     }
 
     #[test]
+    fn this_computer_can_be_the_primary_and_unlocks_with_its_pin_alone() {
+        let place = Place::new();
+        let mut bench = Bench::new(2);
+        let mut random = Random(0);
+        // Token 0 is this computer; token 1 a security key backup.
+        bench.present(&[0, 0, 1, 1]);
+        let session = create(
+            &place.1,
+            &mut bench,
+            &mut random,
+            Kind::Computer,
+            Some(Kind::SecurityKey),
+        )
+        .unwrap();
+        let keys = session.keys();
+        assert_eq!(keys.len(), 2);
+        let computer = id(&bench, 0);
+        assert!(Sealed::decode(&computer).is_ok());
+        assert!(keys
+            .iter()
+            .any(|k| k.kind == Kind::Computer && k.role == Role::Primary));
+        assert!(keys
+            .iter()
+            .any(|k| k.kind == Kind::SecurityKey && k.role == Role::Backup));
+        drop(session);
+        // A computer unlocks alone; its counter staying zero is accepted.
+        for _ in 0..2 {
+            let session = unlocked(&place, &mut bench, 0);
+            assert_eq!(session.credential(), computer);
+        }
+        let session = unlocked(&place, &mut bench, 1);
+        assert!(session.notebook().entries.is_empty());
+    }
+
+    #[test]
+    fn a_computer_joins_a_security_key_vault_once_and_can_replace_a_key() {
+        let place = Place::new();
+        let mut bench = Bench::new(4);
+        let mut random = Random(0);
+        let mut session = created(&place, &mut bench, &mut random);
+        // Token 2 is this computer: authorized by the session's key, then
+        // sealed and unsealed again.
+        bench.present(&[1, 2, 2]);
+        session
+            .add_key(&place.1, Kind::Computer, &mut bench, &mut random)
+            .unwrap();
+        assert_eq!(
+            bench.calls[bench.calls.len() - 3..],
+            [
+                Call::Assert(Purpose::AuthorizeAddKey),
+                Call::Enroll(Purpose::AddKey),
+                Call::Assert(Purpose::AddKey),
+            ]
+        );
+        let computer = id(&bench, 2);
+        assert_eq!(session.keys().len(), 3);
+        // The same computer cannot hold a second key of this vault.
+        bench.present(&[1, 2]);
+        assert_eq!(
+            session
+                .add_key(&place.1, Kind::Computer, &mut bench, &mut random)
+                .err(),
+            Some(Error::Token(TokenError::Computer(Computer::Held)))
+        );
+        assert_eq!(session.keys().len(), 3);
+        drop(session);
+        let mut session = unlocked(&place, &mut bench, 2);
+        assert_eq!(session.credential(), computer);
+        // The computer authorizes replacing the lost primary with a new
+        // security key, token 3; every retained key takes part, the
+        // computer's sealed object sorting first.
+        let primary = id(&bench, 0);
+        bench.present(&[2, 1, 3, 3]);
+        session
+            .replace_keys(
+                &place.1,
+                &[&primary],
+                Kind::SecurityKey,
+                &mut bench,
+                &mut random,
+            )
+            .unwrap();
+        let keys = session.keys();
+        assert_eq!(keys.len(), 3);
+        assert!(!keys.iter().any(|k| k.credential == primary));
+        assert!(keys
+            .iter()
+            .any(|k| k.kind == Kind::Computer && k.credential == computer));
+        drop(session);
+        let session = unlocked(&place, &mut bench, 2);
+        assert_eq!(session.keys().len(), 3);
+    }
+
+    #[test]
+    fn this_computer_can_replace_its_own_revoked_key() {
+        let place = Place::new();
+        let mut bench = Bench::new(3);
+        let mut random = Random(0);
+        let mut session = created(&place, &mut bench, &mut random);
+        bench.present(&[1, 2, 2]);
+        session
+            .add_key(&place.1, Kind::Computer, &mut bench, &mut random)
+            .unwrap();
+        let old = id(&bench, 2);
+        drop(session);
+        // Unlocked with the backup, the computer key is revoked and this
+        // computer enrolls its replacement: only retained keys hold a
+        // computer back. Every retained key takes part, the primary first.
+        let mut session = unlocked(&place, &mut bench, 1);
+        bench.present(&[0, 1, 2, 2]);
+        session
+            .replace_keys(&place.1, &[&old], Kind::Computer, &mut bench, &mut random)
+            .unwrap();
+        let replacement = bench.tokens[2].credentials[1].id.clone();
+        assert_ne!(replacement, old);
+        let keys = session.keys();
+        assert_eq!(keys.len(), 3);
+        assert!(!keys.iter().any(|k| k.credential == old));
+        assert!(keys
+            .iter()
+            .any(|k| k.kind == Kind::Computer && k.credential == replacement));
+        assert_eq!(
+            Sealed::decode(&replacement).unwrap().primary,
+            Sealed::decode(&old).unwrap().primary
+        );
+        // The computer request named no retained computer: the revoked
+        // key's does not hold this computer back.
+        assert!(bench.computers.last().unwrap().is_empty());
+        drop(session);
+        bench.present(&[2]);
+        let session = unlock(&place.1, &replacement, &mut bench, &mut Random(9001)).unwrap();
+        assert_eq!(session.credential(), replacement);
+        // The revoked key is no longer enrolled; no token is asked for.
+        let calls = bench.calls.len();
+        assert_eq!(
+            unlock(&place.1, &old, &mut bench, &mut Random(9002)).err(),
+            Some(Error::State("that key is not enrolled in this vault"))
+        );
+        assert_eq!(bench.calls.len(), calls);
+    }
+
+    #[test]
+    fn an_enrollment_of_the_other_kind_is_not_fresh() {
+        struct Swapped(Bench);
+        impl Tokens for Swapped {
+            fn enroll(
+                &mut self,
+                presented: Presented<'_>,
+                mut request: EnrollRequest<'_>,
+            ) -> Result<Enrolled, TokenError> {
+                request.kind = match request.kind {
+                    Kind::SecurityKey => Kind::Computer,
+                    Kind::Computer => Kind::SecurityKey,
+                };
+                self.0.enroll(presented, request)
+            }
+            fn assert(
+                &mut self,
+                presented: Presented<'_>,
+                request: AssertRequest<'_>,
+            ) -> Result<Asserted, TokenError> {
+                self.0.assert(presented, request)
+            }
+        }
+        for kind in [Kind::SecurityKey, Kind::Computer] {
+            let place = Place::new();
+            let mut tokens = Swapped(Bench::new(1));
+            tokens.0.present(&[0]);
+            assert_eq!(
+                create(&place.1, &mut tokens, &mut Random(0), kind, None).err(),
+                Some(Error::Refused("enrolled portable key is not fresh".into()))
+            );
+            assert!(place.bytes().is_none());
+        }
+    }
+
+    #[test]
     fn the_primary_alone_creates_a_vault_that_takes_a_backup_later() {
         let place = Place::new();
         let mut bench = Bench::new(2);
         let mut random = Random(0);
         bench.present(&[0, 0]);
-        let mut session = create(&place.1, &mut bench, &mut random, false).unwrap();
+        let mut session =
+            create(&place.1, &mut bench, &mut random, Kind::SecurityKey, None).unwrap();
         assert_eq!(
             bench.calls,
             [
@@ -1297,7 +1656,13 @@ pub(in crate::portable) mod tests {
         let primary = id(&bench, 0);
         assert_eq!(
             session
-                .replace_keys(&place.1, &[&primary], &mut bench, &mut random)
+                .replace_keys(
+                    &place.1,
+                    &[&primary],
+                    Kind::SecurityKey,
+                    &mut bench,
+                    &mut random
+                )
                 .err(),
             Some(Error::State(
                 "revoke at least one key and retain at least one"
@@ -1305,7 +1670,9 @@ pub(in crate::portable) mod tests {
         );
         // A backup joins it through the ordinary addition.
         bench.present(&[0, 1, 1]);
-        session.add_key(&place.1, &mut bench, &mut random).unwrap();
+        session
+            .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+            .unwrap();
         assert_eq!(bench.excluded.last().unwrap(), &vec![primary.clone()]);
         assert_eq!(session.keys().len(), 2);
         drop(session);
@@ -1318,7 +1685,14 @@ pub(in crate::portable) mod tests {
         let mut bench = Bench::new(1);
         bench.present(&[0, 0]);
         bench.corrupt = Some(1);
-        assert!(create(&fresh.1, &mut bench, &mut Random(3), false).is_err());
+        assert!(create(
+            &fresh.1,
+            &mut bench,
+            &mut Random(3),
+            Kind::SecurityKey,
+            None
+        )
+        .is_err());
         assert_eq!(fresh.bytes(), None);
     }
 
@@ -1344,7 +1718,14 @@ pub(in crate::portable) mod tests {
             let mut bench = Bench::new(2);
             bench.present(order);
             setup(&mut bench);
-            assert!(create(&place.1, &mut bench, &mut Random(0), true).is_err());
+            assert!(create(
+                &place.1,
+                &mut bench,
+                &mut Random(0),
+                Kind::SecurityKey,
+                Some(Kind::SecurityKey)
+            )
+            .is_err());
             assert!(bench.present.is_empty(), "retried after {order:?}");
             assert_eq!(place.bytes(), None);
             assert_eq!(
@@ -1361,7 +1742,14 @@ pub(in crate::portable) mod tests {
         drop(created(&place, &mut bench, &mut Random(0)));
         let calls = bench.calls.len();
         assert_eq!(
-            create(&place.1, &mut bench, &mut Random(1), true).err(),
+            create(
+                &place.1,
+                &mut bench,
+                &mut Random(1),
+                Kind::SecurityKey,
+                Some(Kind::SecurityKey)
+            )
+            .err(),
             Some(Error::State("a portable vault already exists"))
         );
         assert_eq!(bench.calls.len(), calls);
@@ -1424,7 +1812,7 @@ pub(in crate::portable) mod tests {
         bench.revoked = true;
         bench.present(&[1, 2, 2]);
         assert_eq!(
-            session.add_key(&place.1, &mut bench, &mut random),
+            session.add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random),
             Err(cancelled())
         );
         assert_eq!(bench.calls.last(), Some(&Call::Assert(Purpose::AddKey)));
@@ -1432,7 +1820,13 @@ pub(in crate::portable) mod tests {
         bench.present(&[1, 2, 2]);
         assert_eq!(
             session
-                .replace_keys(&place.1, &[&lost], &mut bench, &mut random)
+                .replace_keys(
+                    &place.1,
+                    &[&lost],
+                    Kind::SecurityKey,
+                    &mut bench,
+                    &mut random
+                )
                 .err(),
             Some(cancelled())
         );
@@ -1464,7 +1858,14 @@ pub(in crate::portable) mod tests {
         bench.present(&[0, 0, 1, 1]);
         bench.revoked = true;
         assert_eq!(
-            create(&fresh.1, &mut bench, &mut random, true).err(),
+            create(
+                &fresh.1,
+                &mut bench,
+                &mut random,
+                Kind::SecurityKey,
+                Some(Kind::SecurityKey)
+            )
+            .err(),
             Some(cancelled())
         );
         assert!(!exists(&fresh.1).unwrap());
@@ -1492,10 +1893,18 @@ pub(in crate::portable) mod tests {
             assert_eq!(saved.err(), stale);
         }
         assert_eq!(
-            second.add_key(&place.1, &mut bench, &mut random).err(),
+            second
+                .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+                .err(),
             stale
         );
-        let replaced = second.replace_keys(&place.1, &[&primary], &mut bench, &mut random);
+        let replaced = second.replace_keys(
+            &place.1,
+            &[&primary],
+            Kind::SecurityKey,
+            &mut bench,
+            &mut random,
+        );
         assert_eq!(replaced.err(), stale);
         assert_eq!(bench.calls.len(), calls);
         assert_eq!(place.bytes(), committed);
@@ -1516,7 +1925,7 @@ pub(in crate::portable) mod tests {
         }));
         bench.present(&[1, 2, 2]);
         assert!(matches!(
-            session.add_key(&place.1, &mut bench, &mut random),
+            session.add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random),
             Err(Error::Refused(_))
         ));
         bench.during = None;
@@ -1544,13 +1953,22 @@ pub(in crate::portable) mod tests {
         let saved = session.save(&copy.1, &entry("A", b"x"), &|| false, &mut random);
         assert_eq!(saved.err(), elsewhere);
         assert_eq!(
-            session.add_key(&copy.1, &mut bench, &mut random).err(),
+            session
+                .add_key(&copy.1, Kind::SecurityKey, &mut bench, &mut random)
+                .err(),
             elsewhere
         );
-        let replaced = session.replace_keys(&copy.1, &[&primary], &mut bench, &mut random);
+        let replaced = session.replace_keys(
+            &copy.1,
+            &[&primary],
+            Kind::SecurityKey,
+            &mut bench,
+            &mut random,
+        );
         assert_eq!(replaced.err(), elsewhere);
         // Refused before the revocation list is read.
-        let replaced = session.replace_keys(&copy.1, &[], &mut bench, &mut random);
+        let replaced =
+            session.replace_keys(&copy.1, &[], Kind::SecurityKey, &mut bench, &mut random);
         assert_eq!(replaced.err(), elsewhere);
         assert_eq!(bench.calls.len(), calls);
         assert_eq!(copy.bytes(), place.bytes());
@@ -1567,7 +1985,9 @@ pub(in crate::portable) mod tests {
             .unwrap();
         let old = LockedVault::decode(&place.bytes().unwrap()).unwrap();
         bench.present(&[1, 2, 2]);
-        session.add_key(&place.1, &mut bench, &mut random).unwrap();
+        session
+            .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+            .unwrap();
         assert_eq!(
             bench.calls[bench.calls.len() - 3..],
             [
@@ -1589,7 +2009,7 @@ pub(in crate::portable) mod tests {
         assert!(added.opened.same_key(&original.opened));
         assert_eq!(added.notebook().entries[0].body(), b"body");
         let seed = bench.tokens[0].credentials[0].seed;
-        let salt = *old.unlock_hint(&id(&bench, 0)).unwrap().salt;
+        let salt = *hint_salt(&old, &id(&bench, 0));
         let previous = old
             .open(
                 &id(&bench, 0),
@@ -1609,7 +2029,9 @@ pub(in crate::portable) mod tests {
         // An already enrolled token is refused by its exclusion list.
         bench.present(&[1, 0]);
         assert_eq!(
-            session.add_key(&place.1, &mut bench, &mut random).err(),
+            session
+                .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+                .err(),
             Some(Error::Token(TokenError::Failed(
                 transaction::Error::Status(Status::CredentialExcluded)
             )))
@@ -1617,7 +2039,7 @@ pub(in crate::portable) mod tests {
         bench.present(&[1, 2, 2]);
         bench.corrupt = Some(bench.calls.len() + 2);
         assert!(matches!(
-            session.add_key(&place.1, &mut bench, &mut random),
+            session.add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random),
             Err(Error::Refused(_))
         ));
         assert!(bench.present.is_empty());
@@ -1633,12 +2055,16 @@ pub(in crate::portable) mod tests {
         let mut session = created(&place, &mut bench, &mut random);
         for token in 2..8 {
             bench.present(&[1, token, token]);
-            session.add_key(&place.1, &mut bench, &mut random).unwrap();
+            session
+                .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+                .unwrap();
         }
         assert_eq!(session.keys().len(), 8);
         let calls = bench.calls.len();
         assert_eq!(
-            session.add_key(&place.1, &mut bench, &mut random).err(),
+            session
+                .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+                .err(),
             Some(Error::State("the portable vault already has eight keys"))
         );
         assert_eq!(bench.calls.len(), calls);
@@ -1657,7 +2083,13 @@ pub(in crate::portable) mod tests {
         let lost = id(&bench, 0);
         bench.present(&[1, 2, 2]);
         session
-            .replace_keys(&place.1, &[&lost], &mut bench, &mut random)
+            .replace_keys(
+                &place.1,
+                &[&lost],
+                Kind::SecurityKey,
+                &mut bench,
+                &mut random,
+            )
             .unwrap();
         assert_eq!(
             bench.calls[bench.calls.len() - 3..],
@@ -1685,7 +2117,7 @@ pub(in crate::portable) mod tests {
         // The historical copy still opens with the lost key, under the old key.
         let old = LockedVault::decode(&old_bytes).unwrap();
         let seed = bench.tokens[0].credentials[0].seed;
-        let salt = *old.unlock_hint(&lost).unwrap().salt;
+        let salt = *hint_salt(&old, &lost);
         let historical = old
             .open(&lost, &Secret32(td_fido::hmac_sha256(&seed, &[&salt])))
             .unwrap();
@@ -1699,18 +2131,32 @@ pub(in crate::portable) mod tests {
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
         bench.present(&[1, 2, 2]);
-        session.add_key(&place.1, &mut bench, &mut random).unwrap();
+        session
+            .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+            .unwrap();
         let before = place.bytes();
         let revoked = id(&bench, 1);
         // The retained primary is presented, but the retained backup is not.
         bench.present(&[0, 1]);
         assert!(session
-            .replace_keys(&place.1, &[&revoked], &mut bench, &mut random)
+            .replace_keys(
+                &place.1,
+                &[&revoked],
+                Kind::SecurityKey,
+                &mut bench,
+                &mut random
+            )
             .is_err());
         assert_eq!(place.bytes(), before);
         bench.present(&[0, 2, 3, 3]);
         session
-            .replace_keys(&place.1, &[&revoked], &mut bench, &mut random)
+            .replace_keys(
+                &place.1,
+                &[&revoked],
+                Kind::SecurityKey,
+                &mut bench,
+                &mut random,
+            )
             .unwrap();
         assert_eq!(
             bench.calls[bench.calls.len() - 4..],
@@ -1776,13 +2222,21 @@ pub(in crate::portable) mod tests {
         // The attacker unlocks with the stolen backup and adds a key.
         let mut attacker = created(&place, &mut bench, &mut random);
         bench.present(&[1, 2, 2]);
-        attacker.add_key(&place.1, &mut bench, &mut random).unwrap();
+        attacker
+            .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+            .unwrap();
         drop(attacker);
         let (stolen, planted) = (id(&bench, 1), id(&bench, 2));
         let mut owner = unlocked(&place, &mut bench, 0);
         bench.present(&[0, 3, 3]);
         owner
-            .replace_keys(&place.1, &[&stolen, &planted], &mut bench, &mut random)
+            .replace_keys(
+                &place.1,
+                &[&stolen, &planted],
+                Kind::SecurityKey,
+                &mut bench,
+                &mut random,
+            )
             .unwrap();
         assert_eq!(
             bench.calls[bench.calls.len() - 3..],
@@ -1816,7 +2270,9 @@ pub(in crate::portable) mod tests {
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
         bench.present(&[1, 2, 2]);
-        session.add_key(&place.1, &mut bench, &mut random).unwrap();
+        session
+            .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+            .unwrap();
         let (a, b, c) = (id(&bench, 0), id(&bench, 1), id(&bench, 2));
         let calls = bench.calls.len();
         let before = place.bytes();
@@ -1832,7 +2288,7 @@ pub(in crate::portable) mod tests {
         ] {
             assert_eq!(
                 session
-                    .replace_keys(&place.1, &set, &mut bench, &mut random)
+                    .replace_keys(&place.1, &set, Kind::SecurityKey, &mut bench, &mut random)
                     .err(),
                 Some(Error::State(refused))
             );
@@ -1853,7 +2309,13 @@ pub(in crate::portable) mod tests {
         bench.present(&[1, 1]);
         assert_eq!(
             session
-                .replace_keys(&place.1, &[&lost], &mut bench, &mut random)
+                .replace_keys(
+                    &place.1,
+                    &[&lost],
+                    Kind::SecurityKey,
+                    &mut bench,
+                    &mut random
+                )
                 .err(),
             Some(Error::Token(TokenError::Failed(
                 transaction::Error::Status(Status::CredentialExcluded)
@@ -1862,7 +2324,13 @@ pub(in crate::portable) mod tests {
         bench.present(&[1, 2, 2]);
         bench.corrupt = Some(bench.calls.len() + 2);
         assert!(matches!(
-            session.replace_keys(&place.1, &[&lost], &mut bench, &mut random),
+            session.replace_keys(
+                &place.1,
+                &[&lost],
+                Kind::SecurityKey,
+                &mut bench,
+                &mut random
+            ),
             Err(Error::Refused(_))
         ));
         assert!(bench.present.is_empty());
@@ -1880,7 +2348,9 @@ pub(in crate::portable) mod tests {
         bench.frozen = true;
         bench.present(&[1, 2, 2]);
         assert_eq!(
-            session.add_key(&place.1, &mut bench, &mut random).err(),
+            session
+                .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+                .err(),
             Some(Error::Refused(
                 "portable key counter did not advance".into()
             ))
@@ -1905,7 +2375,7 @@ pub(in crate::portable) mod tests {
             Err(Error::Store(_))
         ));
         assert!(matches!(
-            session.add_key(&place.1, &mut bench, &mut random),
+            session.add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random),
             Err(Error::Store(_))
         ));
         assert_eq!(bench.calls.len(), calls);
@@ -1922,7 +2392,7 @@ pub(in crate::portable) mod tests {
         }));
         bench.present(&[1, 2, 2]);
         assert!(matches!(
-            session.add_key(&place.1, &mut bench, &mut random),
+            session.add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random),
             Err(Error::Store(_))
         ));
         bench.during = None;
@@ -1944,7 +2414,9 @@ pub(in crate::portable) mod tests {
         let mut session = unlocked(&place, &mut bench, 0);
         assert_eq!(session.credential(), id(&bench, 0));
         bench.present(&[0, 2, 2]);
-        session.add_key(&place.1, &mut bench, &mut random).unwrap();
+        session
+            .add_key(&place.1, Kind::SecurityKey, &mut bench, &mut random)
+            .unwrap();
         assert_eq!(
             bench.presented[bench.presented.len() - 3],
             (Role::Primary, Some(id(&bench, 0)))
@@ -2008,7 +2480,7 @@ pub(in crate::portable) mod tests {
         let mut body = exported.clone();
         *body.last_mut().unwrap() ^= 1;
         let decoded = LockedVault::decode(&exported).unwrap();
-        let salt = decoded.unlock_hint(&backup).unwrap().salt;
+        let salt = hint_salt(&decoded, &backup);
         let at = exported.windows(32).position(|w| w == salt).unwrap();
         let mut slot = exported.clone();
         slot[at] ^= 1;
@@ -2035,7 +2507,13 @@ pub(in crate::portable) mod tests {
         let lost = id(&bench, 0);
         bench.present(&[1, 2, 2]);
         restored
-            .replace_keys(&fresh.1, &[&lost], &mut bench, &mut random)
+            .replace_keys(
+                &fresh.1,
+                &[&lost],
+                Kind::SecurityKey,
+                &mut bench,
+                &mut random,
+            )
             .unwrap();
         assert_eq!(restored.revision(), 3);
         let calls = bench.calls.len();
@@ -2075,17 +2553,22 @@ pub(in crate::portable) mod tests {
                             credential: None,
                         },
                         EnrollRequest {
+                            kind: Kind::SecurityKey,
                             challenge: intent.challenge,
                             proof_challenge: intent.proof_challenge,
                             user: intent.user,
                             salt: intent.salt,
                             excluded: &[],
+                            computers: &Computers::NONE,
                         },
                     )
                     .unwrap();
                 drop(adapter);
                 assert_eq!(enrolled.credential, fixture(label, "credential_id"));
-                assert_eq!(enrolled.key.cose().as_slice(), fixture(label, "cose"));
+                let Factor::SecurityKey { key, .. } = &enrolled.factor else {
+                    panic!("a security key enrolled a computer");
+                };
+                assert_eq!(key.cose().as_slice(), fixture(label, "cose"));
                 assert_eq!(enrolled.secret.0.as_slice(), fixture(label, "output"));
                 assert_eq!(
                     purposes,
@@ -2115,7 +2598,10 @@ pub(in crate::portable) mod tests {
                 cose.extend(x);
                 cose.extend([0x22, 0x58, 0x20]);
                 cose.extend(y);
-                let key = VerificationKey::from_cose(&cose).unwrap();
+                let factor = Factor::SecurityKey {
+                    key: VerificationKey::from_cose(&cose).unwrap(),
+                    salt: intent.salt,
+                };
                 let asserted = adapter
                     .assert(
                         Presented {
@@ -2125,8 +2611,7 @@ pub(in crate::portable) mod tests {
                         },
                         AssertRequest {
                             credential: intent.credential,
-                            key: &key,
-                            salt: &intent.salt,
+                            factor: &factor,
                             challenge: intent.challenge,
                         },
                     )
@@ -2140,7 +2625,10 @@ pub(in crate::portable) mod tests {
 
         #[test]
         fn an_unopened_channel_keeps_its_reason_and_prompts_for_nothing() {
-            let key = cose(&[1; 32]);
+            let factor = Factor::SecurityKey {
+                key: cose(&[1; 32]),
+                salt: [0; 32],
+            };
             let reasons: [fn() -> TokenError; 4] = [
                 || TokenError::Unavailable,
                 || TokenError::Denied,
@@ -2168,11 +2656,13 @@ pub(in crate::portable) mod tests {
                         credential: None,
                     },
                     EnrollRequest {
+                        kind: Kind::SecurityKey,
                         challenge: [0; 32],
                         proof_challenge: [0; 32],
                         user: [0; 32],
                         salt: [0; 32],
                         excluded: &[],
+                        computers: &Computers::NONE,
                     },
                 );
                 assert_eq!(enrolled.err(), Some(reason()));
@@ -2184,8 +2674,7 @@ pub(in crate::portable) mod tests {
                     },
                     AssertRequest {
                         credential: b"id",
-                        key: &key,
-                        salt: &[0; 32],
+                        factor: &factor,
                         challenge: [0; 32],
                     },
                 );
@@ -2193,6 +2682,48 @@ pub(in crate::portable) mod tests {
                 assert!(!prompted);
                 assert_eq!(opened, 2);
             }
+        }
+
+        #[test]
+        fn standalone_hardware_refuses_a_computer_key_without_opening_a_channel() {
+            let mut opened = 0;
+            let mut adapter = Hardware {
+                open: |_: Presented<'_>| {
+                    opened += 1;
+                    Err::<Script, _>(TokenError::Unavailable)
+                },
+                prompt: |_: Presented<'_>, _| Err("unexpected".to_string()),
+                entropy: |_: &mut [u8]| Ok(()),
+            };
+            let presented = Presented {
+                purpose: Purpose::Unlock,
+                role: Role::Primary,
+                credential: None,
+            };
+            let enrolled = adapter.enroll(
+                presented,
+                EnrollRequest {
+                    kind: Kind::Computer,
+                    challenge: [0; 32],
+                    proof_challenge: [0; 32],
+                    user: [0; 32],
+                    salt: [0; 32],
+                    excluded: &[],
+                    computers: &Computers::NONE,
+                },
+            );
+            let standalone = || TokenError::Computer(Computer::Standalone);
+            assert_eq!(enrolled.err(), Some(standalone()));
+            let asserted = adapter.assert(
+                presented,
+                AssertRequest {
+                    credential: b"id",
+                    factor: &Factor::Computer,
+                    challenge: [0; 32],
+                },
+            );
+            assert_eq!(asserted.err(), Some(standalone()));
+            assert_eq!(opened, 0);
         }
     }
 }

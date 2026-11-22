@@ -251,7 +251,12 @@ impl Token {
                     let Operation::Notebook(binding) = self.request.operation() else {
                         return Err("notebook completion has no binding".into());
                     };
-                    if !matches!((binding.method, binding.step), (0x30, 3) | (0x31, 1)) {
+                    // Each method's last step: a security key's proof or
+                    // assertion PIN, a computer's sealing or unsealing PIN.
+                    if !matches!(
+                        (binding.method, binding.step),
+                        (0x30, 3) | (0x31, 1) | (0x32, 2) | (0x33, 1)
+                    ) {
                         return Err("notebook completion skipped its PIN ceremony".into());
                     }
                     let result = input.field(2048)?;
@@ -417,8 +422,11 @@ pub(crate) mod tests {
             wire.send(&[0x45, 0x25]).unwrap();
             return;
         }
+        let Operation::Notebook(binding) = request.operation() else {
+            panic!();
+        };
         let mut result = Bytes(vec![0x44]);
-        field(&mut result, &[0x31; 37]).unwrap();
+        field(&mut result, &[binding.method; 37]).unwrap();
         wire.send(&result.0).unwrap();
         if script == "bad-exit" {
             std::process::exit(1);

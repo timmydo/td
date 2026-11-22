@@ -1,6 +1,7 @@
 //! The root-launched notebook client. No hardware or standalone vault access.
 
 use super::*;
+use crate::protocol::KeyKind;
 #[path = "../../../td-secret/src/notebook_wire.rs"]
 #[allow(
     dead_code,
@@ -65,21 +66,27 @@ struct Backend<'a, L: Link> {
 }
 
 /// Root's prompt for a step (`7d`): its number, the step's purpose, the
-/// key's role, the step, and the enrolled key's fingerprint when the
-/// step names one.
+/// key's role, the step, whether it is this computer's TPM, and the
+/// enrolled key's fingerprint when the step names one.
 fn prompt(bytes: &[u8]) -> Result<([u8; 8], Ask), String> {
     let mut input = Reader::new(bytes);
     input.byte()?;
     let number = input.array()?;
-    let operation =
-        pass::step_operation(input.byte()?).ok_or("root prompted for an unknown purpose")?;
+    let purpose = input.byte()?;
+    let operation = pass::step_operation(purpose).ok_or("root prompted for an unknown purpose")?;
     let role = match input.byte()? {
         1 => Role::Primary,
         2 => Role::Backup,
         _ => return Err("root prompted for an unknown key role".into()),
     };
-    let pin = match input.byte()? {
+    let step = input.byte()?;
+    let computer = input.boolean()?;
+    // A computer key's enrollment proves its new PIN with an unseal: a
+    // second typing of it.
+    let enrolling = matches!(purpose, 1 | 2 | 6 | 8);
+    let pin = match step {
         0 => None,
+        1 if computer && enrolling => Some(PinUse::Proof),
         1 => Some(PinUse::Authorize),
         2 => Some(PinUse::Enroll),
         3 => Some(PinUse::Proof),
@@ -98,8 +105,17 @@ fn prompt(bytes: &[u8]) -> Result<([u8; 8], Ask), String> {
             role,
             key,
             pin,
+            computer,
         },
     ))
+}
+
+/// A key kind's byte on the service protocol.
+fn kind(kind: KeyKind) -> u8 {
+    match kind {
+        KeyKind::SecurityKey => 0,
+        KeyKind::Computer => 1,
+    }
 }
 
 /// The window's answer to root's prompt `number` (`7c`): proceed, the
@@ -247,13 +263,20 @@ impl<L: Link> Backend<'_, L> {
             return Err("too many notebook keys".into());
         }
         let mut keys = Vec::new();
+        // Each key's role, a computer's with its high nibble set.
         for _ in 0..count {
-            let role = match input.byte()? {
+            let byte = input.byte()?;
+            let role = match byte & 0x0f {
                 1 => pass::KeyRole::Primary,
                 2 => pass::KeyRole::Backup,
                 _ => return Err("invalid notebook key role".into()),
             };
-            keys.push(pass::Key::from_credential(role, input.field(1024)?)?);
+            let kind = match byte >> 4 {
+                0 => pass::KeyKind::SecurityKey,
+                1 => pass::KeyKind::Computer,
+                _ => return Err("invalid notebook key kind".into()),
+            };
+            keys.push(pass::Key::from_parts(role, kind, input.field(1024)?)?);
         }
         let using = input.field(1024)?;
         self.using = if using.is_empty() {
@@ -325,8 +348,18 @@ impl<L: Link> Backend<'_, L> {
             Command::AcceptSwap => {
                 Err("trusted notebook mode does not accept storage-backed swap".into())
             }
-            Command::Create { op, backup } => {
-                let response = self.call(vec![2, u8::from(backup)], op, cancel, replies)?;
+            Command::Create {
+                op,
+                primary,
+                backup,
+            } => {
+                let request = vec![
+                    2,
+                    u8::from(backup.is_some()),
+                    kind(primary),
+                    backup.map_or(0, kind),
+                ];
+                let response = self.call(request, op, cancel, replies)?;
                 success(&response)?.finish()?;
                 self.using = Some(0);
                 self.unlocked(op, cancel, replies)
@@ -453,8 +486,8 @@ impl<L: Link> Backend<'_, L> {
                     revision: (revision != 0).then_some(revision),
                 })
             }
-            Command::AddKey { op } => {
-                let response = self.call(vec![9], op, cancel, replies)?;
+            Command::AddKey { op, kind: added } => {
+                let response = self.call(vec![9, kind(added)], op, cancel, replies)?;
                 success(&response)?.finish()?;
                 self.keys(cancel, replies)?;
                 Ok(Reply::Keys {
@@ -462,8 +495,12 @@ impl<L: Link> Backend<'_, L> {
                     keys: self.listing(),
                 })
             }
-            Command::ReplaceKeys { op, revoked } => {
-                let mut request = Frame(vec![10]);
+            Command::ReplaceKeys {
+                op,
+                revoked,
+                kind: replacement,
+            } => {
+                let mut request = Frame(vec![10, kind(replacement)]);
                 request.push(u8::try_from(revoked.len()).map_err(|_| "too many revoked keys")?)?;
                 for index in revoked {
                     field(
@@ -549,7 +586,7 @@ fn operation(command: &Command) -> Op {
         | Command::Unlock { op, .. }
         | Command::BindMail { op, .. }
         | Command::Apply { op, .. }
-        | Command::AddKey { op }
+        | Command::AddKey { op, .. }
         | Command::ReplaceKeys { op, .. }
         | Command::Export { op, .. }
         | Command::ReadCopy { op, .. }
@@ -658,7 +695,31 @@ mod tests {
     use super::*;
 
     fn frame(purpose: u8, role: u8, step: u8, key: Option<[u8; 4]>) -> Vec<u8> {
-        let mut bytes = vec![0x7d, 0, 0, 0, 0, 0, 0, 0, 9, purpose, role, step];
+        computer_frame(purpose, role, step, false, key)
+    }
+
+    fn computer_frame(
+        purpose: u8,
+        role: u8,
+        step: u8,
+        computer: bool,
+        key: Option<[u8; 4]>,
+    ) -> Vec<u8> {
+        let mut bytes = vec![
+            0x7d,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            9,
+            purpose,
+            role,
+            step,
+            u8::from(computer),
+        ];
         match key {
             Some(key) => {
                 bytes.push(1);
@@ -682,6 +743,7 @@ mod tests {
                 role: Role::Primary,
                 key: Some("ab0012ff".into()),
                 pin: None,
+                computer: false,
             }
         );
         assert!(ask.operation.starts_with("unlock"));
@@ -700,11 +762,34 @@ mod tests {
             frame(4, 1, 0, None),
             frame(3, 3, 0, None),
             frame(3, 1, 4, None),
-            frame(3, 1, 0, None)[..11].to_vec(),
+            frame(3, 1, 0, None)[..12].to_vec(),
             [frame(3, 1, 0, None), vec![0]].concat(),
+            computer_frame(3, 1, 1, false, None)
+                .iter()
+                .enumerate()
+                .map(|(at, byte)| if at == 12 { 2 } else { *byte })
+                .collect(),
         ] {
             assert!(prompt(&bad).is_err());
         }
+    }
+
+    /// This computer's TPM asks for its PIN alone: the unlock's PIN, and
+    /// an enrollment's new PIN then, as its proof, the same PIN again.
+    #[test]
+    fn a_computer_s_steps_read_as_its_pin() {
+        let fingerprint = Some([1, 2, 3, 4]);
+        let (_, unlock) = prompt(&computer_frame(3, 1, 1, true, fingerprint)).unwrap();
+        assert!(unlock.computer);
+        assert_eq!(unlock.pin, Some(PinUse::Authorize));
+        assert_eq!(unlock.key.as_deref(), Some("01020304"));
+        let (_, seal) = prompt(&computer_frame(6, 2, 2, true, None)).unwrap();
+        assert_eq!((seal.computer, seal.pin), (true, Some(PinUse::Enroll)));
+        let (_, proof) = prompt(&computer_frame(6, 2, 1, true, fingerprint)).unwrap();
+        assert_eq!(proof.pin, Some(PinUse::Proof));
+        // A security key's repeat assertion stays an authorization.
+        let (_, repeat) = prompt(&frame(6, 2, 1, fingerprint)).unwrap();
+        assert_eq!(repeat.pin, Some(PinUse::Authorize));
     }
 
     /// A link whose replies a script gives from the frames sent so far.
@@ -801,7 +886,7 @@ mod tests {
                 }
                 turn += 1;
                 match turn {
-                    1 => Some(vec![0x7d, 0, 0, 0, 0, 0, 0, 0, 2, 3, 1, 1, 0]),
+                    1 => Some(vec![0x7d, 0, 0, 0, 0, 0, 0, 0, 2, 3, 1, 1, 0, 0]),
                     2 => Some(failure("cancelled")),
                     _ => None,
                 }
@@ -828,7 +913,7 @@ mod tests {
             |sent| {
                 if !prompted {
                     prompted = true;
-                    return Some(vec![0x7d, 0, 0, 0, 0, 0, 0, 0, 7, 3, 1, 1, 0]);
+                    return Some(vec![0x7d, 0, 0, 0, 0, 0, 0, 0, 7, 3, 1, 1, 0, 0]);
                 }
                 if shown_answer(sent) {
                     return Some(vec![0]);

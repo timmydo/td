@@ -22,15 +22,21 @@
 mod sha256;
 
 mod auth;
+pub mod device_pin;
 #[cfg(test)]
 mod emulator_tests;
 mod lockout;
 mod session;
+// The shared fixture guard, mounted by path: td-secret's recipe builds
+// these tests with plain rustc and stages the file, as td-secret's do.
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod test_temp;
 pub use auth::{
     auth_policy_digest, device_pin_policy_digest, validate_auth_sealed_public, AuthRefusal,
-    AuthSealed, DictionaryAttack, DA_SEALED_ATTRIBUTES, GET_CAPABILITY, NO_DA, POLICY_AUTH_VALUE,
-    PT_LOCKOUT_COUNTER, PT_LOCKOUT_INTERVAL, PT_LOCKOUT_RECOVERY, PT_MAX_AUTH_FAIL, PT_PERMANENT,
-    RC_AUTH_FAIL, RC_LOCKOUT,
+    AuthSealed, DictionaryAttack, CHANGED_POLICY, DA_SEALED_ATTRIBUTES, GET_CAPABILITY, NO_DA,
+    OTHER_PRIMARY, POLICY_AUTH_VALUE, PT_LOCKOUT_COUNTER, PT_LOCKOUT_INTERVAL, PT_LOCKOUT_RECOVERY,
+    PT_MAX_AUTH_FAIL, PT_PERMANENT, RC_AUTH_FAIL, RC_LOCKOUT,
 };
 pub use lockout::{
     DaParameters, LockoutAuth, LockoutError, CLEAR, DICTIONARY_ATTACK_LOCK_RESET,

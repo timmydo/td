@@ -7,11 +7,8 @@ use crate::{
 };
 use std::{
     fs::{self, File},
-    io::{self, Read},
-    os::{
-        fd::AsFd,
-        unix::{fs::MetadataExt, net::UnixDatagram},
-    },
+    io,
+    os::{fd::AsFd, unix::net::UnixDatagram},
     path::Path,
     sync::mpsc::{self, Receiver, SyncSender},
     thread,
@@ -28,7 +25,7 @@ use td_protector::pin::Pin;
 mod memory;
 
 const DIRECTORY: &str = "/var/lib/td-passkeys";
-const PRIMARY: &str = "/run/td-admit/td-passkey-primary";
+const PRIMARY: &str = td_tpm::device_pin::ADMITTED_PRIMARY;
 const MAX: usize = 2048;
 const PAUSE: Duration = Duration::from_millis(5);
 
@@ -125,15 +122,8 @@ impl Drop for Hardware {
 }
 
 pub(super) fn storage() -> Result<(File, [u8; 34])> {
-    let (mut f, m) = td_fs::open_real_file(Path::new(PRIMARY), "passkey primary")?;
-    if (m.uid(), m.gid(), m.nlink(), m.mode() & 0o7777, m.len()) != (0, 0, 1, 0o600, 34) {
-        return Err(Error::Refused);
-    }
-    let mut name = [0; 34];
-    f.read_exact(&mut name)?;
-    if name.get(..2) != Some(&[0, 11]) {
-        return Err(Error::Refused);
-    }
+    let name =
+        td_tpm::device_pin::admitted_primary(Path::new(PRIMARY)).map_err(|_| Error::Refused)?;
     td_fs::private_dir(Path::new(DIRECTORY))?;
     Ok((File::open(DIRECTORY)?, name))
 }

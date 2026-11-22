@@ -298,6 +298,10 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-tpm/src/auth.rs"),
         ),
         (
+            "{src}/td-tpm/src/device_pin.rs",
+            include_str!("../../../td-tpm/src/device_pin.rs"),
+        ),
+        (
             "{src}/td-tpm/src/lockout.rs",
             include_str!("../../../td-tpm/src/lockout.rs"),
         ),

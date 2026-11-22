@@ -983,20 +983,28 @@ impl Notebook {
             6 => matches!(self.purpose, 7 | 8),
             _ => false,
         };
+        // 30 and 31 are a security key's enrollment and assertion; 32 and
+        // 33 seal and unseal a computer key, whose PIN step is the only
+        // one after step zero, which root acknowledges itself.
         let enrollment = matches!(self.purpose, 1 | 2 | 6 | 8);
+        let steps: &[u8] = match self.method {
+            0x30 if enrollment => &[0, 2, 3],
+            0x32 if enrollment => &[0, 2],
+            0x31 | 0x33 => &[0, 1],
+            _ => &[],
+        };
         purpose
-            && (self.method == 0x31 || (self.method == 0x30 && enrollment))
+            && steps.contains(&self.step)
             && matches!(self.role, 1 | 2)
             && (self.purpose != 1 || self.role == 1)
             && (self.purpose != 2 || self.role == 2)
-            && (self.step == 0
-                || if self.method == 0x30 {
-                    matches!(self.step, 2 | 3)
-                } else {
-                    self.step == 1
-                })
             && self.operation != [0; 32]
             && self.token != [0; 32]
+    }
+
+    /// Whether the step seals or unseals a computer key in its TPM.
+    pub fn computer(&self) -> bool {
+        matches!(self.method, 0x32 | 0x33)
     }
 
     pub fn follows(&self, previous: &Self) -> bool {
@@ -1025,10 +1033,15 @@ impl Notebook {
             lines.push("LOSING THIS KEY MAKES THE VAULT UNRECOVERABLE".into());
         }
         lines.push(
-            if self.role == 1 {
-                "PRIMARY KEY"
-            } else {
-                "BACKUP KEY"
+            match (self.role, self.computer()) {
+                (1, false) => "PRIMARY KEY",
+                (_, false) => "BACKUP KEY",
+                // Sealing is this computer's; an unsealed slot, as an
+                // imported copy's, may be another computer's.
+                (1, true) if self.method == 0x32 => "PRIMARY KEY: THIS COMPUTER'S TPM",
+                (_, true) if self.method == 0x32 => "BACKUP KEY: THIS COMPUTER'S TPM",
+                (1, true) => "PRIMARY KEY: A COMPUTER'S TPM",
+                (_, true) => "BACKUP KEY: A COMPUTER'S TPM",
             }
             .into(),
         );
@@ -1040,17 +1053,26 @@ impl Notebook {
             }
             .into(),
         );
-        if self.method == 0x31 && matches!(self.purpose, 1 | 2 | 6 | 8) {
-            lines.push("REPEAT THE ASSERTION TO VERIFY THIS NEW KEY".into());
+        if matches!(self.method, 0x31 | 0x33) && matches!(self.purpose, 1 | 2 | 6 | 8) {
+            lines.push(
+                if self.computer() {
+                    "ENTER THE NEW PIN AGAIN TO VERIFY THIS NEW KEY"
+                } else {
+                    "REPEAT THE ASSERTION TO VERIFY THIS NEW KEY"
+                }
+                .into(),
+            );
         }
         if self.step == 0 {
             approval_lines(lines);
         } else {
             lines.push(
-                match self.step {
-                    2 => "ENTER ITS PIN TO CREATE THE CREDENTIAL",
-                    3 => "ENTER ITS PIN AGAIN TO PROVE THE CREDENTIAL",
-                    _ => "ENTER ITS PIN, THEN TOUCH THE KEY",
+                match (self.computer(), self.step) {
+                    (true, 2) => "CHOOSE A PIN FOR THIS COMPUTER'S TPM",
+                    (true, _) => "ENTER THIS COMPUTER'S NOTEBOOK PIN",
+                    (false, 2) => "ENTER ITS PIN TO CREATE THE CREDENTIAL",
+                    (false, 3) => "ENTER ITS PIN AGAIN TO PROVE THE CREDENTIAL",
+                    (false, _) => "ENTER ITS PIN, THEN TOUCH THE KEY",
                 }
                 .into(),
             );
@@ -9359,5 +9381,60 @@ mod notebook_tests {
             next.operation[0] ^= 1;
             assert!(!next.follows(&original));
         }
+    }
+
+    #[test]
+    fn a_computer_seals_only_to_enroll_and_each_method_has_one_pin_step() {
+        let step = |method, action, purpose, role, step| Notebook {
+            method,
+            action,
+            purpose,
+            role,
+            step,
+            operation: [1; 32],
+            token: [2; 32],
+        };
+        // Sealing enrolls: creation, addition, replacement; step 2 only.
+        for (action, purpose, role) in [(1, 1, 1), (2, 2, 2), (5, 6, 2), (6, 8, 1)] {
+            let zero = step(0x32, action, purpose, role, 0);
+            assert!(zero.valid() && zero.computer());
+            let pin = step(0x32, action, purpose, role, 2);
+            assert!(pin.follows(&zero));
+            for other in [1, 3] {
+                assert!(!step(0x32, action, purpose, role, other).valid());
+            }
+        }
+        // Unsealing authorizes any purpose, and repeats an enrollment.
+        for (action, purpose, role) in [(3, 3, 1), (4, 9, 2), (5, 5, 1), (6, 7, 2), (2, 2, 2)] {
+            let zero = step(0x33, action, purpose, role, 0);
+            assert!(zero.valid() && zero.computer());
+            assert!(step(0x33, action, purpose, role, 1).follows(&zero));
+            assert!(!step(0x33, action, purpose, role, 2).valid());
+        }
+        assert!(!step(0x32, 3, 3, 1, 0).valid());
+        assert!(!step(0x34, 3, 3, 1, 0).valid());
+        assert!(!step(0x31, 3, 3, 1, 0).computer());
+        // A computer step names neither a touch nor a credential: an
+        // unsealed slot may be another computer's, a sealing is this one's.
+        let rendered = |notebook: Notebook| {
+            let mut lines = Vec::new();
+            notebook.lines(&mut lines);
+            lines
+        };
+        let unlock = rendered(step(0x33, 3, 3, 1, 1));
+        assert!(unlock.contains(&"PRIMARY KEY: A COMPUTER'S TPM".to_string()));
+        assert!(unlock.contains(&"ENTER THIS COMPUTER'S NOTEBOOK PIN".to_string()));
+        let sealing = rendered(step(0x32, 5, 6, 2, 2));
+        assert!(sealing.contains(&"BACKUP KEY: THIS COMPUTER'S TPM".to_string()));
+        assert!(sealing.contains(&"CHOOSE A PIN FOR THIS COMPUTER'S TPM".to_string()));
+        let repeat = rendered(step(0x33, 5, 6, 2, 1));
+        assert!(repeat.contains(&"ENTER THE NEW PIN AGAIN TO VERIFY THIS NEW KEY".to_string()));
+        for lines in [unlock, sealing, repeat] {
+            assert!(!lines
+                .iter()
+                .any(|line| line.contains("TOUCH") || line.contains("CREDENTIAL")));
+        }
+        let key = rendered(step(0x31, 3, 3, 1, 1));
+        assert!(key.contains(&"ENTER ITS PIN, THEN TOUCH THE KEY".to_string()));
     }
 }

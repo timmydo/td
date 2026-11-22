@@ -3178,7 +3178,7 @@ td-pass/src/app/mod.rs	unchecked-growth-or-clone	70
 td-pass/src/app/paint.rs	allocating-conversion	3
 td-pass/src/app/paint.rs	allocation-macro	3
 td-pass/src/app/tests.rs	allocating-conversion	68
-td-pass/src/app/tests.rs	allocation-macro	117
+td-pass/src/app/tests.rs	allocation-macro	115
 td-pass/src/app/tests.rs	unchecked-growth-or-clone	13
 td-pass/src/backend.rs	allocating-constructor	1
 td-pass/src/backend.rs	allocating-conversion	25
@@ -3415,7 +3415,6 @@ td-protector/src/manage.rs	allocation-macro	3
 td-protector/src/manage.rs	unchecked-growth-or-clone	3
 td-protector/src/pin.rs	allocating-conversion	3
 td-protector/src/pin.rs	allocation-macro	1
-td-protector/src/pin.rs	heap-owner	1
 td-protector/src/pin.rs	unchecked-growth-or-clone	3
 td-protector/src/protected.rs	allocating-constructor	1
 td-protector/src/protected.rs	allocating-conversion	6
@@ -3623,7 +3622,7 @@ td-secret/src/portable_service.rs	allocating-conversion	9
 td-secret/src/portable_service.rs	allocation-macro	4
 td-secret/src/portable_service.rs	unchecked-growth-or-clone	14
 td-secret/src/portable_service_tokens.rs	allocating-conversion	1
-td-secret/src/portable_service_tokens.rs	allocation-macro	2
+td-secret/src/portable_service_tokens.rs	allocation-macro	1
 td-secret/src/portable_service_tokens.rs	unchecked-growth-or-clone	7
 td-secret/src/portable_store.rs	allocating-constructor	1
 td-secret/src/portable_store.rs	allocating-conversion	2
@@ -3994,6 +3993,7 @@ td-toml/src/lib.rs	unchecked-growth-or-clone	60
 td-tpm/src/auth.rs	allocating-constructor	3
 td-tpm/src/auth.rs	allocating-conversion	4
 td-tpm/src/auth.rs	unchecked-growth-or-clone	2
+td-tpm/src/device_pin.rs	heap-owner	1
 td-tpm/src/emulator_tests.rs	allocating-conversion	6
 td-tpm/src/emulator_tests.rs	allocation-macro	4
 td-tpm/src/emulator_tests.rs	unchecked-growth-or-clone	9

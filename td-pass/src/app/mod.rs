@@ -10,6 +10,7 @@ mod input;
 mod layout;
 mod paint;
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,8 +27,8 @@ use td_ui::window::{Clipboard, Input, PointerPhase};
 
 use crate::plain::{self, Bytes, Text};
 use crate::protocol::{
-    Answer, Ask, Change, Command, EntryId, Failure, HostEvent, Item, KeyLabel, Keys, Op, PinUse,
-    Reply, Role,
+    Answer, Ask, Change, Command, EntryId, Failure, HostEvent, Item, KeyKind, KeyLabel, Keys, Op,
+    PinUse, Reply, Role,
 };
 
 /// The largest title, search or find text a field holds; td-secret
@@ -41,12 +42,35 @@ const KEYS_HINT: &str =
 const CREATE_DETAILS: &[&str] = &[
     "Only an enrolled security key and its PIN open the notebook. \
      There is no password and no reset.",
-    "With one key, losing that key or blocking its PIN loses the \
-     notebook and everything in it for good.",
-    "With a primary and a backup, either key opens it alone, so \
-     losing one key, or blocking its PIN, loses nothing.",
-    "Keys can be added later from Keys (Ctrl+K).",
+    ONE_KEY_RISK,
+    TWO_KEYS,
+    LATER_KEYS,
 ];
+/// The create question on td, where this computer's TPM can hold a key.
+const CREATE_DETAILS_ON_TD: &[&str] = &[
+    "Only an enrolled key and its PIN open the notebook: a security key, \
+     or this computer's TPM. There is no password and no reset.",
+    ONE_KEY_RISK,
+    TWO_KEYS,
+    COMPUTER_PIN,
+    COMPUTER_BOUND,
+    COMPUTER_LIMIT,
+    LATER_KEYS,
+];
+const ONE_KEY_RISK: &str = "With one key, losing that key or blocking its PIN loses the \
+     notebook and everything in it for good.";
+const TWO_KEYS: &str = "With a primary and a backup, either key opens it alone, so \
+     losing one key, or blocking its PIN, loses nothing.";
+const LATER_KEYS: &str = "Keys can be added later from Keys (Ctrl+K).";
+/// What a key of this computer's TPM is: device-bound, sharing the
+/// TPM's guess limit.
+const COMPUTER_DETAILS: &[&str] = &[COMPUTER_PIN, COMPUTER_BOUND, COMPUTER_LIMIT];
+const COMPUTER_PIN: &str = "This computer's TPM opens the notebook with its own PIN of 6 to 63 \
+     characters and no security key.";
+const COMPUTER_BOUND: &str = "It opens only on this computer: an exported copy, a replaced \
+     board or a cleared TPM cannot use it, so keep a security key as a backup.";
+const COMPUTER_LIMIT: &str = "Wrong PINs count against the TPM's limit, which the disk's TPM \
+     PIN shares.";
 /// The status row while the keys view of a notebook with one key is up.
 const ONE_KEY_HINT: &str =
     "Keys: this key alone opens the notebook; Insert adds a backup so losing it loses nothing";
@@ -98,6 +122,15 @@ enum Act {
     AcceptSwap,
     CreateWithBackup,
     CreateOneKey,
+    /// On td: this computer's TPM as the primary, with a security key
+    /// backup, or alone.
+    CreateComputerWithBackup,
+    CreateComputerOnly,
+    /// On td, which kind of key Insert adds.
+    AddSecurityKey,
+    AddComputer,
+    /// On td: the replacement is this computer's TPM.
+    ReplaceWithComputer,
     /// Import a store's entries though some cannot be.
     ImportRest,
     /// Of a title the notebook holds: keep the notebook's entry (No),
@@ -733,12 +766,10 @@ impl App {
         self.set_keys(keys);
         self.say(match (what, added) {
             (KeyOp::Add, Some(key)) => {
-                format!("Added the {} key {}", key.role.name(), key.fingerprint)
+                format!("Added the {key}")
             }
             (KeyOp::Replace, Some(key)) => format!(
-                "Replaced: the new {} key is {}; revoked keys no longer open the notebook",
-                key.role.name(),
-                key.fingerprint
+                "Replaced: the new key is the {key}; revoked keys no longer open the notebook"
             ),
             _ => "The keys changed".to_owned(),
         });
@@ -1374,32 +1405,56 @@ impl App {
         }
         self.dialog_revision += 1;
         let revision = self.dialog_revision;
+        let on_td = self.on_td;
         let model = move || {
-            Model::new(
+            let model = Model::new(
                 "Create a notebook with which keys?",
                 "Primary and backup",
-                CREATE_DETAILS,
+                if on_td {
+                    CREATE_DETAILS_ON_TD
+                } else {
+                    CREATE_DETAILS
+                },
                 Act::CreateWithBackup,
                 revision,
             )
-            .and_then(|model| model.with_alternate("One key only", Act::CreateOneKey))
+            .and_then(|model| model.with_alternate("One key only", Act::CreateOneKey))?;
+            if !on_td {
+                return Ok(model);
+            }
+            model
+                .with_further("Computer and backup", Act::CreateComputerWithBackup)
+                .and_then(|model| model.with_extra("Computer only", Act::CreateComputerOnly))
         };
         if self.open_dialog(&model, None, opener) {
-            self.say("Create with a primary and a backup key, or with one key only");
+            self.say(if self.on_td {
+                "Create with security keys, this computer's TPM, or both"
+            } else {
+                "Create with a primary and a backup key, or with one key only"
+            });
         }
     }
 
-    fn create_now(&mut self, backup: bool) {
+    fn create_now(&mut self, primary: KeyKind, backup: Option<KeyKind>) {
         if self.busy.is_some() || !matches!(self.phase, Phase::Locked { keys: None, .. }) {
             return;
         }
         let op = self.op();
-        self.out.push(Out::Send(Command::Create { op, backup }));
+        self.out.push(Out::Send(Command::Create {
+            op,
+            primary,
+            backup,
+        }));
         self.busy = Some(Busy::Create(op));
-        self.say(if backup {
-            "Creating the notebook with a primary and a backup key"
-        } else {
-            "Creating the notebook with one key"
+        self.say(match (primary, backup) {
+            (KeyKind::SecurityKey, Some(_)) => {
+                "Creating the notebook with a primary and a backup key"
+            }
+            (KeyKind::SecurityKey, None) => "Creating the notebook with one key",
+            (KeyKind::Computer, Some(_)) => {
+                "Creating the notebook with this computer's TPM and a backup key"
+            }
+            (KeyKind::Computer, None) => "Creating the notebook with this computer's TPM alone",
         });
     }
 
@@ -1450,6 +1505,7 @@ impl App {
         }
         match self.phase {
             Phase::Swap(_) => layout::SWAP_ROWS,
+            Phase::Locked { keys: None, .. } if self.on_td => layout::CREATE_ROWS_ON_TD,
             Phase::Locked { keys: None, .. } => layout::CREATE_ROWS,
             _ => layout::DIALOG_ROWS,
         }
@@ -1911,6 +1967,8 @@ impl App {
         }
     }
 
+    /// Adds a backup key; on td, asks first whether it is a security key
+    /// or this computer's TPM.
     fn add_key(&mut self) {
         if self.busy.is_some() {
             return self.say("Wait for the current operation to finish");
@@ -1921,13 +1979,40 @@ impl App {
         {
             return;
         }
+        if !self.on_td {
+            return self.add_now(KeyKind::SecurityKey);
+        }
+        self.dialog_revision += 1;
+        let revision = self.dialog_revision;
+        let model = move || {
+            Model::new(
+                "Add which backup key?",
+                "Security key",
+                COMPUTER_DETAILS,
+                Act::AddSecurityKey,
+                revision,
+            )
+            .and_then(|model| model.with_alternate("This computer", Act::AddComputer))
+        };
+        if self.open_dialog(&model, None, None) {
+            self.say("Add a security key, or this computer's TPM");
+        }
+    }
+
+    fn add_now(&mut self, kind: KeyKind) {
+        if self.busy.is_some() {
+            return;
+        }
         let op = self.op();
-        self.out.push(Out::Send(Command::AddKey { op }));
+        self.out.push(Out::Send(Command::AddKey { op, kind }));
         self.busy = Some(Busy::Keys {
             op,
             what: KeyOp::Add,
         });
-        self.say("Adding a backup key");
+        self.say(match kind {
+            KeyKind::SecurityKey => "Adding a backup key",
+            KeyKind::Computer => "Adding this computer's TPM as a backup key",
+        });
     }
 
     /// The keys a replacement revokes: the marked ones, else the selected.
@@ -1973,7 +2058,7 @@ impl App {
         let mut details: Vec<String> = revoked
             .iter()
             .filter_map(|&index| labels.get(index))
-            .map(|key| format!("Revoked: the {} key {}", key.role.name(), key.fingerprint))
+            .map(|key| format!("Revoked: the {key}"))
             .collect();
         let primary = revoked.iter().any(|&index| {
             labels
@@ -1994,14 +2079,20 @@ impl App {
         };
         self.dialog_revision += 1;
         let revision = self.dialog_revision;
+        let on_td = self.on_td;
         let model = move || {
             let details: Vec<&str> = details.iter().map(String::as_str).collect();
-            Model::new(&title, "Replace", &details, Act::Replace, revision)
+            let model = Model::new(&title, "Replace", &details, Act::Replace, revision)?;
+            if on_td {
+                model.with_alternate("With this computer", Act::ReplaceWithComputer)
+            } else {
+                Ok(model)
+            }
         };
         self.open_dialog(&model, None, opener);
     }
 
-    fn replace_now(&mut self) {
+    fn replace_now(&mut self, kind: KeyKind) {
         if self.busy.is_some() {
             return;
         }
@@ -2011,7 +2102,7 @@ impl App {
         }
         let op = self.op();
         self.out
-            .push(Out::Send(Command::ReplaceKeys { op, revoked }));
+            .push(Out::Send(Command::ReplaceKeys { op, revoked, kind }));
         self.busy = Some(Busy::Keys {
             op,
             what: KeyOp::Replace,
@@ -2707,22 +2798,43 @@ fn matches_folded(title: &str, needle: &str) -> bool {
         })
 }
 
+/// The shortest PIN a prompt takes, a security key's 4 or the 6 of the
+/// device PIN this computer's TPM shares with the disk, and what the
+/// window says of an entry outside the profile.
+fn pin_profile(ask: &Ask) -> (usize, &'static str) {
+    if ask.computer {
+        (
+            6,
+            "A PIN for this computer's TPM has 6 to 63 printable ASCII characters",
+        )
+    } else {
+        (4, "A PIN has 4 to 63 printable ASCII characters")
+    }
+}
+
 /// What the prompt asks of the person: the key and what to do with it.
 /// A backup is asked for as a key not already enrolled, since a token
 /// holding one of the vault's credentials refuses to enroll again.
-fn instruction(ask: &Ask) -> String {
+fn instruction(ask: &Ask) -> Cow<'static, str> {
+    if ask.computer {
+        return Cow::Borrowed(match ask.pin {
+            Some(PinUse::Enroll) => "Choose a PIN of 6 to 63 characters for this computer's TPM",
+            Some(PinUse::Proof) => "Once more, type the new PIN of this computer's TPM",
+            _ => "Type the PIN of this computer's TPM",
+        });
+    }
     let key = match &ask.key {
         Some(fingerprint) => format!("the {} key {fingerprint}", ask.role.name()),
         None => format!("the key to enroll as {}", ask.role.name()),
     };
-    match ask.pin {
+    Cow::Owned(match ask.pin {
         None if ask.key.is_none() && ask.role == Role::Backup => {
             format!("Connect {key}, not one already enrolled")
         }
         None => format!("Connect {key}"),
         Some(PinUse::Authorize | PinUse::Enroll) => format!("Type the PIN of {key}"),
         Some(PinUse::Proof) => format!("Once more, type the PIN of {key}"),
-    }
+    })
 }
 
 /// The status line while a prompt waits: the instruction, then the

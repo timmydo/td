@@ -10,7 +10,10 @@ credentials stay on that key.
 
 td-tpm seals a random 256-bit encryption key under the primary and the
 salted PIN. Its DA-protected policy permits only Unseal. Each operation
-that uses the TPM first checks its dictionary-attack configuration. A
+that uses the TPM first checks its dictionary-attack configuration, and
+reads the admitted primary, through td-tpm's shared `device_pin`
+(td-tpm/DESIGN.md, "What belongs to consumers"), which the disk PIN and
+td-secret's notebook keys of this computer's TPM also apply. A
 protected caller supplies the private, owner-only directory by file
 descriptor. The vault locks an independent description of the directory
 for its lifetime. A file named passkeys contains the version, PIN salt,

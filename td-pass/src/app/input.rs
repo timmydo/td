@@ -879,17 +879,19 @@ impl App {
                 return self.say("Type the key's PIN, or Cancel");
             }
             // A PIN's profile, the one the key and root accept: anything
-            // else would fail the whole operation.
+            // else would fail the whole operation. This computer's TPM
+            // takes the disk's longer device PIN.
             (true, Some(_))
-                if !(4..=63).contains(&prompt.pin.text().len())
+                if !(pin_profile(&prompt.ask).0..=63).contains(&prompt.pin.text().len())
                     || !prompt
                         .pin
                         .text()
                         .bytes()
                         .all(|b| (0x20..=0x7e).contains(&b)) =>
             {
+                let (_, refusal) = pin_profile(&prompt.ask);
                 self.prompt = Some(prompt);
-                return self.say("A PIN has 4 to 63 printable ASCII characters");
+                return self.say(refusal);
             }
             (true, Some(_)) => {
                 let pin = Bytes::copy(prompt.pin.text().as_bytes());
@@ -941,9 +943,26 @@ impl App {
                         self.mail(None);
                     }
                     (Choice::Confirmed(Act::Delete), _) => self.delete_now(),
-                    (Choice::Confirmed(Act::Replace), _) => self.replace_now(),
-                    (Choice::Confirmed(Act::CreateWithBackup), _) => self.create_now(true),
-                    (Choice::Confirmed(Act::CreateOneKey), _) => self.create_now(false),
+                    (Choice::Confirmed(Act::Replace), _) => self.replace_now(KeyKind::SecurityKey),
+                    (Choice::Confirmed(Act::ReplaceWithComputer), _) => {
+                        self.replace_now(KeyKind::Computer)
+                    }
+                    (Choice::Confirmed(Act::CreateWithBackup), _) => {
+                        self.create_now(KeyKind::SecurityKey, Some(KeyKind::SecurityKey))
+                    }
+                    (Choice::Confirmed(Act::CreateOneKey), _) => {
+                        self.create_now(KeyKind::SecurityKey, None)
+                    }
+                    (Choice::Confirmed(Act::CreateComputerWithBackup), _) => {
+                        self.create_now(KeyKind::Computer, Some(KeyKind::SecurityKey))
+                    }
+                    (Choice::Confirmed(Act::CreateComputerOnly), _) => {
+                        self.create_now(KeyKind::Computer, None)
+                    }
+                    (Choice::Confirmed(Act::AddSecurityKey), _) => {
+                        self.add_now(KeyKind::SecurityKey)
+                    }
+                    (Choice::Confirmed(Act::AddComputer), _) => self.add_now(KeyKind::Computer),
                     (Choice::Confirmed(Act::Save), Some(then)) => self.save(Some(then)),
                     (Choice::Confirmed(Act::Discard), Some(then)) => {
                         self.discard();
