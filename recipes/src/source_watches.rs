@@ -23,6 +23,14 @@ pub enum Watch {
         index: &'static str,
         pattern: &'static str,
     },
+    /// An `Index` held to one release line, for a pin whose consumer
+    /// qualifies one major: only `line` and its point releases count (`17`
+    /// takes 17.12, never 18.1 or 170.1).
+    Line {
+        index: &'static str,
+        pattern: &'static str,
+        line: &'static str,
+    },
     /// Deliberately not followed, for the reason given.
     Held(&'static str),
 }
@@ -338,6 +346,16 @@ const WATCHES: &[(&str, Watch)] = &[
         },
     ),
     (
+        // td's mail server qualifies PostgreSQL 17 (its startup probe
+        // refuses another major), so a new major moves it before this pin.
+        "postgresql-x86-64-source",
+        Watch::Line {
+            index: "https://ftp.postgresql.org/pub/source/",
+            pattern: "v{}/",
+            line: "17",
+        },
+    ),
+    (
         "ripgrep-seed-source",
         Watch::Index {
             index: GIT_RIPGREP,
@@ -489,6 +507,32 @@ mod tests {
             );
             let (index, pattern) = match entry.watch {
                 Watch::Index { index, pattern } | Watch::PointReleases { index, pattern } => {
+                    (index, pattern)
+                }
+                Watch::Line {
+                    index,
+                    pattern,
+                    line,
+                } => {
+                    // The pin is on its line, which `source-watches` prints
+                    // as a field of its own.
+                    assert!(
+                        !line.is_empty()
+                            && line.split('.').all(|part| {
+                                !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                            }),
+                        "{}: line {line}",
+                        entry.key
+                    );
+                    assert!(
+                        entry
+                            .version
+                            .strip_prefix(line)
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
+                        "{}: version {} is not on line {line}",
+                        entry.key,
+                        entry.version
+                    );
                     (index, pattern)
                 }
                 Watch::Held(reason) => {

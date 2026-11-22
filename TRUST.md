@@ -262,6 +262,21 @@ that boundary. The imported libraries and their code inside static outputs
 are profiler coverage boundaries, not source-built or frame-pointer claims.
 The source GCC/glibc bootstrap and its source pins are absent.
 
+A C package td builds from an upstream release is an ordinary source pin,
+compiled in the root against td glibc; one that links gcc-runtime's start
+files and libgcc in place of GCC's is listed in `BUILD_ROOT_LINKED`
+(`engine/src/target_profile.rs`), and its link-map checks show where its
+links' inputs came from. PostgreSQL 17 (`postgresql-x86-64`), the server
+td-mta stores mail in, is one: every link of its build writes a checked
+map, and every ELF it ships must be byte-identical to one of those
+links' outputs. Its release tarball carries no generated sources, so the
+root's bison, flex and perl write its parser, scanner and catalog files
+during the build, as they do the kernel's; what they write is source the
+root's GCC compiles, never a runtime input. It links td zlib and no TLS
+library, since td builds none in C: a td-built server offers td-mta its
+Unix socket alone, as td-mta refuses a network connection without
+verified TLS (`td-mta/POSTGRES.md` §1).
+
 Changing the root's packages is a reviewed lock change.
 
 ## Rust toolchain and dependencies

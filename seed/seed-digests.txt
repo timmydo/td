@@ -143,6 +143,7 @@ noto-serif-bold-source yd4a274z3ns5ymjdbjwmlsz953wzhnfl-noto-serif-bold-source
 noto-serif-italic-source cdhzpkx8hvwk1wpc8xmxh7p1lwrcww3p-noto-serif-italic-source
 noto-serif-regular-source 5m066pkbyqqi94nkdd7mcnp0wxsmgwsa-noto-serif-regular-source
 openssh-x86-64-source dcdcvzqqiabk98y8ffbd35yz9drzj304-openssh-x86-64-source
+postgresql-x86-64-source zznrcwjb1y143v0rwb7ym92qvggiiv00-postgresql-x86-64-source
 ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source
 ripgrep-source 5lqzfa2vx99vmcy2cd3g88wf06pgs3kl-ripgrep-source
 rust-cargo-dist vv9hjbvrx25p93ai791gkcci9xy5vfzj-rust-cargo-dist

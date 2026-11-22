@@ -197,6 +197,19 @@ fn point_releases(versions: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Only `line` and its point releases (`Watch::Line`): 17 takes 17 and
+/// 17.12, never 18.1 or 170.1.
+fn on_line(versions: Vec<String>, line: &str) -> Vec<String> {
+    versions
+        .into_iter()
+        .filter(|version| {
+            version
+                .strip_prefix(line)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        })
+        .collect()
+}
+
 fn newest(versions: &[String]) -> Option<&String> {
     versions.iter().max_by(|a, b| compare(a, b))
 }
@@ -308,14 +321,15 @@ fn answer(bodies: &BTreeMap<String, Result<String, String>>, url: &str) -> Resul
         .unwrap_or_else(|| Err(format!("{url}: no answer")))
 }
 
-/// One `source-watches` row: KEY VERSION index|points INDEX PATTERN, or KEY
-/// VERSION held REASON.
+/// One `source-watches` row: KEY VERSION index|points INDEX PATTERN, KEY
+/// VERSION line LINE INDEX PATTERN, or KEY VERSION held REASON.
 #[derive(Debug, PartialEq)]
 enum Watch {
     Index {
         index: String,
         pattern: String,
         points: bool,
+        line: Option<String>,
     },
     Held(String),
 }
@@ -335,6 +349,17 @@ fn parse_watches(text: &str) -> Result<Vec<(String, String, Watch)>, String> {
                     index: (*index).to_string(),
                     pattern: (*pattern).to_string(),
                     points: *kind == "points",
+                    line: None,
+                },
+            ),
+            [key, version, "line", line, index, pattern] if !line.is_empty() => (
+                key,
+                version,
+                Watch::Index {
+                    index: (*index).to_string(),
+                    pattern: (*pattern).to_string(),
+                    points: false,
+                    line: Some((*line).to_string()),
                 },
             ),
             [key, version, "held", reason] => (key, version, Watch::Held((*reason).to_string())),
@@ -389,11 +414,15 @@ fn pins(root: &Path, tally: &mut Tally) -> Result<(), String> {
                 index,
                 pattern,
                 points,
+                line,
             } => match answer(&bodies, index) {
                 Ok(body) => {
                     let mut listed = releases(&body, pattern);
                     if *points {
                         listed = point_releases(listed);
+                    }
+                    if let Some(line) = line {
+                        listed = on_line(listed, line);
                     }
                     let (status, verdict) = judge(version, &listed);
                     if status == Status::Failed {
@@ -805,6 +834,22 @@ mod tests {
     }
 
     #[test]
+    fn a_line_watch_follows_one_major_alone() {
+        let listing = r#"<a href="v17.11/">v17.11/</a>
+<a href="v17.12/">v17.12/</a>
+<a href="v170.1/">v170.1/</a>
+<a href="v18.7/">v18.7/</a>
+<a href="v19.0/">v19.0/</a>
+<a href="v19beta1/">v19beta1/</a>"#;
+        let every = releases(listing, "v{}/");
+        assert_eq!(judge("17.12", &every).1, "-> 170.1");
+        let listed = on_line(every, "17");
+        assert_eq!(listed, s(&["17.11", "17.11", "17.12", "17.12"]));
+        assert_eq!(judge("17.12", &listed).0, Status::Current);
+        assert_eq!(judge("17.11", &listed).1, "-> 17.12");
+    }
+
+    #[test]
     fn a_yanked_or_preview_crate_version_is_no_release() {
         let index = concat!(
             r#"{"name":"fd-find","vers":"10.4.0","yanked":false}"#,
@@ -950,7 +995,8 @@ mod tests {
     #[test]
     fn watch_rows_parse_and_refuse_a_malformed_line() {
         let text = "k\t1.0\tindex\thttps://x/\tk-{}.tar.xz\n\
-                    p\t7.2.1\tpoints\thttps://y/\tl-{}.tar.xz\nh\t2\theld\tbecause\n";
+                    p\t7.2.1\tpoints\thttps://y/\tl-{}.tar.xz\n\
+                    m\t17.12\tline\t17\thttps://z/\tv{}/\nh\t2\theld\tbecause\n";
         let rows = parse_watches(text).unwrap();
         assert_eq!(
             rows.iter().map(|(_, _, w)| w).collect::<Vec<_>>(),
@@ -958,17 +1004,26 @@ mod tests {
                 &Watch::Index {
                     index: "https://x/".into(),
                     pattern: "k-{}.tar.xz".into(),
-                    points: false
+                    points: false,
+                    line: None,
                 },
                 &Watch::Index {
                     index: "https://y/".into(),
                     pattern: "l-{}.tar.xz".into(),
-                    points: true
+                    points: true,
+                    line: None,
+                },
+                &Watch::Index {
+                    index: "https://z/".into(),
+                    pattern: "v{}/".into(),
+                    points: false,
+                    line: Some("17".into()),
                 },
                 &Watch::Held("because".into()),
             ]
         );
         assert!(parse_watches("k\t1.0\tsomething\n").is_err());
+        assert!(parse_watches("m\t17.12\tline\t\thttps://z/\tv{}/\n").is_err());
     }
 
     #[test]

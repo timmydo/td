@@ -763,37 +763,105 @@ pub fn build_root_link_map_check(
     inputs: &[&str],
     libc: LinkedLibc,
 ) -> Step {
-    let libc = libc.file();
-    let allowed: String = inputs
-        .iter()
-        .map(|input| format!(" \"$(realpath -m '{{in:{input}}}')\""))
-        .collect();
+    let assertions = link_map_assertions(&format!("'{map}'"), &format!("'{output}'"), inputs, libc);
+    Step::run(
+        dir,
+        &[BUILD_ROOT_SH, "-c", &format!("set -e; {assertions}")],
+    )
+    .env("PATH", BUILD_ROOT_PATH)
+}
+
+/// `build_root_link_map_check` over every map a `build_root_link_map_cc`
+/// build wrote into `maps`: each, read from the directory its link ran in,
+/// must record the link of the output its name ends in and pass the same
+/// assertions, and there must be at least `at_least` of them.
+pub fn build_root_link_maps_check(
+    dir: &str,
+    maps: &str,
+    at_least: usize,
+    inputs: &[&str],
+    libc: LinkedLibc,
+) -> Step {
+    let assertions = link_map_assertions("\"$1\"", "\"$want\"", inputs, libc);
     Step::run(
         dir,
         &[
             BUILD_ROOT_SH,
             "-c",
             &format!(
-                "set -e; m='{map}'; fail() {{ echo \"link map $m: $*\" >&2; exit 1; }}; \
-                 [ -s \"$m\" ] || fail 'missing'; \
-                 outs=$(grep -c '^OUTPUT(' \"$m\" || true); [ \"$outs\" = 1 ] || fail \"records $outs outputs\"; \
-                 o=$(sed -n 's/^OUTPUT(\\([^ ]*\\) .*/\\1/p' \"$m\"); [ \"${{o##*/}}\" = '{output}' ] || fail \"is the link of $o\"; \
-                 set -- \"$(realpath -m '{{root}}')\" \"$(realpath -m '{{src}}')\"{allowed}; \
-                 rt=$(realpath -m '{{in:gcc-runtime}}/lib'); sys=$(realpath -m '{{root}}/sysroot/lib'); \
-                 gcc=0; libc=0; \
-                 while IFS= read -r line; do \
-                 case $line in 'LOAD '*) f=${{line#LOAD }};; *) continue;; esac; \
-                 [ \"$f\" = 'linker stubs' ] && continue; r=$(realpath -m \"$f\"); ok=0; \
-                 for a in \"$@\"; do [ -n \"$a\" ] || continue; case $r in \"$a\"/*) ok=1;; esac; done; \
-                 [ $ok = 1 ] || fail \"loaded $f from outside the build and its inputs\"; \
-                 [ \"$r\" = \"$rt/libgcc.a\" ] && gcc=1; [ \"$r\" = \"$sys/{libc}\" ] && libc=1; \
-                 done < \"$m\"; \
-                 [ $gcc = 1 ] || fail \"did not load gcc-runtime's libgcc.a\"; \
-                 [ $libc = 1 ] || fail \"did not load td glibc's {libc}\""
+                "set -e; check() {{ want=$2; cd \"$3\"; {assertions}; }}; n=0; \
+                 for map in '{maps}'/*.map; do [ -e \"$map\" ] || continue; \
+                 name=${{map##*/}}; name=${{name%.map}}; \
+                 at=$(cat \"${{map%.map}}.dir\") || {{ echo \"$map: no link directory\" >&2; exit 1; }}; \
+                 check \"$map\" \"${{name##*+}}\" \"$at\"; n=$((n+1)); done; \
+                 [ $n -ge {at_least} ] || {{ echo \"{maps}: $n link maps, expected at least {at_least}\" >&2; exit 1; }}; \
+                 echo \"$n link maps checked\""
             ),
         ],
     )
     .env("PATH", BUILD_ROOT_PATH)
+}
+
+/// A front for `build_root_dynamic_cc`'s `{root}/wb/cc` in a build of many
+/// links: `{root}/wb/map-cc` gives each link (no `-c`, `-S`, `-E`, `-M` or
+/// `-MM`; `-o OUTPUT` or `-oOUTPUT`, and a link without either is refused)
+/// its own `TD_LINK_MAP` in `$TD_LINK_MAPS`, named for
+/// OUTPUT's path below `{src}` with each `/` spelled `+` (ld puts the
+/// output's name in place of a `%`), and records beside it the directory
+/// the link ran in, which the map's relative paths resolve against.
+/// Everything else passes through, and without `TD_LINK_MAPS`, as in
+/// configure's probes, no link writes a map. `build_root_link_maps_check`
+/// reads them.
+pub fn build_root_link_map_cc() -> Step {
+    Step::WriteFile {
+        path: "{root}/wb/map-cc".into(),
+        content: format!(
+            "#!{BUILD_ROOT_SH}\n\
+             link=1; out=; prev=\n\
+             for a in \"$@\"; do\n\
+             case $a in -c|-S|-E|-M|-MM) link=0;; -o?*) out=${{a#-o}};; esac\n\
+             [ \"$prev\" = -o ] && out=$a\n\
+             prev=$a\n\
+             done\n\
+             if [ $link = 1 ] && [ -n \"$TD_LINK_MAPS\" ]; then\n\
+             [ -n \"$out\" ] || {{ echo \"map-cc: a link without -o would write no map: $*\" >&2; exit 1; }}\n\
+             src=$(/usr/bin/realpath -m '{{src}}')/; name=$(/usr/bin/realpath -m -- \"$out\"); name=${{name#\"$src\"}}\n\
+             name=\"$TD_LINK_MAPS/${{name//\\//+}}\"\n\
+             pwd > \"$name.dir\" || exit 1\n\
+             export TD_LINK_MAP=\"$name.map\"\n\
+             fi\n\
+             exec {{root}}/wb/cc \"$@\"\n"
+        ),
+        exec: true,
+    }
+}
+
+/// What both map checks assert of one map: `map` and `output` are shell
+/// words naming the map and the file name of the output it must record.
+fn link_map_assertions(map: &str, output: &str, inputs: &[&str], libc: LinkedLibc) -> String {
+    let libc = libc.file();
+    let allowed: String = inputs
+        .iter()
+        .map(|input| format!(" \"$(realpath -m '{{in:{input}}}')\""))
+        .collect();
+    format!(
+        "m={map}; fail() {{ echo \"link map $m: $*\" >&2; exit 1; }}; \
+         [ -s \"$m\" ] || fail 'missing'; \
+         outs=$(grep -c '^OUTPUT(' \"$m\" || true); [ \"$outs\" = 1 ] || fail \"records $outs outputs\"; \
+         o=$(sed -n 's/^OUTPUT(\\([^ ]*\\) .*/\\1/p' \"$m\"); [ \"${{o##*/}}\" = {output} ] || fail \"is the link of $o\"; \
+         set -- \"$(realpath -m '{{root}}')\" \"$(realpath -m '{{src}}')\"{allowed}; \
+         rt=$(realpath -m '{{in:gcc-runtime}}/lib'); sys=$(realpath -m '{{root}}/sysroot/lib'); \
+         gcc=0; libc=0; \
+         while IFS= read -r line; do \
+         case $line in 'LOAD '*) f=${{line#LOAD }};; *) continue;; esac; \
+         [ \"$f\" = 'linker stubs' ] && continue; r=$(realpath -m \"$f\"); ok=0; \
+         for a in \"$@\"; do [ -n \"$a\" ] || continue; case $r in \"$a\"/*) ok=1;; esac; done; \
+         [ $ok = 1 ] || fail \"loaded $f from outside the build and its inputs\"; \
+         [ \"$r\" = \"$rt/libgcc.a\" ] && gcc=1; [ \"$r\" = \"$sys/{libc}\" ] && libc=1; \
+         done < \"$m\"; \
+         [ $gcc = 1 ] || fail \"did not load gcc-runtime's libgcc.a\"; \
+         [ $libc = 1 ] || fail \"did not load td glibc's {libc}\""
+    )
 }
 
 /// The line the bootable-kernel rung's `/init` prints on ttyS0 AFTER it mounts the
@@ -1787,6 +1855,164 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The wrapper names each link's map for its output below `{src}` and
+    /// records where it ran; a compile, or a build without `TD_LINK_MAPS`,
+    /// gets no map. The check then reads every map from its own link
+    /// directory, so relative inputs resolve, and refuses a map without
+    /// that record, one of another output's link, a bad input, and too few.
+    #[test]
+    fn every_link_map_of_a_build_is_named_for_its_output_and_checked_where_it_ran() {
+        let tmp = crate::test_temp::TempDir::new("td-link-maps").unwrap();
+        let base = tmp.path().to_string_lossy().into_owned();
+        let (root, src, store) = (
+            format!("{base}/root"),
+            format!("{base}/root/src"),
+            format!("{base}/store"),
+        );
+        let maps = format!("{root}/maps");
+        for dir in [
+            &format!("{src}/a/b"),
+            &format!("{src}/lib"),
+            &format!("{root}/wb"),
+            &format!("{root}/sysroot/lib"),
+            &maps,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let expand = |text: &str| {
+            text.replace("{root}", &root)
+                .replace("{src}", &src)
+                .replace("{in:gcc-runtime}", &format!("{store}/gcc-runtime"))
+        };
+        // The wrapper as the root runs it, but for where this host keeps
+        // realpath and bash, in front of a `cc` that says what it was given.
+        let Step::WriteFile { content, .. } = super::build_root_link_map_cc() else {
+            panic!("the wrapper is a written file");
+        };
+        let wrapper = format!("{root}/wb/map-cc");
+        std::fs::write(
+            &wrapper,
+            expand(&content)
+                .replace("/usr/bin/realpath", "realpath")
+                .replace(super::BUILD_ROOT_SH, "/bin/sh"),
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{root}/wb/cc"),
+            "#!/bin/sh\nprintf '%s' \"$TD_LINK_MAP\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                format!("{root}/wb/cc"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let cc = |args: &[&str], with_maps: bool| {
+            let mut command = std::process::Command::new("bash");
+            command
+                .arg(&wrapper)
+                .args(args)
+                .current_dir(format!("{src}/a/b"));
+            if with_maps {
+                command.env("TD_LINK_MAPS", &maps);
+            } else {
+                command.env_remove("TD_LINK_MAPS");
+            }
+            let run = command.output().unwrap();
+            assert!(run.status.success(), "{args:?}");
+            String::from_utf8(run.stdout).unwrap()
+        };
+        assert_eq!(cc(&["-c", "-o", "x.o", "x.c"], true), "");
+        assert_eq!(cc(&["x.o", "-o", "../prog"], false), "");
+        assert_eq!(
+            cc(&["x.o", "-o", "../prog"], true),
+            format!("{maps}/a+prog.map")
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{maps}/a+prog.dir")).unwrap(),
+            format!("{src}/a/b\n")
+        );
+        assert_eq!(
+            cc(&["-shared", "-o", "libm.so", "m.o"], true),
+            format!("{maps}/a+b+libm.so.map")
+        );
+        assert_eq!(cc(&["-S", "-o", "x.s", "x.c"], true), "");
+        assert_eq!(cc(&["-E", "x.c"], true), "");
+        assert_eq!(
+            cc(&["x.o", "-ojoined"], true),
+            format!("{maps}/a+b+joined.map")
+        );
+        // A link the wrapper cannot name is refused, not left unmapped.
+        assert_eq!(cc(&["x.o"], false), "");
+        let unnamed = std::process::Command::new("bash")
+            .arg(&wrapper)
+            .arg("x.o")
+            .env("TD_LINK_MAPS", &maps)
+            .current_dir(format!("{src}/a/b"))
+            .output()
+            .unwrap();
+        assert!(!unnamed.status.success());
+        assert!(String::from_utf8_lossy(&unnamed.stderr).contains("a link without -o"));
+
+        let map = |output: &str, extra: &str| {
+            format!(
+                "OUTPUT({output} elf64-x86-64)\nLOAD {store}/gcc-runtime/lib/libgcc.a\n\
+                 LOAD {root}/sysroot/lib/libc.so.6\nLOAD ../../lib/libpgport.a\nLOAD x.o\n{extra}"
+            )
+        };
+        let Step::Run { argv, .. } = super::build_root_link_maps_check(
+            "{src}",
+            "{root}/maps",
+            2,
+            &["gcc-runtime"],
+            super::LinkedLibc::Shared,
+        ) else {
+            panic!("the maps check is a run step");
+        };
+        let script = expand(&argv[2]);
+        let check = || {
+            let run = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+            (
+                run.status.success(),
+                String::from_utf8_lossy(&run.stderr).into_owned(),
+            )
+        };
+        std::fs::write(format!("{maps}/a+prog.map"), map("../prog", "")).unwrap();
+        std::fs::write(format!("{maps}/a+b+libm.so.map"), map("libm.so", "")).unwrap();
+        let (passed, stderr) = check();
+        assert!(passed, "{stderr}");
+        for (name, map, refusal) in [
+            (
+                "a+b+libm.so",
+                map("libm.so", "LOAD ../../../../x.a\n"),
+                "from outside the build",
+            ),
+            ("a+b+libm.so", map("libn.so", ""), "is the link of libn.so"),
+        ] {
+            std::fs::write(format!("{maps}/{name}.map"), map).unwrap();
+            let (passed, stderr) = check();
+            assert!(!passed && stderr.contains(refusal), "{refusal}: {stderr}");
+        }
+        std::fs::write(format!("{maps}/a+b+libm.so.map"), map("libm.so", "")).unwrap();
+        std::fs::remove_file(format!("{maps}/a+b+libm.so.dir")).unwrap();
+        let (passed, stderr) = check();
+        assert!(!passed && stderr.contains("no link directory"), "{stderr}");
+        std::fs::remove_file(format!("{maps}/a+b+libm.so.map")).unwrap();
+        let (passed, stderr) = check();
+        assert!(
+            !passed && stderr.contains("1 link maps, expected at least 2"),
+            "{stderr}"
+        );
     }
     use crate::catalog;
     use crate::types::{Recipe, Step};

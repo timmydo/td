@@ -214,6 +214,11 @@ fn print_source_watches() {
             Watch::PointReleases { index, pattern } => {
                 println!("{key}\t{version}\tpoints\t{index}\t{pattern}")
             }
+            Watch::Line {
+                index,
+                pattern,
+                line,
+            } => println!("{key}\t{version}\tline\t{line}\t{index}\t{pattern}"),
             Watch::Held(reason) => println!("{key}\t{version}\theld\t{reason}"),
         }
     }
@@ -702,7 +707,7 @@ mod tests {
         let pins = td_recipe::source_pins::all();
         // source_pins::tests::catalog_carries_all_legacy_source_locks names
         // each of them.
-        assert_eq!(pins.len(), 142);
+        assert_eq!(pins.len(), 143);
         assert!(pins.iter().all(|pin| pin.key != "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));

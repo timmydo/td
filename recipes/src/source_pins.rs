@@ -1183,6 +1183,18 @@ const PINS: &[PinDef] = &[
         version: "10.6p2",
     },
     PinDef {
+        key: "postgresql-x86-64-source",
+        aliases: &[],
+        // PostgreSQL 17.12, of the major td's mail server qualifies. The recipe
+        // builds the server, its client programs and contrib's pg_trgm, with
+        // td zlib and without TLS, ICU, readline or a procedural language
+        // beyond PL/pgSQL.
+        url: "https://ftp.postgresql.org/pub/source/v17.12/postgresql-17.12.tar.gz",
+        sha256: "b46f61048797e9cf1728dd4ac459831f5126c4745581f729500541c86e59a8ac",
+        file: "postgresql-17.12.tar.gz",
+        version: "17.12",
+    },
+    PinDef {
         key: "ripgrep-seed-source",
         aliases: &[],
         // The upstream x86-64 musl release is a static PIE and is admitted only
@@ -1505,7 +1517,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        assert_eq!(all().len(), 142);
+        assert_eq!(all().len(), 143);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

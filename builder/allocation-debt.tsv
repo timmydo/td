@@ -338,7 +338,7 @@ net/src/feed.rs	unchecked-growth-or-clone	33
 net/src/feed/debian.rs	allocating-conversion	35
 net/src/feed/debian.rs	allocation-macro	52
 net/src/feed/debian.rs	unchecked-growth-or-clone	38
-net/src/feed/outdated.rs	allocating-conversion	30
+net/src/feed/outdated.rs	allocating-conversion	34
 net/src/feed/outdated.rs	allocation-macro	25
 net/src/feed/outdated.rs	unchecked-growth-or-clone	14
 net/src/feed/vendor.rs	allocating-conversion	42
@@ -634,6 +634,14 @@ recipes/src/recipes/noto-fonts.rs	unchecked-growth-or-clone	4
 recipes/src/recipes/openssh-x86-64.rs	allocating-conversion	2
 recipes/src/recipes/openssh-x86-64.rs	allocation-macro	6
 recipes/src/recipes/openssh-x86-64.rs	unchecked-growth-or-clone	12
+recipes/src/recipes/postgresql-x86-64-test.rs	allocating-conversion	2
+recipes/src/recipes/postgresql-x86-64-test.rs	allocation-macro	13
+recipes/src/recipes/postgresql-x86-64-test.rs	heap-owner	1
+recipes/src/recipes/postgresql-x86-64-test.rs	unchecked-growth-or-clone	4
+recipes/src/recipes/postgresql-x86-64.rs	allocating-conversion	3
+recipes/src/recipes/postgresql-x86-64.rs	allocation-macro	11
+recipes/src/recipes/postgresql-x86-64.rs	heap-owner	2
+recipes/src/recipes/postgresql-x86-64.rs	unchecked-growth-or-clone	22
 recipes/src/recipes/ripgrep-seed.rs	allocation-macro	7
 recipes/src/recipes/rust-toolchain-test.rs	allocating-conversion	5
 recipes/src/recipes/rust-toolchain-test.rs	allocation-macro	3
@@ -763,7 +771,7 @@ recipes/src/recipes/zlib-x86-64.rs	allocation-macro	10
 recipes/src/recipes/zlib-x86-64.rs	unchecked-growth-or-clone	13
 recipes/src/shared.rs	allocating-constructor	1
 recipes/src/shared.rs	allocating-conversion	26
-recipes/src/shared.rs	allocation-macro	35
+recipes/src/shared.rs	allocation-macro	40
 recipes/src/shared.rs	heap-owner	1
 recipes/src/shared.rs	unchecked-growth-or-clone	16
 recipes/src/source_closure.rs	allocating-conversion	14

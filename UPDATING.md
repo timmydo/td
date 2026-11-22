@@ -101,10 +101,12 @@ Each watch is a row in `recipes/src/source_watches.rs`: an index URL and a
 pattern in which `{}` stands for the version. A `PointReleases` watch (the
 kernel) takes only versions of three or more parts. A fresh line such as
 7.3 therefore waits for 7.3.1, as td follows the newest stable point
-release. A version whose release part contains `alpha`, `beta`, `rc`,
-`pre` or `dev`, or carries a `-TAG` pre-release, is never taken. `+build`
-metadata is ignored. `td-recipe-eval source-watches` prints the joined
-table.
+release. A `Line` watch (PostgreSQL) takes only one release line's
+versions: td-mta qualifies PostgreSQL 17, so a new major moves td-mta, and
+then this watch's line, before it moves the pin. A version whose release
+part contains `alpha`, `beta`, `rc`, `pre` or `dev`, or carries a `-TAG`
+pre-release, is never taken. `+build` metadata is ignored.
+`td-recipe-eval source-watches` prints the joined table.
 
 Before bumping, read the release notes and advisories between the pin and
 the target: what changed, what it fixes, and whether a fix reaches td's
@@ -134,6 +136,7 @@ and its licences, Noto's eight faces and their licence), per commit.
    | curl's CA extract | `cacert-DATE.pem.sha256` beside the file |
    | OpenSSH (test-only: td-ssh-test's peer, in no image) | the release notes, `txt/release-X.Y`, in base64 |
    | zlib | zlib.net's release line, and the GitHub release asset's digest |
+   | PostgreSQL | `postgresql-X.Y.tar.gz.sha256` beside the tarball in `ftp.postgresql.org/pub/source/vX.Y/` |
    | crates.io | the version's `cksum` in the sparse index |
    | Rust | `xz_hash` in that date's `channel-rust-stable.toml` |
    | GitHub release assets (Nerd Fonts, the ripgrep seed) | the asset's digest |
