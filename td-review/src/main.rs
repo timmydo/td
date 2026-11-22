@@ -6,6 +6,7 @@
 //! the worktrees of branches that have fully landed. The non-interactive modes
 //! exist for scripting and for the integration test.
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 mod app;
 mod chooser;
@@ -171,22 +172,27 @@ fn parse_args() -> Result<Option<Args>, String> {
 }
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            print!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        Err(e) => {
-            eprintln!("td-review: {e}\n\n{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
-    match run(args) {
+    match start() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("td-review: {e}");
+            let _ = writeln!(io::stderr().lock(), "td-review: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn start() -> io::Result<ExitCode> {
+    match parse_args() {
+        Ok(Some(args)) => run(args),
+        Ok(None) => {
+            let mut out = io::stdout().lock();
+            out.write_all(USAGE.as_bytes())?;
+            out.flush()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr().lock(), "td-review: {e}\n\n{USAGE}");
+            Ok(ExitCode::from(2))
         }
     }
 }
@@ -417,13 +423,15 @@ fn delete_headless(
         Some(_) => None,
         None => named.map(|n| vec![n.to_string()]),
     };
+    let mut out = io::stdout().lock();
     let (targets, diverged) = land::delete_plan(git, short, only.as_deref(), landed_oid)?;
     for d in &diverged {
-        println!(
+        writeln!(
+            out,
             "{}/{} is not the landed commit — left alone",
             scrub(&d.remote),
             scrub(short)
-        );
+        )?;
     }
     let targets = match landed {
         Some((_, reached)) => {
@@ -431,12 +439,13 @@ fn delete_headless(
                 .into_iter()
                 .partition(|t| !reached.contains(&t.remote));
             for t in &theirs {
-                println!(
+                writeln!(
+                    out,
                     "{}/{} kept: the push did not reach {}",
                     scrub(&t.remote),
                     scrub(short),
                     scrub(&t.remote)
-                );
+                )?;
             }
             mine
         }
@@ -444,7 +453,14 @@ fn delete_headless(
     };
     let deleted = land::delete_branch(git, base, short, &targets)?;
     for line in &deleted.log {
-        println!("{}", scrub(&line.text));
+        if let Err(e) = writeln!(out, "{}", scrub(&line.text)) {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "td-review: deletion completed on {} remote(s) before output failed",
+                deleted.count()
+            );
+            return Err(e);
+        }
     }
     if !deleted.all_ok {
         return Ok(ExitCode::FAILURE);
@@ -453,15 +469,20 @@ fn delete_headless(
         // After a landing, nothing to delete means the oid filter did its job.
         // Only a hand-typed --delete that matched nothing is a failure.
         if landed_oid.is_none() {
-            eprintln!("td-review: no pushable remote carries '{}'", scrub(short));
+            let _ = writeln!(
+                io::stderr().lock(),
+                "td-review: no pushable remote carries '{}'",
+                scrub(short)
+            );
             return Ok(ExitCode::FAILURE);
         }
         // Not "no pushable remote": one that sat the push-all out is pushable
         // and was simply never asked, and it is named above as kept.
-        println!(
+        writeln!(
+            out,
             "no remote this push reached carries the landed {}",
             scrub(short)
-        );
+        )?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -491,22 +512,39 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
         args.expect.as_deref(),
         args.expect_base.as_deref(),
     )?;
-    for line in &landing.log {
-        println!("{}", scrub(&line.text));
-    }
-    match &landing.outcome {
-        Outcome::Committed { .. } => {}
+    let mut out = io::stdout().lock();
+    let log = landing
+        .log
+        .iter()
+        .try_for_each(|line| writeln!(out, "{}", scrub(&line.text)));
+    let status = match &landing.outcome {
+        Outcome::Committed { sha } => {
+            if log.is_err() {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "td-review: landed {} locally on {} before output failed",
+                    scrub(sha),
+                    scrub(base)
+                );
+            }
+            ExitCode::SUCCESS
+        }
         Outcome::Conflict => {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr().lock(),
                 "td-review: conflicts left in the work tree — resolve or `git reset --hard HEAD`"
             );
-            return Ok(ExitCode::FAILURE);
+            ExitCode::FAILURE
         }
-        Outcome::Nothing => return Ok(ExitCode::FAILURE),
+        Outcome::Nothing => ExitCode::FAILURE,
         Outcome::Blocked(why) | Outcome::Failed(why) => {
-            eprintln!("td-review: {}", scrub_lines(why));
-            return Ok(ExitCode::FAILURE);
+            let _ = writeln!(io::stderr().lock(), "td-review: {}", scrub_lines(why));
+            ExitCode::FAILURE
         }
+    };
+    log?;
+    if status != ExitCode::SUCCESS {
+        return Ok(status);
     }
     if args.push {
         let Outcome::Committed { sha } = &landing.outcome else {
@@ -517,20 +555,27 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
             left_out,
         } = land::push_all_targets(git)?;
         for (name, why) in &left_out {
-            println!("{}", scrub(&why.line(name)));
+            writeln!(out, "{}", scrub(&why.line(name)))?;
         }
         // A push publishes every local commit on the base, not only the one
         // just landed; name them rather than let them ride along unannounced.
         let unpushed = git.unpushed(base)?;
         if unpushed.len() > 1 {
-            println!("publishing {} commits on {base}:", unpushed.len());
+            writeln!(out, "publishing {} commits on {base}:", unpushed.len())?;
             for c in &unpushed {
-                println!("  {}", scrub(c));
+                writeln!(out, "  {}", scrub(c))?;
             }
         }
         let pushed = land::push_all(git, base, sha, &remotes)?;
         for line in &pushed.log {
-            println!("{}", scrub(&line.text));
+            if let Err(e) = writeln!(out, "{}", scrub(&line.text)) {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "td-review: push finished, {} remote(s) reached before output failed",
+                    pushed.count()
+                );
+                return Err(e);
+            }
         }
         if !pushed.all_ok {
             return Ok(ExitCode::FAILURE);
@@ -544,7 +589,10 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
             } else {
                 "no remote was eligible"
             };
-            eprintln!("td-review: {why} — the commit was not published");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "td-review: {why} — the commit was not published"
+            );
             return Ok(ExitCode::FAILURE);
         }
         // Only ever after a verified publish: the branch is the sole copy of
@@ -555,7 +603,7 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
             // A rolling branch survives its landings by definition; sweeping it
             // would delete the branch the agent is still working on.
             if git::is_rolling(short) {
-                println!("{} is a rolling branch — kept", scrub(short));
+                writeln!(out, "{} is a rolling branch — kept", scrub(short))?;
                 return Ok(ExitCode::SUCCESS);
             }
             // A failed cleanup is not a failed landing: the work is published.
@@ -563,8 +611,15 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
             let landed = landed_oid
                 .as_deref()
                 .map(|oid| (oid, pushed.reached.as_slice()));
-            if delete_headless(git, base, branch, true, landed)? != ExitCode::SUCCESS {
-                eprintln!("td-review: landed and published, but the branch delete failed");
+            let cleanup = delete_headless(git, base, branch, true, landed);
+            if let Err(e) = &cleanup {
+                let _ = writeln!(io::stderr().lock(), "td-review: branch cleanup: {e}");
+            }
+            if !matches!(cleanup, Ok(code) if code == ExitCode::SUCCESS) {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "td-review: landed and published, with a branch cleanup error"
+                );
                 return Ok(ExitCode::from(3));
             }
         }
@@ -642,7 +697,8 @@ fn show(Opened { app, repo }: Opened) -> io::Result<()> {
     // that.
     if let Some(file) = saved::file() {
         if let Err(e) = saved::record(&file, &repo) {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr().lock(),
                 "td-review: saving {}: {}",
                 scrub(&file.display().to_string()),
                 scrub(&e.to_string())

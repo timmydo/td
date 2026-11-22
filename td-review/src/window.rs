@@ -37,7 +37,7 @@
 //! confirmation is left up rather than answered.
 
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Write};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -1048,7 +1048,11 @@ impl Handler for Session {
     }
 
     fn notice(&mut self, message: &str) {
-        eprintln!("td-review: window: {}", view::scrub(message));
+        let _ = writeln!(
+            io::stderr().lock(),
+            "td-review: window: {}",
+            view::scrub(message)
+        );
     }
 
     fn keys(&self) -> Vec<td_ui::keys::Section> {

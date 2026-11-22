@@ -3486,3 +3486,34 @@ fn preview_uses_reviewed_attributes_even_when_main_has_none() -> Res<()> {
     }
     Ok(())
 }
+
+#[test]
+fn help_reports_full_output_as_a_command_failure() -> Res<()> {
+    let full = fs::OpenOptions::new().write(true).open("/dev/full")?;
+    let result = Command::new(BIN).arg("--help").stdout(full).output()?;
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("os error 28"));
+    Ok(())
+}
+
+#[test]
+fn failed_deletion_output_reports_the_refs_already_removed() -> Res<()> {
+    let s = scenario("delete-output")?;
+    publish_branch_everywhere(&s)?;
+    let full = fs::OpenOptions::new().write(true).open("/dev/full")?;
+    let result = Command::new(BIN)
+        .envs(CLEAN_ENV)
+        .arg("--repo")
+        .arg(&s.work)
+        .args(["--delete", "work-0001-feature", "--yes"])
+        .stdout(full)
+        .output()?;
+    assert_eq!(result.status.code(), Some(1));
+    let diagnostic = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        diagnostic.contains("deletion completed on 2 remote(s)"),
+        "{diagnostic}"
+    );
+    assert!(!remote_has_branch(&s.origin)? && !remote_has_branch(&s.backup)?);
+    Ok(())
+}

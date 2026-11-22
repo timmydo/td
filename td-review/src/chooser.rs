@@ -13,7 +13,7 @@
 //! discovery to that folder.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -728,7 +728,11 @@ impl<T> Handler for Window<T> {
     }
 
     fn notice(&mut self, message: &str) {
-        eprintln!("td-review: window: {}", view::scrub(message));
+        let _ = writeln!(
+            io::stderr().lock(),
+            "td-review: window: {}",
+            view::scrub(message)
+        );
     }
 }
 
