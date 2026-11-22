@@ -2347,7 +2347,7 @@ dependency.
 
 PostgreSQL transaction adapters own authorization, logical account quotas,
 publication, receipts and uncertain-outcome settlement. POSTGRES.md specifies
-implemented operations and remaining runtime integration. Local response-file
+them. Local response-file
 retention is documented in STORAGE.md and ADMISSION.md.
 
 ## M09 — Bounded DNS and outbound HTTPS transport
@@ -2453,14 +2453,9 @@ completion slots, queued deadlines and observable readiness/shutdown/failure.
 Local fixtures cover durable plaintext and TLS receiving beside an idle
 peer, overload, failed TLS slot reuse and worker failure. The runtime
 retains one static configuration and checks Inbox and exact TLS bindings
-before readiness. Offline `store init` now creates a new store whose
-schema transaction also commits one account and its canonical Inbox, the
-store the runtime's startup Inbox check requires; process fixtures verify
-and reopen it. `serve --smtp-only` activated this path with protected
-configuration, initialized storage and a separate ingress child; its
-process fixture verified accepted-mail survival after killing another
-DATA transfer, and it enabled no HTTPS or gateway serving. `serve` with a
-receive role (CONFIG.md, "Foreground PostgreSQL service") replaced it.
+before readiness. `serve` with a receive role (CONFIG.md, "Foreground
+PostgreSQL service") serves this path; `postgres account-init` creates the
+account and canonical Inbox its startup check requires.
 Graceful operational control and the complete release fault matrix remain
 separate.
 
@@ -2781,13 +2776,10 @@ inspection/operations, storage layout/record/change inspection and raw export,
 device creation/revocation, doctor, redacted config and
 atomic reload. Add size-based log rotation, suppression counters and fallback
 diagnostics. Ensure a restart-required change does not partly apply.
-M20 owns verify/repair/backup/restore; M21 owns migrate. Those commands remain
-unavailable until their owning increment lands; M19 supplies shared CLI wiring.
-The standalone offline `config check`, `store init`, `store verify`,
-database `backup` and `restore` commands have landed independently and
-require no serving runtime or control socket. STORAGE.md specifies
-`store init`; M11 records why it exists. CONFIG.md specifies
-`config check`.
+M20 owns database audit and maintenance and M21 owns `migration`; M19
+supplies shared CLI wiring. Backup and restore use PostgreSQL tooling, and
+the local `config check`, `store init`, `store verify`, `backup` and
+`restore` commands are removed (CONFIG.md, STORAGE.md, DEPLOYMENT.md).
 
 **Acceptance:** unauthorized socket access fails by filesystem policy; stale
 IDs and concurrent controls cannot duplicate delivery. Health reports disk,
@@ -2798,14 +2790,15 @@ or memory without bound. No public administrative API or shell hooks.
 ## M20 — PostgreSQL operations
 
 Use PostgreSQL backup and restore facilities. Database audit and maintenance
-commands are described in POSTGRES.md; they are not prerequisites for a
-production migration of the removed unused backend. Do not add more audit
-commands as a substitute for completing mail serving and relay integration.
+commands are described in POSTGRES.md, chapter 17. Do not add audit
+commands as a substitute for mail-serving work.
 
-## M21 — Stalwart 0.15.2 export/import and cutover runbook
+## M21 — Stalwart 0.15.2 export/import and cutover
 
-**Depends on:** M09/M14/M20. **Own:** migration CLI, archive schema and operator
-runbook; use the shared store transaction API and bounded HTTPS transport.
+**Depends on:** M09/M14/M20. **Own:** migration CLI and archive schema
+(MIGRATION.md) and the documented procedures for the retained source and
+rollback (PRODUCTION.md); use the shared store transaction API and bounded
+HTTPS transport.
 
 Paginate JMAP folders/emails, download raw blobs, build a digest/count manifest,
 and import under stable source-object mappings. Preserve hierarchy, memberships,
@@ -2891,7 +2884,7 @@ protocol worker, service identity, startup/renewal/restart behavior and limits.
 Provide systemd and td-svc examples only after reading their normative contracts;
 the executable cannot require either supervisor. Include direct/gateway DNS,
 Migadu identity/auth configuration, local test instructions and the migration
-runbook. td image recipe/integration is a separate future change.
+procedures (MIGRATION.md, PRODUCTION.md). td image recipe/integration is a separate future change.
 
 **Acceptance:** the exact installed executable passes ELF static-link checks
 and runs on a clean non-td Linux fixture with no td helper installed. It loads
@@ -2908,7 +2901,7 @@ libraries. The build supervisor's init remains PID 1 in that namespace.
 The portable build also retains and verifies a stripped receiver and its
 matching debug companion in one artifact. DEPLOYMENT.md documents the manual
 installation layout, dedicated identity and file provisioning, startup/control,
-certificate replacement, and stopped-store backup/restore. The process suite
+certificate replacement, and PostgreSQL backup and restore. The process suite
 runs the stripped executable. This qualifies the receiving-only artifact;
 end-to-end supervisor qualification, aarch64 and full v1 acceptance remain
 separate work. It does not mark M24 or the full M25 release complete.
