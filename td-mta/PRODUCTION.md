@@ -48,6 +48,22 @@ Five processes use the selected MTA executable:
 - `td-mta-migadu.service`: production outbound relay profile.
 - `td-mta-acme-production.service`: certificate issuance/renewal for all three MX names.
 
+On claw1 the selected frontend profile sets `event_streams = 4` in
+`[limits]`. Push can occupy four of the eight HTTPS connections. Each graphical
+td-mail process opens one stream per eligible watched account, up to two
+streams per process. Change this host setting through the versioned
+[configuration selection procedure](POSTGRES.md#198-explicit-selection-request-preparation-and-settlement-commands).
+To roll back, select the retained previous version against the current
+generation and verify each profile is ready.
+
+If this frontend returns HTTP 429 for a valid EventSource URL and
+credentials, compare its `http_auth_refused` counters in
+`performance-status` before and after the request. Unchanged, unsaturated
+`calls` and `lost` in the same process identify the stream ceiling as the
+cause. An increase in `calls` means the frontend refused at least one
+pre-authentication attempt during the interval. That attempt could belong
+to another client. Lost observations leave the cause uncertain.
+
 The inbound SMTP listener permits eight simultaneous sessions. The SMTP session
 and DATA limits share a peer key: an IPv4 address (including IPv4-mapped
 addresses) or an IPv6 /64. DATA admission has its own fixed limits of four
