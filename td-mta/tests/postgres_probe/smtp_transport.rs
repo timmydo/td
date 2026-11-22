@@ -177,7 +177,7 @@ impl<J: Job> Job for ObservedJob<J> {
     }
 }
 
-trait Duplex: Read + Write + Send {}
+pub(super) trait Duplex: Read + Write + Send {}
 impl<T: Read + Write + Send> Duplex for T {}
 pub(super) struct TlsDriver(TlsIo<TcpTransport, Box<[u8; TLS_WIRE_BYTES]>>);
 fn io_error(error: td_mta::ports::Error) -> std::io::Error {
@@ -302,7 +302,7 @@ impl Drop for Stop<'_> {
         self.0.stop();
     }
 }
-fn reply(stream: &mut BufReader<impl Read>, code: &str) -> String {
+pub(super) fn reply(stream: &mut BufReader<impl Read>, code: &str) -> String {
     let mut response = String::new();
     for _ in 0..64 {
         let mut line = String::new();
@@ -317,7 +317,7 @@ fn reply(stream: &mut BufReader<impl Read>, code: &str) -> String {
     }
     panic!("SMTP reply did not terminate")
 }
-fn command(stream: &mut BufReader<impl Read + Write>, line: &[u8], code: &str) {
+pub(super) fn command(stream: &mut BufReader<impl Read + Write>, line: &[u8], code: &str) {
     stream.get_mut().write_all(line).unwrap();
     stream.get_mut().flush().unwrap();
     reply(stream, code);
@@ -379,7 +379,7 @@ pub(super) fn deliver_after_renewal(address: std::net::SocketAddr, ca: &[u8]) {
     command(&mut peer, b"QUIT\r\n", "221");
 }
 
-fn connect(
+pub(super) fn connect(
     fixture: &Fixture,
     address: std::net::SocketAddr,
     tls: bool,
@@ -571,6 +571,7 @@ pub(super) enum Ending {
     Drain,
     QueuedStop,
     Rate,
+    Fairness,
 }
 
 pub(super) fn exercise(
@@ -641,7 +642,11 @@ pub(super) fn exercise(
         // This resolver accepts a datagram but never answers. The rate fixture
         // must still commit the message and publish a local transient result.
         let silent = rate.then(|| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
-        let endpoint = silent.as_ref().map(|socket| socket.local_addr().unwrap());
+        let slow_dns = (ending == Ending::Fairness).then(super::sender_fairness::Dns::start);
+        let endpoint = silent
+            .as_ref()
+            .map(|socket| socket.local_addr().unwrap())
+            .or(slow_dns.as_ref().map(|dns| dns.address));
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::sync_channel(1);
             let server = scope.spawn({
@@ -659,6 +664,12 @@ pub(super) fn exercise(
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert_eq!(control.state(), State::Ready);
+            if ending == Ending::Fairness {
+                super::sender_fairness::exercise(fixture, address, clock.clone());
+                drop(stop);
+                server.join().unwrap().unwrap();
+                return;
+            }
             if ending == Ending::QueuedStop {
                 stop_before_second_commit(fixture, address, clock.clone(), probe.clone(), &control);
                 server.join().unwrap().unwrap();

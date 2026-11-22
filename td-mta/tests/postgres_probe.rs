@@ -2824,6 +2824,8 @@ fn real_postgres_smtp_worker_receives_and_drains() {
     exercise_configuration(ConfigurationExercise::ReceivingTransport);
 }
 
+#[path = "postgres_probe/sender_fairness.rs"]
+mod sender_fairness;
 #[path = "postgres_probe/smtp_transport.rs"]
 mod smtp_transport;
 
@@ -2837,6 +2839,12 @@ fn real_postgres_smtp_worker_preserves_starttls_receipts() {
 #[ignore = "real local PostgreSQL 17 tools, including psql, required"]
 fn real_postgres_smtp_worker_throttles_one_peers_accepted_mail() {
     exercise_configuration(ConfigurationExercise::ReceivingRate);
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_smtp_worker_keeps_slow_sender_dns_apart() {
+    exercise_configuration(ConfigurationExercise::ReceivingFairness);
 }
 
 #[path = "postgres_probe/multi_account.rs"]
@@ -2929,6 +2937,9 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     });
     timed("audit_scaling::exercise", audit_scaling::exercise);
     timed("configuration MultiAccount", real_postgres_multi_account);
+    timed("configuration ReceivingFairness", || {
+        exercise_configuration(ConfigurationExercise::ReceivingFairness)
+    });
     timed(
         "production service material rotation",
         real_postgres_service_secrets_follow_selected_profile_and_rotation,
@@ -3005,6 +3016,7 @@ enum ConfigurationExercise {
     Performance,
     ReceivingTls,
     ReceivingRate,
+    ReceivingFairness,
     ReceivingTransport,
     ReceivingOwner,
     HttpUploads,
@@ -3205,6 +3217,7 @@ per_peer_limit = 1
         ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
             | ConfigurationExercise::ReceivingRate
+            | ConfigurationExercise::ReceivingFairness
             | ConfigurationExercise::Serving
             | ConfigurationExercise::ReplicaPublication
             | ConfigurationExercise::Performance
@@ -3222,6 +3235,7 @@ per_peer_limit = 1
             | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
             | ConfigurationExercise::ReceivingRate
+            | ConfigurationExercise::ReceivingFairness
     ) {
         let limits = "session_limit = 1\nper_peer_limit = 1\n";
         assert_eq!(cloud.matches(limits).count(), 1, "cloud listener limits");
@@ -3788,6 +3802,7 @@ per_peer_limit = 1
             | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::ReceivingTls
             | ConfigurationExercise::ReceivingRate
+            | ConfigurationExercise::ReceivingFairness
             | ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
     ) {
@@ -3923,7 +3938,8 @@ per_peer_limit = 1
                 | ConfigurationExercise::ReceivingOwner
                 | ConfigurationExercise::ReceivingTransport
                 | ConfigurationExercise::ReceivingTls
-                | ConfigurationExercise::ReceivingRate => {}
+                | ConfigurationExercise::ReceivingRate
+                | ConfigurationExercise::ReceivingFairness => {}
                 ConfigurationExercise::Deletion => {
                     exercise_deletion(&fixture, &request, &trust, prepared.binding())
                 }
@@ -4034,6 +4050,7 @@ per_peer_limit = 1
                 ConfigurationExercise::ReceivingTransport
                     | ConfigurationExercise::ReceivingTls
                     | ConfigurationExercise::ReceivingRate
+                    | ConfigurationExercise::ReceivingFairness
             )
         {
             let socket = smtp_socket.take().unwrap();
@@ -4048,6 +4065,7 @@ per_peer_limit = 1
                 matches!(exercise, ConfigurationExercise::ReceivingTls),
                 match exercise {
                     ConfigurationExercise::ReceivingRate => smtp_transport::Ending::Rate,
+                    ConfigurationExercise::ReceivingFairness => smtp_transport::Ending::Fairness,
                     _ => smtp_transport::Ending::Drain,
                 },
             );

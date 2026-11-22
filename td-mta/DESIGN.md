@@ -1496,19 +1496,24 @@ preserve it. Configuration borrows, resolver order and generation stay fixed
 for the owner's lifetime; resolver changes take effect only through a
 drain and reload (section 6).
 
-Direct receiving uses separate SPF and DKIM workers. SPF queries derive from
-the SMTP envelope and published policy. DKIM queries TXT at the selector's
-`_domainkey` name. The DKIM worker also queries
-`_dmarc` TXT records to discover policy and compare organizational domains.
-Both workers send DNS questions only to configured numeric
-resolvers, have no application-dial capability, and keep their per-message
-work separate from the configured relay/ACME cache. Sender-authentication
-questions advertise a 1232-byte EDNS(0) UDP payload with no options. A
-complete reply can contain one root-owned OPT in the additional section.
-The decoder validates option lengths and combines the extended and header
-response codes before using an answer. A matching FORMERR without OPT
-allows one classic query to the same resolver with a new ID. TCP fallback
-after a matching truncated reply retains the query and original deadline.
+Direct receiving uses separate fixed pools of SPF and DKIM workers. SPF
+queries derive from the SMTP envelope and published policy. DKIM queries
+TXT at the selector's `_domainkey` name. The DKIM workers also query
+`_dmarc` TXT records to discover policy and compare organizational
+domains. Each observation's time budget starts when a worker takes it, and
+the final dot waits for the session's own observations within a bound
+derived from the session and worker counts, so one sender's slow DNS can
+delay but, within the receiver's bounded final-dot wait, not time out
+another sender's result. RESOURCES.md records the pools and bounds. Both
+pools send DNS questions only to configured numeric resolvers, have no
+application-dial capability, and keep their per-message work separate from
+the configured relay/ACME cache. Sender-authentication questions advertise
+a 1232-byte EDNS(0) UDP payload with no options. A complete reply can
+contain one root-owned OPT in the additional section. The decoder
+validates option lengths and combines the extended and header response
+codes before using an answer. A matching FORMERR without OPT allows one
+classic query to the same resolver with a new ID. TCP fallback after a
+matching truncated reply retains the query and original deadline.
 
 The `outbound_dial` helper runs only on the relay route worker while its
 caller retains the sole outbound slot and configured endpoint/TLS policy.

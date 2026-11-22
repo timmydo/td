@@ -19,6 +19,8 @@ pub(super) enum Owner {
     Storage,
     Tls,
     Dkim,
+    /// A verifier holds the slot; the others skip it rather than contend.
+    Verifying,
 }
 
 pub(super) struct Cell<T> {

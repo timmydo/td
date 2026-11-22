@@ -270,7 +270,7 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 486604032 bytes (about 464.06 MiB), including the
+default plan is 499186944 bytes (about 476.06 MiB), including the
 4-MiB index cache. The default pools of 32 SMTP sessions and 16 HTTPS
 connections reserve 39458816 bytes (about 37.63 MiB) more than eight of each,
 and eight event-stream slots of their own another 4980736 bytes;
@@ -284,8 +284,11 @@ Schema-35 search-field reuse adds 20 MiB of planning scratch per body job
 (60 MiB at the default three jobs). This covers bounded PostgreSQL result,
 encoded field and decoded field overlap; it is allocated only when needed.
 Explicit budgets close to the previous plan must be raised before upgrading.
-Direct MX reserves 2 MiB for the SPF worker and 4 MiB for the shared DKIM
-and DMARC worker. Each reservation includes its stack and evaluation scratch.
+Direct MX reserves 2 MiB for each of its three SPF workers and 4 MiB for
+each of its three DKIM and DMARC workers. Each reservation includes its
+stack and evaluation scratch. The two pools reserve 12582912 bytes (12 MiB)
+more than one worker of each; a tightly sized explicit budget must allow
+them.
 DMARC adds 1 KiB per SMTP slot for the retained result and its domains.
 The default remains 512 MiB. Owner search backfill runs separately and needs
 headroom for one complete bounded interpretation and its encoded copy.

@@ -691,6 +691,13 @@ though SPF fails. The documented query counts only the local pass. A
 separate unsigned message claiming the hosted domain fails DMARC under
 `p=reject` and reaches both local accounts with identical observations.
 A silent resolver still permits custody and yields a temporary DMARC result.
+A separate in-process receiver fixture starts a sender whose resolver
+answers each question about its domain after 900 ms, then delivers the
+signed message from an ordinary sender while that observation still holds
+a worker. The ordinary delivery records SPF, both DKIM signatures and DMARC
+as pass; the slow sender's SPF outlives its own budget and records
+`temperror`. The SPF unit fixture queues an ordinary sender behind more
+slow senders than there are workers and still observes its pass.
 
 ## Local delivery-failure notices
 

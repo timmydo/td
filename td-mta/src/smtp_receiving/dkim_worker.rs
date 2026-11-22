@@ -1,4 +1,4 @@
-//! DKIM and DMARC share one worker, DNS meter and borrow of the admitted DATA.
+//! DKIM and DMARC share a worker, DNS meter and borrow of the admitted DATA.
 use super::{Cell, Control, Owner, Phase, Receiving, Slot};
 use crate::{
     clock::RuntimeClock,
@@ -15,6 +15,15 @@ use std::{
 };
 
 pub(crate) const STACK_BYTES: usize = 1024 * 1024;
+/// One message's DKIM and DMARC budget, from the moment a worker takes it.
+const BUDGET_MS: u64 = 2_000;
+/// A peer holds at most `SMTP_DATA_PER_PEER` resident DATA jobs, so one more
+/// worker keeps another peer's verification from waiting on it.
+pub(crate) const WORKERS: usize = crate::limits::SMTP_DATA_PER_PEER + 1;
+// Only a transaction holding resident DATA waits here. With at most one such
+// job queued, it starts within one budget and then runs for its own.
+const _: () = assert!(WORKERS + 1 >= crate::limits::SMTP_DATA_JOBS);
+pub(super) const FINAL_WAIT_MS: u64 = 2 * BUDGET_MS;
 
 pub(super) struct MessageAuthentication {
     pub(super) dkim: dkim::Report,
@@ -109,13 +118,14 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 if slot.authentication.is_some() {
                     continue;
                 }
+                cell.assign(Owner::Verifying);
                 let observe = || {
                     let raw = slot.delivery.as_ref()?.dkim_input()?;
                     // Sample the worker's DNS clock first so the conversion cannot
-                    // extend the absolute deadline established at the final dot.
+                    // extend the receiver's absolute wait from the final dot.
                     let origin = clock.monotonic().ok()?;
                     let time = self.clock.sample().ok()?;
-                    let remaining = until.0.checked_sub(time.monotonic.0)?;
+                    let remaining = until.0.checked_sub(time.monotonic.0)?.min(BUDGET_MS);
                     let deadline = Deadline::after(origin, remaining).ok()?;
                     let current = || {
                         !finished.load(Ordering::Acquire)

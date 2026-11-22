@@ -395,13 +395,13 @@ impl Limits {
                 bytes_each: 512 * KIB,
             },
             Reservation {
-                name: "direct SPF worker and scratch",
-                count: 1,
+                name: "direct SPF workers and scratch",
+                count: crate::smtp_spf::WORKERS,
                 bytes_each: crate::smtp_spf::STACK_BYTES + MIB,
             },
             Reservation {
-                name: "direct DKIM and DMARC worker and scratch",
-                count: 1,
+                name: "direct DKIM and DMARC workers and scratch",
+                count: crate::smtp_receiving::DKIM_WORKERS,
                 bytes_each: crate::smtp_receiving::DKIM_STACK_BYTES + 3 * MIB,
             },
             Reservation {
@@ -509,7 +509,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 486_604_032);
+        assert_eq!(plan.total_bytes(), 499_186_944);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -549,7 +549,7 @@ mod tests {
             ..Limits::default()
         }
         .plan()?;
-        assert_eq!(smtp.total_bytes(), 515_448_064);
+        assert_eq!(smtp.total_bytes(), 528_030_976);
         let https = Limits {
             https_connections: MAX_HTTPS_CONNECTIONS,
             ..Limits::default()
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(
             https.plan(),
             Err(ResourceError::MemoryBudget {
-                required: 593_558_784,
+                required: 606_141_696,
                 available: 512 * MIB,
             })
         );
@@ -567,13 +567,13 @@ mod tests {
             ..https
         }
         .plan()?;
-        assert_eq!(shrunk.total_bytes(), 513_867_008);
+        assert_eq!(shrunk.total_bytes(), 526_449_920);
         let streams = Limits {
             event_streams: MAX_EVENT_STREAMS,
             ..Limits::default()
         }
         .plan()?;
-        assert_eq!(streams.total_bytes(), 501_546_240);
+        assert_eq!(streams.total_bytes(), 514_129_152);
         Ok(())
     }
 

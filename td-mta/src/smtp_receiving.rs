@@ -44,7 +44,7 @@ impl<B: smtp_storage::Storage> Drop for StorageClose<'_, B> {
 
 mod dkim_worker;
 mod wait;
-pub(crate) use dkim_worker::STACK_BYTES as DKIM_STACK_BYTES;
+pub(crate) use dkim_worker::{STACK_BYTES as DKIM_STACK_BYTES, WORKERS as DKIM_WORKERS};
 use wait::{Blocked, Cell, Owner};
 
 const SCAN: Duration = Duration::from_millis(5);
@@ -64,7 +64,7 @@ struct Finish<'a> {
     finished: &'a AtomicBool,
     storage: &'a std::thread::Thread,
     tls: &'a std::thread::Thread,
-    dkim: Option<&'a std::thread::Thread>,
+    dkim: &'a [Option<&'a std::thread::Thread>],
     control: &'a Control,
 }
 impl Drop for Finish<'_> {
@@ -75,7 +75,7 @@ impl Drop for Finish<'_> {
         self.finished.store(true, Ordering::Release);
         self.storage.unpark();
         self.tls.unpark();
-        if let Some(dkim) = self.dkim {
+        for dkim in self.dkim.iter().flatten() {
             dkim.unpark();
         }
     }
@@ -610,21 +610,28 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                     return Err(Error::from(error));
                 }
             };
-            let dkim = td_alloc::string("smtp-dkim").ok().and_then(|name| {
-                std::thread::Builder::new()
-                    .name(name)
-                    .stack_size(dkim_worker::STACK_BYTES)
-                    .spawn_scoped(scope, || {
-                        self.verify_message(&slots, &finished, control, resolvers)
-                    })
-                    .ok()
-            });
-            let dkim_thread = dkim.as_ref().map(|worker| worker.thread());
+            // Each verifier owns its DNS packet; a failed spawn leaves fewer.
+            let mut dkim_workers = [const { None }; dkim_worker::WORKERS];
+            for worker in &mut dkim_workers {
+                *worker = td_alloc::string("smtp-dkim").ok().and_then(|name| {
+                    std::thread::Builder::new()
+                        .name(name)
+                        .stack_size(dkim_worker::STACK_BYTES)
+                        .spawn_scoped(scope, || {
+                            self.verify_message(&slots, &finished, control, resolvers)
+                        })
+                        .ok()
+                });
+            }
+            let dkim_threads = dkim_workers
+                .each_ref()
+                .map(|worker| worker.as_ref().map(std::thread::ScopedJoinHandle::thread));
+            let dkim_available = dkim_threads.iter().any(Option::is_some);
             let _finish = Finish {
                 finished: &finished,
                 storage: storage.thread(),
                 tls: tls.thread(),
-                dkim: dkim_thread,
+                dkim: &dkim_threads,
                 control,
             };
             while started.load(Ordering::Acquire) != 2 {
@@ -738,7 +745,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                             });
                             slot.spf_result = result;
                             if now < until && stopping.is_none() {
-                                if slot.authentication.is_none() && dkim_thread.is_some() {
+                                if slot.authentication.is_none() && dkim_available {
                                     cell.assign(Owner::Dkim);
                                     wake_dkim = true;
                                     continue;
@@ -837,7 +844,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                             control,
                                             spf,
                                             index,
-                                            dkim_thread.is_some(),
+                                            dkim_available,
                                         );
                                         if dispatched.is_err() {
                                             slot.queue_retirement();
@@ -849,20 +856,22 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                         }
                         let owner = wait::owner(
                             slot.phase,
-                            dkim_thread.is_some() && slot.authentication.is_none(),
+                            dkim_available && slot.authentication.is_none(),
                         );
                         cell.assign(owner);
                         match owner {
                             Owner::Tls => wake_tls = true,
                             Owner::Storage => wake_storage = true,
                             Owner::Dkim => wake_dkim = true,
-                            Owner::Network => (),
+                            Owner::Network | Owner::Verifying => (),
                         }
                     }
                     cursor = (cursor + 1) % total;
                     // Each worker can acquire the queued slot when it wakes.
-                    if let Some(thread) = dkim_thread.filter(|_| wake_dkim) {
-                        thread.unpark();
+                    if wake_dkim {
+                        for thread in dkim_threads.iter().flatten() {
+                            thread.unpark();
+                        }
                     }
                     if wake_storage {
                         storage.thread().unpark();
@@ -1048,8 +1057,16 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                 Some(service) => service.poll(index, slot.spf_ticket.as_ref()),
                 None => Some(crate::spf::Outcome::Temperror),
             };
-            // Keep the full original commit budget, including on nearly expired DATA.
-            let until = crate::smtp_spf::wait_until(now, transport_deadline, seconds);
+            // Wait for this transaction's own observations, which other
+            // sessions' slow DNS can delay but not shorten. Keep the full
+            // original commit budget, including on nearly expired DATA.
+            // Without SPF workers the verifier's own wait still applies.
+            let wait = spf
+                .map_or(0, |service| {
+                    service.final_wait_ms(self.resources.limits().smtp_sessions)
+                })
+                .max(dkim_worker::FINAL_WAIT_MS);
+            let until = crate::smtp_spf::wait_until(now, transport_deadline, seconds, wait);
             if until > now && !control.stop_requested() && (dkim_available || result.is_none()) {
                 slot.spf_result = result;
                 slot.commit_wait_timing = Some(crate::performance::Timer::start(

@@ -55,8 +55,8 @@ changing that validator requires an explicit atomic implementation update.
 | Sort runs and merge buffers | 1 | 1048576 | 1048576 |
 | Log queue and formatting | 1 | 131072 | 131072 |
 | DNS, ACME and control scratch | 1 | 524288 | 524288 |
-| Direct SPF worker stack and evaluation scratch | 1 | 2097152 | 2097152 |
-| Direct DKIM and DMARC worker stack and verification scratch | 1 | 4194304 | 4194304 |
+| Direct SPF worker stacks and evaluation scratch | 3 | 2097152 | 6291456 |
+| Direct DKIM and DMARC worker stacks and verification scratch | 3 | 4194304 | 12582912 |
 | Slot queues and queue window | 1 | 131072 | 131072 |
 | Fixed worker stacks | 11 | 262144 | 2883584 |
 | Unix connector stacks | 8 | 262144 | 2097152 |
@@ -72,10 +72,10 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
 | SMTP prepared body | 1 | 33816576 | 33816576 |
 | Upload ingress and retained body | 2 | 33816576 | 67633152 |
-| **Total** | | | **486604032** |
+| **Total** | | | **499186944** |
 
-The total is approximately 464.06 MiB against a 512 MiB configured budget;
-the remaining 50266880 bytes are unassigned headroom, not another cache.
+The total is approximately 476.06 MiB against a 512 MiB configured budget;
+the remaining 37683968 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent
@@ -109,10 +109,10 @@ changes them.
 
 The default pools spend the unassigned headroom on idle capacity and keep
 at least one 32 MiB message buffer (33554432 bytes) unassigned. The fixed
-reservations plan 417127680 bytes. Thirty-two SMTP sessions add 32 × 901376
+reservations plan 429710592 bytes. Thirty-two SMTP sessions add 32 × 901376
 = 28844032 bytes, sixteen HTTPS connections 16 × 2228224 = 35651584 and
-eight event streams 8 × 622592 = 4980736. The plan is 486604032 bytes and
-leaves 50266880 (about 47.94 MiB). The rule would admit up to 23 HTTPS
+eight event streams 8 × 622592 = 4980736. The plan is 499186944 bytes and
+leaves 37683968 (about 35.94 MiB). The rule would admit up to 17 HTTPS
 connections; the pool stays at 16, since ordinary connections are
 authenticated clients served by at most three body workers. Eight streams
 serve four td-mail processes at two each. Four peer keys at the default two
@@ -120,10 +120,10 @@ sessions each hold 8 of the 32 SMTP slots, and filling the pool takes 16.
 
 The compiled maxima are 64 SMTP sessions, 64 ordinary HTTPS connections
 and 32 event streams. With every other default, 64 SMTP sessions plan
-515448064 bytes and 32 streams 501546240, inside the default budget.
-Sixty-four HTTPS connections plan 593558784 bytes: an operator raises
+528030976 bytes and 32 streams 514129152, inside the default budget.
+Sixty-four HTTPS connections plan 606141696 bytes: an operator raises
 `memory_budget_bytes` to that or shrinks the request arena (256 KiB of JSON
-and 4096 tokens plan 513867008 bytes). The maxima size the fixed readiness
+and 4096 tokens plan 526449920 bytes). The maxima size the fixed readiness
 array, guard arrays and HTTPS peer table, not a memory allowance.
 
 The generated Unicode arrays have a checked 58720-byte compiled payload.
@@ -463,43 +463,75 @@ M21 must measure this separate process and its bounded page/body lifecycle.
 
 ## Direct receiving runtime
 
-Direct SMTP uses fixed storage, TLS, SPF and DKIM workers. One SPF worker serves
-all SMTP slots. Each slot has room for one queued envelope and one result;
+Direct SMTP uses fixed storage, TLS, SPF and DKIM workers. Three SPF
+workers serve all SMTP slots, one more than the default per-peer session
+cap. Each slot has room for one queued envelope and one result;
 a new MAIL replaces the previous generation. When the envelope is cleared
 by RSET, a new greeting, a disconnect or slot retirement, or the receiver
-freezes the result for commit, it atomically cancels that generation. The
-worker skips canceled envelopes before starting DNS and checks the active
-generation between resolver exchanges and socket operations. An in-flight
-socket call has at most one second of idle wait within the original
-deadline. The network loop never waits for cancellation or a worker lock.
-The SPF worker’s 2 MiB reservation includes a 1 MiB stack and reusable DNS
-packet and evaluation scratch. One observation has a two-second deadline
-from MAIL, including queueing. At the end of DATA, the receiver waits at
-most another 200 ms within that deadline while preserving the original
-commit budget. Missing worker capacity, local work exhaustion or an expired
-observation produces `temperror`. The direct SMTP SIZE and header limits
+freezes the result for commit, it atomically cancels that generation. A
+free worker takes the oldest queued envelope, so a session that keeps
+sending MAIL requeues behind the others. Workers skip canceled envelopes
+before starting DNS and check the active generation between resolver
+exchanges and socket operations. An in-flight socket call has at most one
+second of idle wait within the observation's deadline. The network loop
+never waits for cancellation. It takes an observation's lock only for the
+constant-time bookkeeping a worker also holds it for, never across DNS, so
+another session's activity cannot make it skip starting or reading an
+observation. Each SPF worker's 2 MiB
+reservation includes a 1 MiB stack and reusable DNS packet and evaluation
+scratch.
+
+One observation has a two-second budget that starts when a worker takes
+it, so time queued behind another sender's slow DNS is not charged to it.
+A slow sender can delay a different sender's observation but, within the
+wait below, cannot cause its `temperror`. At the end of DATA the receiver
+waits for its own observations rather than for a fixed grace. Ahead of a
+queued envelope are at most one envelope per other slot and one finishing
+or abandoned job per worker, each holding its worker for at most two
+seconds. With S configured sessions the wait is therefore bounded by (⌈(S
++ 2) / 3⌉ + 1) × 2 seconds: 26 seconds at the default 32 sessions and
+46 seconds at the compiled maximum of 64, always preserving the original
+commit budget and the transport deadline, which can end the wait sooner.
+The bound uses the workers that actually started, so a failed spawn
+lengthens it. While the pool is idle an ordinary sender with responsive
+DNS waits only for its own lookups. When the configured resolvers are slow
+or silent, every final dot waits for its own observations, about two
+seconds each, while holding its session and, for DKIM, a resident DATA
+job; direct receiving then accepts at roughly the pool's rate instead of
+promptly recording `temperror`. Missing worker capacity, local work
+exhaustion, an observation that outlives its own budget or a wait that
+ends first produces `temperror`. The direct SMTP SIZE and header limits
 reserve space for the longest generated Received-SPF trace and escaped
 envelope values.
 
-The DKIM worker verifies the original dot-unstuffed DATA before the receiver
-rewrites trace headers. It borrows the admitted bytes under the individual
-session lock. Other sessions can continue network and storage work. The
-worker handles one message at a time with a 1 MiB stack and 3 MiB of scratch,
-including the DNS packet and header descriptors. Verification examines up
-to four signatures, 1,024 fields in the first 256 KiB of headers, 128 signed
-field names per signature and 16 KiB per signature or key tag list.
-Repeated body canonicalization modes and lengths reuse a digest within
-the message. The same worker evaluates DMARC, using the original From
-field and the SPF result published for this envelope. It uses the same
-resolver, scratch reservation and deadline. The author scan examines up
-to 1,024 fields and 256 KiB of headers, with at most 16 KiB for From.
-Policy discovery visits at most eight names in each DNS tree walk and
-shares answers between walks in this message. A slot reserves 1 KiB for
-the retained DMARC result and its author and policy domains. The generated DMARC field
-uses 566 bytes for every outcome. SPF, DKIM and DMARC share the
-same final wait of up to 200 ms. Queued observations expire within that
-window, including when the full commit budget needs the time. An incomplete
-observation is recorded on delivery.
+Three DKIM workers verify the original dot-unstuffed DATA before the
+receiver rewrites trace headers. A verifier borrows the admitted bytes
+under the individual session lock and marks the slot as being verified, so
+the other verifiers skip it rather than contend. Other sessions can
+continue network and storage work. Only a transaction holding one of the
+four resident DATA jobs waits for verification, and a peer holds at most
+two of them, so another peer's message always finds a free verifier or
+waits for one message's budget at most. If fewer verifiers started it can
+wait longer, bounded by the receiver's wait, after which DKIM is recorded
+as incomplete. Each message's DKIM and DMARC work has its own two-second
+budget from the moment a verifier takes it, within the receiver's wait.
+Each worker handles one message at a time with a 1 MiB stack and 3 MiB of
+scratch, including the DNS packet and header descriptors. Verification
+examines up to four signatures, 1,024 fields in the first 256 KiB of
+headers, 128 signed field names per signature and 16 KiB per signature or
+key tag list. Repeated body canonicalization modes and lengths reuse a
+digest within the message. The same worker evaluates DMARC, using the
+original From field and the SPF result published for this envelope. It
+uses the same resolver, scratch reservation and deadline. The author scan
+examines up to 1,024 fields and 256 KiB of headers, with at most 16 KiB
+for From. Policy discovery visits at most eight names in each DNS tree
+walk and shares answers between walks in this message. A slot reserves 1
+KiB for the retained DMARC result and its author and policy domains. The
+generated DMARC field uses 566 bytes for every outcome. SPF, DKIM and
+DMARC share the receiver's final wait, which is the longer of the SPF
+bound above and two DKIM budgets. Observations still queued or running
+when it ends, including when the full commit budget needs the time, are
+recorded as incomplete on delivery.
 
 A startup-reserved vector holds at most the configured SMTP connection
 count (compiled maximum 64). Each mutex-protected slot owns its protocol,
@@ -585,7 +617,7 @@ most 16 addresses. Do not
 allocate one packet/name buffer per waiting lookup. Expired entries are
 replaced in place. Configuration fixes names/resolvers; this is not a recursive
 resolver or a DNS cache for incoming arbitrary domains. The separate SPF
-worker performs TXT, A, AAAA, MX and PTR lookups without a cross-message
+workers perform TXT, A, AAAA, MX and PTR lookups without a cross-message
 cache. Its per-observation limits include ten DNS-causing SPF terms, two
 void lookups and eight CNAME hops per lookup. A single DNS work meter spans
 alias continuations, resolver retries and TCP fallback.
