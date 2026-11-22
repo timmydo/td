@@ -110,7 +110,7 @@ dependencies are the local `td-alloc`, `td-civil`, `td-crypto`, `td-header`, `td
 `td-json`, `td-mime`, `td-nfc` and `td-fs` crates, plus the approved private
 tokio-postgres 0.7.18 closure with default features disabled. Std-only
 `td-fs` owns bounded private Unix socket dialing and disposable fixture
-directories. POSTGRES.md section 8 owns the verified-TLS or explicit private
+directories. POSTGRES.md chapter 8 owns the verified-TLS or explicit private
 Unix transport, SCRAM connection probe and PostgreSQL serving contract.
 The driver's private SCRAM
 cryptography/Unicode preparation do not replace td-crypto or td-mime.
@@ -1462,7 +1462,7 @@ mail reader or health checks. Resolve configured outbound hostnames using a
 bounded std-only DNS adapter with explicit UDP/TCP deadlines and A/AAAA/CNAME
 limits; do not hide uninterruptible resolver work in unbounded threads.
 The PostgreSQL bootstrap/writer endpoint is a separate cold-path exception:
-POSTGRES.md section 10 uses a disposable, deadline-owned system-resolver
+POSTGRES.md, "Writer endpoint resolution", uses a disposable, deadline-owned system-resolver
 process with a five-second cap. A parsed bootstrap can reuse a positive
 answer for one second from lookup start. The child uses the trusted platform
 resolver, which supplies no TTL. Mail-routing DNS uses its own Resolver port.

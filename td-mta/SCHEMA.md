@@ -1,13 +1,14 @@
 # Complete configuration schema
 
-The inert selected-profile structural loader is specified in
-[POSTGRES.md §15](POSTGRES.md#15-prepared-instance-role-validation).
-Its role-aware listener and local-MX rules apply only to PreparedProfile;
-the legacy file loader and serving contracts below retain their requirements.
+The selected-profile structural loader is specified in [POSTGRES.md,
+Instance roles and role-aware profile
+loading](POSTGRES.md#instance-roles-and-role-aware-profile-loading). Its
+role-aware listener and local-MX rules apply only to PreparedProfile; the
+legacy file loader and serving contracts below retain their requirements.
 
 [POSTGRES.md](POSTGRES.md) owns active PostgreSQL storage and configuration.
-Receive/JMAP serving is implemented. Relay process integration remains
-incomplete and is refused; there is no alternative local database backend.
+Receive, JMAP and relay serving are implemented; there is no alternative
+local database backend.
 
 ## Status and ownership
 
@@ -504,11 +505,13 @@ Gateway TLS identity. It still obeys local-recipient and resource limits.
 
 Require 1..16 `[listener "NAME"]` stanzas with required `kind` and `bind`.
 Kinds are `direct_smtp`, `gateway_smtp`, `https`, `http01`,
-`loopback_smtp_fixture` and `local_jmap`. At least one SMTP role and one HTTPS listener are
-required by this file schema. POSTGRES.md section 15 describes a separate
-role-selection preparation API; no new file stanza or serving mode selects
-it. No SMTP submission, implicit inbound submission, IMAP or POP role exists
-in this schema.
+`loopback_smtp_fixture` and `local_jmap`. At least one SMTP role and one
+HTTPS listener are required by this file schema. POSTGRES.md, [Instance
+roles and role-aware profile
+loading](POSTGRES.md#instance-roles-and-role-aware-profile-loading)
+states the role-selected requirements every PostgreSQL profile load
+applies; no file stanza selects roles. No SMTP submission, implicit inbound submission,
+IMAP or POP role exists in this schema.
 
 | Field | Applicability |
 | --- | --- |

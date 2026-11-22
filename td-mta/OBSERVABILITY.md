@@ -326,14 +326,17 @@ can shorten the retained history; at the global maximum the ring retains about
 109 minutes. Suppression and eviction are intentional and visible.
 
 Writers flush at most 16 records per transaction with a two-second overall
-DNS/connection/operation deadline, a 50 ms row-lock wait, and one-second statement
-timeouts. The writer uses the bootstrap address policy in POSTGRES.md section 10. Only a
-transport failure before entering the append operation can try another address
-within that same deadline. Logging uses asynchronous commit and never retries
-an uncertain commit. Mail acceptance never depends on diagnostic persistence. Each idle
-writer runs incremental age cleanup at least once per minute while operational,
-deleting at most 1,024 expired rows per pass. Inspection hides all expired rows
-immediately even when physical cleanup is behind or no service is running.
+DNS/connection/operation deadline, a 50 ms row-lock wait, and one-second
+statement timeouts. The writer uses the bootstrap address policy in
+POSTGRES.md, [Writer endpoint
+resolution](POSTGRES.md#writer-endpoint-resolution). Only a transport
+failure before entering the append operation can try another address within
+that same deadline. Logging uses asynchronous commit and never retries an
+uncertain commit. Mail acceptance never depends on diagnostic persistence.
+Each idle writer runs incremental age cleanup at least once per minute while
+operational, deleting at most 1,024 expired rows per pass. Inspection hides
+all expired rows immediately even when physical cleanup is behind or no
+service is running.
 
 Before appending, the serialized writer measures both log relations, including
 their indexes and TOAST. At 96 MiB it suppresses new records and metadata updates;
@@ -598,10 +601,12 @@ rechecks the selection. It exports no message bodies, envelopes or
 credentials. Durable usage counters are observed without an integrity audit.
 Account tables are counted only through their ceiling plus one; reserved
 final-result claims are included in each affected receipt table's occupancy.
-Route-owner, HTTP write and submission expiry receipts count only
-those inside their retention, and device records only unrevoked ones or
+Route-owner, HTTP write and submission expiry receipts count only those
+inside their retention, and device records only unrevoked ones or
 revocations inside 30 days; expired rows await the account's next
-publication of their kind and refuse nothing (POSTGRES.md sections 21, 46,
+publication of their kind and refuse nothing (POSTGRES.md, [Device registry
+records and retention (schema
+4)](POSTGRES.md#device-registry-records-and-retention-schema-4), section 46,
 52, 120 and 217). `active_devices` counts unrevoked devices against 256.
 Connection usage includes this inspection and other client backends; its
 ceiling excludes reserved slots. Configured protocol, disk/work and

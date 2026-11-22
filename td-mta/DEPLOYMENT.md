@@ -403,11 +403,14 @@ follow the procedures elsewhere in this document.
 
 Use the explicit PostgreSQL preparation commands described in POSTGRES.md:
 initialize or inspect the schema with its owner login, initialize the
-account, import validated material and configuration versions, and publish
-a retained configuration-selection request. Those commands do not start
+account, import validated material and configuration versions, and publish a
+retained configuration-selection request. Those commands do not start
 service. Use a separate non-owner runtime login with the privileges in
-POSTGRES.md section 55; `postgres runtime-check` verifies that login.
-Do not give the serving process the schema-owner connection file.
+POSTGRES.md, [Runtime database logins](POSTGRES.md#runtime-database-logins)
+and [Shared runtime login
+privileges](POSTGRES.md#shared-runtime-login-privileges);
+`postgres runtime-check` verifies that login. Do not give the serving
+process the schema-owner connection file.
 
 Run the service as a dedicated unprivileged identity. Provision its protected
 connection file and CA as POSTGRES.md specifies. Provision separate private
@@ -1099,15 +1102,21 @@ matching keys. A different CA key requires an explicit overlap/trust rotation
 for every client. Neither operation changes bundled public roots or grants
 trust to other td-mail accounts. Keep CA expiry on the operator's schedule.
 
-Use `postgres material-version` to retain separate chain/key IDs, then import
-`server.pem` as `certificate-chain` and `server.key` as `private-key`, using
-`material-import` with the owner connection file and expected epoch. Replace
-only the certificate material references in copies of every affected profile.
-Generate/retain a configuration version; `config-import` it with every profile
-and `config-check` it. Prepare and retain a `config-selection-prepare` request
-using the currently selected generation, then publish that exact request with
-`config-select`. Resolve uncertain results with `config-selection-inspect` and
-the same retained request. POSTGRES.md sections 17, 26 and 198 specify these
+Use `postgres material-version` to retain separate chain/key IDs, then
+import `server.pem` as `certificate-chain` and `server.key` as
+`private-key`, using `material-import` with the owner connection file and
+expected epoch. Replace only the certificate material references in copies
+of every affected profile. Generate/retain a configuration version;
+`config-import` it with every profile and `config-check` it. Prepare and
+retain a `config-selection-prepare` request using the currently selected
+generation, then publish that exact request with `config-select`. Resolve
+uncertain results with `config-selection-inspect` and the same retained
+request. POSTGRES.md, [Material operator
+commands](POSTGRES.md#material-operator-commands), [Configuration import,
+check and snapshot
+commands](POSTGRES.md#configuration-import-check-and-snapshot-commands) and
+[Configuration selection
+commands](POSTGRES.md#configuration-selection-commands) specify these
 commands; do not invent a fresh request to hide uncertainty.
 
 Certificate files on disk do not update td-mta's immutable database materials.

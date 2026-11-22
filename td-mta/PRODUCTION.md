@@ -57,7 +57,7 @@ On claw1 the selected frontend profile sets `event_streams = 4` in
 `[limits]`. Push can occupy four of the eight HTTPS connections. Each graphical
 td-mail process opens one stream per eligible watched account, up to two
 streams per process. Change this host setting through the versioned
-[configuration selection procedure](POSTGRES.md#198-explicit-selection-request-preparation-and-settlement-commands).
+[configuration selection procedure](POSTGRES.md#configuration-selection-commands).
 To roll back, select the retained previous version against the current
 generation and verify each profile is ready.
 

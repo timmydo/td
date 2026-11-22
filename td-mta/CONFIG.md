@@ -1,9 +1,10 @@
 # td-mta configuration
 
-The selected-profile structural loader is specified in
-[POSTGRES.md §15](POSTGRES.md#15-prepared-instance-role-validation).
-Its role-aware listener and local-MX rules apply only to PreparedProfile;
-the source parser retains its structural requirements.
+The selected-profile structural loader is specified in [POSTGRES.md,
+Instance roles and role-aware profile
+loading](POSTGRES.md#instance-roles-and-role-aware-profile-loading). Its
+role-aware listener and local-MX rules apply only to PreparedProfile; the
+source parser retains its structural requirements.
 
 ## Scope
 
@@ -1085,15 +1086,17 @@ exceed the listener session limit. Checked integer conversion prevents
 truncation. Finalization checks each against the supplied checked
 ResourcePlan and sums all SMTP session limits within the global pool. The
 file-configuration `finish` path requires at least one SMTP and one HTTPS
-listener. The separate, inert `finish_for_roles` preparation API follows
-POSTGRES.md section 15's exact selected-role requirements. A sum overrun reports
-SessionLimit and the first listener whose addition exceeded the pool. The
-explicit loopback fixture counts toward both the SMTP role requirement and
-the shared pool; SMTP plus HTTP-01 still fails the HTTPS requirement.
-Non-SMTP roles cannot carry those fields. HTTPS and HTTP-01 retain their
-existing shared runtime pools; no per-listener pool is allocated.
-JMAP-origin ports, ACME HTTP-01 availability, certificate consumers, SNI
-names, gateway peer requirements and MX classification use c4b below.
+listener. The role-aware `finish_for_roles` path, which every PostgreSQL
+profile load uses, follows POSTGRES.md, [Instance roles and role-aware profile
+loading](POSTGRES.md#instance-roles-and-role-aware-profile-loading)'s exact
+selected-role requirements. A sum overrun reports SessionLimit and the first
+listener whose addition exceeded the pool. The explicit loopback fixture
+counts toward both the SMTP role requirement and the shared pool; SMTP plus
+HTTP-01 still fails the HTTPS requirement. Non-SMTP roles cannot carry those
+fields. HTTPS and HTTP-01 retain their existing shared runtime pools; no
+per-listener pool is allocated. JMAP-origin ports, ACME HTTP-01
+availability, certificate consumers, SNI names, gateway peer requirements
+and MX classification use c4b below.
 
 The caller supplies 1..16 cells of at most 128 bytes, within the existing 2
 KiB listener partition; the builder fits 128 bytes of builder workspace. The

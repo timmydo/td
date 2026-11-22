@@ -31,7 +31,8 @@ The admitted driver is tokio-postgres 0.7.18 with default features disabled:
 no Tokio runtime or network/time driver is selected. Its private closure
 provides SCRAM crypto and string preparation; TLS remains the td-crypto
 boundary. Serving and owner commands use this driver; the connection probe
-in section 8 is a diagnostic, not an alternative backend. No server package
+in [Operator connection probe](#operator-connection-probe) is a diagnostic, not an
+alternative backend. No server package
 is admitted by the driver dependency; source-build rules still apply.
 
 ### Storage authority
@@ -60,13 +61,15 @@ closure conflict with td's dependency and build principles (AGENTS.md).
 
 ### Contract navigation
 
-The sections below retain their existing numbers for code and document
-references. Use these current entry points rather than treating implementation
-sequence as a backlog:
+Chapters 1–7 state the whole-system contract. The chapters after the
+References give each mechanism's rules; use these entry points:
 
 | Concern | Contract |
 | --- | --- |
 | Database authority, schema and migration barrier | Sections 1–3 below |
+| Connections, bootstrap files, runtime logins and `serve` | [8. Connection, bootstrap and serving startup](#8-connection-bootstrap-and-serving-startup) |
+| Schema ledger, configuration versions and selection | [9. Schema ledger, roles and configuration](#9-schema-ledger-roles-and-configuration) |
+| Accounts, devices and HTTPS authentication | [10. Accounts, devices and administration](#10-accounts-devices-and-administration) |
 | Account administration and identities | [Account administration workflow](#account-administration-workflow) |
 | Account-scoped HTTP authentication | [HTTPS account selection](#https-account-selection) |
 | Incoming mail across accounts | [Transactional incoming delivery](#transactional-incoming-delivery-across-accounts) |
@@ -103,7 +106,7 @@ It does not silently replace a failed TLS connection. Initial authentication
 is PostgreSQL SCRAM over verified TLS or the private socket; cloud
 identity-token login is not supported. Select addresses for the configured
 writer endpoint within bounded DNS and connection deadlines, under the
-one-second positive-answer policy in section 10.
+one-second positive-answer policy in [Writer endpoint resolution](#writer-endpoint-resolution).
 
 Startup connects, verifies writable-primary status and supported schema,
 loads and validates a complete profile/configuration generation, checks
@@ -400,167 +403,117 @@ and [CONFORMANCE.md](CONFORMANCE.md) name.
 - [RDS PostgreSQL TLS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.html)
 - [RDS failover and endpoint changes](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html)
 
-## 8. Implemented connection probe
+## 8. Connection, bootstrap and serving startup
 
-`postgres_probe::probe` is an inert worker entry point, not service startup
-or a storage backend. Its caller supplies an explicit TCP or Unix endpoint,
-server DNS name for TCP, borrowed credentials, trust store and absolute Instant
-deadline at most ten seconds away. It does not resolve DNS, read a connection
-file, load a profile, migrate a schema or retry. User/database names are
-nonempty, NUL-free and at most 256 bytes; passwords are 1..4096 bytes.
-The TLS facade validates the at-most-253-byte TCP server name before dialing.
+This chapter specifies how a td-mta process reaches its database: the
+protected connection specification and trust inputs, bounded writer-name
+resolution, the verified-TLS or explicit private Unix connection worker with
+SCRAM authentication, primary and durability qualification, the runtime
+logins and the qualification every runtime connection repeats, request
+credential ownership, the operator probe and the foreground `serve` command.
+Section 1 states the bootstrap policy these mechanisms implement.
 
-One worker drives connect and a fixed query through tokio-postgres. For TCP,
-TLS is required. The driver sends SSLRequest; td-crypto's outbound Postgres
-selector verifies the certificate chain and server name before startup
-credentials enter the stream. There is no plaintext fallback, direct-TLS
-ALPN, client certificate or channel-binding claim. The plaintext framing
-guard requires the SASL challenge/final/OK sequence and refuses MD5,
-cleartext-password, trust and other authentication methods. The pinned
-driver selects SCRAM-SHA-256 and verifies its server signature; its
-100,000-iteration ceiling bounds the server-directed password work.
-
-For an explicit Unix endpoint the same worker uses the raw socket, with
-SSL disabled only for this endpoint type. The framing guard, SCRAM sequence,
-output limits and retained-session validation windows attach before driver
-startup; skipping the TLS connector cannot bypass them. No certificate file,
-DNS lookup, TCP listener or TCP fallback is involved. Account/role, schema,
-transaction and commit-outcome handling are identical to the TCP path.
-
-Shared `td-fs` admission checks an absolute pathname of at most 107 bytes,
-with no empty, dot or parent components, symlink, or abstract namespace.
-Its direct parent must be owned by the current UID with mode 0700, and the
-socket by that UID with mode 0600. Physical ancestors must belong to root
-or this UID; shared-writable ancestors require the sticky bit, which protects
-their owned child names. Root and same-UID namespace writers remain trusted;
-these are stable-path checks, not atomic lookup against hostile same-UID code.
-Every connect rechecks the endpoint. Dialing shares one absolute deadline
-with admission to at most eight helper threads, each with a 256-KiB stack.
-A timed-out connect retains its slot until the kernel call returns; its
-late stream is closed. Repeated failures cannot accumulate unbounded threads.
-These helpers exist only while dialing Unix endpoints, with at most 2 MiB
-of requested stack reservation per process, in addition to thread overhead.
-
-One worker polls the request future and the PostgreSQL connection on its
-own thread. TCP and Unix reads and writes stay nonblocking during startup,
-queries and shutdown. The worker retries after socket bytes, TLS record
-processing or a driver wake. Once idle it waits in Linux `ppoll` for
-the read and write directions that actually blocked, together with a
-private wake socket. Channel wakes can interrupt that wait. LISTEN uses
-the same mechanism within the caller's slice; idle health checks return
-directly. Each live driver owns one database socket and two local wake
-descriptors. Connection setup fails if it cannot reserve the pair.
-
-The caller and driver share one database connection. Connect, handshake,
-each retained job and teardown keep their original deadlines, including
-the 100 ms cleanup cap. A signal-interrupted wait recomputes time left.
-Native crypto work remains subject to TLS.md's between-call limits.
-
-Before driver intake, cap backend frames at 128 KiB including their length
-word, 128 frames and one MiB total for the entire connection. Fragmented
-headers and authentication codes retain nine bytes of framing state. A
-refusal aborts the transport. Plaintext output has a 64 KiB connection cap;
-TLS retains its existing two wire buffers. These are input/work bounds, not
-a whole-process RSS qualification or a serving pool reservation. The future
-storage worker must define operation-specific budgets and pool accounting.
-
-The sole query uses pg_catalog-qualified functions to inspect server version,
-recovery/read-only state, fsync and full_page_writes. It refuses recovery,
-read-only sessions or disabled durability settings and returns only the
-numeric version. All connections start with a fixed search_path, a five-second
-statement timeout, a one-second lock timeout and a ten-second idle-in-transaction
-timeout. Operations with a different idle budget set it inside their transaction. Worker teardown releases the client
-and drives pending responses, PostgreSQL Terminate and TLS shutdown for at
-most 100 milliseconds within the original deadline. Failed or expired
-connections still abort; cleanup never changes a known operation outcome or
-retries a write. Terminate ends any remaining read transaction without a
-separate SQL round trip. The probe writes no mail or configuration. This does not validate a schema, enforce a
-supported-version range, or establish replication/failover durability.
-Provider diagnostics and credentials never enter the fixed error enum.
-The worker drives `poll_message` and drops asynchronous notices without
-invoking the driver Future implementation, which logs raw server text.
-
-The ignored `postgres_probe` integration fixture requires an independently
-installed PostgreSQL 17 on `PATH`: the directory of the first `initdb`
-there, which must also hold `postgres`, `pg_ctl` and `psql`. No variable
-names it. It initializes only a new private disposable cluster, creates
-its own test certificate and password, and checks verified
-TLS/SCRAM, wrong name/trust/password, expired deadline, TLS refusal,
-cleartext/trust authentication refusal, read-only refusal and reconnect after
-server restart. It never connects to
-an operator's existing database. This is host qualification, not a shipped
-server package or evidence for Azure/RDS. Framing refusal tests run offline
-in the ordinary unit suite.
-The ordinary suite also checks expiry while a peer stalls SSLRequest.
-The framing boundary follows the
-[PostgreSQL message formats](https://www.postgresql.org/docs/17/protocol-message-formats.html).
-
-
-## 9. Implemented bootstrap decoding
+### Connection specification syntax
 
 `postgres_bootstrap::Bootstrap::parse` is a pure parser for a protected
 connection specification and profile name. It performs no file access,
-environment lookup, DNS, connection or service activation. Sections 10 and 11
-provide separate resolver and protected-file workers; loading a database
-profile remains startup work. Never put its secret-bearing input in argv or
-diagnostics.
-Neither the parsed value nor the connection request implements Debug.
+environment lookup, DNS, connection or service activation. Never put its
+secret-bearing input in argv or diagnostics. Neither the parsed value nor
+the connection request implements Debug.
 
-The initial syntax is one `postgresql://USER:PASSWORD@HOST[:PORT]/DATABASE`
-URI (`postgres://` is also accepted). Credentials and database are explicit;
+The syntax is one `postgresql://USER:PASSWORD@HOST[:PORT]/DATABASE` URI
+(`postgres://` is also accepted). Credentials and database are explicit;
 there are no environment defaults, password files, service-name expansion,
-multiple hosts or Unix-socket fallback. For TCP, HOST is an ASCII DNS name, including
-localhost, authenticated by the TLS facade; literal IPs, numeric address
-shorthand, numeric final labels and encoded hosts are refused. The default port
-is 5432. TLS verifies HOST on every connection.
+multiple hosts or Unix-socket fallback. For TCP, HOST is an ASCII DNS name,
+including localhost, authenticated by the TLS facade; literal IPs, numeric
+address shorthand, numeric final labels and encoded hosts are refused. The
+default port is 5432. TLS verifies HOST on every connection.
 
 The optional query accepts `sslmode=verify-full` and an absolute
-`sslrootcert` path, each at most once. Verification is mandatory even without
-sslmode. An absent root path means the public trust store; an explicit path
-replaces it. Unknown parameters, duplicate parameters and weaker TLS modes
-are refused, rather than forwarded to the driver. A root path here is only a
-name; its subsequent reader must enforce the protected-file policy.
+`sslrootcert` path, each at most once. Verification is mandatory even
+without sslmode. An absent root path means the public trust store; an
+explicit path replaces it. Unknown parameters, duplicate parameters and
+weaker TLS modes are refused, rather than forwarded to the driver. A root
+path here is only a name; its reader enforces the protected-file policy.
 
 Local Unix syntax is `postgresql://USER:PASSWORD@[:PORT]/DATABASE?host=DIR`,
 with an empty authority host and an absolute socket directory in the `host`
 query. The socket is `DIR/.s.PGSQL.PORT`; PORT defaults to 5432. Encode URI
-separators in DIR. Only this form accepts `sslmode=disable` (also its default);
-it rejects `sslrootcert` and any other SSL mode. A `host` query cannot replace
-a nonempty authority host. Directory spelling and the resulting socket path
-must satisfy the bounds above; filesystem admission happens at connect.
+separators in DIR. Only this form accepts `sslmode=disable` (also its
+default); it rejects `sslrootcert` and any other SSL mode. A `host` query
+cannot replace a nonempty authority host. Directory spelling and the
+resulting socket path must satisfy the socket bounds under "Verified TLS and
+private Unix transport"; filesystem admission happens at connect.
 
 Input is at most 16 KiB of printable ASCII without whitespace or fragments.
 Percent escapes decode once, preserving literal plus signs. Encode URI
 separators in credentials/database and spaces or non-ASCII data. User and
-database are nonempty UTF-8 text without controls, at most 256 decoded bytes.
-Passwords are 1..4096 non-NUL decoded bytes; the trust path is nonempty UTF-8
-without controls, at most 4096 bytes. Profiles are 1..64 ASCII letters,
-digits, dots, underscores or hyphens, starting with a letter or digit.
-All parse failures return fixed categories without the input or credentials.
-This decoder does not claim cloud connectivity or a supported schema.
+database are nonempty UTF-8 text without controls, at most 256 decoded
+bytes. Passwords are 1..4096 non-NUL decoded bytes; the trust path is
+nonempty UTF-8 without controls, at most 4096 bytes. Profiles are 1..64
+ASCII letters, digits, dots, underscores or hyphens, starting with a letter
+or digit. All parse failures return fixed categories without the input or
+credentials. This decoder does not claim cloud connectivity or a supported
+schema.
 
-## 10. Implemented resolver worker
+### Protected connection files
+
+`postgres_input::Loaded::open` reads a connection file and constructs its
+TLS trust store without DNS, database access or service admission. It takes
+the file path and profile, never a password argument. Every `postgres`
+operator command and `serve` load their bootstrap through it; `serve`
+reopens the file on every configuration reload. The file's parent must
+satisfy the existing `PrivateRoot` contract: mode 0700, non-root owner,
+absolute normalized path within `MAX_ROOT_BYTES`, no symlinks and only
+root/owner ancestors without shared write permissions. The process must run
+as that dedicated owner; std does not verify the process UID. Namespace
+writers and mount authority are trusted, paths remain stable, and checks do
+not defend against hostile pathname races. Opening this directory acquires
+no store lock and creates no local database.
+
+The existing `operator_files::Inputs` boundary checks the connection as a
+regular secret input (0400 or 0600) and binds all input ownership to that
+parent. The URI is at most 16 KiB, optionally followed by one LF or CRLF.
+Other whitespace, comments, extra lines and invalid UTF-8 refuse. The
+reader retains at most 16 KiB plus three bytes of source scratch before
+parsing; parsed credentials are separate bounded allocations. It makes no
+secure memory-erasure claim.
+
+An explicit sslrootcert is opened as a public input under the same owner
+and ancestor policy, including secret/public inode-alias refusal, and read
+with 128 KiB plus one byte of scratch. `TrustStore::from_pem` enforces its
+complete private-CA bundle contract. Explicit trust replaces public roots;
+missing, unreadable, oversized or invalid explicit trust never falls back.
+Without sslrootcert, only the facade's compiled public roots are loaded.
+Every failure is a fixed category, without file paths, file bytes or
+provider messages. Reads are bounded in bytes, not wall time:
+operator-provisioned regular files are cold trusted I/O, outside the
+network deadline.
+
+### Writer endpoint resolution
 
 For an explicit Unix bootstrap, `postgres_resolver::resolve` returns the
 single typed socket endpoint under the supplied deadline, without launching
-a child. For TCP it accepts the parsed bootstrap, the caller's
-trusted absolute td-mta executable path and an absolute deadline at most five seconds
-away. On a cache miss it starts that executable in private resolver mode with a cleared
-environment, hostname-only stdin, bounded stdout and discarded stderr.
-No connection URI, credentials, profile or trust bytes enter the child.
+a child. For TCP it accepts the parsed bootstrap, the caller's trusted
+absolute td-mta executable path and an absolute deadline at most five
+seconds away. On a cache miss it starts that executable in private resolver
+mode with a cleared environment, hostname-only stdin, bounded stdout and
+discarded stderr. No connection URI, credentials, profile or trust bytes
+enter the child.
+
 One parsed bootstrap may reuse its most recent positive answer, in resolver
 order, for one second from lookup start. A hit never extends that interval.
 The platform supplies no DNS TTL. If the address changes, a new connection
 can see the old answer until the interval expires. Existing transport
 fallback, TLS hostname verification, primary qualification and mutation
 settlement apply as usual. The next lookup after expiry consults the system
-resolver even if all recent connections failed. Negative answers and expired
-answers are never served from the cache.
-
-Each profile load starts empty. The cache retains at most sixteen IP
-addresses, with no credentials or trust material. Concurrent misses can run
-independently within the existing worker limits, without waiting for another
-caller's helper. The dedicated outbound HTTP lookup has no such cache.
+resolver even if all recent connections failed. Negative answers and
+expired answers are never served from the cache. Each parsed bootstrap
+starts with no answer. The cache retains at most sixteen IP addresses, with
+no credentials or trust material. Concurrent misses run independently,
+without waiting for another caller's helper; no resolver-specific limit
+bounds them beyond their callers' own worker limits. The dedicated outbound
+HTTP lookup has no such cache.
 
 The child uses the platform resolver and may consult trusted host resolver
 configuration. Blocking libc/NSS resolution stays outside service workers.
@@ -573,220 +526,571 @@ capacity; no streaming partial result is accepted.
 
 Before reading stdin, the dedicated child starts a watchdog that exits its
 whole process after five seconds. This requests expiry after parent loss
-and during blocked input/read/lookup; native exit cleanup may delay it. The internal entry point always
-exits; it cannot leave a watchdog behind in a serving process. Ordinary
-shutdown still owns and reaps an in-flight helper. Native process creation,
-scheduling, kill/reaping, native exit cleanup and filesystem/libc calls retain the platform's
-between-call limitations; this is not a hard real-time or resolver RSS
-claim. The child uses no shell, external resolver program or new dependency.
-The eventual serving pool must separately bound concurrent resolutions.
+and during blocked input/read/lookup; native exit cleanup may delay it. The
+internal entry point always exits; it cannot leave a watchdog behind in a
+serving process. Ordinary shutdown still owns and reaps an in-flight
+helper. Native process creation, scheduling, kill/reaping, native exit
+cleanup and filesystem/libc calls retain the platform's between-call
+limitations; this is not a hard real-time or resolver RSS claim. The child
+uses no shell, external resolver program or new dependency. This resolver
+is not cloud DNS-failover or writer-reconnection qualification.
 
-Unit process fixtures qualify parent cancellation and independent child
-expiry. An explicitly ignored host integration fixture invokes the built td-mta
-binary and resolves localhost twice, without external DNS or an operator
-database. It requires the host name-service configuration; hermetic suites
-still run the resolver deadline/argument checks without that dependency. Cloud DNS
-failover and writer reconnection remain separate qualification work.
+### Verified TLS and private Unix transport
 
-## 11. Implemented protected bootstrap loading
+Every database operation, owner command and serving connection runs on one
+`postgres_probe` connection worker; `postgres_probe::probe` is its
+diagnostic entry point. The caller supplies an explicit TCP or Unix
+endpoint, server DNS name for TCP, borrowed credentials, trust store and an
+absolute Instant deadline. The deadline is at most ten seconds away unless
+the operation's own section admits a longer one, and connection setup never
+receives more than ten seconds. The worker does not resolve DNS, read a
+connection file, load a profile, migrate a schema or retry. User/database
+names are nonempty, NUL-free and at most 256 bytes; passwords are 1..4096
+bytes. The TLS facade validates the at-most-253-byte TCP server name before
+dialing.
 
-`postgres_input::Loaded::open` reads a connection file and constructs its
-TLS trust store without DNS, database access or service admission. It takes
-the file path and profile, never a password argument. The operator probe in
-section 12 selects it; serving does not. The file's parent must satisfy the
-existing `PrivateRoot` contract:
-mode 0700, non-root owner, absolute normalized path within `MAX_ROOT_BYTES`,
-no symlinks and only root/owner ancestors without shared write permissions.
-The supervisor must run as that dedicated owner; std does not verify the
-process UID. Namespace writers and mount authority are trusted, paths remain
-stable, and checks do not defend against hostile pathname races. Opening
-this directory acquires no store lock and creates no local database.
+One worker drives connect and its operation through tokio-postgres. For
+TCP, TLS is required. The driver sends SSLRequest; td-crypto's outbound
+Postgres selector verifies the certificate chain and server name before
+startup credentials enter the stream. There is no plaintext fallback,
+direct-TLS ALPN, client certificate or channel-binding claim. The plaintext
+framing guard requires the SASL challenge/final/OK sequence and refuses
+MD5, cleartext-password, trust and other authentication methods. The pinned
+driver selects SCRAM-SHA-256 and verifies its server signature; its
+100,000-iteration ceiling bounds the server-directed password work.
 
-The existing `operator_files::Inputs` boundary checks the connection as a
-regular secret input (0400 or 0600) and binds all input ownership to that
-parent. The URI is at most 16 KiB, optionally followed by one LF or CRLF.
-Other whitespace, comments, extra lines and invalid UTF-8 refuse. The reader
-retains at most 16 KiB plus three bytes of source scratch before parsing;
-parsed credentials are separate bounded allocations. It makes no secure
-memory-erasure claim.
+For an explicit Unix endpoint the same worker uses the raw socket, with SSL
+disabled only for this endpoint type. The framing guard, SCRAM sequence,
+output limits and retained-session validation windows attach before driver
+startup; skipping the TLS connector cannot bypass them. No certificate
+file, DNS lookup, TCP listener or TCP fallback is involved. Account/role,
+schema, transaction and commit-outcome handling are identical to the TCP
+path.
 
-An explicit sslrootcert is opened as a public input under the same owner
-and ancestor policy, including secret/public inode-alias refusal, and read
-with 128 KiB plus one byte of scratch. `TrustStore::from_pem` enforces its
-complete private-CA bundle contract. Explicit trust replaces public roots;
-missing, unreadable, oversized or invalid explicit trust never falls back.
-Without sslrootcert, only the facade's compiled public roots are loaded.
-Every failure is a fixed category, without file paths, file bytes or provider
-messages. Reads are bounded in bytes, not wall time: operator-provisioned
-regular files are cold trusted I/O, outside the network deadline.
+Shared `td-fs` admission checks an absolute pathname of at most 107 bytes,
+with no empty, dot or parent components, symlink, or abstract namespace.
+Its direct parent must be owned by the current UID with mode 0700, and the
+socket by that UID with mode 0600. Physical ancestors must belong to root
+or this UID; shared-writable ancestors require the sticky bit, which
+protects their owned child names. Root and same-UID namespace writers
+remain trusted; these are stable-path checks, not atomic lookup against
+hostile same-UID code. Every connect rechecks the endpoint. Dialing shares
+one absolute deadline with admission to at most eight helper threads, each
+with a 256-KiB stack. A timed-out connect retains its slot until the kernel
+call returns; its late stream is closed. Repeated failures cannot
+accumulate unbounded threads. These helpers exist only while dialing Unix
+endpoints, with at most 2 MiB of requested stack reservation per process,
+in addition to thread overhead.
 
-Unit tests cover line endings, decoding and bounded reads. The ignored
-`protected_files_enforce_modes_aliases_and_explicit_trust` host fixture
-requires a private TMPDIR under trusted ancestors and exercises actual file
-modes, symlinks, secret/public hard-link aliasing, trust replacement, missing
-trust and size refusal. It uses only a disposable TempDir and generated CA;
-ordinary sandbox tests do not assume host directory ownership.
+### Connection driver and input bounds
 
+One worker polls the request future and the PostgreSQL connection on its
+own thread. TCP and Unix reads and writes stay nonblocking during startup,
+queries and shutdown. The worker retries after socket bytes, TLS record
+processing or a driver wake. Once idle it waits in Linux `ppoll` for the
+read and write directions that actually blocked, together with a private
+wake socket. Channel wakes can interrupt that wait. LISTEN uses the same
+mechanism within the caller's slice; idle health checks return directly.
+Each live driver owns one database socket and two local wake descriptors.
+Connection setup fails if it cannot reserve the pair.
 
-## 12. Operator PostgreSQL probe
+The caller and driver share one database connection. Connect, handshake,
+each retained job and teardown keep their original deadlines, including
+the 100 ms cleanup cap. A signal-interrupted wait recomputes time left.
+Native crypto work remains subject to TLS.md's between-call limits.
+
+Before driver intake, the default allowance caps backend frames at 128 KiB
+including their length word, 128 frames and one MiB total for the entire
+connection. Fragmented headers and authentication codes retain nine bytes
+of framing state. A refusal aborts the transport. Client output defaults to
+a 64 KiB connection cap; TLS retains its existing two wire buffers. Each
+operation class selects its own input and output allowance
+(`postgres_probe::with_*`), named in its section; a runtime-mode connection
+admits at least 1024 frames ("Qualification on each runtime connection").
+No allowance changes the 128-KiB per-frame cap or the authentication
+checks. These are input/work bounds, not a whole-process RSS qualification
+or a serving pool reservation.
+
+### Session settings and primary qualification
+
+Every connection starts with `search_path=pg_catalog`, a five-second
+statement timeout, a one-second lock timeout and a ten-second
+idle-in-transaction timeout. Operations with a different idle budget set it
+inside their transaction. The qualification query uses pg_catalog-qualified
+functions to inspect server version, recovery/read-only state, fsync and
+full_page_writes. It refuses recovery, read-only sessions or disabled
+durability settings and returns only the numeric version. Every schema
+ledger inspection additionally requires PostgreSQL major 17 and a UTF8
+database ("Schema ledger and migration versions").
+
+Worker teardown releases the client and drives pending responses,
+PostgreSQL Terminate and TLS shutdown for at most 100 milliseconds within
+the original deadline. Failed or expired connections still abort; cleanup
+never changes a known operation outcome or retries a write. Terminate ends
+any remaining read transaction without a separate SQL round trip. The
+qualification query alone does not validate a schema, enforce a
+supported-version range, or establish replication/failover durability.
+Provider diagnostics and credentials never enter the fixed error enum. The
+worker drives `poll_message` and drops asynchronous notices without
+invoking the driver Future implementation, which logs raw server text. The
+framing boundary follows the
+[PostgreSQL message formats](https://www.postgresql.org/docs/17/protocol-message-formats.html).
+
+Native PostgreSQL fixtures use only a new private disposable cluster built
+from the first `initdb` on `PATH` (PostgreSQL 17, with `postgres`, `pg_ctl`
+and `psql` in the same directory) and never connect to an operator's
+existing database. They are host qualification, not a shipped server
+package or evidence for Azure/RDS.
+
+### Runtime database logins
+
+`postgres runtime-check --connection-file PATH` checks the current schema
+and one dedicated runtime login's effective data privileges. It closes the
+connection before returning and neither grants privileges nor activates a
+profile. `postgres service-profile-check --connection-file PATH` performs
+the same check, then requires one of the four dedicated serving logins
+below and prepares the selected profile named for it, as `serve` would
+([Selected-profile runtime preparation](#selected-profile-runtime-preparation)); it reports `profile_checked:true`. Each serving connection
+qualifies its own login and schema before using its runtime authority.
+
+Each runtime login must be separate from the owner, have no role
+memberships, and have none of SUPERUSER, CREATEDB, CREATEROLE, REPLICATION
+or BYPASSRLS. It must not own the database or application objects or have
+database CREATE or application-schema CREATE privileges. This
+dedicated-login policy also refuses membership that currently disables
+inheritance or SET ROLE, rather than depending on those options remaining
+unchanged. Database TEMP privileges are outside this application-schema
+boundary. Provider administration and arbitrary externally installed
+SECURITY DEFINER functions are not audited by this check; database
+administrators remain trusted.
+
+Production services use five dedicated PostgreSQL logins. The server's
+authenticated session user selects the exact table and column privileges in
+`postgres_runtime_access::ServiceRole::grants`. Each primary serving login
+must match its selected profile name and roles. The ACME command has its
+own login. Every service can read the schema ledger, runtime barrier and
+replica source marker for admission.
+
+| Login | Additional database authority |
+| --- | --- |
+| `td_mta_receive` | Publish SMTP mail to the Inbox, maintain thread and change history, charge quotas and write application logs. Existing blob bodies, device verifiers and the outbound queue are inaccessible. |
+| `td_mta_frontend` | Authenticate devices, read and mutate mailbox data through JMAP, create uploads and submissions and cancel submissions. Device credential administration and route ownership remain separate. |
+| `td_mta_relay`, `td_mta_migadu` | Deliver submissions, track attempts, produce failure notices and reclaim retired submissions and uploads. Both workers operate on the same queue tables and can read the shared body store, including stored incoming mail and drafts. The configured route and ownership fences distinguish their application operations. |
+| `td_mta_acme` | Read and update certificate issuance state and publish certificates. Mail storage and the service configuration views are inaccessible. |
+
+The dedicated login's profile is named for its role (`receive`, `frontend`,
+`relay` or `migadu`) and must declare exactly that role's bit: receive for
+`td_mta_receive`, JMAP for `td_mta_frontend`, relay for the two relay
+logins. Qualification checks every application table, including tables
+absent from that login's grant plan. Missing grants, extra privileges,
+PUBLIC grants, delegation and extra column grants refuse admission. The
+catalog check covers system columns as well as user-defined columns. The
+schema owner applies each role's grants and qualifies the corresponding
+service connection. PRODUCTION.md describes the coordinated cutover and
+rollback.
+
+The cold check uses the existing bounded listing transport (512 frames,
+1 MiB input, 64 KiB output), retaining the original ten-second maximum
+operation deadline and the shared migration lock through inspection.
+
+### Shared runtime login privileges
+
+The shared-login contract remains available for single-login
+installations: any login that is not one of the five dedicated names is
+qualified against it. The table inventory lives in
+`postgres_runtime_access::TABLES`. In this mode all current tables require
+SELECT. Mail data and receipt tables require INSERT, UPDATE and DELETE,
+while schema, immutable configuration, selection receipts, bootstrap
+receipts, replica bookkeeping and reserved import tables are read-only.
+Upload leases require SELECT, INSERT and DELETE, so upload publication and
+relay retention can reclaim expired ones (section 35); any UPDATE, which
+could extend a lease, refuses. The replica reader keeps SELECT and INSERT
+only on leases. The selection singleton permits only column-level UPDATE on
+`singleton`, which allows FOR SHARE policy fencing without changing its
+generation/version. Application tables must be ordinary logged tables
+without row security. Extra/missing tables, grant options, TRUNCATE,
+REFERENCES, TRIGGER and MAINTAIN privileges refuse. Column grants are
+checked as well as table grants.
+
+Provision the shared login through PostgreSQL/provider administration;
+keep its password out of argv. For a fresh `td_mta_runtime` login, the
+owner can grant the current schema privileges atomically as follows:
+
+```sql
+BEGIN;
+GRANT USAGE ON SCHEMA td_mta TO td_mta_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA td_mta
+    TO td_mta_runtime;
+REVOKE INSERT, UPDATE, DELETE ON
+    td_mta.schema_migrations, td_mta.runtime_barrier,
+    td_mta.config_materials,
+    td_mta.config_material_chunks, td_mta.config_versions,
+    td_mta.config_version_chunks, td_mta.config_selection,
+    td_mta.config_selection_receipts, td_mta.account_bootstraps, td_mta.replica_source,
+    td_mta.replica_accounts, td_mta.replica_progress, td_mta.replica_pending,
+    td_mta.replica_mailbox_receipts, td_mta.replica_email_receipts,
+    td_mta.replica_blob_identities,
+    td_mta.leases, td_mta.imports FROM td_mta_runtime;
+GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
+GRANT INSERT, DELETE ON td_mta.leases TO td_mta_runtime;
+COMMIT;
+```
+
+This is a fresh-role setup, not repair of inherited or preexisting grants.
+Validate with the runtime connection specification afterward. Owner
+commands retain their separate credential. Drain/stop serving instances
+before changing their runtime role or privilege contract; reconnect
+requalifies it. Before a schema upgrade, drain/stop all instances and
+maintenance jobs. Existing explicit schema/table/column grants are
+preserved under the owner migration ACL check. Apply any additional grants
+required by the new version and recheck before restart. Do not install
+default privileges on future tables.
+
+### Selected-profile service views
+
+For the four dedicated serving logins, the only path to secret material is
+through owner-defined security-barrier views in `td_mta_service`:
+`materials`, `material_chunks` and `active_certificates`. The views bind
+the session user and the selected configuration version to that profile's
+allowed material IDs and managed certificate profiles, recorded in the
+`material_bindings` and `certificate_bindings` tables. Shared material,
+such as a TLS key used by both SMTP and HTTPS, is available to each profile
+that uses it. Relay transport credentials are specific to their configured
+profiles. Only ACME directly accesses `td_mta.acme_profiles`.
+
+`td-mta postgres service-material-bind --connection-file PATH --epoch HEX`
+is the owner command that installs this namespace when absent and rebuilds
+the bindings from the currently selected, freshly validated version, in one
+transaction that locks the selection row and refuses if the selection
+changed (`request-or-generation-conflict`). Rerunning it after an uncertain
+commit is safe. The namespace is created outside the migration ledger; the
+deployer grants USAGE on `td_mta_service` and SELECT on the three views to
+each serving login. Once installed, every configuration selection replaces
+the bindings in its own transaction ([Configuration selection (schema 7)](#configuration-selection-schema-7)). Owner writes and service
+admission both require the namespace and views to match the reviewed
+definitions exactly: owner-owned, security-barrier views with no other
+grants, rules, triggers, functions or column ACLs.
+
+### Qualification on each runtime connection
+
+The internal database request distinguishes preparation from runtime mode.
+Preparation remains the default of the protected bootstrap parser and all
+operator commands. Runtime mode authenticates TLS/SCRAM, checks primary and
+durability settings, acquires the shared migration lock, validates the
+current schema and checks the dedicated runtime role/table privileges and
+the maintenance barrier (section 205) before admitting an operation's SQL.
+A new connection repeats all of those checks; a previous cold receipt never
+substitutes for them. Retained sessions (the HTTPS authentication worker,
+HTTPS API read workers and the foreground relay idle reader) hold that
+qualification and migration lock for their finite connection lifetimes,
+with fresh job fences as specified under "Retained HTTPS authentication
+sessions" and section 2. Other operation-owned connections hold the lock
+through their operation. BodyChecks instead authenticates at open and
+performs this qualification inside every closed validation transaction
+(section 2 and section 180), before any Body queries. No prior turn
+supplies cached qualification. Mail helpers still enforce their own epoch,
+current configuration, device, snapshot and publication fences.
+
+Qualification failure closes the connection before the application callback
+runs, with separate redacted schema/role/privilege/maintenance errors. It
+performs no reconnect, publication retry or deadline renewal. An operation
+trying to resolve an earlier uncertain publication still retains that
+uncertainty when qualification refuses; refusal does not prove the earlier
+operation rolled back. Schema initialization and grants remain explicit
+owner operations. A privilege change is refused on the next connection.
+
+Runtime connections use at least 1024 frames to include qualification and
+the operation in one budget; mutation workers admit 1088 frames. Larger
+existing frame budgets, byte budgets, per-frame/authentication caps and
+output budgets are unchanged; qualification does not replenish any
+allowance. The original absolute deadline covers connection setup,
+qualification and application work. Nothing retries a qualification
+failure automatically.
+
+### Request credential ownership
+
+`http_auth::parse_basic` separates bounded HTTP Basic decoding from storage
+authentication. It retains the exact visible-ASCII username (1..254 bytes,
+excluding colon) and at most 97 password bytes. Its owned
+`BasicCredentials` retains at most 352 decoded bytes, has no Debug or Clone
+implementation, and clears its decoded buffer on drop. It contains
+presented bytes only, not a device ID, cached verifier result or
+authorization grant. `postgres_http_auth::Authentication` matches the
+username case-sensitively against a bounded registry of at most 16 account
+bindings, then checks the password using that account's fresh primary
+snapshot. It returns a principal containing both AccountId and DeviceId; a
+device ID alone cannot identify an account because device IDs are unique
+only within their account.
+
+The bounded HTTPS request worker retains this owner for that request only,
+borrowing its password for fresh primary snapshot and publication checks.
+It must not cache the owner across requests or replace those checks with
+the result of earlier authentication. TLS, configured-origin and attempt
+admission precede parsing. Invalid password syntax still goes to the
+backend's credential check; HTTP decoding is not app-password validation.
+
+### Operator connection probe
 
 `td-mta postgres probe --connection-file PATH --profile NAME` runs the
 protected loader, owned resolver helper and TLS/SCRAM probe together. Run
 as the connection directory's dedicated owner. It writes one bounded JSON
 result to stdout and exits zero on success, one on qualification failure,
-or two for invalid arguments. Passwords/URIs are file contents, never required
-arguments. Diagnostics include no input path, endpoint, credentials or raw
-provider text. The selected profile is syntax-checked only; it is not loaded
-from the database.
+or two for invalid arguments. Passwords/URIs are file contents, never
+required arguments. Diagnostics include no input path, endpoint,
+credentials or raw provider text. The selected profile is syntax-checked
+only; it is not loaded from the database.
 
 After cold file loading, DNS receives at most five seconds and the whole
-network operation receives ten seconds. Resolved addresses are attempted
-in order with the same absolute deadline. Only TCP/transport refusal permits
+network operation receives ten seconds. Resolved addresses are attempted in
+order with the same absolute deadline. Only TCP/transport refusal permits
 another address; authentication, TLS-policy, settings or deadline errors
-stop the operation. No attempt renews its budget. As in section 8, driver
+stop the operation. No attempt renews its budget. Driver
 connection/authentication failures are deliberately coarse. A slow first
 address may exhaust the budget before later addresses can be attempted.
+Every other `postgres` operator command shares this address and deadline
+policy unless its section says otherwise.
 
-Success reports the server version and explicitly sets schema_checked and
-profile_checked false. It proves only the section 8 connection/settings
-checks at that instant, not service readiness, replication durability or
-cloud failover qualification. It writes no mail/configuration, installs no
-schema and never opens serving listeners. The separate ignored
-`real_postgres_probe_command_loads_resolves_and_authenticates` fixture
-requires the section 8 PostgreSQL tools plus a private TMPDIR under trusted
-ancestors. It uses a fresh disposable database and tests the actual command,
-private trust, localhost resolution, wrong credentials, read-only refusal,
-restart/reconnect and connection-file mode refusal.
+Success reports the server version and explicitly sets `schema_checked` and
+`profile_checked` false. It proves only the connection/settings checks of
+"Session settings and primary qualification" at that instant, not service
+readiness, replication durability or cloud failover qualification. It
+writes no mail/configuration, installs no schema and never opens serving
+listeners.
 
-## 13. Prepared schema ledger
+### Foreground serve command
 
-`postgres_schema::initialize` is an explicit schema-owner operation used by
-section 14's preparation command; no serving path calls it. Its current
-server contract is PostgreSQL major 17, qualified locally on 17.10. Other
-majors refuse until separately qualified. It creates the preparation ledger
-and sections 16, 19, 21, 25, 27, 30 and 32's material/mail/device/configuration,
-account-bootstrap, passive selection and flag receipt tables,
-not a complete
-serving schema or runtime role. Serving still cannot select
-PostgreSQL. The owner credential is separate from the future runtime
-credential; no owner credential is installed into a serving pool here.
+```text
+td-mta serve --connection-file PATH --profile NAME --runtime PATH \
+    --scratch PATH [--read-only] [--minimum-retry-seconds 1..300]
+```
 
-The operation verifies the same writable-primary/durability settings as the
-probe, begins one transaction, sets synchronous_commit=on, and takes an
+`serve` loads its bootstrap through the protected loader, resolves the
+writer (at most five seconds within a ten-second startup deadline) and, on
+the first address that does not refuse at the transport, qualifies a
+runtime-mode connection, reads the managed-certificate revisions and
+prepares the selected database profile ([Selected-profile runtime preparation](#selected-profile-runtime-preparation)) with a dedicated or
+shared runtime login. `--read-only` selects the restricted replica-reader
+mode, which admits only a JMAP-only profile. Any other failure stops
+startup with a fixed redacted category before listeners open. The process
+then publishes its TLS generation, binds its private control endpoint and
+starts the selected roles' workers. CONFIG.md owns syntax and local
+runtime/scratch placement; the minimum retry interval is specified in
+section 219.
+
+Receive, JMAP and relay roles are all served, through the PostgreSQL SMTP
+storage, HTTPS authentication, JMAP and relay adapters, including a
+JMAP-only instance and a listener-free relay instance. The embedded
+backend, local-store commands and file-backed device registry are removed.
+The ready line on stdout reports `"reload":true` and `"signal_drain":true`.
+
+A watcher observes the selection every 30 seconds with a fresh resolution
+and a passive primary observation under a ten-second deadline. When the
+selected generation or version differs from the one the process loaded, it
+requests orderly drain of every worker; the process then repeats the
+complete startup above against the newly selected configuration, including
+rereading the connection file, and reopens its listeners after a brief gap.
+The control endpoint stays bound across reloads, so a control request
+arriving between generations waits for the next one. If the new
+configuration cannot be loaded, including an unreachable database or a
+profile the new version no longer contains, the process exits with that
+failure rather than keep serving the old generation. An operator stop,
+SIGTERM or SIGINT during drain ends the process instead of reloading. A
+failed observation leaves the current generation serving until the next
+poll; operations of the old generation are fenced at publication by the
+selection row (section 2). A changed managed-certificate revision under the
+same selection refreshes certificates on existing listeners without a
+reload (ACME.md). This is not a live migration or a complete release
+qualification claim.
+
+## 9. Schema ledger, roles and configuration
+
+This chapter specifies the application schema and its migration ledger,
+the owner commands that create, inspect, plan and upgrade it, the mail
+relation shapes, instance roles, immutable configuration material and
+source versions, how shared and per-profile sources compose and validate,
+the transactional configuration selection pointer and its retained
+requests, and how a serving process prepares its selected profile.
+
+### Schema ledger and migration versions
+
+`postgres_schema::initialize` is an explicit schema-owner operation used
+only by `schema-init`; no serving path initializes or upgrades a schema.
+Its server contract is PostgreSQL major 17, qualified locally on 17.10.
+Other majors refuse until separately qualified. Every ledger operation,
+including serving connection admission, also requires a UTF8 database (a
+different encoding reports the fixed unsupported-version-or-checksum
+refusal); text columns use the built-in C collation so byte ordering does
+not depend on the installation's locale. The owner credential is separate
+from every runtime credential and never enters a serving connection.
+
+Initialization verifies the same writable-primary/durability settings as
+the probe, begins one transaction, sets synchronous_commit=on, and takes an
 exclusive transaction-level try-lock on the bigint migration key
 0x74646d7461000001. Conflict returns Busy without waiting. It refuses any
 existing td_mta namespace, even an empty one. The committed SQL in
 src/postgres_schema.sql creates that schema and its schema_migrations
 ledger. Each migration records its exact DDL's SHA-256 and the same 128-bit
-store epoch in a ledger row. Version 1's committed SQL and checksum remain
-fixed; version 2 adds src/postgres_materials.sql and version 3 adds
-src/postgres_mail.sql; version 4 adds src/postgres_devices.sql, and version 5
-adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql,
-version 7 adds src/postgres_selection.sql, and version 8 adds
-src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
-Version 10 adds src/postgres_uploads.sql; version 11 adds
-src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql, and version 13 adds
-src/postgres_receiving.sql; version 14 adds src/postgres_submissions.sql;
-version 15 adds src/postgres_submission_routes.sql; version 16 adds
-src/postgres_route_owners.sql; version 17 adds src/postgres_attempts.sql;
-version 18 adds src/postgres_attempt_recovery.sql.
-New initialization applies all eighteen in
-one transaction. PUBLIC grants are revoked; inherited
-schema/relation grants to other roles refuse initialization and roll back.
-Explicit service grants are installed separately after initialization.
+store epoch in a ledger row. New initialization applies every migration in
+one transaction. PUBLIC grants are revoked; inherited schema/relation
+grants to other roles refuse initialization and roll back. Explicit service
+grants are installed separately after initialization.
+
+The compiled migrations (`postgres_schema::MIGRATIONS`, `VERSION` 45) are:
+
+| Version | DDL |
+| --- | --- |
+| 1 | src/postgres_schema.sql |
+| 2 | src/postgres_materials.sql |
+| 3 | src/postgres_mail.sql |
+| 4 | src/postgres_devices.sql |
+| 5 | src/postgres_configuration.sql |
+| 6 | src/postgres_accounts.sql |
+| 7 | src/postgres_selection.sql |
+| 8 | src/postgres_flags.sql |
+| 9 | src/postgres_flag_batches.sql |
+| 10 | src/postgres_uploads.sql |
+| 11 | src/postgres_drafts.sql |
+| 12 | src/postgres_mailbox_create.sql |
+| 13 | src/postgres_receiving.sql |
+| 14 | src/postgres_submissions.sql |
+| 15 | src/postgres_submission_routes.sql |
+| 16 | src/postgres_route_owners.sql |
+| 17 | src/postgres_attempts.sql |
+| 18 | src/postgres_attempt_recovery.sql |
+| 19 | src/postgres_attempt_phases.sql |
+| 20 | src/postgres_attempt_acceptance.sql |
+| 21 | src/postgres_attempt_refusal.sql |
+| 22 | src/postgres_attempt_rcpt.sql |
+| 23 | src/postgres_attempt_command.sql |
+| 24 | src/postgres_queue_expiry.sql |
+| 25 | src/postgres_route_health.sql |
+| 26 | src/postgres_submission_cancel.sql |
+| 27 | src/postgres_final_capacity.sql |
+| 28 | src/postgres_runtime_barrier.sql |
+| 29 | src/postgres_logs.sql |
+| 30 | src/postgres_acme.sql |
+| 31 | src/postgres_recovery.sql |
+| 32 | src/postgres_legacy_bodies.sql |
+| 33 | src/postgres_summaries.sql |
+| 34 | src/postgres_mime_evidence.sql |
+| 35 | src/postgres_search.sql |
+| 36 | src/postgres_replica_source.sql |
+| 37 | src/postgres_replica_progress.sql |
+| 38 | src/postgres_replica_effects.sql |
+| 39 | src/postgres_replica_mailboxes.sql |
+| 40 | src/postgres_search_index.sql |
+| 41 | src/postgres_receipt_stamps.sql |
+| 42 | src/postgres_retry_floor.sql |
+| 43 | inline `DROP TABLE td_mta.receiving_receipts;` |
+| 44 | src/postgres_replica_retention.sql |
+| 45 | src/postgres_email_received_order.sql |
+
+Every version's committed SQL and checksum are fixed once landed; a schema
+change is a new version. The backup restore verifier pins the same
+checksums in `builder/src/install_mta_backup/restore_migrations.sha256`,
+and a unit test keeps the two lists identical.
+
+### Schema upgrade and grant preservation
 
 `postgres_schema::upgrade` uses an explicit owner credential and the same
 exclusive transaction migration lock. It validates all existing checksums
-and the common epoch before applying every missing migration. A
-compatible current ledger returns its receipt without another write.
-Unknown, missing, changed or inconsistent ledger history refuses. Migration
-preserves the epoch and commits the DDL and ledger row together. A failed
-migration rolls back, leaving the prior version intact; an old version
-cannot serve current operations. Post-COMMIT uncertainty has the same no-replay
-rule as initialization. The connection must use preparation mode and the
-session user must own both the `td_mta` namespace and its ordinary permanent
-`schema_migrations` table, including for a compatible current-version receipt.
+and the common epoch before applying every missing migration. A compatible
+current ledger returns its receipt without another write. Unknown,
+missing, changed or inconsistent ledger history refuses. Migration
+preserves the epoch and existing rows and commits the DDL and ledger rows
+together in one transaction, whose statement and transaction timeouts are
+set to the operation's remaining deadline. A failed migration rolls back,
+leaving the prior version intact; an old version cannot serve current
+operations. Post-COMMIT uncertainty has the same no-replay rule as
+initialization. The connection must use preparation mode and the session
+user must own both the `td_mta` namespace and its ordinary permanent
+`schema_migrations` table, including for a compatible current-version
+receipt.
 
-An upgrade inventories existing explicit nonowner schema, relation and column
-ACL entries in `td_mta` and `td_mta_trgm`, with at most 4096 entries before and
-after the migration transaction. PUBLIC entries or overflow refuse. Before
-COMMIT, every final entry must match an original object class/OID, column
-number, grantor, grantee, privilege and grant option; revocation and removal of
-a grant option are allowed. New objects cannot inherit service access from
-default privileges. Initialization has an empty baseline. These inventories
-use bounded typed rows and require no database TEMP privilege. Current-version
-receipts validate ownership and ledger history, not the ACL inventory.
+An upgrade inventories existing explicit nonowner schema, relation and
+column ACL entries in `td_mta` and `td_mta_trgm`, with at most 4096 entries
+before and after the migration transaction. PUBLIC entries or overflow
+refuse. Before COMMIT, every final entry must match an original object
+class/OID, column number, grantor, grantee, privilege and grant option;
+revocation and removal of a grant option are allowed. New objects cannot
+inherit service access from default privileges. Initialization has an empty
+baseline. These inventories use bounded typed rows and require no database
+TEMP privilege. Current-version receipts validate ownership and ledger
+history, not the ACL inventory.
 
 This preserves explicit grants, not all effective access: role membership,
-ownership, database privileges and routine/type ACLs are outside this check.
-The bundled extension's routine defaults are outside its scope; its private
-namespace remains the access boundary. Table-wide grants naturally cover new
-columns. Stop all database users and administrative grant changes throughout
-the upgrade; the migration lock does not serialize arbitrary administrator
-DDL. Add any required grants for newly created tables explicitly afterward,
-then run runtime qualification before restarting services.
+ownership, database privileges and routine/type ACLs are outside this
+check. The bundled extension's routine defaults are outside its scope; its
+private namespace remains the access boundary. Table-wide grants naturally
+cover new columns. Stop all database users and administrative grant changes
+throughout the upgrade; the migration lock does not serialize arbitrary
+administrator DDL. Add any required grants for newly created tables
+explicitly afterward, then run runtime qualification before starting
+services again.
 
-The client shares the original ten-second worker limit, configured
-statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 10240 input frames for migrations, ledger writes and both bounded ACL
-inventories; probe, inspection and material operations retain 128. The per-frame 128 KiB
-and total 1 MiB input bounds, authentication checks and terminal budget
-refusal are unchanged. Schema operations permit 128 KiB of post-TLS output,
-including startup/authentication and statement names. Driver statement names
-grow with a process-wide counter; schema initialization must still fit after
-long owner audit runs. Probe output remains bounded to 64 KiB. Fixed SQL and typed
-parameters are private to the crate; arbitrary driver execution is not a
-public API. Initialization errors before COMMIT drop the session and leave
-no committed namespace; migration errors preserve the previous schema. Once
-COMMIT may have been sent, a lost response or deadline is Indeterminate,
-never a safe-to-retry refusal. A known successful commit retains its receipt
-even if completing that poll crosses the deadline. There is no automatic
-replay or uncertainty resolver in this preparation API. An operator must
-resolve database state before another initialization.
+### Schema ledger inspection
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently thirteen rows); it requires
-exactly the twelve ordered migration versions, their compiled DDL checksums and
+count plus one (currently 46 rows); it requires exactly the compiled
+ordered migration versions (currently 45), their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
 ledger, not every catalog object or evidence against a malicious schema
 owner. Serving connections retain their own shared lock throughout their
-lifetime and validate the complete serving schema, except for the closed
-Body-validation turns specified in sections 2 and 180.
+lifetime and validate the complete ledger, except for the retained
+validators that take a per-turn transaction lock (section 2). Migration
+planning instead accepts a recognized prefix of the compiled ledger
+("Schema operator commands").
 
-The real PostgreSQL schema fixture checks existing-namespace refusal,
-rollback after inherited-grant refusal, shared/exclusive migration
-conflicts, initialization/inspection, restart persistence and
-version/checksum refusal. A second fixture delays COMMIT with a disposable
-deferred trigger, observes Indeterminate at the client deadline, then
-inspects the committed ledger after the original session ends and verifies
-that another initialization refuses. A database commit can outlive the
-client deadline and disconnect; the configured statement timeout does not
-establish rollback. Neither fixture uses an existing database. They require
-the section 8 tools, including psql. The advisory-lock lifetime/conflict
+### Schema operation budgets and commit uncertainty
+
+Initialization shares the ten-second worker limit; upgrade accepts a
+caller deadline of up to 3600 seconds. Both keep the configured
+statement and lock timeouts (upgrade raises the statement and transaction
+timeouts to its deadline inside its transaction; the one-second lock
+timeout stays) and protocol byte caps. Owner initialization/upgrade permits
+10240 input frames for migrations, ledger writes and both bounded ACL
+inventories; probe, inspection and material operations retain 128 in
+preparation mode. The per-frame 128 KiB and total 1 MiB input bounds,
+authentication checks and terminal budget refusal are unchanged. Schema
+operations permit 128 KiB of post-TLS output, including
+startup/authentication and statement names. Driver statement names grow
+with a process-wide counter; schema initialization must still fit after
+long owner audit runs. Probe output remains bounded to 64 KiB. Fixed SQL
+and typed parameters are private to the crate; arbitrary driver execution
+is not a public API.
+
+Initialization errors before COMMIT drop the session and leave no committed
+namespace; migration errors preserve the previous schema. Once COMMIT may
+have been sent, a lost response or deadline is Indeterminate, never a
+safe-to-retry refusal. A database commit can outlive the client deadline
+and disconnect; the configured statement timeout does not establish
+rollback. A known successful commit retains its receipt even if completing
+that poll crosses the deadline. There is no automatic replay or uncertainty
+resolver for schema operations. An operator must resolve database state
+before another initialization. The advisory-lock lifetime/conflict
 behavior follows PostgreSQL's [advisory-lock
 functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS).
 
-## 14. Operator schema preparation
+### Schema operator commands
 
 `td-mta postgres schema-init --connection-file PATH` explicitly initializes
-section 13's preparation ledger using a separately provisioned schema-owner
-login. It refuses every existing td_mta namespace. It creates the prepared
-material, mail, device, immutable configuration, account-bootstrap and
-selection and flag receipt relations with an initially empty passive configuration
-pointer, but no runtime role or listener. The matching `td-mta
-postgres schema-inspect --connection-file PATH` checks the ledger under its
-shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH [--timeout-seconds N]` applies every missing migration or reports an
-already current ledger. None of these commands takes a profile: the
-namespace and epoch are deployment-wide.
+the ledger and every migration using a separately provisioned schema-owner
+login. It refuses every existing td_mta namespace. It creates all
+application relations with an initially empty configuration selection, but
+no runtime role or listener. The matching `td-mta postgres schema-inspect
+--connection-file PATH` checks the ledger under its shared migration lock.
+`td-mta postgres schema-upgrade --connection-file PATH [--timeout-seconds
+N]` applies every missing migration or reports an already current ledger.
+None of these commands takes a profile: the namespace and epoch are
+deployment-wide.
 
-These commands use the same protected bootstrap, verified TLS/SCRAM, fresh
-bounded DNS lookup and ten-second default deadline as the probe. Schema
-upgrade accepts a longer maintenance deadline, up to 3600 seconds. They
-try another resolved address only on a definite transport refusal before
+These commands use the protected bootstrap, verified TLS/SCRAM, fresh
+bounded DNS lookup and ten-second default deadline of the probe. Schema
+upgrade accepts a longer maintenance deadline, up to 3600 seconds. They try
+another resolved address only on a definite transport refusal before
 COMMIT; the schema worker converts every connection loss after COMMIT may
 have been sent to Indeterminate. No schema error, migration conflict or
 uncertain commit is retried. Exit codes remain zero for success, one for
@@ -800,117 +1104,165 @@ commit; wait for that operation to settle and inspect database state before
 another explicit initialization. An immediate missing-ledger inspection is
 not proof of rollback. A failed stdout write can also lose a successful
 receipt; do not interpret a missing command response as permission to
-replay.
+replay. These commands check the ledger, not complete schema integrity or
+operational mail service, and never enable mail serving.
 
-These commands qualify only the preparation ledger, not complete schema
-integrity or operational mail service. Further schema migrations require
-explicit owner upgrade; profile publication remains separate work.
+### Schema migration planning
 
-## 15. Prepared instance role validation
+`postgres schema-plan --connection-file PATH` takes a shared migration
+lock and validates the ledger through its last installed migration. It
+reports the current and target versions, the store epoch, the ordered
+pending versions, the required schema USAGE, and target table and column
+grants for the shared primary runtime login (`primary_grants`) and for each
+isolated production profile (`service_grants`). Each profile maps table
+names in `td_mta` to the required SQL privilege list. Tables absent from
+that profile's map receive no grant. The four serving logins additionally
+need USAGE on `td_mta_service` and SELECT on its three views
+("Selected-profile service views"), which the plan does not list. Role
+membership, ownership, maintenance state and effective privileges are
+qualified by `runtime-check` after migration. An empty pending list means
+the ledger is current. A corrupt, missing or newer ledger fails. Planning
+changes no SQL objects. Serving and runtime qualification continue to
+require the complete ledger.
 
-`config::profile::Roles` provides the closed, nonempty role set for future
-profile rows: receiving is bit 1, JMAP bit 2 and relay bit 4. Unknown bits
-refuse decoding. These values are structural declarations, never proof of
-runtime support or authorization. No database profile is stored or activated
-by this preparation API.
+### Mail relation shapes (schema 3)
+
+Schema version 3 adds the mail relations. Versions 1 and 2's SQL and
+checksums are unchanged; upgrade from either preserves the epoch and
+existing material rows in the same transaction as version 3's DDL.
+
+The account row holds the committed sequence and retained history floor as
+fixed eight-byte big-endian values, preserving the full unsigned range and
+lexicographic order. The floor cannot exceed the sequence. Mutations must
+lock this row and allocate their sequence transactionally; there is no SQL
+sequence. Blob IDs remain reserved separately from live manifests.
+Manifests contain length, SHA-256, creation time, changed sequence and
+exact ceiling-divided chunk count. Bodies have no whole-message column.
+Chunk rows are account/blob scoped and one through 65,536 bytes. Schema 3
+bounded ordinals to 0 through 511 and manifests to 32 MiB; schema 32 widens
+them to 0 through 1023 and 64 MiB ([Legacy message storage (schema
+32)](#legacy-message-storage-schema-32)). Empty blobs have zero chunks. Deleting a manifest cascades its chunks but retains its reserved
+ID.
+
+The remaining relations preserve mailbox, immutable thread assignment,
+message receipt provenance, membership, keyword, thread anchor, submission,
+recipient, upload lease, import marker and change-history shapes. Foreign
+keys include account identity; historical submission/import identities
+intentionally do not require live objects. Text bounds measure UTF-8 bytes.
+Existing deferred references permit one transaction to build a complete
+graph, and native indexes support account-scoped keyset reads. All tables
+are ordinary logged tables. The owner-only migration ACL checks also cover
+these tables and indexes.
+
+These are row-shape and reference constraints, not a complete publication
+validator. The typed transactions that publish into them verify contiguous
+chunks, exact length and digest, mailbox graphs, immutable fields,
+recipient/receipt coverage, retained history, authorization, quotas and
+operation receipts before COMMIT. Upload leases are not delivery ownership:
+route and attempt ownership use their own tables and fences (section 52).
+
+### Instance roles and role-aware profile loading
+
+`config::profile::Roles` is the closed, nonempty role set of a profile:
+receiving is bit 1, JMAP bit 2 and relay bit 4. Unknown bits refuse
+decoding. These values are structural declarations, never proof of
+authorization. Each profile of a configuration version stores its role
+bits beside its source ([Immutable configuration source versions (schema 5)](#immutable-configuration-source-versions-schema-5)); a disabled or unsupported role cannot
+become active merely because a row names it.
 
 `config::listener::Builder::finish_for_roles` requires SMTP listeners
-exactly when receiving is selected and HTTPS listeners exactly when JMAP is
-selected. A relay-only profile has no inbound listeners; HTTP-01 requires
-receiving or JMAP. Each profile retains the existing listener syntax,
-duplicate/bind checks and aggregate SMTP session limits. A disabled role
-cannot be enabled by merely adding its listener. Sticky builder failures
-remain terminal.
+exactly when receiving is selected and HTTPS (`https` or `local_jmap`)
+listeners exactly when JMAP is selected. A relay-only profile has no
+inbound listeners; HTTP-01 requires receiving or JMAP. Each profile retains
+the existing listener syntax, duplicate/bind checks and aggregate SMTP
+session limits. A disabled role cannot be enabled by merely adding its
+listener. Sticky builder failures remain terminal.
 
-`config::load::read_profile` now carries explicit roles through whole-reader
+`config::load::read_profile` carries explicit roles through whole-reader
 EOF, stanza finalization, listener validation and graph closure. Its
 PreparedProfile retains the selected roles and provides read-only candidate
-inspection or storage reclamation. It cannot be passed as the legacy Loaded
-input to text/provider materialization or serving. No command selects it.
-The separate selected-profile content path is specified in section 18.
-Its owner is included in the compile-time workspace-state bound; the existing
-portable stack fixture qualifies the legacy loader, not this new entry point.
+inspection or storage reclamation. Configuration import, check, selection
+and runtime preparation load every profile through it. The roleless
+`config::load::read` treats its input as receiving plus JMAP; only
+structural fixtures use it, and PreparedProfile cannot be converted into
+its Loaded output. The profile text path is specified under "Profile text
+and TLS policy preparation". The owner is included in the compile-time
+workspace-state bound; the portable stack fixture (`tests/config_stack.rs`)
+qualifies the roleless loader's stack, not `read_profile`.
 
-The input is an already composed selected profile, not a database generation
-format. It retains existing account, identity, route, resource and relay
-requirements. A nonreceiving profile requires explicit domain MX names but
-does not require local SMTP listeners for those shared names; a receiving
-profile retains the local-MX/direct-listener check. Policy serving remains
-part of the HTTPS/JMAP listener role: an enabled MTA-STS policy in a composed
-profile without that role refuses. Certificate consumers, names, origin
-ports, ACME HTTP-01 and all other reference checks remain enforced. A
-relay-only profile has no inbound listeners and must omit unused certificates.
+The input is an already composed selected profile ("Shared and profile
+source composition"), not a database generation format. It retains
+existing account, identity, route, resource and relay requirements. A
+nonreceiving profile requires explicit domain MX names but does not require
+local SMTP listeners for those shared names; a receiving profile retains
+the local-MX/direct-listener check. Policy serving remains part of the
+HTTPS/JMAP listener role: an enabled MTA-STS policy in a composed profile
+without that role refuses. Certificate consumers, names, origin ports, ACME
+HTTP-01 and all other reference checks remain enforced. A relay-only
+profile has no inbound listeners and must omit unused certificates.
 
-The existing file loader still requires both receiving and JMAP as before.
-Future database generation validation must distinguish shared policy from
-per-profile policy serving, compose each selected profile, validate global
-receiving/policy coverage across profiles, resolve versioned database
-materials, verify implemented capabilities, and validate the entire
-generation before publication. This selected-profile structural API does
-not prove those deployment-wide properties.
+This structural check is per profile. Candidate validation ("Source
+candidate validation") adds the cross-profile checks it performs; it does
+not check that receiving or MTA-STS policy coverage is served by some
+profile.
 
-## 16. Prepared versioned configuration material
+### Versioned configuration material (schema 2)
 
 Schema version 2 adds owner-private config_materials manifests and
 config_material_chunks. `postgres_materials::insert` appends one explicit
 128-bit version and its immutable raw bytes in one durable transaction.
-`fresh_version` supplies random identifiers; a duplicate primary key refuses
-without replacing bytes. The caller retains its version before entry so a
-lost commit receipt does not force another identity. There is no update,
-delete, activation or public administration endpoint here. No service path
-consumes these records yet.
+`fresh_version` supplies random identifiers; a duplicate primary key
+refuses without replacing bytes. The caller retains its version before
+entry so a lost commit receipt does not force another identity. There is
+no update, delete, activation or public administration endpoint. Profiles
+name material versions ("Database material references in profiles");
+dedicated serving logins read them only through the service views
+("Selected-profile service views").
 
 The closed kinds and raw input ceilings are relay password (1026 bytes),
-certificate chain (64 KiB), private key (16 KiB), explicit trust bundle (128
-KiB), and text/HTML signature (16 KiB each). Only signatures may be empty.
-These match existing raw input limits, including optional password line
-endings. Storage validates size and kind, not text/PEM syntax, key validity,
-certificate names or cross-references. Complete generation admission must
-still run those checks before selecting a value. A stored reference cannot
-substitute one kind for another.
+certificate chain (64 KiB), private key (16 KiB), explicit trust bundle
+(128 KiB), and text/HTML signature (16 KiB each). Only signatures may be
+empty. These match existing raw input limits, including optional password
+line endings. Storage validates size and kind, not text/PEM syntax, key
+validity, certificate names or cross-references; candidate validation runs
+those checks before a configuration uses a value. A stored reference
+cannot substitute one kind for another.
 
-Each manifest stores kind, length, SHA-256 and chunk count; each chunk holds
-at most 64 KiB with an ordinal. Reads select one exact version and expected
-kind under a read-only repeatable-read snapshot. The worker requires exact
-contiguous ordinals, full non-final chunks, exact total length/count and a
-matching digest before exposing any bytes. It reads at most two manifest
-rows and three chunk rows to detect unexpected extras. SQL constraints bound
-individual rows; the typed writer/read verifier establish aggregate shape.
+Each manifest stores kind, length, SHA-256 and chunk count; each chunk
+holds at most 64 KiB with an ordinal. Reads select one exact version and
+expected kind under a read-only repeatable-read snapshot. The worker
+requires exact contiguous ordinals, full non-final chunks, exact total
+length/count and a matching digest before exposing any bytes. It reads at
+most two manifest rows and three chunk rows to detect unexpected extras.
+SQL constraints bound individual rows; the typed writer/read verifier
+establish aggregate shape.
 
 Every operation qualifies the primary and obtains the shared session schema
-lock, validates the complete current ledger and checks the caller's expected
-store epoch on that same connection. It retains the session through all SQL
-and byte verification. Writes use synchronous_commit=on; the manifest and
-chunks commit together. Failures before COMMIT roll back. Once COMMIT may
-have been sent, a lost response is Indeterminate. After the original backend
-settles, read the retained version and compare the intended bytes; absence
-while that backend may still commit is not proof of rollback. There is no
-automatic replay, uncertainty resolver or permission to pick a fresh version
-and duplicate an uncertain write.
+lock, validates the complete current ledger and checks the caller's
+expected store epoch on that same connection. It retains the session
+through all SQL and byte verification. Writes use synchronous_commit=on;
+the manifest and chunks commit together. Failures before COMMIT roll back.
+Once COMMIT may have been sent, a lost response is Indeterminate. After the
+original backend settles, read the retained version and compare the
+intended bytes; absence while that backend may still commit is not proof
+of rollback. There is no automatic replay, uncertainty resolver or
+permission to pick a fresh version and duplicate an uncertain write.
 
 Material operations retain the ten-second worker deadline, five-second
 statement timeout, one-second lock timeout, 128-KiB backend-frame bound,
 128-frame count and one-MiB input cap. Their post-TLS output cap is 256 KiB
 to carry a maximal trust bundle plus fixed SQL/authentication overhead;
-probe operations retain 64 KiB and schema operations permit 128 KiB.
-Each operation owns a cold,
-fallibly reserved copy of at most 128 KiB; driver encodings/row buffers and
-TLS/provider allocations are additional bounded inputs, not a complete RSS
-qualification. The returned Material owner intentionally has no Debug
-implementation, and errors contain no input bytes or SQL/provider
-diagnostics. Dropping memory does not claim secure erasure. Database owners,
-backups and authorized processes remain inside the service-secret trust
-boundary of section 2; these values confer no td human login or elevation
-authority.
+probe operations retain 64 KiB and schema operations permit 128 KiB. Each
+operation owns a cold, fallibly reserved copy of at most 128 KiB; driver
+encodings/row buffers and TLS/provider allocations are additional bounded
+inputs, not a complete RSS qualification. The returned Material owner
+intentionally has no Debug implementation, and errors contain no input
+bytes or SQL/provider diagnostics. Dropping memory does not claim secure
+erasure. Database owners, backups and authorized processes remain inside
+the service-secret trust boundary of section 2; these values confer no td
+human login or elevation authority.
 
-Real PostgreSQL fixtures cover version-1 migration with preserved epoch,
-rollback after inherited grants, migration-lock refusal, all raw input
-limits, empty signatures, duplicate immutability, kind/epoch refusal,
-restart persistence, chunk corruption/missing data, mid-write rollback and
-lost-COMMIT resolution using the original version. They use only disposable
-local clusters and do not qualify Azure/RDS or configuration activation.
-
-## 17. Operator material preparation
+### Material operator commands
 
 `td-mta postgres material-version` generates one random canonical 128-bit
 version without opening files, contacting a database or reserving an ID.
@@ -926,9 +1278,9 @@ td-mta postgres material-check --connection-file PATH --input-file PATH \
 Both IDs must be exactly 32 lowercase hex characters. Obtain the epoch from
 schema-inspect. Kinds are relay-password, certificate-chain, private-key,
 trust-bundle, text-signature and html-signature. These owner-authorized
-preparation commands store or compare raw bytes only; they neither validate
-text/PEM contents nor activate a configuration. No profile selector applies.
-There is no secret-bearing argument or command that prints stored bytes.
+commands store or compare raw bytes only; they neither validate text/PEM
+contents nor activate a configuration. No profile selector applies. There
+is no secret-bearing argument or command that prints stored bytes.
 
 The protected loader opens connection, optional explicit database trust and
 material in one owner/inode inventory. Passwords and private keys require
@@ -947,28 +1299,85 @@ bytes with the protected input, without outputting either value. A lost
 COMMIT response reports indeterminate-do-not-retry. Wait for the original
 backend to settle, then check that same epoch/version/kind/input. Missing
 while the original backend could still commit is not rollback evidence.
-Keep the intended input available until resolution; do not generate another
-version and replay. A lost stdout receipt likewise does not authorize replay.
+Keep the intended input available until resolution; do not generate
+another version and replay. A lost stdout receipt likewise does not
+authorize replay.
 
 Success JSON echoes only canonical IDs and explicitly reports
 content_validated=false and profile_activated=false. Errors use fixed
 categories without supplied paths, bytes or provider text. Exit codes are
 zero for success, one for refusal/failure and two for invalid arguments.
-The local PostgreSQL fixture covers the actual CLI, maximum and empty inputs,
-protected modes and aliases, kind/epoch/mismatch refusal, duplicate
-immutability and delayed-COMMIT resolution by the retained version.
 
-## 18. Prepared profile content validation
+### Database material references in profiles
 
-`config::materialize::read_profile_text` consumes PreparedProfile and decodes
-its relay password and signatures through the same bounded decoder as the
-legacy loader. It preserves the explicit role set in ResolvedProfile.
-Failures return reusable storage without validated headers; decoder scratch
-is cleared under the existing hygiene contract. The wrapper has redacted
-Debug output and no conversion into the legacy owned ResolvedText admission
-input. Its owner size remains inside the existing configuration-state bound;
-allocated_bytes accounts for that owner plus the existing backing regions,
-not provider memory or total process RSS.
+The postgres_profile_materials loader connects the selected-profile text
+and TLS consumers to immutable PostgreSQL material versions. The
+selected-profile grammar still calls these references file paths; this
+adapter accepts only `/postgres-material/` followed by one canonical
+32-character lowercase version ID. It performs no filesystem opening, URI
+resolution, alias lookup or fallback. Text and TLS target kinds determine
+the expected stored kind; sharing a version between incompatible roles
+refuses. Every read checks the configured epoch, primary, schema, complete
+chunks and digest before returning owned bytes to the existing decoder or
+TLS provider. Database version references are the only runtime material
+source; the old file-configuration serving path is removed.
+
+A managed (ACME) certificate request carries no material reference. The
+loader reads that certificate profile's active pair
+("8.121 Native ACME state and certificate pairs") once per load, pins
+it for both the chain and key requests, and refuses when the pair's
+recorded settings differ from the configured ones. `serve` compares the
+pinned revisions with its watcher's observation before refreshing
+certificates on existing listeners.
+
+Use one loader for the text and TLS stages of one selected profile. All
+reads share its original absolute deadline, at most 256 requests and an
+8 MiB aggregate reservation charged at each requested kind's maximum raw
+length. Failure poisons the loader. These are cold-operation bounds, not
+aggregate native-allocation qualification. The adapter does not cache
+versions or weaken the material reader's per-connection limits. It provides
+no stronger secret-memory erasure guarantee than the existing material
+consumer. The adapter itself selects no configuration and grants no
+runtime privilege; candidate validation, runtime preparation and
+certificate refresh compose it.
+
+### Shared and profile source composition
+
+The config::composition boundary separates shared account, domain, alias,
+identity and identity-address stanzas from profile server, resolver,
+logging, relay, certificate/ACME, gateway/peer, listener and resource
+stanzas. The shared source owns the single version-1 root declaration. A
+profile must begin with a section and cannot add or override shared
+policy. Neither source may supply paths: host-local storage/runtime/log
+placement remains bootstrap input.
+
+Source checks both borrowed byte slices through the existing bounded syntax
+reader and refuses a combined size above the existing 2 MiB source
+ceiling, including its inserted LF. It copies no source bytes. Its composed
+reader adds that LF even when the shared source ends without a newline, so
+a final comment or assignment cannot consume the first profile section.
+Callers must then drive load::read_profile through EOF; that stage applies
+aggregate line limits and every existing field, role and structural
+reference check. Partition diagnostics identify the shared or profile input
+without values.
+
+Composition grants no material, complete-generation or serving authority.
+Every profile still needs the database material adapter, provider checks
+and candidate validation. The selected-profile restrictions on MTA-STS/local
+MX and unused certificates remain; composition does not weaken them to
+accept a cross-profile policy it cannot validate.
+
+### Profile text and TLS policy preparation
+
+`config::materialize::read_profile_text` consumes PreparedProfile and
+decodes its relay password and signatures through the same bounded decoder
+as the roleless loader. It preserves the explicit role set in
+ResolvedProfile. Failures return reusable storage without validated
+headers; decoder scratch is cleared under the existing hygiene contract.
+The wrapper has redacted Debug output and no conversion into the roleless
+owned ResolvedText input. Its owner size remains inside the existing
+configuration-state bound; allocated_bytes accounts for that owner plus the
+existing backing regions, not provider memory or total process RSS.
 
 `TlsPolicies::prepare_profile` compiles the profile's TLS material through
 the existing provider validator: selected inbound identities, required
@@ -976,361 +1385,336 @@ certificate names, relay trust and optional ACME/gateway material. A
 relay-only profile compiles no inbound identity. Client policy preparation
 does not enable relay delivery on a profile whose relay role is disabled.
 Provider failure drops the uncommitted construction reservation and cannot
-publish a new generation. Existing callers and legacy preparation retain
-their own input types and behavior.
+publish a new generation. Dedicated serving logins use the service variants
+(`read_service_text`, `TlsPolicies::prepare_service`), which open only the
+inputs that the login's role uses through the service views.
 
 These APIs accept trusted reader callbacks, not database references or
-filesystem trust proofs. The future database generation loader must resolve
-exact immutable material versions, bound aggregate work, validate the whole
-shared/profile generation and admit implemented runtime capabilities before
-publication. No serving path or operator command selects these APIs here.
-Host tests cover every role combination, malformed text, failed readers,
-wrong certificate names, invalid PEM and reservation recovery. They do not
-extend the existing portable-stack or aggregate native-memory qualification
-to these new entry points.
+filesystem trust proofs; the database material loader supplies them.
+Candidate validation and runtime preparation use exactly the same source,
+material and TLS path (`postgres_configuration::resolve_profile`). The
+existing portable-stack and aggregate native-memory qualification does not
+extend to these entry points.
 
-## 19. Prepared mail relations
+### Source candidate validation
 
-Schema version 3 adds explicit mail relations. Schema initialization, inspection,
-upgrade and material operations now require a UTF8 database (a different
-encoding reports the fixed unsupported-version-or-checksum refusal);
-text columns use the built-in C collation so byte ordering does not
-depend on the installation's locale. Versions 1 and 2's SQL and
-checksums are unchanged. Upgrade from either preserves the epoch and
-existing material rows in the same transaction as version 3's DDL.
-
-The account row holds the committed sequence and retained history floor as
-fixed eight-byte big-endian values, preserving the full unsigned range and
-lexicographic order. The floor cannot exceed the sequence. Future mutations
-must lock this row and allocate their sequence transactionally; there is no
-SQL sequence. Blob IDs remain reserved separately from live manifests.
-Manifests contain length, SHA-256, creation time, changed sequence and exact
-ceiling-divided chunk count. Bodies have no whole-message column. Chunk rows
-are account/blob scoped, ordinals 0 through 511, and one through 65,536 bytes.
-Empty blobs have zero chunks; manifests retain the 32 MiB ceiling. Deleting
-a manifest cascades its chunks but retains its reserved ID.
-
-The remaining relations preserve mailbox, immutable thread assignment,
-message receipt provenance, membership, keyword, thread anchor, submission,
-recipient, upload lease, import marker and change-history shapes. Foreign
-keys include account identity; historical submission/import
-identities intentionally do not require live objects. Text bounds measure
-UTF-8 bytes. Existing deferred references permit one transaction to build a
-complete graph, and native indexes support account-scoped keyset reads.
-All tables are ordinary logged tables. Existing owner-only migration ACL
-checks also cover these tables and indexes.
-
-These are row-shape and reference constraints, not a complete publication
-validator. Future typed transactions must verify contiguous chunks, exact
-length and digest, mailbox graphs, immutable fields, recipient/receipt
-coverage, retained history, authorization, quotas and operation receipts
-before COMMIT. Upload leases are not delivery ownership: distributed route
-and attempt fences, policy/device/configuration tables, runtime privileges,
-and connection pools remain separate work before serving activation. No
-SQLite data migration or Stalwart importer is introduced.
-
-Disposable PostgreSQL tests exercise initial creation and upgrades, logged
-relations, body bounds, deferred same-account references, empty/maximum
-manifests, unsigned sequence ordering, bytewise text ordering, failed graph
-rollback, chunk cascade and retained blob IDs. They do not claim the future
-publication checks or cloud-provider qualification.
-
-## 20. Shared app-password credentials
-
-The private device_credentials module owns the existing v1 app-password
-format and salted verifier construction for reuse by the PostgreSQL device
-adapter. The file registry is removed. Credential types and limits stay in
-the private shared implementation; PostgreSQL exposes Creation::password()
-and its own error type. Registry publication, duplicate-ID refusal, capacity,
-revocation and current-policy locking belong to PostgreSQL transactions.
-
-Generation yields an opaque password separately from ID, salt and verifier.
-Parsing yields a private, non-Debug presented credential so a future database
-lookup can select its ID before comparing the account-bound verifier. A
-successful comparison alone grants no authority: callers must still check
-current account/device policy and revocation at the transaction/snapshot
-boundary. Password and decoded-secret owners retain their existing drop-time
-buffer clearing; this is not a whole-process memory-erasure claim. The hash
-domain, lowercase token encoding and account/ID/salt binding are unchanged,
-with a fixed golden vector and malformed-token/entropy-failure tests.
-
-## 21. Prepared PostgreSQL device registry
-
-Version 4 adds an owner-private devices table. The postgres_devices module
-provides explicit owner-side preparation and publication APIs, plus a cold
-credential check. Sections 193 through 195 add explicit registry inspection,
-revocation and creation commands. Runtime HTTP authentication and admitted
-mail snapshots/transactions use this database registry; there is no local
-file credential authority.
-
-Prepare Creation once before publishing: it owns the password separately
-from the ID, salt, verifier, label, timestamp and request digest. Only the
-verifier enters SQL. The device ID is the creation operation identity;
-its digest binds the epoch, account and complete creation request. An
-existing matching receipt confirms the original creation without another
-write, including if the device has since been revoked. A mismatched digest
-refuses. Without such a receipt, a Creation more than 24 hours old on its
-process's monotonic or wall clock refuses as `Stale` (CLI:
-`stale-device-creation`); the wall clock counts suspend and
-snapshot-restore, which the monotonic one misses. Creation admits at most
-256 unrevoked devices and 320 device records per account. It first deletes
-records revoked more than 30 days ago by the database clock. A deleted
-record was revoked after it was inserted, so its Creation is over 30 days
-old and refuses. This assumes the database clock does not jump forward 29
-days while a process holds a Creation whose own clocks both stand still.
-The CLI holds one for seconds and never republishes after a possible
-COMMIT. No record then holds the credential, so it cannot authenticate,
-and revoking it reports the device missing. A revocation is listed for at
-least 30 days, until the account's next creation after that. The first
-creation after this rule took effect also deletes every record whose
-earlier, client-dated revocation is that old, and a record with a
-future-dated one stays until 30 days past that date; save a `device-list`
-first if they matter. With 256 unrevoked devices and 64 revocations inside
-30 days, creation refuses until the oldest of those revocations retires.
-There is no other delete or ID reuse. Labels retain the existing UTF-8
-byte/control-character rules. Audit timestamps are nonnegative signed
-64-bit UTC milliseconds; timestamp overflow refuses before database work.
-
-Prepare Revocation once with a random operation ID and a digest binding the
-epoch, account, device, operation and requested timestamp. First revocation
-stores that receipt and dates it by the database clock, not the requested
-timestamp, so retention counts from a time no client chose. The same
-operation confirms Recorded; conflicting reuse refuses. A different
-operation observing an already revoked device returns AlreadyRevoked without
-writing or replacing the original receipt. Revocation operation IDs are
-unique within an account. Neither preparation API contacts a database, and
-retained values do not implement on-disk recovery for an operator command. A
-lost process must not invent a replacement creation to resolve missing
-output; later administration must inspect/revoke an undisclosed credential
-instead.
-
-Every writer takes the shared session migration lock and validates primary,
-schema and expected epoch. It explicitly begins a read-committed,
-synchronous-commit transaction with a ten-second idle-transaction timeout
-and locks the account row before selecting or changing device rows. An
-inherited repeatable-read snapshot could otherwise retain a stale capacity
-count after waiting for that lock. Creation
-checks capacity while retaining that same fence. This serializes competing
-instances and supplies the future authorization-write fence: policy-aware
-mail mutations must take their configuration/policy locks first, then the
-account row, recheck current device/identity policy there, and retain the
-fence through COMMIT. Revocation does not alter the mail change sequence.
-No account lock spans peer I/O, and this module admits no mail operation.
-
-A possible COMMIT handoff followed by connection/deadline failure returns
-Indeterminate. Retain the original prepared value. Repeating it takes the
-same account lock and resolves its durable receipt, so it cannot race an
-unsettled original into a duplicate or replace a revoked credential. After a
-revoked record retires, repeating its Creation refuses as Stale and its
-Revocation as missing; neither writes. A definite failure of a retry does
-not settle the original uncertainty; retain that unresolved status until its
-receipt is observed. A known receipt is success even if the final local poll
-crosses the deadline. Receipts live with their device records and retire
-with them, 30 days after revocation; device and operation IDs are random
-128-bit values, and the Creation lifetime above keeps a retired credential
-from returning. Account/schema restoration still requires a fresh epoch
-under the deployment-wide recovery barrier.
-
-check uses one fresh read-only repeatable-read primary snapshot and current
-revocation state, preserving dummy verifier work for unknown IDs. It closes
-that snapshot before return: a successful result grants no authority to a
-later mail read or write, and is never a credential cache. Future serving
-admission must perform credential/policy checks inside the same retained
-snapshot or publication transaction as its mail operation. A malformed token
-can be denied without database access; database failures never authenticate.
-Read snapshots also set the ten-second idle-transaction timeout. All
-operations retain the ten-second worker and statement/lock deadlines. Reads
-keep the 128-frame/1 MiB input bound; creation and revocation use the
-mutation connection's 1088-frame/1 MiB input and 128 KiB output bounds,
-since retirement and the record counts outgrow 128 frames. Provider errors
-and secret values remain redacted.
-
-## 22. Selected-profile database material adapter
-
-The inert postgres_profile_materials loader connects the selected-profile
-text and TLS consumers to immutable PostgreSQL material versions. The
-existing selected-profile grammar still calls these references file paths;
-this adapter accepts only `/postgres-material/` followed by one canonical
-32-character lowercase version ID. It performs no filesystem opening, URI
-resolution, alias lookup or fallback. Text and TLS target kinds determine the
-expected stored kind; sharing a version between incompatible roles refuses.
-Every read checks the configured epoch, primary, schema, complete chunks and
-digest before returning owned bytes to the existing decoder or TLS provider.
-
-Use one loader for the text and TLS stages of one selected profile. All reads
-share its original absolute deadline, at most 256 requests and an 8 MiB
-aggregate reservation charged at each requested kind's maximum raw length.
-Failure poisons the loader. These are cold-operation bounds, not aggregate
-native-allocation qualification. The adapter does not cache versions or
-weaken the material reader's per-connection limits. It provides no stronger
-secret-memory erasure guarantee than the existing material consumer.
-
-Managed ACME requests have no explicit immutable version and refuse here;
-future ACME publication must supply its own fenced database mapping. The
-adapter does not admit a complete shared/profile generation, select an active
-pointer, grant runtime database privileges or open service admission. The
-foreground service composes this adapter into its database profile loader
-before admitting listeners. Database version references are the runtime
-material source; the old file-configuration serving path is removed.
-
-## 23. Shared/profile source composition
-
-The inert config::composition boundary separates shared account, domain,
-alias, identity and identity-address stanzas from profile server, resolver,
-logging, relay, certificate/ACME, gateway/peer, listener and resource stanzas.
-The shared source owns the single version-1 root declaration. A profile must
-begin with a section and cannot add or override shared policy. Neither source
-may supply paths: host-local storage/runtime/log placement remains bootstrap
-input. This establishes source ownership, not implemented distributed route
-selection or database generation publication.
-
-Source checks both borrowed byte slices through the existing bounded syntax
-reader and refuses a combined size above the existing 2 MiB source ceiling,
-including its inserted LF. It copies no source bytes. Its composed reader
-adds that LF even when the shared source ends without a newline, so a final
-comment or assignment cannot consume the first profile section. Callers must
-then drive load::read_profile through EOF; that stage applies aggregate line
-limits and every existing field, role and structural reference check.
-Partition diagnostics identify the shared or profile input without values.
-
-Composition grants no material, complete-generation or serving authority.
-Every profile still needs the database material adapter, provider checks,
-generation-wide coverage and implemented-role admission before publication.
-The existing selected-profile restrictions on MTA-STS/local MX, managed ACME
-and unused certificates remain; composition does not weaken them to accept
-a cross-profile policy it cannot yet validate.
-
-## 24. Complete source candidate validation
-
-The inert postgres_configuration preparer checks one shared source and
-1–16 named profiles before producing an owned Candidate. Profile names use
-the existing lowercase ASCII identifier grammar and must be unique. Their
+The postgres_configuration preparer checks one shared source and 1–16
+named profiles before producing an owned Candidate. Profile names use the
+existing lowercase ASCII identifier grammar and must be unique. Their
 canonical order is bytewise name order. The total shared/profile source,
 profile-name bytes and composition separators cannot exceed 2 MiB.
 
 For every profile, preparation composes the same shared policy, drives the
 structural loader through EOF with its explicit roles, resolves text inputs
-from the expected PostgreSQL epoch, and compiles every configured TLS policy
-through the provider. One absolute deadline covers the whole operation,
+from the expected PostgreSQL epoch, and compiles every configured TLS
+policy through the provider. Across profiles it requires identical shared
+quotas, compatible definitions of every named route (section 4), and that
+each account's configured outbound profile names a relay-role profile. It
+also derives the service-view bindings of the profiles named for the four
+dedicated serving roles. One absolute deadline covers the whole operation,
 including its database reads, within the existing ten-second cold-worker
 ceiling. Each profile retains the material adapter's request/byte bounds.
 Failure returns no candidate. The shared source partition prevents profiles
-from replacing account, domain, alias or identity policy; existing per-profile
-MX/STS/role rules remain unchanged. This does not expand implemented runtime
-roles or supply the outstanding distributed ACME/route policy.
+from replacing account, domain, alias or identity policy; existing
+per-profile MX/STS/role rules remain unchanged.
 
 Candidate retains raw sources and material references, never resolved
 password/key bytes or compiled TLS policies. Its SHA-256 digest binds the
 expected epoch, shared source, profile count and every canonical name, role
 set and profile source using fixed-width length framing. There is no Debug
-or automatic serialization of its source bytes. Explicit borrowed access is
-for the future owner-side database publisher and loader.
+or automatic serialization of its source bytes. Explicit borrowed access
+serves the version publisher and loader.
 
-No configuration row, active pointer, device policy or listener changes here.
-The candidate is not serving authority and its checks describe preparation
-time only: a later startup/load must revalidate current database material,
-certificate validity, schema/epoch and implemented-role admission. Database
-persistence and atomic generation activation remain separate boundaries.
-These cold input/count bounds are not native-allocation qualification.
+A candidate is not serving authority and its checks describe preparation
+time only: selection and startup revalidate current database material,
+certificate validity, schema/epoch and roles. These cold input/count bounds
+are not native-allocation qualification.
 
-## 25. Immutable configuration source versions
+### Immutable configuration source versions (schema 5)
 
 Schema version 5 appends owner-private config_versions and
-config_version_chunks tables. Earlier DDL/checksums remain unchanged.
-The postgres_configuration_store boundary accepts only a validated Candidate
-and a retained ConfigurationVersion ID. It serializes exactly the existing
-canonical digest input, including domain and epoch, into 64 KiB chunks.
-The 2 MiB source bound plus 1 KiB framing allowance permits at most 33 chunks.
-No resolved password, key or provider policy is serialized.
+config_version_chunks tables. Earlier DDL/checksums remain unchanged. The
+postgres_configuration_store boundary accepts only a validated Candidate
+and a retained ConfigurationVersion ID. It serializes exactly the canonical
+digest input, including domain and epoch, into 64 KiB chunks. The 2 MiB
+source bound plus 1 KiB framing allowance permits at most 33 chunks. No
+resolved password, key or provider policy is serialized.
 
 Publication takes the shared schema lock, checks the epoch, and inserts the
 manifest/chunks in one explicit READ COMMITTED transaction with synchronous
 commit enabled and a ten-second idle-transaction timeout. The version's
 primary key serializes competing publishers. A retained ID with the same
-length, digest and chunk count resolves its durable receipt; differing bytes
-conflict. Any failure after COMMIT may have been handed off is Indeterminate.
-Keep the original ID and candidate; another failed attempt does not settle
-an earlier uncertain outcome. No active pointer or service admission changes.
+length, digest and chunk count resolves its durable receipt; differing
+bytes conflict. Any failure after COMMIT may have been handed off is
+Indeterminate. Keep the original ID and candidate; another failed attempt
+does not settle an earlier uncertain outcome. Publishing a version selects
+nothing.
 
-Reading uses one bounded primary REPEATABLE READ snapshot. It checks manifest
-bounds, exact chunk count/order/length, and the digest before decoding. The
-length-framed decoder rejects truncation, trailing bytes, noncanonical names,
-ordering, roles and source limits. After closing that snapshot it reruns the
-complete source preparer, including current material and provider checks,
-under the original absolute deadline. A stored digest is not permission to
-skip validation. Immutable material IDs and epoch checks bind those later
-reads; owner corruption fails closed. Successful publication receipts assume
-the owner preserves immutable rows and do not revalidate historical content.
+Reading uses one bounded primary REPEATABLE READ snapshot. It checks
+manifest bounds, exact chunk count/order/length, and the digest before
+decoding. The length-framed decoder rejects truncation, trailing bytes,
+noncanonical names, ordering, roles and source limits. After closing that
+snapshot, a validating read reruns the complete source preparer, including
+current material and provider checks, under the original absolute
+deadline. A stored digest is not permission to skip validation. Immutable
+material IDs and epoch checks bind those later reads; owner corruption
+fails closed. Successful publication receipts assume the owner preserves
+immutable rows and do not revalidate historical content. A passive source
+read (`read_sources`) verifies only integrity and decoding; it serves
+repair export and dedicated-login preparation, which validate what they
+use.
 
 Only this closed configuration worker has 4 MiB aggregate input/output and
 512 input frames, enough for a full candidate. Per-frame 128 KiB and the
 SCRAM sequence remain unchanged, as do default, material and schema worker
 budgets. This is a finite cold operation, not persistent service transport
-or native-allocation qualification. Runtime privileges and service activation are enforced by the runtime
-boundaries described below.
+or native-allocation qualification.
 
-## 26. Operator configuration preparation
+### Configuration import, check and snapshot commands
 
 `td-mta postgres config-version` generates a fresh ID to retain before any
 publication attempt. `config-import --connection-file PATH --epoch HEX
 --version HEX --shared-file PATH --instance NAME ROLES PATH` validates and
 publishes one immutable source version. Repeat --instance for every named
 profile, up to 16. ROLES is a comma-separated unique selection of receive,
-jmap and relay; it declares structural intent, not implemented capabilities.
-All profile sources refer to already imported immutable material IDs using
-section 22's reference syntax. No source version becomes active here.
+jmap and relay. All profile sources refer to already imported immutable
+material IDs using the `/postgres-material/` reference syntax. No source
+version becomes selected here.
 
 One protected input inventory binds the connection, database trust, shared
 source and all profile files to the bootstrap owner. Sources are public
 operator inputs under the existing stable trusted-namespace contract; they
 cannot alias the secret connection file, including through hard links.
-Inventory names/counts are checked before files are opened. Source/name bytes
-and inserted separators share the preparer's 2 MiB ceiling while loading;
-an extra byte or a later file exceeding the remaining allowance refuses.
-Sources are not printed. Complete candidate validation and publication share
-one absolute ten-second DNS/network deadline after cold file loading.
+Inventory names/counts are checked before files are opened. Source/name
+bytes and inserted separators share the preparer's 2 MiB ceiling while
+loading; an extra byte or a later file exceeding the remaining allowance
+refuses. Sources are not printed. Complete candidate validation and
+publication share one absolute ten-second DNS/network deadline after cold
+file loading.
 
 `config-check --connection-file PATH --epoch HEX --version HEX` loads the
 exact stored version and repeats current material/provider validation. It
-needs no local source files and never falls back to them. Both commands emit
-bounded JSON with epoch, version, digest and profile count on success, and
-explicitly report profile_activated=false. Errors expose fixed categories,
-not paths, credentials, source values or provider text. Exit status is zero
-for success, one for validation/database/input refusal and two for arguments.
-Only definite transport refusal permits another resolved address, under the
-original deadline. Indeterminate publication stops and reports
-indeterminate-retain-version. Keep the same ID and source set, wait for the
-original operation to settle, then check/retry that retained version. A
-failed check (including changed or missing material) is not evidence that a
-previous publication rolled back. Never allocate another ID to hide an
-uncertain result. These owner commands do not supply runtime privileges,
-listener activation or PostgreSQL serving admission.
+needs no local source files and never falls back to them. Both commands
+emit bounded JSON with epoch, version, digest and profile count on success,
+`content_validated:true` and `profile_activated:false`. Errors expose fixed
+categories, not paths, credentials, source values or provider text. Exit
+status is zero for success, one for validation/database/input refusal and
+two for arguments. Only definite transport refusal permits another resolved
+address, under the original deadline. Indeterminate publication stops and
+reports indeterminate-retain-version. Keep the same ID and source set, wait
+for the original operation to settle, then check/retry that retained
+version. A failed check (including changed or missing material) is not
+evidence that a previous publication rolled back. Never allocate another
+ID to hide an uncertain result. Neither command selects the version or
+grants runtime privileges.
 
 `config-snapshot --connection-file PATH --epoch HEX` is an owner-side,
-passive repair export. It observes the selected generation/version and reads
-that immutable source set under one absolute deadline, checking the epoch,
-bounds, chunk sequence, digest and canonical source inventory. It emits the
-shared source and each profile's name, role bits and source in JSON. Sources
-remain bounded to 2 MiB before JSON escaping (at most sixfold expansion).
-Protect redirected output as configuration data: it includes addresses and
-material references, though it does not resolve passwords or keys.
+passive repair export. It observes the selected generation/version and
+reads that immutable source set under one absolute deadline, checking the
+epoch, bounds, chunk sequence, digest and canonical source inventory. It
+emits the shared source and each profile's name, role bits and source in
+JSON. Sources remain bounded to 2 MiB before JSON escaping (at most
+sixfold expansion). Protect redirected output as configuration data: it
+includes addresses and material references, though it does not resolve
+passwords or keys.
 
 Unlike `config-check`, this export does not resolve materials or validate
 certificate expiry, so an operator can repair an expired configuration. Its
-`content_validated` and `profile_activated` fields are always false. An empty
-selection reports `selected=false` without sources. A concurrent selection
-can supersede the observed generation; use that exact generation for the
-existing compare-and-select procedure, never as current serving authority.
+`content_validated` and `profile_activated` fields are always false. An
+empty selection reports `selected=false` without sources. A concurrent
+selection can supersede the observed generation; use that exact generation
+for the compare-and-select procedure, never as current serving authority.
 All candidate imports and selection validation remain mandatory.
 
-## 27. Durable account bootstrap
+### Configuration selection (schema 7)
 
-Schema version 6 adds owner-private account_bootstraps receipts. The inert
+Schema version 7 adds a singleton `config_selection` row and
+`config_selection_receipts`, immutable until publication sweeps them. The
+initial row has generation zero and no version. `postgres_selection`
+supplies owner-side preparation, publication, receipt inspection and
+selected-source reads. The selected version is what every serving instance
+loads: `serve` observes the row every 30 seconds and drains and reloads on
+a change ("Foreground serve command"), and authorization-sensitive
+publications lock the row FOR SHARE and compare it with their loaded
+binding (section 2). Schema migration keeps earlier checksums unchanged and
+initializes selection without choosing an existing version.
+
+A retained change binds a random operation ID to the store epoch, expected
+full-u64 generation, immutable version ID and validated source digest.
+Publication first resolves an existing receipt under a shared singleton
+lock that excludes an earlier publication still committing, then rereads
+and revalidates all profiles and materials under its original absolute
+deadline. The write transaction locks the singleton before any account or
+device lock, checks the receipt again after waiting, compares the
+generation and stored source digest, and increments the generation with
+checked arithmetic. When the service views are installed, it replaces
+their bindings in the same transaction and refuses
+(`required-service-profiles`) unless the version contains a profile for
+each of the four dedicated serving roles. Pointer and receipt commit
+together with explicit synchronous commit and read-committed isolation.
+Competing changes from the same generation cannot both publish. A failed
+candidate or definite rollback leaves the pointer unchanged.
+
+The original ten-second operation ceiling covers every connection,
+validation and transaction; none renews it. A lost COMMIT response is
+indeterminate. The publication transaction uses the bounded mutation
+transport profile (1088 input frames, 1 MiB input, 128 KiB output),
+including schema ledger qualification and COMMIT. Receipt inspection and
+passive observation retain the smaller probe profile. Keep the exact
+retained change and resolve/retry it, never generate another ID from an
+absence observation. Lock/connection failures while resolving leave any
+previous uncertainty outstanding; they are not proof of rollback. The
+shared resolution lock is released before material validation.
+
+Historical receipts resolve their original selection after up to 63 later
+selections or material expiry; receipt success does not assert that
+version is still selected. Each publication deletes, under the singleton
+lock, receipts at least 64 selections older than itself; a request at or
+below that floor reports `Expired` from inspection and publication, never
+absence and never a definite conflict, even when it provably never
+committed. At most 1024 receipts may exist, checked after the sweep under
+the same lock. Callers must persist the retained change before publication
+("Selection request custody").
+
+Owner-side selected-source reads capture a passive generation/version,
+then verify the immutable source bytes and all profiles/materials. A
+concurrent publication can supersede that generation before return.
+Consumers must fence current policy at runtime admission/publication rather
+than treat the returned candidate as authority. Store-epoch checks apply to
+each connection, including receipt resolution after restore.
+
+### Selection request custody
+
+`postgres_selection::Change::encode` produces exactly 89 public bytes:
+format version 1, 16-byte epoch, 16-byte operation ID, eight-byte
+big-endian expected generation, 16-byte configuration version and 32-byte
+source digest. `Change::decode` requires that exact length/version, refuses
+an exhausted generation and recomputes the domain-separated request digest
+internally. It does not retain caller-supplied request-digest bytes.
+Persist the encoded change before first publication and retain the same
+bytes across uncertainty. The encoding contains neither configuration
+source nor credential material.
+
+These are custody bytes, not an authenticated credential or a success
+receipt. Changing the operation ID asks for another operation; changing any
+request field changes its derived digest. Owner database credentials,
+stored receipt comparison, expected generation and current source/material
+validation keep their roles. Decoding cannot establish publication or
+authorize service. An already recorded operation still resolves after up
+to 63 newer selections (later it reports expired) or material expiry,
+while a changed request using its ID conflicts. Missing receipt
+observations do not authorize a replacement operation.
+
+### Configuration selection commands
+
+`td-mta postgres config-selection-prepare --connection-file PATH --epoch HEX
+--version HEX --generation N` rereads and validates the immutable source
+version, prepares one random operation and prints the public request
+("Selection request custody") as 178 hexadecimal characters in JSON, with
+`published:false`. Preparation performs no selection write. Retain that
+request before any publication; the expected generation is explicit, with
+zero meaning the initially unselected database.
+
+`td-mta postgres config-select --connection-file PATH --request HEX` decodes
+and publishes exactly that request. `td-mta postgres
+config-selection-inspect --connection-file PATH --request HEX` resolves its
+retained receipt under the policy-row lock. The public request may be
+supplied as an argument; it contains no password, source text or private
+material. Malformed length, non-hex input and duplicate or mixed operation
+arguments refuse. The protected connection file and ordinary bounded
+DNS/TLS/SCRAM rules still apply.
+
+A recorded result prints the operation, historical generation and version.
+Inspection can return `recorded:false`; that observation is not permission
+to replace the operation. Publication uncertainty reports
+`indeterminate-retain-request` and stops without automatic retry. Resolve
+or explicitly retry the original retained request, never prepare a
+replacement from an absence observation. Historical receipts remain
+resolvable after a newer selection or expired material, while new
+publication revalidates the version and compares the expected generation.
+An altered request using a recorded operation ID conflicts. Each
+publication deletes receipts at least 64 selections older than itself, so
+the ledger never fills; inspecting or publishing a request whose generation
+is that old reports `request-expired-outcome-unknown`
+(`operation-expired-outcome-unknown` for account administration), never
+absence and never a new selection. Resolve a retained request before 64
+further selections.
+
+Select and inspect results report `profile_activated:false`; prepare prints
+`published:false` and service-material-bind only its generation and
+version. Receipt success does not
+assert that its version is still selected, that current materials are
+usable or that any instance has loaded it. Serving instances load a new
+selection by reloading ("Foreground serve command"). Publication keeps the
+receipts of the latest 64 selections, as above, under the backstop
+1024-receipt ceiling; these commands add no automatic deployment policy.
+
+### Selected-profile runtime preparation
+
+`postgres_runtime_profile::load` is the cold bridge from selected database
+sources to an owned resolved profile and caller-reserved TLS generation;
+`serve` and `service-profile-check` call it. It retains a passive binding
+per configured account of epoch, selection generation/version, account,
+profile name and roles. `Prepared::publish` installs the TLS generation;
+`serve` then opens listeners and starts workers. Preparation itself
+provides no device authorization. No conversion to a file-serving input
+exists.
+
+Loading verifies the selected version's source digest, composes every
+profile and checks shared quotas and route declarations. A dedicated
+service login must match the requested profile and roles. It opens the
+text and TLS inputs that role uses, through the service views
+("Selected-profile service views"). For example, a receiving process
+prepares its listener identities while a relay prepares its configured
+transport and password. The shared runtime login revalidates every profile and material
+before resolving the requested profile. Both paths require every configured
+account's durable bootstrap receipt. All material comes from the database
+under the original deadline; there is no filesystem fallback. The caller's
+TLS generation reservation remains in its original domain and is released
+on failure. The returned resolved text contains secrets and has no
+diagnostic dump.
+
+Each explicit binding retains passive identifiers, limits and that
+account's selected sending identity IDs/mailboxes. At most 64 mailboxes of
+at most 254 bytes are copied from the validated configuration; binding
+clones share that immutable catalog. Diagnostic formatting redacts the
+mailboxes. The header and SMTP recipient limits come from the same
+selected profile. Identity lookup is configuration evidence, not sending
+authority: submission publication must freshly fence the selection and
+current device. JMAP bindings also share the bounded visible Identity
+catalog, including public text/HTML signature bytes. No relay credentials
+or signature source paths enter the binding; diagnostic formatting redacts
+the visible catalog. A relay binding also retains the process-local relay
+policy identity from this exact prepared TLS generation (section 183); it
+contains no credentials or TLS lease.
+
+Before returning, a final primary observation rejects a selection already
+superseded during preparation. This does not freeze future changes:
+publications still fence policy afresh, and `serve` reloads on a later
+change. The original at-most-ten-second deadline covers source
+verification, repeated profile preparation, account inspection and final
+observation. The source candidate is discarded before the final check;
+retained text and TLS objects belong to the caller's cold control worker.
+A replica-reader request admits only a JMAP-only profile.
+
+## 10. Accounts, devices and administration
+
+This chapter specifies durable account bootstrap, app-password credentials
+and the device registry, the owner commands that administer accounts,
+aliases, sending identities and devices, and how the HTTPS runtime selects
+an account from authenticated credentials, retains its authentication
+session and serves additional JMAP origins.
+
+### Account bootstrap receipts (schema 6)
+
+Schema version 6 adds owner-private account_bootstraps receipts. The
 postgres_accounts boundary prepares one retained epoch/account/Inbox tuple,
 then atomically inserts account sequence one and floor zero, the shared
-INITIAL_INBOX contents, its Mailbox Created history at sequence one/operation
-one, and the receipt. No existing
-account is reset, populated from configuration or granted serving authority.
+INITIAL_INBOX contents, its Mailbox Created history at sequence
+one/operation one, and the receipt. No existing account is reset,
+populated from configuration or granted serving authority. `account-init`
+and account creation in the account administration workflow publish it;
+runtime preparation inspects the receipt of every configured account.
 
 Publication holds the shared migration lock and verifies the epoch before
 one explicit READ COMMITTED transaction with synchronous commit enabled and
@@ -1339,9 +1723,18 @@ serializes competing creations. A matching receipt resolves the retained
 creation without touching later sequence, mailbox or history changes. A
 different Inbox conflicts; an existing account without a receipt refuses
 rather than attempting repair. The receipt binds account/Inbox for that
-epoch and remains for the account's lifetime, independent of current mailbox
-contents and retained history. It deliberately has no mailbox foreign key.
-Account retirement/receipt removal is not implemented by this boundary.
+epoch and remains for the account's lifetime, independent of current
+mailbox contents and retained history. It deliberately has no mailbox
+foreign key. Account retirement and receipt removal are not implemented.
+
+Account creation uses the bounded mutation connection allowance: 1088 input
+frames, one MiB aggregate input and 128 KiB output, with unchanged
+per-frame, authentication and deadline limits. Its schema-ledger inspection
+and bootstrap writes share that allowance; the ordinary 128-frame probe
+allowance does not fit this operation since schema version 25. Exhausting
+the allowance while reading COMMIT remains indeterminate and settles the
+retained creation. Read-only account inspection retains the ordinary probe
+allowance.
 
 As with device/configuration publication, an error after COMMIT may have
 been handed off is Indeterminate. Keep the original Creation, let the
@@ -1352,16 +1745,486 @@ its final deadline before returning. A retried publication that finds a
 matching retained receipt succeeds even if its last poll crosses the local
 deadline.
 
-Section 196 exposes initialization and retained receipt inspection as
-explicit administrative commands.
-
 These explicit owner operations neither activate account policy nor bypass
-future account limits, authorization, quota or mutation fences. Configuration
-activation must separately bind its declared accounts to existing prepared
-accounts before serving. Existing unreceipted accounts are not adopted, and
-this is not a SQLite or Stalwart migration interface. The real PostgreSQL
-fixture checks exact initial rows, idempotency after later changes, conflicts,
-rollback after partial writes, uncertain commits and competing bootstraps.
+account limits, authorization, quota or mutation fences. Selection does not
+check receipts, but runtime preparation refuses a configuration that
+declares an account without one. Existing unreceipted accounts are not
+adopted, and this is not a SQLite or Stalwart migration interface.
+
+### Account bootstrap commands
+
+`td-mta postgres account-init --connection-file PATH --epoch HEX --account
+ID` prepares one random Inbox identity before bounded address attempts and
+uses the atomic account bootstrap. A confirmed publication prints its
+public epoch/account/Inbox receipt. The protected connection input, fresh
+DNS, TLS/SCRAM and ten-second operation deadline match other explicit
+owner commands. Initialization neither activates account policy nor admits
+a serving backend.
+
+A publication failure reports only a fixed error and the attempted public
+tuple. An outstanding COMMIT reports `indeterminate-inspect-account` and
+stops without retrying. `td-mta postgres account-inspect --connection-file
+PATH --epoch HEX --account ID` reads the retained bootstrap receipt, not
+current Inbox contents, sequence or serving authority. Absence cannot
+settle an outstanding original transaction; let it finish before
+interpreting a missing receipt. A stored receipt can be compared with the
+attempted tuple.
+
+A fresh initialization invocation generates a different Inbox identity and
+conflicts with a preexisting bootstrap receipt. An account lacking a
+receipt also refuses initialization. Neither command resets, repairs or
+adopts an existing account. Lost process output is recovered by inspecting
+the named account's retained receipt, not by blindly repeating
+initialization. Account retirement and import are separate operations.
+
+### App-password credentials
+
+The private device_credentials module owns the v1 app-password format and
+salted verifier construction for the PostgreSQL device adapter. Credential
+types and limits stay in the private shared implementation; PostgreSQL
+exposes Creation::password() and its own error type. Registry publication,
+duplicate-ID refusal, capacity, revocation and current-policy locking
+belong to PostgreSQL transactions.
+
+Generation yields an opaque password separately from ID, salt and verifier.
+Parsing yields a private, non-Debug presented credential so a database
+lookup can select its ID before comparing the account-bound verifier. A
+successful comparison alone grants no authority: callers must still check
+current account/device policy and revocation at the transaction/snapshot
+boundary. Password and decoded-secret owners retain their drop-time buffer
+clearing; this is not a whole-process memory-erasure claim. The hash
+domain, lowercase token encoding and account/ID/salt binding are fixed by
+a golden vector.
+
+### Device registry records and retention (schema 4)
+
+Version 4 adds an owner-private devices table. The postgres_devices module
+provides owner-side preparation and publication APIs, a bounded listing and
+a cold credential check. Runtime HTTP authentication and admitted mail
+snapshots/transactions use this database registry; there is no local file
+credential authority.
+
+Creation admits at most 256 unrevoked devices and 320 device records per
+account. It first deletes records revoked more than 30 days ago by the
+database clock. A revocation is listed for at least 30 days, until the
+account's next creation after that. Records whose revocation predates the
+database-clock rule carry a client-dated revocation: the first creation
+under the rule deletes every such record whose revocation is that old, and
+a record with a future-dated one stays until 30 days past that date; save
+a `device-list` first if they matter. With 256 unrevoked devices and 64
+revocations inside 30 days, creation refuses until the oldest of those
+revocations retires. There is no other delete or ID reuse. Labels retain
+the UTF-8 128-byte/control-character rules. Audit timestamps are
+nonnegative signed 64-bit UTC milliseconds; timestamp overflow refuses
+before database work.
+
+Receipts live with their device records and retire with them, 30 days
+after revocation. Device and operation IDs are random 128-bit values, and
+the Creation lifetime below keeps a retired credential from returning.
+Account/schema restoration still requires a fresh epoch under the
+deployment-wide recovery barrier.
+
+### Device creation and revocation receipts
+
+Prepare Creation once before publishing: it owns the password separately
+from the ID, salt, verifier, label, timestamp and request digest. Only the
+verifier enters SQL. The device ID is the creation operation identity; its
+digest binds the epoch, account and complete creation request. An existing
+matching receipt confirms the original creation without another write,
+including if the device has since been revoked. A mismatched digest
+refuses. Without such a receipt, a Creation more than 24 hours old on its
+process's monotonic or wall clock refuses as `Stale` (CLI:
+`stale-device-creation`); the wall clock counts suspend and
+snapshot-restore, which the monotonic one misses. A retired record was
+revoked after it was inserted, so its Creation is over 30 days old and
+refuses. This assumes the database clock does not jump forward 29 days
+while a process holds a Creation whose own clocks both stand still. The
+CLI holds one for seconds and never republishes after a possible COMMIT.
+No record then holds the credential, so it cannot authenticate, and
+revoking it reports the device missing.
+
+Prepare Revocation once with a random operation ID and a digest binding the
+epoch, account, device, operation and requested timestamp. First
+revocation stores that receipt and dates it by the database clock, not the
+requested timestamp, so retention counts from a time no client chose. The
+same operation confirms Recorded; conflicting reuse refuses. A different
+operation observing an already revoked device returns AlreadyRevoked
+without writing or replacing the original receipt. Revocation operation IDs
+are unique within an account. Neither preparation API contacts a database,
+and retained values do not implement on-disk recovery for an operator
+command. A lost process must not invent a replacement creation to resolve
+missing output; later administration must inspect/revoke an undisclosed
+credential instead.
+
+### Device registry locking and uncertainty
+
+Every writer takes the shared session migration lock and validates
+primary, schema and expected epoch. It explicitly begins a read-committed,
+synchronous-commit transaction with a ten-second idle-transaction timeout
+and locks the account row before selecting or changing device rows. An
+inherited repeatable-read snapshot could otherwise retain a stale capacity
+count after waiting for that lock. Creation checks capacity while retaining
+that same fence. This serializes competing instances and is the
+authorization-write fence: policy-aware mail mutations must take their
+configuration/policy locks first, then the account row, recheck current
+device/identity policy there, and retain the fence through COMMIT.
+Revocation does not alter the mail change sequence. No account lock spans
+peer I/O, and this module admits no mail operation.
+
+A possible COMMIT handoff followed by connection/deadline failure returns
+Indeterminate. Retain the original prepared value. Repeating it takes the
+same account lock and resolves its durable receipt, so it cannot race an
+unsettled original into a duplicate or replace a revoked credential. After
+a revoked record retires, repeating its Creation refuses as Stale and its
+Revocation as missing; neither writes. A definite failure of a retry does
+not settle the original uncertainty; retain that unresolved status until
+its receipt is observed. A known receipt is success even if the final local
+poll crosses the deadline.
+
+`postgres_devices::check` uses one fresh read-only repeatable-read primary
+snapshot and current revocation state, preserving dummy verifier work for
+unknown IDs. It closes that snapshot before return: a successful result
+grants no authority to a later mail read or write, and is never a
+credential cache. Serving does not use it: the HTTPS authentication worker
+checks credentials in its own fresh snapshot ("Retained HTTPS
+authentication sessions"), and authorization-sensitive writes recheck the
+device in their publication transaction (section 2). A malformed token can
+be denied without database access; database failures never authenticate.
+Read snapshots also set the ten-second idle-transaction timeout. All
+operations retain the ten-second worker and statement/lock deadlines.
+Credential checks keep the 128-frame/1 MiB input bound; device-list uses
+the mailbox connection's 512-frame/1 MiB input and 64 KiB output bounds;
+creation and revocation use the
+mutation connection's 1088-frame/1 MiB input and 128 KiB output bounds,
+since retirement and the record counts outgrow 128 frames. Provider errors
+and secret values remain redacted.
+
+### Device listing command
+
+`postgres_devices::list` reads one account's complete device registry,
+including revoked rows, under a fresh repeatable-read, read-only snapshot.
+It validates the primary, current schema and expected store epoch while
+retaining the session migration lock, distinguishes an absent account from
+an empty registry, and acknowledges rollback before returning a successful
+result. Every path closes the connection. No account write fence is taken
+and no mail sequence, credential or receipt is changed.
+
+The query selects only ID, label, creation time and revocation time,
+ordered by ID. It never requests passwords, salts, verifiers or request
+digests. At most 321 rows are fetched so a registry exceeding the
+320-record ceiling (256 unrevoked devices plus revoked records awaiting
+retirement) is refused without a truncated success. Retired records are no
+longer listed. IDs, labels and nonnegative timestamps are validated before
+any result is returned. The returned public metadata is historical and
+cannot authorize authentication or a mail operation.
+
+The command is:
+
+```text
+td-mta postgres device-list --connection-file PATH --epoch HEX --account ID
+```
+
+It uses the protected connection-file loader, verified TLS/SCRAM, fresh
+bounded DNS resolution and the existing shared ten-second
+connection/operation deadline. Database credentials must have the required
+schema/account and metadata-column read privileges. The command grants
+none. The syntactic bootstrap profile placeholder selects no running
+profile. JSON output binds the expected epoch and account and contains the
+four public fields for each device, with escaped labels and nullable
+revoked_at. Errors report fixed categories without connection inputs or
+provider diagnostics. This supplies inspection after lost creation output;
+it neither recovers a password nor creates, revokes, authenticates or
+activates a credential or service.
+
+### Device revocation command
+
+`td-mta postgres device-revoke --connection-file PATH --epoch HEX
+--account ID --device ID` publishes one owner-side revocation. The
+protected connection input, fresh DNS resolution, verified TLS/SCRAM and
+overall ten-second worker deadline are the same as other explicit
+administration commands. The committed revocation is visible to the active
+PostgreSQL authentication and operation fences.
+
+The command samples checked UTC milliseconds and prepares one random
+revocation operation before address attempts. It retains that exact value
+through transport fallback. The account write fence, expected epoch and
+immutable receipt rules of the device registry apply. Success names the
+public epoch, account, device and current invocation's operation ID, with
+`recorded` or `already-revoked`. The latter does not claim that the
+current operation has a durable receipt: the prior revocation remains
+unchanged. No password, verifier, digest or database credential is
+printed.
+
+A possible COMMIT without a known response reports the fixed error
+`indeterminate-inspect-device` and does not retry or claim success. The
+operator can inspect the named device with `device-list`; absence of a
+revocation in a snapshot does not settle an outstanding COMMIT. A later
+explicit revoke of that same device is safe: the account fence serializes
+with the original operation and either records a revocation, observes the
+retained prior one, or, 30 days after a revocation, reports the retired
+device missing. It cannot identify the original operation's receipt and
+never creates a replacement credential. Process loss has no automatic
+retry or on-disk operation recovery.
+
+### Device creation command
+
+`td-mta postgres device-create --connection-file PATH --epoch HEX
+--account ID --label LABEL` creates one owner-side credential. The
+protected connection input, fresh DNS, TLS/SCRAM, ten-second worker and
+expected epoch rules match other explicit owner commands. The label retains
+the registry's 128-byte UTF-8 limit and control-character refusal. The
+command takes checked UTC milliseconds and prepares one Creation before
+address attempts. The registry's 256-unrevoked and 320-record ceilings and
+retirement of old revoked records apply.
+
+Only confirmed creation success prints the password, once, in the local
+JSON receipt together with its public device identity. The guarded password
+is written directly in its fixed hex-dot-hex encoding, without a temporary
+String. The database receives only its salted verifier. No database
+password, salt, verifier or request digest is printed. Output remains the
+operator's local credential receipt and must be retained before leaving the
+terminal.
+
+A failed publication prints only the fixed error category and public
+epoch, account and generated device ID. A possible COMMIT without a known
+response reports `indeterminate-inspect-and-revoke-device`; the command
+does not retry, print the password or generate a replacement credential.
+Inspect and revoke that named device with `device-list` and
+`device-revoke`. A read showing no record does not settle an outstanding
+transaction. Process or output loss after success can leave an undisclosed
+credential: inspect the account registry and revoke it before explicitly
+creating another. The label is not a unique operation identity, and
+rerunning creation is never recovery of the original password. There is no
+on-disk recovery.
+
+### Account administration workflow
+
+`postgres account-list --connection-file PATH [--epoch HEX]` reports the
+selected generation/version and account, receiving-alias and
+sending-identity records. Account IDs remain stable when the name or login
+username changes. The record `section` distinguishes account, alias,
+identity and identity_address; `id` is the stanza label. Names and
+addresses are JSON-escaped. This is a configuration observation, not proof
+that a process serves that generation. Current listing and editing
+revalidate referenced materials; expired or invalid certificates can
+prevent them, as for config-check.
+
+The following owner-side commands replace manual source decoding and SQL:
+
+```text
+td-mta postgres account-create --connection-file PATH --address EMAIL \
+  [--name NAME] [--username USER] --operation-file PATH
+td-mta postgres account-update --connection-file PATH --account ID \
+  [--name NAME] [--username USER] [--outbound-profile NAME] --operation-file PATH
+td-mta postgres account-alias-add --connection-file PATH --account ID \
+  --address EMAIL --operation-file PATH
+td-mta postgres account-alias-remove --connection-file PATH --account ID \
+  --address EMAIL --operation-file PATH
+td-mta postgres account-apply --connection-file PATH --operation-file PATH
+td-mta postgres account-operation-inspect --connection-file PATH --operation-file PATH
+```
+
+Create/update/alias commands accept an optional `--epoch`; otherwise they
+inspect the database epoch before preparing the operation. Create defaults
+name and username to the address. The address's domain must already be
+configured. It generates an account, Inbox and sending identity, and adds
+an explicit receiving alias. Other folders can be created by the client.
+An alias alone never grants permission to send from that address. Update
+changes only supplied name, username and outbound-profile fields, not
+aliases, identities, credentials, account IDs or stored messages. No
+destructive account deletion is offered. These commands retain the
+16-account bound.
+
+The operation file must not exist and must have a checked private mode-0700
+parent with trusted ancestors. It is created exclusively as mode 0600, then
+both file and parent are synced **before any database mutation**. A
+bounded, versioned, SHA-256-checked record retains the exact account/Inbox
+IDs, source bytes, configuration version and compare-and-swap selection
+request. It contains configuration material references, not resolved
+material secrets. The checksum detects corruption, not a malicious
+operator; PostgreSQL owner credentials remain the authority. Source input
+remains bounded to 2 MiB; operation framing allows another 2048 bytes. No
+subprocess implements editing or SQL, and unrelated source bytes/comments
+are retained.
+
+Each command validates the complete edited configuration, bootstraps a new
+account if required, stores the immutable version, and selects it against
+the original observed generation. A first-to-second-account change makes
+the old singleton postmaster explicit in every profile where it was
+implicit. Every profile still passes the ordinary routing, identity,
+material and quota checks. Concurrent changes return a conflict rather than
+silently rebasing.
+
+These steps are resumable, not one cross-operation transaction. Failure can
+leave bootstrapped account storage or an unselected configuration version;
+it cannot partially select a configuration. Keep the operation file and use
+`account-apply` after interruption or an uncertain result. It reuses the
+exact bootstrap and version IDs, syncs the loaded file and parent before
+writes, and resolves the selection receipt before current material
+validation. Never remove the file and retry create with fresh IDs to
+resolve uncertainty. A missing receipt is not proof an earlier request
+cannot still commit. A known generation conflict requires a newly prepared
+edit of current configuration; retain the original for inspection.
+
+Successful selection fences operations of the old generation at their
+publication (section 2). Each serving instance observes the new selection
+within about 30 seconds and drains and reloads itself ("Foreground serve
+command"); consider the account available once every affected instance has
+reloaded. An instance that cannot load the new configuration exits.
+Output always says `profile_activated:false`, marks receipts historical and
+sets `restart_required` whenever it reports a receipt: an instance must
+load the new generation, by its automatic reload or a restart, before the
+edit serves. Reapplying an old successful operation reports its original
+receipt without replacing a newer selection while fewer than 64 selections
+followed it, and `operation-expired-outcome-unknown` after ([Configuration selection (schema 7)](#configuration-selection-schema-7)). It
+does not prove that version is still selected. Credentials use the
+`device-create`, `device-list` and `device-revoke` commands; a username
+change does not revoke them.
+
+### Sending identity administration
+
+`postgres account-identity-add --connection-file PATH --account ID
+--address EMAIL [--name NAME] --operation-file PATH` creates a fresh
+sending identity; name defaults to the address. `account-list` reports its
+generated identity ID. `account-identity-update` takes `--account ID
+--identity ID` and at least one of `--address EMAIL` or `--name NAME`; an
+empty name is allowed. It preserves the identity ID, omitted fields,
+signatures and Reply-To/Bcc lists. `account-identity-remove` takes
+`--account ID --identity ID` and removes that identity and all of its
+address-list entries. Update/remove require the identity to belong to the
+named account. All three commands require the same connection and
+operation-file options and accept optional `--epoch`.
+
+These commands use the same retained-operation, validation, CAS, replay and
+reload contract above. They never add or remove receiving aliases, create
+account storage or provision credentials. A sending address need not be a
+receiving alias or use a locally received domain; the operator is
+responsible for authorizing it with the outbound provider. Normal mailbox
+syntax and the aggregate 64-identity limit still apply. An account may
+become receive-only when its last identity is removed, but the
+configuration must retain at least one identity globally. Removal prevents
+submissions published after the new version is selected, since submission
+publication fences the selection; it does not cancel already accepted
+messages or rewrite their envelopes.
+
+### HTTPS account selection
+
+The fixed HTTPS authentication worker returns an account/device principal.
+The network reactor selects a backend by that authenticated account, and
+retains the principal until the request ends. Backend registration is
+bounded to 16 distinct account IDs. Session discovery, upload, download,
+JMAP API and event snapshot dispatch all use that selection. URL or method
+argument account IDs never select authority: the selected account-scoped
+backend retains its target-account checks, fresh device checks and
+publication fences. Credentials remain request-owned and zeroed on drop; no
+worker pool, read capacity, body-operation concurrency or
+authentication-rate allowance is multiplied by the number of accounts.
+
+Cold preparation constructs a bounded binding registry, verifies every
+configured account's bootstrap, and prepares only that account's sending
+identities and visible catalog in its binding. One final selection
+observation fences the entire registry. Publication retains the bindings
+with the same configuration and TLS generation; an absent account never
+falls back to the first binding. The compatibility binding accessor is for
+common profile facts, not request dispatch. Extracting a singleton binding
+refuses multiple accounts.
+
+JMAP profiles register one Session and backend per account and origin. All
+backends share read slots, pending-mutation ownership, response admission
+and body operation capacity. Each Session names only its authenticated
+account. The resource plan reserves 20 MiB of account metadata
+(`limits::ACCOUNT_METADATA_BYTES`), which compile-time checks keep above
+the aggregate catalog preparation, bindings, Session documents for 16
+accounts on up to 32 origins each, and the relay's account metadata. All
+serving roles use this bounded account registry.
+
+### Retained HTTPS authentication sessions
+
+The fixed authentication worker retains at most one PostgreSQL session
+across requests, shared by every configured account and origin. Its
+adapter binds to the first calling thread, uses a nonblocking mutex with no
+waiter queue, and refuses another thread. Credentials and account/device
+authority remain request-owned; the retained session caches neither
+authentication results nor configuration or maintenance observations. Full
+schema and Runtime-role qualification belongs to connection admission,
+protected by the shared session migration lock held until that connection
+closes.
+
+Connection admission acquires the shared session migration lock once,
+inspects the complete schema ledger and qualifies primary/durability,
+Runtime-role, exact privileges and maintenance. Schema and role
+administration stops all serving instances first; it must not modify the
+protected contract behind a live connection. PostgreSQL continues to
+enforce each statement's privileges. The closed SQL surface cannot exploit
+newly added privileges. These checks repeat on every reconnect, including
+recovery after an idle disconnect.
+
+Each job begins a new READ ONLY REPEATABLE READ transaction. One typed
+query checks the pinned store epoch and current maintenance barrier;
+selected configuration, presented device and account snapshot remain
+freshly observed. The migration lock predates every job snapshot,
+preventing an upgrade from crossing connection qualification. Success and
+wrong-password refusal both require acknowledged ROLLBACK and final
+deadline/window checks. No transaction or account lock survives between
+jobs; the one shared migration lock does. Wrong-password refusals retain
+the clean connection without caching an authentication result. SQL
+failures, failed cleanup, expired jobs and framing failures retire it.
+Before submitting a later job, the adapter polls the clean idle driver
+without queuing SQL. An already-observable idle failure permits one fresh
+connection under the original deadline. No failure after job submission
+retries that job; a disconnect racing the idle check can still fail the
+request.
+
+A session admits at most 64 jobs within sixty seconds of creation. Each job
+keeps its own original deadline, capped at ten seconds including initial
+DNS, TCP, TLS and SCRAM. Before starting a later job whose complete
+allowance would outlive the session, the adapter closes the old connection,
+selects addresses under the writer endpoint resolution policy
+([Writer endpoint resolution](#writer-endpoint-resolution)) and repeats TLS/SCRAM admission. The fixed authentication
+worker checks local idle state once per second, outside client-slot locks,
+and retires a session when fewer than ten seconds of its original lifetime
+remain or its job count is exhausted. This maintenance performs no
+authorization query, driver health poll or new task. A shutdown guard
+closes retained resources on that same worker before it exits, including
+early failure paths.
+
+Only a clean idle session whose job completed with acknowledged rollback
+and final checks may use a separate termination allowance. Consuming
+retirement bounds that allowance by the caller deadline, original session
+expiry and the 100-ms driver cleanup ceiling. It cannot perform another
+job, renew TLS or replenish byte/frame windows. Failed or unfinished jobs
+retain their original deadline and sticky failure behavior. Cleanup is best
+effort if the peer fails or scheduling crosses the immutable TLS expiry; no
+cleanup outcome changes an already completed authentication result.
+
+Authentication and the first job share the initial one-MiB input,
+1088-frame and 64-KiB output window. A completed job admits another such
+window while the sixty-four-MiB input, 69632-frame and four-MiB output
+session totals only decrease. Per-frame and SCRAM limits remain unchanged.
+Available idle messages consume the preceding window before the next
+starts; parser state, connection authentication and sticky failures are
+never reset. Windows are work limits, not resident allocations. The
+one-authentication-worker capacity covers the retained socket and TLS
+buffers, independently of account count.
+
+API reads, downloads, post-verification reauthorization and mutation
+connections keep their own admission and teardown paths; authentication
+session retention changes no write retry, uncertain-COMMIT or
+receipt-settlement behavior.
+
+### JMAP origin aliases
+
+Immutable configuration may declare `server.jmap_origin_aliases` beside
+the primary origin, using CONFIG.md's bounded explicit allowlist (at most
+32 origins including the primary). Candidate preparation validates
+certificate coverage for every allowed JMAP hostname. The runtime prepares
+a private Session and PostgreSQL API backend for each account/origin pair,
+all sharing the same account binding, admission pools, credentials and
+persistent authority. URL and session-state selection remain consistent
+across discovery and API requests. Origin selection never selects another
+account or grants relay permission. No schema migration is required:
+import, check and select a configuration with the new aliases, and each
+serving instance drains and reloads into it ("Foreground serve command").
 
 ## 28. Authenticated mailbox observations
 
@@ -1457,102 +2320,6 @@ failures report I/O failure; corruption remains a row-shape or digest failure.
 This is a finite cold operation, not a reusable pool or
 an assertion that future HTTP transfer limits are already qualified.
 
-## 30. Retained configuration selection
-
-Schema seven adds a singleton `config_selection` row and
-`config_selection_receipts`, immutable until publication sweeps them. The
-initial row has generation zero and no version. `postgres_selection` supplies
-owner-side preparation, publication, receipt inspection and selected-source
-reads. This is still inert storage preparation: it opens no listener and
-supplies no runtime policy, role or device authorization. Production startup
-and policy fencing remain cutover work.
-
-A retained change binds a random operation ID to the store epoch, expected
-full-u64 generation, immutable version ID and validated source digest.
-Publication first resolves an existing receipt under a shared singleton lock
-that excludes an earlier publication still committing, then rereads and revalidates
-all profiles and materials under its original absolute deadline. The write
-transaction locks the singleton before any future account/device locks,
-checks the receipt again after waiting, compares the generation and stored
-source digest, and increments the generation with checked arithmetic.
-Pointer and receipt commit together with explicit synchronous commit and
-read-committed isolation. Competing changes from the same generation cannot
-both publish. A failed candidate or definite rollback leaves the pointer
-unchanged.
-
-The original ten-second operation ceiling covers every connection, validation
-and transaction; none renews it. A lost COMMIT response is indeterminate. The
-publication transaction uses the bounded mutation transport profile (1088
-input frames, 1 MiB input, 128 KiB output), including schema ledger
-qualification and COMMIT. Receipt inspection and passive observation retain
-the smaller probe profile. Keep the exact retained change and resolve/retry
-it, never generate another ID from an absence observation. Lock/connection
-failures while resolving leave any previous uncertainty outstanding; they are
-not proof of rollback. The shared resolution lock is released before material
-validation. Historical receipts resolve their original selection after up to
-63 later selections or material expiry; receipt success does not assert that
-version is still selected. Each publication deletes, under the singleton lock,
-receipts at least 64 selections older than itself; a request at or below that
-floor reports `Expired` from inspection and publication, never absence and
-never a definite conflict, even when it provably never committed. At most 1024
-receipts may exist, checked after the sweep under the same lock. Section 197
-supplies a fixed public encoding for retaining the same change across process
-restart; callers must persist it before publication. Encoding support does not
-activate administration.
-
-Owner-side selected-source reads capture a passive generation/version, then
-verify the immutable source bytes and all profiles/materials. A concurrent publication
-can supersede that generation before return. Consumers must fence current
-policy at runtime admission/publication rather than treat the returned
-candidate as authority. Store-epoch checks apply to each connection, including
-receipt resolution after restore. Schema migration keeps earlier checksums
-unchanged and initializes selection without choosing an existing version.
-
-## 31. Selected-profile runtime preparation
-
-`postgres_runtime_profile::load` is a cold bridge from selected database
-sources to an owned resolved profile and caller-reserved TLS generation.
-It retains a passive binding of epoch, selection generation/version, account,
-profile name and roles. It does not open listeners, publish a runtime
-configuration, enable relay/ACME workers or provide device authorization.
-No conversion to the legacy file-serving input is introduced.
-
-Loading verifies the selected version's source digest, composes every profile
-and checks shared quotas and route declarations. A dedicated service login
-must match the requested profile and roles. It opens the text and TLS inputs
-that role uses, through the owner-bound views described in the runtime-role
-section. For example, a receiving process prepares its listener identities
-while a relay prepares its configured transport and password. The shared
-runtime login revalidates every profile and material before resolving the
-requested profile. Both paths require the configured account's durable
-bootstrap receipt. All material comes from the
-database under the original deadline; there is no filesystem fallback.
-The caller's TLS generation reservation remains in its original domain and
-is released on failure. The returned resolved text contains secrets and has
-no diagnostic dump. Its explicit binding retains passive identifiers, limits
-and the selected sending identity IDs/mailboxes. At most 64 mailboxes of at
-most 254 bytes are copied from the validated configuration; binding clones
-share that immutable catalog. Diagnostic formatting redacts the mailboxes.
-The header and SMTP recipient limits come from the same selected profile.
-Identity lookup is configuration evidence, not sending authority: submission
-publication must freshly fence the selection and current device. JMAP bindings
-also share the bounded visible Identity catalog, including public text/HTML
-signature bytes. No relay credentials or signature source paths enter the
-binding; diagnostic formatting redacts the visible catalog. A relay binding
-also retains the process-local relay policy identity from this exact prepared
-TLS generation (section 183); it contains no credentials or TLS lease.
-
-Before returning, a final primary observation rejects a selection already
-superseded during preparation. This does not freeze future changes: runtime
-startup/publication must still fence policy afresh and admit only implemented
-roles. The original at-most-ten-second deadline covers source verification,
-repeated profile preparation, account inspection and final observation.
-The source candidate is discarded before the final check; retained text and
-TLS objects belong to the caller's cold control worker. Reusable connection
-pools, publication, live refresh and full resource qualification remain
-runtime integration work.
-
-
 ## 32. Retained single-Email flag writes
 
 Schema version 8 adds owner-private flag_receipts. The cold postgres_email_set
@@ -1588,7 +2355,6 @@ same-account inspection (section 79). Receipts a crash orphans expire with the r
 All calls retain finite worker/deadline limits.
 An inspection that crosses its deadline refuses absence/errors, but preserves
 a confirmed historical receipt as known success.
-
 
 ## 33. Bounded flag batches
 
@@ -1736,8 +2502,7 @@ Their bytes never exceed the upload quota, though zero-length uploads can hold
 blob count.
 The candidate scan reads the account's leases (no expiry index), which the
 upload and blob-count quotas bound. Deleting leases needs the runtime DELETE
-grant of section 55.
-
+grant of [Runtime database logins](#runtime-database-logins).
 
 ## 36. Authenticated blob downloads
 
@@ -1763,7 +2528,6 @@ each retains its existing finite frame and byte budgets. Callback errors,
 swallowed reader errors, expired deadlines and failed snapshot connections
 cannot become success. This cold boundary does not yet connect production
 HTTPS dispatch or replace runtime connection and worker admission.
-
 
 ## 37. Retained td-mail draft creation
 
@@ -1802,7 +2566,6 @@ rolls back bodies, ID reservation, metadata, usage and receipt together.
 This remains a cold storage API: HTTP dispatch, sender-identity policy,
 submission, runtime admission and the runtime integration remain work.
 
-
 ## 38. Authenticated change-history pages
 
 `postgres_changes` reads detached Mailbox/Thread/Email/Submission change
@@ -1832,7 +2595,6 @@ no partial results escape or resume on a different snapshot.
 Authorization and policy are admitted at snapshot start; the finite read
 may finish after concurrent revocation. HTTP dispatch and runtime connection
 admission remain part of the runtime integration.
-
 
 ## 39. Shared Email read snapshots
 
@@ -1971,7 +2733,6 @@ minute (section 217). Folder transactions have a
 one-MiB output ceiling for bounded names and a one-MiB/1088-frame input budget.
 Preparation, publication and replay do not enable PostgreSQL serving.
 
-
 ## 43. Atomic Email mailbox replacement
 
 The existing `postgres_email_set::Update` now accepts an optional existing
@@ -1997,7 +2758,6 @@ no Mailbox history unless seen changes. Changed Emails each get one history
 entry, Thread history is unchanged, and the account advances once. All rows,
 history and the ordered receipt commit together; uncertainty resolves through
 the original operation. Existing mutation-worker wire bounds are unchanged.
-
 
 ## 44. Retained Email deletion
 
@@ -2240,7 +3000,6 @@ Deletion, revocation or a configuration change after preparation can therefore
 refuse publication. Section 48 supplies the owner-side enqueue transaction;
 runtime memory admission remains separate work.
 
-
 ## 48. Retained submission publication
 
 Schema version 14 adds owner-private submission_receipts. The inert
@@ -2392,7 +3151,6 @@ recipient Prepared publication and every subsequent phase still need the
 same route-owner fence. Takeover recovery must preserve AcceptancePossible
 uncertainty before any replacement attempt. These workers remain inert.
 
-
 ## 53. Inert first-attempt publication
 
 Schema 17 retains `submission_attempts`: one historical receipt per random
@@ -2417,7 +3175,6 @@ before another attempt. Clock validation and monotonic retry guards remain
 runtime activation requirements. The supplied submission is selected by a
 future bounded scheduler; no unbounded due-queue scan is introduced here.
 
-
 ## 54. Inert abandoned-attempt recovery
 
 Schema 18 adds retained `attempt_recovery_receipts`. A current route owner
@@ -2441,162 +3198,6 @@ separate activation prerequisite. A backwards last-attempt timestamp refuses.
 Runtime clock discontinuity validation and the monotonic restart guard of
 the minimum retry interval still precede any actual retry. Receipt storage has a 1024-per-account
 cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
-
-## 55. Runtime database credential preparation
-
-`postgres runtime-check --connection-file PATH` checks the current schema and
-one dedicated runtime login's effective data privileges. It closes the
-connection before returning and neither grants privileges nor activates a
-profile. Each serving connection qualifies its own login and schema before
-using its runtime authority.
-
-Each runtime login must be separate from the owner, have no role
-memberships, and have none of SUPERUSER, CREATEDB, CREATEROLE, REPLICATION or
-BYPASSRLS. It must not own the database or application objects or have database CREATE or
-application-schema CREATE privileges. This dedicated-login policy also
-refuses membership that currently disables inheritance or SET ROLE, rather
-than depending on those options remaining unchanged. Database TEMP privileges
-are outside this application-schema boundary. Provider administration and
-arbitrary externally installed SECURITY DEFINER functions are not audited by
-this check; database administrators remain trusted.
-
-Production services use five dedicated PostgreSQL logins. The server's
-authenticated session user selects the exact table and column privileges in
-`postgres_runtime_access::ServiceRole::grants`. Each primary serving login
-must match its selected profile name and roles. The ACME command has its own
-login. Every service can read the schema ledger, runtime barrier and replica
-source marker for admission.
-
-| Login | Additional database authority |
-| --- | --- |
-| `td_mta_receive` | Publish SMTP mail to the Inbox, maintain thread and change history, charge quotas and write application logs. Existing blob bodies, device verifiers and the outbound queue are inaccessible. |
-| `td_mta_frontend` | Authenticate devices, read and mutate mailbox data through JMAP, create uploads and submissions and cancel submissions. Device credential administration and route ownership remain separate. |
-| `td_mta_relay`, `td_mta_migadu` | Deliver submissions, track attempts, produce failure notices and reclaim retired submissions and uploads. Both workers operate on the same queue tables and can read the shared body store, including stored incoming mail and drafts. The configured route and ownership fences distinguish their application operations. |
-| `td_mta_acme` | Read and update certificate issuance state and publish certificates. Mail storage and the service configuration views are inaccessible. |
-
-For the four serving profiles, the only path to secret material is through
-owner-defined security-barrier views in `td_mta_service`. The views bind
-the session user and active configuration version to that profile's allowed
-material IDs and certificate profiles. Shared material, such as a TLS key
-used by both SMTP and HTTPS, is available to each profile that uses it.
-Relay transport credentials are specific to their configured profiles.
-Only ACME directly accesses `td_mta.acme_profiles`.
-
-Qualification checks every application table, including tables absent from
-that login's grant plan. Missing grants, extra privileges, PUBLIC grants,
-delegation and extra column grants refuse admission. The catalog check
-covers system columns as well as user-defined columns. The schema owner
-applies each role's grants and qualifies the corresponding service
-connection. PRODUCTION.md describes the coordinated cutover and rollback.
-
-The shared-login contract remains available for single-login installations.
-The table inventory lives in `postgres_runtime_access::TABLES`. In this
-mode all current tables require SELECT. Mail data and receipt tables require
-INSERT, UPDATE and DELETE, while schema, immutable configuration, selection
-receipts, bootstrap receipts and reserved import tables are read-only.
-Upload leases require SELECT, INSERT and DELETE, so upload publication and
-relay retention can reclaim expired ones (section 35); any UPDATE, which could
-extend a lease,
-refuses. The replica reader keeps SELECT and INSERT only.
-The selection singleton permits only column-level UPDATE on `singleton`,
-which allows FOR SHARE policy fencing without changing its generation/version.
-Application tables must be ordinary logged tables without row security.
-Extra/missing tables, grant options, TRUNCATE, REFERENCES, TRIGGER and MAINTAIN
-privileges refuse. Column grants are checked as well as table grants.
-
-Provision the shared login through PostgreSQL/provider administration;
-keep its password out of argv. For a fresh `td_mta_runtime` login, the owner
-can grant the current schema privileges atomically as follows:
-
-```sql
-BEGIN;
-GRANT USAGE ON SCHEMA td_mta TO td_mta_runtime;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA td_mta
-    TO td_mta_runtime;
-REVOKE INSERT, UPDATE, DELETE ON
-    td_mta.schema_migrations, td_mta.runtime_barrier,
-    td_mta.config_materials,
-    td_mta.config_material_chunks, td_mta.config_versions,
-    td_mta.config_version_chunks, td_mta.config_selection,
-    td_mta.config_selection_receipts, td_mta.account_bootstraps, td_mta.replica_source,
-    td_mta.replica_accounts, td_mta.replica_progress, td_mta.replica_pending,
-    td_mta.replica_mailbox_receipts, td_mta.replica_email_receipts,
-    td_mta.replica_blob_identities,
-    td_mta.leases, td_mta.imports FROM td_mta_runtime;
-GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
-GRANT INSERT, DELETE ON td_mta.leases TO td_mta_runtime;
-COMMIT;
-```
-
-This is a fresh-role setup, not repair of inherited or preexisting grants.
-Validate with the runtime connection specification afterward. Owner commands
-retain their separate credential. Drain/stop serving instances before changing
-their runtime role or privilege contract; reconnect requalifies it. Before a
-schema upgrade, drain/stop all instances and maintenance jobs. Existing explicit
-schema/table/column grants are preserved under the owner migration ACL check.
-Apply any additional grants required by the new version and recheck before
-restart. Do not install default privileges on future tables.
-
-The cold check uses the existing bounded listing transport (512 frames,
-1 MiB input, 64 KiB output), retaining the original ten-second maximum
-operation deadline and the shared migration lock through inspection.
-
-## 56. Qualification on each runtime connection
-
-The internal database request distinguishes preparation from runtime mode.
-Preparation remains the default of the protected bootstrap parser and all
-operator commands. Runtime mode authenticates TLS/SCRAM, checks primary and
-durability settings, acquires the shared migration lock, validates the current
-schema and checks the dedicated runtime role/table privileges before admitting
-an operation's SQL. A new connection repeats all of those checks; a previous
-cold receipt never substitutes for them. Retained HTTPS authentication and foreground relay idle readers hold
-that qualification and migration lock for their finite connection lifetimes,
-with fresh job fences as specified under Retained HTTPS authentication
-sessions. Other operation-owned connections hold the lock through their
-operation. BodyChecks instead authenticates at open and performs
-this qualification inside every closed validation transaction (sections 2 and
-180), before any Body queries. No prior turn supplies cached qualification.
-Mail helpers still enforce their own epoch, current configuration, device,
-snapshot and publication fences.
-
-Qualification failure closes the connection before the application callback
-runs, with separate redacted schema/role/privilege errors. It performs no
-reconnect, publication retry or deadline renewal. An operation trying to
-resolve an earlier uncertain publication still retains that uncertainty when
-qualification refuses; refusal does not prove the earlier operation rolled
-back. Schema initialization and grants remain explicit owner operations.
-
-Runtime connections use at least 1024 frames to include qualification and
-the operation in one budget; mutation workers admit 1088 frames. Larger existing
-frame budgets, byte budgets, per-frame/authentication caps and output budgets
-are unchanged; qualification does not replenish any allowance. The original
-absolute deadline covers connection setup, qualification and application work.
-No runtime pool, listener or automatic retry is activated by this increment.
-The real PostgreSQL fixture loads both profiles and exercises read/unread/star
-mutations, batch receipts and lost-COMMIT handling through the dedicated
-runtime login; privilege changes are refused on the next connection.
-
-## 57. Request credential ownership
-
-`http_auth::parse_basic` separates bounded HTTP Basic decoding from storage
-authentication. It retains the exact visible-ASCII username (1..254 bytes,
-excluding colon) and at most 97 password bytes. Its owned
-`BasicCredentials` retains at most 352 decoded bytes, has no Debug or Clone
-implementation, and clears its decoded buffer on drop. It contains presented
-bytes only, not a device ID, cached verifier result or authorization grant.
-`postgres_http_auth::Authentication` matches the username case-sensitively
-against a bounded registry of at most 16 account bindings, then checks the
-password using that account's fresh primary snapshot. It returns a principal
-containing both AccountId and DeviceId; a device ID alone cannot identify an
-account because device IDs are unique only within their account.
-
-At PostgreSQL runtime integration the bounded HTTPS request worker may retain this owner
-for that request only, borrowing its password for fresh primary snapshot and
-publication checks. It must not cache the owner across requests or replace
-those checks with the result of earlier authentication. TLS, configured-origin
-and attempt admission precede parsing. Invalid password syntax still goes to
-the backend's credential check; HTTP decoding is not app-password validation.
-No PostgreSQL listener or alternative production backend is activated here.
 
 ## 58. Mailbox projection from the admitted read snapshot
 
@@ -3130,7 +3731,6 @@ prepared owner loses a COMMIT acknowledgement to a deadline and later settles
 the committed receipt while both foreground read slots are held, proving that
 settlement has separate connection admission.
 
-
 ## 80. Prepared moves between existing mailboxes
 
 The singleton Email/set adapter also accepts td-mail's mailboxIds replacement.
@@ -3148,7 +3748,6 @@ requests under the account and time limits of section 79. The real-client fixtur
 Archive folder through the existing storage helper, moves Inbox to Archive
 and back, checks database membership and unchanged flags, and queries the
 same Email/body ID after each move. This does not activate production serving.
-
 
 ## 81. Prepared Email deletion
 
@@ -3172,7 +3771,6 @@ checks authoritative Email and quota state, and confirms the first message
 still reads and downloads. A delayed deletion COMMIT is settled through its
 original receipt and releases the final body quota. Draft creation and
 production PostgreSQL activation remain separate.
-
 
 ## 82. Prepared root-folder creation
 
@@ -3200,7 +3798,6 @@ released inline by the next creation. Hierarchy creation and renaming remain
 outside this td-mail milestone.
 Singleton deletion uses the same owner as described below.
 
-
 ## 83. Caller-funded draft preparation
 
 The retained plain-text draft helper has an entry point that borrows the
@@ -3218,7 +3815,6 @@ HTTP creation. The PostgreSQL draft fixture checks exhausted record/output
 budgets and expired original/phase deadlines refuse before publication, then
 publishes a caller-funded draft through the existing receipt, body, thread and
 history checks.
-
 
 ## 84. Prepared HTTP plain-text drafts
 
@@ -3247,7 +3843,6 @@ immutable message, settles a delayed commit and releases a rolled-back one
 inline before the next draft. This
 activates no production service, attachment upload or submission capability.
 
-
 ## 85. Caller-funded submission input
 
 Submission input preparation can borrow the original HTTP work meter and
@@ -3264,7 +3859,6 @@ publication work, fresh device authorization and receipt ownership remain the
 runtime caller's obligations. The local PostgreSQL fixture verifies exhausted
 work and both deadline refusals, then checks caller-funded input through the
 existing privacy, source-state, route and queue-publication evidence.
-
 
 ## 86. td-mail submission request decoding
 
@@ -3523,7 +4117,6 @@ submission query/get and retires the draft without adding a submission.
 Queue rows retain the desktop submitting profile's smarthost route. No SMTP
 relay, attachments, cloud-provider failover or runtime integration is claimed.
 
-
 ## 100. Caller-funded upload preparation
 
 `postgres_uploads::prepare_with_meter` retains completed ingress using the
@@ -3535,7 +4128,6 @@ only shorten the meter's original deadline; no database work or new allowance
 is introduced. The cold convenience wrapper constructs its bounded meter and
 uses the same implementation. Memory/concurrency admission, HTTPS upload
 receipt ownership and production activation remain separate work.
-
 
 ## 101. Fixed-worker upload ownership
 
@@ -3562,7 +4154,6 @@ including column-only UPDATE grants. Provisioning grants must match this
 roster before the runtime connection qualifies; no owner credential fallback
 is used for an upload.
 
-
 ## 102. Prepared HTTPS upload receipt
 
 The prepared PostgreSQL HTTPS adapter receives length-delimited or chunked
@@ -3583,7 +4174,6 @@ remains available for bounded same-account inspection. Reads and the service rem
 available. Attachment composition and complete recovery qualification remain
 separate requirements.
 
-
 ## 103. Caller-funded receiving preparation
 
 `postgres_receiving::prepare_with_meter` prepares completed DATA under the
@@ -3602,7 +4192,6 @@ retries. The caller still owns body and scratch memory admission, gateway and
 recipient authority and publication.
 The real PostgreSQL receiving fixture exercises shared-meter exhaustion,
 expiry and successful publication with unchanged provenance and threading.
-
 
 ## 104. Fixed-worker receiving publication ownership
 
@@ -3639,7 +4228,6 @@ The foreground service constructs the PostgreSQL adapter behind this
 interface. Its readiness, ingress capacity, authorization fences, contention
 mappings and completion behavior are exercised by the PostgreSQL worker and
 executable fixtures. The old local storage adapter is removed.
-
 
 ## 106. Fresh receiving readiness
 
@@ -3730,7 +4318,6 @@ name and does not change production trust, client authentication or gateway
 policy. This is prepared PostgreSQL integration evidence; production backend
 selection and deployment qualification remain unchanged.
 
-
 ## 110. Durable outgoing DATA phases
 
 Schema 19 retains one phase receipt per account, attempt and target phase.
@@ -3762,7 +4349,6 @@ known rollback, phase ordering, exact Body membership, retained replies,
 and historical settlement after a policy
 change. Schema upgrade tests include the version-18 boundary.
 
-
 ## 111. Durable positive SMTP outcomes
 
 Schema 20 adds acceptance receipts, bounded to 1024 per account. The prepared
@@ -3786,7 +4372,6 @@ final replies, rollback, delayed COMMIT, duplicate-risk preservation, attempt
 retirement, exclusion of Accepted recipients from subsequent dispatch, and
 final-batch completion after expiry. Negative outcomes, final-outcome capacity
 admission and runtime recovery/scheduling remain separate prerequisites.
-
 
 ## 112. Durable final DATA refusals
 
@@ -3812,7 +4397,6 @@ retry bounds, uncertainty preservation and final completion after expiry.
 This prepares final DATA results only. RCPT/MAIL/DATA-command refusals,
 transport failures, retry dispatch, capacity reservation and production
 activation remain separate work.
-
 
 ## 113. Durable negative RCPT subsets
 
@@ -3863,7 +4447,6 @@ results after expiry, delayed COMMIT, conflicting replay and completion.
 Transport failures, retry dispatch, capacity reservation and production relay
 activation remain separate work.
 
-
 ## 115. Current-owner transport interruption
 
 The attempt recovery publisher also prepares a domain-separated current-owner
@@ -3884,7 +4467,6 @@ The PostgreSQL fixture covers each durable phase, mixed remaining Prepared
 recipients, earlier uncertainty, stale owners, refusal of abandoned recovery
 for the current owner, retained replies, exact replay and retry timestamps,
 rollback, expiry hold, delayed COMMIT and exclusion of settled RCPT results.
-
 
 ## 116. Conservative runtime queue clock guard
 
@@ -3970,7 +4552,6 @@ elapsed due times and covers both states, bounded batches, terminal/future
 exclusion, overflow, minimum interval, expiry, rollback, unknown COMMIT,
 historical replay and the separate fresh-recipient path.
 
-
 ## 118. Clock-guarded expiry admission
 
 The queue clock guard admits one expiry batch per monotonic second after
@@ -3989,7 +4570,6 @@ guard; these ephemeral tokens and identities are never persisted. Every
 observed UTC regression advances a checked expiry generation, including
 subthreshold steps seen by another user of the shared guard. Recovery of UTC
 does not restore an older token. The token admits only terminal expiry.
-
 
 ## 119. Prepared queue expiry storage
 
@@ -4015,7 +4595,6 @@ mail runtime's ordinary DML grants. Upgrade preserves the epoch and earlier
 material, rolls back all new DDL on obstruction, and includes the prior version
 23 in the migration fixture. This schema preparation expires no recipients and
 starts no scheduler; the fenced publisher and runtime wiring remain work.
-
 
 ## 120. Fenced clock-guarded expiry publisher
 
@@ -4077,7 +4656,6 @@ and fence the route's transport first, including an interrupted current-owner
 attempt, share the process guard and detect primary changes. This API starts
 no transport, scan, scheduler or administrator clock-confirm endpoint.
 
-
 ## 121. Prepared shared route health storage
 
 Schema version 25 prepares route health keyed by account, route name and
@@ -4106,19 +4684,6 @@ holds across ownership changes, and cap health rows and receipts per account.
 Clock guards and due times remain separate dispatch requirements. Both tables
 use the runtime's ordinary mail DML grant set and private owner initialization.
 This schema preparation changes no dispatch behavior or runtime admission.
-
-
-## 122. Account-bootstrap mutation budget
-
-Account creation uses the existing bounded mutation connection allowance:
-1088 input frames, one MiB aggregate input and 128 KiB output, with unchanged
-per-frame, authentication and deadline limits. Its schema-ledger inspection
-and bootstrap writes share that allowance. The ordinary 128-frame probe
-allowance no longer fits this operation at schema version 25; exhausting it
-while reading COMMIT must remain indeterminate and settle the retained creation.
-This changes no transaction or replay semantics. Read-only account inspection
-retains the ordinary probe allowance.
-
 
 ## 123. Shared route failure publication and dispatch checks
 
@@ -4210,7 +4775,6 @@ activated; explicit configuration repair and successful-route reset are the
 next publication operations, and no timer silently clears a repair latch;
 route retirement never deletes a latched row.
 
-
 ## 124. Explicit shared route repair
 
 A prepared route-repair operation binds a random retained operation ID to its
@@ -4238,7 +4802,6 @@ endpoint or a configuration-load side effect. Runtime integration must bind
 operator authorization to this operation. Successful-route counter reset is
 a separate operation; repair does not claim that transport has succeeded.
 
-
 ## 125. Shared route success reset
 
 The success publisher requires a retired attempt of the exact current owner,
@@ -4259,7 +4822,6 @@ with the shared health/receipt caps and a final owner/time check. Recipient
 results and account sequence are unchanged. Unknown COMMIT settles the original
 operation. A successful SMTP handoff does not prove final mailbox delivery;
 this operation starts no scheduler or transport and cannot authorize a send.
-
 
 ## 126. Prepared whole-submission cancellation settlement
 
@@ -4335,7 +4897,6 @@ conditional cancellation replays after its own sequence advance or later
 account changes. Its receipt must record the original expected sequence.
 This is the storage precondition needed for ifInState, not client credential
 authorization or an activated EmailSubmission/set update endpoint.
-
 
 ## 129. Device-authorized cancellation publication
 
@@ -4438,7 +4999,6 @@ never a fabricated refusal or success. A current state mismatch remains a
 method-level stateMismatch. Cancellation creates no creation ID or implicit
 Email/set response in this increment.
 
-
 ## 133. Real PostgreSQL cancellation dispatch qualification
 
 The real database scenario now drives validated JMAP requests through response
@@ -4455,7 +5015,6 @@ operation. Later independent receipt inspection confirms its original state
 and single sequence advance. No uncertain response becomes a guessed refusal
 or success. Private response trees use the shared TempDir guard. This qualifies
 the prepared internal path, not production HTTP/relay ownership or cutover.
-
 
 ## 134. Bounded route candidate discovery
 
@@ -4483,7 +5042,6 @@ or production backend is activated by this API. The real PostgreSQL scenario
 covers multi-page discovery, eligibility filtering, separate retry discovery,
 stale generations, cursor-kind binding, active-attempt refusal and unchanged
 account state during read-only scans.
-
 
 ## 135. Expiry discovery during delivery pauses
 
@@ -6090,7 +6648,6 @@ Setup adds no scheduler or backend activation. The source-sized Body allowance
 and ten-second native job cap still require qualification for maximum-sized
 messages and backpressure before the relay runtime can be called usable.
 
-
 ## 186. One bounded configured relay attempt
 
 The inert postgres_relay_attempt driver consumes ConnectedPrepared and runs
@@ -6145,7 +6702,6 @@ no transport or publication authority and cannot carry progress into an
 idle turn. Removing reply-read waits alone does not establish full-recipient
 throughput; section 188 qualifies the combined retained-validation path.
 
-
 ## 187. Retained untouched-envelope observations
 
 The passive EnvelopeChecks owner authenticates one thread-bound connection
@@ -6178,7 +6734,6 @@ ROLLBACK state, independently obtainable conflicting locks, selected-policy,
 role, privilege, recipient-phase and owner-generation fences, fresh address
 observations, cumulative exhaustion, original expiry, and backend termination
 after the last live clock observation but before acknowledged rollback.
-
 
 ## 188. Prepaid configured envelope validation
 
@@ -6243,7 +6798,6 @@ The paired TLS test drives successful command output, an idle reply turn,
 a productive partial reply and another idle turn, proving that the hint
 resets rather than carrying output or read progress into an idle operation.
 
-
 ## 190. Admitted route-candidate discovery
 
 Dispatches::candidates wraps the existing route scanner in the same bounded
@@ -6270,7 +6824,6 @@ expired input/meter deadlines, preparation-mode refusal, stale ownership,
 cursor binding, slot exhaustion/reclamation and unchanged account state.
 An existing delayed Prepared COMMIT verifies all three scan kinds refuse
 while the exact unresolved operation remains in Pending.
-
 
 ## 191. Admitted route acquisition and retained uncertainty
 
@@ -6341,196 +6894,6 @@ through this worker, including separate settlement
 capacity, blocked worker operations, pre-SQL admission refusals, unconfirmed
 clock refusal, historical replay, nonrenewing budgets and reclaimed slots.
 The existing recipient-state and sequence assertions remain in force.
-
-## 193. Bounded administrative device listing
-
-`postgres_devices::list` reads one account's complete device registry,
-including revoked rows, under a fresh repeatable-read, read-only snapshot.
-It validates the primary, current schema and expected store epoch while
-retaining the session migration lock, distinguishes an absent account from
-an empty registry, and acknowledges rollback before returning a successful
-result. Every path closes the connection. No account
-write fence is taken and no mail sequence, credential or receipt is changed.
-
-The query selects only ID, label, creation time and revocation time, ordered
-by ID. It never requests passwords, salts, verifiers or request digests.
-At most 321 rows are fetched so a registry exceeding the 320-record ceiling
-(section 21: 256 unrevoked devices plus revoked records awaiting retirement)
-is refused without a truncated success. Retired records are no longer
-listed. IDs, labels and nonnegative
-timestamps are validated before any result is returned. The returned public
-metadata is historical and cannot authorize authentication or a mail operation.
-
-The explicit preparation command is:
-
-```text
-td-mta postgres device-list --connection-file PATH --epoch HEX --account ID
-```
-
-It uses the protected connection-file loader, verified TLS/SCRAM, fresh
-bounded DNS resolution and the existing shared ten-second connection/operation
-deadline. Database credentials must have the required schema/account and
-metadata-column read privileges. The command grants none. The syntactic
-bootstrap profile placeholder selects no running profile. JSON output binds
-the expected epoch and account and contains the four public fields for each
-device, with escaped labels and nullable revoked_at. Errors report fixed
-categories without connection inputs or provider diagnostics. This supplies
-inspection after lost creation output; it neither recovers a password nor
-creates, revokes, authenticates or activates a credential or service.
-
-The native fixture exercises the API and actual command with a role lacking
-salt/verifier read privileges, Unicode and quoted labels, revoked entries,
-empty and foreign accounts, stale epoch, malformed metadata, exact capacity
-and overflow refusal. Device enumeration leaves account sequences unchanged.
-
-## 194. Explicit administrative device revocation
-
-`td-mta postgres device-revoke --connection-file PATH --epoch HEX
---account ID --device ID` publishes one owner-side revocation in the
-preparation database. The protected connection input, fresh DNS resolution,
-verified TLS/SCRAM and overall ten-second worker deadline are the same as
-other explicit administration commands. The committed revocation is visible
-to the active PostgreSQL authentication and operation fences.
-
-The command samples checked UTC milliseconds and prepares one random
-revocation operation before address attempts. It retains that exact value
-through transport fallback. The existing account write fence, expected
-epoch and immutable receipt rules in section 21 apply. Success names the
-public epoch, account, device and current invocation's operation ID, with
-`recorded` or `already-revoked`. The latter does not claim that the current
-operation has a durable receipt: the prior revocation remains unchanged.
-No password, verifier, digest or database credential is printed.
-
-A possible COMMIT without a known response reports the fixed error
-`indeterminate-inspect-device` and does not retry or claim success. The
-operator can inspect the named device with `device-list`; absence of a
-revocation in a snapshot does not settle an outstanding COMMIT. A later
-explicit revoke of that same device is safe: the account fence serializes
-with the original operation and either records a revocation, observes
-the retained prior one, or, 30 days after a revocation, reports the
-retired device missing. It cannot identify the original operation's receipt
-and never creates a replacement credential. Process loss has no automatic
-retry or on-disk operation recovery. No creation command is introduced.
-
-## 195. Explicit administrative device creation
-
-`td-mta postgres device-create --connection-file PATH --epoch HEX
---account ID --label LABEL` creates one owner-side preparation credential.
-The protected connection input, fresh DNS, TLS/SCRAM, ten-second worker and
-expected epoch rules match other explicit preparation commands. The label
-retains the registry's 128-byte UTF-8 limit and control-character refusal.
-The command takes checked UTC milliseconds and prepares one Creation before
-address attempts. Section 21's 256-unrevoked and 320-record ceilings and
-retirement of old revoked records apply.
-
-Only confirmed creation success prints the password, once, in the local JSON
-receipt together with its public device identity. The guarded password is
-written directly in its fixed hex-dot-hex encoding, without a temporary
-String. The database receives only its salted verifier. No database password,
-salt, verifier or request digest is printed. Output remains the operator's
-local credential receipt and must be retained before leaving the terminal.
-
-A failed publication prints only the fixed error category and public epoch,
-account and generated device ID. A possible COMMIT without a known response
-reports `indeterminate-inspect-and-revoke-device`; the command does not retry,
-print the password or generate a replacement credential. Inspect and revoke
-that named device using sections 193 and 194. A read showing no record does
-not settle an outstanding transaction. Process or output loss after success
-can leave an undisclosed credential: inspect the account registry and revoke
-it before explicitly creating another. The label is not a unique operation
-identity, and rerunning creation is never recovery of the original password.
-No on-disk recovery, serving admission or file-registry change is introduced.
-
-## 196. Explicit administrative account bootstrap
-
-`td-mta postgres account-init --connection-file PATH --epoch HEX --account
-ID` prepares one random Inbox identity before bounded address attempts and
-uses section 27's atomic account bootstrap. A confirmed publication prints
-its public epoch/account/Inbox receipt. The protected connection input,
-fresh DNS, TLS/SCRAM and ten-second operation deadline match other explicit
-preparation commands. Initialization neither activates account policy nor
-admits a serving backend.
-
-A publication failure reports only a fixed error and the attempted public
-tuple. An outstanding COMMIT reports `indeterminate-inspect-account` and
-stops without retrying. `td-mta postgres account-inspect --connection-file
-PATH --epoch HEX --account ID` reads the retained bootstrap receipt, not
-current Inbox contents, sequence or serving authority. Absence cannot settle
-an outstanding original transaction; let it finish before interpreting a
-missing receipt. A stored receipt can be compared with the attempted tuple.
-
-A fresh initialization invocation generates a different Inbox identity and
-conflicts with a preexisting bootstrap receipt. An account lacking a receipt
-also refuses initialization. Neither command resets, repairs or adopts an
-existing account. Lost process output is recovered by inspecting the named
-account's retained receipt, not by blindly repeating initialization. Account
-retirement, import and serving configuration remain separate operations.
-
-## 197. Process-independent selection request custody
-
-`postgres_selection::Change::encode` produces exactly 89 public bytes:
-format version 1, 16-byte epoch, 16-byte operation ID, eight-byte big-endian
-expected generation, 16-byte configuration version and 32-byte source digest.
-`Change::decode` requires that exact length/version, refuses an exhausted
-generation and recomputes the domain-separated request digest internally.
-It does not retain caller-supplied request-digest bytes. Persist the encoded
-change before first publication and retain the same bytes across uncertainty.
-The encoding contains neither configuration source nor credential material.
-
-These are custody bytes, not an authenticated credential or a success receipt.
-Changing the operation ID asks for another operation; changing any request
-field changes its derived digest. Owner database credentials, stored receipt
-comparison, expected generation and current source/material validation keep
-their existing roles. Decoding cannot establish publication or authorize
-service. An already recorded operation still resolves after up to 63 newer
-selections (later reports it expired, section 198) or material expiry, while a
-changed request using its ID conflicts. Missing
-receipt observations do not authorize a replacement operation.
-
-This supplies the bounded recovery representation used by section 198’s
-explicit preparation commands. It does not select production PostgreSQL
-serving. The real PostgreSQL fixture reconstructs an uncertain
-operation before settlement, rejects altered custody against its receipt and
-reconstructs historical requests after newer selection and material expiry.
-
-## 198. Explicit selection request preparation and settlement commands
-
-`td-mta postgres config-selection-prepare --connection-file PATH --epoch HEX
---version HEX --generation N` rereads and validates the immutable source
-version, prepares one random operation and prints section 197's public request
-as 178 hexadecimal characters in JSON. Preparation performs no selection
-write. Retain that request before any publication; the expected generation is
-explicit, with zero meaning the initially unselected database.
-
-`td-mta postgres config-select --connection-file PATH --request HEX` decodes
-and publishes exactly that request. `td-mta postgres config-selection-inspect
---connection-file PATH --request HEX` resolves its retained receipt under the
-existing policy-row lock. The public request may be supplied as an argument;
-it contains no password, source text or private material. Malformed length,
-non-hex input and duplicate or mixed operation arguments refuse. The protected
-connection file and ordinary bounded DNS/TLS/SCRAM rules still apply.
-
-A recorded result prints the operation, historical generation and version.
-Inspection can return `recorded:false`; that observation is not permission to
-replace the operation. Publication uncertainty reports
-`indeterminate-retain-request` and stops without automatic retry. Resolve or
-explicitly retry the original retained request, never prepare a replacement
-from an absence observation. Historical receipts remain resolvable after a
-newer selection or expired material, while new publication revalidates the
-version and compares the expected generation. An altered request using a
-recorded operation ID conflicts. Each publication deletes receipts at least
-64 selections older than itself, so the ledger never fills; inspecting or
-publishing a request whose generation is that old reports
-`request-expired-outcome-unknown` (`operation-expired-outcome-unknown` for
-account administration), never absence and never a new selection. Resolve a
-retained request before 64 further selections.
-
-These commands operate on the preparation database. They do not activate a
-listener, runtime generation or PostgreSQL production backend. Receipt success
-does not assert that its version is still selected or that current materials
-are usable. Publication keeps the receipts of the latest 64 selections, as
-above, under the backstop 1024-receipt ceiling; these commands add no
-automatic deployment policy.
 
 ## 199. Historical account usage audit
 
@@ -6947,16 +7310,6 @@ corrupt sequences, deliberate event-completeness exclusions and a concurrent
 commit after snapshot capture. The authenticated changes fixture qualifies
 the shared decoder through normal transaction-aligned paging.
 
-## 211. PostgreSQL foreground service
-
-The active serve command loads and validates the selected database profile
-and uses PostgreSQL SMTP storage, HTTPS authentication and JMAP adapters.
-CONFIG.md owns syntax and local runtime/scratch placement. Receive and JMAP
-roles are supported, including a JMAP-only instance and a separate relay.
-The embedded backend, local-store commands and file-backed device registry
-are removed. This is not a live migration or a complete release qualification
-claim.
-
 ## 212. Foreground relay scheduling
 
 A relay profile runs one fixed SMTP worker and one lease-renewal worker.
@@ -7011,7 +7364,6 @@ EightBit requires the matching EHLO capability. The worker prepays three
 maximum-body extents plus database validation overhead and reserves one record
 per 4096 bytes of actual body length, rounded up, before scanning. Classification
 uses the existing verification batch.
-
 
 ## 213. Local terminal-delivery notices
 
@@ -7148,7 +7500,6 @@ JMAP/relay processes, cancels queued work with the relay offline and an
 active attempt before MAIL's reply, checks transport closure before another
 command, refuses accepted mail, and includes restart and account auditing.
 
-
 ## 215. Structured attachment sending
 
 The live draft owner accepts td-mail's uploaded attachment descriptors and
@@ -7196,7 +7547,6 @@ Email. The foreground-service fixture uploads through HTTPS and verifies
 binary attachment DATA at its local TLS smart host. Unit cases cover empty
 parts, invalid metadata, source-line/boundary refusals and exact output caps.
 
-
 ## Empty folder deletion
 
 The `postgres_mailbox_set` transaction also accepts one prepared deletion.
@@ -7224,7 +7574,6 @@ retains the prepared operation for bounded same-account inspection
 foreign IDs, protected Inbox, nonempty folders and parents. Native transaction
 checks cover stale state, revoked authorization and exact receipt replay; a
 delayed deletion COMMIT exercises owner settlement and one history row.
-
 
 ## Application diagnostic retention (schema 29)
 
@@ -7621,107 +7970,6 @@ archive round trip, rollback and ambiguous commit, epoch change and pending
 recipient quarantine. Hosted activation and off-host backup durability remain
 separate operational checks.
 
-## HTTPS account selection
-
-The fixed HTTPS authentication worker returns an account/device principal.
-The network reactor selects a backend by that authenticated account, and
-retains the principal until the request ends. Backend registration is bounded
-to 16 distinct account IDs. Session discovery, upload, download, JMAP API and
-event snapshot dispatch all use that selection. URL or method argument account
-IDs never select authority: the selected account-scoped backend retains its
-existing target-account checks, fresh device checks and publication fences.
-Credentials remain request-owned and zeroed on drop; no worker pool, read
-capacity, body-operation concurrency or authentication-rate allowance is
-multiplied by the number of accounts.
-
-Cold preparation constructs a bounded binding registry, verifies every
-configured account's bootstrap, and prepares only that account's sending
-identities and visible catalog in its binding. One final selection observation
-fences the entire registry. Publication retains the bindings with the same
-configuration and TLS generation; an absent account never falls back to the
-first binding. The compatibility binding accessor is for common profile facts,
-not request dispatch. Extracting a singleton binding refuses multiple accounts.
-
-JMAP profiles register one Session and backend per account. All backends
-share read slots, pending-mutation ownership, response admission and body
-operation capacity. Each Session names only its authenticated account. Three
-MiB of startup metadata reservation covers the aggregate catalog preparation,
-bindings and up to sixteen Session documents. All serving roles use this
-bounded account registry.
-
-### Retained HTTPS authentication sessions
-
-The fixed authentication worker retains at most one PostgreSQL session across
-requests, shared by every configured account and origin. Its adapter binds to
-the first calling thread, uses a nonblocking mutex with no waiter queue, and
-refuses another thread. Credentials and account/device authority remain
-request-owned; the retained session caches neither authentication results nor
-configuration or maintenance observations. Full schema and Runtime-role
-qualification belongs to connection admission, protected by the shared
-session migration lock held until that connection closes.
-
-Connection admission acquires the shared session migration lock once, inspects
-the complete schema ledger and qualifies primary/durability, Runtime-role,
-exact privileges and maintenance. Schema and role administration stops all
-serving instances first; it must not modify the protected contract behind a
-live connection. PostgreSQL continues to enforce each statement's privileges.
-The closed SQL surface cannot exploit newly added privileges. These checks
-repeat on every reconnect, including recovery after an idle disconnect.
-
-Each job begins a new READ ONLY REPEATABLE READ transaction. One typed query
-checks the pinned store epoch and current maintenance barrier; selected
-configuration, presented device and account snapshot remain freshly observed.
-The migration lock predates every job snapshot, preventing an upgrade from
-crossing connection qualification. Success and wrong-password refusal both
-require acknowledged ROLLBACK and final deadline/window checks. No transaction
-or account lock survives between jobs; the one shared migration lock does.
-Wrong-password refusals retain the clean connection without caching an
-authentication result. SQL failures, failed cleanup, expired jobs and framing
-failures retire it. Before submitting a later job, the adapter polls the clean
-idle driver without queuing SQL. An already-observable idle failure permits
-one fresh connection under the original deadline. No failure after job
-submission retries that job; a disconnect racing the idle check can still
-fail the request.
-
-A session admits at most 64 jobs within sixty seconds of creation. Each job
-keeps its own original deadline, capped at ten seconds including initial DNS,
-TCP, TLS and SCRAM. Before starting a later job whose complete allowance would
-outlive the session, the adapter closes the old connection, selects addresses
-under section 10 and repeats TLS/SCRAM admission. The existing fixed authentication worker checks local
-idle state once per second, outside client-slot locks, and retires a session
-when fewer than ten seconds of its original lifetime remain or its job count
-is exhausted. This maintenance performs no authorization query, driver health
-poll or new task. A shutdown guard closes retained resources on that same
-worker before it exits, including early failure paths.
-
-Only a clean idle session whose job completed with acknowledged rollback
-and final checks may use a separate termination allowance. Consuming
-retirement bounds that allowance by the caller deadline, original session
-expiry and the existing 100-ms driver cleanup ceiling. It cannot perform
-another job, renew TLS or replenish byte/frame windows. Failed or unfinished
-jobs retain their original deadline and sticky failure behavior. Cleanup is
-best effort if the peer fails or scheduling crosses the immutable TLS expiry;
-no cleanup outcome changes an already completed authentication result.
-
-Authentication and the first job share the initial one-MiB input, 1088-frame
-and 64-KiB output window. A completed job admits another such window while the
-sixty-four-MiB input, 69632-frame and four-MiB output session totals only
-decrease. Per-frame and SCRAM limits remain unchanged. Available idle messages
-consume the preceding window before the next starts; parser state, connection
-authentication and sticky failures are never reset. Windows are work limits,
-not resident allocations. The existing one-authentication-worker capacity
-covers the retained socket and TLS buffers, independently of account count.
-
-API reads, downloads, post-verification reauthorization and mutation connections
-retain their existing admission and teardown paths. This increment changes no
-write retry, uncertain-COMMIT or receipt-settlement behavior. Native fixtures
-check 64 jobs on one backend, rotation, idle migration-lock retention and
-release on close, wrong-thread refusal, fresh policy/epoch/maintenance checks,
-statement privilege enforcement, cold ledger/excess-privilege qualification,
-credential refusals and idle disconnect recovery. A focused fixture reports cold and warm authentication times; those
-measurements do not establish end-to-end HTTP or download performance.
-
-
 ## Transactional incoming delivery across accounts
 
 An accepted SMTP envelope retains each address's pinned local account. The
@@ -7754,7 +8002,6 @@ per-frame, authentication, TLS and ten-second connection limits remain intact.
 The DATA
 worker's output meter includes the separate 2-MiB fanout metadata reservation,
 including when the configured message ceiling is smaller than that metadata.
-
 
 ## Foreground relay scheduling across accounts
 
@@ -7911,109 +8158,6 @@ cannot complete. Claim receipt counts do not grow with idle scheduling turns.
 Account-scoped route ownership and health match the existing database keys;
 there is no schema migration or global smart-host concurrency promise.
 
-## Account administration workflow
-
-`postgres account-list --connection-file PATH [--epoch HEX]` reports the
-selected generation/version and account, receiving-alias and sending-identity
-records. Account IDs remain stable when the name or login username changes.
-The record `section` distinguishes account, alias, identity and identity_address;
-`id` is the stanza label. Names and addresses are JSON-escaped. This is a
-configuration observation, not proof that a process serves that generation.
-Current listing and editing revalidate referenced materials; expired or invalid
-certificates can prevent them, as for config-check.
-
-The following owner-side commands replace manual source decoding and SQL:
-
-```text
-td-mta postgres account-create --connection-file PATH --address EMAIL \
-  [--name NAME] [--username USER] --operation-file PATH
-td-mta postgres account-update --connection-file PATH --account ID \
-  [--name NAME] [--username USER] [--outbound-profile NAME] --operation-file PATH
-td-mta postgres account-alias-add --connection-file PATH --account ID \
-  --address EMAIL --operation-file PATH
-td-mta postgres account-alias-remove --connection-file PATH --account ID \
-  --address EMAIL --operation-file PATH
-td-mta postgres account-apply --connection-file PATH --operation-file PATH
-td-mta postgres account-operation-inspect --connection-file PATH --operation-file PATH
-```
-
-Create/update/alias commands accept an optional `--epoch`; otherwise they
-inspect the database epoch before preparing the operation. Create defaults
-name and username to the address. The address's domain must already be
-configured. It generates an account, Inbox and sending identity, and adds an
-explicit receiving alias. Other folders can be created by the client. An
-alias alone never grants permission to send from that address. Update changes
-only supplied name, username and outbound-profile fields, not aliases, identities, credentials,
-account IDs or stored messages. No destructive account deletion is offered.
-These commands retain the existing 16-account bound.
-
-The operation file must not exist and must have a checked private mode-0700
-parent with trusted ancestors. It is created exclusively as mode 0600, then
-both file and parent are synced **before any database mutation**. A bounded,
-versioned, SHA-256-checked record retains the exact account/Inbox IDs, source
-bytes, configuration version and compare-and-swap selection request. It
-contains configuration material references, not resolved material secrets.
-The checksum detects corruption, not a malicious operator; PostgreSQL owner
-credentials remain the authority. Source input remains bounded to 2 MiB;
-operation framing allows another 2048 bytes. No subprocess implements editing
-or SQL, and unrelated source bytes/comments are retained.
-
-Each command validates the complete edited configuration, bootstraps a new
-account if required, stores the immutable version, and selects it against the
-original observed generation. A first-to-second-account change makes the old
-singleton postmaster explicit in every profile where it was implicit. Every
-profile still passes the ordinary routing, identity, material and quota checks.
-Concurrent changes return a conflict rather than silently rebasing.
-
-These steps are resumable, not one cross-operation transaction. Failure can
-leave bootstrapped account storage or an unselected configuration version;
-it cannot partially select a configuration. Keep the operation file and use
-`account-apply` after interruption or an uncertain result. It reuses the exact
-bootstrap and version IDs, syncs the loaded file and parent before writes,
-and resolves the selection receipt before current
-material validation. Never remove the file and retry create with fresh IDs to
-resolve uncertainty. A missing receipt is not proof an earlier request cannot
-still commit. A known generation conflict requires a newly prepared edit of
-current configuration; retain the original for inspection.
-
-Successful selection fences old instances; restart **every affected mail
-instance** before considering the account available. Output always says
-`profile_activated:false` and marks receipts historical. Reapplying an old
-successful operation reports its original receipt without replacing a newer
-selection while fewer than 64 selections followed it, and
-`operation-expired-outcome-unknown` after (section 30). It does not prove that
-version is still selected. Credentials use the existing `device-create`,
-`device-list` and `device-revoke` commands; a username change does not revoke
-them.
-
-Native tests exercise executable create/list/alias commands, protected
-operation permissions, first-to-second postmaster preservation, exact replay,
-conflicting edits, and selection commit uncertainty. They verify unrelated
-accounts and identities survive and account storage is not duplicated.
-
-### Sending identity administration
-
-`postgres account-identity-add --connection-file PATH --account ID --address
-EMAIL [--name NAME] --operation-file PATH` creates a fresh sending identity;
-name defaults to the address. `account-list` reports its generated identity ID.
-`account-identity-update` takes `--account ID --identity ID` and at least one
-of `--address EMAIL` or `--name NAME`; an empty name is allowed. It preserves
-the identity ID, omitted fields, signatures and Reply-To/Bcc lists.
-`account-identity-remove` takes `--account ID --identity ID` and removes that
-identity and all of its address-list entries. Update/remove require the
-identity to belong to the named account. All three commands require the same
-connection and operation-file options and accept optional `--epoch`.
-
-These commands use the same retained-operation, validation, CAS, replay and
-restart contract above. They never add or remove receiving aliases, create
-account storage or provision credentials. A sending address need not be a
-receiving alias or use a locally received domain; the operator is responsible
-for authorizing it with the outbound provider. Normal mailbox syntax and the
-aggregate 64-identity limit still apply. An account may become receive-only
-when its last identity is removed, but the configuration must retain at least
-one identity globally. Removal prevents future submissions after activation;
-it does not cancel already accepted messages or rewrite their envelopes.
-
 ## Legacy message storage (schema 32)
 
 Owner-authorized migration may preserve raw messages up to 64 MiB. Schema 32
@@ -8049,7 +8193,6 @@ exceeded the former ten-second cap under heavy load. Receipt inspection,
 connection establishment and mailbox publication keep ten seconds, and a
 caller deadline above the scaled allowance is refused before any work.
 
-
 ## Per-account submission routes
 
 An account's optional `outbound_profile` selects the route of a configured
@@ -8073,20 +8216,6 @@ the retained operation workflow. An explicitly empty NAME removes the override
 and restores inheritance. `account-list` includes any explicit selection. All
 mail instances must restart after configuration publication, as for other
 account edits. These commands do not configure provider credentials or DNS.
-
-
-## JMAP origin aliases
-
-Immutable configuration may declare `server.jmap_origin_aliases` beside the
-primary origin, using CONFIG.md's bounded explicit allowlist. Candidate
-preparation validates certificate coverage for every allowed JMAP hostname.
-The runtime prepares a private Session and PostgreSQL API backend for each
-account/origin pair, all sharing the same account binding, admission pools,
-credentials and persistent authority. URL and session-state selection remain
-consistent across discovery and API requests. Origin selection never selects
-another account or grants relay permission. No schema migration is required;
-configuration import/check/select and service restart activate the change.
-
 
 ## Retained SMTP worker session
 
@@ -8126,7 +8255,6 @@ next job reuses a connection only after acknowledged transaction termination
 and successful deadline and protocol-window checks. Expiry maintenance and
 clean idle retirement use the existing bounded termination allowance; an
 unfinished or failed job never gains time through cleanup.
-
 
 ## Retained HTTPS download sessions
 
@@ -8183,7 +8311,6 @@ a chunk's hashing is not independently cancellable. The digest context is
 inline and bounded by active workers.
 This path is not an allocation-free primitive. Other digest callers retain
 the existing owned implementation and storage bytes are unchanged.
-
 
 ## Persistent common-header summaries (schema 33)
 
@@ -8377,7 +8504,6 @@ invocation is bounded, the directory lock excludes overlap, and a failed page
 is retried on the next tick. Schedules require explicit generation and
 activation; normal serving does not enable background scrubbing implicitly.
 
-
 ## Replica source inventory windows
 
 The snapshot read adapter can enumerate account-wide Email IDs for a future
@@ -8559,7 +8685,6 @@ or uncertainty. Status and workers persist clock observations and refuse clock
 rollback. File loss removes freshness evidence; it is not interpreted as a
 completed cycle. DEPLOYMENT.md describes optional supervisor generation.
 
-
 ## Replica source mode
 
 Schema 36 adds `replica_source`, an owner-writable singleton with canonical HTTPS
@@ -8579,7 +8704,6 @@ future local-copy contract. This foundation does not provide a synchronizer,
 read-only service, promotion or recovery qualification. Core mail tables and
 source/local JMAP state separation remain unchanged. A schema-35 binary cannot
 serve schema 36; use the documented fenced upgrade and consistent backup.
-
 
 ## Replica account initialization
 
@@ -8611,7 +8735,6 @@ Source credentials and transport authentication remain outside passive seed
 preparation. A schema-36 binary cannot serve schema 37; retain a consistent
 backup and follow the fenced upgrade procedure.
 
-
 ## Replica Email publication
 
 Schema 38 adds `replica_email_receipts` and `replica_blob_identities`, both
@@ -8640,7 +8763,6 @@ statements. New connections and lock acquisition keep their existing bounds.
 A schema-37 binary cannot serve schema 38. Use the fenced upgrade procedure and
 a consistent backup; this increment does not deploy or activate a local replica.
 
-
 ## Replica pending-page transitions
 
 The retained replica session also admits the closed page-transition operation.
@@ -8651,7 +8773,6 @@ and JMAP sequences remain unchanged. Matching retries preserve the new page's
 existing completion bitmap. [REPLICATION.md](REPLICATION.md) defines cursor
 provenance, inventory-to-change catch-up and retry recognition. Schema 38 is
 unchanged; no unbounded queue or general SQL execution interface is added.
-
 
 ## Replica runtime progress snapshots
 
@@ -8664,7 +8785,6 @@ Malformed state or deadline failure retires the session and returns no snapshot;
 confirmed mutation COMMIT handling remains unchanged. The copy worker can load
 progress without holding the schema-owner password or opening a new database
 connection for each read.
-
 
 ## Replica reuse of verified immutable Blobs
 
@@ -8679,7 +8799,6 @@ the existing immutable-body/derived-metadata trust boundary. Publication with
 fresh bytes still requires the full verified body capability. No schema,
 ordinary fresh-ID publication or source checkpoint policy changes.
 
-
 ## Replica mailbox graph publication
 
 Schema 39 adds indexes on mailbox receipt account/observation and current
@@ -8693,7 +8812,6 @@ explicit 256-folder union capacity boundary. The operation never removes Email
 memberships to force a folder deletion or claims completeness while retirement
 is pending. A schema-38 binary cannot serve schema 39; retain a consistent
 backup and use the fenced upgrade procedure. No replica service is activated.
-
 
 ## Indexed search candidates
 
@@ -8770,7 +8888,6 @@ the whole database, including `td_mta_trgm` and the extension declaration;
 restoring only the `td_mta` schema is insufficient. The restored PostgreSQL
 installation must supply the same extension version before mail is activated.
 
-
 ## Explicit partial-search results
 
 The session advertises `https://timmydouglas.com/ns/mail-search-partial`
@@ -8801,20 +8918,3 @@ The td-mail client opts in only for text queries on an advertising account,
 rejects unsolicited partial inventory, and shows known matches with a persistent
 incomplete-results warning. Its filtered list responses do not replace the
 unfiltered folder cache. CLI results and warning logs expose the skipped count.
-
-
-## Planning a production deployment
-
-`postgres schema-plan --connection-file PATH` takes a shared migration
-lock and validates the ledger through its last installed migration. It
-reports the current and target versions, the store epoch, the ordered
-pending versions, the required schema USAGE, and target table and column
-grants for the shared primary runtime login (`primary_grants`) and for each
-isolated production profile (`service_grants`). Each profile maps table
-names in `td_mta` to the required SQL privilege list. Tables absent from
-that profile's map receive no grant. The deployer provisions the three
-filtered views separately for the four serving profiles. Role membership,
-ownership, maintenance state and effective privileges are qualified by
-`runtime-check` after migration. An empty pending list means the ledger is current. A
-corrupt, missing or newer ledger fails. Planning changes no SQL objects.
-Serving and runtime qualification continue to require the complete ledger.
