@@ -356,6 +356,19 @@ impl Connection {
     }
 }
 
+pub(crate) fn pool_error(
+    operation: &str,
+    directory: &Path,
+    size: usize,
+    error: io::Error,
+) -> String {
+    td_alloc::format(format_args!(
+        "{operation} ({size} bytes) in {}: {error}",
+        directory.display()
+    ))
+    .unwrap_or_default()
+}
+
 /// A private, unlinked, 0600 regular file of `size` bytes for a SHM pool:
 /// `create_new` under a checked process-local serial, unlinked before it
 /// is sized, reachable afterwards only through the returned owner.
@@ -375,15 +388,13 @@ pub fn backing_file(directory: &Path, size: usize) -> Result<File> {
             Ok(file) => {
                 std::fs::remove_file(&path)
                     .map_err(|e| format!("unlink pool {}: {e}", path.display()))?;
-                file.set_len(size as u64).map_err(error)?;
+                file.set_len(size as u64)
+                    .map_err(|e| pool_error("size Wayland pool", directory, size, e))?;
                 return Ok(file);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return Err(format!(
-                    "create Wayland pool in {}: {e}",
-                    directory.display()
-                ));
+                return Err(pool_error("create Wayland pool", directory, size, e));
             }
         }
     }

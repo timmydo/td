@@ -4039,7 +4039,7 @@ td-ui/src/atlas.rs	allocation-macro	1
 td-ui/src/atlas.rs	unchecked-growth-or-clone	3
 td-ui/src/client.rs	allocating-constructor	3
 td-ui/src/client.rs	allocating-conversion	6
-td-ui/src/client.rs	allocation-macro	20
+td-ui/src/client.rs	allocation-macro	19
 td-ui/src/client.rs	unchecked-growth-or-clone	11
 td-ui/src/clipboard.rs	allocating-conversion	1
 td-ui/src/clipboard.rs	allocation-macro	1
@@ -4169,7 +4169,7 @@ td-ui/src/vt_terminfo.rs	allocation-macro	29
 td-ui/src/vt_terminfo.rs	unchecked-growth-or-clone	38
 td-ui/src/wayland.rs	allocating-constructor	2
 td-ui/src/wayland.rs	allocating-conversion	3
-td-ui/src/wayland.rs	allocation-macro	9
+td-ui/src/wayland.rs	allocation-macro	8
 td-ui/src/wayland.rs	heap-owner	1
 td-ui/src/wayland.rs	unchecked-growth-or-clone	8
 td-ui/src/window.rs	allocating-conversion	5

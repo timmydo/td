@@ -14,8 +14,8 @@ use crate::pointer;
 use crate::raster::{MAX_AXIS, MAX_FRAME_BYTES};
 use crate::repeat::Input;
 use crate::wayland::{
-    backing_file, cursor_pixels, error, Connection, Result, CURSOR_HEIGHT, CURSOR_WIDTH, IDLE_WAIT,
-    WRITE_DEADLINE,
+    backing_file, cursor_pixels, error, pool_error, Connection, Result, CURSOR_HEIGHT,
+    CURSOR_WIDTH, IDLE_WAIT, WRITE_DEADLINE,
 };
 use crate::wire::{Builder, Cursor, Message};
 use std::collections::BTreeMap;
@@ -1293,7 +1293,7 @@ impl<T: Tag> Client<T> {
     pub fn close(&mut self) {
         self.closed = true;
         for buffer in &mut self.buffers {
-            if buffer.scrub && zero(&buffer.file, buffer.bytes).is_ok() {
+            if buffer.scrub && zero(&buffer.file, buffer.bytes, &self.temporary).is_ok() {
                 buffer.scrub = false;
                 buffer.holds = None;
             }
@@ -1333,7 +1333,13 @@ impl<T: Tag> Client<T> {
             return self.connection.words(device, 0, &[serial, surface, 0, 0]);
         }
         let file = backing_file(&self.temporary, CURSOR_BYTES)?;
-        file.write_all_at(&cursor_pixels(), 0).map_err(error)?;
+        write_pixels(
+            &file,
+            &cursor_pixels(),
+            0,
+            &self.temporary,
+            "write Wayland cursor",
+        )?;
         let surface = self.allocate_kind(Kind::CursorSurface)?;
         let pool = self.allocate_kind(Kind::Pool)?;
         let buffer = self.allocate_kind(Kind::CursorBuffer)?;
@@ -1478,14 +1484,23 @@ impl<T: Tag> Client<T> {
                         .unwrap_or(height);
                     let (start, stop) = (row * stride, end * stride);
                     let rows = self.pixels.get(start..stop).ok_or("raster rows")?;
-                    buffer
-                        .file
-                        .write_all_at(rows, start as u64)
-                        .map_err(error)?;
+                    write_pixels(
+                        &buffer.file,
+                        rows,
+                        start as u64,
+                        &self.temporary,
+                        "write Wayland frame",
+                    )?;
                     row = end;
                 }
             }
-            None => buffer.file.write_all_at(&self.pixels, 0).map_err(error)?,
+            None => write_pixels(
+                &buffer.file,
+                &self.pixels,
+                0,
+                &self.temporary,
+                "write Wayland frame",
+            )?,
         }
         buffer.holds = Some(frame);
         let id = buffer.id;
@@ -1542,7 +1557,7 @@ impl<T: Tag> Client<T> {
             if buffer.busy {
                 buffer.scrub = true;
             } else {
-                zero(&buffer.file, buffer.bytes)?;
+                zero(&buffer.file, buffer.bytes, &self.temporary)?;
                 buffer.holds = None;
             }
         }
@@ -1747,7 +1762,7 @@ impl<T: Tag> Client<T> {
                 }
                 buffer.busy = false;
                 if buffer.scrub {
-                    zero(&buffer.file, buffer.bytes)?;
+                    zero(&buffer.file, buffer.bytes, &self.temporary)?;
                     buffer.scrub = false;
                     buffer.holds = None;
                 }
@@ -2034,15 +2049,25 @@ fn damage_bands(
     merged
 }
 
+fn write_pixels(
+    file: &File,
+    pixels: &[u8],
+    offset: u64,
+    directory: &std::path::Path,
+    operation: &str,
+) -> Result<()> {
+    file.write_all_at(pixels, offset)
+        .map_err(|e| pool_error(operation, directory, pixels.len(), e))
+}
+
 /// Writes `size` zero bytes over a buffer's backing file.
-fn zero(file: &File, size: usize) -> Result<()> {
+fn zero(file: &File, size: usize, directory: &std::path::Path) -> Result<()> {
     static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
     let mut at = 0;
     while at < size {
         let n = (size - at).min(ZEROS.len());
         let chunk = ZEROS.get(..n).ok_or("zero chunk")?;
-        file.write_all_at(chunk, at as u64)
-            .map_err(|e| format!("zero frame buffer: {e}"))?;
+        write_pixels(file, chunk, at as u64, directory, "zero Wayland frame")?;
         at += n;
     }
     Ok(())
@@ -2052,6 +2077,24 @@ fn zero(file: &File, size: usize) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_frame_store_reports_directory_and_write_size() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let error = write_pixels(
+            &file,
+            &[0; 32],
+            0,
+            std::path::Path::new("/frames"),
+            "write Wayland frame",
+        )
+        .unwrap_err();
+        assert!(error.contains("write Wayland frame (32 bytes) in /frames"));
+        assert!(error.contains("os error 28"));
+    }
+
     use std::io::{Read, Seek, SeekFrom};
 
     #[test]
