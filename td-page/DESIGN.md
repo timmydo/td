@@ -3,7 +3,7 @@
 **Status: normative for the crate's boundary; the behaviour it makes is
 td-web/DESIGN.md's (§1 below names the sections).** td-page is td-web's
 page engine, taken out of the td-web binary so a second program can
-show a styled page: td-mail's HTML mail is the one planned (§4).
+show a styled page: td-mail's HTML mail is the second (§4).
 
 ## 1. What it is
 
@@ -63,10 +63,12 @@ staged beside each program that builds it; it has no recipe of its own.
 
 ## 4. Callers
 
-td-web, the only one today. td-mail's message view is the planned
-second (td-web/DESIGN.md §11): a page made from a message's HTML with
-remote content off, `cid:` pictures from the message's own parts,
-links opened outside the pane, and terms of its own measured against
-td-mail's jail. Each is its own amendment, and the one that makes a
-rule here caller-neutral moves that rule from td-web/DESIGN.md to this
-file.
+td-web, and td-mail's message view (td-mail/README.md, "HTML mail"
+and "Memory"): a page made from a message's HTML part alone, styles
+on, pictures and every sheet it names off, on td-mail's window thread
+within a budget of its own measured against td-mail's jail, with
+td-mail's head as a text page above it. `cid:` pictures from the
+message's own parts and links taken in the pane remain planned
+(td-web/DESIGN.md §11). Each is its own amendment, and the one that
+makes a rule here caller-neutral moves that rule from td-web/DESIGN.md
+to this file.

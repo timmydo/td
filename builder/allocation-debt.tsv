@@ -2220,7 +2220,7 @@ td-mail/src/ui/frame.rs	unchecked-growth-or-clone	7
 td-mail/src/ui/mod.rs	allocating-conversion	29
 td-mail/src/ui/mod.rs	allocation-macro	28
 td-mail/src/ui/mod.rs	heap-owner	11
-td-mail/src/ui/mod.rs	unchecked-growth-or-clone	47
+td-mail/src/ui/mod.rs	unchecked-growth-or-clone	48
 td-mail/src/ui/sidebar.rs	allocating-conversion	7
 td-mail/src/ui/sidebar.rs	allocation-macro	1
 td-mail/src/ui/sidebar.rs	unchecked-growth-or-clone	5
@@ -2236,7 +2236,7 @@ td-mail/src/ui/views/email_list.rs	allocating-conversion	31
 td-mail/src/ui/views/email_list.rs	allocation-macro	31
 td-mail/src/ui/views/email_list.rs	heap-owner	11
 td-mail/src/ui/views/email_list.rs	unchecked-growth-or-clone	91
-td-mail/src/ui/views/email_view.rs	allocating-conversion	43
+td-mail/src/ui/views/email_view.rs	allocating-conversion	42
 td-mail/src/ui/views/email_view.rs	allocation-macro	44
 td-mail/src/ui/views/email_view.rs	heap-owner	4
 td-mail/src/ui/views/email_view.rs	unchecked-growth-or-clone	53

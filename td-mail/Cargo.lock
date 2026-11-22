@@ -7,8 +7,31 @@ name = "td-alloc"
 version = "0.1.0"
 
 [[package]]
+name = "td-charset"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
+
+[[package]]
 name = "td-civil"
 version = "0.1.0"
+
+[[package]]
+name = "td-css"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
+
+[[package]]
+name = "td-dom"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-css",
+ "td-html",
+]
 
 [[package]]
 name = "td-encoding"
@@ -41,6 +64,16 @@ name = "td-kv"
 version = "0.1.0"
 
 [[package]]
+name = "td-layout"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-css",
+ "td-dom",
+ "td-html",
+]
+
+[[package]]
 name = "td-mail"
 version = "0.1.0"
 dependencies = [
@@ -52,10 +85,24 @@ dependencies = [
  "td-html",
  "td-json",
  "td-kv",
+ "td-page",
  "td-regex",
  "td-test-compositor",
  "td-toml",
  "td-ui",
+]
+
+[[package]]
+name = "td-page"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-charset",
+ "td-css",
+ "td-html",
+ "td-layout",
+ "td-ui",
+ "td-url",
 ]
 
 [[package]]
@@ -76,3 +123,7 @@ version = "0.1.0"
 dependencies = [
  "td-alloc",
 ]
+
+[[package]]
+name = "td-url"
+version = "0.1.0"

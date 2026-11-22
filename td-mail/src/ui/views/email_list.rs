@@ -494,6 +494,8 @@ impl EmailListView {
     }
 
     fn open_thread_list(&mut self, cross_folder: bool) -> Option<ViewAction> {
+        // As `open_single_email`'s.
+        self.pending_reply_request = None;
         let email = self.emails.get(self.cursor)?;
         let thread_total = self
             .get_thread_counts(email)
@@ -531,6 +533,10 @@ impl EmailListView {
     }
 
     fn open_single_email(&mut self) -> Option<ViewAction> {
+        // A reply asked for and not yet answered is dropped: its quotation
+        // would be rendered beneath the message opened, beside its page
+        // (README.md, "HTML mail").
+        self.pending_reply_request = None;
         let email = self.emails.get(self.cursor)?;
         let email_id = email.id.clone();
         let was_seen = email.keywords.contains_key("$seen");
@@ -1569,6 +1575,26 @@ mod tests {
         (view, cmd_rx)
     }
 
+    /// A reply asked for in the list and not answered before a message is
+    /// opened is dropped: its answer builds no draft beneath the message.
+    #[test]
+    fn opening_a_message_drops_a_reply_not_yet_answered() {
+        let (mut view, _commands) = make_view();
+        view.cursor = 2;
+        view.handle_key(Key::Char('r'), 10);
+        assert!(view.pending_reply_request.is_some());
+        assert!(matches!(
+            view.handle_key(Key::Enter, 10),
+            ViewAction::Push(_)
+        ));
+        let email = view.emails[2].clone();
+        view.on_response(&BackendResponse::EmailForReply {
+            id: email.id.clone(),
+            result: Box::new(Ok(email)),
+        });
+        assert!(view.pending_compose.is_none());
+    }
+
     #[test]
     fn a_pushed_refresh_defers_for_search_and_keeps_the_selected_message() {
         let (mut view, commands) = make_view();
@@ -1691,7 +1717,9 @@ mod tests {
     fn list_rows(scene: &Scene<'_>) -> Vec<Row> {
         match &scene.body {
             Body::List { total, row, .. } => (0..*total).map(|index| row(index)).collect(),
-            Body::Text { .. } | Body::Edit { .. } => panic!("the scene shows a list"),
+            Body::Text { .. } | Body::Edit { .. } | Body::Page { .. } => {
+                panic!("the scene shows a list")
+            }
         }
     }
 
@@ -1699,7 +1727,9 @@ mod tests {
     fn message(scene: &Scene<'_>) -> String {
         match &scene.body {
             Body::Text { text, .. } => text(60),
-            Body::List { .. } | Body::Edit { .. } => panic!("the scene shows a text"),
+            Body::List { .. } | Body::Edit { .. } | Body::Page { .. } => {
+                panic!("the scene shows a text")
+            }
         }
     }
 
@@ -2054,7 +2084,9 @@ mod tests {
             Body::List {
                 total, selected, ..
             } => assert_eq!((*total, *selected), (20, 8)),
-            Body::Text { .. } | Body::Edit { .. } => panic!("the messages are a list"),
+            Body::Text { .. } | Body::Edit { .. } | Body::Page { .. } => {
+                panic!("the messages are a list")
+            }
         }
     }
 
@@ -2209,7 +2241,9 @@ mod tests {
         );
         match &scene.body {
             Body::List { selected, .. } => assert_eq!(*selected, 2),
-            Body::Text { .. } | Body::Edit { .. } => panic!("the mailbox picker is a list"),
+            Body::Text { .. } | Body::Edit { .. } | Body::Page { .. } => {
+                panic!("the mailbox picker is a list")
+            }
         }
         assert!(scene.status.starts_with("Move to mailbox: 3/3 |"));
     }

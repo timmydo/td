@@ -2,7 +2,7 @@
 name = "td-page"
 version = "0.1.0"
 edition = "2021"
-description = "A styled page made, laid out and painted: td-html, td-css and td-layout over td-ui's faces and raster, shared by td-web and td-mail"
+description = "A styled page made, laid out and painted: td-html, td-css and td-layout over td-ui's faces and raster, for td's browser and mail client"
 license = "MIT"
 
 [package.metadata.td-gate]

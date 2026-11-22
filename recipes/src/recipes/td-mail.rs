@@ -4,25 +4,34 @@ use crate::types::Recipe;
 /// `mail` application packages (APPLICATIONS.md §W.8). Built as td-news
 /// and td-taskmgr are: a static Cargo build from the checkout's own
 /// `td-mail/` tree with the toolkit, whose editor core is the document
-/// pane a message is read in, td's other shared crates it names, and the
-/// compositor's shared font and wire sources staged beside it, the
+/// pane a message is read in, td-page, which makes, lays out and paints
+/// a message's HTML as a page, and td-charset, td-css, td-dom, td-layout
+/// and td-url, which it does that with, td's other shared crates it
+/// names, and the compositor's shared font and wire sources staged beside
+/// it, the
 /// `td-mail-source` seed pinned by the compiled seed-digest table, and the
 /// crate's committed lock naming itself and those crates.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-mail", "0.1.0")
         .local_source("td-mail")
         .local_source_trees(&[
+            "td-charset",
             "td-civil",
+            "td-css",
+            "td-dom",
             "td-encoding",
             "td-fetch-client",
             "td-fs",
             "td-html",
             "td-json",
             "td-kv",
+            "td-layout",
+            "td-page",
             "td-regex",
             "td-toml",
             "td-alloc",
             "td-ui",
+            "td-url",
             "td-compositor",
             "td-test-compositor",
         ])
@@ -47,17 +56,23 @@ mod tests {
         assert_eq!(
             recipe.local_source_trees,
             Some(vec![
+                "td-charset".into(),
                 "td-civil".into(),
+                "td-css".into(),
+                "td-dom".into(),
                 "td-encoding".into(),
                 "td-fetch-client".into(),
                 "td-fs".into(),
                 "td-html".into(),
                 "td-json".into(),
                 "td-kv".into(),
+                "td-layout".into(),
+                "td-page".into(),
                 "td-regex".into(),
                 "td-toml".into(),
                 "td-alloc".into(),
                 "td-ui".into(),
+                "td-url".into(),
                 "td-compositor".into(),
                 "td-test-compositor".into(),
             ])
@@ -86,18 +101,24 @@ mod tests {
             names,
             [
                 "td-alloc",
+                "td-charset",
                 "td-civil",
+                "td-css",
+                "td-dom",
                 "td-encoding",
                 "td-fetch-client",
                 "td-fs",
                 "td-html",
                 "td-json",
                 "td-kv",
+                "td-layout",
                 "td-mail",
+                "td-page",
                 "td-regex",
                 "td-test-compositor",
                 "td-toml",
                 "td-ui",
+                "td-url",
             ]
         );
         assert!(!lock.contains("source = "));
@@ -110,6 +131,7 @@ mod tests {
             "td-html",
             "td-json",
             "td-kv",
+            "td-page",
             "td-regex",
             "td-test-compositor",
             "td-toml",

@@ -176,7 +176,11 @@ pub const EMAIL_VIEW: Table = Table {
             "follow_link",
             "Open the link under the pointer in the browser",
         ),
-        ("h", "toggle_html", "Toggle HTML vs plain text body"),
+        (
+            "h",
+            "toggle_html",
+            "HTML as its page or as text, or the plain part",
+        ),
         (
             "v",
             "raw_headers",

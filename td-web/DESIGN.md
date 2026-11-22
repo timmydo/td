@@ -2423,11 +2423,11 @@ order; each is its own design amendment when it starts:
   allowlists"; UNSAFE.md §9), with the probe's witness. td-ui's
   composition naming a picture's factor would let the seam's `frame`
   draw one as the window does.
-- **HTML mail.** td-page (td-page/DESIGN.md) showing a message's HTML
-  in td-mail: remote content off unless asked for, `cid:` pictures from
-  the message's own parts, links opened outside the pane with their
-  real target shown, and a page's terms of its own measured against
-  td-mail's jail; td-mail's quoting and CLI keep td-html's text.
+- **HTML mail.** td-mail shows a message's HTML through td-page
+  (td-page/DESIGN.md §4), styled, fetching nothing. To come: `cid:`
+  pictures from the message's own parts, links taken in the pane and
+  opened outside it with their real target shown, remote content only
+  when asked for, and its pages made off the window's thread.
 - **Primary selection**: the page's selection offered as the primary
   selection, and a middle click pasting it into the address row, once
   td-ui's widget window binds it and delivers the middle button.

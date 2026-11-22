@@ -82,6 +82,10 @@ pub enum Body<'a> {
         key: String,
         text: Box<dyn Fn(usize) -> String + 'a>,
     },
+    /// A message's HTML as a styled page (`ui::page`), which the view
+    /// lays out itself (`View::lay_out_page`) in the body the frame
+    /// gives it.
+    Page,
     /// A draft in the editable pane: `text()` loaded once for `key`, and
     /// then the pane's, edited in place. While `focused`, every chord
     /// is the pane's; the view's keys are then the bar's labels.
@@ -201,6 +205,23 @@ pub trait View {
         _draft: &mut super::frame::Draft<'_>,
     ) -> ViewAction {
         ViewAction::Continue
+    }
+    /// Lays out the view's message as its pages for the body `rect` the
+    /// frame gives a `Body::Page`, or lets them go when it gives none
+    /// (`ui::page`).
+    fn lay_out_page(
+        &mut self,
+        _rect: Option<td_ui::raster::Rect>,
+        _scale: td_ui::raster::Scale,
+        _faces: Option<&td_ui::prose::Faces>,
+    ) {
+    }
+    /// The view's pages, for a view whose body can be a page.
+    fn page(&self) -> Option<&super::page::Held> {
+        None
+    }
+    fn page_mut(&mut self) -> Option<&mut super::page::Paged> {
+        None
     }
     /// Handle a response from the backend thread.
     /// Returns true if the view consumed the response and should re-render.

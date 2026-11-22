@@ -3,12 +3,15 @@ use crate::compose;
 use crate::jmap::types::{Email, Mailbox};
 use crate::rules;
 use crate::ui::input::Key;
+use crate::ui::page::{Held, Paged};
 use crate::ui::views::{
     strip_newlines, text_scroll, wrap_text, Body, Row, Scene, Scroll, View, ViewAction,
 };
 use std::collections::HashMap;
 use std::sync::mpsc;
 use td_ui::keys;
+use td_ui::prose::Faces;
+use td_ui::raster::{Rect, Scale};
 
 /// The action bar's labels for the view's modes, and the key each stands
 /// for; a press on a label is that key.
@@ -160,6 +163,16 @@ pub struct EmailView {
     move_mode: bool,
     move_cursor: usize,
     prefer_html: bool,
+    /// A message whose body is HTML alone shown as its text, not its page.
+    page_as_text: bool,
+    /// Where the head ends in `text`: the headers and attachments a page
+    /// is shown below.
+    head_end: usize,
+    /// Where the HTML the body shows is (`html_at`), as `text` was made.
+    html_at: Option<(bool, usize)>,
+    /// The message as its pages, while the body is one: let go before
+    /// any text of it is rendered (README.md, "Memory").
+    page: Held,
     browser: Option<String>,
     urls: Vec<String>,
     url_picking: bool,
@@ -210,6 +223,10 @@ impl EmailView {
             move_mode: false,
             move_cursor: 0,
             prefer_html: false,
+            page_as_text: false,
+            head_end: 0,
+            html_at: None,
+            page: Held::default(),
             browser,
             urls: Vec::new(),
             url_picking: false,
@@ -306,31 +323,16 @@ impl EmailView {
         }
     }
 
-    /// One message as lines, and the links it carries in the order the
-    /// picker numbers them.
+    /// One message as lines, the links it carries in the order the
+    /// picker numbers them, and how many of the lines are its head.
     fn render_email(
         email: &Email,
         raw_headers: Option<&str>,
         prefer_html: bool,
-    ) -> (Vec<String>, Vec<String>) {
+    ) -> (Vec<String>, Vec<String>, usize) {
         let mut lines = Vec::new();
-
-        Self::render_headers(email, raw_headers, &mut lines);
-
-        // Attachments
-        if let Some(ref attachments) = email.attachments {
-            if !attachments.is_empty() {
-                lines.push(String::new());
-                lines.push(format!("Attachments ({})", attachments.len()));
-                for (i, att) in attachments.iter().enumerate() {
-                    let name = att.name.as_deref().unwrap_or("unnamed");
-                    let size = att.size.map(format_size).unwrap_or_default();
-                    let type_str = att.r#type.as_deref().unwrap_or("application/octet-stream");
-                    lines.push(format!("  [{}] {} ({}, {})", i + 1, name, type_str, size));
-                }
-                lines.push("  Press A to choose an attachment to download or open".to_string());
-            }
-        }
+        Self::render_head(email, raw_headers, &mut lines);
+        let head = lines.len();
 
         // Separator
         lines.push(String::new());
@@ -351,7 +353,84 @@ impl EmailView {
             }
         }
 
-        (lines, urls)
+        (lines, urls, head)
+    }
+
+    /// The headers and the attachments, as lines: what the view shows
+    /// above a message's body, as text and as td-mail's own above its
+    /// page.
+    fn render_head(email: &Email, raw_headers: Option<&str>, lines: &mut Vec<String>) {
+        Self::render_headers(email, raw_headers, lines);
+
+        // Attachments
+        if let Some(ref attachments) = email.attachments {
+            if !attachments.is_empty() {
+                lines.push(String::new());
+                lines.push(format!("Attachments ({})", attachments.len()));
+                for (i, att) in attachments.iter().enumerate() {
+                    let name = att.name.as_deref().unwrap_or("unnamed");
+                    let size = att.size.map(format_size).unwrap_or_default();
+                    let type_str = att.r#type.as_deref().unwrap_or("application/octet-stream");
+                    lines.push(format!("  [{}] {} ({}, {})", i + 1, name, type_str, size));
+                }
+                lines.push("  Press A to choose an attachment to download or open".to_string());
+            }
+        }
+    }
+
+    /// Where the HTML the body shows is, when `extract_body` would show
+    /// one as text: the HTML part when it is preferred, a text body that
+    /// is HTML, or the HTML part of a message with no text; as whether it
+    /// is among the HTML parts, else the text parts, and its place there.
+    /// Shown as a page.
+    fn html_at(email: &Email, prefer_html: bool) -> Option<(bool, usize)> {
+        if email.is_unreadable() {
+            return None;
+        }
+        // The first of the parts with a value: its place, and whether it
+        // is HTML by its content or its type.
+        let first = |parts: &Option<Vec<crate::jmap::types::BodyPart>>| {
+            parts.iter().flatten().enumerate().find_map(|(at, part)| {
+                let value = email.body_values.get(&part.part_id)?;
+                let html = looks_like_html(&value.value)
+                    || part
+                        .r#type
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("text/html"));
+                Some((at, html))
+            })
+        };
+        if prefer_html {
+            if let Some((at, _)) = first(&email.html_body) {
+                return Some((true, at));
+            }
+        }
+        if let Some((at, html)) = first(&email.text_body) {
+            return html.then_some((false, at));
+        }
+        first(&email.html_body).map(|(at, _)| (true, at))
+    }
+
+    /// The HTML `html_at` found.
+    fn html_in(email: &Email, (html, at): (bool, usize)) -> Option<&str> {
+        let parts = if html {
+            &email.html_body
+        } else {
+            &email.text_body
+        };
+        let part = parts.as_ref()?.get(at)?;
+        email
+            .body_values
+            .get(&part.part_id)
+            .map(|v| v.value.as_str())
+    }
+
+    /// The HTML the body shows as a page, when it shows one.
+    fn page_html(&self) -> Option<&str> {
+        if self.page_as_text {
+            return None;
+        }
+        Self::html_in(self.email.as_ref()?, self.html_at?)
     }
 
     fn extract_body(email: &Email, prefer_html: bool) -> String {
@@ -495,6 +574,7 @@ impl EmailView {
     /// Rebuilds the text and the links from what is loaded, and bumps the
     /// generation so the pane reloads the text its key now names.
     fn rerender_text(&mut self) {
+        self.page.clear();
         let Some(ref email) = self.email else {
             return;
         };
@@ -503,8 +583,16 @@ impl EmailView {
         } else {
             None
         };
-        let (lines, urls) = Self::render_email(email, raw, self.prefer_html);
+        let (lines, urls, head) = Self::render_email(email, raw, self.prefer_html);
+        // The head's lines and the newline after each but the last.
+        self.head_end = lines
+            .iter()
+            .take(head)
+            .map(|line| line.len() + 1)
+            .sum::<usize>()
+            .saturating_sub(1);
         self.text = lines.join("\n");
+        self.html_at = Self::html_at(email, self.prefer_html);
         self.urls = urls;
         self.text_generation = self.text_generation.wrapping_add(1);
     }
@@ -711,6 +799,9 @@ impl EmailView {
                     marked: false,
                 }),
             };
+        }
+        if self.page_html().is_some() {
+            return Body::Page;
         }
         Body::Text {
             key: self.text_key(),
@@ -1056,12 +1147,29 @@ impl View for EmailView {
                 ViewAction::Continue
             }
             Key::Char('h') => {
-                self.prefer_html = !self.prefer_html;
-                self.status_message = Some(if self.prefer_html {
-                    "Showing HTML body".to_string()
+                // A message with a plain part moves between it and its
+                // HTML's page; one whose body is HTML alone between the
+                // page and its text.
+                let html_alone = self
+                    .email
+                    .as_ref()
+                    .is_some_and(|email| Self::html_at(email, false).is_some());
+                let shown = if html_alone {
+                    self.page_as_text = !self.page_as_text;
+                    if self.page_as_text {
+                        "Showing the HTML as text"
+                    } else {
+                        "Showing the HTML as a page"
+                    }
                 } else {
-                    "Showing plain text body".to_string()
-                });
+                    self.prefer_html = !self.prefer_html;
+                    if self.prefer_html {
+                        "Showing HTML body"
+                    } else {
+                        "Showing plain text body"
+                    }
+                };
+                self.status_message = Some(shown.to_string());
                 self.rerender_text();
                 ViewAction::Continue
             }
@@ -1080,9 +1188,10 @@ impl View for EmailView {
                 }
                 ViewAction::Continue
             }
+            // Over a page the numbered links are not in view: b lists them.
             Key::Char(c @ '1'..='9') => {
                 let index = (c as usize) - ('1' as usize);
-                if index < self.urls.len() {
+                if index < self.urls.len() && self.page_html().is_none() {
                     self.open_url(index);
                 }
                 ViewAction::Continue
@@ -1090,6 +1199,33 @@ impl View for EmailView {
             Key::Char('?') => ViewAction::ShowKeys,
             _ => ViewAction::Continue,
         }
+    }
+
+    fn lay_out_page(&mut self, rect: Option<Rect>, scale: Scale, faces: Option<&Faces>) {
+        let html = if self.page_as_text {
+            None
+        } else {
+            self.email
+                .as_ref()
+                .zip(self.html_at)
+                .and_then(|(email, at)| Self::html_in(email, at))
+        };
+        match (rect, html) {
+            (Some(rect), Some(html)) => {
+                let key = self.text_key();
+                let head = self.text.get(..self.head_end).unwrap_or_default();
+                self.page.show(&key, head, html, rect, scale, faces);
+            }
+            _ => self.page.clear(),
+        }
+    }
+
+    fn page(&self) -> Option<&Held> {
+        Some(&self.page)
+    }
+
+    fn page_mut(&mut self) -> Option<&mut Paged> {
+        self.page.get_mut()
     }
 
     fn on_response(&mut self, response: &BackendResponse) -> bool {
@@ -1106,6 +1242,10 @@ impl View for EmailView {
                         self.set_nav_unread(&email.id, !email.keywords.contains_key("$seen"));
                         if let Some(idx) = self.nav_entries.iter().position(|e| e.id == email.id) {
                             self.nav_cursor = idx;
+                        }
+                        // Another message is shown as its page again.
+                        if self.email.as_ref().is_none_or(|shown| shown.id != email.id) {
+                            self.page_as_text = false;
                         }
                         self.email = Some(email.clone());
                         self.rerender_text();
@@ -1124,6 +1264,8 @@ impl View for EmailView {
                 self.pending_forward = false;
                 match result.as_ref() {
                     Ok(email) => {
+                        // The quotation is rendered with the page let go.
+                        self.page.clear();
                         self.email = Some(email.clone());
                         if is_forward {
                             let draft =
@@ -1256,6 +1398,7 @@ impl View for EmailView {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use crate::jmap::types::BodyPart;
 
     fn make_email(id: &str, subject: &str, preview: &str) -> Email {
         Email {
@@ -1304,6 +1447,173 @@ mod tests {
         (view, cmd_rx)
     }
 
+    /// A view on one message with a `plain` part and an `html` part,
+    /// either absent.
+    fn parts_view(plain: Option<&str>, html: Option<&str>) -> EmailView {
+        let (mut view, _rx) = loaded_view("preview");
+        let mut email = make_email("e1", "Hello", "preview");
+        let part = |id: &str, kind: &str| BodyPart {
+            part_id: id.to_string(),
+            blob_id: None,
+            r#type: Some(kind.to_string()),
+            name: None,
+            size: None,
+        };
+        let value = |text: &str| crate::jmap::types::BodyValue {
+            value: text.to_string(),
+            is_encoding_problem: false,
+            is_truncated: false,
+        };
+        if let Some(plain) = plain {
+            email.text_body = Some(vec![part("1", "text/plain")]);
+            email.body_values.insert("1".into(), value(plain));
+        }
+        if let Some(html) = html {
+            email.html_body = Some(vec![part("2", "text/html")]);
+            email.body_values.insert("2".into(), value(html));
+            // JMAP's textBody names the HTML part when there is no text.
+            if plain.is_none() {
+                email.text_body = Some(vec![part("2", "text/html")]);
+            }
+        }
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1".to_string(),
+            result: Box::new(Ok(email)),
+        });
+        view
+    }
+
+    /// The HTML a scene shows as a page and the head above it, or none.
+    fn page_of(view: &EmailView) -> Option<(String, String)> {
+        match view.scene().body {
+            Body::Page => Some((
+                view.text[..view.head_end].to_string(),
+                view.page_html()?.to_string(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// A message whose body is HTML alone is shown as its page, below
+    /// td-mail's own head; `h` shows the HTML as text and again as the
+    /// page.
+    #[test]
+    fn a_message_whose_body_is_html_alone_is_its_page() {
+        let html = "<style>p{color:red}</style><p>Styled <b>words</b>";
+        let mut view = parts_view(None, Some(html));
+        let (head, shown) = page_of(&view).expect("a page");
+        assert_eq!(shown, html);
+        assert!(head.contains("Subject: Hello"), "{head}");
+        assert!(!head.contains("Styled"), "{head}");
+        view.handle_key(Key::Char('h'), 10);
+        assert!(page_of(&view).is_none());
+        let (_, text) = shown_text(&view, 80);
+        assert!(text.contains("Styled words"), "{text}");
+        assert!(!text.contains("<p>"), "{text}");
+        view.handle_key(Key::Char('h'), 10);
+        assert_eq!(page_of(&view).map(|(_, html)| html), Some(html.to_string()));
+    }
+
+    const RECT: Rect = Rect {
+        x: 0,
+        y: 24,
+        width: 640,
+        height: 400,
+    };
+
+    /// The view's pages, laid out for `RECT` as the session lays them.
+    fn held(view: &mut EmailView) -> bool {
+        view.lay_out_page(Some(RECT), Scale::default(), None);
+        view.page().and_then(Held::get).is_some()
+    }
+
+    /// The view lets its pages go before it renders a text: a reply's
+    /// quotation, or the message again as `h` and `v` render it; and with
+    /// no body for them, or a body that is no page.
+    #[test]
+    fn the_view_lets_its_pages_go_before_it_renders_a_text() {
+        let mut view = parts_view(None, Some("<p>the html words"));
+        assert!(held(&mut view));
+        view.handle_key(Key::Char('r'), 10);
+        let email = view.email.clone().unwrap();
+        view.on_response(&BackendResponse::EmailForReply {
+            id: "e1".to_string(),
+            result: Box::new(Ok(email)),
+        });
+        assert!(view.page().and_then(Held::get).is_none());
+        assert!(view.take_pending_action().is_some(), "the reply's draft");
+        assert!(held(&mut view));
+        // The first v asks for the raw headers; the second renders.
+        view.handle_key(Key::Char('v'), 10);
+        view.handle_key(Key::Char('v'), 10);
+        assert!(view.page().and_then(Held::get).is_none());
+        assert!(held(&mut view));
+        view.lay_out_page(None, Scale::default(), None);
+        assert!(view.page().and_then(Held::get).is_none());
+        assert!(held(&mut view));
+        view.handle_key(Key::Char('h'), 10);
+        assert!(!held(&mut view), "shown as text");
+    }
+
+    /// Over a page the digits open nothing: the numbered links are not in
+    /// view. Over the text they open their link.
+    #[test]
+    fn over_a_page_the_digits_open_no_link() {
+        let mut view = parts_view(None, Some("<p><a href='https://e.example/x'>a link</a>"));
+        assert_eq!(view.urls.len(), 1);
+        view.handle_key(Key::Char('1'), 10);
+        assert_eq!(view.status_message, None);
+        view.handle_key(Key::Char('h'), 10);
+        view.handle_key(Key::Char('1'), 10);
+        assert_eq!(view.status_message.as_deref(), Some("Opening [1]..."));
+    }
+
+    /// The HTML shown as text is the message's choice alone: the same
+    /// message loaded again keeps it, another is its page again.
+    #[test]
+    fn another_message_is_its_page_again() {
+        let html = "<p>the html words";
+        let mut view = parts_view(None, Some(html));
+        view.handle_key(Key::Char('h'), 10);
+        assert!(page_of(&view).is_none());
+        let again = view.email.clone().unwrap();
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1".to_string(),
+            result: Box::new(Ok(again.clone())),
+        });
+        assert!(page_of(&view).is_none());
+        let mut other = again;
+        other.id = "e2".to_string();
+        view.email_id = "e2".to_string();
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e2".to_string(),
+            result: Box::new(Ok(other)),
+        });
+        assert!(page_of(&view).is_some());
+    }
+
+    /// A message with a plain part is shown as it, and `h` shows its
+    /// HTML part's page and then the plain part again.
+    #[test]
+    fn a_message_with_a_plain_part_is_its_text_and_h_its_html_page() {
+        let mut view = parts_view(Some("the plain words"), Some("<p>the html words"));
+        assert!(page_of(&view).is_none());
+        assert!(shown_text(&view, 80).1.contains("the plain words"));
+        view.handle_key(Key::Char('h'), 10);
+        assert_eq!(
+            page_of(&view).map(|(_, html)| html),
+            Some("<p>the html words".to_string())
+        );
+        view.handle_key(Key::Char('h'), 10);
+        assert!(page_of(&view).is_none());
+        // Plain text that only looks like markup by its tags is a page;
+        // plain text is never one.
+        let view = parts_view(Some("<div>a</div>"), None);
+        assert!(page_of(&view).is_some());
+        let view = parts_view(Some("a < b and c > d"), None);
+        assert!(page_of(&view).is_none());
+    }
+
     /// The key of the text the scene shows, and the text itself.
     #[test]
     fn read_only_unread_navigation_preserves_flags() {
@@ -1329,7 +1639,9 @@ mod tests {
     fn shown_text(view: &EmailView, columns: usize) -> (String, String) {
         match view.scene().body {
             Body::Text { key, text } => (key, text(columns)),
-            Body::List { .. } | Body::Edit { .. } => panic!("the message is a text"),
+            Body::List { .. } | Body::Edit { .. } | Body::Page { .. } => {
+                panic!("the message is a text")
+            }
         }
     }
 

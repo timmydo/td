@@ -10,6 +10,7 @@
 
 pub mod frame;
 pub mod input;
+pub mod page;
 pub mod sidebar;
 pub mod views;
 
@@ -24,6 +25,7 @@ use crate::rules::CompiledRule;
 use crate::spam::SharedModel;
 use frame::{Draft, Dropdown, Frame, Layout, Pane, Side};
 use input::{Key, Menu};
+use page::{Held, Paged};
 use sidebar::{Entry, Sidebar};
 use std::collections::VecDeque;
 use std::io;
@@ -409,6 +411,9 @@ struct Session {
     mouse: bool,
     /// The surface the frame is laid out for, as the window last gave it.
     surface: Surface,
+    /// The prose faces a message's pages are laid out and drawn in; none
+    /// lays them out on the cell.
+    prose: Option<td_ui::prose::Faces>,
     /// The window's title: the top view's, as the frame last showed it.
     title: String,
     sync_interval: Option<Duration>,
@@ -484,6 +489,7 @@ impl Session {
             sidebar,
             mouse,
             surface,
+            prose: None,
             title: String::new(),
             last_user_activity: Instant::now(),
             last_sync: Instant::now(),
@@ -550,7 +556,7 @@ impl Session {
         let scene = view.scene();
         let total = match &scene.body {
             Body::List { total, .. } => Some(*total),
-            Body::Text { .. } | Body::Edit { .. } => None,
+            Body::Text { .. } | Body::Edit { .. } | Body::Page { .. } => None,
         };
         Some(Shape {
             layout: Layout::new(self.surface, &scene, self.side()),
@@ -561,6 +567,9 @@ impl Session {
 
     /// The rows the body shows, which the page keys move by.
     fn page(&mut self) -> usize {
+        if let Some(page) = self.shown_page() {
+            return page.rows();
+        }
         match self.shape() {
             Some(shape) => shape.layout.page(&mut self.pane, self.surface),
             None => frame::PAGE_ROWS,
@@ -629,6 +638,21 @@ impl Session {
                 username,
             } => self.set_up_account(&account, &server, &username),
             ViewAction::Scroll(scroll) => {
+                if let Some(page) = self.stack.top_mut().and_then(|slot| slot.view.page_mut()) {
+                    let changed = match scroll {
+                        Scroll::Lines(lines) => page.scroll_lines(lines),
+                        Scroll::Pages(pages) => page.scroll_pages(pages),
+                        Scroll::Chord("Up") => page.scroll_lines(-1),
+                        Scroll::Chord("Down") => page.scroll_lines(1),
+                        Scroll::Chord("Home") => page.scroll_to(false),
+                        Scroll::Chord("End") => page.scroll_to(true),
+                        Scroll::Chord(_) => false,
+                    };
+                    if changed {
+                        self.redraw();
+                    }
+                    return;
+                }
                 let changed = match scroll {
                     Scroll::Lines(rows) => self.pane.scroll(rows),
                     Scroll::Pages(pages) => {
@@ -1205,6 +1229,11 @@ impl Session {
                 " </>:width"
             };
             scene.status = format!("Accounts | n/p RET:open u:mark read{width} Tab:back");
+        }
+        if let Some(note) = slot.view.page().and_then(Held::note) {
+            if let Ok(status) = td_alloc::format(format_args!("{note} | {}", scene.status)) {
+                scene.status = status;
+            }
         }
         if let Some(note) = &self.note {
             scene.status = note.clone();
@@ -2055,8 +2084,9 @@ impl Session {
 
     /// Wheel travel in rows, to what lies under the pointer: over the
     /// tree, its rows; over a list, one scroll key per row, bounded; over
-    /// a text, the pane's scroll. With no pointer place known, the side
-    /// with the keys takes it; a tree over the whole body takes it all.
+    /// a text, the pane's scroll; over a page, the page's lines. With no
+    /// pointer place known, the side with the keys takes it; a tree over
+    /// the whole body takes it all.
     fn wheel(&mut self, rows: isize) {
         let Some(shape) = self.shape() else {
             return;
@@ -2079,6 +2109,10 @@ impl Session {
             if self.pane.scroll(rows) {
                 self.redraw();
             }
+            return;
+        }
+        if shape.layout.page.is_some() {
+            self.act(ViewAction::Scroll(Scroll::Lines(rows)));
             return;
         }
         let key = if rows < 0 {
@@ -2133,6 +2167,8 @@ impl Session {
                         .show(&mut slot.text, key, columns, || text(columns));
                 }
             }
+            // The view lays out its own pages, below.
+            Body::Page { .. } => {}
             // The draft is loaded whether or not the surface has room
             // for the pane, so its view's save is always its own.
             Body::Edit { key, text, .. } => {
@@ -2146,6 +2182,17 @@ impl Session {
             let len = entry.text.chars().count();
             slot.entry_first = field.reveal(len, len, slot.entry_first);
         }
+        drop(scene);
+        slot.view
+            .lay_out_page(layout.page, surface.scale, self.prose.as_ref());
+    }
+
+    /// The top view's pages, while its body is one.
+    fn shown_page(&self) -> Option<&Paged> {
+        self.stack
+            .top()
+            .and_then(|slot| slot.view.page())
+            .and_then(Held::get)
     }
 
     /// The frame as text, after `prepare_frame`: what a test reads back.
@@ -2162,6 +2209,7 @@ impl Session {
             first: slot.first,
             entry_first: slot.entry_first,
             pane: &self.pane,
+            page: slot.view.page().and_then(Held::get),
             chooser: self.chooser.as_ref().map(|chooser| &chooser.finder),
             menu: self.menu.as_ref(),
         };
@@ -2478,6 +2526,7 @@ impl Handler for Session {
                 first: slot.first,
                 entry_first: slot.entry_first,
                 pane: &self.pane,
+                page: slot.view.page().and_then(Held::get),
                 chooser: self.chooser.as_ref().map(|chooser| &chooser.finder),
                 menu: self.menu.as_ref(),
             };
@@ -2574,11 +2623,14 @@ pub fn run(
     let live: Vec<Live> = opened.into_iter().flatten().collect();
     let mut session =
         Session::new(setup, live, current_account_idx, mouse).map_err(io::Error::other)?;
-    let typeface = td_ui::pinned_face::load_or_note(
-        "td-mail",
-        std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
-    );
-    let outcome = td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface);
+    let setting = std::env::var_os(td_ui::pinned_face::SETTING);
+    let typeface = td_ui::pinned_face::load_or_note("td-mail", setting.as_deref());
+    // The faces a message's pages are drawn in, their monospace face
+    // the window's own.
+    let prose = td_ui::pinned_face::prose_or_note("td-mail", setting.as_deref(), typeface.as_ref());
+    session.prose = prose.clone();
+    let outcome =
+        td_ui::window::run_with_prose(&mut session, stream, std::env::temp_dir(), typeface, prose);
     for live in &session.live {
         let _ = live.cmd_tx.send(BackendCommand::Shutdown);
     }
@@ -3389,7 +3441,7 @@ mod frame_tests {
     fn view_selected(session: &Session) -> usize {
         match session.stack.current().unwrap().scene().body {
             Body::List { selected, .. } => selected,
-            Body::Text { .. } | Body::Edit { .. } => panic!("no list"),
+            Body::Text { .. } | Body::Edit { .. } | Body::Page { .. } => panic!("no list"),
         }
     }
 
@@ -3998,6 +4050,138 @@ mod frame_tests {
             })
             .unwrap();
         session.poll(0);
+    }
+
+    /// Pushes a message's view and answers its body with `html` alone.
+    fn show_html(session: &mut Session, resp_tx: &Sender<BackendResponse>, html: &str) {
+        let view = views::email_view::EmailView::new(
+            session.cmd_tx().unwrap(),
+            "me@example.com".to_string(),
+            "e1".to_string(),
+            Vec::new(),
+            0,
+            false,
+            Vec::new(),
+            "Archive".to_string(),
+            "Trash".to_string(),
+            None,
+        );
+        session.act(ViewAction::Push(Box::new(view)));
+        let part = crate::jmap::types::BodyPart {
+            part_id: "1".to_string(),
+            blob_id: None,
+            r#type: Some("text/html".to_string()),
+            name: None,
+            size: None,
+        };
+        let mut values = std::collections::HashMap::new();
+        values.insert(
+            "1".to_string(),
+            crate::jmap::types::BodyValue {
+                value: html.to_string(),
+                is_encoding_problem: false,
+                is_truncated: false,
+            },
+        );
+        let email = crate::jmap::types::Email {
+            id: "e1".to_string(),
+            thread_id: None,
+            from: None,
+            to: None,
+            cc: None,
+            reply_to: None,
+            subject: Some("Hello".to_string()),
+            received_at: Some("2025-01-01".to_string()),
+            sent_at: None,
+            preview: Some("preview".to_string()),
+            text_body: Some(vec![part.clone()]),
+            html_body: Some(vec![part]),
+            body_values: values,
+            keywords: std::collections::HashMap::new(),
+            mailbox_ids: std::collections::HashMap::new(),
+            message_id: None,
+            references: None,
+            attachments: None,
+            extra: std::collections::HashMap::new(),
+        };
+        resp_tx
+            .send(BackendResponse::EmailBody {
+                id: "e1".to_string(),
+                result: Box::new(Ok(email)),
+            })
+            .unwrap();
+        session.poll(0);
+    }
+
+    /// An HTML message is its page in the window, below td-mail's head:
+    /// its sheet's rules apply, the reading keys scroll it, `h` shows its
+    /// text, and a view without a page lets its pages go.
+    #[test]
+    fn an_html_message_is_its_styled_page_and_the_keys_scroll_it() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        let mut html = String::from("<style>.gone{display:none}</style><p>first words");
+        html.push_str("<span class=gone>hidden words</span>");
+        for n in 0..200 {
+            html.push_str(&format!("<p>line {n}"));
+        }
+        show_html(&mut session, &resp_tx, &html);
+        let shown = session.shown();
+        assert!(shown.contains("Subject: Hello"), "{shown}");
+        assert!(shown.contains("first words"), "{shown}");
+        assert!(!shown.contains("hidden words"), "{shown}");
+        assert!(session.shown_page().is_some());
+        // PageDown a page, End the bottom, Home the top, the head
+        // scrolling with the page.
+        key(&mut session, "PageDown");
+        let paged = session.shown();
+        assert!(!paged.contains("first words"), "{paged}");
+        assert!(!paged.contains("Subject: Hello"), "{paged}");
+        key(&mut session, "End");
+        assert!(session.shown().contains("line 199"), "{}", session.shown());
+        key(&mut session, "Home");
+        assert!(session.shown().contains("first words"));
+        assert!(session.shown().contains("Subject: Hello"));
+        wheel(&mut session, 40);
+        assert!(!session.shown().contains("first words"));
+        wheel(&mut session, -40);
+        assert!(session.shown().contains("first words"));
+        // As text, td-html's rendering, which knows no sheet.
+        key(&mut session, "h");
+        let text = session.shown();
+        assert!(text.contains("hidden words"), "{text}");
+        assert!(session.shown_page().is_none());
+        key(&mut session, "h");
+        assert!(!session.shown().contains("hidden words"));
+        assert!(session.shown_page().is_some());
+    }
+
+    /// The pages are made again for a body of another size, and the
+    /// status row says, before the view's own words, how a page was not
+    /// made whole.
+    #[test]
+    fn a_page_is_made_again_for_its_body_and_its_note_leads_the_status() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        let mut html = String::from("<p>");
+        html.push_str(&"word ".repeat(crate::compose::HTML_LIMITS.input / 5));
+        html.push_str("past the limit");
+        show_html(&mut session, &resp_tx, &html);
+        session.prepare_frame();
+        let wide = session.shown_page().unwrap().rect();
+        assert_eq!(wide.width, 800);
+        session.input(
+            Input::Resize(Surface::new(400, 600, Default::default()).unwrap()),
+            &mut NoClipboard,
+        );
+        session.prepare_frame();
+        assert_eq!(session.shown_page().unwrap().rect().width, 400);
+        let shown = session.shown();
+        let status = shown.lines().last().unwrap_or_default();
+        assert!(
+            status
+                .trim_start()
+                .starts_with("HTML past 512 KiB not shown; h: text | "),
+            "{status}"
+        );
     }
 
     /// A Control-press on a link in a message opens it through the

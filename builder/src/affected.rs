@@ -10441,11 +10441,11 @@ mod tests {
         let setup = one("td-setup/src/welcome.rs");
         assert_eq!(setup.len(), 6, "{setup:?}");
         assert_eq!(names(&setup), ["td-setup"]);
-        // td-web brings td-page, whose sources cite td-web/DESIGN.md §10,
-        // the contract they keep: its suite, td-page's and the workspace's.
+        // td-web reads td-page, which reads nothing of td-web's: its suite
+        // and the workspace's, not td-page's or td-page's other reader.
         let web = one("td-web/src/app.rs");
         assert_eq!(workspace(&web), 3);
-        assert_eq!(names(&web), ["td-page", "td-web"]);
+        assert_eq!(names(&web), ["td-web"]);
         // A crate others read brings its readers: td-portal and td-editor build
         // modules out of td-compositor sources, so a change there is a change
         // to what they compile, and td-photo reads td-ui, which reads

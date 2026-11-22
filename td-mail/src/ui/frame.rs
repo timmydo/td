@@ -59,6 +59,8 @@ pub struct Layout {
     pub entry: Option<TextEntry>,
     pub list: Option<List>,
     pub pane: Option<Rect>,
+    /// The body a message's pages fill (`Body::Page`).
+    pub page: Option<Rect>,
     /// The account tree, where `Side` puts one.
     pub sidebar: Option<List>,
     /// The band between the entry, or the bar, and the status row, which
@@ -89,6 +91,7 @@ impl Layout {
             entry: None,
             list: None,
             pane: None,
+            page: None,
             sidebar: None,
             body,
             status,
@@ -131,6 +134,9 @@ impl Layout {
             Body::List { .. } => layout.list = List::new(surface, body),
             Body::Text { .. } | Body::Edit { .. } => {
                 layout.pane = (body.width > 0 && body.height > 0).then_some(body);
+            }
+            Body::Page { .. } => {
+                layout.page = (body.width > 0 && body.height > 0).then_some(body);
             }
         }
         layout
@@ -811,6 +817,8 @@ pub struct Frame<'a> {
     pub first: usize,
     pub entry_first: usize,
     pub pane: &'a Pane,
+    /// The top view's message as its pages, when its body is one.
+    pub page: Option<&'a super::page::Paged>,
     /// The finder open over the body, painted in its place.
     pub chooser: Option<&'a finder::Controller>,
     /// The dropdown open over the frame, painted last.
@@ -908,6 +916,11 @@ impl Composition for Frame<'_> {
             Body::Text { .. } | Body::Edit { .. } => {
                 if layout.pane.is_some() {
                     self.pane.emit(damage, sink);
+                }
+            }
+            Body::Page { .. } => {
+                if let (Some(_), Some(page)) = (layout.page, self.page) {
+                    page.emit(damage, sink);
                 }
             }
         }

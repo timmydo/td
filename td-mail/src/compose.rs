@@ -417,7 +417,8 @@ fn html_to_plain(html: &str) -> String {
 /// What one rendering of a message's HTML may read and build, here and in
 /// the message view: the view's and a reply's renderings, with the view's
 /// text kept, some 74 MB at their worst, under the 192 MiB jail beside
-/// td-mail's own 47-92 MB (README.md, "Memory").
+/// td-mail's own 52-97 MB and its prose faces' glyphs (README.md,
+/// "Memory"). A message's page reads the same input.
 pub(crate) const HTML_LIMITS: td_html::Limits = td_html::Limits {
     input: 512 << 10,
     output: 8 << 20,
@@ -1054,17 +1055,31 @@ mod tests {
     /// 1.25 per byte of output budget (td-html/DESIGN.md, "Resident
     /// rendering cost"), and the view keeps its last rendering's text and
     /// a string per line, at most twice its budget, while a reply renders.
+    /// A message's pages are at most their budget and are never held while
+    /// a rendering runs, the view letting them go first, so the larger of
+    /// the two counts. The window's prose faces hold, beside their bytes,
+    /// an atlas page with its key map and shelves for each of the three
+    /// faces at the raster's size, bounded as td-ui bounds its other
+    /// pages, and `prose::ATLAS` for every other size.
     /// `BASELINE` is td-mail's own resident memory at 2880x1800 with
-    /// td-ui's three window buffers, and
+    /// td-ui's three window buffers and the faces' bytes, and
     /// `MEMORY_HIGH` the jail's in recipes/src/recipes/mail.rs, both
     /// reviewed by hand when either changes.
     #[test]
     fn the_html_limits_fit_the_jail() {
-        const BASELINE: usize = 92_000_000;
+        use td_ui::atlas::{MAX_KEYS, PAGE_HEIGHT, PAGE_WIDTH};
+        const BASELINE: usize = 97_000_000;
         const MEMORY_HIGH: usize = 192 << 20;
         let rendering = 100 * HTML_LIMITS.input + HTML_LIMITS.output * 5 / 4;
         let kept = 2 * HTML_LIMITS.output;
-        assert!(BASELINE + rendering + kept < MEMORY_HIGH);
+        let at_size = 3 * (PAGE_WIDTH * PAGE_HEIGHT + (MAX_KEYS / 4 + 2) * 768 + PAGE_HEIGHT * 48);
+        let glyphs = at_size + td_ui::prose::ATLAS;
+        let page = crate::ui::page::BUDGET;
+        let total = BASELINE + glyphs + kept + rendering.max(page);
+        assert!(total < MEMORY_HIGH, "{total}");
+        // What a page's layout holds beyond its budget, uncharged, has the
+        // rest of the rendering's term: measured, not modelled.
+        assert!(rendering - page > 25_000_000);
     }
 
     /// A sent draft and its sidecar move together into the private `sent`
