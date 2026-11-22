@@ -295,3 +295,24 @@ Unit tests run against byte fixtures and a scripted in-memory stream:
 - notifications held, bounded and resumed across a deadline;
 - td-alloc refusals stepped from zero through a query and a held
   notification.
+
+`tests/postgres.rs` runs the client against a real PostgreSQL 17 server
+on a disposable cluster in a `td_fs::TempDir`, found as td-mta's native
+fixtures find theirs: the first `initdb` on `PATH`, with `postgres` and
+`pg_ctl` beside it, each tool run with only `PATH` and `LC_ALL=C`. It
+covers SCRAM login over the Unix socket, a wrong password, cleartext and
+trust refused by the client, an SSLRequest the server answers `N`, every
+type both ways (arrays with NULLs, `name`, the extremes of each integer,
+all 256 byte values), the extended and simple queries, commit and
+rollback, a failed transaction's COMMIT, a deferred constraint failing
+at COMMIT, SQLSTATE errors including `55P03`, a startup
+`statement_timeout`, a client deadline, a COMMIT whose deadline passes
+while a deferred trigger runs (unknown, and the server then commits) and
+one whose backend is terminated (unknown, FATAL `57P01`), LISTEN and
+NOTIFY, an ended idle session found by a poll, a query and a COMMIT
+written to a session the server already ended (its FATAL reported, the
+COMMIT unknown), and each result limit. The test is ignored in ordinary
+runs, since the sandbox gate has no PostgreSQL; the host preflight runs
+it through `test-args = "--include-ignored"`. TLS itself is not
+exercised here: the connector is td-mta's, and its end-to-end test
+belongs with it.

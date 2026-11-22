@@ -179,11 +179,11 @@ parallelism or output and those `cargo run` sets for the td-builder it
 starts, `TD_RUST_HOME`, `TD_CC_HOME` and the memory cap, every cargo
 config that exists above the repository or in `CARGO_HOME`, the test
 runner's and this td-builder's loaded segments, and which `initdb` (the
-native mail leg's PostgreSQL) and `dav1d` (td-photo's decode oracles) are
-first on `PATH` with what their `--version` prints, or that there is
-none. Two worktrees' builds of the same sources differ only in local
-symbol names, which the loader never reads, so they share passes;
-builders built from different sources do not.
+PostgreSQL of the native mail leg and td-postgres) and `dav1d` (td-photo's
+decode oracles) are first on `PATH` with what their `--version` prints,
+or that there is none. Two worktrees' builds of the same sources
+differ only in local symbol names, which the loader never reads, so
+they share passes; builders built from different sources do not.
 Commands are journaled with this td-builder's path spelled `td-builder`.
 
 The preflights run as cargo groups, one per crate and one for the
@@ -1258,7 +1258,10 @@ performance harness. Their real operation deadlines include hashing and TLS;
 an unoptimized full-size body hash can exhaust a deadline before database work
 starts. Ordinary unit and documentation tests retain the test profile. This
 does not change target compiler flags or relax an operation deadline.
-Host preparation must put PostgreSQL 17 on `PATH`. The native tests
+Host preparation must put PostgreSQL 17 on `PATH`; td-postgres's
+real-server test, which its preflight runs through `--include-ignored`,
+starts its cluster from the same first `initdb`, with `postgres` and
+`pg_ctl` beside it. The native tests
 resolve the first `initdb` to its package directory, which must also hold `postgres`,
 `pg_ctl`, `psql`, `pg_dump`, `pg_restore`, `pg_receivewal`, `pg_basebackup`
 and `pg_verifybackup`, and `postgres --version` must report release 17.

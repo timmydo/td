@@ -4338,8 +4338,8 @@ fn elf_loaded_digest(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 /// Host tools a preflight takes from PATH: PostgreSQL's `initdb`, which the
-/// native mail leg requires, and `dav1d`, whose decode oracles td-photo's
-/// tests run only when one is there.
+/// native mail leg and td-postgres's real-server test require, and `dav1d`,
+/// whose decode oracles td-photo's tests run only when one is there.
 const PREFLIGHT_PATH_TOOLS: &[&str] = &["initdb", "dav1d"];
 
 /// What selects and configures the toolchain a cargo preflight runs, which

@@ -11,6 +11,10 @@ description = "td's synchronous, bounded PostgreSQL client: protocol 3.0, SCRAM-
 
 [package.metadata.td-gate]
 clippy-all-targets = true
+# The real-server tests are ignored so the PostgreSQL-free sandbox gate
+# stays honest; the host preflight, whose PATH holds PostgreSQL 17, runs
+# them.
+test-args = "--include-ignored"
 
 [dependencies]
 td-alloc = { path = "../td-alloc" }
