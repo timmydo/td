@@ -17,13 +17,22 @@ clone, so a pushed branch is the PR and there is nothing else to notify.
 
 Create agent-owned development worktrees under `~/src/td-worktrees/<branch>`.
 Keep `~/src/td` as the primary checkout; do not create development worktrees
-as `~/src/td-*` siblings or inside the primary checkout. This is the path
+as `~/src/td-*` siblings or, except as Claude Code does below, inside the
+primary checkout. This is the path
 to pass to `git worktree add`, including when working through Codex CLI.
 For example, from the primary checkout after fetching `origin`:
 
 ```text
 git worktree add -b example-change ~/src/td-worktrees/example-change origin/main
 ```
+
+Claude Code is the exception: its worktree tools create and enter
+checkouts only under the primary checkout's `.claude/worktrees/<name>`,
+so a Claude Code session works there rather than in `~/src/td-worktrees`.
+Its branch carries the repository's `.cargo/config.toml`, so cargo uses
+that worktree's own builder ("Test binaries run under a memory ceiling"),
+and the affected-path mapping ignores `.claude/`. Name the branch for its
+work, renaming the tool's `worktree-<name>` default before pushing.
 
 Tool-managed integration and review checkouts keep their documented
 locations. Disposable agent scratch stays inside the owning worktree as
@@ -1053,7 +1062,7 @@ Doctests do not reach the runner and run uncapped — cargo wires a runner into
 rustdoc only when cross-compiling.
 
 Which builder gets used matters, because cargo searches ancestor directories
-for `.cargo/config.toml`. Older worktrees may still live under the primary
+for `.cargo/config.toml`. Claude Code's worktrees live under the primary
 checkout at `.claude/worktrees/*`. A worktree whose branch carries this file
 uses its own copy and its own `target/release/td-builder`. An older nested
 worktree without this file — or an unrelated crate under the td tree —

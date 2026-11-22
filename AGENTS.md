@@ -195,7 +195,7 @@ It compares against `origin/main` and includes uncommitted files;
 boundaries are:
 
 - change work happens in an isolated worktree branch, at the location
-  specified in `DEVELOPMENT.md`;
+  specified in `DEVELOPMENT.md` (for Claude Code, `.claude/worktrees/`);
 - agent review copies, continuations, and other disposable scratch belong
   under that worktree's `.td-build-cache/agent-scratch/`, never as loose
   `/tmp` trees. Each agent owns its scratch and deletes it before finishing,
