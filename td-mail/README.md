@@ -759,8 +759,10 @@ Use a separate configured account name/cache for a local replica.
 
 ## Memory
 
-td's jail lets td-mail grow to 192 MiB before it throttles it
-(`memory-high`) and to 256 MiB before it ends it (`recipes/src/recipes/mail.rs`).
+td's jail lets td-mail grow to 256 MiB before it throttles it
+(`memory-high`) and to 320 MiB before it ends it
+(`recipes/src/recipes/mail.rs`), room for the mailbox and the message
+beside a rendering's or a page's terms.
 td-mail renders a message's HTML as text, for the message view and for a
 reply's quotation, on the window's thread, one rendering at a time, within
 `compose::HTML_LIMITS`: the first 512 KiB of the HTML, and an 8 MiB
@@ -787,8 +789,8 @@ marks then carrying the target: it peaks 74 MB above the test's 2 MiB
 input. The window's prose faces hold, besides their bytes, an atlas page
 with its keys and shelves for each of three faces at the raster's size
 and td-ui's `prose::ATLAS` for every other size a page draws, 21.5 MB
-at most, so 148 to 193 MB in all, under 192 MiB (201 MB) at either size,
-which leaves 8 to 53 MB for the mailbox and the message itself. A test holds
+at most, so 148 to 193 MB in all, under 256 MiB (268 MB) at either size,
+which leaves 75 to 120 MB for the mailbox and the message itself. A test holds
 `HTML_LIMITS` to td-html's rule (100 bytes a byte of input, 1.25 a byte
 of budget) beside the larger baseline, the faces' glyphs and the view's
 kept text; those figures and the jail's are copied by hand, and reviewed

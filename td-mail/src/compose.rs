@@ -416,7 +416,7 @@ fn html_to_plain(html: &str) -> String {
 
 /// What one rendering of a message's HTML may read and build, here and in
 /// the message view: the view's and a reply's renderings, with the view's
-/// text kept, some 74 MB at their worst, under the 192 MiB jail beside
+/// text kept, some 74 MB at their worst, under the 256 MiB jail beside
 /// td-mail's own 52-97 MB and its prose faces' glyphs (README.md,
 /// "Memory"). A message's page reads the same input.
 pub(crate) const HTML_LIMITS: td_html::Limits = td_html::Limits {
@@ -1069,7 +1069,7 @@ mod tests {
     fn the_html_limits_fit_the_jail() {
         use td_ui::atlas::{MAX_KEYS, PAGE_HEIGHT, PAGE_WIDTH};
         const BASELINE: usize = 97_000_000;
-        const MEMORY_HIGH: usize = 192 << 20;
+        const MEMORY_HIGH: usize = 256 << 20;
         let rendering = 100 * HTML_LIMITS.input + HTML_LIMITS.output * 5 / 4;
         let kept = 2 * HTML_LIMITS.output;
         let at_size = 3 * (PAGE_WIDTH * PAGE_HEIGHT + (MAX_KEYS / 4 + 2) * 768 + PAGE_HEIGHT * 48);

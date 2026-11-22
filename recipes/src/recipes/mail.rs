@@ -48,8 +48,8 @@ pub fn recipe() -> Recipe {
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
-        .and_then(|permissions| permissions.with_memory_high(192 * 1024 * 1024))
-        .and_then(|permissions| permissions.with_memory_max(256 * 1024 * 1024))
+        .and_then(|permissions| permissions.with_memory_high(256 * 1024 * 1024))
+        .and_then(|permissions| permissions.with_memory_max(320 * 1024 * 1024))
         // Tasks, threads included: the client keeps a backend thread per
         // configured account and one connector beside the window's, and
         // td-svc will not restart a program that exits on the cap (a
@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(permissions.session_bus().count(), 0);
         assert_eq!(
             permissions.to_keyfile(),
-            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
+            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Resources]\nmemory-high=268435456\nmemory-max=335544320\npids-max=32\ncpu-max=50000 100000\n"
         );
         let steps = recipe.steps.as_ref().expect("steps");
         assert!(steps.iter().any(|step| matches!(
