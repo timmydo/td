@@ -20,7 +20,9 @@ mod unix_connect;
 pub use bounded::read_bounded;
 pub use on_path::{executable_in, executable_on_path};
 pub use private_dir::{check_private_dir, private_dir};
-pub use private_socket::{check_private_socket, check_private_socket_parent, SocketPath};
+pub use private_socket::{
+    check_private_socket, check_private_socket_parent, check_server_socket, SocketPath,
+};
 pub use real_file::{open_real_file, read_bounded_real_file};
 pub use replace::{replace, replace_if, replace_with};
 pub use unix_connect::connect_until as unix_connect_until;

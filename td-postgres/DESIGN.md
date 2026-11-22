@@ -20,7 +20,7 @@ nothing past it.
 
 | Concern | What td-mta does |
 | --- | --- |
-| Endpoint | TCP to a caller-resolved address, or a private Unix-domain socket whose ownership td-mta checks first (`td_fs::check_private_socket`) |
+| Endpoint | TCP to a caller-resolved address, or a private or group-shared Unix-domain socket whose ownership td-mta checks first (`td_fs::check_server_socket`) |
 | TLS | TCP always: `SslMode::Require` with `SslNegotiation::Postgres`, the SSLRequest handshake, then td-mta's own `TlsIo` over a td-crypto `TlsSession` verifying chain and name. Unix sockets: none. No direct TLS, no fallback, no channel binding (`ChannelBinding::Disable`) |
 | Login | SCRAM-SHA-256 only. td-mta's input filter (`postgres_probe/framing.rs`) refuses any other authentication request, AuthenticationOk without the SASL exchange, and any ReadyForQuery before authentication. Passwords are generated hex tokens, at most 4096 bytes |
 | Startup parameters | user, dbname, password, `application_name = td-mta-postgres`, and `options = -c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog` |

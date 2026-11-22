@@ -586,20 +586,35 @@ file, DNS lookup, TCP listener or TCP fallback is involved. Account/role,
 schema, transaction and commit-outcome handling are identical to the TCP
 path.
 
-Shared `td-fs` admission checks an absolute pathname of at most 107 bytes,
-with no empty, dot or parent components, symlink, or abstract namespace.
-Its direct parent must be owned by the current UID with mode 0700, and the
-socket by that UID with mode 0600. Physical ancestors must belong to root
-or this UID; shared-writable ancestors require the sticky bit, which
-protects their owned child names. Root and same-UID namespace writers
-remain trusted; these are stable-path checks, not atomic lookup against
-hostile same-UID code. Every connect rechecks the endpoint. Dialing shares
-one absolute deadline with admission to at most eight helper threads, each
-with a 256-KiB stack. A timed-out connect retains its slot until the kernel
-call returns; its late stream is closed. Repeated failures cannot
-accumulate unbounded threads. These helpers exist only while dialing Unix
-endpoints, with at most 2 MiB of requested stack reservation per process,
-in addition to thread overhead.
+Shared `td-fs` admission (`check_server_socket`) checks an absolute
+pathname of at most 107 bytes, with no empty, dot or parent components,
+symlink, or abstract namespace. The endpoint must take one of two forms. A
+private socket and its direct parent are owned by the current UID, with
+modes 0600 and 0700; physical ancestors must belong to root or this UID,
+and shared-writable ones require the sticky bit, which protects their
+owned child names. Any other socket must be group-shared, the form a
+PostgreSQL running as a separate account offers its client accounts:
+socket mode exactly 0660 and direct parent mode exactly 0750, both owned
+by one non-root server UID and one group. Root, that server UID and
+members of the group are admitted; membership is the filesystem GID or one
+of at most 1024 supplementary groups, read from `/proc/self/status`, and
+more refuse. Further ancestors must belong to root or the server UID and
+be writable by neither group nor others, sticky or not: under a shared
+sticky directory any account could have created the server's directory.
+Read and search access for others is fine: world-readable ancestors such
+as mode-0755 `/var` and `/var/lib` admit. Root, same-UID and, for the
+shared form, server-UID namespace writers remain trusted; SCRAM still
+authenticates the role, and the group decides only which accounts may
+reach the socket. Inside a user namespace unmapped owners all read as the
+overflow ID, so these checks assume the initial namespace's IDs. These
+are stable-path checks, not atomic lookup against hostile code holding
+that authority. Every connect rechecks the endpoint.
+Dialing shares one absolute deadline with admission to at most eight
+helper threads, each with a 256-KiB stack. A timed-out connect retains its
+slot until the kernel call returns; its late stream is closed. Repeated
+failures cannot accumulate unbounded threads. These helpers exist only
+while dialing Unix endpoints, with at most 2 MiB of requested stack
+reservation per process, in addition to thread overhead.
 
 ### Connection driver and input bounds
 

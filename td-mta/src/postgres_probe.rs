@@ -660,7 +660,7 @@ fn connect_authenticated_until(
             )
         }
         Endpoint::Unix(path) => {
-            td_fs::check_private_socket(path.as_path()).map_err(|_| Error::Transport)?;
+            td_fs::check_server_socket(path.as_path()).map_err(|_| Error::Transport)?;
             let socket =
                 td_fs::unix_connect_until(path.as_path(), connect_deadline).map_err(|error| {
                     if error.kind() == io::ErrorKind::TimedOut {
