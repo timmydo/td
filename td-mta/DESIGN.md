@@ -17,7 +17,9 @@ and explicit uncertainty, without outbound bounces.
 [CONFIG.md](CONFIG.md) describes startup; [CONFORMANCE.md](CONFORMANCE.md)
 states supported client flows and qualification limits. The v1 release still
 requires section 15's evidence; functioning receive/JMAP service is not a
-claim that every target feature below is implemented.
+claim that every target feature below is implemented. Gateway receiving,
+MTA-STS policy serving, `dns-plan` and aggregated health status are specified
+below but not implemented.
 
 The SQLite backend, local-store administration and file-backed device registry
 are removed; there is no SQLite compatibility or conversion path. External
@@ -39,7 +41,8 @@ The current contract is organized by responsibility:
 | Supported flows, test evidence and performance measurement | [CONFORMANCE.md](CONFORMANCE.md) |
 | Installation, schedules and recovery | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | Current Azure host updates and operations | [PRODUCTION.md](PRODUCTION.md) |
-| Planned account replication and recovery boundaries | [REPLICATION.md](REPLICATION.md) |
+| Native certificate issuance and renewal | [ACME.md](ACME.md) |
+| Local read-only account replicas and recovery boundaries | [REPLICATION.md](REPLICATION.md) |
 | Logs and diagnostic counters | [OBSERVABILITY.md](OBSERVABILITY.md) |
 
 [IMPLEMENTATION.md](IMPLEMENTATION.md) retains component task sequencing and
@@ -983,8 +986,8 @@ Publish MX records for every served domain pointing to a configured
 hostname, for example `mx.example.net`, with A/AAAA records for reachable
 addresses. Internet SMTP uses port 25 with STARTTLS; port 25 is not a
 plaintext fallback after trying port 465. The receiving listener offers TLS
-1.2/1.3 with the explicit reviewed algorithm policy recorded by M07 (API
-section 1.1). Dependency upgrades must not silently change this policy. It
+1.2/1.3 with the explicit reviewed algorithm policy recorded in API.md
+section 1.1. Dependency upgrades must not silently change this policy. It
 accepts plaintext delivery for peers that do not negotiate TLS; selecting
 the direct role chooses this v1 compatibility policy. There is no separate
 plaintext-toggle setting. Once STARTTLS begins, a failed handshake closes
@@ -1014,9 +1017,8 @@ Mail with any result can reach Inbox, including mail claiming a hosted
 domain with a published reject policy. Section 46 of POSTGRES.md gives the
 inspection queries.
 
-Port 443 serves JMAP HTTPS and configured MTA-STS policy hosts. Port 80 serves
-ACME HTTP-01 challenges and
-may redirect ordinary GET requests to a fixed configured HTTPS origin; it
+Port 443 serves JMAP HTTPS. Port 80 serves only ACME HTTP-01 challenges,
+from the native ACME worker (ACME.md); other requests receive 404. It
 never accepts credentials or JMAP writes. URLs in JMAP discovery are generated
 from configured origins, never an untrusted Host header.
 
@@ -1026,10 +1028,23 @@ Support serving a static MTA-STS policy from the configured
 mode, then allow the operator to select enforcement after certificate/DNS
 validation. This is policy publication for senders that support MTA-STS,
 not outbound MX lookup or a claim that all inbound sessions use TLS.
+Neither the policy route nor `dns-plan` is implemented; the HTTPS listener
+only presents a configured `mta-sts.DOMAIN` certificate identity.
+
+One direct SMTP listener may serve additional explicit MX hostnames through
+`server_name_aliases` (CONFIG.md and SCHEMA.md). Graph validation treats
+those names as local and requires the listener certificate to cover them.
+The listener's primary name remains its SMTP greeting and EHLO identity;
+the aliases grant neither recipient acceptance nor relay authority. TLS
+policy bindings retain the aliases so a policy prepared for another list
+cannot be attached as the same listener configuration. Gateway and HTTP
+listeners reject this setting.
 
 ### 4.2 Gateway MX
 
-In gateway mode public MX records point to another server. The gateway owns
+`serve` refuses gateway listeners (`unsupported-listener`); this section
+specifies the target contract. In gateway mode public MX records point to
+another server. The gateway owns
 Internet acceptance/retry and sends to a dedicated td-mta listener. The
 deployment restricts that listener using firewall rules AND explicit peer
 address admission in td-mta. Require STARTTLS with verified client certificates
@@ -1065,8 +1080,9 @@ service's gateway support is a receiving role, not a general forwarding MTA.
 
 ### 4.3 Smart host and local conformance fixtures
 
-The initial provider is `smtp.migadu.com`, port 465, implicit TLS, and mailbox
-password authentication, matching Migadu's published settings. Provider MTA
+The production provider is `smtp.migadu.com`, port 465, implicit TLS, and
+mailbox password authentication, matching Migadu's published settings;
+PRODUCTION.md lists the deployment's other routes. Provider MTA
 software/version is unverified. Do not infer it from unrelated deployments or
 make compatibility depend on a banner. No live SMTP probing is needed.
 
@@ -1077,7 +1093,8 @@ Support advertised AUTH PLAIN and LOGIN with bounded challenge/reply handling.
 Do not advertise or use an AUTH mechanism merely because a banner suggests it.
 The shared EHLO reader retains STARTTLS, supported AUTH mechanism flags and
 8BITMIME. Recognize only a bare case-insensitive 8BITMIME keyword; parameters
-make that line unadvertised. Valid repeated advertisements are unioned. AUTH keywords are case-insensitive; SASL names are exact uppercase
+make that line unadvertised. Valid repeated advertisements are unioned.
+AUTH keywords are case-insensitive; SASL names are exact uppercase
 ASCII names of 1 through 20 letters, digits, hyphens or underscores (RFC 4422).
 Unknown valid mechanisms are ignored. An invalid mechanism invalidates that
 AUTH line's entire list; valid repeated lists are unioned. The greeting line
@@ -1085,10 +1102,10 @@ is never an advertisement. Capabilities are available only after a complete,
 successful 250 reply with no unread tail, under the shared 512-byte line and
 16 KiB aggregate bounds. These flags are syntax evidence only: the driver
 must discard pre-TLS capabilities and obtain a fresh EHLO on the verified TLS
-transport before selecting AUTH. This parser increment does not send AUTH or
-activate the relay driver.
+transport before selecting AUTH.
 
-The prepared relay EHLO owner accepts only a completed TLS connection with
+Relay profiles run these steps on their one foreground route worker
+(section 11). The relay EHLO owner accepts only a completed TLS connection with
 verified server-name evidence and the configured relay role. It consumes the
 initial 220 greeting for implicit TLS, or sends a fresh EHLO immediately after
 required STARTTLS. It retains supported AUTH and 8BITMIME flags together with that same
@@ -1098,9 +1115,8 @@ original absolute deadline abort the socket. Each turn performs at most one
 TLS transport operation and parses at most one bounded control line; four
 caller-reserved 512-byte cells hold input, greeting, EHLO reply and command.
 The returned session has no authentication, account or queue authority.
-The production relay scheduler remains separate work.
 
-The prepared required-STARTTLS relay owner retains the original plaintext
+The required-STARTTLS relay owner retains the original plaintext
 socket and configured relay TLS reservation through the initial 220 and EHLO.
 Only a required-STARTTLS policy is admitted. It shares the bounded EHLO wire
 driver with the verified-TLS owner, but exposes only a completed STARTTLS
@@ -1110,8 +1126,7 @@ that owner into the existing bounded STARTTLS/220 driver; native ClientHello
 bytes remain private until the successful 220. Initial EHLO, STARTTLS and
 handshake retain the original handshake deadline, which may not exceed the
 original job deadline. A fresh verified TLS EHLO still determines AUTH and
-8BITMIME; pre-TLS advertisements confer neither capability. This is a
-prepared owner, not activation of the runtime relay scheduler.
+8BITMIME; pre-TLS advertisements confer neither capability.
 
 Each compiled relay policy retains a private domain-separated SHA-256 digest
 of the exact decoded username/password, framed by lengths. The completed EHLO
@@ -1121,14 +1136,14 @@ It retains no second plaintext password copy and sends no AUTH bytes. This is
 a local configuration-binding check, not a persisted password verifier,
 current-generation admission or successful remote authentication. Credential
 rotation changes new policies; old sessions continue to identify their old
-snapshot until the runtime retires them. The prepared AUTH owner performs this check before writing any AUTH command;
-the runtime must still enforce live queue/route fences. The prepared native
-PostgreSQL MAIL adapter additionally requires the authenticated session's
-process-local policy ID to match the TLS generation created with the attempt's
-selected-profile Binding. That ID is passive provenance, never persisted
-queue authority. POSTGRES.md, [TLS policy provenance before MAIL](POSTGRES.md#tls-policy-provenance-before-mail) owns this bound-path check.
+snapshot until the runtime retires them. The AUTH owner performs this check
+before writing any AUTH command; the runtime must still enforce live
+queue/route fences. The native PostgreSQL MAIL adapter additionally
+requires the authenticated session's process-local policy ID to match the
+TLS generation created with the attempt's selected-profile Binding. That ID
+is passive provenance, never persisted queue authority. POSTGRES.md, [TLS policy provenance before MAIL](POSTGRES.md#tls-policy-provenance-before-mail), owns this bound-path check.
 
-The prepared AUTH exchange consumes that fresh-EHLO session and borrows the
+The AUTH exchange consumes that fresh-EHLO session and borrows the
 original work meter and credential strings. Prefer advertised PLAIN; select
 LOGIN only when PLAIN is absent. Never retry with another mechanism after
 refusal. The connector prefers a PLAIN initial response when the complete
@@ -1153,23 +1168,24 @@ releases TLS, socket and retained policy before returning reserved buffers.
 Success retains exclusive connection custody, mechanism evidence and the
 verified TLS EHLO capabilities. PLAIN and LOGIN install no SASL security
 layer and do not reset this capability state. This is not account, route,
-queue or current-generation authority. This prepares
-local protocol machinery; production relay scheduling is not activated.
-The inert native Prepared connector now composes configured resolution,
+queue or current-generation authority.
+
+The native Prepared connector composes configured resolution (section 5),
 numeric dialing, implicit TLS or required STARTTLS, fresh EHLO and AUTH.
 It binds same-load profile provenance before network work and rechecks native
-authority before credentials, retaining an opaque same-session MAIL handoff.
-POSTGRES.md, [Configured relay connection setup](POSTGRES.md#configured-relay-connection-setup) owns its custody and failure contract. AUTH refusals
+authority before dialing and before credentials, retaining an opaque
+same-session MAIL handoff.
+POSTGRES.md, [Configured relay connection setup](POSTGRES.md#configured-relay-connection-setup) and [Connection setup failures](POSTGRES.md#connection-setup-failures), own its custody and failure contract. AUTH refusals
 may expose an isolated complete peer rejection code; partial, multiline,
 malformed or current-cell-tailed input supplies no such classification.
 Only actual 535 selects this connector's Auth repair continuation.
-The inert single-attempt driver consumes that opaque connector and composes
+The single-attempt driver consumes that opaque connector and composes
 bound MAIL, ordered RCPT, DATA, verified-source Body and final publication.
 It retains closed phase-specific evidence and passive interruption custody
 on failure; callers settle actual replies and unknown Pending before any
-recovery. It does not select jobs, schedule retries or activate PostgreSQL.
-POSTGRES.md, [Relay attempt lifecycle](POSTGRES.md#relay-attempt-lifecycle) specifies the handoff and its bounded qualification.
-
+recovery. The driver selects no job and schedules no retry; the route worker
+does both (POSTGRES.md, [Relay scheduling turn](POSTGRES.md#relay-scheduling-turn)). POSTGRES.md, [Settlement of a stopped attempt](POSTGRES.md#settlement-of-a-stopped-attempt) and [Bound body transfer](POSTGRES.md#bound-body-transfer), specify the
+handoff and its bounded qualification.
 
 Credential cells and caller strings must not enter logs; no secure-erasure
 claim is made for caller scratch or native TLS buffers.
@@ -1189,8 +1205,8 @@ or a prerequisite silently downloaded by the test suite.
 
 Resource policy separates enforceable limits from performance goals. Bound
 untrusted message/request sizes, parser depth, operation counts, concurrency,
-queues, caches and retained generations. Disk-backed indexes must avoid
-retaining the mailbox in RAM. Downloads stream; current SMTP DATA and upload
+queues, caches and retained generations. Database queries and indexes must
+not retain the mailbox in RAM. Downloads stream; current SMTP DATA and upload
 ingress retain bounded full-message buffers accounted for in the resource
 ledger. Reducing this resident ingress is a performance goal. Check
 lengths and capacity before growth; use fallible reservation where available
@@ -1274,18 +1290,21 @@ planned stacks for nine fixed roles plus `tls_handshakes` HTTPS workers; event p
 workers. HTTPS and direct SMTP visit a bounded set of slots in round-robin
 order and wait for socket readiness, worker completion or the next deadline
 through the adapter in section 3. Established TLS record work is bounded per
-slot. Disk, dial, handshake and DNS jobs use fixed workers. Read slots are acquired per store operation with a bounded fair
-wait queue; exhaustion returns a retryable HTTP 503 before response headers
-or the mapped JMAP method error. A streaming response that has begun cannot
-fabricate an error object inside its body: finish from its admitted view or
-terminate it. An online backup uses one read slot; interactive work shares
-the other. This default reserves foreground capacity during background work.
+slot. Disk, dial, handshake and DNS jobs use fixed workers. Read slots are
+acquired per store operation from the profile's fixed `storage_views` count;
+a full count refuses rather than queueing, returning a retryable HTTP 503
+before response headers or the mapped JMAP method error (API.md). A
+streaming response that has begun cannot fabricate an error object inside
+its body: finish from its admitted view or terminate it. The relay route
+worker owns separate read permits (RESOURCES.md), so outbound delivery
+cannot occupy foreground views. There is no in-service backup.
 
-[ADMISSION.md](ADMISSION.md) fixes disk quotas, checkpoint completion space,
-maintenance drain/exclusive budgets, network timers and exact JMAP response
-retention. These are admission contracts, not measured throughput or guarantees
-against a host disk filling concurrently. They gate persistence and protocol
-implementations; they do not impose the speculative RAM ledger.
+[ADMISSION.md](ADMISSION.md) fixes logical disk accounting, mutation
+publication, work budgets and commit allowances, network timers and exact
+JMAP response retention. These are admission contracts, not measured
+throughput or guarantees against a host disk filling concurrently. They gate
+persistence and protocol implementations; they do not impose the speculative
+RAM ledger.
 
 Initial default ceilings (validated together at startup):
 
@@ -1304,12 +1323,12 @@ Initial default ceilings (validated together at startup):
 | JMAP JSON request / methods per request | 1 MiB / 16 |
 | JMAP object IDs per get/set / query page | 256 / 256 |
 | JSON nesting / parser tokens per request | 32 / 32768 |
-| Combined resident index cache | 4 MiB |
+| Combined body-worker header cache (`index_cache_bytes`) | 4 MiB |
 | Storage read views | 6, each with bounded row/key/cursor scratch and a database snapshot |
 | Bodies retained by upload leases | 128 MiB per account, expiry after 24 hours, reclaimed by the next upload or relay retention |
 | Retained submission storage | 256 MiB and 1000 submissions |
 | Maintenance sort scratch on disk | 64 MiB per account |
-| Active log plus retained generations | 8 MiB each, 4 retained |
+| Active log plus retained generations (validated; no file sink uses them) | 8 MiB each, 4 retained |
 
 Values are operator-adjustable within implemented compiled maxima. SMTP
 command/path/line limits also obey protocol minimums; the table does not
@@ -1332,10 +1351,11 @@ every combination of account count, body size, backup epoch, live reader,
 history pruning and fence ownership merely because it can be tested. Existing
 fixture measurements remain evidence for their exact inputs; their exclusions
 are limits on claims, not an instruction to implement every excluded case.
-Whole-service memory/fairness evaluation belongs to M23 after functional
-integration, with targeted earlier measurement where a concrete risk warrants
-it. A measured leak, attacker-controlled unbounded growth or broken refusal
-must be fixed when found; deferring performance tuning never excuses those.
+Whole-service memory/fairness evaluation follows functional integration, as
+IMPLEMENTATION.md sequences it, with targeted earlier measurement where a
+concrete risk warrants it. A measured leak, attacker-controlled unbounded
+growth or broken refusal must be fixed when found; deferring performance
+tuning never excuses those.
 
 All network operations have idle and total deadlines; slow progress must not
 reset the total deadline forever. Bound keepalive requests and fairness between
@@ -1344,25 +1364,29 @@ mail reader or health checks. Resolve configured outbound hostnames using a
 bounded std-only DNS adapter with explicit UDP/TCP deadlines and A/AAAA/CNAME
 limits; do not hide uninterruptible resolver work in unbounded threads.
 The PostgreSQL bootstrap/writer endpoint is a separate cold-path exception:
-POSTGRES.md, "Writer endpoint resolution", uses a disposable, deadline-owned system-resolver
+POSTGRES.md, [Writer endpoint resolution](POSTGRES.md#writer-endpoint-resolution), uses a disposable, deadline-owned system-resolver
 process with a five-second cap. A parsed bootstrap can reuse a positive
 answer for one second from lookup start. The child uses the trusted platform
-resolver, which supplies no TTL. Mail-routing DNS uses its own Resolver port.
+resolver, which supplies no TTL. Outbound HTTPS clients, including the
+native ACME worker and replica copying, resolve their fixed origin through
+the same helper. Mail-routing DNS uses its own Resolver port.
 Never perform recipient-MX lookups for outbound mail. Saturation produces SMTP
 temporary failure, HTTP/JMAP limit responses, or bounded retry, as appropriate.
 
-The prepared `dns_wire` layer emits only one recursive IN A or AAAA question
-for an already configured hostname. Its fixed name representation retains
-label boundaries and folds only ASCII letters. Reply-name decoding accepts
-at most 255 expanded bytes, 63 bytes per label and 32 backward compression
-pointers in a packet of at most 65535 bytes. It reports the original field
-extent separately from referenced suffixes. This is structural parsing, not
-proof that a pointer targets a previously parsed name field. Network peer,
-transaction/question matching, answer and CNAME limits, TTL handling, cache
-ownership and UDP/TCP deadlines remain the resolver owner's responsibility;
-the wire helper performs no lookup and supplies no authenticated identity.
+The relay route worker resolves its configured smart host through the
+following layers. The `dns_wire` layer emits only one recursive IN A or
+AAAA question for an already configured hostname. Its fixed name
+representation retains label boundaries and folds only ASCII letters.
+Reply-name decoding accepts at most 255 expanded bytes, 63 bytes per label
+and 32 backward compression pointers in a packet of at most 65535 bytes. It
+reports the original field extent separately from referenced suffixes. This
+is structural parsing, not proof that a pointer targets a previously parsed
+name field. Network peer, transaction/question matching, answer and CNAME
+limits, TTL handling, cache ownership and UDP/TCP deadlines remain the
+resolver owner's responsibility; the wire helper performs no lookup and
+supplies no authenticated identity.
 
-The prepared `dns_reply` decoder matches the response bit, standard opcode,
+The `dns_reply` decoder matches the response bit, standard opcode,
 reserved Z bit, transaction ID and complete single IN A/AAAA question before
 accepting even a truncated-response indication. A nontruncated packet must
 frame exactly, with at most 256 records across all sections. Known IN address
@@ -1387,14 +1411,15 @@ lookup results, never permanent recipient failures. The owner must match the
 network peer, retain the original configured TLS identity and treat TTL zero
 as usable only for the current lookup, without caching it.
 
-The prepared `dns_transport` exchange runs synchronously on the fixed
-resolver worker against a caller-admitted numeric server. A connected UDP
-socket filters the peer; at most 16 datagrams are considered. The configured
-relay and ACME address lookups use classic DNS with a 512-byte UDP limit.
-Each UDP receive allows one extra byte to detect oversized responses. Only a response matching the full question may request TCP
-fallback. Drop UDP before opening one TCP connection to that same endpoint;
-write the length-prefixed query and read exactly one length-prefixed response,
-refusing early EOF, invalid framing and another truncation indication.
+The `dns_transport` exchange runs synchronously on the relay route worker
+against a caller-admitted numeric server. A connected UDP socket filters
+the peer; at most 16 datagrams are considered. Configured relay address
+lookups use classic DNS with a 512-byte UDP limit. Each UDP receive allows
+one extra byte to detect oversized responses. Only a response matching the
+full question may request TCP fallback. Drop UDP before opening one TCP
+connection to that same endpoint; write the length-prefixed query and read
+exactly one length-prefixed response, refusing early EOF, invalid framing
+and another truncation indication.
 
 Every operation shares the original runtime clock, job deadline, work meter
 and remaining CNAME allowance. Blocking socket waits use the earlier job or
@@ -1402,11 +1427,10 @@ meter deadline with a one-second idle cap; partial progress never renews the
 total. Check time before and after I/O and parsing. Standard socket calls
 retain the host-kernel failure boundary, rather than promising recovery from
 an arbitrarily stalled kernel. The caller supplies an unpredictable query ID.
-This exchange does not yet activate the Resolver port, cache, configured-name
-selection or worker admission; those owners must preserve the original TLS
+The lookup and Resolver-port owners below preserve the original TLS
 identity, chain TTL and alias allowance across queries.
 
-The prepared `dns_lookup` owner combines A and AAAA for one caller-admitted
+The `dns_lookup` owner combines A and AAAA for one caller-admitted
 configured host using one to four caller-admitted numeric resolvers. Each
 question tries servers in configuration order with a fresh entropy-sourced
 transaction ID. Transport or server errors may try the next server under the
@@ -1439,23 +1463,24 @@ rule applies to an otherwise valid empty response with an absent, ambiguous
 or unrelated SOA. Malformed RDATA in the selected SOA rejects the response.
 Stage addresses privately and publish the caller prefix only after both
 families complete and the original budget still permits it;
-errors leave caller addresses unchanged. Configured-name admission, worker
-scheduling and cache integration remain separate owners.
+errors leave caller addresses unchanged. Configured-name admission and
+caching belong to the Resolver-port owner.
 
-The prepared `dns_owner::Configured` implements the Resolver port for one
-exclusively owned fixed worker. Construct it from the active configuration's
-outbound and certificate views, a nonzero configuration generation, the shared
-runtime clock, worker-local entropy, the single reserved packet cell and a
-mutable cache owned by the relay worker across delivery attempts. Rebuilding
-the borrowed resolver for another attempt does not reset the cache. It
-admits only the configured relay hostname and optional ACME directory hostname,
-case-insensitively. No raw-host registration API admits incoming names, alias
-targets or arbitrary application destinations. The service owner has two fixed
-endpoint slots; offline migration's separately authorized temporary destination
-is outside this service owner. Constructing the port does not start a worker
-or activate outbound delivery.
+`dns_owner::Configured` implements the Resolver port for one exclusively
+owned fixed worker. The relay connector constructs it for each attempt from
+the active configuration's outbound and certificate views, the profile's
+nonzero TLS-policy generation, the shared runtime clock, worker-local
+entropy, the single reserved packet cell and a mutable cache owned by the
+relay worker across delivery attempts. Rebuilding the borrowed resolver for
+another attempt does not reset the cache. It admits only the configured
+relay hostname and optional ACME directory hostname, case-insensitively.
+No raw-host registration API admits incoming names, alias targets or
+arbitrary application destinations. The service owner has two fixed
+endpoint slots; offline migration's separately authorized temporary
+destination is outside this service owner. The native ACME worker does not
+use this owner; it resolves through the system-resolver helper above.
 
-The cache binding includes configuration generation, canonical configured
+The cache binding includes that generation, canonical configured
 hostnames (including optional ACME presence), and ordered numeric resolver
 endpoints. Any binding change clears both slots. The first binding pins an
 Arc of the runtime clock; a different clock domain is refused before use.
@@ -1468,7 +1493,8 @@ meter under the caller's original deadline and uses the configured resolver
 order. Only a positive result with future combined expiry is inserted. A cache hit that expires before final publication refuses.
 The caller output prefix changes only after the final clock check; errors
 preserve it. Configuration borrows, resolver order and generation stay fixed
-for the owner's lifetime, consistent with restart-only resolver changes.
+for the owner's lifetime; resolver changes take effect only through a
+drain and reload (section 6).
 
 Direct receiving uses separate SPF and DKIM workers. SPF queries derive from
 the SMTP envelope and published policy. DKIM queries TXT at the selector's
@@ -1484,22 +1510,23 @@ response codes before using an answer. A matching FORMERR without OPT
 allows one classic query to the same resolver with a new ID. TCP fallback
 after a matching truncated reply retains the query and original deadline.
 
-The prepared `outbound_dial` helper runs only on the admitted outbound
-handshake worker while its caller retains the sole outbound slot and configured
-endpoint/TLS policy. It tries at most 16 numeric addresses in order, with no
-ambient name lookup. Each attempt uses the earlier original job/meter deadline
-and a two-second connect cap; fallback never renews either budget. Prepay dial
-and socket-setup work before opening a socket, and check time before and after
+The `outbound_dial` helper runs only on the relay route worker while its
+caller retains the sole outbound slot and configured endpoint/TLS policy.
+It tries at most 16 numeric addresses in order, with no ambient name lookup.
+Each attempt uses the earlier original job/meter deadline and a two-second
+connect cap; fallback never renews either budget. Prepay dial and
+socket-setup work before opening a socket, and check time before and after
 connect and conversion to the exclusively owned nonblocking TcpTransport.
 Failure or late completion drops the socket. No per-peer thread or retained
-failed connection is created. Standard blocking connect retains the documented
-host-kernel failure boundary.
+failed connection is created. Standard blocking connect retains the
+documented host-kernel failure boundary.
 
 TCP success grants no TLS identity, credential permission or queue authority.
 The caller retains the configured hostname/policy for the existing TLS handoff,
 which must verify it before SMTP authentication. DNS expiry controls cache
 reuse, not the identity of a connection made from the current lookup. Dialing
-itself does not activate delivery or establish a fresh attempt fence.
+establishes no attempt fence; the connector rechecks native authority before
+dialing and again before credentials (section 4.3).
 
 No design can promise survival of arbitrary dependency panic, kernel OOM kill,
 or storage failure. Do not use catch_unwind as storage recovery. An unexpected
@@ -1509,21 +1536,26 @@ tests cover both orderly shutdown and abrupt termination.
 
 ## 6. Configuration and local administration
 
-Use a documented small line/stanza configuration grammar with versioned schema,
-quoted strings and integer/boolean values. It resembles td's existing service
-files but is not advertised as general TOML. Reject duplicate/unknown keys,
-invalid UTF-8, embedded NUL, conflicting aliases, dangling account references,
-and incompatible listener policies. No includes, environment expansion, shell
-evaluation, arbitrary hooks, or network-loaded configuration.
-[CONFIG.md](CONFIG.md) specifies the implemented bounded syntax and resource
-stanzas, typed local routing, reader completion and identity preimage helpers.
-[SCHEMA.md](SCHEMA.md) specifies the remaining complete operator schema and
-snapshot partitions. Its typed loader, complete candidate validation and
-command wiring remain planned.
+Operator configuration sources use a documented small line/stanza grammar
+with versioned schema, quoted strings and integer/boolean values. It
+resembles td's existing service files but is not advertised as general TOML.
+Reject duplicate/unknown keys, invalid UTF-8, embedded NUL, conflicting
+aliases, dangling account references, and incompatible listener policies. No
+includes, environment expansion, shell evaluation, arbitrary hooks, or
+network-loaded configuration. [CONFIG.md](CONFIG.md) specifies the
+implemented bounded syntax and resource stanzas, typed local routing, reader
+completion and identity preimage helpers. [SCHEMA.md](SCHEMA.md) specifies
+the operator schema and snapshot partitions. `postgres config-import`
+validates every profile of a complete candidate and stores one immutable
+source version in PostgreSQL; `config-check` revalidates a stored version
+and the selection commands activate one (POSTGRES.md, [Configuration import, check and snapshot commands](POSTGRES.md#configuration-import-check-and-snapshot-commands) and [Configuration selection (schema 7)](POSTGRES.md#configuration-selection-schema-7)).
 
-Separate operator configuration (`/etc/td-mta/`) from service-managed data
-(`/var/lib/td-mta/`), runtime control (`/run/td-mta/`), and logs
-(`/var/log/td-mta/`). All paths can be configured absolutely for other distros.
+PostgreSQL holds configuration, mail, credentials, certificates and logs.
+Besides owner tools' explicit state directories, the local filesystem holds
+only the protected connection file, operator source and material files read
+by the import commands, and each instance's private `--runtime` and
+`--scratch` directories. Every path is an explicit command-line argument, so
+any distribution layout can be used.
 Secret values come from protected files, not command-line arguments or logs.
 Check file type, ownership, permissions, and trusted ancestors before use;
 the service does not support a data root with an untrusted concurrent writer.
@@ -1541,9 +1573,11 @@ Current commands use stable JSON output and exit codes:
 | Command | Contract |
 | --- | --- |
 | `postgres config-import`, `postgres config-check`, `postgres config-select` | Validate, store and select database configuration |
-| `serve --connection-file PATH --profile NAME --runtime PATH --scratch PATH` | Foreground PostgreSQL receive/JMAP service |
+| `serve --connection-file PATH --profile NAME --runtime PATH --scratch PATH` | Foreground PostgreSQL receive/JMAP/relay service; `--read-only` serves a replica, `--minimum-retry-seconds` shortens the relay retry floor |
+| `acme`, `acme-status` | Native certificate issuance and inspection ([ACME.md](ACME.md)) |
 | `status --json --runtime PATH` | Selected service lifecycle; `--require-ready` makes its exit code a readiness probe |
 | `stop --runtime PATH` | Request orderly shutdown through the private control socket |
+| `queue-clock-status`, `queue-clock-confirm`, `queue-route-status`, `queue-route-repair`, `logging-status`, `performance-status` | Other private control-socket requests (CONFIG.md, OBSERVABILITY.md) |
 | `postgres device-create`, `postgres device-revoke`, `postgres device-list` | Database credential administration |
 | `postgres schema-init`, `postgres schema-inspect`, `postgres schema-plan`, `postgres schema-upgrade` | Explicit database schema administration |
 | `postgres account-init`, `postgres account-inspect` | Account initialization and inspection |
@@ -1586,9 +1620,25 @@ newly selected configuration, with its listeners, pool sizing, accounts, aliases
 and sending identities, requires a bounded drain and reload. A managed
 certificate renewal updates the running profile's inbound TLS policies in
 place as specified in ACME.md.
+A serving process observes the selected configuration generation, and the
+managed certificate revisions, in a 30-second certificate watcher; this
+includes idle read-only replicas, so activation does not depend on client
+traffic. A definite selection change requests a bounded drain and reload; a
+failed observation retains the current selection. A reload drains the old
+generation before loading the new one, with a brief listener gap, and log
+records carry the effective configuration generation.
 Device revocations are observed from PostgreSQL. Revocation
 is rechecked before a mutation commits; a connection is not permanent authority.
-Reload has bounded coexistence memory and records the effective generation.
+
+Cold profile preparation retains one bounded binding, private identity
+catalog per configured account and a Session per account/allowed-origin pair.
+Authentication selects the account
+before dispatch, and all backends share the process admission limits. Every
+configured account must be bootstrapped before the profile can publish.
+Receiving uses one retained fanout and one shared prepared body. Relay scheduling
+rotates account-scoped leases through one foreground worker and one shared
+queue-clock guard. RESOURCES.md accounts for aggregate startup and relay
+metadata independently of message-body reservations.
 
 ## 7. Identity, passwords, and TLS lifecycle
 
@@ -1612,7 +1662,15 @@ credential portal. A later td image integration must specify provisioning
 under that platform's credential policy rather than a root shell.
 
 ACME runs inside the executable using HTTPS, JWS, and the crypto provider.
-Start with HTTP-01 on port 80; DNS-01 and TLS-ALPN-01 are deferred. The operator
+[ACME.md](ACME.md) owns the native single-endpoint HTTP-01 worker, its
+supported CA subset, persistence bounds, renewal scheduling and operational
+commands. DNS-01 and TLS-ALPN-01 are unsupported. The worker starts
+independently of selected mail profiles, so initial issuance can run before
+a usable certificate exists; mail profile import/activation still requires
+a valid certificate. The native worker owns the declared HTTP-01 listener.
+Mail services publish a verified managed certificate generation to their
+existing listeners. Explicit external certificate inputs remain supported.
+No Certbot subprocess or dependency is introduced. The operator
 controls the deployment host's ports and DNS; this development host is not
 configured as the mail server. Certificate identifiers include the MX/JMAP
 hostname, configured gateway listener names selected for ACME, and enabled
@@ -1620,7 +1678,8 @@ MTA-STS policy hostnames, not automatically every alias. ACME-managed gateway
 names require reachable HTTP-01 validation; private names use provisioned
 certificates rather than starting an order that cannot be validated.
 
-Persist the ACME account key and resumable order state privately. Bound
+Persist the ACME account key and resumable order state privately in
+PostgreSQL. Bound
 directory/nonces/order responses and certificate chain sizes. Validate nonce,
 URL, challenge, CSR, key, identifier set, and returned chain. JWS/CSR encoding
 is bounded std code; signing/key generation is provider code. CA endpoints
@@ -1659,9 +1718,31 @@ header evidence does not detect later corruption in an unrequested body tail
 and grants no body pin. Qualified stored search fields likewise answer
 searches without current body verification, under the digest/version and
 fallback contract in POSTGRES.md. Body projections, previews and downloads
-retain their documented current-byte verification. POSTGRES.md, "Worker-local verified header projections", owns cache admission and lifetime; its persistent
-summary section owns digest/version binding, publication and rebuilding.
+retain their documented current-byte verification. POSTGRES.md, [Worker-local verified header projections](POSTGRES.md#worker-local-verified-header-projections), owns cache admission and lifetime; its persistent summary section owns
+digest/version binding, publication and rebuilding.
 
+PostgreSQL body verification uses td-crypto's opaque `BulkSha256` operation
+to accelerate complete-body hashing on the storage worker. It retains one
+native digest context per active verification and updates it with each existing
+64 KiB chunk. Full length, ordinal and digest checks precede ordinary verified pins;
+qualified selective projections use the separate chunk-verifying pin below.
+The allocation-free digest factory remains available to other operations.
+POSTGRES.md owns the snapshot and deadline contract.
+
+Persistent MIME interpretation reuses publication-derived tree descriptors,
+as specified in POSTGRES.md, with current entity-header rechecks. Qualified
+body-bearing Email/get verifies only requested chunks against the manifest
+before exposing their bytes; it does not claim integrity of unrequested
+chunks. The private chunk-verified pin is distinct from the full-body path
+used by raw downloads and audits. Publication and
+owner backfill use the shared MIME parser under fixed versioned limits; absent
+or incompatible evidence retains the existing verified traversal. Original
+message bytes and mutable authorization remain authoritative.
+
+Owner-side periodic integrity scrubbing verifies complete bodies in bounded
+read-only pages, separately from interactive reads. POSTGRES.md owns its
+snapshot, progress and failure contract; DEPLOYMENT.md owns explicit schedule
+activation. It never repairs mail or enables itself during serving.
 
 [STORAGE.md](STORAGE.md) owns process-local locks and disposable response
 files. No local mail database, body directory, backup command or migration
@@ -1686,11 +1767,8 @@ transaction. A delivery job owns its connection authorization adapter,
 so a worker can construct it and transfer the job without borrowing that
 worker's stack. Borrowed adapters remain supported through the same
 interface. Publication still acquires a fresh policy guard; retaining
-the adapter does not retain permission. Tests between workers verify
-durable publication and refusal after revocation. Transcript fixtures
-connect actual outcomes to the session and verify reopened mail. The
-receiving network driver additionally exercises real local TCP delivery
-and reopened storage. The direct receiving runtime described below
+the adapter does not retain permission.
+The direct receiving runtime described below
 connects these adapters with fixed workers on caller-bound listeners.
 The `serve` command activates direct receiving for receive profiles. The engine binds
 routing for its lifetime, accepts only configured recipients, retains accepted
@@ -1711,10 +1789,10 @@ preserves malformed body boundaries, and MessageIds source extents retain
 only the bounded policy lookback.
 Framing, message-size and streaming-write failures during
 DATA close the connection, so the remaining stream cannot become
-commands. The runtime must flush a close reply and use bounded transport
-draining so unread DATA is discarded before closing where the shutdown
-bounds permit; drained bytes never reenter the parser. The session does
-not implement this shutdown.
+commands. The receiving runtime, not the session engine, flushes a close
+reply and uses bounded transport draining so unread DATA is discarded
+before closing where the shutdown bounds permit; drained bytes never
+reenter the parser.
 The `smtp_network` owner performs one bounded transport or parser turn
 per call. It distinguishes progress from a socket wait, retains unread
 input across worker handoffs, tracks partial reply writes, and advances
@@ -1740,9 +1818,12 @@ The `smtp_receiving` runtime accepts caller-bound IPv4 and IPv6-only direct list
 and retains one immutable routing/TLS configuration snapshot. It verifies
 the actual local socket address and complete TLS listener binding,
 including listener limits, greeting/trace compatibility and ingress spool
-capacity, and checks the account's single Inbox before readiness. It does
-not serve the configuration's HTTPS listener, enable gateway receiving
-or implement hot reload. A connection-specific direct
+capacity, and checks the account's single Inbox before readiness. It serves
+only direct SMTP listeners; the `https` driver serves HTTPS in the same
+process (section 10), and gateway listeners are refused (section 4.2). A
+newly selected configuration drains this runtime and starts a new one
+(section 6); a managed certificate renewal replaces its TLS policies in
+place (ACME.md). A connection-specific direct
 adapter binds the real socket peer and actual negotiated TLS version;
 plaintext and TLS direct SMTP grant no remote identity authentication.
 The runtime checks each bound direct certificate chain's admitted UTC
@@ -1880,10 +1961,8 @@ TLS handshake authorized by its retained policy returns the session and
 its TLS transport for further SMTP. Failure or cancellation closes the
 connection and releases native state and handshake capacity on the
 worker; there is no plaintext fallback. Borrowed wire buffers are
-released and owned buffers are freed on refusal. A local real-TLS
-fixture exercises post-handshake EHLO reset and encrypted commands;
-the fixed receiving workers and `serve` with a receive role activate
-that path.
+released and owned buffers are freed on refusal. The fixed receiving
+workers run this path for receive profiles.
 
 Implement a bounded SMTP state machine with EHLO/HELO, MAIL, RCPT, DATA, RSET,
 NOOP, QUIT, SIZE, 8BITMIME, STARTTLS, and enhanced status codes. Advertise
@@ -1951,66 +2030,56 @@ downloadable; raw storage does not depend on rendering success. Pathological
 messages hitting processing limits expose a typed error without killing the
 service or hiding an accepted raw message. POLICY.md defines decoding,
 charsets, opaque-message access and property behavior; CASES.md names their
-independent fixtures. Their implementation still gates the Mail capability.
+independent fixtures. CONFORMANCE.md records the qualified td-mail subset.
 
-The first transfer-decoding primitive implements the frozen base64 octets
-using fixed inline state and caller buffers. It charges source/output work,
-yields after bounded transitions and preserves malformed-input diagnostics.
-It supplies no MIME structure, nested-source ownership, charset conversion
-or protocol projection yet.
+### 9.1 MIME interpretation primitives
 
-A bounded transfer-input owner now connects identity/base64 decoding to a
-borrowed immutable body reader and a checked encoded extent. It reuses one
-source partition and brackets refill/decode turns with clock and work
-checks. It retains the source pin and supports QP rewind and replay.
-Optional exclusive stage checkpoint storage supports charged save/restore of
-the same source, without copying ring bytes or resetting the clock/work
-state. Part authorization, nested source ownership and MIME structure remain
-separate.
+API.md sections 1.12 through 1.21 specify the transfer, header and charset
+primitives that JMAP reads, previews, search and part downloads compose.
+Each uses fixed inline state and caller buffers, charges source and output
+work against the original meter, yields after bounded transitions and
+preserves malformed-input diagnostics.
 
-The raw header scanner emits bounded name/value source extents, preserves
-folded bytes, and identifies the body boundary under the file parsing policy.
-It enforces the supplied header allowance and charges bounded work without
-allocating per-field strings. Source retention, aggregate MIME admission and
-header normalization remain with later integration.
-
-The bounded charset decoder covers the policy's four charset families with
-fixed state across source fragments. It preserves valid scalars and reports
-replacement diagnostics. A bounded body prescan supplies the frozen
-absent/ASCII-label UTF-8 heuristic and unknown-label fallback; the owner
-replays the same immutable transfer-decoded source for final decoding. Header
-filtering, NFC and JSON projection remain separate.
-
-A fixed-state unfolding primitive removes accepted line endings only before
-space or tab, retaining the whitespace and every nonfold octet. It supports
-fragmentation and output backpressure within the 32 KiB conversion region;
-form-specific text processing and protocol integration remain separate.
-
-The resident Raw header cursor composes UTF-8 replacement with NUL removal
-and I-JSON noncharacter replacement, preserving folds and original text.
-It streams scalars from the existing header arena, with charged work and no
-owned strings. Header selection, source collection and JSON/JMAP output
-remain separate.
-
-The transfer-to-charset owner retains one authorized immutable body borrow
-through prescan, checkpoint rewind and final scalar decoding. Both passes
-share charged work and a monotonic clock watermark, preserving diagnostics
-and retirement. It stages one byte within fixed state; body-value projection
-and protocol output remain separate.
-
-A fixed quoted-printable cursor now implements the stable transfer policy
-with explicit source-position rewind requests. It scans and replays long
-whitespace runs using fixed state, with charged lookahead and bounded turns.
-The transfer reader binds those requests to its immutable raw extent, reuses
-resident input or refills from the exact run start. Caller checkpoints
-retain QP scan/replay state, and charset prescan uses the same owned source.
-Nested decoded-source checkpoint integration remains separate.
-
-The plain body-value filter converts CRLF, replaces noncharacters for I-JSON
-and applies a UTF-8 scalar-boundary byte cap with fixed pending state. It keeps
-validating the remaining scalars after truncation so trailing diagnostics are
-retained. HTML truncation, response serialization and JMAP integration remain
-separate.
+- The base64 decoder implements the frozen base64 octets.
+- The transfer-input owner connects identity, base64 and quoted-printable
+  decoding to a borrowed immutable body reader and a checked encoded extent.
+  It reuses one source partition, brackets refill/decode turns with clock
+  and work checks and retains the source pin. Optional exclusive stage
+  checkpoint storage supports charged save/restore of the same source,
+  without copying ring bytes or resetting the clock/work state. It is one
+  raw-source stage: decoded sources are not chained, and POLICY.md refuses
+  embedded messages under a transfer encoding.
+- The quoted-printable cursor implements the stable transfer policy with
+  explicit source-position rewind requests. It scans and replays long
+  whitespace runs using fixed state, with charged lookahead and bounded
+  turns. The transfer reader binds those requests to its immutable raw
+  extent, reuses resident input or refills from the exact run start. Caller
+  checkpoints retain QP scan/replay state, and charset prescan uses the same
+  owned source.
+- The raw header scanner emits bounded name/value source extents, preserves
+  folded bytes, and identifies the body boundary under the file parsing
+  policy. It enforces the supplied header allowance and charges bounded work
+  without allocating per-field strings.
+- The unfolding primitive removes accepted line endings only before space
+  or tab, retaining the whitespace and every nonfold octet. It supports
+  fragmentation and output backpressure within the 32 KiB conversion region.
+- The resident Raw header cursor composes UTF-8 replacement with NUL removal
+  and I-JSON noncharacter replacement, preserving folds and original text.
+  It streams scalars from the existing header arena, with charged work and
+  no owned strings.
+- The charset decoder covers the policy's four charset families with fixed
+  state across source fragments. It preserves valid scalars and reports
+  replacement diagnostics. A bounded body prescan supplies the frozen
+  absent/ASCII-label UTF-8 heuristic and unknown-label fallback.
+- The transfer-to-charset owner retains one authorized immutable body borrow
+  through prescan, checkpoint rewind and final scalar decoding, replaying the
+  same transfer-decoded source. Both passes share charged work and a
+  monotonic clock watermark, preserving diagnostics and retirement. It
+  stages one byte within fixed state.
+- The plain body-value filter converts CRLF, replaces noncharacters for
+  I-JSON and applies a UTF-8 scalar-boundary byte cap with fixed pending
+  state. It keeps validating the remaining scalars after truncation so
+  trailing diagnostics are retained.
 
 JMAP preview, body-value serialization and text search may group at most 64
 existing scalar decoder turns between native snapshot checks. Every child turn
@@ -2040,13 +2109,7 @@ probes without extending snapshot authority.
 
 ## 10. HTTP and JMAP
 
-Typed `/get` ID planning preserves first-request order and counts every
-input toward the method limit, including duplicates. Local IDs use a
-separate sorted lookup of their 16-byte storage keys; its allocation fits
-the existing per-object scratch reservation. Admission is checked before
-each bounded lookup and insertion. Foreign IDs retain decoded-string
-comparison and admission checks between comparisons, so escaped spellings
-of the same unknown ID still produce one `notFound` entry.
+### 10.1 HTTP framing and connections
 
 The `http_request` module implements transport-independent HTTP/1.1 request
 framing. Its head storage may be borrowed or owned; the HTTPS runtime uses
@@ -2082,12 +2145,10 @@ connection/request counts and scheduling. Routes match the raw target; only
 validated endpoint components may be decoded, never used as arbitrary
 filesystem paths. It must authorize and admit body storage before sending
 100 Continue, check decoder completion before publication, and close on
-framing failure. The current HTTPS runtime serves authenticated uploads, raw
+framing failure. The HTTPS runtime serves authenticated uploads, raw
 downloads, the Core API and EventSource with these bounds. Authenticated
-discovery advertises Core and the td-mail Mail profile. Device persistence
-and local administration are implemented under section 7. Framing tests
-cover split input, pipelined tails, binary bodies, output backpressure,
-smuggling patterns and exact/refused limits without a network listener.
+discovery advertises the Session of section 10.4. Device administration
+follows section 7.
 
 This profile accepts origin-form and absolute-form request targets; absolute
 URI authority controls routing even when Host differs, as RFC 9112 section
@@ -2098,14 +2159,13 @@ Bracketed IPv6 Host values reject zone identifiers. Chunk extensions accept
 grammar-defined whitespace around semicolons and equals signs, but refuse
 standalone trailing whitespace before CRLF. Malformed request-line syntax is
 distinct from a well-formed unsupported HTTP version. Browser compatibility
-and Mail capability conformance remain unclaimed. These fixed parser caps
-are independent of the proposed slot partitions in RESOURCES and ADMISSION.
-The current HTTPS runtime uses the configured connection count and shared
+and full RFC 8621 conformance remain unclaimed. These fixed parser caps
+are independent of the slot partitions in RESOURCES.md and ADMISSION.md.
+The HTTPS runtime uses the configured connection count and shared
 handshake cap; RESOURCES.md records its concrete buffers. Whole-service
-memory measurement remains section-5/M23 work; the existing Limits::plan
-arithmetic is unchanged.
+memory measurement follows section 5.
 
-`serve --mailbox-access` runs the receiver plus the `https` driver over
+`serve` with a JMAP role runs the `https` driver beside any receiver over
 IPv4 or IPv6-only listeners. The binary's confined `listener_sys` adapter
 sets IPV6_V6ONLY before bind, independent of kernel defaults, and both safe
 protocol adapters verify that option for IPv6 caller-bound sockets. Separate
@@ -2174,13 +2234,11 @@ authorization. Other refusals need not consume the body. When retiring a
 connection, apply RESOURCES.md's bounded write-half closure. Refusals may
 drain bounded unread data; successful uploads and downloads do not drain.
 Connection slots remain charged until retired.
-Authenticated GET /.well-known/jmap returns Core and Mail Session
-metadata; unknown targets get 404. Submission remains unadvertised.
+Authenticated GET /.well-known/jmap returns the Session of section 10.4;
+unknown targets get 404.
 Non-POST upload methods get 405 with Allow: POST. Missing, invalid and revoked
 credentials receive the same 401 Basic challenge. No credential enters error
-output. A failed local credential publication
-marks the service failed and initiates orderly shutdown; restart must recover
-a healthy registry before serving again.
+output.
 
 TLS completes before HTTP parsing. The configured origin certificate's
 window is checked before readiness and every network scan; its failure stops
@@ -2198,8 +2256,8 @@ principal and allowed request origin select the request backend;
 caller-supplied account IDs do not.
 Session discovery exposes only that account. Each request observes current
 revocation state.
-Upload publication acquires a fresh commit-time authorization guard; future
-mutations must do the same.
+Upload publication and every other mutation acquire fresh commit-time
+authorization.
 
 A profile's HTTPS listeners share its configured connection pool. When it has at
 least two slots, each network peer can occupy at most the smaller of
@@ -2238,8 +2296,7 @@ snapshot and exchange deadline; storage owns account/device access. Filename
 and media template values are decoded once and cannot inject response
 headers. Pre-output errors return an HTTP refusal; after output starts an
 error retires the connection. ADMISSION.md owns exact bounds and status
-mapping. Other methods return 405 with Allow: GET. Discovery is authenticated
-and exposes the supported td-mail read profile.
+mapping. Other methods return 405 with Allow: GET.
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,
 and downloads. Reject conflicting Content-Length/Transfer-Encoding, ambiguous
@@ -2248,6 +2305,16 @@ patterns. Bound headers independently of bodies. Stream chunked/content-length
 uploads and downloads. No request compression, arbitrary proxy routing, or
 cross-origin browser access by default. Protocol errors terminate the connection
 when its framing cannot be trusted.
+
+### 10.2 JMAP profile and methods
+
+Typed `/get` ID planning preserves first-request order and counts every
+input toward the method limit, including duplicates. Local IDs use a
+separate sorted lookup of their 16-byte storage keys; its allocation fits
+the existing per-object scratch reservation. Admission is checked before
+each bounded lookup and insertion. Foreign IDs retain decoded-string
+comparison and admission checks between comparisons, so escaped spellings
+of the same unknown ID still produce one `notFound` entry.
 
 RFC 8620 and RFC 8621 define wire semantics. Maintain a capability/method/property
 coverage table with normative section references and local acceptance fixtures.
@@ -2267,15 +2334,14 @@ object property or a validated selection, with caller-supplied account rights
 and same-view batch counts. API.md owns its snapshot, provisional-output and
 fixed-buffer contract. The retained dispatcher implements Mailbox/get,
 including result references, bounded enumeration and same-view counts. The
-live HTTPS capability preflight admits Core and Mail for the supported
-td-mail read flow qualified in CONFORMANCE.md.
+live HTTPS capability preflight admits the capabilities the Session advertises
+(section 10.4) for the td-mail flows qualified in CONFORMANCE.md.
 
 The retained Mailbox/changes dispatcher validates scoped state and exact
 UnsignedInt limits, consumes one retained change-page cursor and encodes
 transaction-aligned changes under the original request work and deadline.
 It keeps the read view through final publication and emits null
 updatedProperties because history does not track per-field changes.
-This method remains behind admitted Mail opt-in, including live requests.
 
 The retained change-page cursor coalesces typed object history into bounded
 transaction-aligned pages. API.md owns its token scope, limit, snapshot and
@@ -2285,8 +2351,7 @@ separate from this passive cursor.
 The passive thread member reader returns bounded received-date windows
 from one retained snapshot without an SQL sort or account-sized collection.
 API.md and STORAGE.md own the fixed-memory and repeated-scan tradeoff.
-The storage reader itself performs no method dispatch; Mail advertisement
-remains separate.
+The storage reader itself performs no method dispatch.
 
 Retained Thread/get handles explicit IDs or bounded all-thread enumeration
 and streams received-date member
@@ -2295,7 +2360,7 @@ contract is in API.md; CONFORMANCE.md qualifies its live td-mail read path.
 
 Retained Thread/changes shares the checked changes encoder with Mailbox,
 selecting Thread state and wire IDs and omitting Mailbox-only fields.
-API.md owns this contract; the live read profile requires Mail opt-in.
+API.md owns this contract.
 
 The compatibility baseline includes the current td-mail JMAP implementation,
 particularly its existing sending flow:
@@ -2311,11 +2376,10 @@ particularly its existing sending flow:
   used to reconcile a lost sending response. Preserve message IDs and filing
   metadata used in the client's subsequent reconciliation.
 
-The repository baseline was inspected at
-`248054be6` (including td-mail sending commit `c2c343bf3`). Implementers recheck
-current client calls before freezing the wire fixtures. Existing td-mail mock
-tests remain unit/integration coverage, but v1 additionally runs the real client
-against the real service through its actual td-fetch transport.
+CONFORMANCE.md's td-mail call inventory tracks the client's current calls.
+Existing td-mail mock tests remain unit/integration coverage, but v1
+additionally runs the real client against the real service through its
+actual td-fetch transport.
 
 JMAP changes, state preconditions, partial set results, creation/result
 references, and account isolation must be explicit. A multi-method request is
@@ -2324,11 +2388,13 @@ later methods fail. Thread assignment is deterministic and persisted using
 Message-ID, References and In-Reply-To; duplicate or cyclic headers cannot
 merge accounts or cause unbounded work. An existing Email's threadId is
 immutable. New arrivals may join one existing thread, but never merge or
-renumber existing Email threadIds. STORAGE section 3 owns authoritative lookup
-and deterministic conflict rules; M02 freezes their byte encodings/fixtures.
+renumber existing Email threadIds. POSTGRES.md owns authoritative anchor
+lookup and deterministic conflict rules; FORMAT.md fixes their encodings.
+
+### 10.3 Search
 
 Text search streams decoded searchable data with bounded working memory and
-uses disk indexes for candidate selection where available. Queries have stable
+uses SQL indexes for candidate selection where available. Queries have stable
 ordering with an ID tie-break and a committed snapshot. Do not silently truncate
 results or report an exact total before computing it. Exhausted work/time
 budgets return the appropriate explicit error; attachment binary contents are
@@ -2363,11 +2429,242 @@ parser and completes every supported source before publishing evidence;
 partial traversal cannot become an empty result. Matching preserves field
 boundaries and charges bounded batches against the original method meter.
 POSTGRES.md owns the cache, owner rebuilding and fallback rules. New arrivals
-currently use uncached interpretation until an owner rebuild prepares them.
+use uncached interpretation until explicit or scheduled owner preparation.
 Schema 40 can narrow that scan using pg_trgm over a stored candidate
 projection, followed by the same field matcher. Missing indexed evidence
 retains bounded fallback. POSTGRES.md owns index qualification, negative
 metadata trust, extension setup and upgrade/restore requirements.
+
+### 10.4 Session and mail writes
+
+Authenticated discovery returns one Session per account and allowed origin.
+It advertises Core, Mail, td's replication and partial-search extensions
+and, unless the instance serves `--read-only`, Submission. The Core API
+runs on the bounded HTTPS body worker.
+ADMISSION.md owns its request/response lifetime and quota contract; STORAGE.md
+owns the request-spool lock and cold cleanup. Mail reads, read/star
+assignments, mailbox moves, Email creation and deletion, and root-folder
+creation and empty-folder deletion are exposed for td-mail. The account permits those writes; POLICY.md
+specifies its Mailbox rights.
+CONFORMANCE.md records the client/TLS evidence. For an EventSource stream the
+authentication worker observes the authorized account's state in a bounded
+database transaction. The network thread sends a passive snapshot. Idle
+streams hold a connection slot and release the database view between samples.
+
+Authenticated HTTPS Email/set accepts td-mail keyword patches for `$seen`
+and `$flagged` and single-destination mailbox replacement, with matching
+Session and Mailbox rights. Memberships, flags and corresponding
+Email/Mailbox history commit together in one bounded, device-authorized
+PostgreSQL transaction, and known commit outcomes survive later accounting
+refusal. Pure Email/set destruction removes messages and last-owner bodies.
+Structured Email creation follows section 10.5.
+
+Authenticated Mailbox/set accepts the root-folder name-only create objects
+td-mail emits. The PostgreSQL creation transaction (POSTGRES.md, [Root-folder creation](POSTGRES.md#root-folder-creation))
+owns validation, uniqueness, IDs, authorization and commit outcomes. The
+adapter prepays the entire response before calling it, preserves
+per-object refusals and exposes mayCreateTopLevelMailbox except on
+read-only replicas. Singleton deletion uses the same transaction family
+(POSTGRES.md, [Empty folder deletion](POSTGRES.md#empty-folder-deletion)) and deletes only empty roleless
+leaves, with one Mailbox tombstone and sequence increment. Role, child and
+membership refusals leave state unchanged. The endpoint advertises
+mayDelete for roleless folders and confirms only known commits. Hierarchy
+creation, rename and role mutation are refused; POLICY.md owns the request
+restrictions.
+
+### 10.5 Structured draft creation
+
+Authenticated Mail dispatch accepts td-mail's singleton literal Email/set
+creation shape through `draft_input`, `compose_text` and PostgreSQL draft
+publication (POSTGRES.md, [Plain-text draft creation](POSTGRES.md#plain-text-draft-creation) and [Draft attachments](POSTGRES.md#draft-attachments)). It refuses nonempty
+mixed create/update/destroy calls, multiple creations and resolved
+`#create` arguments in this profile. Existing flag, move and destruction
+calls retain their own paths. Account and scoped ifInState checks precede
+creation; publication rechecks conditional state and fresh device authority.
+
+The `draft_input` decoder borrows text from the already parsed request and
+retains only bounded address, identifier and attachment descriptor vectors.
+It accepts td-mail's single From, optional recipient/reply lists, Subject,
+Message-ID, whole-second UTC sentAt in years 1900 through 9999 with seconds
+00 through 59, one `text`/`text/plain` body part, complete untruncated body
+value, one local-form mailbox ID, exactly `$draft` plus `$seen`, and at
+most 64 attachments. Each attachment names a local blob ID, a nonempty name
+of at most 255 bytes, a type of at most 127 bytes, the `attachment`
+disposition and optionally a `header:Content-Description:asText` of at
+most 1024 bytes, none containing control characters. HTML, preview and
+other creation fields are refused. Message header syntax and MIME
+composition remain `compose_text` work; decoding confers no authorization
+or storage.
+
+Each descriptor list has the composer's 1000-entry bound. The admitted JSON
+byte ceiling also bounds aggregate decoded strings. Text validation is paid
+from the original work meter before UTF-8 scanning, with fresh monotonic
+and phase checks before and after; each input member spends a record. A
+shorter execution deadline never renews the meter.
+
+The `compose_text` composer writes td-mail's structured creation fields into
+caller-owned private output. It writes ASCII MIME headers, UTF-8 encoded
+display words, validated ASCII mailboxes and single strict Message-IDs.
+Generated IDs admit visible ASCII only, forbid escapes and quoted local
+parts, and retain the shared parser's dot-atom or non-folding domain-literal
+grammar. Reply-ID lists retain order. Each identifier occupies
+one continuation line and is limited to 995 bytes; address and identifier
+lists have a 1000-item ceiling. Caller-supplied Date and Message-ID are not
+regenerated. Date is whole-second UTC in the supported 1900..9999 range.
+The stored copy retains Bcc. With attachments the composer emits
+multipart/mixed around the text part; POSTGRES.md, [Draft attachments](POSTGRES.md#draft-attachments), owns attachment
+encoding and source rules. The composer prepares no relay copy, authorizes
+no account and creates no Email.
+
+Text preserves its UTF-8 bytes, canonicalizing CRLF, bare CR and bare LF to
+CRLF before bounded base64 encoding. The worker counts that extent first,
+then streams it using fixed scratch, the original work meter and freshly
+sampled monotonic time between bounded turns. Each 1024-byte newline
+conversion buffer prepays up to 1025 input bytes for CRLF lookahead,
+forfeiting unused credit. It rejects clock regression.
+Validation, encoding and sink publication spend separately; no replay
+renews the meter. A caller-supplied total encoded-byte ceiling is enforced
+before each sink write. Any failure leaves only provisional bytes: the
+caller must discard its output and publish nothing. Success requires a
+fresh final budget/deadline check. Durable quota admission and the
+PostgreSQL transaction belong to draft publication.
+
+Draft publication composes outside the database transaction into one
+buffer of at most the selected message ceiling (32 MiB), under the original
+request work meter and deadline. It then atomically publishes its Blob,
+JMAP-origin Email, one existing mailbox membership, `$draft` and `$seen`,
+thread anchor, quota counters, receipt and Email/Thread/Mailbox history.
+It authorizes the device at admission and again in the publication
+transaction; no transaction spans composition. Attachment sources are read
+through the verified blob reader under the selected account and current
+device, and publication rechecks each source.
+
+Publication rechecks the policy generation, account epoch, optional state
+precondition and mailbox. References, In-Reply-To and the supplied Message-ID
+select an existing immutable thread using the existing last-32 nearest-first
+rule; otherwise entropy supplies a new thread. Supplied visible metadata is
+validated by composition before it becomes an anchor. Bcc stays in the stored
+copy. Known commit outcomes are preserved; an unknown COMMIT retains the exact
+draft receipt for inspection, and failure before commit rolls back bodies,
+metadata, usage and receipt together. The API caller must reserve its full
+response before entry. One draft owner per process admits a draft without
+waiting: owner contention, an unsettled uncertain draft, exhausted read slots
+and account quota refuse as Busy, and a retained uncertain COMMIT blocks the
+next draft until inline settlement (POSTGRES.md, [Uncertain HTTP writes and
+inline settlement](POSTGRES.md#uncertain-http-writes-and-inline-settlement)).
+
+New draft Email and Thread IDs must be absent from live rows and retained
+change history. The format-compatible history check walks the existing
+account/kind sequence index once, paying each examined row from the
+original work meter; exhausted work refuses creation. This is linear in
+retained kind history, not an ID-point lookup. Pruned history is outside
+this collision claim, matching QUEUE.md's random-ID policy. Composition
+enforces a shorter execution-phase deadline without renewing its meter.
+
+The dispatcher materializes and prepays the complete bounded result before
+calling the body-worker adapter. Input refusal returns notCreated with
+invalidProperties and a known field where available. Ambiguous native Invalid
+or NotFound errors return per-object serverFail, never a guessed bad property;
+this can conservatively include a composition or missing-mailbox refusal.
+Native message-size Quota returns tooLarge, distinct from work capacity and
+logical account quota admission. Success returns Email, Blob and Thread IDs,
+size and the native before/after Email state. An indeterminate commit
+becomes serverPartialFail. An outer deadline or failed physical response
+write can still lose the response and never makes creation safe to replay.
+
+The original parsed arena supplies borrowed body text, while retained
+arguments still enforce ordinary argument validation and result-reference
+resolution. No second JSON tree is created. Draft creation authorizes no
+sending identity and takes no responsibility for delivery; its creation ID
+is recorded for EmailSubmission/set (sections 10.6 and 11.1).
+
+### 10.6 Request-local creation map
+
+Authenticated Email and Mailbox creation retain successful creation IDs in
+one bounded request-local overlay. The original request arena retains the
+initial createdIds map. A reused key points to the latest successful creation
+across both types; refused and indeterminate creations preserve its previous
+mapping. The final encoder merges the sorted overlay with the original map
+in linear order, skipping empty reservations. It includes createdIds only
+when the request supplied it, including an empty object.
+
+ADMISSION.md's active-profile exception owns the aggregate overlay bound and
+resident-storage contract. Before creation, the dispatcher reserves each new
+slot and conservative response growth from its remaining allowance. Lookup
+uses a bounded binary index and the original meter under fresh admission.
+Known publication copies a bounded ID into the prepared stable slot without
+allocating or searching. Initial mappings need no second allocation or
+quadratic seed scan. Counting and output stream one bounded pair per turn.
+EmailSubmission/set resolves a `#key` creation reference through this overlay,
+falling back to the request's supplied `createdIds`.
+
+### 10.7 HTTPS authentication and body workers
+
+HTTPS origin checks and bounded attempt admission remain on the network
+reactor. Credential decoding and verifier lookup run on one fixed
+`https-auth` worker through `http_auth::Authenticator`. Pending work occupies
+only existing bounded connection slots; no task or connection is spawned per
+authentication. Busy retries keep the same attempt charge and original
+absolute/header/idle deadline. The worker checks monotonic time before and
+after lookup; an expired or regressed result cannot enter routing.
+
+Decoded credentials remain in the bounded client owner, with zero-on-drop
+storage, for the request's later fresh body/method authorization. Ordinary
+responses and EventSource clear them with the original credential head
+before output; other client retirement also clears them. A successful
+device ID is only the initial observation; mutations and body admission keep
+their existing fresh authorization boundaries. The PostgreSQL verifier owns
+the database-backed device check. The backend contract requires bounded
+completion under the supplied deadline. Service shutdown joins the verifier
+along with the existing workers; database lookup must never run on the
+network reactor. The fixed PostgreSQL verifier retains one finite session
+across jobs. It qualifies the complete schema and runtime role once at
+connection admission, holding the shared migration lock until that session
+closes. Schema and role administration stops serving instances first. Each
+job checks epoch, maintenance, configuration and device in a fresh
+transaction, and acknowledges rollback before returning success or a
+wrong-password refusal. Idle sessions retain no transaction or account
+authority. PostgreSQL still enforces each statement's privileges.
+POSTGRES.md owns the session's lifetime, cumulative protocol allowances,
+thread ownership, retirement and pre-submission recovery. The same
+authentication worker runs throttled local idle maintenance outside
+client-slot locks and closes retained resources before thread exit,
+including early failure paths. Neither hook performs authentication queries
+or starts a new task. Maintenance Busy defers cleanup to the next throttled
+turn without stopping HTTPS; other maintenance errors still stop serving.
+Clean completed sessions have a separate bounded termination allowance;
+request deadlines, TLS lifetime and failed-job bounds are unchanged.
+
+Each bounded HTTPS body worker may retain one worker-local backend cache
+for its last account and origin. API reads and download authorization use
+alternative cache variants; changing account or origin, or handling an
+upload, discards that context on the owning thread. It never lives on the
+network reactor or in an account-sized cache. The native PostgreSQL context
+owns one existing read permit, establishes fresh authority in a new
+transaction for every job, and rolls back before response output. Download
+body verification and replay keep one fresh snapshot, while a retained
+connection performs fresh authorization in a separate transaction after
+verification and before response bytes. Bounded HTTP input/output turns
+also retire expired idle sessions locally, without SQL or a background task.
+POSTGRES.md, [Retained HTTPS API read sessions](POSTGRES.md#retained-https-api-read-sessions), owns its finite session, protocol and cleanup bounds;
+POSTGRES.md owns the download authority and retirement rules and
+RESOURCES.md the active connection count. Mutations retain their existing
+separate publication and uncertain-COMMIT paths.
+
+### 10.8 Private Unix JMAP
+
+A `local_jmap` listener serves the existing authenticated HTTP/JMAP engine
+through a current-user mode-0600 pathname socket in a mode-0700 directory.
+It does not open a TCP listener, manufacture TLS verification, or require a
+certificate. CONFIG.md and SCHEMA.md own declaration and lifetime exclusion.
+Its fixed logical origin is `http://localhost`; network JMAP continues to
+require HTTPS. A private profile owns its connection pool and authentication
+worker. Local peers share that profile's bounded sign-in budget. Connections
+and sign-in attempts on a public HTTPS profile consume its own limits.
+All account authorization, durable-write, body integrity and read-only
+replica rules are unchanged. The transport choice does not select replica
+mode or grant write authority. Clients must explicitly bind this logical
+origin to the configured private socket, without DNS or TCP fallback.
 
 ## 11. Submission and retry semantics
 
@@ -2423,7 +2720,8 @@ doubles at most four times, capped hourly, with
 jitter, and expires after five days. V1 ignores free-text server retry hints.
 Persist UTC scheduling data; use monotonic time within a running attempt and
 bound catch-up after clock changes/restart. No sleeping thread per queue item.
-Use a disk due-time index and fixed queue window, not an in-memory full queue.
+Read due work through PostgreSQL due-time order in bounded 64-candidate pages,
+not an in-memory full queue.
 
 A disconnect after the DATA terminator, or a crash after remote acceptance but
 before its durable local record, leaves an uncertain outcome. Preserve the same
@@ -2444,13 +2742,140 @@ never send unsolicited error mail to an unverified inbound reverse path.
 If failure notification cannot be committed, retain a pending notification
 record and retry locally. Retention then reclaims the record and its data.
 
+### 11.1 JMAP submission requests
+
+EmailSubmission/set accepts either one creation or a cancellation update,
+never both. A creation names an existing Email or resolves a `#key` creation
+reference through the request-local overlay or the supplied `createdIds`
+(section 10.6). An optional onSuccessUpdateEmail patch must have exactly one
+key, `#` followed by that creation's key. PostgreSQL submission admission,
+source verification, transmitted-copy publication and durable receipt
+settlement are specified in POSTGRES.md. The shared header and envelope
+algorithms below do not grant publication authority. The foreground route
+worker schedules these durable submissions.
+
+### 11.2 Sending identities
+
+The sending identity catalog is a cold preparation boundary for td-mail's
+default Identity/get objects. It validates the existing bounded canonical
+visible-identity preimage before hashing it, then retains only JSON-visible
+identity data and IDs. Relay credentials and signature paths are excluded.
+The cold encoder reserves at most six times the 192-KiB preimage ceiling
+plus 512 bytes per permitted identity. It fallibly copies the used bytes
+into a retained allocation and releases that scratch; at most 64 entries
+index the immutable bytes. The temporary and retained allocations overlap
+only during that bounded copy. JSON escaping expands a source byte at most
+sixfold, while the per-identity slack covers object framing. This is an
+explicit cold allocation under section 5, not a claim that the 1-MiB
+configuration-generation partition covers it. It
+provides immutable object slices and configuration-digest identity state
+under a serving snapshot's store epoch after checking its account ID.
+Noncharacters in any visible text refuse preparation, matching Session's
+I-JSON policy. The catalog confers no authority.
+
+Identity/get serves td-mail's default projection from the account's catalog
+when the instance advertises Submission. Omitted or
+null ids selects all configured identities; explicit IDs preserve request
+order and deduplicate under maxObjectsInGet. Missing IDs are notFound. The
+td-mail profile accepts omitted/null properties and refuses property lists.
+Account validation precedes access, catalog and storage accounts must agree,
+and identity state binds the catalog digest to the live store epoch. Output
+uses the original retained-response quota and deadline, with bounded copying
+and a final snapshot check. Other calls in a batch retain normal error and
+result-reference handling.
+
+### 11.3 Submission input and transmitted copies
+
+Submission admission (POSTGRES.md, [Submission input preparation](POSTGRES.md#submission-input-preparation)) freezes td-mail's implicit
+envelope and outgoing copy from one authenticated, verified Email snapshot
+under one original deadline and work meter. Shared MIME scanning locates the
+bounded root header section; `submission_envelope` derives the envelope
+(section 11.4) and `transmitted_headers` filters the headers. The remaining
+body bytes are copied without interpretation into one retained copy of at
+most 32 MiB; original stored bytes remain unchanged.
+
+The `transmitted_headers` worker removes root Bcc and Resent-Bcc fields,
+including folded continuations and duplicates, from a private outgoing copy.
+It accepts exactly a complete resident root-header section and CRLF separator,
+bounded by the configuration's 1 MiB header ceiling plus separator. The shared
+header scanner defines fields; all other header bytes and the separator are
+preserved. The caller separately copies the original immutable body without
+rewriting it. The locally stored draft retains its blind-recipient headers.
+
+No output is publishable until success. Invalid or incomplete extents,
+original work exhaustion, phase expiry, clock regression and sink failure
+refuse the operation, potentially after provisional output. Scanner turns,
+short name comparisons and at-most-4096-byte sink writes spend the original
+request meter under fresh monotonic checks. The filter itself builds no
+message-sized buffer.
+This worker grants neither source custody nor envelope/sending authority;
+native queue admission, identity authorization and transactional publication
+remain required before responsibility exists.
+
+Outgoing header filtering requires CRLF-only line endings throughout the
+section, checked in charged 4096-byte chunks before emission. Bare CR or LF
+is refused rather than letting an incoming-parser/receiver difference hide
+a blind-recipient field in a preserved value.
+
+`transmitted_copy::write` is a streaming variant that submission admission
+does not call. It retains the caller's verified native blob pin while
+collecting bounded root headers, applying blind-recipient filtering and
+streaming the remaining immutable body in at most 4096-byte chunks. Header
+scratch belongs to the caller; no full-message buffer or new work allowance
+is created. The configured header and transmitted-size ceilings, original
+meter, native snapshot deadline and a non-extending execution phase cover
+copying. Every header-filter clock sample also checks the retained native pin,
+so header scanning and emission cannot outlive its original snapshot deadline
+even when the caller supplies a longer phase. Native integrity verification
+precedes entry under its own funding.
+
+Every transmitted copy changes only complete root Bcc/Resent-Bcc fields. The
+body is copied byte for byte; the streaming variant rereads a body prefix
+already read while finding the header boundary from the same immutable pin
+and charges it again.
+Clock regression, expiry, work or size exhaustion, missing native bytes and
+sink failures refuse completion; all emitted bytes remain private and must
+be discarded on failure. A successful copy supplies no sending identity,
+envelope authority, ingress slot or queue publication. Its consumer still
+owns those reservations and fresh authorization before accepting delivery.
+
+### 11.4 Implicit submission envelopes
+
+The `submission_envelope` worker derives the implicit envelope used by
+`td-mail` from a complete immutable root-header section and the selected
+identity's configured mailbox. It requires exactly one single-address From
+matching that identity under `config::values::mailbox_key`: decoded local
+case is significant and only the domain is folded. An optional single Sender
+must also match that identity before supplying the reverse path. The current
+single-address identity policy cannot authorize another Sender header merely
+by substituting the envelope reverse path. Duplicate From/Sender fields or multiple addresses
+in either refuse. This supplies header evidence, not account, device or
+configuration-generation authority; the native publication consumer still
+holds the same source and freshly authorizes the selected identity.
+
+Recipients come from To/Cc/Bcc in source order. Shared address parsing supplies
+provisional extents, then each SMTP mailbox must independently pass the strict
+configuration syntax; raw recovery candidates, groups, address literals and
+international addresses refuse. No permissive display fallback grants sending
+authority. Equivalent quoted local spellings and domain case deduplicate while
+preserving the first address spelling and order. Reply-To and Resent fields do
+not add recipients. Explicit envelopes and SMTP parameters are outside this
+worker's interface.
+
+At most the configured 1..1000 unique recipients are retained. A fallibly
+reserved array plus sorted indices bounds retention and comparisons; insertion
+movement and canonicalization spend the original work meter. Header scanning,
+CRLF validation, address parsing and comparisons use fresh monotonic checks
+under a phase that cannot extend the meter deadline. No envelope escapes an
+invalid header, exhausted budget, deadline or clock failure. The transmitted
+copy and all queue rows still require separate admission and atomic publication.
+
 ## 12. Logs and observability
 
-[OBSERVABILITY.md](OBSERVABILITY.md) specifies the implemented M04d1 event
-and explicit inspection encoders and M04d2 fixed event queue/loss counters
-and bounded status snapshots. Schema 29 adds the bounded PostgreSQL service
-sink and independent local logging status; full status aggregation remains
-planned.
+[OBSERVABILITY.md](OBSERVABILITY.md) specifies the event and explicit
+inspection encoders, fixed event queue/loss counters, bounded health
+snapshots, the PostgreSQL service sink (schema 29) and independent local
+logging status. `status` does not aggregate the health snapshot.
 
 Emit versioned JSON Lines with bounded event sizes, fixed event codes, severity,
 UTC time, process boot ID, config generation, connection/request ID, transaction
@@ -2491,29 +2916,44 @@ Nonempty queues retain periodic retry/expiry scheduling, and lease renewal
 remains independent. Every wake rechecks current database authority. POSTGRES.md
 specifies subscription ordering, bounded coalescing and lost-hint recovery.
 
-Expose counters for accepted/refused mail, TLS/plain sessions, active slots,
-limit refusals, queue age/depth, unknown outcomes, logical disk usage/quotas, dropped logs,
-index lag, authentication failures and certificate expiry/renewal. `status`
-distinguishes serving, degraded, recovering and refusing mutations. Readiness
-requires valid local configuration, usable storage, configured listeners,
-an open writer admission gate and completed recovery. Smart-host or CA health
-does not determine readiness.
+SMTP receiving emits bounded refusal observations through the existing
+nonblocking application-log producer. OBSERVABILITY.md owns their numeric
+peer attribution, fixed reason/status vocabulary, sampling and queued-versus-
+delivered distinction. No protocol acceptance, retry or durable publication
+rule is relaxed by diagnostic collection.
+
+The health snapshot carries counters for accepted/refused mail, TLS/plain
+sessions, active slots, limit refusals, queue age/depth, unknown outcomes,
+logical disk usage/quotas, dropped logs, index lag, authentication failures
+and certificate expiry/renewal. It distinguishes serving, degraded,
+recovering and refusing mutations; its readiness requires valid local
+configuration, usable storage, configured listeners, an open writer
+admission gate and completed recovery. `status` reports the service
+lifecycle, and `--require-ready` succeeds once every selected network
+worker is ready. Smart-host or CA health does not determine readiness.
 Agent-facing output clearly separates facts, recommended actions, and untrusted
 data. No API executes instructions obtained from messages or logs.
 
 ## 13. Migration and operational lifecycle
 
-Migrate from Stalwart 0.15.2 through its authenticated JMAP interface and raw
-blob downloads, not by reverse-engineering its database. Preserve raw message
-bytes, folder names/hierarchy, membership, and received dates; preserve ordinary
-keywords/read state when available at little extra cost. Stable remote IDs are
-recorded for resumability, not reused as local pathnames. The provisional
-export/verify commands and their archive bounds are specified in
-`MIGRATION.md`, including its resumable insert-only PostgreSQL importer and
-retained plans for existing-message keyword/membership and folder metadata reconciliation,
-and explicit only-unmapped import with same-transaction folder checks;
-they do not grant final-cutover authority. No identities, rules,
-contacts, calendars, account passwords, or server configuration are migrated.
+The production domains have moved from Stalwart 0.15.2 to td-mta;
+PRODUCTION.md, "Retired Stalwart source and recovery copies", records the
+retained source and the rollback procedure. That cutover preserved mail:
+source deletions and state reconciliation were intentionally omitted.
+td-mail is the only client whose flows migration preserves (MIGRATION.md).
+
+Migrate from an external server through its authenticated JMAP interface and
+raw blob downloads, not by reverse-engineering its database. Preserve raw
+message bytes, folder names/hierarchy, membership, and received dates;
+preserve ordinary keywords/read state when available at little extra cost.
+Stable remote IDs are recorded for resumability, not reused as local
+pathnames. The provisional export/verify commands and their archive bounds
+are specified in `MIGRATION.md`, including its resumable insert-only
+PostgreSQL importer and retained plans for existing-message
+keyword/membership and folder metadata reconciliation, and explicit
+only-unmapped import with same-transaction folder checks; they do not grant
+final-cutover authority. No identities, rules, contacts, calendars, account
+passwords, or server configuration are migrated.
 
 Stream a paginated export into an archive containing raw files and a versioned
 manifest with source account/object IDs, byte counts, digests and mailbox
@@ -2522,7 +2962,7 @@ Message-ID or byte digest alone: identical messages can be distinct objects.
 Repeated imports must not duplicate a previously mapped object; preserve a
 single source email's multiple folder memberships. Do not log access tokens.
 
-A bulk copy while Stalwart is live is provisional. Final cutover requires a
+A bulk copy while the source is live is provisional. Final cutover requires a
 documented quiescent interval: freeze client writes and receipt on the source,
 reconcile the final source state, verify per-folder/object counts and digests,
 then switch service/DNS. Upstream SMTP senders queue during temporary refusal.
@@ -2540,10 +2980,26 @@ Run in the foreground as a dedicated unprivileged service identity. Deployment
 provisions directories and grants only low-port binding through its supervisor
 or a reviewed launcher. Do not run the protocol engine as root or introduce
 setuid behavior. Inherited-listener support, if selected, must validate socket
-types, addresses and counts, and obey the unsafe contract. Systemd/td-svc
-examples are packaging tasks, not executable dependencies. SIGTERM draining
-and abrupt-death recovery both need tests; signal integration cannot silently
-add an unsafe surface. Persistent state is outside the executable's directory.
+types, addresses and counts, and obey the unsafe contract. The installer's
+systemd and Shepherd definitions (DEPLOYMENT.md) are packaging, not
+executable dependencies. SIGTERM and SIGINT request the same orderly drain as
+`stop` through the confined signal surface recorded in UNSAFE.md; drain and
+abrupt-death recovery both need tests. Persistent state is outside the
+executable's directory.
+
+The coordinated production deployment assigns a separate Linux UID and
+PostgreSQL login to the HTTPS frontend, SMTP receiver, each relay and ACME.
+The owner derives access to selected input material and active listener
+certificates when it publishes configuration. A receiving process can insert
+mail and use its listener key. It has no database access to relay passwords,
+ACME account state or stored message bodies. Relay workers share queue
+authority and can read the credentials of their own selected route. Their
+database login can read the primary body store used for outbound delivery,
+including bodies outside their queue. The
+frontend retains the mail and device authority required by JMAP. PostgreSQL,
+owner administration and backup remain trusted. POSTGRES.md documents the
+role contract and PRODUCTION.md describes the cutover and rollback. Single-user
+installations can serve the same profiles with the shared runtime login.
 
 This standalone artifact does not automatically enter td's system image.
 Future image integration follows the target-graph provenance, profiling,
@@ -2552,18 +3008,13 @@ build is useful for other distros but is not a td target-graph artifact.
 
 ## 14. Implementation ownership
 
-The implementation plan is the handoff contract. Tasks must name dependencies,
-owned modules, typed interfaces, explicit exclusions, and executable acceptance
-criteria. Freeze formats and API shapes before parallel consumers implement
-them. Each independently landable increment stays green under DEVELOPMENT.md.
-An unresolved design decision is written down before implementing dependent
-code; it is not delegated to whichever worker arrives first.
-
-The plan's initial schema/format/dependency tasks resolve exact encodings,
-provider features, enforced resource limits and standard capability tables.
-They may refine this document with measured evidence, but cannot silently
-relax its durability, authentication, bounded-input/work, or no-live-service-test
-boundaries. Resource tuning follows section 5.
+[IMPLEMENTATION.md](IMPLEMENTATION.md) sequences the remaining tasks. Freeze
+formats and API shapes before parallel consumers implement them. An
+unresolved design decision is written down before implementing dependent
+code; it is not delegated to whichever worker arrives first. Measured
+evidence may refine this document, but cannot silently relax its durability,
+authentication, bounded-input/work, or no-live-service-test boundaries.
+Resource tuning follows section 5.
 
 ## 15. Acceptance evidence
 
@@ -2633,437 +3084,3 @@ V1 is ready only with reproducible evidence for all of the following:
 
 Migadu settings are documentation-derived, not tested against its live server.
 Implementation fixtures cite the additional extension RFCs they exercise.
-
-The mailbox-access Core API now runs on the bounded HTTPS body worker.
-ADMISSION.md owns its request/response lifetime and quota contract; STORAGE.md
-owns the separate data/tmp/requests lock and cold cleanup. Core Session metadata
-is exposed by authenticated discovery now that its required endpoints are
-active. Mail reads, read/star assignments, mailbox moves and root-folder
-creation and empty-folder deletion are exposed for td-mail. The account permits those writes; POLICY.md
-specifies its Mailbox rights.
-CONFORMANCE.md records the client/TLS evidence. For an EventSource stream the
-authentication worker observes the authorized account's state in a bounded
-database transaction. The network thread sends a passive snapshot. Idle
-streams hold a connection slot and release the database view between samples.
-
-## Device Email update transaction foundation
-
-The storage coordinator now accepts bounded, device-authorized single-mailbox
-replacement plus `$seen` and `$flagged` assignments through the typed
-update_emails boundary documented in
-STORAGE.md. Memberships, flags and corresponding Email/Mailbox history
-commit together,
-and known commit outcomes survive later accounting refusal. Authenticated
-HTTPS Email/set activates td-mail keyword patches for these two flags and
-single-destination mailbox replacement, with matching Session and Mailbox
-rights. Pure Email/set destruction now removes messages and last-owner bodies.
-Structured Email creation remains absent.
-
-Authenticated Mailbox/set accepts the root-folder name-only create objects
-td-mail emits. The bounded native creation coordinator owns validation,
-uniqueness, IDs, authorization and commit outcomes. The adapter prepays the
-entire response before calling it, preserves per-object refusals and exposes
-mayCreateTopLevelMailbox only with this active endpoint. Singleton deletion
-uses the same coordinator and deletes only empty roleless leaves, with one
-Mailbox tombstone and sequence increment. Role, child and membership refusals
-leave state unchanged. The endpoint advertises mayDelete for roleless folders
-and confirms only known commits. Hierarchy creation, rename and role mutation
-remain absent; POLICY.md owns the request restrictions.
-
-## Prepared sending identities
-
-The sending identity catalog is a cold preparation boundary for td-mail's
-default Identity/get objects. It validates the existing bounded canonical
-visible-identity preimage before hashing it, then retains only JSON-visible
-identity data and IDs. Relay credentials and signature paths are excluded.
-The cold encoder reserves at most six times the 192-KiB preimage ceiling
-plus 512 bytes per permitted identity. It fallibly copies the used bytes
-into a retained allocation and releases that scratch; at most 64 entries
-index the immutable bytes. The temporary and retained allocations overlap
-only during that bounded copy. JSON escaping expands a source byte at most
-sixfold, while the per-identity slack covers object framing. This is an
-explicit cold allocation under section 5, not a claim that the proposed
-1-MiB configuration-generation partition already covers activation. It
-provides immutable object slices and configuration-digest identity state
-under a serving snapshot's store epoch after checking its account ID.
-Noncharacters in any visible text refuse preparation, matching Session's
-I-JSON policy. It confers no authority and does not by itself enable Identity/get,
-submission capability or sending.
-
-The prepared identity dispatcher implements td-mail's default Identity/get
-projection under an explicitly supplied catalog and Submission declaration.
-It does not enter the HTTPS service or advertise Submission yet. Omitted or
-null ids selects all configured identities; explicit IDs preserve request
-order and deduplicate under maxObjectsInGet. Missing IDs are notFound. The
-td-mail profile accepts omitted/null properties and refuses property lists.
-Account validation precedes access, catalog and storage accounts must agree,
-and identity state binds the catalog digest to the live store epoch. Output
-uses the original retained-response quota and deadline, with bounded copying
-and a final snapshot check. Other calls in a batch retain normal error and
-result-reference handling.
-
-## Plain-text draft composition
-
-The inert `compose_text` worker composes td-mail's plain-text structured
-creation fields into caller-owned private staging. It writes ASCII MIME
-headers, UTF-8 encoded display words, validated ASCII mailboxes and single
-strict Message-IDs. Generated IDs admit visible ASCII only, forbid escapes
-and quoted local parts, and retain the shared parser's dot-atom or
-non-folding domain-literal grammar. Reply-ID lists retain order. Each identifier occupies
-one continuation line and is limited to 995 bytes; address and identifier
-lists have a 1000-item ceiling. Caller-supplied Date and Message-ID are not
-regenerated. Date is whole-second UTC in the supported 1900..9999 range.
-The stored copy retains Bcc. This worker does not prepare a relay copy,
-construct attachments, authorize an account, create an Email, or advertise
-Submission; those are separate service steps.
-
-Text preserves its UTF-8 bytes, canonicalizing CRLF, bare CR and bare LF to
-CRLF before bounded base64 encoding. The worker counts that extent first,
-then streams it using fixed scratch, the original work meter and freshly
-sampled monotonic time between bounded turns. Each 1024-byte newline
-conversion buffer prepays up to 1025 input bytes for CRLF lookahead,
-forfeiting unused credit. It rejects clock regression.
-Validation, encoding and sink publication spend separately; no replay
-renews the meter. A caller-supplied total encoded-byte ceiling is enforced
-before each sink write. Any failure leaves only provisional bytes: the
-caller must discard staging and publish nothing. Success requires a fresh
-final budget/deadline check. Durable quota admission and the native
-transaction remain the future creation adapter's responsibility.
-
-The native Rust allocation probe compiles the same composition source and
-checks complete Unicode/text output, size refusal and invalid-header refusal
-without allocation; caller-owned text and sink backing are outside it.
-
-## Native plain-text draft publication
-
-The worker-side `create_text_draft` coordinator stages a single composed
-message under body-byte/blob admission, then atomically publishes its Blob,
-JMAP-origin Email, one existing mailbox membership, `$draft` and `$seen`,
-thread anchor and Email/Thread/Mailbox history. The original request work
-meter and deadline cover composition and native planning. It authorizes
-the device at admission and again under a revocation-excluding guard through
-publication; no coordinator lock or policy guard spans composition.
-
-Publication rechecks the policy generation, account epoch, optional state
-precondition and mailbox. References, In-Reply-To and the supplied Message-ID select an
-existing immutable thread using the existing last-32 nearest-first rule;
-otherwise entropy supplies a new thread. Supplied visible metadata is
-validated by composition before it becomes an anchor. Bcc stays in the
-stored copy. Native transaction/accounting settlement preserves known
-commit outcomes, stops admission on uncertainty, and releases private
-staging and unused quota on refusal. The API caller must reserve its full
-response before entry. This typed worker does not expose Email/set creation,
-construct attachments, authorize sending or advertise Submission.
-
-New draft Email and Thread IDs must be absent from live rows and retained
-change history. The format-compatible history check walks the existing
-account/kind sequence index once, paying each examined row from the
-original work meter; exhausted work refuses creation. This is linear in
-retained kind history, not an ID-point lookup. Pruned history is outside
-this collision claim, matching QUEUE.md's random-ID policy. Composition
-enforces a shorter execution-phase deadline without renewing its meter.
-
-## td-mail structured draft input
-
-The inert `draft_input` decoder borrows text from an already parsed request
-and retains only bounded address and identifier descriptor vectors. It
-accepts td-mail's single From, optional recipient/reply lists, Subject,
-Message-ID, whole-second UTC sentAt in years 1900 through 9999 with seconds
-00 through 59, one `text`/`text/plain` body part,
-complete untruncated body value, one local-form mailbox ID, and exactly
-`$draft` plus `$seen`. Nonempty attachments, HTML and other creation fields
-are refused in this increment. Message header syntax and MIME composition
-remain `compose_text` work; decoding confers no authorization or storage.
-
-Each descriptor list has the composer's 1000-entry bound. The admitted JSON
-byte ceiling also bounds aggregate decoded strings. Text validation is paid
-from the original work meter before UTF-8 scanning, with fresh monotonic
-and phase checks before and after; each input member spends a record. A
-shorter execution deadline never renews the meter. The decoder does not
-activate HTTPS creation or Submission.
-
-## HTTPS plain-text draft creation
-
-Authenticated Mail dispatch accepts td-mail's singleton literal Email/set
-creation shape through `draft_input` and `create_text_draft`. It refuses
-nonempty mixed create/update/destroy calls, multiple creations and resolved
-`#create` arguments in this profile. Existing flag, move and destruction
-calls retain their own paths. Account and scoped ifInState checks precede
-creation; publication rechecks conditional state and fresh device authority.
-
-The dispatcher materializes and prepays the complete bounded result before
-calling the body-worker adapter. Input refusal returns notCreated with
-invalidProperties and a known field where available. Ambiguous native Invalid
-or NotFound errors return per-object serverFail, never a guessed bad property;
-this can conservatively include a composition or missing-mailbox refusal.
-Native message-size Quota returns tooLarge, distinct from work capacity and
-logical account quota admission. Exhausted staging slots are normalized to
-Busy before composition so they remain temporary service pressure. Success returns Email, Blob and Thread IDs,
-size and the native before/after Email state. Known publication survives
-accounting stop flags and staging cleanup errors; an indeterminate commit
-becomes serverPartialFail. Draft staging cleanup failure retires the fully
-charged ingress slot until quiescent restart; it does not itself retire the
-service. A stopped coordinator still retires the service after the response. An outer deadline or failed physical response write can
-still lose the response and never makes creation safe to replay.
-
-The original parsed arena supplies borrowed body text, while retained
-arguments still enforce ordinary argument validation and result-reference
-resolution. No second JSON tree or full composed-message buffer is created.
-Draft creation does not advertise Submission, authorize a sending identity,
-resolve creation IDs for later calls, or take responsibility for delivery.
-
-## Transmitted-copy header filtering
-
-The inert `transmitted_headers` worker removes root Bcc and Resent-Bcc fields,
-including folded continuations and duplicates, from a private outgoing copy.
-It accepts exactly a complete resident root-header section and CRLF separator,
-bounded by the configuration's 1 MiB header ceiling plus separator. The shared
-header scanner defines fields; all other header bytes and the separator are
-preserved. The caller separately streams the original immutable body without
-rewriting it. The locally stored draft retains its blind-recipient headers.
-
-No output is publishable until success. Invalid or incomplete extents,
-original work exhaustion, phase expiry, clock regression and sink failure
-refuse the operation, potentially after provisional output. Scanner turns,
-short name comparisons and at-most-4096-byte sink writes spend the original
-request meter under fresh monotonic checks. No message-sized buffer is built.
-This worker grants neither source custody nor envelope/sending authority;
-native queue admission, identity authorization and transactional publication
-remain required before responsibility exists.
-
-Outgoing header filtering requires CRLF-only line endings throughout the
-section, checked in charged 4096-byte chunks before emission. Bare CR or LF
-is refused rather than letting an incoming-parser/receiver difference hide
-a blind-recipient field in a preserved value.
-
-## Verified native transmitted copies
-
-`transmitted_copy::write` retains the caller's verified native blob pin while
-collecting bounded root headers, applying blind-recipient filtering and
-streaming the remaining immutable body in at most 4096-byte chunks. Header
-scratch belongs to the caller; no full-message buffer or new work allowance
-is created. The configured header and transmitted-size ceilings, original
-meter, native snapshot deadline and a non-extending execution phase cover
-copying. Every header-filter clock sample also checks the retained native pin,
-so header scanning and emission cannot outlive its original snapshot deadline
-even when the caller supplies a longer phase. Native integrity verification
-precedes entry under its own funding.
-
-The filter changes only complete root Bcc/Resent-Bcc fields. The body is copied
-byte for byte, including a body prefix already read while finding the header
-boundary. That prefix is reread from the same immutable pin and charged again.
-Clock regression, expiry, work or size exhaustion, missing native bytes and
-sink failures refuse completion; all emitted bytes remain private and must
-be discarded on failure. A successful copy supplies no sending identity,
-envelope authority, ingress slot or queue publication. Its consumer still
-owns those reservations and fresh authorization before accepting delivery.
-
-## Implicit submission envelopes
-
-The inert `submission_envelope` worker derives the implicit envelope used by
-`td-mail` from a complete immutable root-header section and the selected
-identity's configured mailbox. It requires exactly one single-address From
-matching that identity under `config::values::mailbox_key`: decoded local
-case is significant and only the domain is folded. An optional single Sender
-must also match that identity before supplying the reverse path. The current
-single-address identity policy cannot authorize another Sender header merely
-by substituting the envelope reverse path. Duplicate From/Sender fields or multiple addresses
-in either refuse. This supplies header evidence, not account, device or
-configuration-generation authority; the native publication consumer still
-holds the same source and freshly authorizes the selected identity.
-
-Recipients come from To/Cc/Bcc in source order. Shared address parsing supplies
-provisional extents, then each SMTP mailbox must independently pass the strict
-configuration syntax; raw recovery candidates, groups, address literals and
-international addresses refuse. No permissive display fallback grants sending
-authority. Equivalent quoted local spellings and domain case deduplicate while
-preserving the first address spelling and order. Reply-To and Resent fields do
-not add recipients. Explicit envelopes and SMTP parameters are outside this
-worker's interface.
-
-At most the configured 1..1000 unique recipients are retained. A fallibly
-reserved array plus sorted indices bounds retention and comparisons; insertion
-movement and canonicalization spend the original work meter. Header scanning,
-CRLF validation, address parsing and comparisons use fresh monotonic checks
-under a phase that cannot extend the meter deadline. No envelope escapes an
-invalid header, exhausted budget, deadline or clock failure. The transmitted
-copy and all queue rows still require separate admission and atomic publication.
-
-
-PostgreSQL submission admission, source verification, transmitted-copy
-publication and durable receipt settlement are specified in POSTGRES.md.
-The shared header and envelope algorithms above do not grant publication
-authority. The foreground route worker schedules these durable submissions.
-
-## Request-local creation map
-
-Authenticated Email and Mailbox creation retain successful creation IDs in
-one bounded request-local overlay. The original request arena retains the
-initial createdIds map. A reused key points to the latest successful creation
-across both types; refused and indeterminate creations preserve its previous
-mapping. The final encoder merges the sorted overlay with the original map
-in linear order, skipping empty reservations. It includes createdIds only
-when the request supplied it, including an empty object.
-
-ADMISSION.md's active-profile exception owns the aggregate overlay bound and
-resident-storage contract. Before creation, the dispatcher reserves each new
-slot and conservative response growth from its remaining allowance. Lookup
-uses a bounded binary index and the original meter under fresh admission.
-Known publication copies a bounded ID into the prepared stable slot without
-allocating or searching. Initial mappings need no second allocation or
-quadratic seed scan. Counting and output stream one bounded pair per turn.
-This profile records creation IDs but does not yet resolve #draft in
-EmailSubmission/set or advertise Submission capability.
-
-## HTTPS authentication worker handoff
-
-HTTPS origin checks and bounded attempt admission remain on the network
-reactor. Credential decoding and verifier lookup run on one fixed
-`https-auth` worker through `http_auth::Authenticator`. Pending work occupies
-only existing bounded connection slots; no task or connection is spawned per
-authentication. Busy retries keep the same attempt charge and original
-absolute/header/idle deadline. The worker checks monotonic time before and
-after lookup; an expired or regressed result cannot enter routing.
-
-Decoded credentials remain in the bounded client owner, with zero-on-drop
-storage, for future fresh body/method authorization. Ordinary responses and
-EventSource clear them with the original credential head before output;
-other client retirement also clears them. A successful device ID is
-only the initial observation; mutations and body admission keep their existing
-fresh authorization boundaries. The PostgreSQL verifier owns the database-backed device check. The backend contract requires bounded completion
-under the supplied deadline. Service shutdown joins the verifier along with
-the existing workers; database lookup must never run on the network reactor.
-The fixed PostgreSQL verifier retains one finite session across jobs. It
-qualifies the complete schema and runtime role once at connection admission,
-holding the shared migration lock until that session closes. Schema and role
-administration stops serving instances first. Each job checks epoch,
-maintenance, configuration and device in a fresh transaction, and acknowledges
-rollback before returning success or a wrong-password refusal. Idle sessions
-retain no transaction or account authority. PostgreSQL still enforces each
-statement's privileges. POSTGRES.md owns the session's lifetime, cumulative
-protocol allowances, thread ownership, retirement and pre-submission recovery.
-The same authentication worker runs throttled local idle maintenance outside
-client-slot locks and closes retained resources before thread exit, including
-early failure paths. Neither hook performs authentication queries or starts a
-new task. Maintenance Busy defers cleanup to the next throttled turn without
-stopping HTTPS; other maintenance errors still stop serving. Clean completed
-sessions have a separate bounded termination
-allowance; request deadlines, TLS lifetime and failed-job bounds are unchanged.
-
-Each bounded HTTPS body worker may retain one worker-local API read context
-for its last account and origin. Changing either or handling a transfer discards that
-context on the owning thread. It never lives on the network reactor or in an
-account-sized cache. The native PostgreSQL context owns one existing read
-permit, establishes fresh authority in a new transaction for every job, and
-rolls back before response output. Bounded HTTP input/output turns also retire
-expired idle sessions locally, without SQL or a background task. POSTGRES.md, "Retained HTTPS API read sessions", owns its finite
-session, protocol and cleanup bounds. Mutations retain their existing separate
-publication and uncertain-COMMIT paths.
-
-## Private Unix JMAP
-
-A `local_jmap` listener serves the existing authenticated HTTP/JMAP engine
-through a current-user mode-0600 pathname socket in a mode-0700 directory.
-It does not open a TCP listener, manufacture TLS verification, or require a
-certificate. CONFIG.md and SCHEMA.md own declaration and lifetime exclusion.
-Its fixed logical origin is `http://localhost`; network JMAP continues to
-require HTTPS. A private profile owns its connection pool and authentication
-worker. Local peers share that profile's bounded sign-in budget. Connections
-and sign-in attempts on a public HTTPS profile consume its own limits.
-All account authorization, durable-write, body integrity and read-only
-replica rules are unchanged. The transport choice does not select replica
-mode or grant write authority. Clients must explicitly bind this logical
-origin to the configured private socket, without DNS or TCP fallback.
-
-## Native ACME deployment profile
-
-[ACME.md](ACME.md) owns the implemented single-endpoint native HTTP-01 worker,
-its supported CA subset, persistence bounds, renewal scheduling and operational
-commands. It starts independently of selected mail profiles, so initial issuance
-can run before a usable certificate exists. Mail profile import/activation still
-requires a valid certificate. The native worker owns the declared HTTP-01
-listener. Mail services publish a verified managed certificate generation
-to their existing listeners. Established TLS sessions keep the generation
-they acquired. Explicit external certificate inputs
-remain supported. No Certbot subprocess or dependency is introduced.
-
-Cold profile preparation retains one bounded binding, private identity
-catalog per configured account and a Session per account/allowed-origin pair.
-Authentication selects the account
-before dispatch, and all backends share the process admission limits. Every
-configured account must be bootstrapped before the profile can publish.
-Receiving uses one retained fanout and one shared prepared body. Relay scheduling
-rotates account-scoped leases through one foreground worker and one shared
-queue-clock guard. RESOURCES.md accounts for aggregate startup and relay
-metadata independently of message-body reservations.
-
-### Direct SMTP hostname aliases
-
-One direct SMTP listener may serve additional explicit MX hostnames through
-`server_name_aliases` (CONFIG.md and SCHEMA.md). Graph validation treats
-those names as local and requires the listener certificate to cover them.
-The listener's primary name remains its SMTP greeting and EHLO identity;
-the aliases grant neither recipient acceptance nor relay authority. TLS
-policy bindings retain the aliases so a policy prepared for another list
-cannot be attached as the same listener configuration. Gateway and HTTP
-listeners reject this setting.
-
-
-The fixed HTTPS body workers retain one backend cache selected by account and
-origin. API reads and download authorization use alternative cache variants;
-uploads retire the worker cache. Download body verification and replay keep one
-fresh snapshot, while a retained connection performs fresh authorization in a
-separate transaction after verification and before response bytes. POSTGRES
-owns its authority and retirement rules; RESOURCES owns its unchanged active
-connection count.
-
-PostgreSQL body verification uses td-crypto's opaque `BulkSha256` operation
-to accelerate complete-body hashing on the storage worker. It retains one
-native digest context per active verification and updates it with each existing
-64 KiB chunk. Full length, ordinal and digest checks precede ordinary verified pins;
-qualified selective projections use the separate chunk-verifying pin below.
-The allocation-free digest factory remains available to other operations.
-POSTGRES.md owns the snapshot and deadline contract.
-
-Persistent MIME interpretation reuses publication-derived tree descriptors,
-as specified in POSTGRES.md, with current entity-header rechecks. Qualified
-body-bearing Email/get verifies only requested chunks against the manifest
-before exposing their bytes; it does not claim integrity of unrequested
-chunks. The private chunk-verified pin is distinct from the full-body path
-used by raw downloads and audits. Publication and
-owner backfill use the shared MIME parser under fixed versioned limits; absent
-or incompatible evidence retains the existing verified traversal. Original
-message bytes and mutable authorization remain authoritative.
-
-Owner-side periodic integrity scrubbing verifies complete bodies in bounded
-read-only pages, separately from interactive reads. POSTGRES.md owns its
-snapshot, progress and failure contract; DEPLOYMENT.md owns explicit schedule
-activation. It never repairs mail or enables itself during serving.
-
-Local file-certificate profiles also observe the selected configuration
-generation in the existing 30-second certificate watcher. A definite change
-requests a bounded drain and reload. A failed observation retains the current
-selection. This includes idle read-only
-replicas, so certificate activation does not depend on client traffic.
-
-SMTP receiving emits bounded refusal observations through the existing
-nonblocking application-log producer. OBSERVABILITY.md owns their numeric
-peer attribution, fixed reason/status vocabulary, sampling and queued-versus-
-delivered distinction. No protocol acceptance, retry or durable publication
-rule is relaxed by diagnostic collection.
-
-## Production service authority
-
-The coordinated production deployment assigns a separate Linux UID and
-PostgreSQL login to the HTTPS frontend, SMTP receiver, each relay and ACME.
-The owner derives access to selected input material and active listener
-certificates when it publishes configuration. A receiving process can insert
-mail and use its listener key. It has no database access to relay passwords,
-ACME account state or stored message bodies. Relay workers share queue
-authority and can read the credentials of their own selected route. Their
-database login can read the primary body store used for outbound delivery,
-including bodies outside their queue. The
-frontend retains the mail and device authority required by JMAP. PostgreSQL,
-owner administration and backup remain trusted. POSTGRES.md documents the
-role contract and PRODUCTION.md describes the cutover and rollback. Single-user
-installations can serve the same profiles with the shared runtime login.
