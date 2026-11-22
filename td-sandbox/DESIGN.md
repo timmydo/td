@@ -334,10 +334,17 @@ are stdout, stderr and exit (exactly one byte). Framing and payload shape are
 validated; no message chooses a host operation beyond terminal output. PTY
 output merges stderr; pipe mode preserves it and forwards stdin EOF. Exit
 codes are retained, signals represented as 128+signal. Blocking input and host-output writes run on dedicated workers, outside
-lifecycle polling. After command exit, output readers receive a 200ms drain
-window each; descendants retaining stdin or idle output descriptors cannot
-delay teardown. Delivering queued output and the exit frame can still wait
-for the host output consumer, but stop remains responsive even then.
+lifecycle polling. After command exit, each output reader in turn drains
+until its descriptor ends, it has been found idle (nothing read and nothing
+being delivered) for about 200ms in all, counted in 5ms looks, or it has
+delivered 4 MiB. A reader blocked delivering to a slow host consumer is
+not idle, and the command's own output fits in any pipe or terminal
+buffer below that byte allowance, so all of it precedes the exit frame,
+barring a reader stalled for the whole idle allowance. Descendants
+retaining stdin or a quiet or trickling output descriptor delay teardown
+by about 200ms per reader; one that floods, by 4 MiB of delivery.
+Delivering queued output and the exit frame can wait for the host output
+consumer, but stop remains responsive even then.
 
 The outer foreground terminal guard uses td-ui's audited termios and signal
 operations. It disables local canonical/echo/signal processing, reads with a
@@ -396,7 +403,11 @@ make no whole-operation allocation guarantee.
 
 ## Validation
 
-Unit tests cover bounded frames, the record and its lock, an unreadable
+Unit tests cover bounded frames, the output drain (a consumer slower than
+the idle allowance still receives every byte before the exit frame; a
+descriptor held quiet after output, flooded or trickled ends the drain;
+a vanished consumer fails it), the
+record and its lock, an unreadable
 record's removal, each request line and answer as root's intake parses
 them, home-relative grant paths, a held sandbox never created over and
 its adoption, the import's drops, adoptions, bounds, report and
