@@ -158,7 +158,7 @@ fn scan(root: &Path, path: &Path) {
             assert_eq!(source.matches("std::arch::asm!").count(), 2);
             fingerprint(
                 &source,
-                "6e12f632bffe256083dcf43b53117097287d0522d0d1d19aabefde41806b1dff",
+                "49b69bdb792f9c73ba8f2fadd8991cdaf264fdb1c10e1cffaa3e9ecbbb3a02ff",
             );
         } else if relative == "td-mta/src/signal_sys.rs" {
             assert_eq!(words(&source, "unsafe"), 2);

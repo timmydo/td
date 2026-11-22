@@ -132,4 +132,4 @@ pub(super) fn owner(phase: Phase, verify: bool) -> Owner {
 }
 
 // The common readiness array fits either protocol's configured maximum.
-const _: () = assert!(crate::limits::MAX_SMTP_SESSIONS <= crate::limits::MAX_HTTPS_CONNECTIONS);
+const _: () = assert!(crate::limits::MAX_SMTP_SESSIONS <= crate::limits::MAX_HTTPS_SLOTS);

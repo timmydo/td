@@ -19,7 +19,7 @@ pub const DOWNLOAD_TEMPLATE: &str = "/jmap/download/{accountId}/{blobId}/{name}?
 pub const EVENT_TEMPLATE: &str = "/jmap/events?types={types}&closeafter={closeafter}&ping={ping}";
 pub(crate) const MAX_BYTES: usize = 32 * 1024;
 
-/// Per-endpoint limits enforced by the runtime within its shared pool.
+/// Per-endpoint limits enforced by the runtime within its ordinary budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Concurrency {
     pub uploads: usize,

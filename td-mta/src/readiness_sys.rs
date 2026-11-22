@@ -54,7 +54,7 @@ impl<'a> PollFd<'a> {
 }
 
 const HTTPS_FDS: usize =
-    1 + crate::config::listener::MAX_LISTENERS + crate::limits::MAX_HTTPS_CONNECTIONS;
+    1 + crate::config::listener::MAX_LISTENERS + crate::limits::MAX_HTTPS_SLOTS;
 
 pub(crate) struct PollSet<'a> {
     fds: [PollFd<'a>; HTTPS_FDS],

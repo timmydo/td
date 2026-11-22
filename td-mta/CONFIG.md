@@ -270,9 +270,10 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 481623296 bytes (about 459.31 MiB), including the
+default plan is 486604032 bytes (about 464.06 MiB), including the
 4-MiB index cache. The default pools of 32 SMTP sessions and 16 HTTPS
-connections reserve 39458816 bytes (about 37.63 MiB) more than eight of each;
+connections reserve 39458816 bytes (about 37.63 MiB) more than eight of each,
+and eight event-stream slots of their own another 4980736 bytes;
 RESOURCES.md derives them, and a tightly sized explicit budget must allow
 them. A listener's explicit `session_limit` still bounds its own sessions.
 Bounded folder/keyword prefix prefetch adds 128 KiB per read
@@ -1964,13 +1965,15 @@ application/json with fixed or chunked bodies and returns ordered retained
 responses, result references, createdIds and the prepared Session state.
 Malformed requests and advertised limits receive standard JMAP problem details.
 Authenticated GET `/.well-known/jmap` returns Core, Mail and Submission
-capabilities and the sole writable account with its primary-account mappings. The event_streams limit defaults to two and
-must be nonzero for mailbox-access. The resource plan already requires it
-strictly below https_connections, reserving capacity for other requests. The
+capabilities and the sole writable account with its primary-account mappings. The event_streams limit defaults to eight,
+at most 32, and must be nonzero for mailbox-access. Streams have their own
+slots beside the `https_connections` that serve ordinary requests, so a
+full set of streams takes no ordinary capacity and ordinary connections at
+their limit leave every stream slot (DESIGN.md section 10). The
 profile-neutral resource planner permits zero for receive-only profiles; mailbox-access
 startup additionally validates Core-specific admission. EventSource GET uses
-the Session URL template and an independent stream ceiling within the shared
-HTTPS/per-peer connection caps. A stream emits the selected account states
+the Session URL template and the stream ceiling, within the per-peer
+connection cap over both. A stream emits the selected account states
 on first connection, and emits changes after successful authorization checks.
 A matching Last-Event-ID suppresses the initial frame. With closeafter=state
 the response ends after its first state frame. Setting ping to zero disables

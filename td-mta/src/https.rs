@@ -35,19 +35,30 @@ use wait::{Owner, Slot, Wait};
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
 const SCAN: Duration = Duration::from_millis(5);
 const MAX_PER_PEER: usize = 16;
+const EVENTS_PREFIX: &str = "/jmap/events?";
 const DRAIN_BYTES: usize = 64 * 1024;
 const DRAIN_SECONDS: u64 = 5;
 
-fn peer_limit(peer: PeerAddress, slots: usize) -> usize {
+/// A network peer leaves at least one slot, and one ordinary admission, for
+/// another peer; `ordinary` is the profile's `https_connections`.
+fn peer_limit(peer: PeerAddress, slots: usize, ordinary: usize) -> usize {
     match peer {
-        PeerAddress::Network(_) => slots.saturating_sub(1).clamp(1, MAX_PER_PEER),
+        PeerAddress::Network(_) => slots
+            .saturating_sub(1)
+            .min(ordinary.saturating_sub(1))
+            .clamp(1, MAX_PER_PEER),
         PeerAddress::Local => slots.min(MAX_PER_PEER),
     }
 }
 
-fn has_peer_capacity(peer: PeerAddress, occupied: &[Option<AdmissionPeer>]) -> bool {
+fn has_peer_capacity(
+    peer: PeerAddress,
+    occupied: &[Option<AdmissionPeer>],
+    ordinary: usize,
+) -> bool {
     let key = peer.admission_peer();
-    occupied.iter().filter(|entry| **entry == Some(key)).count() < peer_limit(peer, occupied.len())
+    occupied.iter().filter(|entry| **entry == Some(key)).count()
+        < peer_limit(peer, occupied.len(), ordinary)
 }
 
 pub struct BoundListener {
@@ -165,6 +176,7 @@ struct Client {
     credentials: Option<http_auth::BasicCredentials>,
     authentication: Option<Result<Option<http_auth::Principal>, Error>>,
     body_slot: Option<BodyPermit>,
+    request_slot: Option<CountPermit>,
     events: Option<EventState>,
     stop_after_response: bool,
     absolute: Deadline,
@@ -265,39 +277,73 @@ enum BodyKind {
     Download,
     Api,
 }
+/// Every pool counter, in one shared allocation; permits name their counter.
+#[derive(Default)]
+struct Counters {
+    active: AtomicU8,
+    transfers: AtomicU8,
+    /// Connections serving ordinary requests; push streams have their own slots.
+    requests: AtomicU8,
+    uploading: AtomicBool,
+}
+#[derive(Clone, Copy)]
+enum Counter {
+    Active,
+    Transfers,
+    Requests,
+}
+impl Counters {
+    fn count(&self, counter: Counter) -> &AtomicU8 {
+        match counter {
+            Counter::Active => &self.active,
+            Counter::Transfers => &self.transfers,
+            Counter::Requests => &self.requests,
+        }
+    }
+}
 struct BodyPool {
-    active: Arc<AtomicU8>,
-    transfers: Arc<AtomicU8>,
-    uploading: Arc<AtomicBool>,
+    counters: Arc<Counters>,
     maximum: u8,
+    request_maximum: u8,
 }
 impl BodyPool {
+    /// Held from a connection's first ordinary request until it closes or
+    /// becomes an event stream, so streams cannot take ordinary capacity.
+    fn admit_request(&self, slot: &mut Option<CountPermit>) -> bool {
+        if slot.is_none() {
+            *slot = CountPermit::acquire(&self.counters, Counter::Requests, self.request_maximum);
+        }
+        slot.is_some()
+    }
     fn admit(&self, slot: &mut Option<BodyPermit>, kind: BodyKind) -> bool {
         if slot.is_some() {
             return false;
         }
         let upload = if kind == BodyKind::Upload {
             if self
+                .counters
                 .uploading
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
                 return false;
             }
-            Some(UploadPermit(self.uploading.clone()))
+            Some(UploadPermit(self.counters.clone()))
         } else {
             None
         };
         let transfer = if kind != BodyKind::Api {
             let maximum = self.maximum.saturating_sub(1).max(1);
-            let Some(permit) = CountPermit::acquire(&self.transfers, maximum) else {
+            let Some(permit) = CountPermit::acquire(&self.counters, Counter::Transfers, maximum)
+            else {
                 return false;
             };
             Some(permit)
         } else {
             None
         };
-        let Some(active) = CountPermit::acquire(&self.active, self.maximum) else {
+        let Some(active) = CountPermit::acquire(&self.counters, Counter::Active, self.maximum)
+        else {
             return false;
         };
         *slot = Some(BodyPermit {
@@ -308,9 +354,10 @@ impl BodyPool {
         true
     }
 }
-struct CountPermit(Arc<AtomicU8>);
+struct CountPermit(Arc<Counters>, Counter);
 impl CountPermit {
-    fn acquire(counter: &Arc<AtomicU8>, maximum: u8) -> Option<Self> {
+    fn acquire(counters: &Arc<Counters>, which: Counter, maximum: u8) -> Option<Self> {
+        let counter = counters.count(which);
         let mut active = counter.load(Ordering::Acquire);
         for _ in 0..4 {
             if active >= maximum {
@@ -318,7 +365,7 @@ impl CountPermit {
             }
             match counter.compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => return Some(Self(counter.clone())),
+                Ok(_) => return Some(Self(counters.clone(), which)),
                 Err(current) => active = current,
             }
         }
@@ -327,13 +374,13 @@ impl CountPermit {
 }
 impl Drop for CountPermit {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0.count(self.1).fetch_sub(1, Ordering::AcqRel);
     }
 }
-struct UploadPermit(Arc<AtomicBool>);
+struct UploadPermit(Arc<Counters>);
 impl Drop for UploadPermit {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.uploading.store(false, Ordering::Release);
     }
 }
 struct BodyPermit {
@@ -506,7 +553,13 @@ impl Https<'_> {
             crate::jmap_request::Request::validate_resources(self.resources)
                 .map_err(|_| Error::Invalid)?;
         }
-        let count = self.resources.limits().https_connections;
+        let limits = self.resources.limits();
+        let count = limits
+            .https_connections
+            .checked_add(limits.event_streams)
+            .filter(|count| *count <= crate::limits::MAX_HTTPS_SLOTS)
+            .ok_or(Error::Invalid)?;
+        let request_maximum = u8::try_from(limits.https_connections).map_err(|_| Error::Invalid)?;
         let mut slots: Vec<Slot> = Vec::new();
         slots
             .try_reserve_exact(count)
@@ -519,10 +572,9 @@ impl Https<'_> {
             return Err(Error::Capacity);
         }
         let body_active = BodyPool {
-            active: Arc::new(AtomicU8::new(0)),
-            transfers: Arc::new(AtomicU8::new(0)),
-            uploading: Arc::new(AtomicBool::new(false)),
+            counters: Arc::new(Counters::default()),
             maximum: body_count,
+            request_maximum,
         };
         let body_warm = AtomicU8::new(0);
         std::thread::scope(|scope| {
@@ -998,7 +1050,7 @@ impl Https<'_> {
         }
         self.ready.store(true, Ordering::Release);
         let mut attempts = Attempts::default();
-        let mut peers = [None; crate::limits::MAX_HTTPS_CONNECTIONS];
+        let mut peers = [None; crate::limits::MAX_HTTPS_SLOTS];
         let peers = peers.get_mut(..slots.len()).ok_or(Error::Invalid)?;
         let mut listener_cursor = 0;
         let mut cursor = 0;
@@ -1160,7 +1212,7 @@ impl Https<'_> {
                     Err(error) => return Err(error.into()),
                 };
                 *peers.get_mut(index).ok_or(Error::Invalid)? = None;
-                if !has_peer_capacity(peer, peers) {
+                if !has_peer_capacity(peer, peers, self.resources.limits().https_connections) {
                     control.log(
                         crate::observability::Kind::AdmissionRefused {
                             reason: crate::observability::Refusal::Capacity,
@@ -1250,6 +1302,7 @@ impl Https<'_> {
                     credentials: None,
                     authentication: None,
                     body_slot: None,
+                    request_slot: None,
                     events: None,
                     stop_after_response: false,
                     absolute,
@@ -1345,6 +1398,18 @@ impl Https<'_> {
                                 client.timing =
                                     Some(crate::performance::Timer::start(request_phase(target)));
                                 client.phase = Phase::Authorize;
+                                if !target.starts_with(EVENTS_PREFIX)
+                                    && !body_active.admit_request(&mut client.request_slot)
+                                {
+                                    control.log(
+                                        crate::observability::Kind::AdmissionRefused {
+                                            reason: crate::observability::Refusal::Capacity,
+                                        },
+                                        None,
+                                        None,
+                                    );
+                                    self.respond(client, 429, time.utc_ms)?;
+                                }
                             }
                             Ok(_) => (),
                             Err(http_request::Error::Limit) => {
@@ -1460,8 +1525,7 @@ impl Https<'_> {
                                     } else {
                                         503
                                     }
-                                } else if let Some(query) =
-                                    head.target.strip_prefix("/jmap/events?")
+                                } else if let Some(query) = head.target.strip_prefix(EVENTS_PREFIX)
                                 {
                                     if backend.session().is_none() {
                                         404
@@ -1494,6 +1558,10 @@ impl Https<'_> {
                                         });
                                         client.principal = Some(principal);
                                         client.keep_alive = false;
+                                        // The stream slot replaces any ordinary charge
+                                        // and reserves no earlier response body.
+                                        client.request_slot = None;
+                                        client.response = Vec::new();
                                         client.phase = Phase::EventRead;
                                         *event_count =
                                             event_count.checked_add(1).ok_or(Error::Capacity)?;
@@ -2227,17 +2295,26 @@ mod tests {
     #[test]
     fn connection_limits_leave_room_for_another_network_peer() {
         let network = PeerAddress::Network(std::net::Ipv4Addr::LOCALHOST.into());
-        for (slots, network_limit, local_limit) in [
-            (8, 7, 8),
-            (1, 1, 1),
-            (2, 1, 2),
-            (16, 15, 16),
-            (17, 16, 16),
-            (32, 16, 16),
-            (crate::limits::MAX_HTTPS_CONNECTIONS, 16, 16),
+        for (slots, ordinary, network_limit, local_limit) in [
+            (8, 8, 7, 8),
+            (1, 1, 1, 1),
+            (2, 2, 1, 2),
+            (16, 16, 15, 16),
+            (17, 17, 16, 16),
+            (32, 32, 16, 16),
+            // Stream slots never let one peer hold every ordinary admission.
+            (24, 16, 15, 16),
+            (8, 5, 4, 8),
+            (3, 1, 1, 3),
+            (
+                crate::limits::MAX_HTTPS_SLOTS,
+                crate::limits::MAX_HTTPS_CONNECTIONS,
+                16,
+                16,
+            ),
         ] {
-            assert_eq!(peer_limit(network, slots), network_limit);
-            assert_eq!(peer_limit(PeerAddress::Local, slots), local_limit);
+            assert_eq!(peer_limit(network, slots, ordinary), network_limit);
+            assert_eq!(peer_limit(PeerAddress::Local, slots, ordinary), local_limit);
         }
     }
 
@@ -2250,11 +2327,11 @@ mod tests {
         for slot in slots.iter_mut().take(7) {
             *slot = Some(peer.admission_peer());
         }
-        assert!(!has_peer_capacity(address("2001:db8:1::abcd"), &slots));
-        assert!(has_peer_capacity(address("2001:db8:1:1::1"), &slots));
+        assert!(!has_peer_capacity(address("2001:db8:1::abcd"), &slots, 8));
+        assert!(has_peer_capacity(address("2001:db8:1:1::1"), &slots, 8));
         let slots = [Some(address("::ffff:192.0.2.1").admission_peer()), None];
-        assert!(!has_peer_capacity(address("192.0.2.1"), &slots));
-        assert!(has_peer_capacity(address("192.0.2.2"), &slots));
+        assert!(!has_peer_capacity(address("192.0.2.1"), &slots, 2));
+        assert!(has_peer_capacity(address("192.0.2.2"), &slots, 2));
     }
 
     #[test]

@@ -23,8 +23,8 @@ they convey no authorization. Derived MIME-part wire IDs belong to M02.
 
 Each HTTPS or direct SMTP network owner has its own private Unix stream pair
 for worker completion and stop notifications. Each bounded poll array holds
-the read end, up to 16 listeners and 64 connections. Polling borrows the original sockets, and
-worker-owned connections stay outside the wait. The array uses 648 bytes on
+the read end, up to 16 listeners and 96 connections. Polling borrows the original sockets, and
+worker-owned connections stay outside the wait. The array uses 904 bytes on
 the supported 64-bit targets.
 
 Each live PostgreSQL driver uses three descriptors: its connected TCP or
@@ -46,6 +46,7 @@ changing that validator requires an explicit atomic implementation update.
 | --- | ---: | ---: | ---: |
 | SMTP slots | 32 | 377088 | 12066816 |
 | HTTPS slots | 16 | 1703936 | 27262976 |
+| HTTPS event-stream slots | 8 | 98304 | 786432 |
 | JMAP dispatch method heap | 3 | 2097152 | 6291456 |
 | Body/search jobs | 3 | 22298624 | 66895872 |
 | Storage read views | 6 | 1871872 | 11231232 |
@@ -60,7 +61,7 @@ changing that validator requires an explicit atomic implementation update.
 | Fixed worker stacks | 11 | 262144 | 2883584 |
 | Unix connector stacks | 8 | 262144 | 2097152 |
 | Main stack allowance | 1 | 1048576 | 1048576 |
-| TLS session headroom | 49 | 524288 | 25690112 |
+| TLS session headroom | 57 | 524288 | 29884416 |
 | TLS handshake headroom | 2 | 4194304 | 8388608 |
 | Established TLS processing | 3 | 4194304 | 12582912 |
 | Certificate generations | 2 | 8388608 | 16777216 |
@@ -71,10 +72,10 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
 | SMTP prepared body | 1 | 33816576 | 33816576 |
 | Upload ingress and retained body | 2 | 33816576 | 67633152 |
-| **Total** | | | **481623296** |
+| **Total** | | | **486604032** |
 
-The total is approximately 459.31 MiB against a 512 MiB configured budget;
-the remaining 55247616 bytes are unassigned headroom, not another cache.
+The total is approximately 464.06 MiB against a 512 MiB configured budget;
+the remaining 50266880 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent
@@ -96,25 +97,33 @@ bytes: the 1 MiB request, 32768 tokens at 16 bytes, 256 result entries at
 128 bytes and 96 KiB of scratch. The two 18437-byte TLS wire arrays and a
 16 KiB socket buffer, 53258 bytes, fit SMTP's I/O partition; with the 32 KiB
 head, 16 KiB input, 2 KiB event frame and 512-byte response head, 88586
-bytes, they fit the HTTPS scratch. The DATA buffers, body jobs, read views,
-workers, certificates and account metadata are fixed reservations; neither
-pool changes them.
+bytes, they fit the HTTPS scratch. An event stream never holds a request
+arena, so its slot reserves only that 96 KiB scratch: 98304 + 524288 =
+622592 bytes. Only `https_connections` connections can hold an ordinary
+request at once; a connection awaiting its first request in a stream slot
+holds no more than the scratch. A keep-alive connection that becomes a
+stream releases its earlier response, including a Session document of up
+to 32 KiB, and keeps only its 512-byte stream head. The DATA buffers, body jobs, read views,
+workers, certificates and account metadata are fixed reservations; no pool
+changes them.
 
 The default pools spend the unassigned headroom on idle capacity and keep
 at least one 32 MiB message buffer (33554432 bytes) unassigned. The fixed
 reservations plan 417127680 bytes. Thirty-two SMTP sessions add 32 × 901376
-= 28844032 bytes and sixteen HTTPS connections 16 × 2228224 = 35651584. The
-plan is 481623296 bytes and leaves 55247616 (about 52.69 MiB). The rule
-would admit up to 25 HTTPS connections; the
-pool stays at 16, since ordinary connections are authenticated clients
-served by at most three body workers. Four peer keys at the default two
+= 28844032 bytes, sixteen HTTPS connections 16 × 2228224 = 35651584 and
+eight event streams 8 × 622592 = 4980736. The plan is 486604032 bytes and
+leaves 50266880 (about 47.94 MiB). The rule would admit up to 23 HTTPS
+connections; the pool stays at 16, since ordinary connections are
+authenticated clients served by at most three body workers. Eight streams
+serve four td-mail processes at two each. Four peer keys at the default two
 sessions each hold 8 of the 32 SMTP slots, and filling the pool takes 16.
 
-The compiled maxima are 64 for each pool. Sixty-four SMTP sessions with
-every other default plan 510467328 bytes, inside the default budget.
-Sixty-four HTTPS connections plan 588578048 bytes: an operator raises
+The compiled maxima are 64 SMTP sessions, 64 ordinary HTTPS connections
+and 32 event streams. With every other default, 64 SMTP sessions plan
+515448064 bytes and 32 streams 501546240, inside the default budget.
+Sixty-four HTTPS connections plan 593558784 bytes: an operator raises
 `memory_budget_bytes` to that or shrinks the request arena (256 KiB of JSON
-and 4096 tokens plan 508886272 bytes). The maxima size the fixed readiness
+and 4096 tokens plan 513867008 bytes). The maxima size the fixed readiness
 array, guard arrays and HTTPS peer table, not a memory allowance.
 
 The generated Unicode arrays have a checked 58720-byte compiled payload.
@@ -3366,10 +3375,12 @@ retains the aggregate admission requirement.
 
 The mailbox-access profile adds fixed HTTPS network, TLS, authentication and
 body workers to the receiver/control threads. A startup vector contains at
-most https_connections mutex-protected slots (compiled maximum 64); each
+most `https_connections` plus `event_streams` mutex-protected slots
+(compiled maximum 96); each
 occupied slot holds two 18,437-byte TLS wire arrays, a 32 KiB request head,
-a 16 KiB plaintext input buffer, bounded response headers (under 512 bytes),
-an optional fixed 2 KiB event frame plus stream bookkeeping, deadlines and
+a 16 KiB plaintext input buffer, a response buffer (headers under 512
+bytes, or an ordinary response up to the Session document's 32 KiB, which
+becoming a stream releases), an optional fixed 2 KiB event frame plus stream bookkeeping, deadlines and
 transport state. The client also owns the bounded decoded credentials while
 authentication or body work needs them. Ordinary responses and EventSource
 clear both the credential head and decoded owner before retaining output;
@@ -3393,11 +3404,12 @@ plus these TLS workers; this is not a measured stack/RSS guarantee. Each nonbloc
 one head turn or advances one bounded response. The network thread admits
 origin/rate checks and hands credential lookup to the fixed authentication
 worker. The current local backend tries its registry mutex there and performs
-no credential file I/O. A network-owned 64-entry peer table avoids locking TLS slots for admission;
+no credential file I/O. A network-owned 96-entry peer table avoids locking TLS slots for admission;
 a retired slot can retain its old peer charge until the next scan. The
-per-peer limit leaves at least one slot for another peer in a pool of
-two or more. At the default size, one IPv4 address or IPv6 /64 can use
-fifteen of the sixteen slots. Mapped IPv4 shares its IPv4 allowance.
+per-peer limit leaves at least one slot and one ordinary admission for
+another peer whenever the pool and the ordinary budget allow two. At the
+default size, one IPv4 address or IPv6 /64 can use fifteen of the 24
+slots. Mapped IPv4 shares its IPv4 allowance.
 Transient accept resource failures back off for five seconds. Session slots
 are the completion storage; no unbounded work queue or per-client thread exists.
 An HTTP connection admits at most 32 requests under its original absolute

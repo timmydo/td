@@ -568,7 +568,7 @@ configured account and HTTPS origin. Its request/upload byte, method and
 object limits come from the validated ResourcePlan. The caller supplies the
 actual upload/API concurrency admission counts as named Concurrency fields,
 retained for runtime inspection, each nonzero and no greater
-than the HTTPS pool. Construction does not prove those admissions exist and
+than the ordinary `https_connections` budget. Construction does not prove those admissions exist and
 does not authenticate or activate discovery: the runtime must enforce the
 same counts and finish the advertised Core contract before serving it.
 
@@ -589,8 +589,8 @@ success. HTTP authentication, cache-control, worker handoff and Core endpoint
 activation remain separate; discovery must not expose this preparation early.
 
 Session concurrency limits are per endpoint, not additive reservations of
-connection slots. The runtime also applies its shared HTTPS pool and event
-stream ceiling; simultaneous traffic can exhaust that shared capacity.
+connection slots. The runtime also applies its ordinary-connection and
+separate event-stream budgets; simultaneous traffic can exhaust either.
 The prepared document retains its bounded 32 KiB allocation and should be
 shared for the selected configuration, rather than rebuilt per connection.
 A multi-account profile retains one document per account (at most sixteen).

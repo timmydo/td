@@ -54,8 +54,10 @@ Five processes use the selected MTA executable:
 - `td-mta-acme-production.service`: certificate issuance/renewal for all three MX names.
 
 On claw1 the selected frontend profile sets `event_streams = 4` in
-`[limits]`. Push can occupy four of the frontend's `https_connections`,
-which default to sixteen. Each graphical
+`[limits]`: four stream slots of their own, beside the frontend's
+`https_connections` for ordinary requests, which default to sixteen. The
+default is eight streams; selecting a configuration without the setting
+adopts it. Each graphical
 td-mail process opens one stream per eligible watched account, up to two
 streams per process. Change this host setting through the versioned
 [configuration selection procedure](POSTGRES.md#configuration-selection-commands).
@@ -69,6 +71,10 @@ credentials, compare its `http_auth_refused` counters in
 cause. An increase in `calls` means the frontend refused at least one
 pre-authentication attempt during the interval. That attempt could belong
 to another client. Lost observations leave the cause uncertain.
+An ordinary request refused with 429 before authentication, on any
+target, means all `https_connections` ordinary admissions were held; its
+log record is a capacity `AdmissionRefused`. Event streams never hold
+ordinary admissions.
 
 The inbound SMTP listener permits eight simultaneous sessions, so four peer
 keys at two sessions each can hold all of them. The listener's explicit

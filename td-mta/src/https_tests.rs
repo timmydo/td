@@ -16,6 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 struct Now(Instant, AtomicU64);
+fn now() -> Arc<Now> {
+    Arc::new(Now(Instant::now(), AtomicU64::new(0)))
+}
 impl Clock for Now {
     fn sample(&self) -> Result<Time, Error> {
         Ok(Time {
@@ -40,7 +43,7 @@ fn wait(mut test: impl FnMut() -> bool) {
 fn client(
     address: std::net::SocketAddr,
     lease: &GenerationLease<TlsPolicies>,
-    clock: Arc<dyn Clock>,
+    clock: &Arc<Now>,
 ) -> TlsConnection<Box<[u8; TLS_WIRE_BYTES]>> {
     let pool = HandshakePool::new(1).unwrap();
     let (input, output) = buffers();
@@ -60,7 +63,7 @@ fn client(
         .handoff(
             TcpTransport::from_stream(TcpStream::connect(address).unwrap()).unwrap(),
             &[],
-            clock,
+            Arc::<Now>::clone(clock),
             absolute,
             cap,
         )
@@ -85,6 +88,11 @@ fn send(client: &mut (impl Transport + ?Sized), request: &[u8]) {
 }
 fn request(client: &mut impl Transport, request: &[u8]) -> String {
     send(client, request);
+    head(client)
+}
+/// Reads through the end of a response head; an event stream's first event
+/// may follow in the same read.
+fn head(client: &mut impl Transport) -> String {
     let mut reply = Vec::new();
     let mut scratch = [0; 1024];
     wait(|| {
@@ -93,9 +101,21 @@ fn request(client: &mut impl Transport, request: &[u8]) -> String {
             IoProgress::Pending => (),
             IoProgress::Closed => panic!("HTTPS closed before response"),
         }
-        reply.ends_with(b"\r\n\r\n")
+        reply.windows(4).any(|w| w == b"\r\n\r\n")
     });
     String::from_utf8(reply).unwrap()
+}
+fn basic_authorization(password: &[u8]) -> String {
+    base64(&[b"private-user:".as_slice(), password].concat())
+}
+fn local_origin(address: std::net::SocketAddr) -> String {
+    format!("https://localhost:{}", address.port())
+}
+/// The shared fixture configuration, served at this listener's address.
+fn local_source(address: std::net::SocketAddr, origin_text: &str) -> String {
+    source(false)
+        .replace("https://localhost", origin_text)
+        .replace("127.0.0.1:443", &address.to_string())
 }
 fn base64(bytes: &[u8]) -> String {
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -130,7 +150,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
             &mut td_crypto::SystemEntropy::try_new().unwrap(),
         )
         .unwrap();
-    let authorization = base64(&[b"private-user:".as_slice(), password.expose()].concat());
+    let authorization = basic_authorization(password.expose());
     let mut incorrect = password.expose().to_vec();
     let last = incorrect.last_mut().unwrap();
     *last = if *last == b'0' { b'1' } else { b'0' };
@@ -191,10 +211,8 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
     let material = Material::new();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
-    let origin_text = format!("https://localhost:{}", address.port());
-    let source = source(false)
-        .replace("https://localhost", &origin_text)
-        .replace("127.0.0.1:443", &address.to_string());
+    let origin_text = local_origin(address);
+    let source = local_source(address, &origin_text);
     let lease = material.published(&source);
     let resolved = resolved(&source);
     let resource = Limits {
@@ -209,7 +227,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
     let timeouts = NetworkLimits::default().plan(&admission).unwrap();
-    let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
+    let clock = now();
     let handshakes = HandshakePool::new(2).unwrap();
     let ready = AtomicBool::new(false);
     let control = Control::default();
@@ -268,7 +286,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 let mut stalled = TcpStream::connect(address).unwrap();
                 stalled.write_all(&[22]).unwrap();
                 wait(|| handshakes.available() == 1);
-                let mut alongside = client(address, &lease, clock.clone());
+                let mut alongside = client(address, &lease, &clock);
                 alongside.abort();
                 clock.1.fetch_add(61_000, Ordering::Relaxed);
                 wait(|| handshakes.available() == 2);
@@ -287,7 +305,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     drop((first, second));
                 });
                 let tls_before = crate::performance::snapshot(crate::performance::Phase::HttpTls).unwrap();
-                let mut queued = client(address, &lease, clock.clone());
+                let mut queued = client(address, &lease, &clock);
                 queued.abort();
                 release.join().unwrap();
                 std::thread::sleep(Duration::from_millis(50));
@@ -329,7 +347,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 let host = format!("localhost:{}", address.port());
                 // Refuse misdirected traffic even while credential publication holds the lock.
                 let registry = devices.lock().unwrap();
-                let mut wire = client(address, &lease, clock.clone());
+                let mut wire = client(address, &lease, &clock);
                 let head = "GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n";
                 assert!(request(&mut wire, head.as_bytes()).starts_with("HTTP/1.1 421 "));
                 wire.abort();
@@ -341,14 +359,14 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 authentication.armed.store(true, Ordering::Release);
                 let reply = std::thread::scope(|waiting_scope| {
                     let waiting = waiting_scope.spawn(|| {
-                        let mut wire = client(address, &lease, clock.clone());
+                        let mut wire = client(address, &lease, &clock);
                         let head = format!("GET / HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\n\r\n");
                         request(&mut wire, head.as_bytes())
                     });
                     wait(|| authentication.entered.load(Ordering::Acquire));
                     // A blocked credential backend cannot stall handshakes or
                     // the reactor's origin refusal for another client.
-                    let mut other = client(address, &lease, clock.clone());
+                    let mut other = client(address, &lease, &clock);
                     assert!(request(&mut other, b"GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n").starts_with("HTTP/1.1 421 "));
                     other.abort();
                     authentication.released.store(true, Ordering::Release);
@@ -360,7 +378,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 std::thread::sleep(Duration::from_millis(20));
                 // The late body arrives after the server has sent its refusal and close_notify.
                 clock.1.fetch_add(2_000, Ordering::Relaxed);
-                let mut post = client(address, &lease, clock.clone());
+                let mut post = client(address, &lease, &clock);
                 let body = "x".repeat(32 * 1024);
                 // Leave one byte outstanding so the peer is still draining when
                 // this client sends close_notify. A complete frame releases its slot.
@@ -374,8 +392,8 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 // Two unfinished bodies plus idle peers fill the cap. A trickle must not
                 // renew the shared close/drain deadline when the fake clock advances.
                 clock.1.fetch_add(2_000, Ordering::Relaxed);
-                let mut silent = client(address, &lease, clock.clone());
-                let mut trickle = client(address, &lease, clock.clone());
+                let mut silent = client(address, &lease, &clock);
+                let mut trickle = client(address, &lease, &clock);
                 let head = format!("POST /jmap HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\nContent-Length: 65536\r\n\r\n");
                 assert!(request(&mut silent, head.as_bytes()).starts_with("HTTP/1.1 404 "));
                 assert!(request(&mut trickle, head.as_bytes()).starts_with("HTTP/1.1 404 "));
@@ -394,7 +412,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 std::thread::sleep(Duration::from_millis(50));
                 clock.1.fetch_add(1_001, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(50));
-                let mut released = client(address, &lease, clock.clone());
+                let mut released = client(address, &lease, &clock);
                 released.abort();
                 drop((silent, trickle, refused, post, idle));
                 std::thread::sleep(Duration::from_millis(20));
@@ -456,7 +474,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     clock.1.fetch_add(2_000, Ordering::Relaxed);
                     let head =
                         format!("GET {target} HTTP/1.1\r\nHost: {authority}\r\n{fields}\r\n");
-                    let mut wire = client(address, &lease, clock.clone());
+                    let mut wire = client(address, &lease, &clock);
                     let reply = request(&mut wire, head.as_bytes());
                     assert!(reply.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
                     assert!(reply.contains("Connection: close\r\n"));
@@ -468,15 +486,15 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 devices.lock().unwrap().revoke(id, 2).unwrap();
-                let mut wire = client(address, &lease, clock.clone());
+                let mut wire = client(address, &lease, &clock);
                 let head = format!(
                 "GET / HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\n\r\n"
             );
                 assert!(request(&mut wire, head.as_bytes()).starts_with("HTTP/1.1 401 "));
                 wire.abort();
                 std::thread::sleep(Duration::from_millis(20));
-                let mut idle = client(address, &lease, clock.clone());
-                let mut active = client(address, &lease, clock.clone());
+                let mut idle = client(address, &lease, &clock);
+                let mut active = client(address, &lease, &clock);
                 let head = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
                 assert!(request(&mut active, head.as_bytes()).starts_with("HTTP/1.1 401 "));
                 clock.1.fetch_add(31_000, Ordering::Relaxed);
@@ -538,15 +556,13 @@ fn stopped_upload_receipt(late: Option<bool>) {
     let (_, password) = devices
         .create("late", 1, &mut td_crypto::SystemEntropy::try_new().unwrap())
         .unwrap();
-    let authorization = base64(&[b"private-user:".as_slice(), password.expose()].concat());
+    let authorization = basic_authorization(password.expose());
     let devices = Mutex::new(devices);
     let material = Material::new();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
-    let origin_text = format!("https://localhost:{}", address.port());
-    let source = source(false)
-        .replace("https://localhost", &origin_text)
-        .replace("127.0.0.1:443", &address.to_string());
+    let origin_text = local_origin(address);
+    let source = local_source(address, &origin_text);
     let lease = material.published(&source);
     let resolved = resolved(&source);
     let resource = Limits::default().plan().unwrap();
@@ -554,7 +570,7 @@ fn stopped_upload_receipt(late: Option<bool>) {
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
     let timeouts = NetworkLimits::default().plan(&admission).unwrap();
-    let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
+    let clock = now();
     let late = Late(&clock, late);
     let ready = AtomicBool::new(false);
     let control = Control::default();
@@ -584,7 +600,7 @@ fn stopped_upload_receipt(late: Option<bool>) {
                 let worker = scope.spawn(|| server.run(&control));
                 let _stop = Stop(&control);
                 wait(|| ready.load(Ordering::Acquire));
-                let mut wire = client(address, &lease, clock.clone());
+                let mut wire = client(address, &lease, &clock);
                 let mut account_bytes = [0; crate::wire::IdKind::WIRE_BYTES];
                 let account_text = crate::wire::encode_id(account, &mut account_bytes).unwrap();
                 let head = format!(
@@ -609,7 +625,7 @@ fn stopped_upload_receipt(late: Option<bool>) {
                 if late.1.is_none() {
                     assert!(!control.stop_requested());
                     assert!(!worker.is_finished());
-                    let mut next = client(address, &lease, clock.clone());
+                    let mut next = client(address, &lease, &clock);
                     send(&mut next, head.as_bytes());
                     wait(|| match next.read(&mut bytes) {
                         Ok(IoProgress::Pending) => false,
@@ -696,15 +712,13 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
     let (_, password) = devices
         .create("late", 1, &mut td_crypto::SystemEntropy::try_new().unwrap())
         .unwrap();
-    let authorization = base64(&[b"private-user:".as_slice(), password.expose()].concat());
+    let authorization = basic_authorization(password.expose());
     let devices = Mutex::new(devices);
     let material = Material::new();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
-    let origin_text = format!("https://localhost:{}", address.port());
-    let source = source(false)
-        .replace("https://localhost", &origin_text)
-        .replace("127.0.0.1:443", &address.to_string());
+    let origin_text = local_origin(address);
+    let source = local_source(address, &origin_text);
     let lease = material.published(&source);
     let resolved = resolved(&source);
     let resource = Limits {
@@ -717,7 +731,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
     let timeouts = NetworkLimits::default().plan(&admission).unwrap();
-    let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
+    let clock = now();
     let late = Script {
         mode: AtomicU64::new(0),
         entered: AtomicBool::new(false),
@@ -759,13 +773,13 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                     "11".repeat(16),
                     address.port()
                 );
-                let mut first = client(address, &lease, clock.clone());
+                let mut first = client(address, &lease, &clock);
                 send(&mut first, get.as_bytes());
                 assert_eq!(upload_reply(&mut first).0, 503);
                 first.abort();
                 std::thread::sleep(Duration::from_millis(30));
                 late.mode.store(1, Ordering::Release);
-                let mut broken = client(address, &lease, clock.clone());
+                let mut broken = client(address, &lease, &clock);
                 send(&mut broken, get.as_bytes());
                 let mut received = Vec::new();
                 let mut bytes = [0; 1024];
@@ -783,11 +797,11 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 );
                 std::thread::sleep(Duration::from_millis(30));
                 late.mode.store(2, Ordering::Release);
-                let mut blocked = client(address, &lease, clock.clone());
+                let mut blocked = client(address, &lease, &clock);
                 send(&mut blocked, get.as_bytes());
                 wait(|| late.entered.load(Ordering::Acquire));
                 let busy_before = crate::performance::snapshot(crate::performance::Phase::HttpBodyBusy).unwrap();
-                let mut upload = client(address, &lease, clock.clone());
+                let mut upload = client(address, &lease, &clock);
                 let post = format!(
                     "POST /jmap/upload/{account} HTTP/1.1\r\nHost: localhost:{}\r\n\
                      Authorization: Basic {authorization}\r\nContent-Length: 0\r\n\r\n",
@@ -803,7 +817,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                      Authorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
                     address.port()
                 );
-                let mut api = client(address, &lease, clock.clone());
+                let mut api = client(address, &lease, &clock);
                 send(&mut api, api_head.as_bytes());
                 let refused = full_reply(&mut api);
                 assert_eq!(refused.0, 429);
@@ -816,11 +830,11 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 clock.1.fetch_add(1_001, Ordering::Relaxed);
                 late.entered.store(false, Ordering::Release);
                 late.release.store(false, Ordering::Release);
-                let mut api = client(address, &lease, clock.clone());
+                let mut api = client(address, &lease, &clock);
                 send(&mut api, api_head.as_bytes());
                 wait(|| late.entered.load(Ordering::Acquire));
                 for request in [&get, &post, &api_head] {
-                    let mut other = client(address, &lease, clock.clone());
+                    let mut other = client(address, &lease, &clock);
                     send(&mut other, request.as_bytes());
                     let refused = full_reply(&mut other);
                     assert_eq!(refused.0, 429);
@@ -831,7 +845,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 assert_eq!(busy_after.calls - busy_before.calls, 5);
                 assert_eq!(busy_after.busy - busy_before.busy, 5);
                 assert_eq!(busy_after.total_us, 0);
-                let mut abandoned = client(address, &lease, clock.clone());
+                let mut abandoned = client(address, &lease, &clock);
                 send(&mut abandoned, api_head.as_bytes());
                 wait(|| crate::performance::snapshot(crate::performance::Phase::HttpBodyBusy)
                     .is_some_and(|sample| sample.calls == busy_after.calls + 1));
@@ -841,7 +855,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 wait(|| matches!(api.read(&mut bytes), Ok(IoProgress::Closed) | Err(_)));
                 std::thread::sleep(Duration::from_millis(30));
                 late.mode.store(0, Ordering::Release);
-                let mut again = client(address, &lease, clock.clone());
+                let mut again = client(address, &lease, &clock);
                 send(&mut again, get.as_bytes());
                 assert_eq!(upload_reply(&mut again).0, 503);
                 again.abort();
@@ -849,7 +863,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 late.entered.store(false, Ordering::Release);
                 late.release.store(false, Ordering::Release);
                 late.mode.store(2, Ordering::Release);
-                let mut shutdown = client(address, &lease, clock.clone());
+                let mut shutdown = client(address, &lease, &clock);
                 send(&mut shutdown, get.as_bytes());
                 wait(|| late.entered.load(Ordering::Acquire));
                 drop(stop);
@@ -1063,7 +1077,7 @@ fn account_origin_upload_policy(first_read_only: bool) {
     let material = Material::with_names(&["localhost", "alias.test"]);
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
-    let origin_text = format!("https://localhost:{}", address.port());
+    let origin_text = local_origin(address);
     let alias_text = format!("https://alias.test:{}", address.port());
     let source = source(false)
         .replace(
@@ -1088,7 +1102,7 @@ fn account_origin_upload_policy(first_read_only: bool) {
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
     let timeouts = NetworkLimits::default().plan(&admission).unwrap();
-    let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
+    let clock = now();
     let ready = AtomicBool::new(false);
     let control = Control::default();
     let handshakes = HandshakePool::new(2).unwrap();
@@ -1139,7 +1153,7 @@ fn account_origin_upload_policy(first_read_only: bool) {
             let discovery = |username: &str, password: &str, host: &str| {
                 request("/.well-known/jmap", username, password, host)
             };
-            let mut peer = client(address, &lease, clock.clone());
+            let mut peer = client(address, &lease, &clock);
             let pipeline = discovery("first", "first-password", "localhost")
                 + &discovery("second", "second-password", "alias.test");
             send(&mut peer, pipeline.as_bytes());
@@ -1157,7 +1171,7 @@ fn account_origin_upload_policy(first_read_only: bool) {
             drop(peer);
             // Successful authentication refunds per-peer admission; the request
             // count still retires this connection after its thirty-second response.
-            let mut peer = client(address, &lease, clock.clone());
+            let mut peer = client(address, &lease, &clock);
             for index in 1..=32 {
                 clock.1.fetch_add(1_000, Ordering::Relaxed);
                 send(&mut peer, discovery("first", "first-password", "localhost").as_bytes());
@@ -1167,7 +1181,7 @@ fn account_origin_upload_policy(first_read_only: bool) {
             }
             wait(|| matches!(peer.read(&mut [0]), Ok(IoProgress::Closed) | Err(_)));
             drop(peer);
-            let mut peer = client(address, &lease, clock.clone());
+            let mut peer = client(address, &lease, &clock);
             send(&mut peer, discovery("first", "first-password", "localhost").as_bytes());
             assert_eq!(full_reply(&mut peer).0, 200);
             std::thread::sleep(Duration::from_millis(50));
@@ -1183,7 +1197,7 @@ fn account_origin_upload_policy(first_read_only: bool) {
             ] {
                 let before = expected.api_calls.load(Ordering::Acquire);
                 let authorization = base64(format!("{username}:{password}").as_bytes());
-                let mut peer = client(address, client_lease, clock.clone());
+                let mut peer = client(address, client_lease, &clock);
                 send(&mut peer, format!("POST /jmap/api HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}", address.port()).as_bytes());
                 let (status, _, body) = full_reply(&mut peer);
                 assert_eq!(status, 200);
@@ -1198,7 +1212,7 @@ fn account_origin_upload_policy(first_read_only: bool) {
             ] {
                 std::thread::sleep(Duration::from_millis(250));
                 let authorization = base64(format!("{username}:{password}").as_bytes());
-                let mut peer = client(address, client_lease, clock.clone());
+                let mut peer = client(address, client_lease, &clock);
                 send(&mut peer, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
                 let (status, _, body) = full_reply(&mut peer);
                 assert_eq!(status, 200);
@@ -1216,20 +1230,20 @@ fn account_origin_upload_policy(first_read_only: bool) {
                 drop(peer);
                 for (target, expected) in [(other, 404), (own, if first_read_only && username == "first" { 403 } else { 200 })] {
                     std::thread::sleep(Duration::from_millis(250));
-                    let mut peer = client(address, client_lease, clock.clone());
+                    let mut peer = client(address, client_lease, &clock);
                     send(&mut peer, format!("POST /jmap/upload/{target} HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n", address.port()).as_bytes());
                     assert_eq!(full_reply(&mut peer).0, expected);
                 }
             }
             }
-            let mut event_client = client(address, &lease, Arc::<Now>::clone(&clock));
+            let mut event_client = client(address, &lease, &clock);
             let event_request = request("/jmap/events?types=Mailbox&closeafter=state&ping=0", "first", "first-password", "localhost");
             send(&mut event_client, event_request.as_bytes());
             assert_eq!(full_reply(&mut event_client).0, 503);
             assert_ne!(first.session.state().unwrap(), first_alias.session.state().unwrap());
             for (host, origin, expected) in [("unlisted.test", &origin_text, 421), ("alias.test", &origin_text, 403), ("localhost", &alias_text, 403)] {
                 std::thread::sleep(Duration::from_millis(250));
-                let mut peer = client(address, &lease, clock.clone());
+                let mut peer = client(address, &lease, &clock);
                 let authorization = base64(b"first:first-password");
                 send(&mut peer, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: {host}:{}\r\nOrigin: {origin}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
                 assert_eq!(full_reply(&mut peer).0, expected);
@@ -1330,15 +1344,13 @@ fn exercise_body_pool(transfers: u64) {
             &mut td_crypto::SystemEntropy::try_new().unwrap(),
         )
         .unwrap();
-    let authorization = base64(&[b"private-user:".as_slice(), password.expose()].concat());
+    let authorization = basic_authorization(password.expose());
     let devices = Mutex::new(devices);
     let material = Material::new();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
-    let origin_text = format!("https://localhost:{}", address.port());
-    let source = source(false)
-        .replace("https://localhost", &origin_text)
-        .replace("127.0.0.1:443", &address.to_string());
+    let origin_text = local_origin(address);
+    let source = local_source(address, &origin_text);
     let lease = material.published(&source);
     let resolved = resolved(&source);
     let resource = Limits {
@@ -1352,7 +1364,7 @@ fn exercise_body_pool(transfers: u64) {
         .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
         .unwrap();
     let timeouts = NetworkLimits::default().plan(&admission).unwrap();
-    let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
+    let clock = now();
     let backend = Parallel {
         entered: AtomicU64::new(0),
         release: AtomicBool::new(false),
@@ -1380,25 +1392,25 @@ fn exercise_body_pool(transfers: u64) {
             let api = format!("POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n", address.port());
             let mut downloads = Vec::new();
             for count in 1..=transfers {
-                let mut download = client(address, &lease, clock.clone());
+                let mut download = client(address, &lease, &clock);
                 send(&mut download, get.as_bytes());
                 wait(|| backend.entered.load(Ordering::Acquire) == count);
                 downloads.push(download);
             }
-            let mut excess_transfer = client(address, &lease, clock.clone());
+            let mut excess_transfer = client(address, &lease, &clock);
             send(&mut excess_transfer, get.as_bytes());
             assert_eq!(full_reply(&mut excess_transfer).0, 429);
             excess_transfer.abort();
             backend.fail_next.store(true, Ordering::Release);
-            let mut failed = client(address, &lease, clock.clone());
+            let mut failed = client(address, &lease, &clock);
             send(&mut failed, api.as_bytes());
             assert_eq!(full_reply(&mut failed).0, 503);
             let mut scratch = [0; 1024];
             wait(|| matches!(failed.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
-            let mut second = client(address, &lease, clock.clone());
+            let mut second = client(address, &lease, &clock);
             send(&mut second, api.as_bytes());
             wait(|| backend.entered.load(Ordering::Acquire) == transfers + 1);
-            let mut full = client(address, &lease, clock.clone());
+            let mut full = client(address, &lease, &clock);
             send(&mut full, api.as_bytes());
             assert_eq!(full_reply(&mut full).0, 429);
             full.abort();
@@ -1410,11 +1422,207 @@ fn exercise_body_pool(transfers: u64) {
             for connection in downloads.iter_mut().chain(std::iter::once(&mut second)) {
                 wait(|| matches!(connection.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
             }
-            let mut again = client(address, &lease, clock.clone());
+            let mut again = client(address, &lease, &clock);
             send(&mut again, get.as_bytes());
             assert_eq!(full_reply(&mut again).0, 200);
             assert_eq!(backend.entered.load(Ordering::Acquire), transfers + 2);
             wait(|| matches!(again.read(&mut scratch), Ok(IoProgress::Closed) | Err(_)));
+            drop(stop);
+            worker.join().unwrap().unwrap();
+        });
+    }).unwrap();
+}
+
+#[test]
+fn event_streams_at_their_cap_leave_ordinary_requests_admitted() {
+    push_budget(true);
+}
+
+#[test]
+fn ordinary_connections_at_their_cap_leave_push_admitted() {
+    push_budget(false);
+}
+
+/// Five ordinary admissions and three stream slots, served to two peers:
+/// IPv4 and IPv6 loopback, each limited to four connections (one fewer than
+/// the ordinary budget). Every refusal below is a budget's own 429.
+fn push_budget(streams_first: bool) {
+    struct Pushing<'a>(&'a Mutex<TestCredentials>);
+    impl http_auth::Authenticator for Pushing<'_> {
+        fn observe_events(
+            &self,
+            principal: http_auth::Principal,
+            _: http_auth::EventCredential<&[u8]>,
+            _: Deadline,
+        ) -> Result<http_auth::EventObservation, Error> {
+            Ok(http_auth::EventObservation {
+                identity: crate::ports::ViewIdentity {
+                    account: principal.account,
+                    epoch: crate::ids::StoreEpoch::from_bytes([2; 16]),
+                    committed_sequence: crate::format::Sequence::from_u64(3),
+                    history_floor: crate::format::Sequence::default(),
+                },
+                credential_stamp: [5; 32],
+            })
+        }
+        fn authenticate(
+            &self,
+            username: &str,
+            password: &[u8],
+            deadline: Deadline,
+        ) -> Result<Option<http_auth::Principal>, Error> {
+            http_auth::Authenticator::authenticate(self.0, username, password, deadline)
+        }
+    }
+    struct Backend(crate::jmap_session::Session);
+    impl crate::https_upload::Backend for Backend {
+        fn account(&self) -> AccountId {
+            AccountId::from_bytes([0xaa; 16])
+        }
+        fn session(&self) -> Option<&crate::jmap_session::Session> {
+            Some(&self.0)
+        }
+        fn event_snapshot(
+            &self,
+            identity: crate::ports::ViewIdentity,
+        ) -> Result<crate::jmap_events::Snapshot, Error> {
+            crate::jmap_events::Snapshot::mail(identity, false, None)
+        }
+        fn receive(
+            &self,
+            _: crate::https_upload::Request<'_>,
+            _: &mut dyn Transport,
+            _: &Control,
+        ) -> Result<crate::https_upload::Response, Error> {
+            Err(Error::Invalid)
+        }
+    }
+    let _serial = serial();
+    let mut devices = TestCredentials::new(AccountId::from_bytes([0xaa; 16]));
+    let (_, password) = devices
+        .create("push", 1, &mut td_crypto::SystemEntropy::try_new().unwrap())
+        .unwrap();
+    let authorization = basic_authorization(password.expose());
+    let devices = Mutex::new(devices);
+    let authentication = Pushing(&devices);
+    let material = Material::new();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    // Every HTTPS listener shares the origin's port.
+    let socket6 = TcpListener::bind(("::1", address.port())).unwrap();
+    let address6 = socket6.local_addr().unwrap();
+    let origin_text = local_origin(address);
+    let source = local_source(address, &origin_text)
+        + &format!("[listener \"https6\"]\nkind = \"https\"\nbind = \"{address6}\"\ncertificate = \"public\"\n");
+    let lease = material.published(&source);
+    let resolved = resolved(&source);
+    let resource = Limits {
+        https_connections: 5,
+        event_streams: 3,
+        ..Limits::default()
+    }
+    .plan()
+    .unwrap();
+    let admission = DiskLimits::default()
+        .plan(&resource, WorkLimits::default(), ViewMode::OnlineBackground)
+        .unwrap();
+    let timeouts = NetworkLimits::default().plan(&admission).unwrap();
+    let clock = now();
+    let backend = Backend(
+        crate::jmap_session::Session::mail_submission(
+            Origin::parse(&origin_text).unwrap(),
+            crate::config::identities::AccountView {
+                id: AccountId::from_bytes([0xaa; 16]),
+                username: "private-user",
+                name: "private-user",
+            },
+            &resource,
+            crate::jmap_session::Concurrency {
+                uploads: 1,
+                requests: resource.https_body_workers(),
+            },
+        )
+        .unwrap(),
+    );
+    let ready = AtomicBool::new(false);
+    let control = Control::default();
+    let handshakes = HandshakePool::new(2).unwrap();
+    resolved.candidate().with_graph(|records, graph| {
+        let rows = records.view(graph).unwrap().listeners().unwrap();
+        let row = |bind| (0..rows.len()).filter_map(|i| rows.listener(i).unwrap()).find(|r| r.kind == Kind::Https && r.bind.tcp() == Some(bind)).unwrap();
+        let listeners = [
+            BoundListener::new(socket, row(address), &lease).unwrap(),
+            BoundListener::new(socket6, row(address6), &lease).unwrap(),
+        ];
+        let server = Https {
+            backends: &[&backend], listeners: &listeners, policies: &lease,
+            handshakes: &handshakes, authentication: &authentication,
+            origins: &[Origin::parse(&origin_text).unwrap()], resources: &resource,
+            timeouts: &timeouts, clock: clock.clone(), ready: &ready,
+        };
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| server.run(&control));
+            let stop = Stop(&control);
+            wait(|| ready.load(Ordering::Acquire));
+            let get = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port());
+            let events = get("/jmap/events?types=Mailbox&closeafter=no&ping=0");
+            let discovery = get("/.well-known/jmap");
+            let open_stream = |at| {
+                let mut stream = client(at, &lease, &clock);
+                let head = request(&mut stream, events.as_bytes());
+                assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+                assert!(head.contains("text/event-stream"), "{head}");
+                stream
+            };
+            let ordinary = |at| {
+                let mut peer = client(at, &lease, &clock);
+                send(&mut peer, discovery.as_bytes());
+                let (status, head, _) = full_reply(&mut peer);
+                (peer, status, head)
+            };
+            let admitted = |at| {
+                let (peer, status, head) = ordinary(at);
+                assert_eq!(status, 200);
+                assert!(head.contains("Connection: keep-alive"));
+                peer
+            };
+            let served = |peer: &mut _| {
+                send(peer, discovery.as_bytes());
+                assert_eq!(full_reply(peer).0, 200);
+            };
+            if streams_first {
+                let _streams = [(); 3].map(|()| open_stream(address));
+                // Every ordinary admission is still available beside them.
+                let mut first = admitted(address);
+                let mut others = [(); 4].map(|()| admitted(address6));
+                // A fourth stream meets its own budget on a keep-alive connection.
+                let [rest @ .., last] = &mut others;
+                send(last, events.as_bytes());
+                let (status, head, _) = full_reply(last);
+                assert_eq!(status, 429);
+                assert!(head.contains("Retry-After: 1"));
+                served(&mut first);
+                for peer in rest {
+                    served(peer);
+                }
+            } else {
+                let mut held = [(); 4].map(|()| admitted(address));
+                let mut promoted = admitted(address6);
+                // Every ordinary admission is held; the keep-alive connection
+                // still becomes a stream and hands its admission back.
+                let head = request(&mut promoted, events.as_bytes());
+                assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+                assert!(head.contains("text/event-stream"), "{head}");
+                let mut released = admitted(address6);
+                let _stream = open_stream(address6);
+                let (_, status, head) = ordinary(address6);
+                assert_eq!(status, 429);
+                assert!(head.contains("Retry-After: 1"));
+                served(&mut released);
+                for peer in &mut held {
+                    served(peer);
+                }
+            }
             drop(stop);
             worker.join().unwrap().unwrap();
         });

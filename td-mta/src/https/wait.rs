@@ -95,12 +95,12 @@ pub(super) fn wait(
     accept_after: Tick,
     clock: &dyn crate::ports::Clock,
 ) -> Result<(), Error> {
-    use crate::limits::MAX_HTTPS_CONNECTIONS;
+    use crate::limits::MAX_HTTPS_SLOTS;
     // Network-owned guards pin their transports while ppoll borrows the fds.
     // Worker-owned slots stay unlocked for all database, TLS and body work.
     let started = Instant::now();
     let time = clock.sample()?;
-    let mut guards = [const { None }; MAX_HTTPS_CONNECTIONS];
+    let mut guards = [const { None }; MAX_HTTPS_SLOTS];
     let mut free = false;
     // Wall-clock changes can invalidate a listening certificate. Its boundary
     // has whole-second precision. Traffic and stop always wake earlier.

@@ -670,7 +670,7 @@ closes, and idle reuse expires. The native fixture also pipelines a real API
 body (counted or chunked) followed by discovery, a complete JMAP problem
 followed by discovery, and a raw download followed by discovery, checking
 response boundaries and downloaded bytes against PostgreSQL. With fifteen
-IPv6 connections from one address, the default pool minus one, the next
+IPv6 connections from one address, the default ordinary budget minus one, the next
 connection from that address is refused
 and an IPv4 client completes authenticated session discovery. Four idle
 persistent API connections prove the three body permits are released. Parser backing

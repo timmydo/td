@@ -4,6 +4,11 @@ use std::fmt;
 // RESOURCES.md derives these pools from the per-slot reservations below.
 pub(crate) const MAX_SMTP_SESSIONS: usize = 64;
 pub(crate) const MAX_HTTPS_CONNECTIONS: usize = 64;
+pub(crate) const MAX_EVENT_STREAMS: usize = 32;
+/// Ordinary HTTPS connections and push streams have separate slots.
+pub(crate) const MAX_HTTPS_SLOTS: usize = MAX_HTTPS_CONNECTIONS + MAX_EVENT_STREAMS;
+/// A push stream holds TLS wire arrays, head, input and its frame, never a request arena.
+pub const EVENT_STREAM_SLOT_BYTES: usize = 96 * KIB;
 
 pub const KIB: usize = 1024;
 pub const MIB: usize = 1024 * KIB;
@@ -157,7 +162,7 @@ limits! {
         smtp_per_peer: 2, 1, 32;
         https_connections: 16, 1, MAX_HTTPS_CONNECTIONS;
         tls_handshakes: 2, 1, 8;
-        event_streams: 2, 0, 8;
+        event_streams: 8, 0, MAX_EVENT_STREAMS;
         body_jobs: 3, 1, 8;
         storage_views: 6, 1, 8;
         message_bytes: MAX_MESSAGE_BYTES, 1, MAX_MESSAGE_BYTES;
@@ -209,7 +214,7 @@ impl Reservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourcePlan {
     limits: Limits,
-    reservations: [Reservation; 27],
+    reservations: [Reservation; 28],
     total_bytes: usize,
     log_disk_bytes: usize,
 }
@@ -265,10 +270,6 @@ impl Limits {
                 "per-peer SMTP cap exceeds session pool",
             ),
             (
-                self.event_streams < self.https_connections,
-                "event streams must leave an HTTPS slot",
-            ),
-            (
                 self.header_bytes <= self.message_bytes,
                 "headers exceed message limit",
             ),
@@ -295,6 +296,7 @@ impl Limits {
             &[
                 self.smtp_sessions,
                 self.https_connections,
+                self.event_streams,
                 self.outbound_deliveries,
             ],
         )?;
@@ -336,6 +338,11 @@ impl Limits {
                     "https slot",
                     &[self.json_bytes, json_descriptors, response_ids, 96 * KIB],
                 )?,
+            },
+            Reservation {
+                name: "event stream slots",
+                count: self.event_streams,
+                bytes_each: EVENT_STREAM_SLOT_BYTES,
             },
             Reservation {
                 name: "JMAP method heap",
@@ -502,7 +509,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 481_623_296);
+        assert_eq!(plan.total_bytes(), 486_604_032);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -532,6 +539,7 @@ mod tests {
         };
         assert_eq!(slot("smtp slots")?, 901_376);
         assert_eq!(slot("https slots")?, 2_228_224);
+        assert_eq!(slot("event stream slots")?, 622_592);
         let headroom = plan.limits().memory_budget_bytes - plan.total_bytes();
         assert!(headroom >= MAX_MESSAGE_BYTES);
         // The SMTP maximum fits the default budget; the HTTPS maximum needs more
@@ -541,7 +549,7 @@ mod tests {
             ..Limits::default()
         }
         .plan()?;
-        assert_eq!(smtp.total_bytes(), 510_467_328);
+        assert_eq!(smtp.total_bytes(), 515_448_064);
         let https = Limits {
             https_connections: MAX_HTTPS_CONNECTIONS,
             ..Limits::default()
@@ -549,7 +557,7 @@ mod tests {
         assert_eq!(
             https.plan(),
             Err(ResourceError::MemoryBudget {
-                required: 588_578_048,
+                required: 593_558_784,
                 available: 512 * MIB,
             })
         );
@@ -559,7 +567,13 @@ mod tests {
             ..https
         }
         .plan()?;
-        assert_eq!(shrunk.total_bytes(), 508_886_272);
+        assert_eq!(shrunk.total_bytes(), 513_867_008);
+        let streams = Limits {
+            event_streams: MAX_EVENT_STREAMS,
+            ..Limits::default()
+        }
+        .plan()?;
+        assert_eq!(streams.total_bytes(), 501_546_240);
         Ok(())
     }
 
@@ -632,6 +646,13 @@ mod tests {
                     ..defaults
                 },
                 1_703_936 + 512 * KIB,
+            ),
+            (
+                Limits {
+                    event_streams: defaults.event_streams + 1,
+                    ..defaults
+                },
+                EVENT_STREAM_SLOT_BYTES + 512 * KIB,
             ),
             (
                 Limits {
@@ -773,12 +794,25 @@ mod tests {
             ..Limits::default()
         };
         assert!(matches!(limits.plan(), Err(ResourceError::Inconsistent(_))));
-        let limits = Limits {
-            https_connections: 8,
+        // Push streams no longer borrow ordinary HTTPS slots.
+        assert!(Limits {
+            https_connections: 1,
             event_streams: 8,
             ..Limits::default()
-        };
-        assert!(matches!(limits.plan(), Err(ResourceError::Inconsistent(_))));
+        }
+        .plan()
+        .is_ok());
+        assert!(matches!(
+            Limits {
+                event_streams: MAX_EVENT_STREAMS + 1,
+                ..Limits::default()
+            }
+            .plan(),
+            Err(ResourceError::OutOfRange {
+                field: "event_streams",
+                ..
+            })
+        ));
         let limits = Limits {
             memory_budget_bytes: MIB,
             ..Limits::default()

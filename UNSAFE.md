@@ -3697,8 +3697,9 @@ The library denies `unsafe_code`. Its single function-scoped exception,
 `readiness_sys::ppoll`, invokes Linux `ppoll` (271 on x86-64, 73 on
 aarch64). Each eight-byte C-layout pollfd holds a transparent
 `BorrowedFd` and two 16-bit event fields. HTTPS and direct SMTP each admit
-at most 81 entries: one private Unix wake receiver, up to 16 listeners
-and up to 64 connected sockets. SMTP borrows TCP sockets. HTTPS also
+at most 113 entries: one private Unix wake receiver, up to 16 listeners
+and up to 96 connected sockets, 64 ordinary HTTPS connections and 32 event
+streams; SMTP uses at most 64 of them. SMTP borrows TCP sockets. HTTPS also
 admits Unix sockets. The ACME HTTP-01 responder borrows a private stop
 receiver, at most one TCP listener and up to eight connected TCP sockets.
 Only connected sockets can request writable

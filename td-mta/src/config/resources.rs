@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(actual.timeouts().execution_seconds(), 600);
         assert_eq!(actual.timeouts().limits().minimum_rate, 32768);
         assert_eq!(actual.resources().limits().jmap_method_bytes, 1_048_576);
-        assert_eq!(actual.resources().total_bytes(), 361_037_056);
+        assert_eq!(actual.resources().total_bytes(), 366_017_792);
     }
     #[test]
     fn operator_memory_budget_accepts_a_larger_bounded_configuration() {

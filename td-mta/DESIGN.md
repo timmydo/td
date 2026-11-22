@@ -916,7 +916,7 @@ The library denies `unsafe_code` with one function-scoped exception for
 Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
 `readiness_sys.rs` borrows connected sockets, listeners and wake receivers
 through each deadline-bounded wait. HTTPS and direct SMTP each wait on a
-fixed set sized for a private wake receiver, 16 listeners and 64 client slots. PostgreSQL
+fixed set sized for a private wake receiver, 16 listeners and 96 client slots. PostgreSQL
 and single-connection transport waits use one or two entries. The dedicated
 HTTP-01 responder waits on its private stop receiver, one TCP listener and
 up to eight connected TCP sockets. UNSAFE.md
@@ -1312,8 +1312,8 @@ Initial default ceilings (validated together at startup):
 | --- | --- |
 | Simultaneous inbound SMTP sessions | 32, at most 2 per SMTP peer key |
 | Accepted inbound mail per peer key | Bursts of 100 messages and 256 MiB, then 120 messages/hour and about 1 GiB/day |
-| Active HTTPS connections | 16, at most 15 per IPv4 address or IPv6 /64, with a separate cap of 2 TLS handshakes |
-| Event-source connections within the HTTPS pool | 2 |
+| Active HTTPS connections | 16 serving ordinary requests, with a separate cap of 2 TLS handshakes |
+| Event-source connections | 8, in their own slots beside the ordinary connections; at most 15 of all 24 connections per IPv4 address or IPv6 /64 |
 | Concurrent smart-host deliveries | 1 |
 | Concurrent body/search jobs | 3 |
 | Incoming message or uploaded blob | 32 MiB hard maximum, bounded resident ingress |
@@ -2259,9 +2259,25 @@ revocation state.
 Upload publication and every other mutation acquire fresh commit-time
 authorization.
 
-A profile's HTTPS listeners share its configured connection pool. When it has at
-least two slots, each network peer can occupy at most the smaller of
-sixteen and the pool size minus one. A one-slot pool admits one connection.
+A profile's HTTPS listeners share its connection pool of
+`https_connections` plus `event_streams` slots. A connection's first
+ordinary request takes one of `https_connections` admissions and keeps it
+until the connection closes or becomes an event stream; an EventSource
+request takes one of `event_streams` instead. Exhausting either answers 429
+with Retry-After: 1 and leaves the other untouched, so streams at their cap
+never refuse an ordinary request and ordinary connections at theirs never
+refuse a stream. A connection holds neither while its TLS handshake and
+request head are pending, but it does occupy a slot, and a refused one keeps
+its slot through its response and bounded drain. A new connection of either
+class can therefore wait in the listen backlog while the slots are full;
+the budgets decide refusals, not when a slot frees. Each network peer can
+occupy at most the smallest of sixteen, the pool size minus one and
+`https_connections` minus one, so one peer always leaves a slot and an
+ordinary admission for another; a peer is never limited below one
+connection. The cap counts streams too, so a small ordinary budget also
+limits one peer's streams: `https_connections = 2` admits one connection
+of either kind per network peer. A promoted stream releases its earlier
+response storage when it is admitted.
 Connections and authentication attempts use the same peer key as SMTP:
 the IPv4 address (including mapped IPv4), or the IPv6 /64 prefix. In a private Unix-socket
 profile, all clients share up to sixteen slots, subject to the configured
