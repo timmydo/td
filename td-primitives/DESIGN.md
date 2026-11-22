@@ -35,6 +35,7 @@ check found.
 | `sha` | SHA-1, as one function and not a `Digest` | The OpenPGP v4 fingerprint and SSH's hashed `known_hosts`, which those formats define by it. No signature can be built on it, and no HMAC but the one below |
 | `hmac` | HMAC (RFC 2104) | TLS key schedules. HKDF and the TLS 1.2 PRF are not here: rustls derives both from it |
 | `hmac` | `hmac_sha1`, one function | td-ssh's reading of hashed `known_hosts` entries, whose format defines it. SHA-1 still is no `Digest` |
+| `hmac` | `pbkdf2_sha256`: PBKDF2-HMAC-SHA-256 (RFC 8018 5.2), up to 1024 bytes of output | td-postgres's SCRAM-SHA-256 client (RFC 7677), whose `Hi` it is. It has no cap on iterations: a database server chooses them, so the caller that reads them sets one |
 | `keccak` | SHA3-256, SHA3-512, SHAKE128, SHAKE256 (FIPS 202) | ML-KEM, which is built from them |
 | `chacha20_poly1305` | ChaCha20-Poly1305 (RFC 8439) | TLS records. Poly1305 is reachable only through this AEAD and the next |
 | `chacha20_poly1305` | `OpenSshAead`: `chacha20-poly1305@openssh.com` (OpenSSH's PROTOCOL.chacha20poly1305) | td-ssh's packets, its one cipher |
@@ -182,7 +183,8 @@ What is **not** claimed:
   `OpenSshAead` clears its two keys on drop and copies K_2 into a `Cipher` that clears
   itself, once per packet. `Sponge`, Blowfish's state, and ML-KEM's seeds and secret
   polynomials are cleared when done with; the `dk` and shared secret ML-KEM returns are
-  the caller's.
+  the caller's. `pbkdf2_sha256` clears each block's last link and running sum, and
+  each copied `Hmac` resets itself on drop.
 
 ## Timing measurement
 
@@ -341,6 +343,11 @@ a change to any of these reds:
   Neither writes anything or returns a tag, and SSH's packets are far below the second.
 - `bcrypt_pbkdf` refuses an empty passphrase, salt or output, zero rounds and more than
   1024 bytes of output, writing nothing.
+- `pbkdf2_sha256` refuses zero iterations and an empty output or one past 1024 bytes,
+  writing nothing. It takes an empty password or salt, as RFC 8018 does; refusing
+  either is the caller's protocol decision. Its password is the HMAC key, so the
+  password's length counts as public, as an HMAC key's does above: only the one
+  keying of HMAC depends on it, not the iterations.
 
 AES-GCM refuses a plaintext past SP 800-38D's 2^36 - 32 bytes and checks no
 AAD length against SP 800-38D's 2^61 - 1 bytes. The bound is the address
@@ -434,7 +441,7 @@ inventory and the vendor's instruction documentation.
 | `tests/ssh/openssh_ed25519_{a2,a16,chachapoly}.txt` | OpenSSH 10.3's `ssh-keygen`: real files, the only second implementation of `bcrypt_pbkdf` to be had here. Throwaway keys, passphrases in their headers | `ssh-keygen -t ed25519` with the `-a` and `-Z` each header names |
 | `tests/bignum_vectors.txt` | Python big integers in `bignum_vectors.py`: `bignum`'s Montgomery multiplication, addition, subtraction, entry, exit, inversion and exponentiation, as raw limbs, modulo P-256's, P-384's and P-521's field primes and orders at 4, 6 and 9 limbs, over 0, 1, 2, m - 1, m - 2, the halves of m, a value a limb below m and two drawn values, every pair for the binary operations, and entry of m, m + 1 and all ones. 2,298 rows; the curves' own moduli are checked equal to the file's | `python3 -I bignum_vectors.py > bignum_vectors.txt`, from `tests/` |
 | `tests/ecdsa_retry.txt` | Python's `hmac` and big integers in `ecdsa_retry.py`: P-256 signatures after the first nonce candidates are replaced by ones out of range, zero, or making s zero, so the signature comes from RFC 6979's later blocks. The script first reproduces RFC 6979 A.2.5's k and r | `python3 -I ecdsa_retry.py > ecdsa_retry.txt`, from `tests/` |
-| Inline | FIPS 180, FIPS 197, RFC 4231, RFC 5903, RFC 6979, RFC 7748, RFC 8032, RFC 8439 including A.3's reduction edges, and a few values from Python big integers, each marked where it stands | none |
+| Inline | FIPS 180, FIPS 197, RFC 4231, RFC 5903, RFC 6979, RFC 7748, RFC 7914 11's PBKDF2-HMAC-SHA256 pair, RFC 8032, RFC 8439 including A.3's reduction edges, a few values from Python big integers, and PBKDF2 outputs from Python's `hashlib.pbkdf2_hmac` ending inside a block and at one, empty passwords and salts among them, each marked where it stands | none |
 
 `tests/vectors.rs` and `tests/ssh_vectors.rs` go through the public API, so on a
 given CPU they reach only one backend. Unit tests beside each backend therefore run
@@ -526,7 +533,7 @@ that run is a record in the landing commit, not a test to repeat.
   `td-tls-provider` for TLS, kept private behind its facade
   (td-crypto/DESIGN.md). P-521 and `uncompressed` are here for its
   certificate and handshake policy.
-- `td-fido` keeps its own AES, P-256 and HMAC-SHA256 for the disk and login
-  path, `td-netd` its SHA-1, and the engine its SHA-256. Moving them here is
+- `td-fido` keeps its own AES, P-256, HMAC-SHA256 and PBKDF2 for the disk and
+  login path, `td-netd` its SHA-1, and the engine its SHA-256. Moving them here is
   possible now that this crate exists, and is a separate change because each
   sits on the boot or login path.

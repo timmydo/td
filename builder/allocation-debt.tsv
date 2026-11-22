@@ -3329,6 +3329,7 @@ td-primitives/src/der.rs	allocation-macro	1
 td-primitives/src/der.rs	unchecked-growth-or-clone	4
 td-primitives/src/ec.rs	allocation-macro	3
 td-primitives/src/hmac.rs	allocation-macro	1
+td-primitives/src/hmac.rs	unchecked-growth-or-clone	1
 td-primitives/src/leakage.rs	allocating-constructor	2
 td-primitives/src/leakage.rs	allocating-conversion	5
 td-primitives/src/leakage.rs	allocation-macro	7
