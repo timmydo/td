@@ -43,6 +43,7 @@ const PULSE: &[(&str, &str)] = &[
     ("lib", PULSE_LIB_RS),
     ("client", include_str!("../../../td-pulse/src/client.rs")),
     ("proto", include_str!("../../../td-pulse/src/proto.rs")),
+    ("socket", include_str!("../../../td-pulse/src/socket.rs")),
     ("tag", include_str!("../../../td-pulse/src/tag.rs")),
     ("wire", include_str!("../../../td-pulse/src/wire.rs")),
 ];
@@ -58,7 +59,7 @@ fn staged_path(name: &str) -> String {
         "workload_accounts" => "{src}/engine/src/workload_accounts.rs".into(),
         _ => {
             let dir = match name {
-                "lib" | "client" | "proto" | "tag" | "wire" => "td-pulse",
+                "lib" | "client" | "proto" | "socket" | "tag" | "wire" => "td-pulse",
                 _ => "td-audio",
             };
             format!("{{src}}/{dir}/src/{name}.rs")
@@ -231,7 +232,7 @@ mod tests {
         pulse_declared.sort_unstable();
         pulse_written.sort_unstable();
         assert_eq!(pulse_written, pulse_declared);
-        assert_eq!(pulse_written.len(), 4);
+        assert_eq!(pulse_written.len(), 5);
 
         let mut staged: Vec<String> = staged_files().into_iter().map(|(name, _)| name).collect();
         let mut expected: Vec<String> = std::iter::once("td-audio/src/main.rs".to_string())

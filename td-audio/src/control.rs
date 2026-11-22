@@ -7,16 +7,18 @@
 //! Exit codes: 0 success, 1 the daemon refused or could not be reached, 2 a
 //! usage error.
 
-use crate::mixer::VOLUME_NORM;
 use crate::proto::{self, error, subscription};
 use crate::session::shown;
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{self, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
-use td_pulse::client::{self, level, Client, Listing, SinkInput, Transport, DEFAULT_SINK};
+use std::time::Duration;
+use td_pulse::client::{
+    self, level, levels_like, percent, volume_of, Client, Listing, SinkInput, DEFAULT_SINK,
+    MAX_PERCENT,
+};
+use td_pulse::socket::UnixSocket;
 use td_pulse::tag;
 
 /// The personalities this module answers for.
@@ -35,10 +37,6 @@ const DEADLINE: Duration = Duration::from_secs(5);
 
 /// What the daemon is told this client is called.
 const CLIENT_NAME: &str = "td-audio";
-
-/// The highest level offered, in percent. The mixer caps at `VOLUME_NORM`,
-/// so there is no boost to offer.
-const MAX_PERCENT: u32 = 100;
 
 /// Run one control personality and return its exit code.
 pub fn main(
@@ -182,90 +180,12 @@ fn switched(switch: Switch, muted: bool) -> bool {
     }
 }
 
-/// A volume as a whole percentage of `VOLUME_NORM`, rounded and clamped:
-/// td's mixer plays nothing louder, whatever a server reports.
-fn percent(volume: u32) -> u32 {
-    let norm = u64::from(VOLUME_NORM);
-    let rounded = (u64::from(volume) * 100 + norm / 2) / norm;
-    u32::try_from(rounded.min(u64::from(MAX_PERCENT))).unwrap_or(MAX_PERCENT)
-}
-
-/// A whole percentage as a volume, rounded: the inverse of `percent` on
-/// every value `percent` returns up to `MAX_PERCENT`.
-fn volume_of(percent: u32) -> u32 {
-    let norm = u64::from(VOLUME_NORM);
-    let volume = (u64::from(percent.min(MAX_PERCENT)) * norm + 50) / 100;
-    u32::try_from(volume).unwrap_or(VOLUME_NORM)
-}
-
-/// `levels` set to `volume` on as many channels as `like` has.
-fn levels_like<'a>(
-    levels: &'a mut [u32; tag::CHANNELS_MAX],
-    like: &[u32],
-    volume: u32,
-) -> &'a [u32] {
-    *levels = [volume; tag::CHANNELS_MAX];
-    let channels = like.len().clamp(1, tag::CHANNELS_MAX);
-    levels.get(..channels).unwrap_or(levels.as_slice())
-}
-
-/// The daemon's socket as td-pulse's transport, with one deadline for the
-/// whole command, so a daemon that answers a byte at a time cannot stretch
-/// a request past it. `None` once `watch` is waiting for events.
-struct Socket {
-    stream: UnixStream,
-    deadline: Option<Instant>,
-}
-
-impl Socket {
-    /// Arm one of the socket's timeouts with what is left of the deadline.
-    fn arm(&self, set: fn(&UnixStream, Option<Duration>) -> io::Result<()>) -> io::Result<()> {
-        let Some(deadline) = self.deadline else {
-            return set(&self.stream, None);
-        };
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        set(&self.stream, Some(left))
-    }
-}
-
-/// A timed-out socket call, as the one error it means.
-fn timed_out(error: io::Error) -> io::Error {
-    match error.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::ErrorKind::TimedOut.into(),
-        _ => error,
-    }
-}
-
-impl Transport for Socket {
-    type Error = io::Error;
-
-    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.arm(UnixStream::set_write_timeout)?;
-        self.stream.write_all(bytes).map_err(timed_out)
-    }
-
-    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
-            self.arm(UnixStream::set_read_timeout)?;
-            match self.stream.read(buffer) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                result => return result.map_err(timed_out),
-            }
-        }
-    }
-}
-
-fn connect(socket: &Path, deadline: Duration) -> Result<Client<Socket>, Failure<'_>> {
-    let stream = UnixStream::connect(socket).map_err(|error| Failure::Connect(socket, error))?;
-    // A deadline past what an Instant can hold is now: fail closed.
-    let now = Instant::now();
-    let transport = Socket {
-        stream,
-        deadline: Some(now.checked_add(deadline).unwrap_or(now)),
-    };
+/// Connect with one deadline for the whole command, so a daemon that answers
+/// a byte at a time cannot stretch a request past it.
+fn connect(socket: &Path, deadline: Duration) -> Result<Client<UnixSocket>, Failure<'_>> {
+    let mut transport =
+        UnixSocket::connect(socket).map_err(|error| Failure::Connect(socket, error))?;
+    transport.deadline_in(deadline);
     Client::connect(transport, CLIENT_NAME).map_err(Failure::Daemon)
 }
 
@@ -520,7 +440,7 @@ fn title(stream: &SinkInput) -> &str {
 }
 
 fn execute<'a>(
-    client: &mut Client<Socket>,
+    client: &mut Client<UnixSocket>,
     command: &Command<'a>,
     out: &mut dyn Write,
     subscribed: &mut dyn FnMut(),
@@ -644,7 +564,7 @@ fn execute<'a>(
         Command::Watch => {
             client.subscribe(subscription::MASK_SINK | subscription::MASK_SINK_INPUT)?;
             // Events come when something changes, which may be never.
-            client.transport_mut().deadline = None;
+            client.transport_mut().no_deadline();
             subscribed();
             loop {
                 let event = client.next_event()?;
@@ -691,17 +611,19 @@ impl fmt::Display for Facility {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+    use crate::mixer::VOLUME_NORM;
     use crate::serve::tests::{
         admit_as, auth_packet, browser_policy, client_name_packet, created_sink_input,
         drain_socket, named_create_request, own_uid, BROWSER_UID,
     };
     use crate::serve::Server;
     use crate::sink::{AudioSink, MemorySink, Spec};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
     use td_fs::TempDir;
 
     /// A daemon serving on its own thread, as the CLI meets one. Dropping it,
@@ -1170,20 +1092,6 @@ mod tests {
         let created = lines.next().unwrap();
         assert!(created.starts_with("new sink-input "), "{out}");
         assert_eq!(lines.next(), None, "{out}");
-    }
-
-    /// Every whole percent survives the trip to a volume and back, so a step
-    /// from a level that was read lands where it says; a reported level over
-    /// the norm shows as the most there is.
-    #[test]
-    fn a_percent_and_its_volume_round_trip() {
-        for value in 0..=MAX_PERCENT {
-            assert_eq!(percent(volume_of(value)), value);
-        }
-        assert_eq!(volume_of(100), VOLUME_NORM);
-        assert_eq!(volume_of(1_000), VOLUME_NORM);
-        assert_eq!(percent(VOLUME_NORM / 2), 50);
-        assert_eq!(percent(u32::MAX), MAX_PERCENT);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The PulseAudio native protocol as td speaks it: the pstream framing
 //! (`wire`), the tagstruct codec (`tag`), the captured command table, error
-//! codes and version negotiation (`proto`), and the blocking control client
-//! td's controllers share (`client`).
+//! codes and version negotiation (`proto`), the blocking control client td's
+//! controllers share (`client`), and td-audio's socket as its transport
+//! (`socket`).
 //!
 //! The normative design is `APPLICATIONS.md` §K.3. `td-audio` serves this
 //! protocol on its socket; a control client speaks the same bytes, so the
@@ -11,6 +12,7 @@
 
 pub mod client;
 pub mod proto;
+pub mod socket;
 pub mod tag;
 pub mod wire;
 
@@ -22,6 +24,7 @@ mod tests {
             ("client.rs", include_str!("client.rs")),
             ("lib.rs", include_str!("lib.rs")),
             ("proto.rs", include_str!("proto.rs")),
+            ("socket.rs", include_str!("socket.rs")),
             ("tag.rs", include_str!("tag.rs")),
             ("wire.rs", include_str!("wire.rs")),
         ]
@@ -115,7 +118,75 @@ mod tests {
         assert!(code(include_str!("lib.rs")).contains(concat!("#![forbid(", "un", "safe_code)]")));
     }
 
-    /// The codec is bytes in and bytes out. No file names an OS facility, a
+    /// The only lines that may name these modules, each in one file, exactly
+    /// once and as a whole line, so a `pub` prefix re-exporting one fails:
+    /// `socket.rs`'s connected stream, its path, its io traits and errors,
+    /// its clock and its tests' threads, and this file's test reading its
+    /// own source directory. The last field is whether the line must sit in
+    /// the file's test module. Split so this list does not match itself.
+    const PERMITTED: &[(&str, &str, bool)] = &[
+        (
+            "socket.rs",
+            concat!("use std::", "io::{Error, ErrorKind, Read, Result, Write};"),
+            false,
+        ),
+        (
+            "socket.rs",
+            concat!("use std::", "os::unix::net::UnixStream;"),
+            false,
+        ),
+        ("socket.rs", concat!("use std::", "path::Path;"), false),
+        (
+            "socket.rs",
+            concat!("use std::", "time::{Duration, Instant};"),
+            false,
+        ),
+        ("socket.rs", concat!("use std::", "thread;"), true),
+        (
+            "lib.rs",
+            concat!(
+                "let dir = std::",
+                "path::Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"src\");"
+            ),
+            true,
+        ),
+    ];
+
+    /// Whether the squeezed text declares a public `item` (`use`, `type`),
+    /// plainly or restricted to a path.
+    fn public(squeezed: &str, item: &str) -> bool {
+        let restricted = squeezed.match_indices("pub(").any(|(at, _)| {
+            squeezed
+                .get(at..)
+                .and_then(|rest| rest.find(')').and_then(|close| rest.get(close + 1..)))
+                .is_some_and(|after| after.starts_with(item))
+        });
+        restricted
+            || squeezed.match_indices("pub").any(|(at, _)| {
+                squeezed
+                    .get(at + 3..)
+                    .is_some_and(|after| after.starts_with(item))
+            })
+    }
+
+    /// Where the file's test module starts, when it is `#[cfg(test)]` and
+    /// the file's last item: after it, the only line that closes an item at
+    /// the left margin is the file's last.
+    fn test_module(text: &str) -> Option<usize> {
+        let at = text.find(concat!("#[cfg(test)]\nmod ", "tests {\n"))?;
+        let closing: Vec<usize> = text
+            .get(at..)?
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == "}")
+            .map(|(number, _)| number)
+            .collect();
+        let last = text.get(at..)?.lines().count().checked_sub(1)?;
+        (closing == [last]).then_some(at)
+    }
+
+    /// The codec is bytes in and bytes out. Outside the lines `PERMITTED`
+    /// names, no file names an OS facility, a clock, a thread, a
     /// syscall, a device or the PCM and control requests td-audio refuses
     /// (`UNSAFE.md` §13): the daemon links this crate, so a name here would
     /// reach the shipped binary past td-audio's own scans. Whole files, not
@@ -124,10 +195,48 @@ mod tests {
     /// a mention fails closed; a grouped `std` import is refused because it
     /// names a module without any of the paths below. Each name is split so
     /// this list does not match itself.
+    ///
+    /// This is a tripwire against reaching an OS facility by accident, not a
+    /// proof against code written to evade it, which a name scan cannot be:
+    /// that is review's to catch. It closes the spellings review found.
     #[test]
     fn the_codec_reaches_no_device_or_operating_system_facility() {
         for (file, text) in sources() {
-            let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            let mut squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(!public(&squeezed, "use"), "{file} re-exports");
+            // A path split across lines by a comment would squeeze to one
+            // the list below never sees whole. Cut at the first `//`, and
+            // whole, since a `//` in a string literal would cut too early.
+            for line in text.lines() {
+                for code in [line.split("//").next().unwrap_or(""), line] {
+                    let code = code.trim();
+                    assert!(
+                        !code.starts_with("::") && !code.ends_with("::"),
+                        "{file} splits a path: {line}"
+                    );
+                }
+            }
+            let tests_at = test_module(text);
+            for (owner, line, test_only) in PERMITTED.iter().filter(|(owner, ..)| *owner == file) {
+                let whole = text.lines().filter(|text| text.trim() == *line).count();
+                if *test_only {
+                    let at = text.find(line);
+                    assert!(
+                        tests_at.is_some() && at > tests_at,
+                        "{owner}: {line} outside a last, test-only module"
+                    );
+                }
+                let line: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                assert_eq!(whole, 1, "{owner}: {line}");
+                assert_eq!(squeezed.matches(&line).count(), 1, "{owner}: {line}");
+                squeezed = squeezed.replace(&line, "");
+            }
+            if file == "socket.rs" {
+                // Its io is the five names it imports, never the module, and
+                // it names no type another file could reach the stream by.
+                assert!(!squeezed.contains(concat!("io", "::")), "{file} names io");
+                assert!(!public(&squeezed, "type"), "{file} aliases");
+            }
             for refused in [
                 concat!("std::", "{"),
                 concat!("std::", "fs"),
@@ -136,6 +245,18 @@ mod tests {
                 concat!("std::", "process"),
                 concat!("std::", "env"),
                 concat!("std::", "io"),
+                concat!("std::", "path"),
+                concat!("std::", "time"),
+                concat!("std::", "thread"),
+                concat!("std", "as"),
+                concat!("std::", "*"),
+                concat!("::", "r#"),
+                concat!("print", "!("),
+                concat!("print", "ln!("),
+                concat!("dbg", "!("),
+                concat!("macro", "_rules!"),
+                concat!("::", "//"),
+                concat!("ext", "erncrate"),
                 concat!("/de", "v/"),
                 concat!("SNDRV", "_"),
                 concat!("SYS", "_"),

@@ -8712,9 +8712,13 @@ separate safe, std-only `td-pulse` crate, which
 forbids `unsafe` and which the td-audio recipe compiles to an rlib before
 linking the daemon against it; surface #13 stays in td-audio. td-pulse
 also holds the blocking control client the personalities, and later the
-compositor and the mixer panel, are built on. It owns no socket: the
-caller connects and hands it a transport, so the crate stays bytes in and
-bytes out. Every request it sends is pinned to a packet captured from
+compositor and the mixer panel, are built on. The client owns no socket:
+the caller hands it a transport, and the one each controller hands it is
+td-pulse's `socket` module, a connected Unix stream with a deadline over
+whole requests. That module is the crate's only file that names an OS
+facility, and only the stream, its path, its io traits and errors and a
+monotonic clock; the rest stays bytes in and bytes out. Every request it
+sends is pinned to a packet captured from
 libpulse for the same question, 16.1's where libpulse 17.0 sends the same
 bytes and 17.0's own otherwise; the handshake differs from the captured
 one only in asking for no shared memory and sending a zero cookie. It

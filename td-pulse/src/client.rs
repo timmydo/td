@@ -3,9 +3,9 @@
 //! td's controllers — the `td-audio` CLI personalities, the compositor's
 //! volume keys and bar, the mixer panel — are ordinary Pulse clients of the
 //! daemon's socket (`APPLICATIONS.md` §K.5). This is the one client they
-//! share. It owns no socket: the caller connects and hands it a
-//! [`Transport`], so this crate stays bytes in and bytes out and the client
-//! can be driven by a scripted server in tests.
+//! share. It owns no socket: the caller hands it a [`Transport`], td's
+//! controllers `socket::UnixSocket`, so this module stays bytes in and bytes
+//! out and the client can be driven by a scripted server in tests.
 //!
 //! The server is not trusted. The client runs inside the compositor, so a
 //! reply is parsed against the version-35 schema the request asked for and
@@ -159,6 +159,41 @@ fn text_property<'a>(properties: &'a [Property], key: &str) -> Option<&'a str> {
     let property = properties.iter().find(|property| property.key == key)?;
     let value = property.value.strip_suffix(&[0]).unwrap_or(&property.value);
     std::str::from_utf8(value).ok()
+}
+
+/// `PA_VOLUME_NORM`: unity, and the loudest td's mixer plays anything.
+pub const VOLUME_NORM: u32 = 0x10000;
+
+/// The most a whole-percent level offers: unity, since the mixer caps there
+/// and there is no boost to offer.
+pub const MAX_PERCENT: u32 = 100;
+
+/// A volume as a whole percentage of `VOLUME_NORM`, rounded and clamped:
+/// td's mixer plays nothing louder, whatever a server reports.
+pub fn percent(volume: u32) -> u32 {
+    let norm = u64::from(VOLUME_NORM);
+    let rounded = (u64::from(volume) * 100 + norm / 2) / norm;
+    u32::try_from(rounded.min(u64::from(MAX_PERCENT))).unwrap_or(MAX_PERCENT)
+}
+
+/// A whole percentage as a volume, rounded: the inverse of `percent` on
+/// every value `percent` returns.
+pub fn volume_of(percent: u32) -> u32 {
+    let norm = u64::from(VOLUME_NORM);
+    let volume = (u64::from(percent.min(MAX_PERCENT)) * norm + 50) / 100;
+    u32::try_from(volume).unwrap_or(VOLUME_NORM)
+}
+
+/// `levels` set to `volume` on as many channels as `like` has, at least one:
+/// the cvolume a setter sends to put a stream or the output at one level.
+pub fn levels_like<'a>(
+    levels: &'a mut [u32; tag::CHANNELS_MAX],
+    like: &[u32],
+    volume: u32,
+) -> &'a [u32] {
+    *levels = [volume; tag::CHANNELS_MAX];
+    let channels = like.len().clamp(1, tag::CHANNELS_MAX);
+    levels.get(..channels).unwrap_or(levels.as_slice())
 }
 
 /// The loudest channel of a cvolume: the one level td's mixer plays a stream
@@ -1167,6 +1202,31 @@ mod tests {
             .map(|packet| wire::command_and_tag(packet).unwrap().1)
             .collect();
         assert_eq!(tags, vec![EVENT_TAG - 1, 0]);
+    }
+
+    /// Every whole percent survives the trip to a volume and back, so a step
+    /// from a level that was read lands where it says; a reported level over
+    /// the norm shows as the most there is.
+    /// One level on as many channels as the cvolume it copies, at least one
+    /// and at most `CHANNELS_MAX`.
+    #[test]
+    fn levels_like_copies_the_channel_count() {
+        let mut levels = [0; tag::CHANNELS_MAX];
+        assert_eq!(levels_like(&mut levels, &[1, 2], 7), [7, 7]);
+        assert_eq!(levels_like(&mut levels, &[], 7), [7]);
+        let wide = [0; tag::CHANNELS_MAX + 3];
+        assert_eq!(levels_like(&mut levels, &wide, 7).len(), tag::CHANNELS_MAX);
+    }
+
+    #[test]
+    fn a_percent_and_its_volume_round_trip() {
+        for value in 0..=MAX_PERCENT {
+            assert_eq!(percent(volume_of(value)), value);
+        }
+        assert_eq!(volume_of(100), VOLUME_NORM);
+        assert_eq!(volume_of(1_000), VOLUME_NORM);
+        assert_eq!(percent(VOLUME_NORM / 2), 50);
+        assert_eq!(percent(u32::MAX), MAX_PERCENT);
     }
 
     #[test]

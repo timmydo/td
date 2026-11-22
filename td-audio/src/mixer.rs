@@ -37,7 +37,7 @@ use std::io;
 /// `PA_VOLUME_NORM`: unity gain. Volumes are the protocol's own fixed-point
 /// scale, so rung 26 needs no conversion and this module needs no floats in its
 /// interface.
-pub const VOLUME_NORM: u32 = 0x1_0000;
+pub const VOLUME_NORM: u32 = td_pulse::client::VOLUME_NORM;
 /// The loudest a stream may be set to — 0 dB. td does not offer software gain
 /// above unity, because summing two amplified streams clips the mix rather than
 /// making either louder.

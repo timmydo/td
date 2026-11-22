@@ -2,7 +2,7 @@
 name = "td-pulse"
 version = "0.1.0"
 edition = "2021"
-description = "The PulseAudio native protocol codec: pstream framing, tagstruct and the captured command table"
+description = "The PulseAudio native protocol: pstream framing, tagstruct, the captured command table, td's control client and its Unix socket transport"
 license = "MIT"
 
 # This crate's confinement assertions live in test targets, so the lint pass
