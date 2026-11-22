@@ -1998,7 +1998,9 @@ a private Session and backend selected by both authenticated principal and
 allowed request origin. Aggregate connection,
 request, upload, event and work admission limits remain process-wide.
 Receiving profiles accept the configured local accounts and commit each DATA
-transaction to every distinct recipient account together. Relay profiles rotate
+transaction to every distinct recipient account together; an account whose
+quota refuses the message after RCPT takes a local notice in that commit
+(POSTGRES.md). Relay profiles rotate
 through all configured accounts with one delivery worker. A busy account lease
 or paused route does not prevent other accounts from being selected. Persistent
 leases, retry selection and failure notices remain account-scoped; transport,

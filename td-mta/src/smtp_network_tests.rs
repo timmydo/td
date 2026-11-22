@@ -167,7 +167,11 @@ fn begin(n: &mut Network<'_>, w: &mut Wire, t: &Timer) {
         .extend(b"EHLO sender.test\r\nMAIL FROM:<>\r\nRCPT TO:<a@example.test>\r\nDATA\r\n");
     for _ in 0..100 {
         if n.advance(w, t).unwrap() == Progress::Work {
-            return;
+            if !matches!(n.session().pending(), Pending::Recipient { .. }) {
+                return;
+            }
+            n.recipient_checked(Ok(crate::smtp_storage::Recipient::Accepted), t)
+                .unwrap();
         }
     }
     panic!("no storage handoff");

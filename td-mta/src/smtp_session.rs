@@ -6,7 +6,7 @@ use crate::{
     limits::MAX_MESSAGE_BYTES,
     ports::{CommitFailure, Error},
     smtp_rate::Charge,
-    smtp_storage::Commits,
+    smtp_storage::{Commits, Recipient as Check},
 };
 use std::{
     fmt::Write,
@@ -67,7 +67,13 @@ impl Rejection {
     pub(crate) fn with_command(mut self, command: &str) -> Self {
         if !matches!(
             self.reason,
-            "unknown_recipient" | "routing_unavailable" | "recipient_limit"
+            "unknown_recipient"
+                | "routing_unavailable"
+                | "recipient_limit"
+                | "mailbox_full"
+                | "mailbox_quota"
+                | "mailbox_unavailable"
+                | "recipient_check_unavailable"
         ) {
             return self;
         }
@@ -94,6 +100,7 @@ impl Rejection {
     pub(crate) fn from_reply(bytes: &[u8]) -> Option<Self> {
         let status = match bytes.get(..3)? {
             b"421" => 421,
+            b"450" => 450,
             b"451" => 451,
             b"452" => 452,
             b"500" => 500,
@@ -118,6 +125,11 @@ impl Rejection {
             b"421 4.3.2 Transaction limit reached\r\n" => "transaction_limit",
             b"421 4.7.0 Too much mail from this address, try again later\r\n" => "rate_limited",
             b"452 4.5.3 Too many recipients\r\n" => "recipient_limit",
+            b"452 4.2.2 Mailbox full\r\n" => "mailbox_full",
+            b"452 4.2.2 Recipient mailbox full\r\n" => "message_mailbox_full",
+            b"552 5.2.3 Message exceeds mailbox quota\r\n" => "mailbox_quota",
+            b"450 4.2.1 Mailbox unavailable\r\n" => "mailbox_unavailable",
+            b"451 4.3.0 Recipient check unavailable\r\n" => "recipient_check_unavailable",
             b"554 5.5.0 Buffered plaintext at STARTTLS\r\n" => "starttls_buffered_plaintext",
             _ => "command_refused",
         };
@@ -228,6 +240,11 @@ pub enum Pending<'a> {
         bytes: &'a [u8],
         close: bool,
     },
+    /// Check this RCPT's account (its first in the envelope) before replying.
+    Recipient {
+        account: AccountId,
+        declared_bytes: Option<u64>,
+    },
     /// Reserve the full admitted message bound before sending 354.
     BeginData {
         maximum_bytes: usize,
@@ -250,6 +267,10 @@ impl std::fmt::Debug for Pending<'_> {
         match self {
             Self::Input => f.write_str("Input"),
             Self::Reply { close, .. } => f.debug_struct("Reply").field("close", close).finish(),
+            Self::Recipient { declared_bytes, .. } => f
+                .debug_struct("Recipient")
+                .field("declared_bytes", declared_bytes)
+                .finish_non_exhaustive(),
             Self::BeginData { maximum_bytes } => f
                 .debug_struct("BeginData")
                 .field("maximum_bytes", maximum_bytes)
@@ -265,6 +286,7 @@ impl std::fmt::Debug for Pending<'_> {
 enum State {
     Command,
     Reply(Next),
+    Recipient,
     Begin,
     Data,
     Write,
@@ -295,6 +317,10 @@ pub struct Session<'a> {
     tls: bool,
     envelope: Option<Envelope>,
     rejected_envelope: Option<Envelope>,
+    offered: Option<Recipient>,
+    /// Accounts this envelope's checks refused, answered again without a
+    /// check: at most one storage check per configured account per MAIL.
+    refused: [Option<(AccountId, &'static str)>; crate::config::identities::MAX_ACCOUNTS],
     recipient_bytes: usize,
     transactions: u64,
     spf_requested: bool,
@@ -330,6 +356,8 @@ impl<'a> Session<'a> {
             tls: false,
             envelope: None,
             rejected_envelope: None,
+            offered: None,
+            refused: [None; crate::config::identities::MAX_ACCOUNTS],
             recipient_bytes: 0,
             transactions: 0,
             spf_requested: false,
@@ -389,6 +417,13 @@ impl<'a> Session<'a> {
             State::Reply(next) => Pending::Reply {
                 bytes: self.reply.as_bytes(),
                 close: next == Next::Closed,
+            },
+            State::Recipient => match (&self.offered, &self.envelope) {
+                (Some(offered), Some(envelope)) => Pending::Recipient {
+                    account: offered.account,
+                    declared_bytes: envelope.declared_bytes,
+                },
+                _ => Pending::Closed,
             },
             State::Begin => Pending::BeginData {
                 maximum_bytes: self.settings.message_bytes,
@@ -500,6 +535,29 @@ impl<'a> Session<'a> {
         };
         Ok(())
     }
+    /// The trusted storage driver's quota and Inbox check of the offered
+    /// RCPT's account. A refusal applies to that recipient alone.
+    pub fn recipient_checked(&mut self, result: Result<Check, Error>) -> Result<(), Error> {
+        if self.state != State::Recipient {
+            return Err(Error::Conflict);
+        }
+        let offered = self.offered.take().ok_or(Error::Invalid)?;
+        let reply = match result {
+            Ok(Check::Accepted) => {
+                self.accept(offered)?;
+                return Ok(());
+            }
+            Ok(Check::Full) => "452 4.2.2 Mailbox full\r\n",
+            Ok(Check::ExceedsQuota) => "552 5.2.3 Message exceeds mailbox quota\r\n",
+            Ok(Check::Unavailable) => "450 4.2.1 Mailbox unavailable\r\n",
+            Err(_) => "451 4.3.0 Recipient check unavailable\r\n",
+        };
+        if let Some(slot) = self.refused.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some((offered.account, reply));
+        }
+        self.respond(reply, Next::Command);
+        Ok(())
+    }
     pub fn data_ready(&mut self, result: Result<(), Error>) -> Result<(), Error> {
         if self.state != State::Begin {
             return Err(Error::Conflict);
@@ -555,6 +613,11 @@ impl<'a> Session<'a> {
                 self.accepted = Some(Charge::accepted(self.data_bytes));
                 self.reset();
                 self.respond("250 2.0.0 Message accepted\r\n", Next::Command);
+            }
+            // No account had room, or a full one had none for its notice.
+            Err(CommitFailure::Rejected(Error::Quota)) => {
+                self.reset();
+                self.respond("452 4.2.2 Recipient mailbox full\r\n", Next::Command);
             }
             // An uncertain publication is temporary too: the sender's retry
             // may duplicate one that committed (POSTGRES.md section 46).
@@ -613,6 +676,8 @@ impl<'a> Session<'a> {
     fn reset(&mut self) {
         self.spf_requested = false;
         self.envelope = None;
+        self.offered = None;
+        self.refused = [None; crate::config::identities::MAX_ACCOUNTS];
         self.recipient_bytes = 0;
         self.data_bytes = 0;
     }
@@ -831,17 +896,44 @@ impl<'a> Session<'a> {
                 return Ok(());
             }
         };
-        let envelope = self.envelope.as_mut().ok_or(Error::Invalid)?;
+        if let Some(reply) = self
+            .refused
+            .iter()
+            .flatten()
+            .find(|(id, _)| *id == account)
+            .map(|(_, reply)| *reply)
+        {
+            self.respond(reply, Next::Command);
+            return Ok(());
+        }
+        let envelope = self.envelope.as_ref().ok_or(Error::Invalid)?;
         // ReceiptRecipients stores a count and a u32 length before each address.
         let needed = self.recipient_bytes + 4 + address.len();
         if envelope.recipients.len() == self.settings.recipients || needed + 4 > MAX_RECEIPT_BYTES {
             self.respond("452 4.5.3 Too many recipients\r\n", Next::Command);
             return Ok(());
         }
-        envelope.recipients.push(Recipient {
+        let known = envelope
+            .recipients
+            .iter()
+            .any(|recipient| recipient.account == account);
+        let recipient = Recipient {
             account,
             address: copy(address)?,
-        });
+        };
+        // An account's first RCPT waits for its quota and Inbox check.
+        if known {
+            self.accept(recipient)
+        } else {
+            self.offered = Some(recipient);
+            self.state = State::Recipient;
+            Ok(())
+        }
+    }
+    fn accept(&mut self, recipient: Recipient) -> Result<(), Error> {
+        let envelope = self.envelope.as_mut().ok_or(Error::Invalid)?;
+        let needed = self.recipient_bytes + 4 + recipient.address.len();
+        td_alloc::push(&mut envelope.recipients, recipient).map_err(|_| Error::Capacity)?;
         self.recipient_bytes = needed;
         self.respond("250 2.1.5 Recipient accepted\r\n", Next::Command);
         Ok(())

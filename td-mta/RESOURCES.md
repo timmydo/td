@@ -4617,7 +4617,7 @@ at most one turn every five seconds. POSTGRES.md, [Failure-notice work bounds](P
 separate aggregate database framing and composition work ceilings. The
 shared account body/blob quotas include generated notices; compact notices
 (at most 16 KiB each) may pass them by up to 16 KiB and one blob per
-configured `queue_submissions` (POSTGRES.md, [Compact failure notices and the quota margin](POSTGRES.md#compact-failure-notices-and-the-quota-margin)). Failure retains only the database Pending marker; no unbounded
+configured `queue_submissions` and one more (POSTGRES.md, [Compact failure notices and the quota margin](POSTGRES.md#compact-failure-notices-and-the-quota-margin)). Failure retains only the database Pending marker; no unbounded
 local retry queue is added.
 
 

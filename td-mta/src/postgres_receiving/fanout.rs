@@ -1,6 +1,6 @@
 //! One atomic SMTP publication spanning all accepted local accounts.
 use super::*;
-use crate::{format::row::ReceiptRecipients, ids::AccountId};
+use crate::{format::row::ReceiptRecipients, ids::AccountId, smtp_storage::Recipient};
 
 pub struct Target<'a> {
     pub binding: &'a Binding,
@@ -11,9 +11,19 @@ pub struct Fanout {
     length: u64,
     deliveries: Vec<Delivery>,
 }
+/// A local notice stored instead of the message in an account whose quota
+/// refused it after RCPT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Notice {
+    pub email: EmailId,
+    pub old_sequence: u64,
+    pub new_sequence: u64,
+}
+/// Every target appears once: delivered in `accounts` or noticed in `notices`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FanoutOutcome {
     pub accounts: Vec<(AccountId, Outcome)>,
+    pub notices: Vec<(AccountId, Notice)>,
 }
 impl Fanout {
     pub(crate) fn epoch(&self) -> Result<crate::ids::StoreEpoch, Error> {
@@ -216,11 +226,54 @@ pub(crate) async fn publish_body(
     accounts
         .try_reserve_exact(fanout.deliveries.len())
         .map_err(|_| Error::Capacity)?;
+    let mut refused =
+        td_alloc::with_capacity(fanout.deliveries.len()).map_err(|_| Error::Capacity)?;
     for (delivery, state) in fanout.deliveries.iter().zip(&states) {
-        accounts.push((
-            delivery.binding.account(),
-            write_delivery(client, delivery, state, deadline).await?,
-        ));
+        // The quota charge precedes every write, so a refused account is untouched.
+        match write_delivery(client, delivery, state, deadline).await {
+            Ok(outcome) => accounts.push((delivery.binding.account(), outcome)),
+            Err(Error::Quota) => {
+                td_alloc::push(&mut refused, (delivery, state)).map_err(|_| Error::Capacity)?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // With no account to receive it the whole message stays refused.
+    if accounts.is_empty() {
+        return Err(Error::Quota);
+    }
+    let mut notices = td_alloc::with_capacity(refused.len()).map_err(|_| Error::Capacity)?;
+    for (delivery, state) in refused {
+        let facts = &delivery.provenance;
+        let old = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
+        if sequence(state.try_get(1).map_err(|_| Error::Integrity)?)? > old {
+            return Err(Error::Integrity);
+        }
+        let (email, new_sequence) = crate::postgres_failure_notice::store_refused(
+            client,
+            crate::postgres_failure_notice::Refused {
+                binding: &delivery.binding,
+                reverse_path: &facts.reverse,
+                recipients: &facts.recipients,
+                length: delivery.length(),
+                old,
+            },
+            deadline,
+        )
+        .await
+        .map_err(notice_error)?;
+        td_alloc::push(
+            &mut notices,
+            (
+                delivery.binding.account(),
+                Notice {
+                    email,
+                    old_sequence: old,
+                    new_sequence,
+                },
+            ),
+        )
+        .map_err(|_| Error::Capacity)?;
     }
     let mut timing =
         crate::performance::Timer::start(crate::performance::Phase::SmtpDatabaseCommit);
@@ -230,7 +283,97 @@ pub(crate) async fn publish_body(
         .await
         .map_err(|_| Error::Indeterminate)?;
     timing.succeeded();
-    Ok(FanoutOutcome { accounts })
+    Ok(FanoutOutcome { accounts, notices })
+}
+
+fn notice_error(error: crate::postgres_failure_notice::Error) -> Error {
+    use crate::postgres_failure_notice::Error as N;
+    match error {
+        N::Quota => Error::Quota,
+        N::Capacity => Error::Capacity,
+        N::Work(ports::Error::Deadline) => Error::Connection(postgres_probe::Error::Deadline),
+        N::Work(error) => Error::Input(error),
+        N::Crypto => Error::Crypto,
+        N::Database => Error::Database,
+        N::Connection(error) => Error::Connection(error),
+        N::Policy => Error::Policy,
+        N::Owner(_) | N::Integrity | N::Indeterminate => Error::Integrity,
+    }
+}
+
+/// The binding facts an RCPT check reads, copied into its database job.
+#[derive(Clone, Copy)]
+pub(crate) struct RecipientScope {
+    pub(crate) account: AccountId,
+    pub(crate) epoch: crate::ids::StoreEpoch,
+    selection: crate::postgres_selection::Selection,
+    quotas: crate::postgres_configuration::SharedQuotas,
+}
+impl RecipientScope {
+    pub(crate) fn new(binding: &Binding) -> Result<Self, Error> {
+        if !binding.roles().receive() {
+            return Err(Error::Policy);
+        }
+        Ok(Self {
+            account: binding.account(),
+            epoch: binding.epoch(),
+            selection: binding.selection(),
+            quotas: binding.quotas(),
+        })
+    }
+}
+
+/// Advisory check of one offered RCPT account: SELECTs only, without
+/// account locks so it never waits for another delivery's commit, then the
+/// session rolls back. Its statements may each see a later commit;
+/// publication rechecks the selection, Inbox and quota under its locks.
+pub(crate) async fn recipient_body(
+    client: &Client,
+    scope: RecipientScope,
+    declared_bytes: Option<u64>,
+) -> Result<Recipient, Error> {
+    let selected = client
+        .query_one(
+            "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true",
+            &[],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
+    let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
+    if generation != scope.selection.generation
+        || version != Some(scope.selection.version.as_bytes().as_slice())
+    {
+        return Err(Error::Policy);
+    }
+    let account = scope.account;
+    // Count roles in one statement rather than compare the Inbox's history
+    // with an account row read by another, which a commit could separate.
+    let inboxes: i64 = client
+        .query_one(
+            "SELECT count(*) FROM td_mta.mailboxes WHERE account=$1 AND role='inbox'",
+            &[&account.as_bytes().as_slice()],
+        )
+        .await
+        .map_err(|_| Error::Database)?
+        .try_get(0)
+        .map_err(|_| Error::Integrity)?;
+    if inboxes != 1 {
+        return Ok(Recipient::Unavailable);
+    }
+    let caps = scope.quotas;
+    // A message without SIZE still needs room for one byte and one blob.
+    let bytes = declared_bytes.unwrap_or(1).max(1);
+    match publication::charge(client, account, caps, [bytes, 1, 0, 0, 0]).await {
+        Ok(_) => Ok(Recipient::Accepted),
+        Err(publication::Error::Quota)
+            if declared_bytes.is_some_and(|declared| declared > caps.body_bytes) =>
+        {
+            Ok(Recipient::ExceedsQuota)
+        }
+        Err(publication::Error::Quota) => Ok(Recipient::Full),
+        Err(error) => Err(publication_error(error)),
+    }
 }
 
 /// Check all configured Inboxes under one connection and original deadline.

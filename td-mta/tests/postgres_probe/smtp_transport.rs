@@ -92,6 +92,14 @@ impl<B: Storage> Storage for ObservedStorage<'_, B> {
     ) -> Result<(), td_mta::ports::Error> {
         self.inner.ready(account, deadline)
     }
+    fn recipient(
+        &self,
+        account: td_mta::ids::AccountId,
+        declared_bytes: Option<u64>,
+        deadline: Deadline,
+    ) -> Result<smtp_storage::Recipient, smtp_storage::Failure> {
+        self.inner.recipient(account, declared_bytes, deadline)
+    }
     fn stopped(&self) -> bool {
         self.inner.stopped()
     }

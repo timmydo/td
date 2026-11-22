@@ -20,7 +20,8 @@ pub(crate) enum Error {
 
 pub(crate) struct Usage([i64; 5]);
 
-/// The caller holds the account row FOR UPDATE until commit or rollback.
+/// The caller holds the account row FOR UPDATE until commit or rollback,
+/// except for an advisory check that never publishes the returned Usage.
 pub(crate) async fn charge(
     client: &Client,
     account: AccountId,

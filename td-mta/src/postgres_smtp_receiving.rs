@@ -109,6 +109,24 @@ impl Receiving<'_> {
             .map_err(Error::Publication)
     }
 
+    /// Admission evidence for one offered RCPT account; publication rechecks.
+    pub(crate) fn recipient_cached(
+        &self,
+        session: &mut postgres_probe::MutationSession,
+        account: crate::ids::AccountId,
+        declared_bytes: Option<u64>,
+        until: Deadline,
+    ) -> Result<crate::smtp_storage::Recipient, Error> {
+        if !self.valid() {
+            return Err(ports::Error::Forbidden.into());
+        }
+        let binding = self.binding_for(account).ok_or(ports::Error::Forbidden)?;
+        let scope = changes::fanout::RecipientScope::new(binding).map_err(Error::Publication)?;
+        session
+            .recipient(scope, declared_bytes, phase(self.clock, until)?)
+            .map_err(Error::Publication)
+    }
+
     /// Publish completed, caller-admitted SMTP input. The trusted caller owns
     /// peer, gateway, recipient and ingress authority; receipt facts are passive.
     pub fn create(

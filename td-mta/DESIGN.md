@@ -1754,9 +1754,9 @@ claim full power-loss, managed-provider or whole-service resource qualification.
 ## 9. SMTP receiving and message representation
 
 The current `smtp_session` engine consumes one command or at most 1000 DATA bytes
-per turn. Pending replies require an explicit flush acknowledgement; reservation,
-body writes and publication require separate trusted driver results before
-input resumes. A final DATA 250 follows only a successful commit result for
+per turn. Pending replies require an explicit flush acknowledgement; RCPT
+account checks, reservation, body writes and publication require separate
+trusted driver results before input resumes. A final DATA 250 follows only a successful commit result for
 the routed account. An indeterminate result gets the temporary 451 of a
 refused one; the sender's retry may duplicate a delivery that committed.
 A supplied result alone is not durability proof. PostgreSQL receiving
@@ -1843,8 +1843,9 @@ next absolute deadline. Checks of wall-clock certificate validity are bounded
 by its one-second precision. Even at capacity, listeners remain observable
 for the existing 421 refusal. TLS and DKIM workers sleep until dispatched;
 storage wakes at least once a second for idle connection retirement. One
-fixed storage worker performs admission and publication; one fixed TLS
-worker constructs sessions and advances handshakes. The network loop copies
+fixed storage worker performs RCPT account checks, admission and
+publication; one fixed TLS worker constructs sessions and advances
+handshakes. The network loop copies
 one decoded DATA chunk of at most 1000 bytes per connection turn into its
 admitted resident buffer. That copy performs no database, filesystem or peer
 I/O and cannot queue behind another connection's publication. Workers are
@@ -1858,7 +1859,7 @@ results are applied to the retained protocol owner before releasing the
 slot, including when ancillary accounting stops further admission.
 
 The PostgreSQL adapter retains one finite session on the fixed storage worker
-for fresh admission and publication transactions. Startup readiness remains
+for fresh RCPT check, admission and publication transactions. Startup readiness remains
 one-shot before that worker starts. The network and TLS workers never own or
 retire the cached session. Idle maintenance and a shutdown guard release it on
 its owning worker; Busy maintenance defers without stopping service. No database
@@ -1989,8 +1990,10 @@ transport boundaries. It inserts no wrapping or other content changes. The
 configured total-message and aggregate header limits, original deadlines and
 work budgets still apply; SMTP commands and outbound line limits are unchanged.
 
-Reject unknown/nonlocal recipients at RCPT. Resolve accepted aliases to stable
-account IDs and deduplicate delivery to the same account within one transaction;
+Reject unknown/nonlocal recipients at RCPT, and refuse there, for that
+recipient alone, one whose account is full or has no single Inbox
+(POSTGRES.md, "Transactional incoming delivery across accounts"). Resolve
+accepted aliases to stable account IDs and deduplicate delivery to the same account within one transaction;
 retain the accepted envelope recipients for inspection. Delivery decisions are
 pinned for that transaction rather than changing halfway through a reload.
 Gateway admission revocation is a separate commit-time fence: SCHEMA.md defines
@@ -2002,8 +2005,14 @@ several accepted aliases match. Aliases select accounts, not folders; alias
 names remain envelope metadata. Provision exactly one Inbox before receipt
 and forbid its deletion or role reassignment while receiving is enabled.
 Final DATA success requires one PostgreSQL transaction covering every distinct
-accepted recipient account. A confirmed commit returns 250. A lost commit
-acknowledgment returns 451 and releases the worker for the next message.
+accepted recipient account. Each receives the message, or, when its quota
+refuses the message after its RCPT, a local Inbox notice instead; at least
+one must receive it, and no notice goes to the reverse path. This is a
+deliberate departure from RFC 5321's report-to-the-reverse-path duty for
+an accepted recipient: the owner, not an unverified sender, learns of
+mail their full account missed. When no account can take it, DATA gets
+452 4.2.2. A confirmed
+commit returns 250. A lost commit acknowledgment returns 451 and releases the worker for the next message.
 Each account stores only its own accepted envelope recipients,
 preserving recipient privacy across accounts.
 
@@ -2898,8 +2907,8 @@ UTC time, process boot ID, config generation, connection/request ID, transaction
 sequence and submission ID when relevant. Escape/control-character encode all
 peer strings. Structured fields have documented meaning and stable enum values.
 Default logs omit credentials, Authorization/AUTH contents, message bodies
-and subjects. RCPT rejections for unknown recipients, unavailable routing or
-recipient limits include up to 96 bytes of the validated recipient spelling,
+and subjects. RCPT rejections for unknown recipients, unavailable routing,
+recipient limits or a refused account check include up to 96 bytes of the validated recipient spelling,
 explicitly labeled as untrusted with truncation reported. A queued DATA close
 refusal may also retain its existing envelope until reply acknowledgement,
 abort or session drop, solely for diagnostics after delivery authority is

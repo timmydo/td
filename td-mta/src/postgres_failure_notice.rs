@@ -243,15 +243,7 @@ pub fn publish_next(
                     crate::postgres_sequence::Error::Integrity => Error::Integrity,
                     crate::postgres_sequence::Error::Database => Error::Database,
                 })?;
-            let boxes = client.query("SELECT id,changed FROM td_mta.mailboxes WHERE account=$1 AND role='inbox' ORDER BY id LIMIT 2", &[&account]).await.map_err(|_| Error::Database)?;
-            if boxes.len() != 1 {
-                return Err(Error::Integrity);
-            }
-            let inbox = boxes.first().ok_or(Error::Integrity)?;
-            let mailbox: &[u8] = field(inbox, 0)?;
-            if mailbox.len() != 16 || number(field(inbox, 1)?)? > old {
-                return Err(Error::Integrity);
-            }
+            let mailbox = inbox(client, account, old).await?;
             let heading = format!("Local delivery report\nSubmission: {submission}\nOriginal Email: {original}\n\nNo further attempts are scheduled for this submission.\nAn unknown outcome is not proof of failure; resending may deliver a duplicate.\n");
             // A recent notice reports every recipient in full; an older one, or
             // one its size or the account's quota refuses, is stored compact.
@@ -370,68 +362,34 @@ pub fn publish_next(
                     (bytes, digest, interpretation, usage)
                 }
             };
-            let used: bool = field(&client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$3) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND ((kind=3 AND object=$2) OR (kind=2 AND object=$3)))", &[&account,&email.as_bytes().as_slice(),&thread.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?,0)?;
-            if used {
-                return Err(Error::Integrity);
-            }
-            publication::write_blob(
+            write_notice(
                 client,
-                publication::Blob {
+                Notice {
                     account: account_id,
-                    id: blob,
+                    mailbox: &mailbox,
+                    email,
+                    blob,
+                    thread,
+                    message_id: &message_id,
                     bytes: &bytes,
                     digest: &digest,
                     interpretation: interpretation.as_ref(),
-                    created_at: now,
-                    changed: next,
+                    now,
+                    next,
                 },
+                usage,
                 deadline,
             )
-            .await
-            .map_err(publication_error)?;
+            .await?;
             let changed = next.to_be_bytes();
             let changed = changed.as_slice();
             let email = email.as_bytes().as_slice();
-            let thread = thread.as_bytes().as_slice();
+            let submission = submission.as_bytes().as_slice();
+            execute(client,"UPDATE td_mta.submissions SET notification=2,notification_email_id=$3,changed=$4 WHERE account=$1 AND id=$2 AND notification=1 AND completed_at IS NOT NULL", &[&account,&submission,&email,&changed],1).await?;
             execute(
                 client,
-                "INSERT INTO td_mta.threads VALUES($1,$2,$3)",
-                &[&account, &thread, &changed],
-                1,
-            )
-            .await?;
-            execute(client,"INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES($1,$2,$3,$4,$5,4,$6)", &[&account,&email,&blob.as_bytes().as_slice(),&thread,&now,&changed],1).await?;
-            execute(
-                client,
-                "INSERT INTO td_mta.memberships VALUES($1,$2,$3,$4)",
-                &[&account, &email, &mailbox, &changed],
-                1,
-            )
-            .await?;
-            execute(
-                client,
-                "INSERT INTO td_mta.thread_anchors VALUES($1,$2,$3,$4)",
-                &[&account, &message_id, &email, &changed],
-                1,
-            )
-            .await?;
-            execute(
-                client,
-                "UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=$2",
-                &[&account, &mailbox, &changed],
-                1,
-            )
-            .await?;
-            execute(client,"UPDATE td_mta.submissions SET notification=2,notification_email_id=$3,changed=$4 WHERE account=$1 AND id=$2 AND notification=1 AND completed_at IS NOT NULL", &[&account,&submission.as_bytes().as_slice(),&email,&changed],1).await?;
-            execute(client,"INSERT INTO td_mta.changes VALUES($1,$2,0,3,1,$3),($1,$2,1,2,1,$4),($1,$2,2,1,2,$5),($1,$2,3,5,2,$6)", &[&account,&changed,&email,&thread,&mailbox,&submission.as_bytes().as_slice()],4).await?;
-            usage
-                .publish(client, account_id)
-                .await
-                .map_err(publication_error)?;
-            execute(
-                client,
-                "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
-                &[&account, &changed],
+                "INSERT INTO td_mta.changes VALUES($1,$2,3,5,2,$3)",
+                &[&account, &changed, &submission],
                 1,
             )
             .await?;
@@ -452,17 +410,279 @@ pub fn publish_next(
         Err(error) => Err(Error::Connection(error)),
     }
 }
-/// A full account still stores compact notices, past its body/blob caps by
-/// at most one per configured queued submission (POSTGRES.md section 213).
+async fn inbox(client: &Client, account: &[u8], old: u64) -> Result<[u8; 16], Error> {
+    let boxes = client.query("SELECT id,changed FROM td_mta.mailboxes WHERE account=$1 AND role='inbox' ORDER BY id LIMIT 2", &[&account]).await.map_err(|_| Error::Database)?;
+    if boxes.len() != 1 {
+        return Err(Error::Integrity);
+    }
+    let inbox = boxes.first().ok_or(Error::Integrity)?;
+    let mailbox: &[u8] = field(inbox, 0)?;
+    if number(field(inbox, 1)?)? > old {
+        return Err(Error::Integrity);
+    }
+    mailbox.try_into().map_err(|_| Error::Integrity)
+}
+
+struct Notice<'a> {
+    account: crate::ids::AccountId,
+    mailbox: &'a [u8; 16],
+    email: EmailId,
+    blob: BlobId,
+    thread: ThreadId,
+    message_id: &'a str,
+    bytes: &'a [u8],
+    digest: &'a [u8; 32],
+    interpretation: Option<&'a crate::postgres_mime_evidence::Prepared>,
+    now: i64,
+    next: u64,
+}
+
+/// One unread Inbox Email with its blob, fresh thread, anchor, history and
+/// quota charge, in the caller's transaction holding the account row lock.
+async fn write_notice(
+    client: &Client,
+    notice: Notice<'_>,
+    usage: publication::Usage,
+    deadline: Instant,
+) -> Result<(), Error> {
+    let account = notice.account.as_bytes().as_slice();
+    let used: bool = field(&client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$3) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND ((kind=3 AND object=$2) OR (kind=2 AND object=$3)))", &[&account,&notice.email.as_bytes().as_slice(),&notice.thread.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?,0)?;
+    if used {
+        return Err(Error::Integrity);
+    }
+    publication::write_blob(
+        client,
+        publication::Blob {
+            account: notice.account,
+            id: notice.blob,
+            bytes: notice.bytes,
+            digest: notice.digest,
+            interpretation: notice.interpretation,
+            created_at: notice.now,
+            changed: notice.next,
+        },
+        deadline,
+    )
+    .await
+    .map_err(publication_error)?;
+    let changed = notice.next.to_be_bytes();
+    let changed = changed.as_slice();
+    let email = notice.email.as_bytes().as_slice();
+    let thread = notice.thread.as_bytes().as_slice();
+    let mailbox = notice.mailbox.as_slice();
+    execute(
+        client,
+        "INSERT INTO td_mta.threads VALUES($1,$2,$3)",
+        &[&account, &thread, &changed],
+        1,
+    )
+    .await?;
+    execute(client,"INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES($1,$2,$3,$4,$5,4,$6)", &[&account,&email,&notice.blob.as_bytes().as_slice(),&thread,&notice.now,&changed],1).await?;
+    execute(
+        client,
+        "INSERT INTO td_mta.memberships VALUES($1,$2,$3,$4)",
+        &[&account, &email, &mailbox, &changed],
+        1,
+    )
+    .await?;
+    execute(
+        client,
+        "INSERT INTO td_mta.thread_anchors VALUES($1,$2,$3,$4)",
+        &[&account, &notice.message_id, &email, &changed],
+        1,
+    )
+    .await?;
+    execute(
+        client,
+        "UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=$2",
+        &[&account, &mailbox, &changed],
+        1,
+    )
+    .await?;
+    execute(
+        client,
+        "INSERT INTO td_mta.changes VALUES($1,$2,0,3,1,$3),($1,$2,1,2,1,$4),($1,$2,2,1,2,$5)",
+        &[&account, &changed, &email, &thread, &mailbox],
+        3,
+    )
+    .await?;
+    usage
+        .publish(client, notice.account)
+        .await
+        .map_err(publication_error)?;
+    execute(
+        client,
+        "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
+        &[&account, &changed],
+        1,
+    )
+    .await
+}
+
+/// Facts of an incoming message an account's quota refused at DATA.
+pub(crate) struct Refused<'a> {
+    pub binding: &'a crate::postgres_runtime_profile::Binding,
+    /// The unverified SMTP reverse path; empty for a null one.
+    pub reverse_path: &'a str,
+    /// This account's accepted RCPT spellings.
+    pub recipients: &'a [String],
+    pub length: u64,
+    /// The account sequence observed under the caller's row lock.
+    pub old: u64,
+}
+/// Recipient addresses a refused-delivery notice names.
+const REFUSED_ADDRESSES: usize = 8;
+const REFUSED_HEADING: &str = "Local delivery report\n\nA message to this account was not stored: the account's mail storage\nquota is full. Other local recipients of the same delivery received it,\nso the sending server was told it was delivered and will normally not\nsend it again. Delete mail to make room for new messages.\n\n";
+
+fn refused_text(reverse_path: &str, recipients: &[String], length: u64) -> Result<String, Error> {
+    let mut text = String::new();
+    append(&mut text, REFUSED_HEADING)?;
+    let sender = if reverse_path.is_empty() {
+        "(none)"
+    } else {
+        reverse_path
+    };
+    detail(&mut text, "Sender (unverified): ", sender, 254)?;
+    let mut buffer = [0; 20];
+    append(&mut text, "Size: ")?;
+    append(&mut text, decimal(length, &mut buffer))?;
+    append(&mut text, " bytes\n")?;
+    for address in recipients.iter().take(REFUSED_ADDRESSES) {
+        detail(&mut text, "Recipient: ", address, 254)?;
+    }
+    if let Some(more) = recipients.len().checked_sub(REFUSED_ADDRESSES) {
+        if more > 0 {
+            append(&mut text, "Further recipients: ")?;
+            append(&mut text, decimal(more as u64, &mut buffer))?;
+            append(&mut text, "\n")?;
+        }
+    }
+    if text.len() > COMPACT_TEXT {
+        return Err(Error::Integrity);
+    }
+    Ok(text)
+}
+
+/// Store a compact notice in an account whose quota refused an incoming
+/// message that another local account of the same DATA transaction received.
+/// The caller holds the selection and this account's row lock, and commits.
+/// The notice may pass the caps by one compact message; past that this
+/// refuses with Quota.
+pub(crate) async fn store_refused(
+    client: &Client,
+    refused: Refused<'_>,
+    deadline: Instant,
+) -> Result<(EmailId, u64), Error> {
+    let text = refused_text(refused.reverse_path, refused.recipients, refused.length)?;
+    let account_id = refused.binding.account();
+    let account = account_id.as_bytes().as_slice();
+    let next = crate::postgres_sequence::next(client, account, refused.old)
+        .await
+        .map_err(|error| match error {
+            crate::postgres_sequence::Error::Capacity => Error::Capacity,
+            crate::postgres_sequence::Error::Integrity => Error::Integrity,
+            crate::postgres_sequence::Error::Database => Error::Database,
+        })?;
+    let now: i64 = field(
+        &client
+            .query_one(
+                "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+                &[],
+            )
+            .await
+            .map_err(|_| Error::Database)?,
+        0,
+    )?;
+    let mailbox = inbox(client, account, refused.old).await?;
+    let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
+    let mut ids = [[0; 16]; 3];
+    for id in &mut ids {
+        entropy.fill(id).map_err(|_| Error::Crypto)?;
+    }
+    let [email, blob, thread] = ids;
+    let (email, blob, thread) = (
+        EmailId::from_bytes(email),
+        BlobId::from_bytes(blob),
+        ThreadId::from_bytes(thread),
+    );
+    let message_id = td_alloc::format(format_args!("notice-{email}@localhost.invalid"))
+        .map_err(|_| Error::Capacity)?;
+    let clock = RuntimeClock::new();
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or(Error::Work(ports::Error::Deadline))?;
+    let until = Deadline::after(
+        clock.sample().map_err(Error::Work)?.monotonic,
+        u64::try_from(left.as_millis()).map_err(|_| Error::Capacity)?,
+    )
+    .map_err(Error::Work)?;
+    let mut meter = Meter::new(
+        until,
+        Charge {
+            io_bytes: 1024 * 1024,
+            output_bytes: 1024 * 1024,
+            records: 64 * 1024,
+            ..Charge::default()
+        },
+    );
+    let bytes = render(&text, &message_id, now, COMPACT_MESSAGE, &clock, &mut meter)?;
+    let usage = publication::charge(
+        client,
+        account_id,
+        incoming_caps(refused.binding.quotas()),
+        [bytes.len() as u64, 1, 0, 0, 0],
+    )
+    .await
+    .map_err(publication_error)?;
+    let (digest, interpretation) = seal(&bytes, deadline)?;
+    write_notice(
+        client,
+        Notice {
+            account: account_id,
+            mailbox: &mailbox,
+            email,
+            blob,
+            thread,
+            message_id: &message_id,
+            bytes: &bytes,
+            digest: &digest,
+            interpretation: interpretation.as_ref(),
+            now,
+            next,
+        },
+        usage,
+        deadline,
+    )
+    .await?;
+    Ok((email, next))
+}
+
+/// A full account still stores compact submission notices, past its
+/// body/blob caps by one per configured queued submission beyond the one
+/// incoming notice `incoming_caps` admits (POSTGRES.md, "Compact failure
+/// notices and the quota margin").
 fn compact_caps(
     caps: crate::postgres_configuration::SharedQuotas,
 ) -> crate::postgres_configuration::SharedQuotas {
+    margin(caps, caps.queue_submissions.saturating_add(1))
+}
+/// A notice replacing refused incoming mail passes the caps by at most one
+/// compact message, so it never takes a queued submission's share.
+fn incoming_caps(
+    caps: crate::postgres_configuration::SharedQuotas,
+) -> crate::postgres_configuration::SharedQuotas {
+    margin(caps, 1)
+}
+fn margin(
+    caps: crate::postgres_configuration::SharedQuotas,
+    notices: u64,
+) -> crate::postgres_configuration::SharedQuotas {
     crate::postgres_configuration::SharedQuotas {
-        body_bytes: caps.body_bytes.saturating_add(
-            caps.queue_submissions
-                .saturating_mul(COMPACT_MESSAGE as u64),
-        ),
-        blob_count: caps.blob_count.saturating_add(caps.queue_submissions),
+        body_bytes: caps
+            .body_bytes
+            .saturating_add(notices.saturating_mul(COMPACT_MESSAGE as u64)),
+        blob_count: caps.blob_count.saturating_add(notices),
         ..caps
     }
 }
@@ -701,8 +921,14 @@ mod tests {
             queue_submissions: 3,
         };
         let raised = compact_caps(caps);
-        assert_eq!(raised.body_bytes, 1000 + 3 * 16 * 1024);
-        assert_eq!(raised.blob_count, 13);
+        // One share more than the queue: an incoming notice may hold it.
+        assert_eq!(raised.body_bytes, 1000 + 4 * 16 * 1024);
+        assert_eq!(raised.blob_count, 14);
+        let incoming = incoming_caps(caps);
+        assert_eq!(
+            (incoming.body_bytes, incoming.blob_count),
+            (1000 + 16 * 1024, 11)
+        );
         assert_eq!(
             (
                 raised.upload_bytes,
@@ -717,6 +943,23 @@ mod tests {
             ..caps
         };
         assert_eq!(compact_caps(huge).body_bytes, u64::MAX);
+    }
+    #[test]
+    fn refused_notice_text_stays_compact_with_a_null_sender_and_many_recipients() {
+        let address = format!("{}\u{1b}", "a".repeat(253));
+        let recipients = vec![address; 1000];
+        let text = refused_text("", &recipients, u64::MAX).unwrap();
+        assert!(text.contains("Sender (unverified): (none)\n"), "{text}");
+        assert!(text.contains(&format!("Size: {} bytes\n", u64::MAX)));
+        assert_eq!(text.matches("Recipient: ").count(), REFUSED_ADDRESSES);
+        assert!(text.contains("Further recipients: 992\n"), "{text}");
+        assert!(!text.contains('\u{1b}'));
+        assert!(text.len() <= COMPACT_TEXT, "{}", text.len());
+        let few = refused_text("sender@example.test", recipients.get(..2).unwrap(), 7).unwrap();
+        assert!(few.contains("Sender (unverified): sender@example.test\n"));
+        assert!(!few.contains("Further recipients"));
+        let too_long = vec!["b".repeat(255)];
+        assert_eq!(refused_text("", &too_long, 1), Err(Error::Integrity));
     }
     #[test]
     fn decimal_renders_every_width() {

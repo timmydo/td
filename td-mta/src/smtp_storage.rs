@@ -19,6 +19,17 @@ pub struct Begin<'a, 'cfg> {
     pub header_bytes: usize,
     pub deadline: Deadline,
 }
+/// One newly offered RCPT account, checked before its 250.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Recipient {
+    Accepted,
+    /// At its body or blob cap, or without room for the declared SIZE.
+    Full,
+    /// The declared SIZE exceeds the account's whole body cap.
+    ExceedsQuota,
+    /// No single Inbox to file into.
+    Unavailable,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Failure {
     /// No publication or new work was consumed; retain the original deadline.
@@ -85,6 +96,14 @@ pub trait Storage: Sync {
     }
     fn capacity(&self) -> u64;
     fn ready(&self, account: AccountId, deadline: Deadline) -> Result<(), Error>;
+    /// Check an offered RCPT's account quota and Inbox. This is admission
+    /// evidence only; publication rechecks both under its account locks.
+    fn recipient(
+        &self,
+        account: AccountId,
+        declared_bytes: Option<u64>,
+        deadline: Deadline,
+    ) -> Result<Recipient, Failure>;
     fn stopped(&self) -> bool;
     fn begin(
         &self,
@@ -93,33 +112,51 @@ pub trait Storage: Sync {
     ) -> Result<Self::Job<'_>, Failure>;
 }
 
-/// Complete account set for one all-or-nothing accepted DATA publication.
+/// Complete account set for one accepted DATA publication. Each account
+/// received the message or, when its quota refused the message after RCPT,
+/// a local notice in the same transaction; at least one received it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Commits {
-    entries: [Option<Commit>; crate::config::identities::MAX_ACCOUNTS],
+    entries: [Option<(Commit, bool)>; crate::config::identities::MAX_ACCOUNTS],
 }
 impl Commits {
     pub fn new(commits: impl IntoIterator<Item = Commit>) -> Result<Self, Error> {
+        Self::with_notices(commits, [])
+    }
+    pub fn with_notices(
+        delivered: impl IntoIterator<Item = Commit>,
+        noticed: impl IntoIterator<Item = Commit>,
+    ) -> Result<Self, Error> {
         let mut result = Self {
             entries: [None; crate::config::identities::MAX_ACCOUNTS],
         };
-        let mut count = 0;
-        for commit in commits {
+        let entries = delivered
+            .into_iter()
+            .map(|commit| (commit, false))
+            .chain(noticed.into_iter().map(|commit| (commit, true)));
+        for (count, (commit, notice)) in entries.enumerate() {
             if result
                 .iter()
                 .any(|prior| prior.account == commit.account || prior.epoch != commit.epoch)
             {
                 return Err(Error::Invalid);
             }
-            *result.entries.get_mut(count).ok_or(Error::Capacity)? = Some(commit);
-            count += 1;
+            *result.entries.get_mut(count).ok_or(Error::Capacity)? = Some((commit, notice));
         }
-        if count == 0 {
+        if result.delivered().next().is_none() {
             return Err(Error::Invalid);
         }
         Ok(result)
     }
+    /// Every committed account, delivered or noticed.
     pub fn iter(&self) -> impl Iterator<Item = &Commit> {
-        self.entries.iter().flatten()
+        self.entries.iter().flatten().map(|(commit, _)| commit)
+    }
+    pub fn delivered(&self) -> impl Iterator<Item = &Commit> {
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|(_, notice)| !notice)
+            .map(|(commit, _)| commit)
     }
 }

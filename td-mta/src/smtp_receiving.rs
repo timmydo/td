@@ -313,6 +313,7 @@ impl<'a> Connection<'a> {
 
 #[derive(Clone, Copy)]
 enum Work {
+    Recipient,
     Begin,
     Write,
     Commit { prepared: bool },
@@ -1031,6 +1032,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
     ) -> Result<(), Error> {
         let network = slot.connection()?.network()?;
         let (work, seconds) = match network.session().pending() {
+            Pending::Recipient { .. } => (Work::Recipient, self.admission.work().admission_seconds),
             Pending::BeginData { .. } => (Work::Begin, self.admission.work().admission_seconds),
             Pending::Data(_) => (Work::Write, self.timeouts.execution_seconds()),
             Pending::Commit => (
@@ -1193,6 +1195,40 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             return self.storage_refused(slot, work, Error::Deadline, control);
         }
         match work {
+            Work::Recipient => {
+                let network = slot.connection()?.network()?;
+                let Pending::Recipient {
+                    account,
+                    declared_bytes,
+                } = network.session().pending()
+                else {
+                    return Err(Error::Conflict);
+                };
+                match self.storage.recipient(account, declared_bytes, cap) {
+                    Ok(check) => {
+                        if cap.expired(clock.monotonic()?) {
+                            return self.storage_refused(slot, work, Error::Deadline, control);
+                        }
+                        slot.connection()?
+                            .network_mut()?
+                            .recipient_checked(Ok(check), clock)?;
+                    }
+                    Err(smtp_storage::Failure::Retry) => {
+                        slot.phase = Phase::Retry {
+                            work,
+                            deadline: cap,
+                            at: later(clock, 5)?,
+                        };
+                        return Ok(());
+                    }
+                    Err(smtp_storage::Failure::Refused(error)) => {
+                        return self.storage_refused(slot, work, error, control)
+                    }
+                    Err(smtp_storage::Failure::HeaderLimit) => {
+                        return self.storage_refused(slot, work, Error::Invalid, control)
+                    }
+                }
+            }
             Work::Begin => {
                 let timing =
                     crate::performance::Timer::start(crate::performance::Phase::SmtpAdmission);
@@ -1394,6 +1430,17 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
         error: Error,
         control: &Control,
     ) -> Result<(), Error> {
+        // A refused RCPT check keeps the envelope and its SPF evaluation.
+        if matches!(work, Work::Recipient) {
+            slot.connection()?
+                .network_mut()?
+                .recipient_checked(Err(error), self.clock.as_ref())?;
+            if self.storage.stopped() {
+                control.fail();
+            }
+            slot.phase = Phase::Done;
+            return Ok(());
+        }
         slot.data_timing.take();
         slot.commit_wait_timing.take();
         slot.spf_ticket = None;
@@ -1405,7 +1452,7 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
             Work::Commit { .. } => {
                 network.committed(Err(CommitFailure::Rejected(error)), self.clock.as_ref())?
             }
-            Work::Tls => return Err(Error::Conflict),
+            Work::Recipient | Work::Tls => return Err(Error::Conflict),
         }
         if self.storage.stopped() {
             control.fail();

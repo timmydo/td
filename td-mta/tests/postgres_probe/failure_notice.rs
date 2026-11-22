@@ -96,12 +96,12 @@ pub(super) fn exercise(
     assert_eq!(usage("body_bytes"), cap + length);
     assert_eq!(usage("blob_count"), blobs + 1);
     resync(fixture, &account);
-
     // The overshoot is bounded: past one compact message per configured
-    // queued submission, the notice waits until the owner makes room.
+    // queued submission and one more, the notice waits for room.
     group(0xd6, &old);
     resync(fixture, &account);
-    let margin = binding.quotas().queue_submissions as i64 * COMPACT;
+    // One share beyond the queue is kept for a notice replacing incoming mail.
+    let margin = (binding.quotas().queue_submissions as i64 + 1) * COMPACT;
     sql(
         fixture,
         &format!(
@@ -118,7 +118,7 @@ pub(super) fn exercise(
         fixture,
         &format!(
             "UPDATE td_mta.account_usage SET blob_count={} WHERE account={account}",
-            blob_cap + queued
+            blob_cap + queued + 1
         ),
     );
     assert_eq!(publish(), Err(notice::Error::Quota));

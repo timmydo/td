@@ -11,7 +11,7 @@ use crate::{
     postgres_receiving::{self, Message},
     postgres_smtp_receiving::{self as owner, Receiving},
     smtp_rate::PeerKey,
-    smtp_storage::{Begin, Commits, Completion, Failure, Job, Storage},
+    smtp_storage::{Begin, Commits, Completion, Failure, Job, Recipient, Storage},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -298,6 +298,27 @@ impl<'b> Storage for Backend<'b> {
             return Err(Error::Forbidden);
         }
         self.owner.ready(deadline).map_err(owner_error)
+    }
+    fn recipient(
+        &self,
+        account: AccountId,
+        declared_bytes: Option<u64>,
+        deadline: Deadline,
+    ) -> Result<Recipient, Failure> {
+        let mut meter = Meter::new(
+            deadline,
+            Charge {
+                io_bytes: 64 * 1024,
+                records: 64,
+                ..Charge::default()
+            },
+        );
+        charge(&self.clock, &mut meter, Charge::default())?;
+        self.with_session(deadline, &mut meter, |session, cap, _| {
+            self.owner
+                .recipient_cached(session, account, declared_bytes, cap)
+        })
+        .map_err(|error| Failure::Refused(owner_error(error)))
     }
     fn begin(
         &self,
@@ -588,12 +609,19 @@ impl Job for Delivery<'_, '_> {
         );
         match result {
             Ok(outcome) => {
-                let commits =
-                    Commits::new(outcome.accounts.iter().map(|(account, result)| Commit {
+                let epoch = self.backend.owner.binding.epoch();
+                let commits = Commits::with_notices(
+                    outcome.accounts.iter().map(|(account, result)| Commit {
                         account: *account,
-                        epoch: self.backend.owner.binding.epoch(),
+                        epoch,
                         sequence: Sequence::from_u64(result.new_sequence),
-                    }));
+                    }),
+                    outcome.notices.iter().map(|(account, notice)| Commit {
+                        account: *account,
+                        epoch,
+                        sequence: Sequence::from_u64(notice.new_sequence),
+                    }),
+                );
                 // A committed account set the reply cannot describe still
                 // stops the service.
                 Ok(Completion {

@@ -289,7 +289,12 @@ pub(super) fn exercise(
             super::wait_command(child);
         }
     };
-    super::multi_receiving::smtp(fixture, smtp_address, false);
+    super::multi_receiving::smtp(
+        fixture,
+        smtp_address,
+        false,
+        published.binding().quotas().body_bytes,
+    );
     let basic = |name: &str, password: &[u8]| {
         let input = [name.as_bytes(), b":", password].concat();
         let encoded = super::certificate::pem("BASIC", &input);
@@ -389,7 +394,12 @@ pub(super) fn exercise(
         );
         assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
     }
-    super::multi_receiving::smtp(fixture, smtp_address, true);
+    super::multi_receiving::smtp(
+        fixture,
+        smtp_address,
+        true,
+        published.binding().quotas().body_bytes,
+    );
     let queue_command = |name: &str| {
         let result = Command::new(env!("CARGO_BIN_EXE_td-mta"))
             .args([name, "--runtime"])

@@ -99,10 +99,15 @@ fn exchange(
     let mut reader = ReplyReader::new(&mut scratch).unwrap();
     let mut bytes = [0; 2048];
     for _ in 0..100_000 {
-        assert_ne!(
-            network.advance(server, clock).unwrap(),
-            NetworkProgress::Work
-        );
+        if network.advance(server, clock).unwrap() == NetworkProgress::Work {
+            assert!(matches!(
+                network.session().pending(),
+                Pending::Recipient { .. }
+            ));
+            network
+                .recipient_checked(Ok(crate::smtp_storage::Recipient::Accepted), clock)
+                .unwrap();
+        }
         client.flush().unwrap();
         if !reader.complete() {
             match client.read(&mut bytes).unwrap() {

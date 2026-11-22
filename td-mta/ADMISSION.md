@@ -148,7 +148,13 @@ under the original queued admission cap. The PostgreSQL adapter admits four
 resident DATA jobs across all listeners and accounts, at most two per
 peer key. Session limits, DATA admission and the accepted-mail rate use the
 socket peer's IPv4 address (including IPv4-mapped addresses) or IPv6 /64.
-The fixed storage worker serializes publication. On rate exhaustion, the
+The fixed storage worker serializes publication and RCPT account checks,
+at most one check per configured account per MAIL, within the existing
+100-MAIL connection and per-peer session limits. A check needs no DATA
+admission or accepted-mail rate, and each spends one of the retained
+database session's sixteen transactions (POSTGRES.md), so a peer that
+repeats MAIL/RCPT/RSET makes the worker renew that session once per
+sixteen checks. On rate exhaustion, the
 receiver replies to MAIL with 421 4.7.0 and closes (DESIGN.md section 9).
 A paused DATA sender consumes one permit,
 and exhaustion waits before 354 without allocating another incoming body.

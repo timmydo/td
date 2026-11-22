@@ -3033,7 +3033,7 @@ td-mta/src/smtp_relay_ehlo_tests.rs	allocating-conversion	2
 td-mta/src/smtp_relay_ehlo_tests.rs	heap-owner	1
 td-mta/src/smtp_relay_ehlo_tests.rs	unchecked-growth-or-clone	6
 td-mta/src/smtp_session.rs	direct-reservation	3
-td-mta/src/smtp_session.rs	unchecked-growth-or-clone	5
+td-mta/src/smtp_session.rs	unchecked-growth-or-clone	4
 td-mta/src/smtp_session_tests.rs	allocating-conversion	4
 td-mta/src/smtp_session_tests.rs	allocation-macro	13
 td-mta/src/smtp_session_tests.rs	unchecked-growth-or-clone	5

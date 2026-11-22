@@ -377,8 +377,14 @@ refused because the peer key exceeded its accepted-mail rate
 (DESIGN.md section 9). Historical `data_line_too_long` and
 `undeclared_8bit_data` reasons remain readable; current local receiving tolerates
 long lines and undeclared non-NUL 8-bit DATA.
-For `unknown_recipient`, `routing_unavailable` and `recipient_limit`, the
-complete pending RCPT command is revalidated with the protocol path parser.
+An RCPT refused by its account check reports `mailbox_full` (452 4.2.2),
+`mailbox_quota` (552 5.2.3), `mailbox_unavailable` (450 4.2.1) or
+`recipient_check_unavailable` (451 4.3.0). A DATA refused because no
+recipient account had room, or a full account's notice was refused past
+its margin, reports `message_mailbox_full` (452 4.2.2)
+without recipient text. For the four RCPT reasons, `unknown_recipient`,
+`routing_unavailable` and `recipient_limit`, the complete pending RCPT
+command is revalidated with the protocol path parser.
 Its recipient spelling (without brackets or obsolete source routes) appears
 in `untrusted` as `{"source":"smtp_recipient","truncated":false,"text":"..."}`.
 Only the first 96 ASCII bytes are retained; a longer address sets `truncated`

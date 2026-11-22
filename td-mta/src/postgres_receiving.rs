@@ -20,7 +20,9 @@ use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 pub(crate) mod fanout;
 mod input;
-pub use fanout::{prepare_fanout, publish_fanout, ready_many, Fanout, FanoutOutcome, Target};
+pub use fanout::{
+    prepare_fanout, publish_fanout, ready_many, Fanout, FanoutOutcome, Notice, Target,
+};
 pub use input::Message;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -361,6 +363,16 @@ async fn write_delivery(
 ) -> Result<Outcome, Error> {
     let account_id = delivery.binding.account();
     let account = account_id.as_bytes().as_slice();
+    // Charge before any write: a Quota refusal leaves this account untouched,
+    // so a fanout can keep the transaction for its other accounts.
+    let usage = publication::charge(
+        client,
+        account_id,
+        delivery.binding.quotas(),
+        [delivery.bytes.len() as u64, 1, 0, 0, 0],
+    )
+    .await
+    .map_err(publication_error)?;
     let old = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
     let floor = sequence(state.try_get(1).map_err(|_| Error::Integrity)?)?;
     if floor > old {
@@ -405,14 +417,6 @@ async fn write_delivery(
             return Err(Error::Conflict);
         }
     }
-    let usage = publication::charge(
-        client,
-        account_id,
-        delivery.binding.quotas(),
-        [delivery.bytes.len() as u64, 1, 0, 0, 0],
-    )
-    .await
-    .map_err(publication_error)?;
     publication::write_blob(
         client,
         publication::Blob {

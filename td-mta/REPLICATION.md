@@ -630,8 +630,8 @@ epoch, source origin/epoch, preserved account ID, username, protected
 password file, optional CA file and explicit positive `--body-bytes`,
 `--blobs`, `--emails` and `--receipts` quotas. Each live Email and each
 distinct live Blob uses one receipt. A td source's account may hold up to
-its `queue_submissions` × 16 KiB of body and that many blobs past its own
-caps in compact failure notices (POSTGRES.md, [Compact failure notices and
+its `queue_submissions` + 1 times 16 KiB of body and that many blobs past
+its own caps in compact failure notices (POSTGRES.md, [Compact failure notices and
 the quota
 margin](POSTGRES.md#compact-failure-notices-and-the-quota-margin)); replica
 quotas equal to the source caps stall on such an account. It authenticates

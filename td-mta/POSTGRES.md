@@ -4890,16 +4890,53 @@ account receives only its own recipient metadata. Original body preparation,
 work meter and deadlines remain shared; SQL publication charges body I/O for
 every target before opening the transaction.
 
+An RCPT whose account is not yet on the envelope waits for one check on the
+fixed storage worker before its reply: a SELECT-only transaction on the
+cached session that takes no account lock, so no other connection's held
+row lock delays it; it still queues behind this process's own in-flight
+storage work. It confirms the pinned selection, a single Inbox, and room under the
+body and blob caps for the declared SIZE (one byte without SIZE) and one blob.
+It charges the declared SIZE alone, not the trace header publication adds,
+so a message within that header of the remaining room passes RCPT and meets
+the DATA-time refusal below. The distinct replies let an unauthenticated peer
+probe an account's remaining room by SIZE within the session's MAIL limit;
+that is inherent to refusing by declared SIZE.
+A full account gets `452 4.2.2 Mailbox full`, a declared SIZE above the whole
+body cap `552 5.2.3 Message exceeds mailbox quota`, a missing Inbox `450
+4.2.1 Mailbox unavailable` and a failed check `451 4.3.0 Recipient check
+unavailable`. Each refuses that recipient alone; the other recipients
+proceed. Further addresses of an account already on the envelope are not
+checked again, and a refused account is refused again from the session's
+memory until the transaction ends, so one MAIL costs at most one check per
+configured account. Each check is a short transaction (BEGIN with its
+epoch and barrier check, three SELECTs, ROLLBACK) and spends one of the
+retained session's sixteen transactions, so a session renews after at most
+sixteen checks and publications together. The check is admission evidence, not a
+reservation.
+
 Publication locks the current selection, then every account in ID order before
 writing any email. It uses the existing account write path for quotas,
-Inbox, thread, body and history, and commits once after every target succeeds.
-A quota or Inbox refusal rolls everything back. Final
-protocol success verifies that the returned account set exactly covers the
-accepted envelope.
+Inbox, thread, body and history, charging each account's quota before any
+of its writes. An account whose quota refuses the message then (it filled
+after its RCPT, or the message outgrew its room) receives a compact local
+notice in the same transaction instead, through the renderer and Inbox
+write of [Local terminal-delivery notices](#local-terminal-delivery-notices)
+and charged against caps raised by one compact notice, naming the
+unverified reverse path, the message size and at most eight of that account's own accepted
+addresses. Nothing is sent to the reverse path. When no account can take
+the message, or a notice is refused past its margin, the transaction rolls
+back and DATA gets `452 4.2.2 Recipient mailbox full`, which is temporary:
+the owner can make room. An account then past its cap is refused at RCPT
+on the sender's retry, but one that still has room for the declared SIZE
+(one byte without SIZE) passes RCPT and meets the same 452 at DATA. Any
+other refusal, an Inbox one included, rolls everything back. One COMMIT
+covers every delivery and notice, and 250 follows only its confirmation.
+Final protocol success verifies that the returned delivered and noticed
+accounts exactly cover the accepted envelope, with at least one delivery.
 
 The closed fanout driver admits 40 MiB outgoing bytes, 1 MiB incoming bytes
-and 1088 response frames per target account, for at most sixteen accounts.
-These are cumulative transport limits, not resident allocations; the existing
+and 1088 response frames per target account, for at most sixteen accounts;
+an RCPT check takes one account's allowance. These are cumulative transport limits, not resident allocations; the existing
 per-frame, authentication, TLS and ten-second connection limits remain intact.
 The DATA
 worker's output meter includes the separate 2-MiB fanout metadata reservation,
@@ -6045,12 +6082,16 @@ included, at the next turn; the compact text says the delivery status may
 already be retired.
 
 A compact notice's charge is checked against body/blob caps raised by a
-fixed margin: 16 KiB of body and one blob per configured
-`queue_submissions`, so at most one compact notice per configured queued
-submission passes the caps, and one queue's worth of failures still stores
-its notices in a full account, whose submissions can then retire and
-release their quota. Usage stays exact. Past the margin a notice stays
-Pending until the owner deletes mail; 16 KiB of room then suffices. Every
+fixed margin: 16 KiB of body and one blob for each configured
+`queue_submissions` and one more. The extra share is the most the notice
+replacing incoming mail its quota refused after RCPT ([Transactional
+incoming delivery across
+accounts](#transactional-incoming-delivery-across-accounts)) may take: that
+notice is charged against the caps raised by one share alone, so however
+many arrive, one queue's worth of failures still stores its notices in a
+full account, whose submissions can then retire and release their quota.
+Usage stays exact. Past the margin a submission notice stays Pending until
+the owner deletes mail; 16 KiB of room then suffices. Every
 charge refuses only a column it grows past its cap, so a column already
 past a cap (an operator lowered it, or this margin was used) does not
 refuse a charge that leaves it unchanged; a lowered queue cap therefore

@@ -24,6 +24,7 @@ pub enum Progress {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Work {
+    Recipient,
     Begin,
     Data,
     Commit,
@@ -128,6 +129,15 @@ impl<'a> Network<'a> {
         let rejection = self.session.rejection()?;
         self.refusal_reported = true;
         Some(rejection)
+    }
+
+    pub fn recipient_checked(
+        &mut self,
+        result: Result<crate::smtp_storage::Recipient, Error>,
+        clock: &(impl Clock + ?Sized),
+    ) -> Result<(), Error> {
+        self.complete_work(Work::Recipient, clock)?;
+        self.session.recipient_checked(result)
     }
 
     pub fn data_ready(
@@ -457,6 +467,10 @@ impl<'a> Network<'a> {
                         _ => return Err(Error::Invalid),
                     }
                 }
+            }
+            Pending::Recipient { .. } => {
+                self.work = Some(Work::Recipient);
+                return Ok(Progress::Work);
             }
             Pending::BeginData { .. } => {
                 if self.data_deadline.is_none() {

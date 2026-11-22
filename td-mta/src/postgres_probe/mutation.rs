@@ -194,6 +194,31 @@ impl MutationSession {
         }
         result
     }
+    pub(crate) fn recipient(
+        &mut self,
+        scope: fanout::RecipientScope,
+        declared_bytes: Option<u64>,
+        deadline: Instant,
+    ) -> Result<crate::smtp_storage::Recipient, receiving::Error> {
+        let result = (|| {
+            self.begin(scope.epoch, Some(1), deadline)
+                .map_err(receiving::Error::Connection)?;
+            let check = self
+                .worker
+                .run(move |client| {
+                    Box::pin(
+                        async move { fanout::recipient_body(client, scope, declared_bytes).await },
+                    )
+                })
+                .map_err(receiving::Error::Connection)??;
+            self.finish(true).map_err(receiving::Error::Connection)?;
+            Ok(check)
+        })();
+        if result.is_err() {
+            self.retired = true;
+        }
+        result
+    }
     pub(crate) fn publish(
         &mut self,
         fanout: &Fanout,

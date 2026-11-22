@@ -52,6 +52,9 @@ fn reply<'s>(s: &'s Session<'_>) -> &'s str {
 }
 fn command(s: &mut Session<'_>, line: &str, code: &str) {
     assert_eq!(s.feed(line.as_bytes()).unwrap(), line.len());
+    if matches!(s.pending(), Pending::Recipient { .. }) {
+        s.recipient_checked(Ok(Check::Accepted)).unwrap();
+    }
     assert!(reply(s).starts_with(code), "{}", reply(s));
     s.reply_sent().unwrap();
 }
@@ -417,7 +420,7 @@ mod long_lines {
 fn commit_outcomes_and_begin_refusal() {
     fixture(|routes| {
         for outcome in [
-            Err(CommitFailure::Rejected(Error::Quota)),
+            Err(CommitFailure::Rejected(Error::Busy)),
             Err(CommitFailure::Indeterminate(Error::Io {
                 kind: std::io::ErrorKind::Other,
                 os_code: None,
@@ -753,6 +756,135 @@ fn multi_account_envelope_requires_complete_commit_set() {
 }
 
 #[test]
+fn recipient_checks_refuse_only_their_own_account() {
+    let other = AccountId::from_bytes([3; 16]);
+    let mut text = [0; 1024];
+    let mut domains = [DomainSlot::EMPTY; 1];
+    let mut aliases = [AliasSlot::EMPTY; 3];
+    let at = Location {
+        line: NonZeroU32::new(1).unwrap(),
+        column: 1,
+    };
+    let mut builder = Builder::new(&mut text, &mut domains, &mut aliases).unwrap();
+    builder.account(ACCOUNT, at).unwrap();
+    builder.account(other, at).unwrap();
+    builder.postmaster(ACCOUNT, at).unwrap();
+    builder.domain("example.test", at).unwrap();
+    builder.alias("Alice@example.test", ACCOUNT, at).unwrap();
+    builder.alias("alias@example.test", ACCOUNT, at).unwrap();
+    builder.alias("second@example.test", other, at).unwrap();
+    let routing = builder.finish().unwrap();
+    let mut s = session(&routing);
+    command(&mut s, "EHLO sender.test\r\n", "250-");
+    command(&mut s, "MAIL FROM:<> SIZE=1200\r\n", "250 ");
+    for (check, reply_text, reason) in [
+        (
+            Ok(Check::Full),
+            "452 4.2.2 Mailbox full\r\n",
+            "mailbox_full",
+        ),
+        (
+            Ok(Check::ExceedsQuota),
+            "552 5.2.3 Message exceeds mailbox quota\r\n",
+            "mailbox_quota",
+        ),
+        (
+            Ok(Check::Unavailable),
+            "450 4.2.1 Mailbox unavailable\r\n",
+            "mailbox_unavailable",
+        ),
+        (
+            Err(Error::Busy),
+            "451 4.3.0 Recipient check unavailable\r\n",
+            "recipient_check_unavailable",
+        ),
+    ] {
+        s.feed(b"RCPT TO:<second@example.test>\r\n").unwrap();
+        assert_eq!(
+            s.pending(),
+            Pending::Recipient {
+                account: other,
+                declared_bytes: Some(1200)
+            }
+        );
+        assert_eq!(s.feed(b"NOOP\r\n"), Err(Error::Conflict));
+        assert_eq!(s.data_ready(Ok(())), Err(Error::Conflict));
+        s.recipient_checked(check).unwrap();
+        assert_eq!(reply(&s), reply_text);
+        let refusal = s.rejection().unwrap();
+        assert_eq!(refusal.reason(), reason);
+        assert_eq!(refusal.recipient(), Some(("second@example.test", false)));
+        s.reply_sent().unwrap();
+        assert!(s.envelope().unwrap().recipients.is_empty());
+        // The same account is answered again without another check.
+        s.feed(b"RCPT TO:<second@example.test>\r\n").unwrap();
+        assert_eq!(reply(&s), reply_text);
+        assert_eq!(s.rejection().unwrap().reason(), reason);
+        s.reply_sent().unwrap();
+        // A new transaction checks it afresh.
+        command(&mut s, "RSET\r\n", "250 ");
+        command(&mut s, "MAIL FROM:<> SIZE=1200\r\n", "250 ");
+    }
+    assert_eq!(
+        s.recipient_checked(Ok(Check::Accepted)),
+        Err(Error::Conflict)
+    );
+    s.feed(b"RCPT TO:<Alice@example.test>\r\n").unwrap();
+    assert!(matches!(s.pending(), Pending::Recipient { account, .. } if account == ACCOUNT));
+    s.recipient_checked(Ok(Check::Accepted)).unwrap();
+    assert_eq!(reply(&s), "250 2.1.5 Recipient accepted\r\n");
+    s.reply_sent().unwrap();
+    // A further address of a checked account needs no second check.
+    s.feed(b"RCPT TO:<alias@example.test>\r\n").unwrap();
+    assert_eq!(reply(&s), "250 2.1.5 Recipient accepted\r\n");
+    s.reply_sent().unwrap();
+    command(&mut s, "RCPT TO:<second@example.test>\r\n", "250 ");
+    assert_eq!(s.envelope().unwrap().recipients.len(), 3);
+    s.feed(b"DATA\r\n").unwrap();
+    s.data_ready(Ok(())).unwrap();
+    s.reply_sent().unwrap();
+    s.feed(b".\r\n").unwrap();
+    // The account whose quota refused the message at DATA holds a notice.
+    let noticed = Commit {
+        account: other,
+        ..receipt()
+    };
+    s.committed(Ok(Commits::with_notices([receipt()], [noticed]).unwrap()))
+        .unwrap();
+    assert!(reply(&s).starts_with("250 "));
+    assert_eq!(
+        Commits::with_notices([], [noticed]),
+        Err(Error::Invalid),
+        "a notice alone is no delivery"
+    );
+    assert_eq!(
+        Commits::with_notices([receipt()], [receipt()]),
+        Err(Error::Invalid)
+    );
+    // Abort discards an offered recipient awaiting its check.
+    s.reply_sent().unwrap();
+    command(&mut s, "MAIL FROM:<>\r\n", "250 ");
+    s.feed(b"RCPT TO:<second@example.test>\r\n").unwrap();
+    s.abort();
+    assert_eq!(s.pending(), Pending::Closed);
+}
+
+#[test]
+fn data_write_refusal_keeps_a_recipient_shaped_body_line_out_of_diagnostics() {
+    fixture(|routes| {
+        let mut s = session(routes);
+        begin(&mut s, "");
+        s.feed(b"RCPT TO:<leak@example.test>\r\n").unwrap();
+        assert!(matches!(s.pending(), Pending::Data(_)));
+        s.data_written(Err(Error::Deadline)).unwrap();
+        assert_eq!(reply(&s), "451 4.3.0 Delivery temporarily unavailable\r\n");
+        let refusal = s.rejection().unwrap();
+        assert_eq!(refusal.reason(), "delivery_unavailable");
+        assert_eq!(refusal.recipient(), None);
+    });
+}
+
+#[test]
 fn data_refusals_have_content_free_diagnostics() {
     fixture(|routes| {
         for (input, reason) in [
@@ -834,6 +966,11 @@ fn rate_limit_refuses_the_next_mail_and_charges_only_acceptance() {
         s.feed(b".\r\n").unwrap();
         s.committed(Err(CommitFailure::Rejected(Error::Quota)))
             .unwrap();
+        // A quota refusal at the dot is temporary and names no recipient.
+        assert_eq!(reply(&s), "452 4.2.2 Recipient mailbox full\r\n");
+        let refusal = s.rejection().unwrap();
+        assert_eq!(refusal.reason(), "message_mailbox_full");
+        assert_eq!(refusal.recipient(), None);
         s.reply_sent().unwrap();
         assert_eq!(s.take_accepted(), None);
         s.set_rate_limited(true);
