@@ -73,6 +73,7 @@ fn defaults_and_explicit_empty_match_email_get_not_body_defaults() {
     }
     assert!(!view.fields().contains(Field::Headers));
     assert!(!view.fields().contains(Field::BodyStructure));
+    assert!(!view.fields().contains(Field::SenderAuthentication));
     let mut empty = [];
     let view = Cursor::new(&[], &mut empty).finish().unwrap();
     assert_eq!(view.fields(), Fields::id_only());
@@ -203,6 +204,7 @@ fn default_capacity_and_singleton_fields_are_exact() {
         ("attachments", Field::Attachments),
         ("hasAttachment", Field::HasAttachment),
         ("preview", Field::Preview),
+        ("senderAuthentication", Field::SenderAuthentication),
     ];
     for (name, requested) in fields {
         let keys = [name];

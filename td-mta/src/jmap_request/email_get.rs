@@ -62,6 +62,8 @@ impl Selection {
         self.stored
     }
     /// Validates one property under the caller's original work allowance.
+    /// It does not check capabilities: a caller that admits
+    /// `senderAuthentication` must check the request's `using` first.
     pub fn include(
         &mut self,
         name: &str,
@@ -230,6 +232,10 @@ impl Worker<'_, '_, '_, '_, '_> {
                 name.push(text.as_bytes())?;
                 selected.include_name(name, &mut work, clock.as_ref())?;
             }
+        }
+        // RFC 8620 section 1.8: an extension property needs its capability.
+        if selected.stored.selects_authentication() && !self.sender_authentication {
+            return Err(Error::InvalidArguments);
         }
         let all = ids.as_ref().is_none_or(|v| v.kind == scan::Kind::Null);
         let mut requested = self.get_ids::<EmailId>(

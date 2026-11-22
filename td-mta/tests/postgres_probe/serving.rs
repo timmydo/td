@@ -435,6 +435,75 @@ pub(super) fn exercise(
     let identity = td_mta::ids::IdentityId::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
     let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let identity = td_mta::wire::encode_id(identity, &mut identity_bytes).unwrap();
+    // The direct-MX Email's recorded results, only under their capability.
+    let authenticated = {
+        let id = td_mta::ids::EmailId::parse(&sql(
+            fixture,
+            "SELECT encode(email_id,'hex') FROM td_mta.email_authentication",
+        ))
+        .unwrap();
+        let mut bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        td_mta::wire::encode_id(id, &mut bytes).unwrap().to_owned()
+    };
+    let sender_authentication = |id: &str, using: &[&str]| {
+        let mut capabilities = vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
+        capabilities.extend_from_slice(using);
+        let reply = post(&td_json::json!({"using":capabilities,"methodCalls":[["Email/get",{"accountId":account_wire,"ids":[id],"properties":["senderAuthentication"]},"auth"]]}).to_string());
+        reply["methodResponses"][0].clone()
+    };
+    let reply = sender_authentication(&authenticated, &[]);
+    assert_eq!(reply[0].as_str(), Some("error"), "{reply:?}");
+    assert_eq!(reply[1]["type"].as_str(), Some("invalidArguments"));
+    let reply = sender_authentication(
+        &authenticated,
+        &[td_mta::jmap_request::SENDER_AUTHENTICATION],
+    );
+    assert_eq!(
+        reply[1]["list"],
+        td_json::json!([{"id":authenticated,"senderAuthentication":{
+            "spf":{"result":"fail","identity":"mailfrom","domain":"example.test"},
+            "dkim":{"complete":true,"signatures":[
+                {"result":"pass","algorithm":"ed25519-sha256","keyBits":256,
+                    "domain":"football.example.com","selector":"brisbane"},
+                {"result":"pass","algorithm":"rsa-sha256","keyBits":1024,
+                    "domain":"football.example.com","selector":"test"}]},
+            "dmarc":{"result":"pass","author":"football.example.com",
+                "policyDomain":"football.example.com",
+                "policy":{"disposition":"reject","strictSpf":true,"strictDkim":true},
+                "aligned":"dkim"}}}]),
+        "{reply:?}"
+    );
+    // A stored value the schema should have refused fails the request
+    // rather than reaching the JSON writer or returning part of a result.
+    let refused = || {
+        let (mut tls, _) = super::smtp_transport::upgrade_protocol(
+            TcpStream::connect(https_address).unwrap(),
+            Arc::new(td_mta::clock::RuntimeClock::new()),
+            &fixture.ca,
+            td_crypto::TlsProtocol::Http1,
+        );
+        let body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail",td_mta::jmap_request::SENDER_AUTHENTICATION],"methodCalls":[["Email/get",{"accountId":account_wire,"ids":[authenticated.as_str()],"properties":["senderAuthentication"]},"auth"]]}).to_string();
+        write!(tls,"POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",https_address.port(),encoded,body.len(),body).unwrap();
+        tls.flush().unwrap();
+        let mut reply = String::new();
+        tls.read_to_string(&mut reply).unwrap();
+        assert!(!reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(!reply.contains("senderAuthentication"), "{reply}");
+    };
+    for (forge, restore) in [
+        (
+            "UPDATE td_mta.email_authentication SET spf_domain='a\"b'",
+            "UPDATE td_mta.email_authentication SET spf_domain='example.test'",
+        ),
+        (
+            "UPDATE td_mta.email_dkim_signatures SET ordinal=3 WHERE ordinal=1",
+            "UPDATE td_mta.email_dkim_signatures SET ordinal=1 WHERE ordinal=3",
+        ),
+    ] {
+        sql(fixture, forge);
+        refused();
+        sql(fixture, restore);
+    }
     // Exercise live upload, structured composition and later SMTP delivery.
     let attachment_blob = {
         let (mut tls, _) = super::smtp_transport::upgrade_protocol(
@@ -666,6 +735,14 @@ pub(super) fn exercise(
             .to_owned()
     };
     let expiry_notice = notice_wire(expired);
+    // A locally generated Email has no direct-MX results.
+    assert_eq!(
+        sender_authentication(
+            &expiry_notice,
+            &[td_mta::jmap_request::SENDER_AUTHENTICATION]
+        )[1]["list"],
+        td_json::json!([{"id":expiry_notice,"senderAuthentication":null}])
+    );
     assert!(notice_text(&expiry_notice).contains("Delivery deadline expired"));
     assert!(cloud.0.try_wait().unwrap().is_none());
     assert!(clock_command("queue-clock-status").contains("confirmed"));

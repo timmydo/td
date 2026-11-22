@@ -531,7 +531,10 @@ Authentication-Results field uses 3,297 bytes plus the hostname for every
 outcome. Publication adds two statements per account copy inside its
 transaction: one `email_authentication` row and one statement for up to
 four signature rows, at most 32 statements for 16 accounts. Each copy
-retains its own validated result, a few hundred bytes. SPF, DKIM and
+retains its own validated result, a few hundred bytes. Reading the
+JMAP property costs one query per sixteen-ID Email/get window and
+retains at most sixteen results of at most about 2 KiB each, reserved
+fallibly through td-alloc. SPF, DKIM and
 DMARC share the receiver's final wait, which is the longer of the SPF
 bound above and two DKIM budgets. Observations still queued or running
 when it ends, including when the full commit budget needs the time, are

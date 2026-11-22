@@ -48,6 +48,7 @@ fn stored_and_derived_fields_are_recognized_without_header_alias_collisions() {
         ("attachments", Field::Attachments),
         ("hasAttachment", Field::HasAttachment),
         ("preview", Field::Preview),
+        ("senderAuthentication", Field::SenderAuthentication),
     ];
     for (name, field) in expected {
         assert_eq!(parse(name), Ok(Some(Property::Field(field))));

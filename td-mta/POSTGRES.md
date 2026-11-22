@@ -2394,7 +2394,8 @@ or method reopening. Prefetching does not authorize body output: body
 callbacks still verify the same snapshot's bytes.
 
 For selected mailboxIds and keywords, two additional typed, account-scoped
-batch queries prefetch bounded prefixes for the same IDs. Each lateral
+batch queries prefetch bounded prefixes for the same IDs; a selected
+`senderAuthentication` adds a third ([Direct-MX sender authentication results](POSTGRES.md#direct-mx-sender-authentication-results)). Each lateral
 subquery aggregates at most nine values and their validation fields into
 one protocol row, rather than spending one protocol frame per value and
 repeating it during fallback. Sets shorter than nine are complete; a
@@ -4821,6 +4822,45 @@ the monitoring policy and records `dmarc_policy` as `none`; otherwise it
 records a policy error. Reporting URIs are checked locally. The difference
 between the RFC's two descriptions of a missing `p` is recorded in
 [RFC erratum 9236](https://mailarchive.ietf.org/arch/msg/dmarc/PLyfRTXCYKRgss8WQonFqif0OkM/).
+
+### Reading sender authentication over JMAP
+
+A serving primary's session advertises
+`https://timmydouglas.com/ns/td-mta/sender-authentication` globally and for
+its account, with no members. A read-only session does not; a replica,
+which is served read-only, holds no rows because replication carries
+none. A request naming the capability there fails with
+`unknownCapability`, and clients read the replicated
+Authentication-Results header instead. A request that names it in
+`using` may select the read-only Email property `senderAuthentication`;
+selecting it without the capability is `invalidArguments` (RFC 8620
+section 1.8). The property is not a default. It is `null` for an Email
+without a row, and otherwise states the rows of this section:
+
+```json
+{"spf": {"result": "pass", "identity": "mailfrom", "domain": "example.org"},
+ "dkim": {"complete": true, "signatures": [
+   {"result": "pass", "algorithm": "rsa-sha256", "keyBits": 2048,
+    "domain": "example.org", "selector": "s1"}]},
+ "dmarc": {"result": "pass", "author": "example.org",
+  "policyDomain": "example.org",
+  "policy": {"disposition": "reject", "strictSpf": false, "strictDkim": false},
+  "aligned": "dkim"}}
+```
+
+Members mirror the columns, in signature order; a column that is NULL is
+`null`, `identity` is `helo` when `spf_helo` is true, and `policy` is
+`null` when no policy governed. The property reads the Email's own
+snapshot. With the Email/get metadata prefetch, one
+account-scoped query returns the rows for each window of up to sixteen
+IDs, at most four signature rows per Email; each cached value is read
+once, and any other read issues the same query for one ID. A value the
+schema should have refused, such as a name outside the field's alphabet or
+a gap in signature ordinals, fails the request as storage corruption
+rather than reaching the JSON writer or returning part of a result.
+Email/set accepts no change to it. `Authentication-Results` remains
+readable as an ordinary header property; clients should prefer this
+property, which names only the receiver's own results.
 
 ### Inspecting direct-MX SPF observations
 

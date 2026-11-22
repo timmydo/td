@@ -22,6 +22,7 @@ pub enum Field {
     Attachments,
     HasAttachment,
     Preview,
+    SenderAuthentication,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Property<'a> {
@@ -119,6 +120,7 @@ const FIELDS: &[(&str, Field)] = &[
     ("attachments", Field::Attachments),
     ("hasAttachment", Field::HasAttachment),
     ("preview", Field::Preview),
+    ("senderAuthentication", Field::SenderAuthentication),
 ];
 const FIELD_BYTES: u64 = {
     let mut sum = 0;

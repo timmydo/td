@@ -50,6 +50,11 @@ pub trait Source {
         after: Option<&str>,
         maximum: usize,
     ) -> Result<EmailValues<String>, Self::Error>;
+    /// The receiver's own direct-MX results, or None for any other Email.
+    fn email_authentication(
+        &mut self,
+        email: EmailId,
+    ) -> Result<Option<crate::sender_authentication::Results>, Self::Error>;
 }
 
 /// Maximum bytes in one provisional sink callback.
@@ -61,8 +66,10 @@ const MAILBOXES: u8 = 4;
 const KEYWORDS: u8 = 8;
 const SIZE: u8 = 16;
 const RECEIVED: u8 = 32;
+const AUTHENTICATION: u8 = 64;
 
-/// Only the seven stored fields; id is always emitted.
+/// Only the stored fields; id is always emitted. `all` is the replica
+/// metadata set, which excludes sender authentication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stored(u8);
 impl Stored {
@@ -81,6 +88,7 @@ impl Stored {
             Field::Keywords => KEYWORDS,
             Field::Size => SIZE,
             Field::ReceivedAt => RECEIVED,
+            Field::SenderAuthentication => AUTHENTICATION,
             Field::Headers
             | Field::BodyStructure
             | Field::BodyValues
@@ -97,6 +105,9 @@ impl Stored {
     }
     pub(crate) fn selects_keywords(self) -> bool {
         self.has(KEYWORDS)
+    }
+    pub(crate) fn selects_authentication(self) -> bool {
+        self.has(AUTHENTICATION)
     }
     fn has(self, field: u8) -> bool {
         self.0 & field != 0
@@ -224,11 +235,139 @@ pub(crate) fn write_members<S: Source + ?Sized>(
         buffered(view, &mut out, &mut emit, format_args!("}}"))?;
         flush(view, &mut out, &mut emit)?;
     }
+    if selected.has(AUTHENTICATION) {
+        let results = view.email_authentication(email)?;
+        append(&mut out, ",\"senderAuthentication\":")?;
+        match results {
+            None => append(&mut out, "null")?,
+            Some(results) => authentication(view, &mut out, &mut emit, &results)?,
+        }
+        flush(view, &mut out, &mut emit)?;
+    }
     if close {
         append(&mut out, "}")?;
         flush(view, &mut out, &mut emit)?;
     }
     Ok(true)
+}
+
+struct Name<'a>(Option<&'a str>);
+impl std::fmt::Display for Name<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Stored names are validated LDH-and-underscore text: no JSON escapes.
+        match self.0 {
+            Some(name) => write!(f, "\"{name}\""),
+            None => f.write_str("null"),
+        }
+    }
+}
+
+/// Each emission names at most one stored domain, well under one chunk.
+fn authentication<S: Source + ?Sized>(
+    view: &mut S,
+    out: &mut TextBuffer<'_>,
+    emit: &mut impl FnMut(&[u8]) -> Result<(), Error>,
+    results: &crate::sender_authentication::Results,
+) -> Result<(), S::Error> {
+    if !results.readable() {
+        return Err(Error::Corrupt.into());
+    }
+    buffered(
+        view,
+        out,
+        emit,
+        format_args!(
+            "{{\"spf\":{{\"result\":\"{}\",\"identity\":\"{}\",\"domain\":{}}}",
+            results.spf.as_str(),
+            if results.spf_helo { "helo" } else { "mailfrom" },
+            Name(results.spf_domain.as_deref())
+        ),
+    )?;
+    buffered(
+        view,
+        out,
+        emit,
+        format_args!(
+            ",\"dkim\":{{\"complete\":{},\"signatures\":[",
+            !results.dkim.incomplete
+        ),
+    )?;
+    for (index, row) in results.dkim.signatures.iter().enumerate() {
+        buffered(
+            view,
+            out,
+            emit,
+            format_args!(
+                "{}{{\"result\":\"{}\",\"algorithm\":{},\"keyBits\":{}",
+                if index == 0 { "" } else { "," },
+                row.outcome.as_str(),
+                Name(row.algorithm.map(td_crypto::DkimAlgorithm::as_str)),
+                Bits(row.key_bits)
+            ),
+        )?;
+        buffered(
+            view,
+            out,
+            emit,
+            format_args!(",\"domain\":{}", Name(row.domain.as_deref())),
+        )?;
+        buffered(
+            view,
+            out,
+            emit,
+            format_args!(",\"selector\":{}}}", Name(row.selector.as_deref())),
+        )?;
+    }
+    let dmarc = &results.dmarc;
+    buffered(
+        view,
+        out,
+        emit,
+        format_args!(
+            "]}},\"dmarc\":{{\"result\":\"{}\",\"author\":{}",
+            dmarc.outcome.as_str(),
+            Name(dmarc.author.as_deref())
+        ),
+    )?;
+    buffered(
+        view,
+        out,
+        emit,
+        format_args!(",\"policyDomain\":{}", Name(dmarc.policy_domain.as_deref())),
+    )?;
+    match dmarc.policy {
+        None => buffered(view, out, emit, format_args!(",\"policy\":null"))?,
+        Some(policy) => buffered(
+            view,
+            out,
+            emit,
+            format_args!(
+                ",\"policy\":{{\"disposition\":\"{}\",\"strictSpf\":{},\"strictDkim\":{}}}",
+                policy.disposition.as_str(),
+                policy.strict_spf,
+                policy.strict_dkim
+            ),
+        )?,
+    }
+    buffered(
+        view,
+        out,
+        emit,
+        format_args!(
+            ",\"aligned\":{}}}}}",
+            Name(dmarc.aligned.map(crate::dmarc::Identifier::as_str))
+        ),
+    )
+}
+
+struct Bits(Option<u16>);
+impl std::fmt::Display for Bits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(bits) => write!(f, "{bits}"),
+            None => f.write_str("null"),
+        }
+    }
 }
 fn append(out: &mut TextBuffer<'_>, text: &str) -> Result<(), Error> {
     out.append(text).map_err(|_| Error::Capacity)

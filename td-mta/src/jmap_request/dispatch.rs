@@ -49,7 +49,7 @@ mod push;
 mod replica;
 #[path = "thread_get.rs"]
 mod thread_get;
-use super::{MAIL, PARTIAL_SEARCH, REPLICATION, SUBMISSION};
+use super::{MAIL, PARTIAL_SEARCH, REPLICATION, SENDER_AUTHENTICATION, SUBMISSION};
 #[path = "identity_get.rs"]
 mod identity_get;
 #[path = "submission_get.rs"]
@@ -528,7 +528,12 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
             selected.selects_mailboxes(),
             selected.selects_keywords(),
         )
-        .map_err(postgres_read_error)
+        .map_err(postgres_read_error)?;
+        if selected.selects_authentication() {
+            self.prefetch_authentication(ids)
+                .map_err(postgres_read_error)?;
+        }
+        Ok(())
     }
     fn search_email(
         &mut self,
@@ -903,6 +908,7 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
     let mut submission = false;
     let mut replication = false;
     let mut partial_search = false;
+    let mut sender_authentication = false;
     for capability in request.using {
         retention.admit_work_turn().map_err(Error::Storage)?;
         core |= capability.as_string_bytes() == Some(CORE.as_bytes());
@@ -910,6 +916,8 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
         submission |= capability.as_string_bytes() == Some(SUBMISSION.as_bytes());
         replication |= capability.as_string_bytes() == Some(REPLICATION.as_bytes());
         partial_search |= capability.as_string_bytes() == Some(PARTIAL_SEARCH.as_bytes());
+        sender_authentication |=
+            capability.as_string_bytes() == Some(SENDER_AUTHENTICATION.as_bytes());
     }
     let mut calls = td_alloc::BudgetVec::with_capacity(&budget, request.call_count())
         .map_err(|_| Error::ResponseCapacity)?;
@@ -935,6 +943,7 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
         email_updates,
         submission,
         partial_search,
+        sender_authentication,
         submissions,
         implicit: None,
     };
@@ -1044,6 +1053,7 @@ struct Worker<'io, 'c, 's, 'sr, 'a> {
     email_updates: bool,
     submission: bool,
     partial_search: bool,
+    sender_authentication: bool,
     submissions: Option<SubmissionAccess<'io>>,
     implicit: Option<(&'static str, Range<u64>)>,
 }
@@ -1812,6 +1822,7 @@ pub(super) mod tests {
                 email_updates: false,
                 submission: false,
                 partial_search: false,
+                sender_authentication: false,
                 submissions: None,
                 implicit: None,
             };
@@ -2227,6 +2238,7 @@ pub(super) mod tests {
                 email_updates: false,
                 submission: false,
                 partial_search: false,
+                sender_authentication: false,
                 submissions: None,
                 implicit: None,
             };

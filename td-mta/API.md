@@ -7226,13 +7226,15 @@ available for mailbox discovery; no query or query-delta support is claimed.
 email_property::Cursor recognizes one immutable decoded Email property key.
 The existing shared header-property cursor owns all convenience aliases,
 parameterized header grammar, field/form restrictions and requested spelling.
-The Email wrapper adds the fifteen standard fixed fields, distinguishing
-unknown names from malformed or forbidden header forms. It allocates no
+The Email wrapper adds the fifteen standard fixed fields and td's
+`senderAuthentication`, distinguishing unknown names from malformed or
+forbidden header forms. Recognition does not gate the extension: Email/get
+refuses it unless the request names its capability. It allocates no
 storage and borrows any recognized header spelling from the original key.
 
 Header recognition yields under its existing per-turn bounds; one subsequent
 fixed-table turn charges at most 256 candidate bytes and 32 records before
-comparisons (currently 125 bytes and 15 records). The caller must supply one
+comparisons (currently 145 bytes and 16 records). The caller must supply one
 original meter across all turns; this passive cursor does not bind its identity.
 Failure is sticky even
 if supplied another meter. Completed recognition is passive cached metadata,
@@ -7275,8 +7277,13 @@ import/set values belongs to their method admission before storage.
 
 ## Provisional stored Email JSON
 
-email_response::write_stored emits a complete object for the explicit seven
-stored Email fields, always including id. Stored::include refuses derived
+email_response::write_stored emits a complete object for the explicit
+stored Email fields, always including id: the seven metadata fields and the
+opt-in `senderAuthentication`, which `Stored::all` (the replica metadata
+set) excludes. It comes from `Source::email_authentication` in the same
+snapshot; a recorded name the Authentication-Results field could not state
+is corruption, so stored names need no JSON escaping. Email/get admits the
+property only under its capability. Stored::include refuses derived
 fields; the full Email/get projection will route those through MIME/header
 consumers. This helper does not implement a partial Email/get method or
 advertise Mail. An absent Email emits nothing and returns false.

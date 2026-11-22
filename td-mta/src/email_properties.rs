@@ -33,6 +33,7 @@ const fn bit(field: email_property::Field) -> u16 {
         email_property::Field::Attachments => 4096,
         email_property::Field::HasAttachment => 8192,
         email_property::Field::Preview => 16384,
+        email_property::Field::SenderAuthentication => 32768,
     }
 }
 pub type View<'v, 'k> = crate::property_selection::View<'v, 'k, Fields>;

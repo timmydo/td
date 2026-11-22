@@ -43,15 +43,16 @@ pub struct Observed {
     pub dmarc: dmarc::Report,
 }
 
+/// Validated results; only this crate builds or reads one.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Results {
-    pub spf: spf::Outcome,
+pub struct Results {
+    pub(crate) spf: spf::Outcome,
     /// The MAIL FROM domain SPF evaluated; the HELO domain for a null path.
-    pub spf_domain: Option<String>,
+    pub(crate) spf_domain: Option<String>,
     /// SPF evaluated the HELO identity because the reverse path was null.
-    pub spf_helo: bool,
-    pub dkim: dkim::Report,
-    pub dmarc: dmarc::Report,
+    pub(crate) spf_helo: bool,
+    pub(crate) dkim: dkim::Report,
+    pub(crate) dmarc: dmarc::Report,
 }
 
 fn trace_name(name: &str) -> bool {
@@ -111,6 +112,25 @@ impl Results {
             dkim,
             dmarc,
         })
+    }
+
+    /// Every name is one the field could state, so it needs no JSON escape.
+    pub(crate) fn readable(&self) -> bool {
+        let dkim = self.dkim.signatures.len() <= dkim::MAX_SIGNATURES
+            && self.dkim.signatures.iter().all(|row| {
+                [row.domain.as_deref(), row.selector.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .all(trace_name)
+            });
+        dkim && [
+            self.spf_domain.as_deref(),
+            self.dmarc.author.as_deref(),
+            self.dmarc.policy_domain.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(trace_name)
     }
 
     /// An independent copy for another recipient account's Email.
@@ -292,6 +312,59 @@ fn authserv_id_matches(value: &[u8], authserv_id: &str) -> Option<bool> {
     Some(token.eq_ignore_ascii_case(authserv_id.as_bytes()))
 }
 
+/// Stored vocabulary, read back from PostgreSQL text columns.
+pub(crate) mod stored {
+    use crate::{dkim, dmarc, spf};
+    use td_crypto::DkimAlgorithm;
+
+    fn find<T: Copy>(values: &[T], name: fn(T) -> &'static str, text: &str) -> Option<T> {
+        values.iter().copied().find(|value| name(*value) == text)
+    }
+    pub(crate) fn spf(text: &str) -> Option<spf::Outcome> {
+        use spf::Outcome::*;
+        find(
+            &[None, Neutral, Pass, Fail, Softfail, Temperror, Permerror],
+            spf::Outcome::as_str,
+            text,
+        )
+    }
+    pub(crate) fn dkim(text: &str) -> Option<dkim::Outcome> {
+        use dkim::Outcome::*;
+        find(
+            &[Pass, Fail, Permerror, Temperror],
+            dkim::Outcome::as_str,
+            text,
+        )
+    }
+    pub(crate) fn algorithm(text: &str) -> Option<DkimAlgorithm> {
+        find(
+            &[DkimAlgorithm::Rsa, DkimAlgorithm::Ed25519],
+            DkimAlgorithm::as_str,
+            text,
+        )
+    }
+    pub(crate) fn dmarc(text: &str) -> Option<dmarc::Outcome> {
+        use dmarc::Outcome::*;
+        find(
+            &[None, Pass, Fail, Permerror, Temperror],
+            dmarc::Outcome::as_str,
+            text,
+        )
+    }
+    pub(crate) fn disposition(text: &str) -> Option<dmarc::Disposition> {
+        use dmarc::Disposition::*;
+        find(
+            &[None, Quarantine, Reject],
+            dmarc::Disposition::as_str,
+            text,
+        )
+    }
+    pub(crate) fn identifier(text: &str) -> Option<dmarc::Identifier> {
+        use dmarc::Identifier::*;
+        find(&[Spf, Dkim], dmarc::Identifier::as_str, text)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -359,6 +432,95 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(value)
             );
+        }
+    }
+
+    #[test]
+    fn stored_words_round_trip_every_variant() {
+        use super::stored;
+        use crate::{dkim, dmarc, spf};
+        // Each exhaustive match stops compiling when a variant is added, so
+        // the stored vocabulary is revisited with it.
+        for value in [
+            spf::Outcome::None,
+            spf::Outcome::Neutral,
+            spf::Outcome::Pass,
+            spf::Outcome::Fail,
+            spf::Outcome::Softfail,
+            spf::Outcome::Temperror,
+            spf::Outcome::Permerror,
+        ] {
+            match value {
+                spf::Outcome::None
+                | spf::Outcome::Neutral
+                | spf::Outcome::Pass
+                | spf::Outcome::Fail
+                | spf::Outcome::Softfail
+                | spf::Outcome::Temperror
+                | spf::Outcome::Permerror => {}
+            }
+            assert_eq!(stored::spf(value.as_str()), Some(value));
+        }
+        for value in [
+            dkim::Outcome::Pass,
+            dkim::Outcome::Fail,
+            dkim::Outcome::Permerror,
+            dkim::Outcome::Temperror,
+        ] {
+            match value {
+                dkim::Outcome::Pass
+                | dkim::Outcome::Fail
+                | dkim::Outcome::Permerror
+                | dkim::Outcome::Temperror => {}
+            }
+            assert_eq!(stored::dkim(value.as_str()), Some(value));
+        }
+        for value in [
+            td_crypto::DkimAlgorithm::Rsa,
+            td_crypto::DkimAlgorithm::Ed25519,
+        ] {
+            match value {
+                td_crypto::DkimAlgorithm::Rsa | td_crypto::DkimAlgorithm::Ed25519 => {}
+            }
+            assert_eq!(stored::algorithm(value.as_str()), Some(value));
+        }
+        for value in [
+            dmarc::Outcome::None,
+            dmarc::Outcome::Pass,
+            dmarc::Outcome::Fail,
+            dmarc::Outcome::Permerror,
+            dmarc::Outcome::Temperror,
+        ] {
+            match value {
+                dmarc::Outcome::None
+                | dmarc::Outcome::Pass
+                | dmarc::Outcome::Fail
+                | dmarc::Outcome::Permerror
+                | dmarc::Outcome::Temperror => {}
+            }
+            assert_eq!(stored::dmarc(value.as_str()), Some(value));
+        }
+        for value in [
+            dmarc::Disposition::None,
+            dmarc::Disposition::Quarantine,
+            dmarc::Disposition::Reject,
+        ] {
+            match value {
+                dmarc::Disposition::None
+                | dmarc::Disposition::Quarantine
+                | dmarc::Disposition::Reject => {}
+            }
+            assert_eq!(stored::disposition(value.as_str()), Some(value));
+        }
+        for value in [dmarc::Identifier::Spf, dmarc::Identifier::Dkim] {
+            match value {
+                dmarc::Identifier::Spf | dmarc::Identifier::Dkim => {}
+            }
+            assert_eq!(stored::identifier(value.as_str()), Some(value));
+        }
+        for word in ["", "PASS", "pass ", "softfail\0", "rsa-sha1"] {
+            assert_eq!(stored::spf(word), None);
+            assert_eq!(stored::algorithm(word), None);
         }
     }
 }

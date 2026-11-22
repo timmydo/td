@@ -19,6 +19,7 @@ struct Fixture<'a> {
     expired: &'a Cell<bool>,
     absent: bool,
     foreign: bool,
+    authentication: Option<fn() -> crate::sender_authentication::Results>,
 }
 impl Source for Fixture<'_> {
     type Error = Error;
@@ -94,6 +95,13 @@ impl Source for Fixture<'_> {
             has_more,
         })
     }
+    fn email_authentication(
+        &mut self,
+        _: EmailId,
+    ) -> Result<Option<crate::sender_authentication::Results>, Error> {
+        self.check_snapshot()?;
+        Ok(self.authentication.map(|make| make()))
+    }
 }
 #[test]
 fn complete_projection_pages_sets_and_preserves_wire_fields() {
@@ -103,6 +111,7 @@ fn complete_projection_pages_sets_and_preserves_wire_fields() {
         expired: &expired,
         absent: false,
         foreign: false,
+        authentication: None,
     };
     let mut bytes = Vec::new();
     assert!(
@@ -134,6 +143,7 @@ fn explicit_projection_keeps_id_and_absence_emits_nothing() {
         expired: &expired,
         absent: false,
         foreign: false,
+        authentication: None,
     };
     for (field, name) in [
         (Field::BlobId, "blobId"),
@@ -179,6 +189,7 @@ fn sink_failure_expiry_and_cross_snapshot_values_withhold_completion() {
         expired: &expired,
         absent: false,
         foreign: false,
+        authentication: None,
     };
     assert_eq!(
         write_stored(&mut source, EMAIL, Stored::all(), &mut [0; 2048], |_| Err(
@@ -203,4 +214,141 @@ fn sink_failure_expiry_and_cross_snapshot_values_withhold_completion() {
         |_| Ok(())
     )
     .is_err());
+}
+#[test]
+fn sender_authentication_is_opt_in_and_names_every_recorded_value() {
+    use crate::{dkim, dmarc, sender_authentication::Results, spf};
+    fn full() -> Results {
+        Results {
+            spf: spf::Outcome::Softfail,
+            spf_domain: Some("bounce.example".into()),
+            spf_helo: false,
+            dkim: dkim::Report {
+                signatures: [
+                    dkim::SignatureResult {
+                        outcome: dkim::Outcome::Pass,
+                        algorithm: Some(td_crypto::DkimAlgorithm::Rsa),
+                        domain: Some("example.com".into()),
+                        selector: Some("s_1".into()),
+                        key_bits: Some(2048),
+                    },
+                    dkim::SignatureResult {
+                        outcome: dkim::Outcome::Permerror,
+                        algorithm: None,
+                        domain: None,
+                        selector: None,
+                        key_bits: None,
+                    },
+                ]
+                .into(),
+                incomplete: true,
+            },
+            dmarc: dmarc::Report {
+                outcome: dmarc::Outcome::Pass,
+                author: Some("mail.example.com".into()),
+                policy_domain: Some("example.com".into()),
+                policy: Some(dmarc::Requested {
+                    disposition: dmarc::Disposition::Quarantine,
+                    strict_spf: false,
+                    strict_dkim: true,
+                }),
+                aligned: Some(dmarc::Identifier::Dkim),
+            },
+        }
+    }
+    let expired = Cell::new(false);
+    let mut source = Fixture {
+        count: 1,
+        expired: &expired,
+        absent: false,
+        foreign: false,
+        authentication: None,
+    };
+    let mut projection = Stored::id_only();
+    projection.include(Field::SenderAuthentication).unwrap();
+    assert!(!Stored::all().selects_authentication());
+    let write = |source: &mut Fixture<'_>| {
+        let mut bytes = Vec::new();
+        write_stored(source, EMAIL, projection, &mut [0; 2048], |chunk| {
+            assert!(chunk.len() <= MAX_CHUNK_BYTES);
+            td_alloc::extend_from_slice(&mut bytes, chunk).unwrap();
+            Ok(())
+        })
+        .map(|_| td_json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap())
+    };
+    let json = write(&mut source).unwrap();
+    assert!(json["senderAuthentication"].is_null());
+    assert_eq!(json.as_obj().unwrap().len(), 2);
+    source.authentication = Some(full);
+    let json = write(&mut source).unwrap();
+    assert_eq!(
+        json["senderAuthentication"],
+        td_json::json!({
+            "spf": {"result": "softfail", "identity": "mailfrom", "domain": "bounce.example"},
+            "dkim": {"complete": false, "signatures": [
+                {"result": "pass", "algorithm": "rsa-sha256", "keyBits": 2048,
+                    "domain": "example.com", "selector": "s_1"},
+                {"result": "permerror", "algorithm": null, "keyBits": null,
+                    "domain": null, "selector": null}
+            ]},
+            "dmarc": {"result": "pass", "author": "mail.example.com",
+                "policyDomain": "example.com",
+                "policy": {"disposition": "quarantine", "strictSpf": false, "strictDkim": true},
+                "aligned": "dkim"}
+        })
+    );
+    source.authentication = Some(|| {
+        let mut bare = full();
+        bare.dkim.signatures.clear();
+        bare.dmarc = dmarc::Report::unavailable();
+        bare.spf_helo = true;
+        bare.spf_domain = None;
+        bare
+    });
+    let json = write(&mut source).unwrap();
+    assert_eq!(
+        json["senderAuthentication"]["dkim"]["signatures"],
+        td_json::json!([])
+    );
+    assert!(json["senderAuthentication"]["dmarc"]["policy"].is_null());
+    assert!(json["senderAuthentication"]["dmarc"]["aligned"].is_null());
+    assert_eq!(
+        json["senderAuthentication"]["spf"],
+        td_json::json!({"result": "softfail", "identity": "helo", "domain": null})
+    );
+    // Four signatures with the longest names still fit the fixed chunks.
+    source.authentication = Some(|| {
+        let mut long = full();
+        let name = || Some(String::from_utf8(td_alloc::filled(253, b'a').unwrap()).unwrap());
+        long.spf_domain = name();
+        long.dmarc.author = name();
+        long.dmarc.policy_domain = name();
+        let row = || dkim::SignatureResult {
+            outcome: dkim::Outcome::Temperror,
+            algorithm: Some(td_crypto::DkimAlgorithm::Ed25519),
+            domain: name(),
+            selector: name(),
+            key_bits: Some(65535),
+        };
+        long.dkim.signatures = [row(), row(), row(), row()].into();
+        long
+    });
+    let json = write(&mut source).unwrap();
+    let long = &json["senderAuthentication"];
+    assert_eq!(long["dkim"]["signatures"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        long["dkim"]["signatures"][3]["selector"]
+            .as_str()
+            .unwrap()
+            .len(),
+        253
+    );
+    assert_eq!(long["dmarc"]["policyDomain"].as_str().unwrap().len(), 253);
+    // A name the field could not state is corruption, never escaped JSON.
+    source.authentication = Some(|| {
+        let mut forged = full();
+        forged.spf_domain = Some("a\"b".into());
+        forged
+    });
+    assert_eq!(write(&mut source).err(), Some(Error::Corrupt));
 }

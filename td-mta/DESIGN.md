@@ -1033,8 +1033,10 @@ envelope sender that field would repeat are already in Received and
 Return-Path, so any Received-SPF in a stored message is the peer's
 untrusted claim. The observations are information only. Mail with any result
 can reach Inbox, including mail claiming a hosted domain with a published
-reject policy. POSTGRES.md, [Direct-MX sender authentication results](POSTGRES.md#direct-mx-sender-authentication-results),
-gives the field and row formats and the inspection queries.
+reject policy. JMAP clients that negotiate td's sender-authentication
+capability read the rows as the read-only Email property
+`senderAuthentication`. POSTGRES.md, [Direct-MX sender authentication results](POSTGRES.md#direct-mx-sender-authentication-results),
+gives the field, row and property formats and the inspection queries.
 
 Port 443 serves JMAP HTTPS. Port 80 serves only ACME HTTP-01 challenges,
 from the native ACME worker (ACME.md); other requests receive 404. It

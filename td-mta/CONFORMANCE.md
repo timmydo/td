@@ -654,10 +654,14 @@ recording SPF fail, both DKIM passes with key sizes and DMARC pass. The
 fields claiming the receiver are gone; the one naming another server and
 the claimed Received-SPF pass stay farther down. The `email_authentication`
 and `email_dkim_signatures` rows state the same results, and the POSTGRES.md
-inspection queries return them. Header tests cover every SPF,
-DKIM and DMARC result at one fixed field length, the effective null sender,
-names the field cannot state, authserv-id parsing through comments and
-quoted strings, and maximum trace size. A schema-46 upgrade test checks
+inspection queries return them. Email/get returns them as
+`senderAuthentication` when the request names td's sender-authentication
+capability, refuses the property as `invalidArguments` when it does not,
+returns `null` for a locally generated failure notice, and fails the
+request after a forged row name or signature-ordinal gap. Header tests
+cover every SPF, DKIM and DMARC result at one fixed field length, the
+effective null sender, names the field cannot state, authserv-id
+parsing through comments and quoted strings, and maximum trace size. A schema-46 upgrade test checks
 that existing Emails gain no rows, PUBLIC has no access, the CHECK and
 foreign-key constraints refuse malformed rows and rows cascade with their
 Email. DNS and policy fixtures exercise aliases, TCP fallback,

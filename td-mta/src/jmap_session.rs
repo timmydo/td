@@ -43,6 +43,23 @@ impl std::fmt::Debug for Session {
         out.write_str("Session(<redacted>)")
     }
 }
+/// A read-only session, such as a replica's, which holds no
+/// sender-authentication rows, does not offer the property; clients read
+/// the stored header instead.
+struct Advertised(bool);
+impl std::fmt::Display for Advertised {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 {
+            write!(
+                f,
+                ",\"{}\":{{}}",
+                crate::jmap_request::SENDER_AUTHENTICATION
+            )
+        } else {
+            Ok(())
+        }
+    }
+}
 impl Session {
     pub fn mail_access(
         origin: Origin<'_>,
@@ -140,7 +157,7 @@ impl Session {
                 ",\"maxCallsInRequest\":{}",
                 ",\"maxObjectsInGet\":{}",
                 ",\"maxObjectsInSet\":{}",
-                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}},\"{replication}\":{{}},\"{partial_search}\":{{}}{submission_global}}}",
+                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}},\"{replication}\":{{}},\"{partial_search}\":{{}}{sender_authentication}{submission_global}}}",
                 ",\"accounts\":{{\"{}\":{{\"name\":",
             ),
             limits.message_bytes,
@@ -157,6 +174,7 @@ impl Session {
             id,
             replication = crate::jmap_request::REPLICATION,
             partial_search = crate::jmap_request::PARTIAL_SEARCH,
+            sender_authentication = Advertised(!read_only),
             submission_global = if submission { ",\"urn:ietf:params:jmap:submission\":{}" } else { "" },
         ))
         .map_err(|_| Error::Capacity)?;
@@ -167,7 +185,7 @@ impl Session {
             "\"urn:ietf:params:jmap:core\":{{}},\"urn:ietf:params:jmap:mail\":{{",
             "\"maxMailboxesPerEmail\":null,\"maxMailboxDepth\":null,",
             "\"maxSizeMailboxName\":{},\"maxSizeAttachmentsPerEmail\":{},",
-            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":{may_create}}},\"{replication}\":{{\"inventoryBaseFence\":true,\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}},\"{partial_search}\":{{}}{submission_account}}}}}}}",
+            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":{may_create}}},\"{replication}\":{{\"inventoryBaseFence\":true,\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}},\"{partial_search}\":{{}}{sender_authentication}{submission_account}}}}}}}",
             ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\""
         ),
             crate::format::row::MAX_MAILBOX_NAME,
@@ -175,6 +193,7 @@ impl Session {
             id,
             replication = crate::jmap_request::REPLICATION,
             partial_search = crate::jmap_request::PARTIAL_SEARCH,
+            sender_authentication = Advertised(!read_only),
             read_only = read_only,
             may_create = !read_only,
             inventory_limit = limits.query_page.min(crate::postgres_read::MAX_REPLICA_INVENTORY_PAGE),
@@ -232,11 +251,32 @@ impl Session {
     }
     /// The request parser accepts exactly the capabilities in this document.
     pub fn capabilities(&self) -> &'static [&'static str] {
-        use crate::jmap_request::{CORE, MAIL, PARTIAL_SEARCH, REPLICATION, SUBMISSION};
-        if self.submission {
-            &[CORE, MAIL, SUBMISSION, REPLICATION, PARTIAL_SEARCH]
+        use crate::jmap_request::{
+            CORE, MAIL, PARTIAL_SEARCH, REPLICATION, SENDER_AUTHENTICATION, SUBMISSION,
+        };
+        if self.read_only {
+            if self.submission {
+                &[CORE, MAIL, SUBMISSION, REPLICATION, PARTIAL_SEARCH]
+            } else {
+                &[CORE, MAIL, REPLICATION, PARTIAL_SEARCH]
+            }
+        } else if self.submission {
+            &[
+                CORE,
+                MAIL,
+                SUBMISSION,
+                REPLICATION,
+                PARTIAL_SEARCH,
+                SENDER_AUTHENTICATION,
+            ]
         } else {
-            &[CORE, MAIL, REPLICATION, PARTIAL_SEARCH]
+            &[
+                CORE,
+                MAIL,
+                REPLICATION,
+                PARTIAL_SEARCH,
+                SENDER_AUTHENTICATION,
+            ]
         }
     }
     pub fn origin(&self) -> Result<Origin<'_>, Error> {
@@ -330,6 +370,11 @@ mod tests {
             .capabilities()
             .contains(&crate::jmap_request::SUBMISSION));
         let value = td_json::parse(std::str::from_utf8(session.bytes()).unwrap()).unwrap();
+        let authentication = crate::jmap_request::SENDER_AUTHENTICATION;
+        assert!(!session.capabilities().contains(&authentication));
+        assert!(value["capabilities"][authentication].is_null());
+        let (_, listed) = value["accounts"].as_object().unwrap().first().unwrap();
+        assert!(listed["accountCapabilities"][authentication].is_null());
         let accounts = value["accounts"].as_object().unwrap();
         let (_, account) = accounts.first().unwrap();
         assert_eq!(account["isReadOnly"].as_bool(), Some(true));
@@ -378,7 +423,7 @@ mod tests {
         assert_eq!(core["maxObjectsInGet"].as_u64(), Some(256));
         assert_eq!(core["maxObjectsInSet"].as_u64(), Some(256));
         assert!(core["collationAlgorithms"].as_array().unwrap().is_empty());
-        assert_eq!(value["capabilities"].as_object().unwrap().len(), 4);
+        assert_eq!(value["capabilities"].as_object().unwrap().len(), 5);
         assert_eq!(value["accounts"].as_object().unwrap().len(), 1);
         let object = &value["accounts"]["a07070707070707070707070707070707"];
         assert_eq!(object["name"].as_str(), Some("Personal mail"));
@@ -387,6 +432,13 @@ mod tests {
         let replication = crate::jmap_request::REPLICATION;
         assert!(session.capabilities().contains(&replication));
         assert!(value["capabilities"][replication].as_object().is_some());
+        let authentication = crate::jmap_request::SENDER_AUTHENTICATION;
+        assert!(session.capabilities().contains(&authentication));
+        assert_eq!(value["capabilities"][authentication], td_json::json!({}));
+        assert_eq!(
+            object["accountCapabilities"][authentication],
+            td_json::json!({})
+        );
         assert_eq!(
             object["accountCapabilities"][replication],
             td_json::json!({"inventoryBaseFence":true,"maxInventoryIds":256,"maxMetadataIds":16})

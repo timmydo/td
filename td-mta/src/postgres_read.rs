@@ -155,6 +155,7 @@ pub struct Snapshot<'a> {
     summary_window: Option<Vec<tokio_postgres::Row>>,
     search_window: Option<search_reads::Window>,
     value_window: value_reads::Window,
+    authentication_window: AuthenticationWindow,
     _worker_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     _permit: Option<ReadPermit<'a>>,
 }
@@ -218,6 +219,170 @@ impl crate::email_response::Source for Snapshot<'_> {
     ) -> Result<Values<String>, Error> {
         self.keywords(email, after, maximum)
     }
+    fn email_authentication(
+        &mut self,
+        email: EmailId,
+    ) -> Result<Option<crate::sender_authentication::Results>, Error> {
+        self.sender_authentication(email)
+    }
+}
+
+type AuthenticationWindow = Vec<(
+    EmailId,
+    Option<Option<crate::sender_authentication::Results>>,
+)>;
+
+// One row per signature, or one row for an Email without signatures or results.
+const AUTHENTICATION: &str = "SELECT a.spf_result,a.spf_domain,a.dkim_complete,a.dmarc_result,
+    a.dmarc_author,a.dmarc_policy_domain,a.dmarc_policy,a.dmarc_strict_spf,a.dmarc_strict_dkim,
+    a.dmarc_aligned,s.ordinal,s.result,s.algorithm,s.domain,s.selector,s.key_bits,a.spf_helo,i.id
+    FROM unnest($2::bytea[]) i(id)
+    LEFT JOIN td_mta.email_authentication a ON a.account=$1 AND a.email_id=i.id
+    LEFT JOIN td_mta.email_dkim_signatures s ON s.account=a.account AND s.email_id=a.email_id
+    ORDER BY i.id,s.ordinal LIMIT $3";
+
+/// Groups AUTHENTICATION rows by requested Email; every requested ID must
+/// appear once, in byte order, and nothing else.
+fn authentication_window(
+    rows: &[tokio_postgres::Row],
+    ids: &[EmailId],
+) -> Result<AuthenticationWindow, Error> {
+    let mut window = td_alloc::with_capacity(ids.len()).map_err(|_| Error::Capacity)?;
+    let id = |row: &tokio_postgres::Row| {
+        row.try_get::<_, &[u8]>(17)
+            .ok()
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            .map(EmailId::from_bytes)
+            .ok_or(Error::Integrity)
+    };
+    let mut start = 0;
+    while let Some(first) = rows.get(start) {
+        let email = id(first)?;
+        let mut end = start + 1;
+        while let Some(row) = rows.get(end) {
+            if id(row)? != email {
+                break;
+            }
+            end += 1;
+        }
+        let group = rows.get(start..end).ok_or(Error::Integrity)?;
+        if ids.get(window.len()) != Some(&email) {
+            return Err(Error::Integrity);
+        }
+        let recorded = first
+            .try_get::<_, Option<&str>>(0)
+            .map_err(|_| Error::Integrity)?
+            .is_some();
+        let value = if recorded {
+            Some(authentication(group)?.ok_or(Error::Integrity)?)
+        } else if group.len() == 1 {
+            None
+        } else {
+            return Err(Error::Integrity);
+        };
+        td_alloc::push(&mut window, (email, Some(value))).map_err(|_| Error::Capacity)?;
+        start = end;
+    }
+    if window.len() != ids.len() {
+        return Err(Error::Integrity);
+    }
+    Ok(window)
+}
+
+fn stored_text(row: &tokio_postgres::Row, index: usize) -> Result<Option<String>, Error> {
+    row.try_get::<_, Option<&str>>(index)
+        .map_err(|_| Error::Integrity)?
+        .map(td_alloc::string)
+        .transpose()
+        .map_err(|_| Error::Capacity)
+}
+
+fn stored_word<T>(
+    row: &tokio_postgres::Row,
+    index: usize,
+    parse: fn(&str) -> Option<T>,
+) -> Result<Option<T>, Error> {
+    row.try_get::<_, Option<&str>>(index)
+        .map_err(|_| Error::Integrity)?
+        .map(|text| parse(text).ok_or(Error::Integrity))
+        .transpose()
+}
+
+/// Rows from AUTHENTICATION; any value the schema should have refused is
+/// an integrity failure rather than a partial result.
+fn authentication(
+    rows: &[tokio_postgres::Row],
+) -> Result<Option<crate::sender_authentication::Results>, Error> {
+    use crate::{dkim, dmarc, sender_authentication::stored};
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    if rows.len() > dkim::MAX_SIGNATURES {
+        return Err(Error::Integrity);
+    }
+    let mut signatures = td_alloc::with_capacity(rows.len()).map_err(|_| Error::Capacity)?;
+    for row in rows {
+        let Some(ordinal) = row
+            .try_get::<_, Option<i64>>(10)
+            .map_err(|_| Error::Integrity)?
+        else {
+            continue;
+        };
+        if usize::try_from(ordinal).ok() != Some(signatures.len()) {
+            return Err(Error::Integrity);
+        }
+        let bits = row
+            .try_get::<_, Option<i32>>(15)
+            .map_err(|_| Error::Integrity)?
+            .map(|bits| u16::try_from(bits).map_err(|_| Error::Integrity))
+            .transpose()?;
+        td_alloc::push(
+            &mut signatures,
+            dkim::SignatureResult {
+                outcome: stored_word(row, 11, stored::dkim)?.ok_or(Error::Integrity)?,
+                algorithm: stored_word(row, 12, stored::algorithm)?,
+                domain: stored_text(row, 13)?,
+                selector: stored_text(row, 14)?,
+                key_bits: bits,
+            },
+        )
+        .map_err(|_| Error::Capacity)?;
+    }
+    let flag = |index| {
+        first
+            .try_get::<_, Option<bool>>(index)
+            .map_err(|_| Error::Integrity)
+    };
+    let disposition = stored_word(first, 6, stored::disposition)?;
+    let policy = match (disposition, flag(7)?, flag(8)?) {
+        (Some(disposition), Some(strict_spf), Some(strict_dkim)) => Some(dmarc::Requested {
+            disposition,
+            strict_spf,
+            strict_dkim,
+        }),
+        (None, None, None) => None,
+        _ => return Err(Error::Integrity),
+    };
+    let results = crate::sender_authentication::Results {
+        spf: stored_word(first, 0, stored::spf)?.ok_or(Error::Integrity)?,
+        spf_domain: stored_text(first, 1)?,
+        spf_helo: first.try_get::<_, bool>(16).map_err(|_| Error::Integrity)?,
+        dkim: dkim::Report {
+            signatures,
+            incomplete: !first.try_get::<_, bool>(2).map_err(|_| Error::Integrity)?,
+        },
+        dmarc: dmarc::Report {
+            outcome: stored_word(first, 3, stored::dmarc)?.ok_or(Error::Integrity)?,
+            author: stored_text(first, 4)?,
+            policy_domain: stored_text(first, 5)?,
+            policy,
+            aligned: stored_word(first, 9, stored::identifier)?,
+        },
+    };
+    if !results.readable() {
+        return Err(Error::Integrity);
+    }
+    Ok(Some(results))
 }
 
 pub fn with_snapshot<T>(
@@ -363,6 +528,7 @@ impl<'a> Snapshot<'a> {
             summary_window: None,
             search_window: None,
             value_window: value_reads::Window::default(),
+            authentication_window: Vec::new(),
             _worker_thread: std::marker::PhantomData,
             _permit: permit,
         };
@@ -614,6 +780,7 @@ impl Snapshot<'_> {
         self.summary_window = None;
         self.search_window = None;
         self.value_window = value_reads::Window::default();
+        self.authentication_window = Vec::new();
         self.metadata = None;
         Ok(())
     }
@@ -1044,6 +1211,86 @@ impl Snapshot<'_> {
             Ok(Values { identity,email,values,has_more })
         })).map_err(Error::Connection).and_then(|result|result);
         self.retain(result)
+    }
+    /// The receiver's own direct-MX results for one Email of this account,
+    /// from the prefetched window when it holds them.
+    pub(crate) fn sender_authentication(
+        &mut self,
+        email: EmailId,
+    ) -> Result<Option<crate::sender_authentication::Results>, Error> {
+        self.check()?;
+        let cached = self
+            .authentication_window
+            .iter_mut()
+            .find(|(id, slot)| *id == email && slot.is_some())
+            .and_then(|(_, slot)| slot.take());
+        if let Some(value) = cached {
+            return Ok(value);
+        }
+        self.prefetch_authentication(&[email])?;
+        let value = self
+            .authentication_window
+            .iter_mut()
+            .find(|(id, _)| *id == email)
+            .and_then(|(_, slot)| slot.take())
+            .ok_or(Error::Integrity);
+        self.retain(value)
+    }
+    /// One account-scoped query for up to sixteen Emails' results; each
+    /// cached value is read at most once.
+    pub(crate) fn prefetch_authentication(&mut self, emails: &[EmailId]) -> Result<(), Error> {
+        self.check()?;
+        self.authentication_window = Vec::new();
+        if emails.len() > postgres_body::MAX_METADATA_IDS {
+            return self.retain(Err(Error::Capacity));
+        }
+        let mut ids = td_alloc::with_capacity(emails.len()).map_err(|_| Error::Capacity);
+        if let Ok(ids) = ids.as_mut() {
+            for email in emails {
+                if !ids.contains(email) && td_alloc::push(ids, *email).is_err() {
+                    return self.retain(Err(Error::Capacity));
+                }
+            }
+            ids.sort_unstable_by(|a: &EmailId, b| a.as_bytes().cmp(b.as_bytes()));
+        }
+        let ids = self.retain(ids)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let identity = self.identity;
+        let result = self
+            .worker
+            .run(|client| {
+                Box::pin(async move {
+                    let mut keys =
+                        td_alloc::with_capacity(ids.len()).map_err(|_| Error::Capacity)?;
+                    for id in &ids {
+                        td_alloc::push(&mut keys, id.as_bytes().as_slice())
+                            .map_err(|_| Error::Capacity)?;
+                    }
+                    let limit = i64::try_from(ids.len())
+                        .ok()
+                        .and_then(|n| n.checked_mul(4))
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or(Error::Capacity)?;
+                    let rows = client
+                        .query_typed(
+                            AUTHENTICATION,
+                            &[
+                                (&identity.account.as_bytes().as_slice(), Type::BYTEA),
+                                (&keys, Type::BYTEA_ARRAY),
+                                (&limit, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| Error::Database)?;
+                    authentication_window(&rows, &ids)
+                })
+            })
+            .map_err(Error::Connection)
+            .and_then(|result| result);
+        self.authentication_window = self.retain(result)?;
+        Ok(())
     }
     /// Order received dates in the requested direction and equal dates by ID
     /// ascending, matching the existing td-mail query interpretation.
