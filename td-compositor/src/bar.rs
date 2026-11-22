@@ -79,6 +79,9 @@ pub struct Readings {
     pub uptime_secs: Option<u64>,
     pub epoch_secs: Option<u64>,
     pub link: Link,
+    /// The output as the audio threads last read it, from the runtime
+    /// rather than a file; `None` leaves the field off the line.
+    pub audio: Option<crate::audio::Reading>,
 }
 
 impl Readings {
@@ -108,6 +111,7 @@ impl Readings {
             uptime_secs: uptime.as_deref().and_then(parse_uptime_secs),
             epoch_secs,
             link: sample_link(proc_root, sys_root),
+            audio: None,
         }
     }
 }
@@ -423,9 +427,23 @@ fn line(clock: &Clock, readings: &Readings) -> Result<String, crate::allocation:
         }
     };
     let temperature = readings.temperature;
+    let audio = AudioField(readings.audio);
     crate::allocation::format(format_args!(
-        "{net}  {load}  TEMP {temperature}  {memory}  {uptime}  {clock}"
+        "{net}  {load}  TEMP {temperature}  {memory}  {uptime}  {audio}{clock}"
     ))
+}
+
+/// The audio field and the gap after it, or nothing: just before the
+/// clock, so the clock keeps the right edge.
+struct AudioField(Option<crate::audio::Reading>);
+
+impl std::fmt::Display for AudioField {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(reading) => write!(out, "{}  ", reading.field()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// The workspaces the strip names: those holding a window, and the ACTIVE one
@@ -739,7 +757,11 @@ fn tick(
     clock: &Clock,
     reported: &mut Reported,
 ) -> Tick {
-    let readings = Readings::sample(proc_root, sys_root, epoch_secs);
+    let mut readings = Readings::sample(proc_root, sys_root, epoch_secs);
+    readings.audio = match runtime.lock() {
+        Ok(runtime) => runtime.audio_shown(),
+        Err(_) => return Tick::Poisoned,
+    };
     let Ok(line) = line(clock, &readings) else {
         // Keep the previous line and retry on the next tick.
         return Tick::Continue(None);
@@ -1631,6 +1653,48 @@ Local:
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The tick reads the runtime's audio reading into the line it
+    /// publishes, so the field shows what the audio threads last read.
+    #[test]
+    fn the_sampler_publishes_the_runtimes_audio_reading() {
+        let dir = crate::temp_dir::TempDir::new("td-bar-audio").unwrap();
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&dir.path().join("fb"), 320, 200, 320 * 4)
+                .unwrap();
+        let runtime = Mutex::new(crate::runtime::Runtime::new(framebuffer));
+        let (keys, _queued) = std::sync::mpsc::sync_channel(1);
+        let level = crate::audio::Reading::Level {
+            percent: 45,
+            muted: false,
+        };
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.enable_audio(keys);
+            runtime.audio_reading(level);
+        }
+        let fixture = Fixture::new("0.42 0.31 0.28 2/517 9182\n", MEMINFO, "187245.31 91.2\n");
+        let mut reported = Reported::default();
+        assert_eq!(
+            tick(
+                &runtime,
+                &fixture.proc_root,
+                &fixture.sys_root,
+                Some(0),
+                &Clock::Utc,
+                &mut reported
+            ),
+            Tick::Continue(None)
+        );
+        let mut expected = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
+        expected.audio = Some(level);
+        let expected = line(&Clock::Utc, &expected);
+        assert!(expected.contains("VOL 45%"));
+        let mut runtime = runtime.lock().unwrap();
+        runtime.fail_next_repaint();
+        // Identical to what the tick published, so no paint is attempted.
+        assert!(runtime.set_status(expected).is_ok());
+    }
+
     #[test]
     fn the_sampler_publishes_the_selected_clock_to_the_runtime() {
         let path = std::env::temp_dir().join(format!(
@@ -1733,9 +1797,36 @@ Local:
                     up: Some(true),
                     address: Address::Known("10.0.2.15".to_string()),
                 },
+                audio: Some(crate::audio::Reading::Level {
+                    percent: 100,
+                    muted: false,
+                }),
             },
         );
         let failed = line(&Clock::Utc, &Readings::default());
+        // The audio field's other two forms, and the notices a volume key
+        // leaves, which the bar draws in the line's place.
+        let mut audio = Vec::new();
+        for reading in [
+            crate::audio::Reading::Level {
+                percent: 45,
+                muted: true,
+            },
+            crate::audio::Reading::Unavailable,
+            crate::audio::Reading::Level {
+                percent: 45,
+                muted: false,
+            },
+        ] {
+            audio.push(line(
+                &Clock::Utc,
+                &Readings {
+                    audio: Some(reading),
+                    ..Readings::default()
+                },
+            ));
+            audio.push(reading.notice().to_string());
+        }
         // `DOWN` spells a `W` that neither of the others does, and the
         // interface NAME is a kernel-supplied string: `dev_valid_name`
         // forbids only `/`, `:` and whitespace, so a name is not guaranteed
@@ -1751,7 +1842,8 @@ Local:
                 ..Readings::default()
             },
         );
-        for text in [full.as_str(), failed.as_str(), down.as_str()] {
+        let fixed = [full.as_str(), failed.as_str(), down.as_str()];
+        for text in fixed.into_iter().chain(audio.iter().map(String::as_str)) {
             for character in text.chars() {
                 assert!(
                     crate::text::covered(character),
@@ -1760,6 +1852,53 @@ Local:
             }
         }
         assert!(full.contains('.') && failed.contains('?') && down.contains("DOWN"));
+        assert!(full.contains("VOL 100%") && audio.concat().contains("NO AUDIO"));
+    }
+
+    /// The audio field sits just before the clock, which keeps the right
+    /// edge, in each of its three forms; with no audio thread it is absent
+    /// and the line is what it was.
+    #[test]
+    fn the_audio_field_comes_before_the_clock() {
+        let with = |audio| {
+            line(
+                &Clock::Utc,
+                &Readings {
+                    uptime_secs: Some(60),
+                    epoch_secs: Some(0),
+                    audio,
+                    ..Readings::default()
+                },
+            )
+        };
+        let clock = "1970-01-01 00:00:00 UTC";
+        for (audio, field) in [
+            (
+                Some(crate::audio::Reading::Level {
+                    percent: 45,
+                    muted: false,
+                }),
+                "UP 00:01  VOL 45%  ",
+            ),
+            (
+                Some(crate::audio::Reading::Level {
+                    percent: 45,
+                    muted: true,
+                }),
+                "UP 00:01  MUTE  ",
+            ),
+            (
+                Some(crate::audio::Reading::Unavailable),
+                "UP 00:01  NO AUDIO  ",
+            ),
+            (None, "UP 00:01  "),
+        ] {
+            let shown = with(audio);
+            assert!(
+                shown.ends_with(&format!("{field}{clock}")),
+                "{audio:?}: {shown}"
+            );
+        }
     }
 
     #[test]

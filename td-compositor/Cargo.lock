@@ -11,4 +11,9 @@ name = "td-compositor"
 version = "0.1.0"
 dependencies = [
  "td-backlight",
+ "td-pulse",
 ]
+
+[[package]]
+name = "td-pulse"
+version = "0.1.0"

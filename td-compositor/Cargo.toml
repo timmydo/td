@@ -22,6 +22,7 @@ target-recipe = []
 
 [dependencies]
 td-backlight = { path = "../td-backlight" }
+td-pulse = { path = "../td-pulse" }
 
 [workspace]
 

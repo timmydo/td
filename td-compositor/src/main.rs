@@ -69,6 +69,7 @@ mod gzip;
 mod temp_dir;
 
 mod attention;
+mod audio;
 mod authority;
 mod bar;
 mod buffer;
@@ -648,6 +649,15 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
             .map_err(|_| "runtime lock poisoned".to_string())?
             .enable_screenshots(jobs, saves),
         Err(error) => eprintln!("td-compositor: {error}"),
+    }
+    // The volume keys and the bar's field (DESIGN.md, "VOLUME"), in the
+    // installed compositor alone, which the audio unit admits to the output;
+    // a development or headless compositor has neither. Reported, never
+    // fatal: without them the keys say there is no audio.
+    if options.terminal_authority {
+        if let Err(error) = audio::start(&runtime, Path::new(audio::SOCKET)) {
+            eprintln!("td-compositor: audio control unavailable: {error}");
+        }
     }
     if let Err(error) = vm_bridge::start(Arc::clone(&runtime), task_launcher) {
         eprintln!("td-compositor: VM bridge unavailable: {error}");
@@ -1249,6 +1259,7 @@ mod confinement {
         ),
         ("atlas.rs", include_str!("../../td-ui/src/atlas.rs")),
         ("attention.rs", include_str!("attention.rs")),
+        ("audio.rs", include_str!("audio.rs")),
         ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
         ("buffer.rs", include_str!("buffer.rs")),

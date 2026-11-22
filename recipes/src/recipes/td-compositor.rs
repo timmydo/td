@@ -35,6 +35,7 @@ const MODULES: &[(&str, &str)] = &[
         "authority",
         include_str!("../../../td-compositor/src/authority.rs"),
     ),
+    ("audio", include_str!("../../../td-compositor/src/audio.rs")),
     ("bar", include_str!("../../../td-compositor/src/bar.rs")),
     (
         "buffer",
@@ -216,6 +217,36 @@ const STAGED_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// td-pulse, which the volume keys and the bar's audio field are built on:
+/// its root and its modules, staged at the crate's own path and compiled to
+/// an rlib, as td-audio's recipe compiles it for the daemon. Listed here
+/// rather than shared with that recipe because each recipe file names the
+/// sources it reads.
+const PULSE_LIB_RS: &str = include_str!("../../../td-pulse/src/lib.rs");
+const PULSE: &[(&str, &str)] = &[
+    ("td-pulse/src/lib.rs", PULSE_LIB_RS),
+    (
+        "td-pulse/src/client.rs",
+        include_str!("../../../td-pulse/src/client.rs"),
+    ),
+    (
+        "td-pulse/src/proto.rs",
+        include_str!("../../../td-pulse/src/proto.rs"),
+    ),
+    (
+        "td-pulse/src/socket.rs",
+        include_str!("../../../td-pulse/src/socket.rs"),
+    ),
+    (
+        "td-pulse/src/tag.rs",
+        include_str!("../../../td-pulse/src/tag.rs"),
+    ),
+    (
+        "td-pulse/src/wire.rs",
+        include_str!("../../../td-pulse/src/wire.rs"),
+    ),
+];
+
 #[cfg(test)]
 fn declared_modules() -> Vec<&'static str> {
     let mut names = Vec::new();
@@ -257,12 +288,13 @@ pub fn recipe() -> Recipe {
         "{src}/td-time/src",
         "{src}/td-civil/src",
         "{src}/td-disks/src",
+        "{src}/td-pulse/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
         });
     }
-    for (name, source) in STAGED_FILES {
+    for (name, source) in STAGED_FILES.iter().chain(PULSE) {
         steps.push(Step::WriteFile {
             path: format!("{{src}}/{name}"),
             content: (*source).into(),
@@ -299,12 +331,40 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("SOURCE_DATE_EPOCH", "1"),
+        // Like td-backlight, without panic=abort: the session tests link it
+        // with the test harness's unwinding.
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--crate-type",
+                "rlib",
+                "--crate-name",
+                "td_pulse",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "opt-level=s",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-o",
+                "{src}/libtd_pulse.rlib",
+                "{src}/td-pulse/src/lib.rs",
+            ],
+        )
+        .env("SOURCE_DATE_EPOCH", "1"),
         target_rustc(
             "{src}",
             rustc,
             &[
                 "--extern",
                 "td_backlight={src}/libtd_backlight.rlib",
+                "--extern",
+                "td_pulse={src}/libtd_pulse.rlib",
                 "--edition",
                 "2021",
                 "--cfg",
@@ -351,6 +411,8 @@ pub fn recipe() -> Recipe {
             &[
                 "--extern",
                 "td_backlight={src}/libtd_backlight.rlib",
+                "--extern",
+                "td_pulse={src}/libtd_pulse.rlib",
                 "--edition",
                 "2021",
                 "--test",
@@ -377,6 +439,7 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &["{root}/session-tests", "timezone::"]),
         Step::run("{root}", &["{root}/session-tests", "clock::"]),
         Step::run("{root}", &["{root}/session-tests", "bar::"]),
+        Step::run("{root}", &["{root}/session-tests", "audio::"]),
         split_target_debug("{out}"),
         Step::assert_static(&[
             "{out}/bin/td-compositor",
@@ -585,6 +648,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// td-pulse is staged whole: every module its root declares, and the
+    /// rlib both compositor builds link.
+    #[test]
+    fn recipe_stages_td_pulse_whole() {
+        let mut declared: Vec<&str> = PULSE_LIB_RS
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub mod ")?.strip_suffix(';'))
+            .chain(std::iter::once("lib"))
+            .collect();
+        let mut staged: Vec<&str> = PULSE
+            .iter()
+            .filter_map(|(path, _)| path.strip_prefix("td-pulse/src/")?.strip_suffix(".rs"))
+            .collect();
+        declared.sort_unstable();
+        staged.sort_unstable();
+        assert_eq!(staged, declared);
+        let steps = recipe().steps.unwrap_or_default();
+        let linked = steps
+            .iter()
+            .filter(|step| match step {
+                Step::Run { argv, .. } => argv
+                    .iter()
+                    .any(|arg| arg == "td_pulse={src}/libtd_pulse.rlib"),
+                _ => false,
+            })
+            .count();
+        assert_eq!(linked, 2, "the binary and the session tests");
+        // The volume keys dial the socket the audio unit serves.
+        let audio = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "audio").then_some(*source))
+            .unwrap();
+        let socket = td_engine::permissions::TD_AUDIO_SOCKET_PATH;
+        assert!(audio.contains(&format!("pub const SOCKET: &str = \"{socket}\";")));
     }
 
     #[test]

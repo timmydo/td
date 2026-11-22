@@ -142,6 +142,37 @@ implementation. A short status notice shows the resulting percentage or
 failure; startup and failures also go to the compositor log. The startup floor
 is reapplied on compositor restart; brightness is not a persistent preference.
 
+VOLUME. Physical `KEY_MUTE` (113), `KEY_VOLUMEDOWN` (114) and
+`KEY_VOLUMEUP` (115) are the compositor's, as the brightness keys are:
+they work on the lock and attention screens, never reach a Wayland
+client, and the keymap no longer names them. A step is five percent and
+lands on a multiple of five, clamped to 0–100, and repeats while held;
+either step unmutes. Mute toggles on the press alone, since a repeating
+toggle would land wherever the key was let go. The compositor is an
+ordinary Pulse client of `td-audio` (APPLICATIONS.md §K.5), admitted in
+the output role the audio unit names its uid for: it reads and sets the
+output's level and mute and hears the output change, and reaches no
+stream. Two threads, on two td-pulse connections, keep the daemon off
+the input path. `td-audio-control` takes keys from a two-entry queue the
+input path only `try_send`s to, so a held key's repeats beyond it are
+dropped rather than waited on; each key is a read, the writes it asks
+for to the index that read named, and a read back, all within one
+two-second deadline for the key, on a connection kept between keys. A
+kept connection that fails before anything was written, as one to a
+restarted daemon does, is retried once fresh inside that deadline;
+nothing else is, so a key never lands twice, and a failure goes to the
+compositor log. `td-audio-watch` holds a sink
+subscription and re-reads the output on each sink event, so a change
+made by the CLI reaches the bar; while the daemon is away it reconnects
+after one second, doubling to thirty, and starting over only once a
+connection showed a reading. Only the installed authority-paired
+compositor starts them, after giving the runtime the key queue so no
+first reading is lost; a development or headless compositor has no
+volume control and no field. A key's outcome is a notice,
+`VOLUME 45%`, `MUTED` or `NO AUDIO`, shown at once, and a console line,
+`TD-VOLUME level=45 muted=no` or `TD-VOLUME unavailable`, written as
+one write beginning a line of its own.
+
 A status bar owns the top 24 rows. It is BUILT IN rather than a client,
 because a client would need a way to be placed and to reserve space —
 layer-shell, or a private protocol standing in for it — and none of that is
@@ -162,7 +193,12 @@ on, and the reason the reservation has a test of its own: fullscreen is the
 one arrangement with no gap, so it is the only one whose pixels would reach
 row 0 if the reservation were dropped.
 
-The status line shows load, CPU temperature, memory, uptime and a clock.
+The status line shows load, CPU temperature, memory, uptime, the audio
+output and a clock. The audio field, just before the clock, is what the
+volume threads last read: `VOL 45%`, `MUTE`, or `NO AUDIO` until the
+daemon answers and whenever the watcher loses it; a key that fails
+says so in its notice and leaves the field to the watcher. Scrolling or clicking it does
+nothing yet; a wheel over the bar still switches workspaces.
 Load is the one-minute average. Temperature is the hottest readable Intel
 coretemp package or AMD k10temp die, rounded to whole degrees Celsius.
 On AMD the control temperature is the fallback when the die channel is

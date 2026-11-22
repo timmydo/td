@@ -35,7 +35,7 @@ xkb_keycodes "td" {
     <HOME> = 110; <UP> = 111; <PGUP> = 112;
     <LEFT> = 113; <RGHT> = 114; <END> = 115;
     <DOWN> = 116; <PGDN> = 117; <INS> = 118; <DELE> = 119;
-    <MUTE> = 121; <VOL-> = 122; <VOL+> = 123; <POWR> = 124;
+    <POWR> = 124;
     <KPEQ> = 125; <PAUS> = 127;
     <LWIN> = 133; <RWIN> = 134; <MENU> = 135;
 };
@@ -147,9 +147,6 @@ xkb_symbols "td" {
     key <RGHT> { [ Right ] }; key <END> { [ End ] };
     key <DOWN> { [ Down ] }; key <PGDN> { [ Next ] };
     key <INS> { [ Insert ] }; key <DELE> { [ Delete ] };
-    key <MUTE> { [ XF86AudioMute ] };
-    key <VOL-> { [ XF86AudioLowerVolume ] };
-    key <VOL+> { [ XF86AudioRaiseVolume ] };
     key <POWR> { [ XF86PowerOff ] };
     key <PAUS> { [ Pause ] };
     key <LWIN> { repeat=no, [ Super_L ] };
@@ -623,7 +620,7 @@ mod tests {
             assert!(values.insert(value));
             assert!((8..=255).contains(&value));
         }
-        assert_eq!(names.len(), 110);
+        assert_eq!(names.len(), 107);
 
         let symbols = XKB_KEYMAP.split("xkb_symbols").nth(1).unwrap();
         let mut declared = BTreeSet::new();

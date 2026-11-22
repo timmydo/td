@@ -55,6 +55,9 @@ const KEY_TAB: u16 = 15;
 const KEY_PAGEDOWN: u16 = 109;
 const KEY_BRIGHTNESSDOWN: u16 = 224;
 const KEY_BRIGHTNESSUP: u16 = 225;
+const KEY_MUTE: u16 = 113;
+const KEY_VOLUMEDOWN: u16 = 114;
+const KEY_VOLUMEUP: u16 = 115;
 const KEY_1: u16 = 2;
 const KEY_2: u16 = 3;
 const KEY_3: u16 = 4;
@@ -415,6 +418,7 @@ struct KeyDecision {
     lock: bool,
     draining: bool,
     brightness: Option<bool>,
+    volume: Option<crate::audio::Key>,
     command: Option<Command>,
     /// `Super+q`: ask the focused window to close.
     close: bool,
@@ -464,6 +468,7 @@ impl KeyBindings {
             lock: false,
             draining: false,
             brightness: None,
+            volume: None,
             command: None,
             close: false,
             launcher: None,
@@ -478,6 +483,23 @@ impl KeyBindings {
         if event.kind == EV_KEY && matches!(event.code, KEY_BRIGHTNESSDOWN | KEY_BRIGHTNESSUP) {
             if matches!(event.value, KEY_PRESS | KEY_REPEAT) && !self.excluded(device) {
                 decision.brightness = Some(event.code == KEY_BRIGHTNESSUP);
+            }
+            return decision;
+        }
+        // The volume keys likewise (td-compositor/DESIGN.md, "Volume"). A
+        // step repeats while held; mute acts on the press alone, since a
+        // repeating toggle would land wherever the key happened to let go.
+        if event.kind == EV_KEY && matches!(event.code, KEY_MUTE | KEY_VOLUMEDOWN | KEY_VOLUMEUP) {
+            let acts = match event.code {
+                KEY_MUTE => event.value == KEY_PRESS,
+                _ => matches!(event.value, KEY_PRESS | KEY_REPEAT),
+            };
+            if acts && !self.excluded(device) {
+                decision.volume = Some(match event.code {
+                    KEY_MUTE => crate::audio::Key::Mute,
+                    KEY_VOLUMEDOWN => crate::audio::Key::Down,
+                    _ => crate::audio::Key::Up,
+                });
             }
             return decision;
         }
@@ -1836,6 +1858,9 @@ trait InputTarget {
     fn brightness(&mut self, _brighter: bool) -> Result<(), String> {
         Ok(())
     }
+    fn volume(&mut self, _key: crate::audio::Key) -> Result<(), String> {
+        Ok(())
+    }
     fn confirm_install(&mut self, _timestamp: u128) -> Result<(), String> {
         Ok(())
     }
@@ -2837,6 +2862,12 @@ impl InputTarget for LiveInputTarget {
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .brightness(brighter)
+    }
+    fn volume(&mut self, key: crate::audio::Key) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| crate::allocation::string("runtime lock poisoned").unwrap_or_default())?
+            .volume(key)
     }
     fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {
         if let Some(attempt) = &self.secret_attempt {
@@ -4305,6 +4336,7 @@ fn apply_locked<T: InputTarget>(
         && decision.attention.is_none()
         && decision.secret.is_none()
         && decision.brightness.is_none()
+        && decision.volume.is_none()
         && decision.notice.is_none()
         && decision.confirm_install.is_none()
         // A counted press other than a PIN byte, so it never falls through
@@ -4405,6 +4437,9 @@ fn deliver_key_decision<T: InputTarget>(
 ) -> Result<(), String> {
     if let Some(brighter) = decision.brightness {
         runtime.brightness(brighter)?;
+    }
+    if let Some(key) = decision.volume {
+        runtime.volume(key)?;
     }
     if decision.draining {
         runtime.drain_attention()?;
@@ -5436,6 +5471,87 @@ mod tests {
                 assert!(release.brightness.is_none());
                 assert!(release.forward.is_none());
             }
+        }
+    }
+
+    /// The volume keys reach the target on the lock screen as brightness
+    /// does, a step on press and repeat and mute on press alone, and no
+    /// client sees them.
+    #[test]
+    fn volume_keys_reach_the_target_while_locked_without_client_keys() {
+        use crate::audio::Key;
+        let bindings = Mutex::new(KeyBindings::default());
+        let target = Mutex::new(RecordingTarget {
+            locked: true,
+            ..RecordingTarget::default()
+        });
+        let mut pointer = PointerMotion::default();
+        for code in [KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_MUTE] {
+            for value in [KEY_PRESS, KEY_REPEAT, KEY_RELEASE] {
+                apply(&target, key(code, value), 0, &bindings, &mut pointer, None).unwrap();
+            }
+        }
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.volume_events,
+            vec![Key::Up, Key::Up, Key::Down, Key::Down, Key::Mute]
+        );
+        assert!(target.keys.is_empty());
+        assert!(target.secret_roles.is_empty());
+        assert!(target.commands.is_empty());
+        assert!(target.brightness_events.is_empty());
+    }
+
+    /// Consumed in every attention state, and never forwarded: the keys
+    /// that were the client's XF86Audio keysyms are the compositor's now.
+    #[test]
+    fn volume_keys_are_consumed_and_work_during_attention() {
+        use crate::audio::Key;
+        let mut bindings = KeyBindings::default();
+        for state in [
+            AttentionState::Closed,
+            AttentionState::Open,
+            AttentionState::Draining,
+        ] {
+            bindings.attention = state;
+            for (code, wanted, repeats) in [
+                (KEY_VOLUMEDOWN, Key::Down, true),
+                (KEY_VOLUMEUP, Key::Up, true),
+                (KEY_MUTE, Key::Mute, false),
+            ] {
+                let press = bindings.feed(key(code, KEY_PRESS));
+                assert_eq!(press.volume, Some(wanted));
+                let repeat = bindings.feed(key(code, KEY_REPEAT));
+                assert_eq!(repeat.volume, repeats.then_some(wanted));
+                let release = bindings.feed(key(code, KEY_RELEASE));
+                assert!(release.volume.is_none());
+                for decision in [press, repeat, release] {
+                    assert!(decision.forward.is_none());
+                    assert!(decision.secret.is_none());
+                    assert!(decision.attention.is_none());
+                    assert!(decision.brightness.is_none());
+                }
+            }
+        }
+    }
+
+    /// A security key's keyboard moves no volume, as it moves no brightness,
+    /// and its volume keys still reach no client.
+    #[test]
+    fn an_excluded_keyboards_volume_keys_do_nothing() {
+        const KEY: usize = 1;
+        let mut bindings = KeyBindings {
+            attention_excluded: BTreeSet::from([KEY]),
+            ..KeyBindings::default()
+        };
+        for code in [KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_MUTE] {
+            let decision = bindings.feed_device(KEY, key(code, KEY_PRESS));
+            assert!(decision.volume.is_none());
+            assert!(decision.forward.is_none());
+            assert!(bindings
+                .feed_device(0, key(code, KEY_PRESS))
+                .volume
+                .is_some());
         }
     }
 
@@ -7493,6 +7609,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingTarget {
         brightness_events: Vec<bool>,
+        volume_events: Vec<crate::audio::Key>,
         attention_events: Vec<bool>,
         secret_roles: Vec<crate::secret_client::Selection>,
         notices: Vec<crate::attention::Notice>,
@@ -7564,6 +7681,10 @@ mod tests {
     impl InputTarget for RecordingTarget {
         fn brightness(&mut self, brighter: bool) -> Result<(), String> {
             self.brightness_events.push(brighter);
+            Ok(())
+        }
+        fn volume(&mut self, key: crate::audio::Key) -> Result<(), String> {
+            self.volume_events.push(key);
             Ok(())
         }
         fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {

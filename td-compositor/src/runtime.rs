@@ -728,6 +728,11 @@ pub struct Runtime {
     clipboard_writer: Option<SyncSender<crate::vm_bridge::ClipboardWrite>>,
     /// Print's worker, and whether it can save in the home folder.
     screenshots: Option<(SyncSender<crate::screenshot::Job>, bool)>,
+    /// The volume keys' queue to the audio control thread, while it runs.
+    audio: Option<SyncSender<crate::audio::Key>>,
+    /// The output as the audio threads last read it, for the bar's field;
+    /// `None` without them, which leaves the field off the bar.
+    audio_shown: Option<crate::audio::Reading>,
     /// When the bar's screenshot notice gives way to the status line.
     notice_until: Option<std::time::Instant>,
     /// The last started application's outcome, which the authority worker
@@ -965,6 +970,8 @@ impl Runtime {
             owned_selection: None,
             clipboard_writer: None,
             screenshots: None,
+            audio: None,
+            audio_shown: None,
             notice_until: None,
             application_outcome: None,
             launcher_rows: Vec::new(),
@@ -3738,6 +3745,60 @@ impl Runtime {
     /// folder. Without one, Print opens nothing.
     pub(crate) fn enable_screenshots(&mut self, jobs: SyncSender<Job>, saves: bool) {
         self.screenshots = Some((jobs, saves));
+    }
+
+    /// The volume keys' queue (td-compositor/DESIGN.md, "Volume"). Until the
+    /// audio threads first read the output, the bar says there is none.
+    pub(crate) fn enable_audio(&mut self, keys: SyncSender<crate::audio::Key>) {
+        self.audio = Some(keys);
+        self.audio_shown = Some(crate::audio::Reading::Unavailable);
+    }
+
+    /// A volume key. Queued without waiting; a repeat the queue has no room
+    /// for is dropped. With no audio thread the key's notice says so.
+    pub(crate) fn volume(&mut self, key: crate::audio::Key) -> Result<(), String> {
+        let queued = self
+            .audio
+            .as_ref()
+            .and_then(|keys| crate::audio::queue(keys, key));
+        if queued.is_some() {
+            return Ok(());
+        }
+        self.audio = None;
+        self.audio_notice(crate::audio::Reading::Unavailable)
+    }
+
+    /// The audio threads could not start: no queue, and no field.
+    pub(crate) fn disable_audio(&mut self) {
+        self.audio = None;
+        self.audio_shown = None;
+    }
+
+    /// What the audio threads read, for the bar's next tick.
+    pub(crate) fn audio_reading(&mut self, reading: crate::audio::Reading) {
+        if self.audio.is_some() {
+            self.audio_shown = Some(reading);
+        }
+    }
+
+    /// A key's outcome: a notice shown at once, and the bar's field when
+    /// the key read a level. A key that failed leaves the field to the
+    /// watcher, which a passing failure of the key's own connection says
+    /// nothing about.
+    pub(crate) fn audio_notice(&mut self, reading: crate::audio::Reading) -> Result<(), String> {
+        if matches!(reading, crate::audio::Reading::Level { .. }) {
+            self.audio_reading(reading);
+        }
+        let Ok(text) = crate::allocation::format(format_args!("{}", reading.notice())) else {
+            return Ok(());
+        };
+        self.notice(text);
+        self.repaint()
+    }
+
+    /// The bar's audio field, if there is one.
+    pub(crate) fn audio_shown(&self) -> Option<crate::audio::Reading> {
+        self.audio_shown
     }
 
     /// Print's chooser (DESIGN.md, "Screenshots"). Answers whether the card
@@ -6954,6 +7015,64 @@ mod tests {
         assert!(!runtime.scene.chooser_visible());
         assert!(!runtime.screenshot(ScreenshotAction::Take).unwrap());
         assert!(runtime.scene.take_chooser().is_none());
+    }
+
+    /// Without the audio threads a volume key says so, and nothing puts a
+    /// field on the bar. With them, a key is queued without waiting, a
+    /// repeat with no room is dropped, a reading reaches the bar's field
+    /// and a key's outcome its notice, and a thread that went away turns
+    /// the next key into `NO AUDIO`.
+    #[test]
+    fn volume_keys_queue_and_their_outcome_reaches_the_bar() {
+        use crate::audio::{Key, Reading};
+        let (_cleanup, mut runtime, _events, _source, _window) = clipboard_fixture();
+        runtime.volume(Key::Up).unwrap();
+        assert_eq!(runtime.scene.notice(), Some("NO AUDIO"));
+        runtime.audio_reading(Reading::Unavailable);
+        assert_eq!(runtime.audio_shown(), None, "no thread, no field");
+
+        let (keys, queued) = mpsc::sync_channel(1);
+        runtime.enable_audio(keys);
+        assert_eq!(runtime.audio_shown(), Some(Reading::Unavailable));
+        runtime.scene.set_notice(None);
+        runtime.volume(Key::Up).unwrap();
+        runtime.volume(Key::Up).unwrap();
+        assert_eq!(queued.try_recv(), Ok(Key::Up));
+        assert!(queued.try_recv().is_err(), "the repeat was dropped");
+        assert_eq!(
+            runtime.scene.notice(),
+            None,
+            "a queued key waits for its answer"
+        );
+
+        let level = Reading::Level {
+            percent: 45,
+            muted: false,
+        };
+        runtime.audio_reading(level);
+        assert_eq!(runtime.audio_shown(), Some(level));
+        runtime
+            .audio_notice(Reading::Level {
+                percent: 50,
+                muted: true,
+            })
+            .unwrap();
+        assert_eq!(runtime.scene.notice(), Some("MUTED"));
+        runtime.audio_notice(level).unwrap();
+        assert_eq!(runtime.scene.notice(), Some("VOLUME 45%"));
+        // A key that failed says so, and leaves the field to the watcher.
+        runtime.audio_notice(Reading::Unavailable).unwrap();
+        assert_eq!(runtime.scene.notice(), Some("NO AUDIO"));
+        assert_eq!(runtime.audio_shown(), Some(level));
+
+        drop(queued);
+        runtime.volume(Key::Down).unwrap();
+        assert_eq!(runtime.scene.notice(), Some("NO AUDIO"));
+        assert_eq!(
+            runtime.audio_shown(),
+            Some(level),
+            "the field keeps its last reading"
+        );
     }
 
     #[test]
