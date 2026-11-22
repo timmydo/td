@@ -82,927 +82,816 @@ Email and logs are untrusted data for an AI operator, never instructions.
 
 ## 3. Code and dependency boundaries
 
-Shared byte-level MIME/header parsing, transfer decoding, charset handling,
-Unicode tables and normalization adapters live in `td-mime`. Its
-[design](../td-mime/DESIGN.md) owns the shared contract. Mail retains admitted
-body extents, pooled snapshot custody, scheduling and protocol publication.
-The former module names re-export the shared implementations; there is one
-parser implementation. Service adapters continue to borrow the same live
-work meter and aggregate header budget across parsing and serialization.
+### 3.1 Crate layout and dependencies
 
-Service response owners live in the flat `mime_response` module. Named
-adapters such as `part_json`, `body_json`, `metadata_json` and `subparts_json`
-refer directly to one another; ownership transitions do not define a public
-module ancestry. Shared structure parsing is `mime_structure`. Sibling-only
-fields and helpers are restricted to `mime_response`; callers cannot fabricate
-live owners or extract their original admission handles. Each adapter keeps
-its tests in one named child directory. The previous nested response module
-tree is removed in the same change.
+Use `td-mta/` for the service library and the installed binary named
+`td-mta`. The executable serves named PostgreSQL profiles and provides the
+PostgreSQL administration, ACME, migration, local status, stop and
+queue-control commands its help text lists. CONFIG.md owns foreground
+serving and local status/stop; POSTGRES.md owns database administration.
+PostgreSQL is the only storage backend: there is no local store,
+file-configuration check or file-backed device command. The separate
+`td-mta-deploy` binary is the local launcher and deployment supervisor
+PRODUCTION.md describes. There is no separate runtime package or td-net
+helper executable.
 
-Use `td-mta/` for the service library and installed binary named `td-mta`.
-The executable serves named PostgreSQL profiles and provides PostgreSQL
-schema, account, credential and configuration commands. CONFIG.md owns
-foreground serving and local status/stop; POSTGRES.md owns database
-administration. Local SQLite initialization, verification, backup/restore,
-file-configuration checks and file-backed device commands are removed.
-Its direct
-dependencies are the local `td-alloc`, `td-civil`, `td-crypto`, `td-header`, `td-html`,
-`td-json`, `td-mime`, `td-nfc` and `td-fs` crates, plus the approved private
-tokio-postgres 0.7.18 closure with default features disabled. Std-only
-`td-fs` owns bounded private Unix socket dialing and disposable fixture
-directories. POSTGRES.md chapter 8 owns the verified-TLS or explicit private
-Unix transport, SCRAM connection probe and PostgreSQL serving contract.
-The driver's private SCRAM
-cryptography/Unicode preparation do not replace td-crypto or td-mime.
-Application protocols, configuration and scheduling use std
-plus the local libraries; the private PostgreSQL adapters own SQL. There is
-no separate runtime package or td-net helper executable.
-`td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
-specifies the TLS policy and session contract. ClientConfig, ServerConfig,
-shared clock and public client/server sessions are implemented. The mail
-record pump composes them, and td-mta's listeners and relay serve through
-it; their qualification remains open (IMPLEMENTATION.md, M07).
-
-The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
-crypto errors into td-crypto. Mail ports re-export those traits and translate
-shared errors. td-crypto holds the approved Rustls closure, its
-cryptography td-primitives through td-tls-provider, and no other crate
-does. M07a1 implements opaque SHA-256; M07a2 qualifies it against the existing
-mail-format digest fixtures. M07a3 adds worker-local entropy initialization;
-M07a4 implements the Crypto factory and opaque P-256 operations.
-TLS sessions and bounded mail record progress are implemented and serve;
-qualification remains open (IMPLEMENTATION.md, M07).
-Direct streaming digests use td-owned inline SHA-256 without heap allocation
-or provider calls.
-No Rustls, td-tls-provider or td-primitives public types, re-exports or
-configuration escape hatches cross its facade.
-Mail transport adapters consume opaque td-crypto configurations/session state.
-The service's transitive lock/executable still includes the backend dependencies;
-it is not described as dependency-free once they are added.
+The direct dependencies are the local `td-alloc`, `td-civil`, `td-crypto`,
+`td-header`, `td-html`, `td-json`, `td-mime`, `td-nfc` and `td-fs` crates,
+plus the approved private PostgreSQL closure: tokio-postgres 0.7.18 with
+default features disabled, and tokio 1.54.1 with only `io-util` for the
+private stream adapter (td-crypto/DEPENDENCIES.md). Std-only `td-fs` owns
+bounded private Unix socket dialing and checks, real-file opening, bounded
+reads, file replacement and disposable fixture directories. POSTGRES.md, [8. Connection, bootstrap and serving startup](POSTGRES.md#8-connection-bootstrap-and-serving-startup), owns the verified-TLS or explicit private Unix transport, SCRAM
+connection probe and PostgreSQL serving contract. The driver's private
+SCRAM cryptography and Unicode preparation do not replace td-crypto or
+td-mime. Application protocols, configuration and scheduling use std plus
+the local libraries; the private PostgreSQL adapters own SQL.
 
 Reusable protocol-independent components belong in shared std-only td
-libraries. The bounded JSON string framer and scalar escaping live in td-json.
-Existing streaming mail adapters use its incremental string API with fixed
-state and caller-provided output. Future request dispatch chooses bounded
+libraries (section 3.2). Mail re-exports the shared MIME and header parsers
+under their mail module names (`mime_structure`, `mime_part_headers`,
+`header_*` and the rest); there is one parser implementation. Service
+response owners live in the flat `mime_response` module. Named adapters such
+as `part_json`, `body_json`, `metadata_json` and `subparts_json` refer
+directly to one another; ownership transitions do not define a public module
+ancestry. Sibling-only fields and helpers are restricted to `mime_response`;
+callers cannot fabricate live owners or extract their original admission
+handles. Each adapter keeps its tests in one named child directory. The
+`blob_*` modules adapt the same owners and encoders to one verified native
+`PinnedBlob` (section 3.4).
+
+### 3.2 Shared parsing libraries
+
+`td-mime` owns byte-level MIME and header parsing, transfer decoding,
+charset handling, Unicode tables, normalization adapters and mail-header
+interpretation; its [design](../td-mime/DESIGN.md) owns the shared
+contract. Mail retains admitted body extents, pooled snapshot custody,
+scheduling, request selection and protocol publication. Service adapters
+borrow the same live work meter and aggregate header budget across parsing
+and serialization. The field interpretation in section 3.5 and the
+traversal and body-list selection in section 3.6 are td-mime code;
+td-mta's `mime_response` and `blob_*` owners bind them to a source.
+
+`td-header` owns the reusable lexical cursors with generic caller-owned
+admission: CFWS, delimited tokens, MIME parameter names and values, the
+boundary/token protocol validator, the delimiter line matcher, language
+tags and lists, URI syntax, URI wire unfolding and URI spelling selection.
+Its passive resident extent helper shares checked absolute slice mapping
+without reading bytes or granting source authorization. The crate owns no
+field selection, display policy, clock or crypto and retains its
+fixed-work/source-extent contract ([design](../td-header/DESIGN.md)).
+Grammar placement, scalar decoding, normalization, deadlines and budget
+adapters stay in td-mime.
+
+- The value cursor validates the complete raw token or quoted spelling
+  before projecting provisional octets with ordinary/extended prefix
+  roles. Candidate assembly and charset/display/boundary conversion stay in
+  td-mime. The name and value wrappers share zero-count fresh admission
+  without spending parsing steps or prepaid credit.
+- The passive language-tag feed state is shared by parameter prefixes and
+  encoded-word qualifiers; recognition retains its precharged 75-byte
+  ceiling.
+- One stateless projection reader unquotes and unfolds MIME value, phrase
+  and comment octets. Caller callbacks preserve source bounds, distinct
+  errors and EOF charges; escaped-fold provenance remains available to
+  display consumers. Strict logical character assembly is shared too:
+  separate read and local-verification callbacks borrow the original work
+  context sequentially. The first logical octet retains escape provenance.
+  Projected bytes create no lexical validity or display-word placement
+  proof; placement, charset decoding and filtering, normalization and
+  sticky admission/failure ownership stay in td-mime.
+- All display and body noncharacter checks use one table-free Unicode
+  predicate without changing their distinct control/output rules.
+- URI syntax keeps its required-scheme constructor, with allowed fragments,
+  for URL consumers and adds generic URI-reference spelling with fixed
+  scheme-prefix disambiguation. Internal IPv6 parsing keeps its prepaid
+  work and bounded buffer. td-mime retains URL-list placement, whitespace,
+  complete-field validation and replay, original job/email admission and
+  typed errors. No second URI parser exists.
+- The bounded URI wire-whitespace remover reports literal octet provenance
+  within the supplied spelling slice and refuses stickily. Gaps between
+  octet offsets show removed whitespace but prove no placement; callers
+  rebase offsets to their field or message. It grants no field validity or
+  label/publication authority.
+- The fixed URI spelling selector applies caller-authorized surrounding
+  CFWS policy; POLICY.md freezes the ambiguous parentheses rule. Exclusive
+  CFWS or whitespace-probe child state returns original slice offsets
+  without copying the selected value. Leading grammar failure rejects;
+  optional suffix grammar can remain literal, but work or internal refusal
+  never falls back. The selector owns no original allowance or
+  field/word/URI authority.
+
+`td-json` owns the bounded JSON string framer, scalar escaping,
+string-array framing and checked backing identity/prefix retention (its
+`Window`). Streaming mail adapters use its incremental API with fixed state
+and caller-provided output. Shared punctuation and escaping keep fixed paid
+progress without retaining values; the retention primitive supplies no
+source or completion authority. Request dispatch chooses bounded
 representations under section 5; it need not eliminate every allocation.
 td-json owns no mail, clock, crypto or scheduler policy.
 
-The deterministic NFC ordering/composition engine lives in td-nfc. Pure
-source/decoder/decomposition checkpoints and fixed Unicode tables remain
-caller-owned; a separate live context binds the original Meter, HeaderBudget,
-private credit and the real Tick supplied for each poll. The shared engine
-holds an exclusive borrow of
-fixed scratch, four pure checkpoints and fixed positions, flags, bitmaps
-and sticky failure. Existing mail source/cursor/scratch
-ceilings and charge counts remain unchanged. Different future source types
-must qualify their own bounds without widening existing header sources.
+`td-nfc` owns the deterministic canonical ordering/composition engine
+([design](../td-nfc/DESIGN.md)). Pure source, decoder and decomposition
+checkpoints and the fixed Unicode tables remain caller-owned; a separate
+live context binds the original Meter, HeaderBudget, private credit and the
+real Tick supplied for each poll. The engine holds an exclusive borrow of
+fixed scratch, four pure checkpoints and fixed positions, flags, bitmaps and
+sticky failure. The qualified mail source, cursor and scratch ceilings and
+charge counts are fixed; a new source type must qualify its own bounds
+without widening existing header sources.
 
 MIME parameter display NFC uses a separate qualified source over private
-pure lexical/field/family/octet/scalar/display checkpoints. Its live owner
-retains original work/header budgets and private credit; the real supplied
-Tick is fixed within each poll, without being stored in checkpoints;
+pure lexical, field, family, octet, scalar and display checkpoints. Its live
+owner retains the original work/header budgets and private credit; the real
+supplied Tick is fixed within each poll and never stored in checkpoints, so
 copying replay progress duplicates none of them. This composition fits the
-existing parser/conversion reservations and preserves the smaller header
-source enum. Completion remains provisional metadata, with filename
-precedence/retention and complete MIME traversal still separate increments.
+existing parser and conversion reservations and preserves the smaller header
+source enum. Its completion is provisional metadata for the enclosing
+part-header owner (section 3.5).
 
-M06cb retains derived filenames in caller-reserved backing under one original
-work/header owner. Disposition filename precedes type name; a present empty
-plan wins. Only absent plans continue to the next field. Whole-field syntax,
-work, interpretation and output-capacity failures retire retained bytes rather
-than choosing a lower-priority candidate. Completed display bytes are passive
-metadata, never paths or locator authority; enclosing publication needs fresh
-admission. This adds no per-part heap strings or resource arena.
+New extractions must preserve the caller's bounded-work and memory
+contract.
 
-M06cc admits selected boundary/charset logical bytes as ASCII protocol
-metadata, preserving spelling and complete extended-family precedence.
-Invalid selected values are passive diagnostics, never an ordinary retry or
-multipart/charset-default authority. The shared td-header validator owns
-pure bounded grammar; mail owns selected source replay, original work/header
-admission, fixed charset-alias classification, output and sticky refusal.
-No display decoding/NFC can introduce structural syntax. Healthy handoff
-returns original budgets while retained bytes remain provisional. Strict
+### 3.3 MIME response ownership rules
+
+Every MIME interpretation, serialization and retention stage, in td-mime
+and in td-mta's `mime_response` and `blob_*` owners, obeys these rules. The
+stage descriptions in sections 3.5 to 3.9 state only what they add.
+
+- **Original budgets.** A stage spends the original job Meter, the message's
+  aggregate HeaderBudget and its owner-bound private credit. Composing owners
+  run children in exclusive phases: one live child owns the budgets at a time,
+  and fresh consuming handoff moves the same owners to the next phase. A phase
+  handoff renews no allowance and adds no charge beyond the ones a stage
+  names; it may forfeit prepaid credit. Rereads, replays and newly emitted
+  bytes spend the original allowances; copying already charged bytes into
+  retention records only reported bytes and repeats no wire debit. Caller
+  limits add refusal policy over already bounded work; they never renew
+  traversal or job allowances.
+- **One immutable source.** A binding fixes one immutable authorized source
+  and its original owners. No replacement source, node slice or budget can
+  enter between phases.
+- **Provisional output.** Events, extents, fragments and caller-window bytes
+  stay hidden or provisional until fresh whole completion of the enclosing
+  owner, and remain provisional through final whole-job admission and
+  publication. Nothing (view, metadata, selection or diagnostic) escapes
+  before whole healthy completion. Bytes already written to caller output
+  when a stage refuses must be discarded; cursors do not clear them.
+- **Refusal retires.** A work, capacity, source, deadline or child refusal
+  retires the owner and hides completion stickily. In a composition it also
+  retires every earlier completed group. A refusal never chooses a
+  lower-priority candidate or a second fallback; only the syntax-only
+  recoveries a stage names below exist. Dropping a live child (safe
+  forgetting) leaves its parent retired or abandoned, and abandonment
+  cannot skip an ordinal.
+- **Freshness.** Active polls (including empty output and pending escape
+  drains), explicit checks and consuming finish freshly check the original job
+  deadline; the native pinned stages also check at construction and on every
+  poll, including cached completion, and check the pin's own deadline. Late
+  native or pin expiry overrides provisional progress, and a healthy supplied
+  parsing Tick cannot revive expired body access. Unfinished freshness checks
+  precede capacity checks. Outside the native pinned stages, cached completion
+  and constructor admission are inert; passive accessors sample no time.
+- **Passive evidence confers nothing.** Descriptors, classifications,
+  generated fragments, locator candidates, retained bytes, visitation and
+  completion values grant no source, account, blob or publication authority
+  and cannot reconstruct a live owner. A stage that must prove something,
+  such as that no emitted prefix was lost, starts from the original
+  exclusive owner, never from an advanced or emitted-only owner or passive
+  bytes. Consistency checks on supplied passive input detect inconsistent
+  descriptors, not fabricated ones; callers supply the original handoff.
+- **Fixed storage.** No stage allocates an arena of its own, a per-part
+  heap string, a metadata table or source-sized scratch, or adds a second
+  parser or normalization. Header backing and output go to separately
+  admitted caller-reserved fixed windows and cells, which refuse rather
+  than grow.
+
+### 3.4 Email/get composition
+
+Email/get (`jmap_request/email_get_body.rs`) composes the native stages
+over one verified `PinnedBlob` per message, under one method Meter, the
+original execution deadline and a per-message HeaderBudget:
+
+1. `root_headers` retains the bounded root header input and
+   `mime_response::root_header_json` projects each requested header
+   property, at most 64 distinct names;
+2. when a body property is requested, `blob_structure` completes the MIME
+   traversal over the pin, or rebuilds the same handoff from valid
+   persistent MIME evidence (POSTGRES.md, [Chunk-verified MIME projections](POSTGRES.md#chunk-verified-mime-projections)); `blob_part`
+   interprets every part's headers, labels and location, containers and
+   unselected parts included; `blob_part_locators` derives direct-leaf
+   locator candidates; `blob_body_lists` selects textBody, htmlBody and
+   attachments;
+3. each listed part is interpreted again and emitted through
+   `blob_part_json` and `blob_selected_metadata` with exactly the five
+   members td-mail consumes: partId, blobId, type, name and size;
+4. preview (`blob_preview_selection`, `blob_selected_preview`) and
+   bodyValues (`blob_value_parts`, `blob_body_values`, `blob_body_value`)
+   decode selected text parts.
+
+The native stages share the resident owners' classification, member encoder,
+locator policy and selected-metadata core, with the same field order, escaping
+and charges. Output is staged through 4 KiB into the response owner, which
+enforces response admission and the deadline; a failed method publishes none
+of its list. A header-only selection whose names are all among From, To, Cc
+and Subject is served from the persistent common-header summary rows without
+reading body chunks (POSTGRES.md, [Persistent common-header summaries (schema
+33)](POSTGRES.md#persistent-common-header-summaries-schema-33)). Other
+header-only Email/get may reuse a worker-local header projection (POSTGRES.md,
+[Worker-local verified header
+projections](POSTGRES.md#worker-local-verified-header-projections));
+body-derived properties never do. Email/query text search reuses the native
+traversal and part interpretation. API.md, "td-mail Email/get worker
+projection", owns the defaults, bounds and error mapping, and the API.md
+"Native ..." sections own each native stage.
+
+Email/get refuses bodyStructure, headers, hasAttachment and the bodyProperties
+argument. No runtime caller constructs the resident source binding
+(`mime_response::bound::Cursor`) or the replay, composition, source-bound,
+requested, selected and subParts stages built on it (sections 3.7 to 3.9),
+`blob_body_json`, `blob_delimiters`, the header-array projection or the
+body-property decoders (`body_properties`, `email_properties`,
+`property_selection`); no stage renders body-part `headers` or `header:*`
+properties. They are library stages qualified by their own tests; their
+contracts below bind any caller. Live client qualification has not yet
+measured concurrency or large-mailbox behavior (API.md).
+
+### 3.5 Header field selection and projection
+
+A fixed-state metadata selector retains the first completely valid
+occurrence of each MIME field, then applies normal or digest-child
+Content-Type defaults after the entire header section validates. Header,
+nesting and work refusal retire all candidates. The bounded resident MIME
+syntax cursor reuses the CFWS and quoted-string validators and returns raw
+token and parameter extents under original job/email admission; its events
+stay provisional until whole-field validation.
+
+Resident unstructured-header decoding composes with NFC and bounded charged
+replay. Keywords and List-Id Text retain source punctuation while decoding
+original phrase/comment words with fixed lexical placement state and shared
+normalization. Content-Type and Content-Disposition Text decode original
+comment words while retaining parameter spelling. POLICY.md owns malformed
+display recovery.
+
+**Parameter families.** Complete parameter-family selection is td-mime
+policy, not td-header's. The fixed-state owner validates the whole field,
+classifies names, then replays every numbered index under the original work
+and header allowance. It retains only source extents and passive rejection
+evidence, with no section table or decoded output. POLICY.md owns
+precedence and fallback. The selector fits the existing parser reservation;
+ancestor frames must not each retain one. The octet owner reuses that
+inline selector for complete validation and then charged replay. It accepts
+source, kind and attribute rather than a caller-manufactured plan; rejected
+family octets never escape selection. The complete field grammar proves an
+ordinary value before replay, sharing td-header's delimited quoted-string
+and MIME token rules with the Ordinary value validator, and replay rechecks
+that complete spelling before emitting octets. Replay failure retires all
+provisional output and cannot choose a second fallback. Charset, language
+and data roles are lexical evidence only.
+
+**Name and filename scalars.** Literal conversion composes validated octet
+replay with one decoder across all data sections. A fixed incremental
+matcher and slice lookup share the exact mail charset alias table, with no
+label buffer or registry. Unknown or empty declared labels recover as
+POLICY.md specifies. One held byte separates replay and decoding turns, and
+the original budget and private credit persist through both. Charset
+diagnostics stay separate from rejected-family evidence. Display conversion
+branches to a private original-raw Ordinary decoder only after complete
+family choice and before data conversion. Raw quote/LWS edges and
+contiguous unescaped words establish filename encoded-word compatibility;
+neither projection nor decoded punctuation supplies placement. Extended
+and numbered data remain literal. Control filtering precedes NFC, and the
+original allowances and credit span the inline handoff, word recognition
+and charset work.
+
+**Filename precedence.** Derived filenames are retained in caller-reserved
+backing under one original work/header owner. The Content-Disposition
+filename precedes the Content-Type name; a present empty plan wins, and
+only absent plans continue to the next field. Whole-field syntax, work,
+interpretation and output-capacity failures retire retained bytes rather
+than choosing a lower-priority candidate. Completed display bytes are
+passive metadata, never paths or locator authority.
+
+**Boundary and charset.** Selected boundary and charset logical bytes are
+admitted as ASCII protocol metadata, preserving spelling and complete
+extended-family precedence. Invalid selected values are passive
+diagnostics, never an ordinary retry or a multipart or charset-default
+authority. td-header's validator owns the pure bounded grammar; td-mime
+owns selected source replay, original work/header admission, fixed
+charset-alias classification, output and sticky refusal. No display
+decoding or NFC can introduce structural syntax. A healthy handoff returns
+the original budgets while retained bytes remain provisional. Strict
 70-byte/alphabet admission and extended-family precedence may differ from
-permissive or RFC 2231-unaware clients; POLICY.md owns that parser differential
-and the explicit unreadable-content/raw-download recovery, not a fallback to
-an alternative boundary interpretation.
+permissive or RFC 2231-unaware clients; POLICY.md owns that parser
+differential and the explicit unreadable-content/raw-download recovery,
+never a fallback to an alternative boundary interpretation.
 
-M06cd supplies raw resident delimiter events before child header parsing.
-Pure shared line matching uses selected boundary prefixes; mail owns CRLF/LF
+**Content-ID.** One complete value runs through the existing identifier
+validation/replay and text conversion engines. Its private purpose admits
+exactly one bracketed identifier; ordinary MessageIds lists keep their own
+behavior. CFWS and outer angles are omitted, while token spelling, folds
+and Unicode diagnostics use the existing conversion policy. Its JSON string
+uses the shared td-json framer under the same owners: whole-value grammar
+success precedes identifier scalars, and ordinary escaping adds serialized
+output charges to the existing conversion work. The fixed framer/source pair
+retains no string, applies no NFC or encoded-word decoding and returns the
+original owners with the existing encoding-problem diagnostic. The binding
+uses the generic framer directly to keep its typed CID error domain without
+widening the header-property `json_string` error roster. CID Begin/End are
+non-scalar structural events from its fixed single-identifier projector;
+they yield while the child enforces its own sequence. Premature JSON finish
+and child source-state refusal keep distinct outer/source error contexts;
+metadata composition adapts those contexts explicitly rather than
+flattening them.
+
+**Content-Language.** Field-value parsing uses shared CFWS and passive tag
+spelling to produce ordered original-case extents, provisional until
+whole-list success. Malformed tails, nesting and late refusals retire every
+event; no locale, charset, selected metadata or publication authority
+follows. Its JSON array uses td-json's shared string-array frame, the same
+frame MessageIds and URLs use; those keep whole-field validation before
+array output, mode/null policy, original admission owners and contextual
+errors. Tags replay one charged ASCII byte at a time without a retained
+list. Grammar and replay share prepaid credit; exact JSON bytes consume
+original output work. Earlier serialized tags retire on a malformed tail or
+any later refusal.
+
+**Label selection and retention.** First-valid Content-ID and
+Content-Language raw fields are selected from a complete resident entity
+header section, with the strict single-identifier and complete
+language-list syntax running as exclusive children of the same owners.
+Only malformed needed occurrences are skipped; nesting, raw-header limits,
+incomplete source and admission refusal retire all selected fields. Later
+duplicates are scanned without interpreting values. Selection allocates no
+label string or list. The CID/language JSON pair is retained in separate
+caller-reserved windows; a later language, capacity or admission refusal
+retires the earlier CID too. Missing values remain absent.
+
+**Content-Location selection.** The existing raw scanner and a complete
+authorized field child select the first valid Content-Location. Only
+malformed needed occurrences can be skipped; a first empty reference
+remains present. A syntax refusal retires its parser and value and keeps
+only original owner references for a freshly admitted internal consuming
+discard; work, interpretation, nesting and internal refusals never take
+that path. Later duplicates are scanned without value interpretation, and
+no selection or diagnostic escapes before the complete raw boundary.
+Original scalar output costs remain funded even when selection discards
+provisional scalars.
+
+**Content-Location value.** Composition selects the URI spelling outside
+whole-field CFWS through the shared selector bound to the original owners,
+then unfolds before decoding encoded words. Every probe and replay is
+charged; an empty or invalid URI spelling can complete selection without
+granting URI or presence validity. Word placement is limited to the entire
+selected spelling. Only completely recognized encoded-word runs decode;
+every other spelling keeps all word-looking markers in literal replay after
+URI validation. Removing wire whitespace erases spacing, and parentheses
+are URI characters. No stage resolves a reference against a base, matches
+labels or validates a decoded label as a URI.
+
+- The literal reader validates the complete spelling with shared URI
+  unfolding and reference validation before replaying literal ASCII octets,
+  with provenance rebased to the original field-value slice. It introduces
+  no source-sized scratch, normalization, percent decoding or encoded-word
+  interpretation. Empty references remain permitted.
+- The word reader validates every wire fold and classifies the whole run
+  before any scalar, including tails after the scratch fills. Shared
+  passive framing locates bounded candidates; td-mime's recognition
+  supplies grammar and charset policy, using the Text Q alphabet because
+  the candidate is neither a phrase nor a comment, so parentheses and
+  quotes remain payload data without granting placement. Unknown,
+  oversized, touching or mixed literal runs request whole-spelling literal
+  replay without decoded prefix output. Healthy runs replay through one
+  fixed 75-octet scratch, immutable during decoding, funding all three wire
+  passes and both recognitions per word through the original owners.
+  Private relative word metadata reconstructs views after moves without
+  self references or repeated scans. Diagnostics accumulate across words.
+- Encoded-word transfer/charset progress is private and separate from its
+  borrowed Word wrapper; it may follow caller-owned fixed scratch across
+  moves while the same recognized logical bytes remain immutable. Its shape
+  checks cover charset, encoding and length, not byte identity or
+  placement.
+- Decoded labels keep spaces, non-ASCII and decomposed spelling and receive
+  no URI check or NFC.
+
+**Content-Location JSON and retention.** One bound source and original owner
+set funds both the scalar output and the exact serialized JSON bytes;
+framing adds no source scan, interpretation credit, normalization or URI
+policy. Empty output and pending escape drains still freshly admit, and only
+whole JSON completion exposes passive field metadata. The optional complete
+fragment is retained in one fixed caller-reserved window through td-json's
+shared retention, the same mechanism the CID/language pair uses; absence
+and a present empty reference stay distinct. The source-bound selector
+replays only its one immutable authorized Input's selected raw extent into
+distinct reserved backing. Its whole view covers both the completed header
+selection and the retained JSON; capacity or later admission refusal hides
+both.
+
+**Composed part headers.** Retained selected part headers are composed
+after traversal releases its parser state. The original job/header budgets
+and conversion scratch survive selection, lowercase token output, exact
+charset and normalized filename projection; separate caller windows retain
+complete passive views only after all phases succeed. Duplicate, default
+and parameter choice follow the policy above; replay counts work without
+counting the same raw headers twice. The label phase runs after filename
+completion over the same authorized entity, and both scans must agree on
+section and body bounds. The label JSON pair runs as a second exclusive
+phase whose field extents are checked against the recognized header section
+and mapped only into the same immutable entity; source-bound location runs
+as a third, with the original scratch parked, and its boundary must agree
+with the earlier header view. A failure in any phase retires the earlier
+groups and hides every View without wiping provisional caller backing; a
+healthy fresh finish returns passive metadata and the original reusable
+owners. The original parser reservation and caller windows suffice.
+`blob_part` runs this interpreter over a native retained header prefix
+(API.md, "Native retained MIME-part metadata"). API.md sections 1.69 to
+1.82, 1.86 and 1.88 to 1.113 specify the stages above.
+
+**Root header properties.** Email/get projects requested header properties
+from `root_headers` input through `root_header_json`, which retains the
+original collected bytes and native custody (API.md, "Root-header JSON with
+original custody").
+
+**Header arrays.** Source-ordered EmailHeader JSON streams through the
+original resident header Scanner, the Raw scalar engine and the JSON string
+frame. Names keep case and duplicates; values keep folding, leading
+whitespace and the existing Raw filtering/replacement policy. The original
+job and interpretation budgets move exclusively between scanning and
+projection. Fresh complete handoff returns only those budgets and a passive
+header boundary and diagnostic. Whole-array retention in one caller-reserved
+fixed Window constructs its own fresh streamed header owner, so advanced
+streams and emitted-only completions cannot reconstruct a lost prefix.
+Fresh admission precedes capacity refusal; a full healthy Window refuses
+before the next producer turn can expose a source failure, with no refund
+of paid work. Capacity refusal is sticky and retires original budget
+custody. Exact capacity preserves Raw, order and case semantics and all
+streamed charges. Completed polls are inert; explicit checked expiry hides
+values, and consuming finish requires fresh original job/interpretation
+admission. Retained bytes grant no pin or publication authority. API.md
+sections 1.149 and 1.150 define the cursor bounds and allocation intervals.
+
+### 3.6 Multipart traversal and body lists
+
+Raw resident delimiter events precede child header parsing. Pure shared
+line matching uses the selected boundary prefixes; td-mime owns CRLF/LF
 versus bare CR, checked absolute offsets and original job admission. Events
-are provisional and the later explicit-frame traversal must discard them on
-any final refusal. The later traversal must exclude delimiter-leading endings from child headers;
-parent clipping, header admission and descriptor authority remain separate.
-
-M06ce separates private protocol and delimiter progress from public owners.
-A composing owner can retain both progress and original admission in its
-own fields, borrowing its immutable boundary and budgets only during polls.
-The public cursors use these same cores; no duplicate parsing mechanism or
-fresh allowance is introduced. Detached lexical progress is not authority:
-the enclosing owner pins source/boundary identity, prepaid header credit,
+are provisional; traversal discards them on any final refusal and excludes
+delimiter-leading line endings from child headers. Private protocol and
+delimiter progress are separate from the public owners: a composing owner
+keeps both progress and original admission in its own fields and borrows
+its immutable boundary and budgets only during polls, and the public
+cursors use the same cores. Detached lexical progress is not authority; the
+enclosing owner pins source and boundary identity, prepaid header credit,
 sticky retirement, provisional retention and fresh final publication.
 
-M06cf composes complete resident MIME traversal with fixed explicit frames,
-parent-first child clipping and caller-backed compact descriptors. Root
-headers count once; every child spends the remaining aggregate entity-header
-cap and original email interpretation/job admission. Outer delimiters bound
-an entire child before its headers or inner delimiters are interpreted, so
-outermost active prefixes win. Missing closes diagnose their containers;
-absent/invalid boundaries, no opening or encoded multipart refuse structure.
-Descriptors stay hidden until the entire parse succeeds and are passive
-source evidence. Fresh handoff returns original budgets, never blob IDs.
-Leaf sizing uses stable transfer decoding without charset/NFC or attached
-message recursion. Full metadata projection, locators, worker integration
-and native/RSS qualification remain separate.
-
-M06cg composes retained selected part headers after traversal releases its
-parser state. Original job/header budgets and conversion scratch survive
-selection, lowercase token output, exact charset and normalized filename
-projection. Separate caller windows retain complete passive views only after
-all phases succeed. Duplicate/default/parameter choice remains the existing
-policy; replay counts work without counting the same raw headers twice.
-Content-ID/language/location, body-list/JSON composition, authenticated
-locators and streaming/worker qualification remain separate.
-
-M06ch classifies retained selected headers and derives resident body lists
-with explicit frames, scope-local alternative masks and bounded fallback.
-Completed preorder evidence and classifications remain caller-pinned. A final
-membership sweep applies both RFC attachment conditions after fallback;
-results stay hidden until all tree validation/work completes. Original job
-and email budgets survive fresh completion. No locator or wire authority is
-introduced; automatic composition and body JSON remain separate.
-
-M06cj adds bounded Content-Language field-value parsing with the original job
-and email budgets. Shared CFWS and passive tag spelling produce ordered
-original-case extents, provisional until whole-list success. Malformed tails,
-nesting and late refusals retire every event; no locale, charset, selected
-metadata or publication authority follows. First-valid part-header selection
-and retained language JSON remain separate.
-
-M06ck adds one complete Content-ID value through the existing identifier
-validation/replay and text conversion engines. Its private purpose admits
-exactly one bracketed identifier; ordinary MessageIds lists keep their
-existing behavior. The mail adapter borrows original work/header owners,
-retains sticky failure and performs fresh consuming handoff. CFWS and outer
-angles are omitted, while token spelling, folds and Unicode diagnostics use
-the existing conversion policy. Selected-header retention, JSON, reference
-resolution and publication remain separate.
-
-M06cl moves the existing URI syntax validator into std-only td-header,
-retaining its required scheme and allowed fragments. Mail retains URL-list
-placement, whitespace, complete-field validation/replay, original job/email
-admission and typed errors. Internal IPv6 parsing keeps the same prepaid
-work and bounded buffer. No second URI parser remains in mail; relative
-Content-Location spelling and its projection are subsequent work.
-
-M06cm adds generic URI-reference spelling to the shared validator with
-fixed scheme-prefix disambiguation. Existing mail URL consumers retain the
-scheme-required constructor and original grammar/work; no base resolution,
-Content-Location field placement or retained metadata authority is added.
-
-M06cn adds a shared bounded URI wire-whitespace remover with literal octet
-provenance within the supplied spelling slice and sticky refusal.
-Content-Location composition must select the URI spelling outside CFWS and
-unfold before decoding encoded words; this primitive alone grants neither
-field validity nor label/publication authority. Encoded-word placement and
-trailing-CFWS selection remain open composer policy: whitespace removal
-erases spacing, and parentheses are URI characters. Gaps between octet
-offsets show removed whitespace but grant no placement proof; callers
-separately rebase those offsets to their field/message.
-
-M06co separates private encoded-word transfer/charset progress from its
-borrowed Word wrapper. Public consumers retain their source and original
-budgets; progress can also follow caller-owned fixed scratch across moves,
-provided the same recognized logical bytes remain immutable. Shape checks
-cover charset, encoding and length, not byte identity or placement. This
-supplies no new field grammar or Content-Location label authority.
-
-M06cp composes URI wire unfolding and complete encoded-word recognition
-for one caller-selected, placement-authorized candidate. A fixed 75-octet
-scratch remains immutable during decoding; private relative word metadata
-reconstructs views after moves without self references or repeated scans.
-Oversized or unknown candidates request whole literal replay. All wire folds
-are validated before scalar emission, including tails after scratch fills.
-Recognition uses the Text Q alphabet because the authorized candidate is
-neither a phrase nor a comment; parentheses and quotes remain payload data,
-without granting placement. The original job/header owners charge source,
-scratch transitions, recognition, decoding and output. Whole-field
-CFWS/placement and URI label validity remain
-open; the helper grants no Content-Location or publication authority.
-
-M06db extends the selected URI word reader with caller-authorized
-complete encoded-word runs. Shared passive framing locates bounded
-candidates while existing mail recognition supplies grammar and charset
-policy. Complete wire fold validation and whole-run classification
-precede every scalar. Unknown, oversized, touching or mixed literal runs
-request whole-spelling fallback without decoded prefix output. Healthy
-runs replay through one fixed 75-octet buffer, funding all three wire
-passes and both recognitions per word through the same original owners.
-Diagnostics accumulate across words. Decoded labels preserve spaces,
-non-ASCII and decomposed spelling without NFC or URI validation.
-Whole-field placement, label matching and publication remain enclosing
-responsibilities.
-
-M06dc composes original-owner URI spelling selection, whole encoded-word
-runs and complete literal fallback for one authorized field-value slice.
-Word placement is limited to the entire selected spelling. Only completely
-recognized runs decode; other spellings retain all word-looking markers in
-literal replay after URI validation. Decoded labels receive no URI check or
-normalization. Child phases remain exclusive under the original owners;
-fresh handoff never adds charge or renews credit. No metadata escapes before
-whole healthy completion, and every refusal hides the End and retires its
-parser. Only M06df's consuming malformed-syntax path retains original owner
-references for freshly admitted discard. Empty-reference presence, discovery,
-label matching and retained response publication remain external.
-
-M06dd binds complete authorized location scalars to shared td-json framing.
-One bound source and original owner set funds both scalar output and exact
-serialized JSON bytes. Framing adds no source scans, interpretation credit,
-normalization or URI policy. Empty output and pending escape drains still
-freshly admit; whole JSON completion alone exposes passive field metadata.
-Any refusal retires source/frame and hides metadata, with bytes provisional
-through fresh consuming finish. Null selection, retained buffers and response
-publication remain separate obligations.
-
-M06de retains an optional caller-selected complete location JSON fragment in
-one fixed caller-reserved window. Absence and a present empty reference stay
-distinct. Share checked backing identity/prefix bookkeeping in std-only
-td-json and migrate CID/language pair retention to it in the same landing.
-The shared primitive supplies no source or completion authority. Enclosing
-cursors keep original exclusive admission owners, freshly consume completing
-children without added charge and hide all fragment metadata on any refusal.
-Whole retained views remain provisional through fresh final admission and
-whole-job publication. M06df owns first-valid location discovery;
-M06dg owns source-bound retention; traversal response integration remains
-separate composition.
-
-M06df selects first-valid resident Content-Location fields with the existing
-raw scanner and complete authorized field child. Only malformed needed
-occurrences can be skipped; first empty references remain present. A syntax
-refusal retires its parser/value and retains only original owner references
-for a freshly admitted internal consuming discard. Work, interpretation,
-nesting and internal refusals never enter that path. Later duplicates are
-scanned without value interpretation; no selection/diagnostic escapes before
-the complete raw boundary. Original scalar output costs remain funded even
-when selection discards provisional scalars. Selected extents preserve the
-original resident source; M06dg binds retained composition while publication
-remains external.
-
-M06dg binds the completed resident first-valid location selector and optional
-JSON retention to one immutable authorized Input and original allowances.
-Only that Input's selected raw extent is replayed into distinct reserved
-backing. No replacement source can enter between phases. Whole-view
-visibility includes both completed header selection and retained JSON;
-capacity or later admission refusal hides both. Fresh consuming finish
-returns original reusable allowances, with publication and label resolution
-still owned by the enclosing response job. This composition introduces no
-new parser arena or retained-storage grant.
-
-M06cq composes shared URI unfolding and reference validation into a selected
-literal spelling reader. It validates the complete spelling before replaying
-literal ASCII octets and slice-relative provenance under original job/header
-owners. No source-sized scratch, normalization, percent decoding or encoded
-word interpretation is introduced. Whole-field CFWS/placement, presence,
-label retention and publication remain separate composer obligations.
-
-M06cr shares a fixed URI spelling selector with caller-authorized surrounding
-CFWS policy. POLICY.md freezes the ambiguous parentheses rule. Exclusive CFWS
-or whitespace-probe child state returns original slice offsets without
-copying the selected value. Leading grammar failure rejects; optional suffix
-grammar can remain literal, but work/internal refusal never falls back. The
-helper owns no original allowance or field/word/URI authority. Complete mail
-composition, presence, retained metadata and publication remain open.
-
-M06cs binds the shared URI spelling selector to original job/header owners,
-with no new CFWS grammar or field authority. Every probe/replay remains
-charged; consuming fresh handoff returns the same owners and slice offsets
-for the next phase. Empty or invalid URI spelling can complete selection
-without granting URI/presence validity. Complete Content-Location word/literal
-composition, retained metadata and publication remain separate work.
-
-M06ct composes whole field-value CFWS selection with the literal URI reader
-under exclusive child ownership. Fresh consuming phase handoff transfers
-the same original job/header owners without a selected-value copy. Complete
-selection and URI/fold validation precede literal octets; source provenance
-is rebased to the original supplied field-value slice. Caller explicitly
-chooses literal interpretation and owns encoded-word placement/path choice,
-field discovery/presence and retained metadata/publication. Empty references
-remain permitted. Complete Content-Location word/literal dispatch remains
-open; this path grants no resolution or source authority.
-
-M06cu selects first-valid Content-ID and Content-Language raw fields from a
-complete resident entity header section. Existing strict single-identifier
-and shared complete-language-list syntax run as exclusive children of the
-same original job/header owners. Malformed needed occurrences are skipped;
-nesting, raw-header limits, incomplete source and admission refusal retire
-all selected fields. Later duplicates are scanned without interpreting
-values. Passive absolute extents remain hidden until complete section
-success and provisional through fresh admission. Projection/retention and
-traversal coordination remain separate; selection grants no source or blob
-authority and allocates no label string or list.
-
-M06cv retains those two passive raw extents in completed part-header Views.
-The label selector runs after filename completion with the same authorized
-entity and original owners; both scans must agree on section/body bounds.
-No View is exposed until labels complete. Later label failure retires prior
-heads/charset/filename results. The original parser reservation and caller
-windows suffice; label strings/lists, location dispatch and automatic
-traversal/JSON integration remain separate.
-
-M06cw binds selected Content-ID projection to shared std-only JSON string
-framing under the same original job/header owners. Whole-value grammar
-success precedes identifier scalars; any opening quote and subsequent JSON
-fragments remain provisional through fresh completion admission. Ordinary
-JSON escaping adds serialized output charges to existing conversion work.
-The fixed framer/source pair allocates no retained string, applies no NFC or
-encoded-word decoding, and returns original owners with the existing
-encoding-problem diagnostic. Missing-field mapping, label arrays and whole
-part/response composition remain separate.
-
-The CID JSON binding uses the generic framer directly to preserve its typed
-CID error domain without widening the older header-property json_string
-error roster. CID Begin/End are non-scalar structural events from its fixed
-single-identifier projector; they yield while the child enforces its own
-sequence. Premature JSON finish and child source-state refusal retain their
-distinct outer/source error contexts. Future metadata composition must adapt
-those contexts explicitly rather than silently flattening them.
-
-M06cx extracts generic string-array framing into std-only td-json and
-atomically replaces the mail MessageIds/URLs framing mechanism. Mail retains
-whole-field validation before array output, mode/null policy, original
-admission owners and contextual errors. Shared punctuation and string
-escaping retain fixed paid progress without retaining values or granting
-source/publication authority. Content-Language binding remains separate.
-
-M06cy binds selected Content-Language grammar to the shared string-array
-frame under original job/header owners. Ordered, original-case tag extents
-replay one charged ASCII byte at a time without a retained list. Grammar and
-replay share prepaid credit; exact JSON bytes consume original output work.
-Earlier serialized tags retire on malformed tails or any later refusal.
-Fresh whole-list/framing completion precedes consuming original-owner
-handoff. Null/presence mapping and retained MIME/response composition remain
-separate; the binding grants no locale, source or publication authority.
-
-M06cz retains the selected CID/language JSON pair in separate caller-reserved
-windows. Exclusive child phases consume and return the original job/header
-owners without another output charge or source-sized temporary. No fragment
-escapes before complete healthy pair finish; a later language, capacity or
-admission refusal retires the earlier CID too. Missing values remain absent.
-Field selection, source authorization, optional/null policy and enclosing
-response publication remain separate. The child handoff may forfeit prepaid
-credit; it cannot renew any allowance.
-
-M06da composes complete retained part headers with the selected label JSON
-pair under the original job/header/scratch owners. It checks selected field
-extents against the recognized header section and maps them only into the
-same authorized immutable entity. One live child owns the budgets at a time;
-no completed header metadata escapes before whole healthy label completion.
-Failure hides both Views without wiping provisional caller backing. Healthy
-fresh finish returns passive metadata and the original reusable owners.
-M06dh adds source-bound location in a third exclusive phase. All retained
-metadata remains hidden until its boundary agrees with the earlier header
-view. Location refusal retires previous groups too; original scratch stays
-parked during that child. Traversal and response publication remain separate.
-
-M06di retains the traversal's per-part default context in an existing
-packed descriptor flag, independent of selected type. Later metadata must
-use that context with the same original source extents; passive descriptors
-cannot authorize or bind a source. Digest defaulting is not inferred from
-a child's final media classification.
-
-M06dj binds complete traversal to its original immutable source and
-keeps its original job/header owners through per-part metadata. The
-binding alone maps descriptors to clipped entities/context and
-constructs the retained child; callers cannot replace source or budgets
-between phases. Healthy metadata correlates raw body starts before
-exposure. A child refusal retires the binding. Part construction marks
-it Abandoned until successful consumption, including after safe
-forgetting. Fresh binding finish precedes original-owner release.
-Passive earlier copies remain provisional; source/blob authority,
-body-list/response serialization and publication stay external. No
-simultaneous traversal frame set or metadata table is added.
-
-M06dk consumes bound retained headers into compact body-list nodes with
-original descriptor parent/depth and original job/header/scratch owners.
-Fresh metadata consumption precedes fixed classification comparisons and
-whole-node output admission. Classification refusal keeps the binding
-retired; success alone restores it. Return original metadata and Part
-ordinal beside the node for one-pass response consumption. Caller nodes
-share the existing body slot reservation, without another metadata
-table. Complete preorder, whole-part visitation, source authority and
-response publication remain external. Existing body-list traversal
-checks supplied depth/parent shape but cannot certify sibling order or
-completeness against the source.
-
-M06dl owns complete ordered classification. A private source-bound owner
-chooses each original ordinal exactly once, writes only freshly consumed
-nodes into separately admitted fixed slots and exposes a complete node
-set only after all descriptors finish under original owners. Part
-consumption also returns original metadata for one-pass response use.
-Safe forgetting, capacity/child refusal and extra-part requests cannot
-leave healthy completion. Finishing ordered construction and consuming
-the completed owner freshly admit; passive views do not confer source or
-publication authority. Source-bound body-list/response serialization
-remains a separate next boundary.
-
-M06dm consumes private complete classification into original-source body-list
-selection. The existing iterative selector reads only that owner's original
-nodes and retains the original job/header allowances. No replacement node
-slice, source or budget enters the transition. Fresh admission precedes local
-constructor checks; complete selection creates a private owner retaining the
-same immutable source binding, original header limit, cells and passive lists.
-Caller selection limits only add refusal policy over already bounded nodes;
-they do not renew traversal or job allowances. Explicit
-checks and consuming finish retire all visibility after refusal. Caller list
-windows remain separately admitted; there is no new parsing, charge,
-allowance, source-sized scratch or selection algorithm. Response composition
-must consume that private selected owner, never reconstruct it from passive
-Views. Serialization, authenticated locators and publication remain external.
-
-M06dn consumes private selected ownership into original-source response
-metadata replay. Fresh constructor and next-part admission precede local
-state checks. Every original ordinal is visited once using the original
-source, context, header limit and job/header owners. Existing metadata
-projection supplies the only live child, with one reused caller window and
-scratch; rereads and output spend original allowances. No second
-classification, node output charge, metadata table or renewed credit is
-introduced. Only successful fresh consumption advances visitation; child
-refusal or safe forgetting retires the complete owner. Fresh whole replay
-finish produces a private completed owner retaining original source and
-allowances. It proves metadata visitation, not response bytes or publication;
-JSON framing, locators and output admission must compose with that visitation
-in later increments. The next framer wraps each live Part atomically before
-its window is reused; Projected alone contains no retained part metadata or
-serialization proof. Copied cells and previously emitted metadata remain
-provisional through final whole-job admission.
-
-M06do wraps a live complete replay Part atomically in fixed metadata
-member framing before window reuse. Its parent remains abandoned until
-fresh whole serialization finish; refusal, premature finish or safe
-forgetting retires visitation. It frames selected scalar fields through
-the shared JSON string engine, copies only privately retained complete
-CID/language/location JSON, and uses original allowances for scalar
-rereads, bounded control steps and every wire byte of the new fragment,
-including copied retained metadata. Apply final charset
-defaults/non-text absence, preserve selected label spelling, and enforce
-the JMAP unsigned-size ceiling. No new normalization, field selection,
-metadata arena, source authority or parsing algorithm enters. The member
-fragment excludes braces, blob IDs and subparts; tree/body-list
-composition, property selection, locators and publication remain later
-boundaries. Completion returns passive descriptor/node evidence and
-original owners, not a publication capability.
-
-M06dp binds the original live replay child and a distinct
-caller-reserved fragment window to private framing plus shared fixed
-retention. It accepts no advanced framer that could omit an
-already-emitted prefix. Admission precedes storage capacity; for a
-retention-bound child, only fresh whole retention consumption advances
-visitation. Failure, premature finish or safe forgetting retires the
-parent, including after Complete. No output is charged a second time by
-retention. The retained fragment/end are passive and provisional; whole
-composition must wrap this live handoff with the original replay owner
-before publication. Bare Part/framer finishes still advance visitation
-without retention; later whole composition must consume the live
-retention path to prove storage. No new parser, arena allocation,
-allowance or source identity enters.
-
-M06dq wraps original selected replay, metadata framing and fixed
-retention in one whole collection. Exactly one separately admitted
-cell/window belongs to each original ordinal. Its child cannot detach
-either phase; only a fresh whole retained handoff stores that cell and
-clears collection abandonment. Retained passive bytes and Projected
-visitation cannot reconstruct this proof. Whole Serialized completion
-preserves original selection, preorder fragments and original
-work/header owners through fresh checks/consumption. Control steps and
-cell records use the original allowances, with no repeated wire debit.
-The collection adds no normalization, metadata parser, JSON serializer,
-source authority or publication algorithm. Enclosing body-list/tree
-composition, braces, locators and publication remain later boundaries.
-
-M06dr consumes exclusive whole Serialized ownership to compose either
-original bodyStructure metadata or original selected body-list members.
-It never reconstructs authority from passive fragments or visitation.
-Generated fragments are copied unchanged; original preorder/depth/parent
-identity drives a fixed 64-frame iterative tree. Original allowances
-fund bounded control and every newly emitted byte, with no source/I/O
-replay charge. Fresh complete consumption yields exclusive Composed,
-which proves emission only. Whole fixed retention must construct its own
-fresh composer from Serialized; an advanced composer or Composed cannot
-prove that an omitted prefix was retained. Locators, property selection
-and complete response publication remain subsequent boundaries.
-
-M06ds binds original whole collection to fresh private composition and a
-fixed separately admitted member window. An advanced composer or completed
-emission cannot provide constructor authority, so an omitted prefix cannot
-become retained proof. Shared Window records only reported bytes, without
-additional wire debit. Fresh complete retention yields exclusive Retained
-with original Composed and full bytes; passive ViewBytes cannot reconstruct
-that owner. Fresh checks/consumption preserve original allowance identity
-and sticky refusal. These members remain provisional through authenticated
-locators, request property selection and complete job publication.
-
-M06dt consumes original whole retained metadata to derive provisional
-p1 candidates from every original descriptor. Relative encoded extents,
-transfer tags and multipart nulls use the frozen wire contract; no
-passive imported descriptor can enter the owner. Each bounded turn funds
-canonical bytes and its stored-cell record in original allowances.
-Exclusive Mapped preserves original retained completion through fresh
-checks/consumption. Its parent BlobId is untrusted: source-identity and
-live account/lease authorization must bind this proof before issuance,
-download or reuse. This adds no permission, parent pin, body decoding,
-nested locator context or complete response publication.
-
-M06du binds that original Mapped to a real complete PinnedBlob by parent
-ID, full length and an incremental digest of all original resident bytes.
-Bound keeps both exclusive owners, including the actual pooled-view pin.
-The pin's own query clock fences digest work and final consumption; a
-healthy supplied parsing Tick cannot revive expired body access. Root
-authorization remains the existing caller obligation before opening the
-pin, and source matching alone grants no permission. Hash visits are
-bounded and funded in original work, with no replacement allowance.
-This adds source identity, not authenticated issuance or publication;
-binding-path allocation/whole-service qualification remains open.
-
-M06dv qualifies only eight source-binding Rust allocation intervals using
-actual retained body pins and original MIME owners in one test-only
-source graph. Cold setup and original mapping precede counting; binding
-construction, digest work and binding-owned snapshot-pin teardown are
-measured; enclosing pooled-view/scratch-lease release stays outside.
-Successful release, actual-clock refusal, source mismatch and original
-work refusal preserve every counter. This leaves native/whole-service
-resource qualification and authenticated publication open. Unmeasured
-source-binding cases are explicitly listed in API §1.127.
-
-M06dw emits an original part metadata fragment plus its source-bound
-leaf blobId or multipart null while retaining original Bound and the actual
-snapshot-bound body pin. Each turn funds at most 64 new wire bytes in original
-work, with no retained-source reread. Actual pin fences surround work;
-complete emission creates an exclusive Member, freshly checked before
-releasing original Bound. Partial/error bytes remain provisional and
-must be discarded. This is one part-member building block; current
-access policy, whole tree/list composition and publication remain open.
-
-M06dx binds a fresh original source-bound member emitter to a fixed
-caller window and retains the whole fragment plus blobId before granting
-exclusive Retained ownership. Deadline checks precede capacity, with
-original output charging and post-work pin fences preserved. Checked
-fragment length plus 81 reserves the worst suffix while all original
-backing and actual snapshot pin overlap. Fresh final release preserves
-original Bound; passive retained bytes alone cannot establish source
-custody or publication. Whole collection/composition and current access
-policy remain later boundaries.
-
-M06dy collects all original source-bound whole members into separately
-admitted fixed cells. Child handoff retains exclusive source and actual
-pin custody; abandonment cannot skip an ordinal. Fresh complete child
-acceptance funds original work and samples the actual pin before
-installing its original cell and returning Bound. Whole Serialized
-ownership requires every original ordinal and stays fresh through
-release. Cells remain provisional; composition, request selection and
-current access policy/publication still follow. Only the eight allocation
-intervals named in API §1.130 are qualified.
-
-M06dz emits original source-bound whole tree/list members while keeping
-every collected member and the actual pin. One shared bounded Frame
-serves the existing metadata adapter and the new source-bound adapter;
-its ordinal/depth/parent walk and list framing remain identical. Every
-turn funds original work and samples the actual pin after work even on
-quota refusal. Exclusive Composed preserves collection custody through
-fresh release; emitted prefixes remain provisional. Whole response
-retention, request selection and current access/publication follow.
-Only the eight allocation intervals in API §1.131 are qualified.
-
-M06ea retains whole source-bound Structure/Lists property members in a
-separately admitted fixed window. It starts only from original complete
-collection, privately creates the fresh composer and reuses td-json
-Window; only successful reported bytes advance, with no additional work
-fees. Original collection and actual snapshot pin remain held through
-fresh complete Retained and final release. Capacity/deadline failures
-are sticky; whole output stays provisional through current authenticated
-publication. Only API §1.132's eight allocation intervals are qualified.
-Whole ledger admission, request selection and publication remain later.
-
-M06eb selects requested textBody, htmlBody, attachments and hasAttachment
-members through the same bounded Frame while retaining original complete
-collection and actual body pin. A pure four-boolean selection supplies no
-permission; full-list callers retain their prior ALL behavior and fees.
-Empty selection freshly admits, then completes without output or charge;
-all explicit/final owner boundaries remain fresh. Exclusive selected
-Composed carries selection and original collection through release.
-Only API §1.133's eight allocation intervals are measured. Whole selected
-retention, broader request routing and current publication remain later.
-
-M06ec shares the existing source-bound retention core to retain whole
-requested list members from a fresh
-original Serialized and Properties into the shared Window. Empty
-selection freshly completes into zero capacity. Original collection,
-selection and actual pin remain exclusive through Retained and fresh
-release. Advance only successful reported bytes with no additional work
-fee; unfinished freshness precedes capacity and all refusals are sticky.
-Only API §1.134's eight intervals are allocation-qualified. Whole ledger
-admission, wider request routing and current publication remain later.
-
-M06ed routes pure requested bodyStructure and list properties through
-the same bounded Frame, retaining original collection and actual pin.
-Tree first then selected lists yields canonical keys and separators;
-single-mode legacy bytes/turns/funding remain unchanged. Exclusive
-requested Composed carries selection through fresh original release.
-Only API §1.135's eight intervals are allocation-qualified. Whole
-requested retention, per-part bodyProperties, JSON request decoding,
-full admission and authorized publication remain later.
-
-M06ee retains whole requested source-bound tree/list members through
-the shared Window while holding original collection, requested selection
-and actual snapshot pin through fresh Retained/release. NONE accepts zero
-capacity; nonempty final-copy exact fit completes. Advance only
-successful reported output, with no additional work fee, fresh
-unfinished checks before capacity and sticky hiding. Only API §1.136's
-eight intervals are qualified. Per-part properties, request JSON
-parsing, whole admission and current publication remain later.
-
-M06ef selects ten existing source-bound part fields while retaining the
-original Bound, ordinal and actual snapshot pin. ALL preserves original
-emission; NONE freshly completes without work. Partial selections use a
-fixed bounded, funded index of original generated metadata, not a JSON
-request/source parser or reconstructed owner. Preserve selected strings,
-arrays, blob wire/null and canonical commas; freshly finalize both owners.
-Only API §1.137's eight intervals are allocation-qualified. Whole selected
-retention/collection/tree integration, headers/subParts, JSON requests,
-full admission and authenticated publication remain later.
-
-M06eg whole selected part-field retention privately configures a fresh
-original-bound emitter from Bound, ordinal and pure ten-field
-Properties. Legacy ALL and the selected adapter share the existing fixed
-Window, polling, sticky failure and fresh finalization; no advanced
-emitter enters whole retention. The adapter holds only immutable
-selection beside the shared core and maps whole views/release labels.
-Exact fit completes on the final selected copy; NONE admits empty
-complete into zero capacity with original custody and fresh consuming
-boundaries. Generated-index/copy work keeps §1.137's exact five-cost
-charges. API §1.138 defines passive bytes and measured Rust intervals;
-collection/tree integration, headers, header:*, subParts, request
-defaults/parsing, full admission and current authenticated publication
-remain later.
-
-M06eh original selected-field collection privately threads one immutable
-ten-field Properties through the existing source-bound collection core
-and each fresh whole-retained child. Legacy public construction passes
-ALL. The selected facade preserves labels while sharing exact
-cardinality, ordinal custody, abandonment, sticky child/parent refusal
-and fresh complete acceptance. NONE needs zero-capacity child windows
-and one Cell per original ordinal. It pays no emission work but still
-pays the original ordinal handoff. Complete Serialized/released slots
-remain passive and keep original
-Bound/descriptor custody; no public conversion strips selection into a
-legacy complete owner. API §1.139 defines the bounded state and eight Rust
-intervals. Tree/list composition, request parsing and current
-authenticated publication follow.
-
-M06ei selected-field composition retains §1.139's immutable metadata
-selection and original collection custody while delegating to the shared
-source-bound frame. The provisional tree/list structural subParts
-scaffold is independent of those ten fields; NONE removes metadata, not
-nodes or list entries. Suppress its leading comma for empty whole
-metadata. ALL keeps legacy turns and charges. Fresh consuming/explicit
-checks and passive labels remain the existing boundaries. API §1.140
-scopes eight Rust intervals; request parsing/defaults,
-headers/header:*/subParts selection, full admission and current
-authenticated publication remain later.
-
-M06ej requested outer properties preserve independent selected part
-metadata through the existing requested source-bound frame. Immutable
-outer Properties remain in the original requested owner and metadata
-Properties remain in its facade; complete views/releases preserve both.
-Outer NONE spends no composition work but keeps complete original
-collection custody and fresh consuming boundaries. Structural subParts
-remain the provisional internal scaffold. API §1.141 scopes eight Rust
-intervals; whole output retention, request parsing/defaults,
-configurable headers/header:*/subParts selection, full admission and
-current authenticated publication follow.
-
-M06ek whole requested selected-field retention reuses the original
-fixed-window core under exclusive selected facades. Complete Serialized
-alone starts fresh requested composition; immutable part and outer
-selections survive complete output and fresh release alongside original
-backing/cells/descriptor custody. Capacity and work refusal prevent
-completion; original-job/actual-pin refusal hides completed views and
-remains sticky. API §1.142 scopes eight Rust allocation intervals and
-caller-owned windows. Structural subParts remains a provisional
-scaffold; configurable headers/header:*/subParts selection, request
-parsing/defaults, full admission and current authenticated publication
-remain later.
-
-The M06ei–M06ek constructors above retain their legacy structural
-scaffold. API §1.147 adds explicit subParts selection through the same
-engine; header rendering, full admission and authenticated publication
-still remain later.
-
-M06el decoded body-part key recognition distinguishes all twelve
-standard EmailBodyPart fields and reuses the existing bounded header
-selector in BodyPart context. Result tags and borrowed header plans
-remain passive; unknown keys stay for the enclosing dispatcher, never
-become ALL. API §1.143 scopes bounded paid comparisons and eight Rust
-allocation intervals. JSON/argument parsing, defaults, duplicate policy,
-full selection aggregation and configurable header/subParts composition
-remain later; this recognition does not change the provisional
-structural scaffold or grant current publication authority.
-
-M06em aggregates decoded body-part keys through the BodyPart recognizer
-into ten metadata flags, structural flags and a caller-owned borrowed
-header-cell prefix. Exact requested header keys deduplicate in bounded
-paid two-sided comparisons while preserving first spelling/loan and
-request order. Unknown/form/capacity/work failures forbid whole success.
-Explicit empty stays NONE; the pure omitted-argument default constant
-contains only the ten metadata fields. API §1.144 scopes passive result
-semantics and eight Rust intervals. JSON shapes/default dispatch,
-configurable structural/header rendering, full admission and current
-authenticated publication remain later.
-
-M06en decodes an admitted UTF-8 bodyProperties JSON fragment into fixed
-caller-preallocated Strings and key-reference slots. Omitted differs
-from explicit empty/null; complete syntax and scalar escapes precede
-semantic selection. Input, record and scalar-output work are prepaid;
-capacity refusal never grows storage. Whole success borrows only the
-completed prefix. Cells are cold/reset storage tied to decoded loans,
-not a persistent request-arena pool. API §1.145 defines exact turn and
-EOF costs and the eight isolated Rust intervals. Full request decoding,
-composition wiring/admission and authenticated publication remain later.
-
-M06eo joins admitted JSON fragment decoding and original BodyPart
-semantic selection through a single passive request cursor. No whole
-view escapes between stages; omission alone immediately selects the
-ten-field default. Transfer complete decoded key loans without copying
-or adding a second parser turn. Original sticky errors, exact debits,
-first header loans and caller storage stay intact. API §1.146 scopes
-the eight Rust intervals and fixed cursor footprint. Whole request
-framing, configurable composition/admission and authenticated
-publication remain later.
-
-M06ep selects structural subParts through the existing requested framing
-engine and original selected collection custody. False closes root-only
-bodyStructure and classified list leaves after metadata; true preserves
-legacy tree/null bytes and costs. Immutable structural/outer selection
-survives completion and original owner release without widening the ten
-metadata flags. Both freshness domains remain enforced. API §1.147
-qualifies eight Rust intervals; header rendering, whole admitted request
-wiring and authenticated publication remain later.
-
-M06eq retains complete selected subParts composition in the original
-shared fixed Window. Original fresh selected collection custody begins
-retention; advanced/emitted-only/passive inputs cannot recreate a lost
-prefix. Selection, metadata and original pointers survive whole values
-and consuming release. Short capacity and explicitly checked expiry in
-either freshness domain hide whole success stickily. Completed passive
-values survive expiry until a check or consuming operation. API §1.148
-scopes eight Rust intervals. Header rendering, full admitted request
-wiring and authenticated publication remain later.
-
-M06er streams source-ordered EmailHeader JSON through the original resident
-header Scanner, Raw scalar engine and JSON string frame. Names preserve case
-and duplicates; values preserve folding/leading whitespace and existing Raw
-filtering/replacement policy. Original job and interpretation budgets move
-exclusively between scanning and projection. Emitted fragments remain
-provisional; fresh complete handoff returns only the original budgets and
-passive header boundary/diagnostic. API §1.149 scopes its bounded cursor and
-eight Rust allocation intervals. M06es below qualifies whole-array retention;
-configurable body-part header wiring and original pin/authenticated publication
-admission remain later.
-
-M06es retains a whole resident header array in one original caller-reserved
-fixed Window by constructing its own fresh streamed header owner. Advanced
-streams and emitted-only completions cannot reconstruct an already-lost
-prefix. Fresh admission precedes capacity refusal; a full healthy Window
-refuses before the next producer turn can expose a source failure, with no
-refund of paid work. Capacity refusal is sticky and retires original budget
-custody;
-whole passive bytes require healthy completion. Exact capacity preserves
-original Raw/order/case semantics and all streamed charges. Completed polls
-remain inert; explicit checked expiry hides values and consuming finish
-requires fresh original job/interpretation admission. Passive retained bytes
-and budget Completion grant no original pin or publication authority.
-
-The four-list-only selected source-bound adapters retain a narrower type
-contract than requested tree/list selection: their Properties cannot
-select bodyStructure. They remain public facades over the same shared
-Frame and retention core, with no independent polling or capacity engine.
-The broader requested facade keeps its immutable five-property label;
-the Frame's mode is an internal active walk, a legacy constructor label
-only. These are selection types, not JSON request default policy.
-
-The reusable CFWS, delimited-token and MIME parameter-name/value cursors
-live in td-header with generic caller-owned admission. Its passive resident
-extent helper shares checked absolute slice mapping without reading bytes or
-granting source authorization. Mail grammar placement, scalar decoding,
-normalization, deadlines and budget adapters remain in td-mta. The shared
-lexical crate owns no field selection, display policy, clock or crypto and
-retains the existing fixed-work/source-extent contract.
-The value cursor validates complete raw token/quoted spelling before
-projecting provisional octets with ordinary/extended prefix roles. Candidate
-assembly and charset/display/boundary conversion remain in mail. Zero-count
-fresh admission is shared by the name/value wrappers without spending
-parsing steps or prepaid credit.
-The passive language-tag feed state is shared by parameter prefixes and
-encoded-word qualifiers; recognition retains its precharged 75-byte ceiling.
-Stateless shared projection now unquotes/folds MIME value, phrase and
-comment octets through one reader. Caller callbacks preserve source
-bounds, distinct errors and EOF charges; escaped-fold provenance remains
-available to mail display consumers. Strict logical character assembly is
-also shared: separate read/local verification callbacks borrow the
-original work context sequentially. The first logical octet retains escape
-provenance; filtering and placement remain mail policy. All mail
-display/body noncharacter checks use one table-free Unicode predicate
-without changing their distinct control/output rules. Original placement,
-charset decoding/filtering, normalization and sticky admission/failure
-ownership remain in mail. Projected bytes create no lexical validity or
-display-word placement proof.
-
-Complete parameter-family selection remains mail policy. The fixed-state
-owner validates the whole field, classifies names, then replays every numbered
-index under the original work and header allowance. It retains only source
-extents and passive rejection evidence; no section table or decoded output.
-POLICY.md owns precedence and fallback. All derived output remains provisional
-until a later charged drain and conversion completes. This selector fits the
-existing parser reservation; ancestor frames must not each retain one.
-The octet owner reuses that inline selector for complete validation and then
-charged replay, retaining its original budgets and credit throughout. It
-accepts source/kind/attribute rather than a caller-manufactured plan; rejected
-family octets never escape selection. The complete field grammar proves an
-ordinary value before replay: it shares td-header's delimited quoted-string
-and MIME token rules with mime_value's Ordinary validator. Replay rechecks
-that complete spelling before octets. Replay failure retires all provisional
-output and cannot choose a second fallback. Charset/language/data roles are
-lexical evidence only; original-source placement and metadata publication
-remain with later owners.
-Literal Name/Filename scalar conversion composes validated octet replay with
-one decoder across all data sections. A fixed incremental matcher and slice
-lookup share the exact existing mail charset alias table; no label buffer or
-registry is introduced. Unknown/empty declared labels recover as POLICY.md
-specifies. One held byte separates replay and decoding turns, and original
-budget/private credit persist through both. Charset diagnostics remain
-separate from rejected-family evidence. Scalar controls/noncharacters, raw
-word placement, filtering/NFC and display publication stay with later owners.
-Display conversion branches to a private original-raw Ordinary decoder only
-after complete family choice and before data conversion. Raw quote/LWS edges
-and contiguous unescaped words establish filename compatibility; neither
-projection nor decoded punctuation supplies placement. Extended/numbered data
-remain literal. Filtering precedes later NFC, and original allowances/credit
-span the inline handoff, word recognition and charset work. All scalar output
-and diagnostics remain provisional until fresh display completion; response
-retention and final metadata authority are still later-owner boundaries.
-New extractions must preserve the caller's bounded-work and memory contract.
-
-The core may contain owned tables generated from the approved, checksummed
-Unicode 17.0 inputs in ../td-mime/UNICODE.md. They add no Cargo dependency or runtime
-data fetch. The approved corpus and license now live in the checkout and are
-verified by the ordinary offline test suite and a cold tooling example. M06
-now has reproducible offline table generation, fixed runtime lookups and
-bounded NFC over resident valid UTF-8, verified against the complete official
-NFC equations. M06t composes resident unstructured-header decoding with NFC
-and bounded charged replay. Keywords and List-Id Text now retain source
-punctuation while decoding original phrase/comment words with fixed lexical
-placement state and shared normalization. POLICY.md owns malformed display
-recovery. Content-Type and Content-Disposition Text decode original comment
-words while retaining parameter spelling. A bounded resident MIME syntax
-cursor now reuses the CFWS and quoted-string validators, returning raw token
-and parameter extents under original job/email admission. Events remain
-provisional until whole-field validation. A fixed-state metadata selector
-now retains the first completely valid occurrence of each MIME field, then
-applies normal or digest-child Content-Type defaults after the entire header
-section validates. Header, nesting and work refusal retire all candidates.
-Derived parameter metadata, MIME part traversal and protocol integration
-remain open.
-
-The core also contains 27 positive leap insertion dates generated from the
-approved, checksummed IANA input in ../td-mime/leap-seconds/README.md. Offline tooling
+Complete traversal uses fixed explicit frames, parent-first child clipping
+and caller-backed compact descriptors; td-mime/DESIGN.md owns the engine
+shared by resident and fragmented input. Root headers count once; every
+child spends the remaining aggregate entity-header cap and the original
+email interpretation/job admission. Outer delimiters bound an entire child
+before its headers or inner delimiters are interpreted, so outermost active
+prefixes win. Missing closes diagnose their containers; an absent or
+invalid boundary, no opening delimiter or an encoded multipart refuses the
+structure. Descriptors stay hidden until the entire parse succeeds and are
+passive source evidence; fresh handoff returns the original budgets, never
+blob IDs. Leaf sizing uses stable transfer decoding, without charset/NFC or
+attached-message recursion. An existing packed descriptor flag retains each
+part's default context independently of its selected type; later metadata
+uses that context with the same original source extents, and digest
+defaulting is never inferred from a child's final media classification.
+
+`blob_structure` joins a verified PinnedBlob to the fragmented cursor
+(API.md, "Native complete MIME traversal"). `mime_response::bound` binds a
+complete resident traversal to its original immutable source and keeps its
+original job/header owners through per-part metadata. Only the binding maps
+descriptors to clipped entities and context and constructs the retained
+child. Healthy metadata correlates raw body starts before exposure. Part
+construction marks the binding Abandoned until successful consumption,
+including after safe forgetting, and a child refusal retires it. Fresh
+binding finish precedes original-owner release. No simultaneous traversal
+frame set or metadata table exists.
+
+Body lists are derived from the retained selected headers' classifications
+with explicit frames, scope-local alternative masks and bounded fallback;
+completed preorder evidence and classifications remain caller-pinned. A
+final membership sweep applies both RFC attachment conditions after
+fallback, and results stay hidden until all tree validation and work
+completes. The selector checks supplied depth and parent shape but cannot
+certify sibling order or completeness against the source; the owners below
+supply that.
+
+- Classification consumes bound retained headers into compact body-list
+  nodes with the original descriptor parent and depth. Fresh metadata
+  consumption precedes the fixed classification comparisons and whole-node
+  output admission. Classification refusal keeps the binding retired;
+  success alone restores it. The original metadata and Part ordinal return
+  beside each node for one-pass response consumption, and nodes share the
+  existing body slot reservation.
+- A private source-bound owner chooses each original ordinal exactly once,
+  writes only freshly consumed nodes into separately admitted fixed slots
+  and exposes the complete node set only after every descriptor finishes.
+  Safe forgetting, capacity or child refusal and extra-part requests cannot
+  reach healthy completion.
+- Selection consumes that private complete classification. The iterative
+  selector reads only its original nodes; fresh admission precedes local
+  constructor checks, and complete selection creates a private owner
+  retaining the same source binding, header limit, cells and passive lists.
+  Caller list windows are separately admitted. Response composition
+  consumes that private selected owner, never one reconstructed from
+  passive Views.
+
+`blob_body_lists` checks each native node's ordinal, parent and depth
+against the traversal and then runs the same selector; Email/get supplies
+classifications from interpreting every part, and coordinate checks do not
+authenticate fabricated classes (API.md, "Native body-list selection").
+API.md sections 1.83 to 1.85, 1.87 and 1.114 to 1.118 specify the resident
+stages of this section.
+
+### 3.7 Response serialization and retention
+
+These resident stages carry a selected body-list owner to whole bodyStructure
+or list members; API.md sections 1.119 to 1.124 specify them.
+
+- **Replay.** Private selected ownership becomes response metadata replay.
+  Fresh constructor and next-part admission precede local state checks.
+  Every original ordinal is visited once with the original source, context,
+  header limit and owners; the existing metadata projection is the only
+  live child, with one reused caller window and scratch. There is no second
+  classification, node output charge or metadata table. Only successful
+  fresh consumption advances visitation; child refusal or safe forgetting
+  retires the whole owner. Completed replay proves metadata visitation, not
+  response bytes; it contains no retained part metadata or serialization
+  proof.
+- **Member framing.** Each live replay Part is wrapped atomically in fixed
+  metadata member framing before its window is reused, and its parent stays
+  abandoned until fresh whole serialization finish. Framing emits selected
+  scalar fields through the shared JSON string engine and copies only
+  privately retained complete CID, language and location JSON. Original
+  allowances fund scalar rereads, bounded control steps and every wire byte
+  of the fragment, copied metadata included. It applies final charset
+  defaults and non-text absence, preserves selected label spelling and
+  enforces the JMAP unsigned-size ceiling. The fragment excludes braces,
+  blob IDs and subparts. The native `blob_part_json` uses the same encoder
+  for partId, size, type, charset, name, disposition, cid, language and
+  location; a multipart partId is null.
+- **Fragment retention.** The original live replay child binds to a
+  distinct caller-reserved fragment window through private framing and the
+  shared fixed retention. No advanced framer that could omit an emitted
+  prefix is accepted. Admission precedes storage capacity. For a
+  retention-bound child only fresh whole retention consumption advances
+  visitation; failure, premature finish or safe forgetting retires the
+  parent, including after Complete. Bare Part or framer finishes advance
+  visitation without retention, so whole composition consumes the live
+  retention path to prove storage.
+- **Collection.** One whole collection wraps selected replay, member
+  framing and retention, with exactly one separately admitted cell and
+  window per original ordinal. Its child cannot detach either phase; only a
+  fresh whole retained handoff stores that cell and clears collection
+  abandonment. Whole Serialized completion preserves the original
+  selection, preorder fragments and owners; control steps and cell records
+  use the original allowances.
+- **Composition.** Exclusive whole Serialized ownership composes either
+  original bodyStructure metadata or selected body-list members. Generated
+  fragments are copied unchanged; original preorder, depth and parent
+  identity drive a fixed 64-frame iterative tree. Original allowances fund
+  bounded control and every newly emitted byte, with no source or I/O
+  replay charge. Exclusive Composed proves emission only.
+- **Member retention.** Whole retention binds the original collection to a
+  fresh private composer of its own and a fixed separately admitted member
+  window, so an advanced composer or completed emission cannot prove that
+  an omitted prefix was retained. The shared Window records only reported
+  bytes. Fresh complete retention yields exclusive Retained with the
+  original Composed and the full bytes; passive ViewBytes cannot
+  reconstruct it.
+
+### 3.8 Source binding and blob IDs
+
+A leaf part's blobId is its direct part locator, the canonical 69-byte
+`p1_` form in WIRE.md: parent blob ID, encoded extent within that blob and
+transfer encoding. A multipart part's blobId is JSON null. A locator is
+untrusted until matched against a live authorized parsed part.
+
+On the live path `blob_part_locators` consumes the original native
+traversal handoff and exactly one caller-reserved candidate cell per
+descriptor, mapping one part per turn through the shared locator policy and
+original budgets. The parent ID comes from the held PinnedBlob and offsets
+stay absolute within that blob, even for a clipped nonzero extent. Every
+range must fit the original blob length and the root descriptor's clipped
+extent, and a body start cannot precede its own entity. Mapping reads and
+decodes no body bytes. Email/get publishes candidates only inside its
+admitted response for the account whose view pinned the parent; the HTTPS
+direct-part route authorizes the parent again and reproduces the exact
+non-container descriptor before download (API.md, "Direct MIME-part HTTPS
+downloads").
+
+The resident stages bind locators as follows:
+
+- **Mapping.** Whole retained metadata derives provisional p1 candidates
+  from every original descriptor; no passive imported descriptor can enter
+  the owner. Each bounded turn funds the canonical bytes and its stored-cell
+  record. Exclusive Mapped preserves the retained completion. Its parent
+  BlobId is untrusted: source identity and live account/lease authorization
+  must bind it before issuance, download or reuse.
+- **Source identity.** Mapped binds to a real complete PinnedBlob by parent
+  ID, full length and an incremental digest of all original resident bytes.
+  Bound keeps both exclusive owners, including the actual pooled-view pin,
+  whose own query clock fences digest work and final consumption. Root
+  authorization remains the caller's obligation before opening the pin;
+  source matching alone grants no permission. Hash visits are bounded and
+  funded in original work.
+- **Member emission.** A part metadata fragment is emitted with its
+  source-bound leaf blobId or multipart null while the original Bound and
+  the actual pin are retained. Each turn funds at most 64 new wire bytes,
+  with no retained-source reread, and actual pin fences surround the work.
+  Complete emission creates an exclusive Member, freshly checked before the
+  Bound is released.
+- **Member retention.** A fresh source-bound emitter writes into a fixed
+  caller window and retains the whole fragment plus blobId before granting
+  exclusive Retained. Deadline checks precede capacity, and the checked
+  fragment length plus 81 reserves the worst suffix while all original
+  backing and the actual pin overlap.
+- **Collection.** All source-bound whole members are collected into
+  separately admitted fixed cells. Each child handoff keeps exclusive
+  source and pin custody; fresh complete acceptance funds original work and
+  samples the actual pin before installing its cell and returning Bound.
+  Whole Serialized ownership requires every original ordinal.
+- **Tree and lists.** One shared bounded Frame serves the metadata adapter
+  and the source-bound adapter, with identical ordinal, depth and parent
+  walk and list framing. Every turn funds original work and samples the
+  actual pin after work, even on quota refusal. Exclusive Composed keeps
+  collection custody through fresh release.
+- **Tree and list retention.** Whole Structure and Lists members are
+  retained in a separately admitted fixed window, starting only from the
+  original complete collection with a privately created fresh composer and
+  the td-json Window. Only successful reported bytes advance, with no
+  additional work fee; the collection and actual pin stay held through
+  Retained and final release, and capacity and deadline failures are
+  sticky.
+
+API.md sections 1.125 to 1.132 specify these stages. Each of API.md
+sections 1.127 to 1.150 names the eight Rust allocation intervals it
+qualifies, and section 1.127 lists the unmeasured source-binding cases;
+those intervals qualify no native allocation, RSS or whole-service
+resource use.
+
+### 3.9 Request property selection
+
+Email/get validates each requested property with the bounded Email
+property recognizer under the method Meter and keeps its own selection:
+stored fields, at most 64 header properties and the body members of
+section 3.4. The selection types below serve the resident and
+`blob_body_json` composers. They are pure selections, not permission and
+not JSON request default policy.
+
+- **Lists.** A four-boolean selection of textBody, htmlBody, attachments
+  and hasAttachment drives the shared Frame. Full-list callers keep the ALL
+  behavior and fees; an empty selection freshly admits, then completes
+  without output or charge, and retains into zero capacity.
+- **Tree and lists.** Requested bodyStructure and list properties route
+  through the same Frame, tree first, then the selected lists, with
+  canonical keys and separators; single-mode bytes, turns and funding are
+  unchanged. Retention of NONE accepts zero capacity, and a nonempty
+  final-copy exact fit completes.
+- **Part fields.** A ten-field selection (partId, blobId, size, type,
+  charset, name, disposition, cid, language and location) applies to
+  source-bound part members while the original Bound, ordinal and pin are
+  retained. ALL preserves the original emission; NONE freshly completes
+  without work. Partial selections use a fixed bounded, funded index of the
+  original generated metadata, not a JSON request or source parser.
+  Selected strings, arrays, blob wire/null and canonical commas are
+  preserved. Whole retention configures its own fresh emitter from Bound,
+  ordinal and the selection; ALL and selected adapters share one fixed
+  Window, polling, sticky failure and fresh finalization, and the
+  generated-index/copy work keeps API.md section 1.137's exact five-cost
+  charges. Collection threads one immutable selection through the
+  collection core and every child; NONE needs zero-capacity child windows
+  and one Cell per ordinal and pays the ordinal handoff but no emission
+  work. No public conversion strips a selection into an unselected complete
+  owner.
+- **Composition with selected fields.** The structural subParts scaffold is
+  independent of the ten fields: NONE removes metadata, not nodes or list
+  entries, and an empty member suppresses its leading comma. Requested
+  outer Properties stay in the requested owner and metadata Properties in
+  its facade; complete views and releases keep both, and outer NONE spends
+  no composition work while keeping collection custody. Whole requested
+  retention starts only from complete Serialized; capacity and work
+  refusal prevent completion, and original-job or actual-pin refusal hides
+  completed views stickily.
+- **subParts.** Explicit structural selection runs through the same
+  requested engine. False closes a root-only bodyStructure and classified
+  list leaves after metadata; true keeps the tree, null leaves and costs
+  that constructors without explicit selection emit. The structural and
+  outer selections survive completion and release without widening the ten
+  metadata flags. Retention starts from the original fresh selected
+  collection; short capacity or explicitly checked expiry in either
+  freshness domain hides whole success stickily, and completed passive
+  values survive expiry until a check or consuming operation.
+
+The four-list-only selected adapters keep a narrower type contract than
+requested tree/list selection: their Properties cannot select
+bodyStructure. They are public facades over the same shared Frame and
+retention core, with no independent polling or capacity engine. The broader
+requested facade keeps its immutable five-property label; the Frame's mode
+is an internal active walk and a constructor label only.
+
+**bodyProperties decoding.** Body-part key recognition distinguishes all
+twelve standard EmailBodyPart fields and reuses the bounded header selector
+in BodyPart context; result tags and borrowed header plans stay passive,
+and an unknown key stays for the enclosing dispatcher, never becoming ALL.
+Aggregation (shared with Email properties in `property_selection`) yields
+the ten metadata flags, the structural flags and a caller-owned borrowed
+header-cell prefix. Exact requested header keys deduplicate in bounded paid
+two-sided comparisons, keeping the first spelling, loan and request order;
+unknown, form, capacity and work failures forbid whole success. Explicit
+empty stays NONE, and the omitted-argument default contains only the ten
+metadata fields. The argument decoder reads an admitted UTF-8 JSON
+fragment into fixed caller-preallocated Strings and key-reference slots:
+omission differs from explicit empty or null, complete syntax and scalar
+escapes precede semantic selection, input, record and scalar-output work is
+prepaid, and capacity refusal never grows storage. Whole success borrows
+only the completed prefix; cells are cold/reset storage tied to decoded
+loans, not a persistent request-arena pool. One passive request cursor
+joins decoding and selection: no whole view escapes between stages,
+omission alone selects the ten-field default, and complete decoded key
+loans transfer without copying or a second parser turn; the original sticky
+errors, exact debits, first header loans and caller storage stay intact.
+API.md sections 1.143 to 1.146 specify these stages, and sections 1.133 to
+1.142, 1.147 and 1.148 the selections above.
+
+### 3.10 Generated data tables
+
+td-mime contains owned tables generated from the approved, checksummed
+Unicode 17.0 inputs in [UNICODE.md](../td-mime/UNICODE.md). They add no
+Cargo dependency or runtime data fetch. The approved corpus and license
+live in the checkout and are verified by the ordinary offline test suite
+and a cold tooling example. Table generation is reproducible offline;
+runtime uses fixed lookups and bounded NFC over resident valid UTF-8,
+verified against the complete official NFC equations.
+
+td-mime also contains 27 positive leap insertion dates generated from the
+approved, checksummed IANA input in
+[leap-seconds/README.md](../td-mime/leap-seconds/README.md). Offline tooling
 verifies the complete pin before generation; runtime Date projection uses
 the 108-byte static table without file access or allocation. Expiration is
 provenance metadata and does not invalidate historical insertions. Unlisted
 second-60 dates remain unverified. Updates require a reviewed source pin
-and regenerated table.
+and a regenerated table.
 
 These are named data dependencies, not permission to import a Unicode or
 mail parsing library.
 
-The backend admission and gate contract lives in td-crypto/DESIGN.md. All
-three packages stay in the test roster. The user approved Rustls as the TLS
-engine; td-crypto/DEPENDENCIES.md records exact transitive pins, features,
-licenses, roots and rationale, and td-crypto/PORTABLE.md the portable inputs. The separate, user-approved private
-PostgreSQL storage closure is pinned in td-crypto/DEPENDENCIES.md and
-POSTGRES.md. No external async runtime, web framework, mail parser,
-serialization or ACME framework rides along.
-The backend increment demonstrates static musl linking and bounded TLS
-behavior before consumers depend on it; exact versions belong in the
-lock/review.
+### 3.11 Cryptography and TLS boundary
 
-The portable musl artifact has a separate, host-only build manifest: pin Rust
-and its target standard library, the binutils the build inspects and splits
-with (the pinned Debian build root's), the musl source archive whose notice the
-linked libc carries, and their source/artifact checksums and provenance.
-Nothing in the closure compiles C.
-Provision them before offline builds; ambient host tools cannot silently fill
-missing inputs. M03b2 owns these exact pins and a clean build fixture. This
-portability workflow is outside td's Debian-runtime target artifact graph;
-it must not import host-built outputs into that graph or claim its provenance.
+`td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend;
+`td-crypto/TLS.md` specifies the TLS policy and session contract. td-crypto
+holds the Crypto, Entropy and Digest traits and their fixed errors; mail
+ports re-export the traits and translate the shared errors. td-crypto
+implements opaque streaming SHA-256, worker-local entropy, the Crypto
+factory, opaque P-256 operations, ClientConfig, ServerConfig, the shared
+clock and public client/server sessions. Direct streaming digests use
+td-owned inline SHA-256 without heap allocation or provider calls. The mail
+record pump composes the sessions, and td-mta's listeners and relay serve
+through it; IMPLEMENTATION.md tracks their remaining qualification and what
+of the cryptography's qualification remains before deployment.
+
+td-crypto holds the approved Rustls closure and its td-owned cryptography,
+`td-primitives` through `td-tls-provider`; no other crate in td-mta's closure
+depends on them directly. No Rustls, td-tls-provider or td-primitives public
+types, re-exports or configuration escape hatches cross its facade, and mail
+and storage code do not see them. Mail transport adapters consume opaque
+td-crypto configurations and session state. Retaining Rustls means td-crypto
+still has an external TLS implementation, and the service's transitive lock
+and executable include the backend dependencies; neither is described as
+dependency-free. TLS framing and cryptographic verification belong to
+td-crypto; mail STARTTLS transitions, deadline/lease accounting and gateway
+allowlist authorization belong to td-mta. API section 1.1 owns that
+integration.
+
+The backend admission and gate contract lives in td-crypto/DESIGN.md. The
+three packages admitted to an external closure, td-crypto, td-tls-provider and
+td-mta (`builder/src/crypto_policy.rs`), stay in the test roster. The user
+approved Rustls as the TLS engine; td-crypto/DEPENDENCIES.md records exact
+transitive pins, features, licenses, roots and rationale, and
+td-crypto/PORTABLE.md the portable inputs and the static musl linking and
+bounded TLS qualification. The separate, user-approved private PostgreSQL
+storage closure is pinned in td-crypto/DEPENDENCIES.md and POSTGRES.md. No
+external async runtime (the tokio pin admits only `io-util`, as
+td-crypto/DEPENDENCIES.md records), web framework, mail parser, serialization
+or ACME framework rides along. Exact versions belong in the locks and their
+review.
+
+The portable musl artifact has a separate, host-only build manifest: pin
+Rust and its target standard library, the binutils the build inspects and
+splits with (the pinned Debian build root's), the musl source archive whose
+notice the linked libc carries, and their source/artifact checksums and
+provenance. Nothing in the closure compiles C. Provision them before
+offline builds; ambient host tools cannot silently fill missing inputs.
+td-crypto/PORTABLE.md owns these exact pins and the clean build fixture.
+This portability workflow is outside td's Debian-runtime target artifact
+graph; it must not import host-built outputs into that graph or claim its
+provenance.
+
+### 3.12 Clock adapters
 
 Core adapters provide typed errors and caller-owned buffers for transport,
 clock, cryptography and fault-injected persistence. Deadline-only consumers
@@ -1010,22 +899,15 @@ may sample a fresh monotonic tick without reading UTC. That tick shares the
 combined clock sample's origin and conversion; the default adapter derives
 it from a combined sample so injected errors and ticks remain observable.
 RuntimeClock reads Instant directly for this operation. SMTP transport and
-DATA accounting retain their existing check frequency and regression checks;
-certificate validity and received timestamps still use combined samples.
-MIME transfer, text, body-value and preview adapters likewise use fresh
-monotonic-only samples at their existing checkpoints. Nested CheckedClock
-wrappers share one regression watermark between full and monotonic methods;
-no parser charge, checkpoint, final fence or source-error ordering is removed.
-Network workers cannot
-bypass the store's commit API. TLS framing/cryptographic verification belongs
-to td-crypto; mail STARTTLS transitions, deadline/lease accounting and gateway
-allowlist authorization belong to td-mta. API section 1.1 owns that integration.
+DATA accounting retain their check frequency and regression checks;
+certificate validity and received timestamps use combined samples. MIME
+transfer, text, body-value and preview adapters use fresh monotonic-only
+samples at their checkpoints. Nested CheckedClock wrappers share one
+regression watermark between full and monotonic methods; no parser charge,
+checkpoint, final fence or source-error ordering is removed. Network
+workers cannot bypass the store's commit API.
 
-td-crypto's cryptography is td-owned: `td-primitives` behind the facade,
-and for TLS the shared `td-tls-provider` crate, kept private behind it;
-mail/storage code and the direct dependency do not see it. F04 records what
-of its qualification remains before deployment. Retaining Rustls means
-td-crypto still has an external TLS implementation.
+### 3.13 Unsafe surfaces
 
 The library denies `unsafe_code` with one function-scoped exception for
 Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
