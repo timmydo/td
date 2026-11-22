@@ -171,7 +171,10 @@ first reading is lost; a development or headless compositor has no
 volume control and no field. A key's outcome is a notice,
 `VOLUME 45%`, `MUTED` or `NO AUDIO`, shown at once, and a console line,
 `TD-VOLUME level=45 muted=no` or `TD-VOLUME unavailable`, written as
-one write beginning a line of its own.
+one write beginning a line of its own. The physical-input boot waits on
+those lines: it presses volume-down four times, each after the last was
+applied, before Firefox's tone, and requires the recorded tone at 80%,
+the cube of which is the amplitude td-audio plays.
 
 A status bar owns the top 24 rows. It is BUILT IN rather than a client,
 because a client would need a way to be placed and to reserve space —

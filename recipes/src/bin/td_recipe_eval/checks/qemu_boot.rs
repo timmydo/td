@@ -250,6 +250,24 @@ const TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX: &str = "portal: TD-PORTAL-FILE-CH
 const TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER: &str = "TD-PORTAL-FILE-CHOOSER-COMPLETED";
 const TD_APPLICATION_CURSOR_PREFIX: &str =
     "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
+/// The compositor's console line for each volume-down step, from unity: the
+/// controller presses the next only once the last was applied, because the
+/// compositor's key queue drops what outruns its round trips.
+const TD_VOLUME_STEP_MARKERS: [&str; FIREFOX_AUDIO_VOLUME_STEPS] = [
+    "TD-VOLUME level=95 muted=no",
+    "TD-VOLUME level=90 muted=no",
+    "TD-VOLUME level=85 muted=no",
+    "TD-VOLUME level=80 muted=no",
+];
+/// A volume key that found no audio: the compositor was not admitted to
+/// td-audio, or the daemon is gone. The tone would play at unity.
+const TD_VOLUME_UNAVAILABLE_MARKER: &str = "TD-VOLUME unavailable";
+/// What begins every one of the compositor's volume lines.
+const TD_VOLUME_LEVEL_PREFIX: &str = "TD-VOLUME level=";
+/// How long the four presses may take, from the first: well inside the
+/// guest's 20 s for the tone and menu that follow, so a key that never
+/// lands is named here rather than as Firefox's input giving up.
+const TD_VOLUME_KEYS_TIMEOUT: Duration = Duration::from_secs(12);
 /// td-svc's console copy of a line from the `[wayland]` unit, which logs
 /// td-authd's and td-compositor's output to /var/log/svc/wayland.log and
 /// copies each line here behind its name, as every `console=yes` unit's.
@@ -427,6 +445,18 @@ const FIREFOX_AUDIO_MIN_WINDOW_CORRELATION: f64 = 0.9;
 const FIREFOX_AUDIO_MAX_TRANSIENT_WINDOWS: usize = 7;
 const FIREFOX_AUDIO_MAX_TRANSIENT_RUNS: usize = 2;
 const FIREFOX_AUDIO_CAPTURE_MARGIN_SECS: u64 = 2;
+/// The volume-down presses the input boot makes before Firefox's tone,
+/// each one five percent of td-audio's output from unity, so the tone is
+/// recorded at 80% (td-compositor/DESIGN.md, "VOLUME").
+const FIREFOX_AUDIO_VOLUME_STEPS: usize = 4;
+/// The output level those presses leave, as a fraction of unity.
+const FIREFOX_AUDIO_KEYED_LEVEL: f64 = 0.80;
+/// The quarter-gain full-scale sine's AC RMS at unity, 0.25 * 32767 / sqrt 2:
+/// what the rung-27h landing run measured (5,792.4) before the keys.
+const FIREFOX_AUDIO_UNITY_AC_RMS: f64 = 5_792.4;
+/// How far each channel's AC RMS may sit from the keyed level's. One step
+/// either side is 17% or more away, so the band says which level played.
+const FIREFOX_AUDIO_KEYED_RMS_TOLERANCE: f64 = 0.08;
 /// At 48 kHz stereo S16, the physical-input boot's host timeout remains below
 /// the 768 MiB absolute capture ceiling: the applications' fetch
 /// (APPLICATIONS.md §W.9) took the timeout past the 640 MiB one, and the unit
@@ -653,6 +683,12 @@ struct ConsoleEvidence {
     td_firefox_file_chooser_pixels: bool,
     td_firefox_file_chooser: bool,
     td_application_cursor: bool,
+    /// Each volume-down step the compositor reported applied, in order.
+    td_volume_steps: [bool; FIREFOX_AUDIO_VOLUME_STEPS],
+    td_volume_unavailable: bool,
+    /// A whole, well-formed volume line that is none of the steps: a level
+    /// off the grid, or muted.
+    td_volume_unexpected: bool,
     td_profiler_attribution: bool,
     initramfs_freed: bool,
     td_wayland_runtime: bool,
@@ -1838,7 +1874,17 @@ fn validate_firefox_input(result: &BootResult, expect_audio_capture: bool) -> Re
             ));
         }
     }
-    match (&result.firefox_audio, expect_audio_capture) {
+    firefox_audio_outcome(&result.firefox_audio, expect_audio_capture, &result.console)
+}
+
+/// The WAV oracle's verdict as the input boot needs it: verified, and at the
+/// level the volume keys left, exactly when it was requested.
+fn firefox_audio_outcome(
+    audio: &FirefoxAudioCapture,
+    expect_audio_capture: bool,
+    console: &str,
+) -> Result<(), String> {
+    match (audio, expect_audio_capture) {
         (FirefoxAudioCapture::Verified(audio), true) => {
             println!(
                 "   [firefox-audio] {FIREFOX_AUDIO_RATE} Hz stereo, {} ms active, peak {}, fitted {:.2} Hz, zero-crossing {:.2}/{:.2} Hz, AC RMS {:.1}/{:.1}, mean window correlations {:.4}/{:.4}, transient windows {}/{} in {}/{} runs",
@@ -1856,12 +1902,14 @@ fn validate_firefox_input(result: &BootResult, expect_audio_capture: bool) -> Re
                 audio.left_transient_runs,
                 audio.right_transient_runs
             );
+            // Printed first, so a level that fails keeps the other measurements.
+            firefox_audio_keyed_level(audio.left_ac_rms, audio.right_ac_rms)?;
         }
         (FirefoxAudioCapture::Invalid(error), _) => {
             return Err(format!(
                 "Firefox completed its trusted WebAudio stimulus but the QEMU WAV oracle failed: \
                  {error}. Last serial output:\n{}",
-                tail(&result.console, 80)
+                tail(console, 80)
             ));
         }
         (FirefoxAudioCapture::NotRequested, true) => {
@@ -6493,6 +6541,30 @@ fn validate_firefox_audio_shape(
     Ok(active_ms)
 }
 
+/// Whether the tone played at the level the volume keys left: each channel's
+/// AC RMS within `FIREFOX_AUDIO_KEYED_RMS_TOLERANCE` of the unity tone's
+/// times the cubic taper td-audio applies to its output.
+fn firefox_audio_keyed_level(left_ac_rms: f64, right_ac_rms: f64) -> Result<(), String> {
+    let expected = FIREFOX_AUDIO_UNITY_AC_RMS * FIREFOX_AUDIO_KEYED_LEVEL.powi(3);
+    let (low, high) = (
+        expected * (1.0 - FIREFOX_AUDIO_KEYED_RMS_TOLERANCE),
+        expected * (1.0 + FIREFOX_AUDIO_KEYED_RMS_TOLERANCE),
+    );
+    if [left_ac_rms, right_ac_rms]
+        .iter()
+        .all(|rms| (low..=high).contains(rms))
+    {
+        return Ok(());
+    }
+    Err(td_engine::allocation::format(format_args!(
+        "QEMU WAV per-channel AC RMS is {left_ac_rms:.1}/{right_ac_rms:.1}, not the \
+         {expected:.1} the volume keys' {:.0}% output plays a quarter-gain tone at \
+         ({low:.1}-{high:.1})",
+        FIREFOX_AUDIO_KEYED_LEVEL * 100.0
+    ))
+    .unwrap_or_default())
+}
+
 fn verify_firefox_audio_active(
     data: &[u8],
     peak: i32,
@@ -6825,6 +6897,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FIREFOX_SOAK_MARKER),
         exact_line_window(TD_FIREFOX_SECCOMP_AUDIT_MARKER),
         (WAYLAND_CONSOLE_PREFIX.len() + TD_APPLICATION_CURSOR_PREFIX.len()).saturating_add(32),
+        WAYLAND_CONSOLE_PREFIX.len() + exact_line_window(TD_VOLUME_UNAVAILABLE_MARKER),
+        WAYLAND_CONSOLE_PREFIX.len() + exact_line_window("TD-VOLUME level=100 muted=yes"),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
             .saturating_add(exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER)),
@@ -7360,6 +7434,31 @@ fn latch_console_evidence_from(
         buf,
         starts_at_stream_boundary,
     );
+    for (found, marker) in evidence
+        .td_volume_steps
+        .iter_mut()
+        .zip(TD_VOLUME_STEP_MARKERS)
+    {
+        latch_prefixed_line_marker(
+            found,
+            buf,
+            WAYLAND_CONSOLE_PREFIX.as_bytes(),
+            marker.as_bytes(),
+            starts_at_stream_boundary,
+        );
+    }
+    latch_prefixed_line_marker(
+        &mut evidence.td_volume_unavailable,
+        buf,
+        WAYLAND_CONSOLE_PREFIX.as_bytes(),
+        TD_VOLUME_UNAVAILABLE_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_unexpected_volume(
+        &mut evidence.td_volume_unexpected,
+        buf,
+        starts_at_stream_boundary,
+    );
     latch_prefixed_line_marker(
         &mut evidence.td_profiler_attribution,
         buf,
@@ -7557,6 +7656,56 @@ fn latch_prefixed_line_marker(
         let line = rest.get(..end).unwrap_or_default();
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() || is_kernel_record(line) {
+            *found = true;
+            return;
+        }
+    }
+}
+
+/// Latch a whole `wayland: TD-VOLUME level=N muted=yes|no` line that is none
+/// of the expected steps. Only a line that ends and reads exactly so counts:
+/// one torn by a kernel record, or not yet ended, is left to the step latches
+/// and the phase's deadline rather than read as a wrong level.
+fn latch_unexpected_volume(found: &mut bool, haystack: &[u8], starts_at_stream_boundary: bool) {
+    if *found {
+        return;
+    }
+    let prefix = WAYLAND_CONSOLE_PREFIX.as_bytes();
+    let level = TD_VOLUME_LEVEL_PREFIX.as_bytes();
+    for start in 0..haystack.len() {
+        if (start != 0 || !starts_at_stream_boundary)
+            && haystack.get(start.wrapping_sub(1)) != Some(&b'\n')
+        {
+            continue;
+        }
+        let Some(rest) = haystack.get(start..) else {
+            return;
+        };
+        let Some(line) = rest.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(end) = line.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let line = line.get(..end).unwrap_or_default();
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(reading) = line.strip_prefix(level) else {
+            continue;
+        };
+        let digits = reading
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let well_formed = (1..=3).contains(&digits)
+            && matches!(
+                reading.get(digits..),
+                Some(b" muted=no") | Some(b" muted=yes")
+            );
+        if well_formed
+            && !TD_VOLUME_STEP_MARKERS
+                .iter()
+                .any(|marker| marker.as_bytes() == line)
+        {
             *found = true;
             return;
         }
@@ -8227,6 +8376,7 @@ enum PhysicalInputPhase {
     Arm,
     Cursor,
     Focus,
+    Volume,
     Menu,
     Final,
     TerminalPrepare,
@@ -8292,6 +8442,10 @@ struct PhysicalInputController {
     phase: PhysicalInputPhase,
     terminal_focus_floor: Option<u32>,
     clipboard_focus_retries: u8,
+    /// The volume-down presses sent so far in the `Volume` phase.
+    volume_pressed: usize,
+    /// When the volume presses must be done by, from the first.
+    volume_until: Option<Instant>,
 }
 
 impl PhysicalInputController {
@@ -8302,6 +8456,8 @@ impl PhysicalInputController {
             phase: PhysicalInputPhase::AuthorityArm,
             terminal_focus_floor: None,
             clipboard_focus_retries: 0,
+            volume_pressed: 0,
+            volume_until: None,
         }
     }
 
@@ -8367,10 +8523,68 @@ impl PhysicalInputController {
             // the following pointer frames still reached it. Click the already
             // attested input point before crossing from tablet to PS/2 input.
             qmp.button_until("left", deadline)?;
-            qmp.key_x_until(deadline)?;
-            qmp.button_until("wheel-down", deadline)?;
-            qmp.button_until("right", deadline)?;
-            self.phase = PhysicalInputPhase::Menu;
+            // Lower td-audio's output through the compositor's volume key
+            // before the tone, so the WAV proves the key reached the output.
+            qmp.key_chord_until(&["volumedown"], deadline)?;
+            self.volume_pressed = 1;
+            self.volume_until = Instant::now().checked_add(TD_VOLUME_KEYS_TIMEOUT);
+            self.phase = PhysicalInputPhase::Volume;
+        }
+        if self.phase == PhysicalInputPhase::Volume {
+            if evidence.td_volume_unavailable {
+                // Refused, the complaint is empty, which still fails the boot.
+                return Err(td_engine::allocation::format(format_args!(
+                    "the compositor's volume key found no audio ({TD_VOLUME_UNAVAILABLE_MARKER})"
+                ))
+                .unwrap_or_default());
+            }
+            if evidence.td_volume_unexpected {
+                return Err(td_engine::allocation::format(format_args!(
+                    "the compositor's volume key left a level other than the steps {TD_VOLUME_STEP_MARKERS:?}; \
+                     the console tail has its TD-VOLUME line"
+                ))
+                .unwrap_or_default());
+            }
+            let awaited = self.volume_pressed.checked_sub(1);
+            let applied = awaited
+                .and_then(|step| evidence.td_volume_steps.get(step))
+                .copied()
+                .unwrap_or(false);
+            if !applied
+                && self
+                    .volume_until
+                    .is_none_or(|until| Instant::now() >= until)
+            {
+                let marker = awaited
+                    .and_then(|step| TD_VOLUME_STEP_MARKERS.get(step))
+                    .copied()
+                    .unwrap_or_default();
+                return Err(td_engine::allocation::format(format_args!(
+                    "volume-down press {} of {FIREFOX_AUDIO_VOLUME_STEPS} was not applied within \
+                     {}s: no {WAYLAND_CONSOLE_PREFIX}{marker:?} line",
+                    self.volume_pressed,
+                    TD_VOLUME_KEYS_TIMEOUT.as_secs()
+                ))
+                .unwrap_or_default());
+            }
+            if applied {
+                let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+                let qmp = self.qmp.as_mut().ok_or_else(|| {
+                    td_engine::allocation::format(format_args!(
+                        "QMP controller disappeared before the volume keys"
+                    ))
+                    .unwrap_or_default()
+                })?;
+                if self.volume_pressed < FIREFOX_AUDIO_VOLUME_STEPS {
+                    qmp.key_chord_until(&["volumedown"], deadline)?;
+                    self.volume_pressed = self.volume_pressed.saturating_add(1);
+                } else {
+                    qmp.key_x_until(deadline)?;
+                    qmp.button_until("wheel-down", deadline)?;
+                    qmp.button_until("right", deadline)?;
+                    self.phase = PhysicalInputPhase::Menu;
+                }
+            }
         }
         if self.phase == PhysicalInputPhase::Menu && evidence.td_firefox_input_menu {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
@@ -8735,6 +8949,8 @@ impl Qmp {
                         | "b"
                         | "h"
                         | "q"
+                        // The compositor's volume key, before Firefox's tone.
+                        | "volumedown"
                 )
             })
         {
@@ -10234,6 +10450,165 @@ mod tests {
         assert!(evidence.td_terminal_authority);
     }
 
+    /// A volume key the compositor answered with no audio ends the boot at
+    /// once rather than playing the tone at unity, and the step markers
+    /// latch only as whole wayland lines.
+    #[test]
+    fn a_volume_key_with_no_audio_ends_the_input_boot() {
+        let mut controller = PhysicalInputController::new(PathBuf::from("/nonexistent"));
+        controller.phase = PhysicalInputPhase::Volume;
+        controller.volume_pressed = 1;
+        let mut evidence = ConsoleEvidence {
+            td_volume_unavailable: true,
+            ..ConsoleEvidence::default()
+        };
+        let error = controller.progress(&mut evidence).unwrap_err();
+        assert!(error.contains(TD_VOLUME_UNAVAILABLE_MARKER), "{error}");
+
+        let mut found = false;
+        let marker = TD_VOLUME_STEP_MARKERS[0].as_bytes();
+        let prefix = WAYLAND_CONSOLE_PREFIX.as_bytes();
+        latch_prefixed_line_marker(
+            &mut found,
+            b"\nwayland: TD-VOLUME level=95 muted=nope\n",
+            prefix,
+            marker,
+            true,
+        );
+        assert!(!found);
+        latch_prefixed_line_marker(
+            &mut found,
+            b"\nwayland: TD-VOLUME level=95 muted=no\n",
+            prefix,
+            marker,
+            true,
+        );
+        assert!(found);
+    }
+
+    /// The console wiring: a real wayland step line latches its own step and
+    /// no other, an unprefixed one nothing, the unavailable line its flag, and
+    /// a whole line off the grid the unexpected flag, which a torn or
+    /// unended one does not set.
+    #[test]
+    fn the_console_latches_the_compositors_volume_lines() {
+        let latch = |console: &[u8]| {
+            let mut evidence = ConsoleEvidence::default();
+            latch_console_evidence_from(&mut evidence, console, b"", true);
+            evidence
+        };
+        let evidence = latch(b"boot\nwayland: TD-VOLUME level=90 muted=no\r\n");
+        assert_eq!(evidence.td_volume_steps, [false, true, false, false]);
+        assert!(!evidence.td_volume_unexpected && !evidence.td_volume_unavailable);
+        let evidence = latch(b"boot\nTD-VOLUME level=90 muted=no\n");
+        assert_eq!(
+            evidence.td_volume_steps,
+            [false; FIREFOX_AUDIO_VOLUME_STEPS]
+        );
+        let evidence = latch(b"boot\nwayland: TD-VOLUME unavailable\n");
+        assert!(evidence.td_volume_unavailable);
+        for wrong in [
+            &b"boot\nwayland: TD-VOLUME level=97 muted=no\n"[..],
+            b"boot\nwayland: TD-VOLUME level=80 muted=yes\n",
+        ] {
+            let evidence = latch(wrong);
+            assert!(evidence.td_volume_unexpected, "{wrong:?}");
+            assert_eq!(
+                evidence.td_volume_steps,
+                [false; FIREFOX_AUDIO_VOLUME_STEPS]
+            );
+        }
+        for partial in [
+            &b"boot\nwayland: TD-VOLUME level=9"[..],
+            b"boot\nwayland: TD-VOLUME level=9[    1.0] usb 1-1\n",
+            b"boot\nwayland: TD-VOLUME level=95 muted=no\n",
+        ] {
+            assert!(!latch(partial).td_volume_unexpected, "{partial:?}");
+        }
+    }
+
+    /// A press the compositor never applies, or one that lands off the grid,
+    /// ends the boot naming the volume step, not Firefox's input.
+    #[test]
+    fn a_volume_press_never_applied_is_named() {
+        let mut controller = PhysicalInputController::new(PathBuf::from("/nonexistent"));
+        controller.phase = PhysicalInputPhase::Volume;
+        controller.volume_pressed = 2;
+        controller.volume_until = Instant::now().checked_add(Duration::from_secs(60));
+        let mut evidence = ConsoleEvidence::default();
+        evidence.td_volume_steps[0] = true;
+        assert!(controller.progress(&mut evidence).is_ok());
+        controller.volume_until = Some(Instant::now());
+        let error = controller.progress(&mut evidence).unwrap_err();
+        assert!(error.contains("press 2 of 4"), "{error}");
+        assert!(error.contains(TD_VOLUME_STEP_MARKERS[1]), "{error}");
+
+        controller.volume_until = Instant::now().checked_add(Duration::from_secs(60));
+        evidence.td_volume_unexpected = true;
+        let error = controller.progress(&mut evidence).unwrap_err();
+        assert!(error.contains("other than the steps"), "{error}");
+    }
+
+    /// The steps, the keyed level and the press count are one grid: five
+    /// points each, from unity, ending at the level the tone is judged at.
+    #[test]
+    fn the_volume_steps_end_at_the_keyed_level() {
+        assert_eq!(TD_VOLUME_STEP_MARKERS.len(), FIREFOX_AUDIO_VOLUME_STEPS);
+        for (step, marker) in TD_VOLUME_STEP_MARKERS.iter().enumerate() {
+            let level = 100 - 5 * (step + 1);
+            assert_eq!(*marker, format!("{TD_VOLUME_LEVEL_PREFIX}{level} muted=no"));
+        }
+        let keyed = (FIREFOX_AUDIO_KEYED_LEVEL * 100.0).round();
+        assert_eq!(keyed, (100 - 5 * FIREFOX_AUDIO_VOLUME_STEPS) as f64);
+    }
+
+    /// A verified tone at unity fails the input boot: the volume keys did
+    /// not reach the output. At the keyed level it passes.
+    #[test]
+    fn an_unkeyed_tone_fails_the_input_boot() {
+        let at = |rms: f64| {
+            FirefoxAudioCapture::Verified(FirefoxAudioEvidence {
+                active_ms: 1_174,
+                peak: 4_200,
+                fitted_hz: 440.0,
+                left_crossing_hz: 440.0,
+                right_crossing_hz: 440.0,
+                left_ac_rms: rms,
+                right_ac_rms: rms,
+                left_correlation: 0.999,
+                right_correlation: 0.999,
+                left_transient_windows: 0,
+                right_transient_windows: 0,
+                left_transient_runs: 0,
+                right_transient_runs: 0,
+            })
+        };
+        let keyed = FIREFOX_AUDIO_UNITY_AC_RMS * FIREFOX_AUDIO_KEYED_LEVEL.powi(3);
+        assert!(firefox_audio_outcome(&at(keyed), true, "").is_ok());
+        let error = firefox_audio_outcome(&at(FIREFOX_AUDIO_UNITY_AC_RMS), true, "").unwrap_err();
+        assert!(error.contains("80%"), "{error}");
+        assert!(firefox_audio_outcome(&at(keyed), false, "").is_err());
+    }
+
+    /// The tone's level says which output level played: the keyed level's
+    /// RMS passes, unity and a step either side do not.
+    #[test]
+    fn the_tone_plays_at_the_level_the_volume_keys_left() {
+        let at = |level: f64| FIREFOX_AUDIO_UNITY_AC_RMS * level * level * level;
+        assert!(firefox_audio_keyed_level(at(0.80), at(0.80)).is_ok());
+        assert!(firefox_audio_keyed_level(at(0.80) * 1.05, at(0.80) * 0.95).is_ok());
+        for wrong in [1.0, 0.85, 0.75] {
+            let error = firefox_audio_keyed_level(at(wrong), at(wrong)).unwrap_err();
+            assert!(error.contains("80%"), "{error}");
+        }
+        assert!(
+            firefox_audio_keyed_level(at(0.80), at(1.0)).is_err(),
+            "each channel"
+        );
+        // The landing run's measured unity tone is the constant's.
+        assert!((FIREFOX_AUDIO_UNITY_AC_RMS - 0.25 * 32_767.0 / 2_f64.sqrt()).abs() < 0.1);
+    }
+
     #[test]
     fn staged_qmp_input_waits_for_each_guest_acknowledgement() {
         assert_eq!(qmp_absolute_pixel(960, QMP_OUTPUT_WIDTH).unwrap(), 24_576);
@@ -10259,7 +10634,7 @@ mod tests {
             stream.write_all(b"{\"QMP\":{\"version\":{}}}\r\n").unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut commands = Vec::new();
-            for _ in 0..39 {
+            for _ in 0..43 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 commands.push(line.trim_end().to_string());
@@ -10303,8 +10678,24 @@ mod tests {
         assert_eq!(seen.load(Ordering::SeqCst), 3);
         evidence.td_firefox_input_focused = true;
         controller.progress(&mut evidence).unwrap();
-        assert_eq!(controller.phase, PhysicalInputPhase::Menu);
-        assert_eq!(seen.load(Ordering::SeqCst), 7);
+        assert_eq!(controller.phase, PhysicalInputPhase::Volume);
+        assert_eq!(seen.load(Ordering::SeqCst), 5);
+        // One volume-down press per applied step, nothing before it is.
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 5);
+        for step in 0..FIREFOX_AUDIO_VOLUME_STEPS {
+            evidence.td_volume_steps[step] = true;
+            controller.progress(&mut evidence).unwrap();
+            controller.progress(&mut evidence).unwrap();
+            let last = step + 1 == FIREFOX_AUDIO_VOLUME_STEPS;
+            if last {
+                assert_eq!(controller.phase, PhysicalInputPhase::Menu);
+                assert_eq!(seen.load(Ordering::SeqCst), 11);
+            } else {
+                assert_eq!(controller.phase, PhysicalInputPhase::Volume);
+                assert_eq!(seen.load(Ordering::SeqCst), 6 + step);
+            }
+        }
         evidence.td_firefox_input_menu = true;
         evidence.td_term_clipboard_focus = Some(7);
         controller.progress(&mut evidence).unwrap();
@@ -10404,27 +10795,38 @@ mod tests {
             .unwrap()
             .contains("\"axis\":\"y\",\"value\":16384"));
         assert!(commands.get(3).unwrap().contains("\"button\":\"left\""));
-        assert!(commands.get(4).unwrap().contains("\"data\":\"x\""));
+        for index in 4..=7 {
+            assert_eq!(
+                commands.get(index).map(String::as_str),
+                Some(concat!(
+                    r#"{"execute":"input-send-event","arguments":{"events":["#,
+                    r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"volumedown"}}},"#,
+                    r#"{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"volumedown"}}}"#,
+                    "]}}"
+                ))
+            );
+        }
+        assert!(commands.get(8).unwrap().contains("\"data\":\"x\""));
         assert!(commands
-            .get(5)
+            .get(9)
             .unwrap()
             .contains("\"button\":\"wheel-down\""));
-        assert!(commands.get(6).unwrap().contains("\"button\":\"right\""));
+        assert!(commands.get(10).unwrap().contains("\"button\":\"right\""));
         assert!(commands
-            .get(7)
+            .get(11)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":8192"));
-        assert!(commands.get(8).unwrap().contains("\"button\":\"left\""));
-        assert!(commands.get(9).unwrap().contains("\"data\":\"l\""));
-        assert!(commands.get(10).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(10).unwrap().contains("\"data\":\"w\""));
+        assert!(commands.get(12).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(13).unwrap().contains("\"data\":\"l\""));
+        assert!(commands.get(14).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(14).unwrap().contains("\"data\":\"w\""));
         for (index, key) in [
-            (11, "e"),
-            (12, "l"),
-            (13, "c"),
-            (14, "o"),
-            (15, "m"),
-            (16, "e"),
+            (15, "e"),
+            (16, "l"),
+            (17, "c"),
+            (18, "o"),
+            (19, "m"),
+            (20, "e"),
         ] {
             assert!(commands
                 .get(index)
@@ -10432,29 +10834,29 @@ mod tests {
                 .contains(&format!("\"data\":\"{key}\"")));
         }
         assert!(commands
-            .get(17)
+            .get(21)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":973"));
         assert!(commands
-            .get(18)
+            .get(22)
             .unwrap()
             .contains("\"down\":true,\"button\":\"left\""));
         assert!(commands
-            .get(19)
+            .get(23)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":2202"));
         assert!(commands
-            .get(20)
+            .get(24)
             .unwrap()
             .contains("\"down\":false,\"button\":\"left\""));
-        assert!(commands.get(21).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(21).unwrap().contains("\"data\":\"c\""));
+        assert!(commands.get(25).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(25).unwrap().contains("\"data\":\"c\""));
         assert!(commands
-            .get(22)
+            .get(26)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":24576"));
-        assert!(commands.get(23).unwrap().contains("\"button\":\"left\""));
-        for index in 24..=26 {
+        assert!(commands.get(27).unwrap().contains("\"button\":\"left\""));
+        for index in 28..=30 {
             assert_eq!(
                 commands.get(index).map(String::as_str),
                 Some(concat!(
@@ -10467,32 +10869,32 @@ mod tests {
                 ))
             );
         }
-        assert!(commands.get(27).unwrap().contains("\"data\":\"v\""));
-        assert!(commands.get(28).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(29).unwrap().contains("\"data\":\"v\""));
-        assert!(commands.get(30).unwrap().contains("\"data\":\"shift\""));
-        assert!(commands.get(31).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(31).unwrap().contains("\"data\":\"v\""));
         assert!(commands.get(32).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(33).unwrap().contains("\"data\":\"v\""));
+        assert!(commands.get(34).unwrap().contains("\"data\":\"shift\""));
+        assert!(commands.get(35).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(36).unwrap().contains("\"data\":\"shift\""));
         assert!(commands
-            .get(33)
+            .get(37)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":24576"));
         assert!(commands
-            .get(33)
+            .get(37)
             .unwrap()
             .contains("\"axis\":\"y\",\"value\":16384"));
-        assert!(commands.get(34).unwrap().contains("\"button\":\"left\""));
+        assert!(commands.get(38).unwrap().contains("\"button\":\"left\""));
         // The pointer leaves the chooser's rectangle before the command.
         assert!(commands
-            .get(35)
+            .get(39)
             .unwrap()
             .contains("\"axis\":\"x\",\"value\":16359"));
         assert!(commands
-            .get(35)
+            .get(39)
             .unwrap()
             .contains("\"axis\":\"y\",\"value\":32728"));
         assert_eq!(
-            commands.get(36).map(String::as_str),
+            commands.get(40).map(String::as_str),
             Some(concat!(
                 r#"{"execute":"input-send-event","arguments":{"events":["#,
                 r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"ctrl"}}},"#,
@@ -10503,14 +10905,14 @@ mod tests {
             ))
         );
         assert!(commands
-            .get(37)
+            .get(41)
             .unwrap()
             .contains("\"execute\":\"screendump\""));
         assert!(commands
-            .get(37)
+            .get(41)
             .unwrap()
             .contains("portal-file-chooser.ppm"));
-        assert!(commands.get(38).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(42).unwrap().contains("\"data\":\"ret\""));
         let source = include_str!("qemu_boot.rs");
         assert!(
             source.contains("qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;")
