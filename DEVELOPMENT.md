@@ -929,6 +929,22 @@ because `~/.td` was absent or unwritable. The one td control-plane program
 not yet covered is `td-recipe-eval`, whose QEMU and check-runner teardown
 still kill without a record.
 
+# Testing write failures
+
+For a command whose result travels on stdout, exercise the normal binary
+with stdout redirected to `/dev/full`. Check its exit status and stderr.
+Use a buffered writer in a protocol test to exercise failure at flush,
+and a second request to verify that dispatch stops when a reply is lost.
+If an operation already changed state, check both that state and what
+the diagnostic tells the caller about retrying.
+
+For a file replacement, inject a short write followed by ENOSPC in the
+staging file, then exercise file sync and directory sync separately.
+Check the old bytes, permissions and links after a failure before
+publication. A directory sync failure after publication needs a distinct
+outcome because the new name may already be visible. The editor file
+tests exercise these stages without filling a host filesystem.
+
 # Formatting
 
 Every tracked Rust file is in rustfmt's default style for its manifest's
