@@ -20,6 +20,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-busd/src/app_policy.rs"),
     ),
     ("alsa", include_str!("../../../td-audio/src/alsa.rs")),
+    ("control", include_str!("../../../td-audio/src/control.rs")),
     ("device", include_str!("../../../td-audio/src/device.rs")),
     ("mixer", include_str!("../../../td-audio/src/mixer.rs")),
     ("pcm", include_str!("../../../td-audio/src/pcm.rs")),
@@ -40,6 +41,7 @@ const MODULES: &[(&str, &str)] = &[
 const PULSE_LIB_RS: &str = include_str!("../../../td-pulse/src/lib.rs");
 const PULSE: &[(&str, &str)] = &[
     ("lib", PULSE_LIB_RS),
+    ("client", include_str!("../../../td-pulse/src/client.rs")),
     ("proto", include_str!("../../../td-pulse/src/proto.rs")),
     ("tag", include_str!("../../../td-pulse/src/tag.rs")),
     ("wire", include_str!("../../../td-pulse/src/wire.rs")),
@@ -56,7 +58,7 @@ fn staged_path(name: &str) -> String {
         "workload_accounts" => "{src}/engine/src/workload_accounts.rs".into(),
         _ => {
             let dir = match name {
-                "lib" | "proto" | "tag" | "wire" => "td-pulse",
+                "lib" | "client" | "proto" | "tag" | "wire" => "td-pulse",
                 _ => "td-audio",
             };
             format!("{{src}}/{dir}/src/{name}.rs")
@@ -218,7 +220,7 @@ mod tests {
         declared.sort_unstable();
         written.sort_unstable();
         assert_eq!(written, declared);
-        assert_eq!(written.len(), 12);
+        assert_eq!(written.len(), 13);
 
         let mut pulse_declared = declared_in(PULSE_LIB_RS);
         let mut pulse_written: Vec<_> = PULSE
@@ -229,7 +231,7 @@ mod tests {
         pulse_declared.sort_unstable();
         pulse_written.sort_unstable();
         assert_eq!(pulse_written, pulse_declared);
-        assert_eq!(pulse_written.len(), 3);
+        assert_eq!(pulse_written.len(), 4);
 
         let mut staged: Vec<String> = staged_files().into_iter().map(|(name, _)| name).collect();
         let mut expected: Vec<String> = std::iter::once("td-audio/src/main.rs".to_string())

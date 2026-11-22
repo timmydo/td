@@ -6,8 +6,13 @@ version = 3
 name = "td-audio"
 version = "0.1.0"
 dependencies = [
+ "td-fs",
  "td-pulse",
 ]
+
+[[package]]
+name = "td-fs"
+version = "0.1.0"
 
 [[package]]
 name = "td-pulse"

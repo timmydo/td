@@ -3450,6 +3450,7 @@ td-protector/src/upgrade_tests.rs	allocating-conversion	21
 td-protector/src/upgrade_tests.rs	allocation-macro	29
 td-protector/src/upgrade_tests.rs	heap-owner	1
 td-protector/src/upgrade_tests.rs	unchecked-growth-or-clone	92
+td-pulse/src/client.rs	unchecked-growth-or-clone	1
 td-pulse/src/tag.rs	allocating-constructor	1
 td-pulse/src/tag.rs	allocating-conversion	5
 td-pulse/src/tag.rs	unchecked-growth-or-clone	38

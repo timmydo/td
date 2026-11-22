@@ -1,6 +1,7 @@
 //! The PulseAudio native protocol as td speaks it: the pstream framing
-//! (`wire`), the tagstruct codec (`tag`), and the captured command table,
-//! error codes and version negotiation (`proto`).
+//! (`wire`), the tagstruct codec (`tag`), the captured command table, error
+//! codes and version negotiation (`proto`), and the blocking control client
+//! td's controllers share (`client`).
 //!
 //! The normative design is `APPLICATIONS.md` §K.3. `td-audio` serves this
 //! protocol on its socket; a control client speaks the same bytes, so the
@@ -8,6 +9,7 @@
 //! safe code: the daemon's syscall surface stays in `td-audio`.
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod proto;
 pub mod tag;
 pub mod wire;
@@ -17,6 +19,7 @@ mod tests {
     /// Every source file of this crate, read at compile time.
     fn sources() -> Vec<(&'static str, &'static str)> {
         vec![
+            ("client.rs", include_str!("client.rs")),
             ("lib.rs", include_str!("lib.rs")),
             ("proto.rs", include_str!("proto.rs")),
             ("tag.rs", include_str!("tag.rs")),

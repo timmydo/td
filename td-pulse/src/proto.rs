@@ -374,12 +374,12 @@ pub fn command_name(command: u32) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::tag;
 
-    fn unhex(text: &str) -> Vec<u8> {
+    pub(crate) fn unhex(text: &str) -> Vec<u8> {
         text.as_bytes()
             .as_chunks::<2>()
             .0
@@ -393,7 +393,7 @@ mod tests {
     /// connect, subscribe, enumerate, create, write, uncork, cork, flush,
     /// prebuf, trigger, ask for latency, rename, set volume, mute, drain,
     /// disconnect — talked to a logging stub over a Unix socket.
-    mod captured {
+    pub(crate) mod captured {
         /// `GET_PLAYBACK_LATENCY`, tag 14: channel, then a client timeval.
         pub const GET_PLAYBACK_LATENCY: &str = "4c0000000e4c0000000e4c00000000546a986546000c2970";
         /// `GET_SINK_INFO` by name, tag 5: an invalid index, then the name.
@@ -431,7 +431,7 @@ mod tests {
     /// never sends, `pa_context_set_sink_{volume,mute}_by_index` driven from
     /// the runtime's Python, each run under the runtime's loader against a
     /// logging relay in front of td-audio's server.
-    mod captured_17 {
+    pub(crate) mod captured_17 {
         /// `set_sink_volume_by_index(0, {0x8000, 0x4000})`, tag 2: the index,
         /// a NULL name, then a two-channel cvolume.
         pub const SET_SINK_VOLUME_BY_INDEX: &str =

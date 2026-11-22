@@ -19,6 +19,9 @@ path = "src/main.rs"
 [dependencies]
 td-pulse = { path = "../td-pulse" }
 
+[dev-dependencies]
+td-fs = { path = "../td-fs" }
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

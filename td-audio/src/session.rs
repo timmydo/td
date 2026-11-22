@@ -2004,7 +2004,7 @@ pub const DISPLAY_MAX: usize = 96;
 /// overrides, embeddings and isolates would let it reorder its own row and
 /// its neighbours'; zero-width characters and the line and paragraph
 /// separators would hide or break it.
-fn shown(character: char) -> bool {
+pub(crate) fn shown(character: char) -> bool {
     !character.is_control()
         && !matches!(
             character,

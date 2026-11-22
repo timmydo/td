@@ -270,8 +270,8 @@ impl Decoder {
     /// How many bytes are held, waiting for the rest of a frame.
     ///
     /// `Descriptor::parse` bounds the bytes and the daemon separately limits
-    /// how long an incomplete frame may reserve them.
-    #[cfg(test)]
+    /// how long an incomplete frame may reserve them; a control client refuses
+    /// to hold more than one control frame's worth.
     pub fn buffered(&self) -> usize {
         self.unread().len()
     }

@@ -9,10 +9,9 @@
 //! Rung 25 is the half that is testable with no browser, no jail and no
 //! protocol — which is why the ladder puts it first: it is the cheapest place
 //! to find out that the pinned kernel's sound pins are wrong. Rung 26's own
-//! gate is a client playing audio through the daemon, and the `status` and
-//! `volume` personalities §K.5 describes are not here: they are Pulse clients
-//! of this socket, and a public entry point that cannot do what its name says
-//! is worse than one that is absent.
+//! gate is a client playing audio through the daemon. The control
+//! personalities §K.5 describes — `status`, `volume`, `apps` and the rest —
+//! are Pulse clients of this socket, in `control`, through td-pulse's client.
 #![deny(unsafe_code)]
 
 #[allow(dead_code, reason = "shared immutable application policy")]
@@ -24,6 +23,7 @@ mod app_policy;
 mod workload_accounts;
 
 mod alsa;
+mod control;
 mod device;
 mod mixer;
 mod pcm;
@@ -53,6 +53,15 @@ use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    if let Some((personality, rest)) = arguments.split_first() {
+        if let Some(name) = personality
+            .to_str()
+            .filter(|name| control::PERSONALITIES.contains(name))
+        {
+            let code = control::main(name, rest, &mut io::stdout(), &mut io::stderr());
+            return ExitCode::from(code);
+        }
+    }
     match run(&arguments) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -72,6 +81,14 @@ usage: td-audio devices [--proc PATH]
        td-audio serve [--socket PATH] [--card N] [--device N] [--proc PATH]
                       [--passes N]
        td-audio probe [--socket PATH]
+       td-audio status [--socket PATH]
+       td-audio outputs [--socket PATH]
+       td-audio volume [--socket PATH] [LEVEL]
+       td-audio mute [--socket PATH] [on|off|toggle]
+       td-audio apps [--socket PATH]
+       td-audio app [--socket PATH] NAME volume LEVEL
+       td-audio app [--socket PATH] NAME mute on|off|toggle
+       td-audio watch [--socket PATH]
 
   devices      list the playback PCMs /proc/asound/pcm reports
   tone         play a deterministic tone through the ALSA back end, or render
@@ -81,6 +98,14 @@ usage: td-audio devices [--proc PATH]
   serve        run the PulseAudio-protocol daemon: bind the socket, mix every
                client, and play the sum through the ALSA back end
   probe        connect to the supervised daemon's socket
+  status       the active output, its level and mute, and the stream count
+  outputs      every output; the active one is marked
+  volume       print the output's level, or set it: 40%, +5% or -5%
+  mute         print the output's mute, or set it
+  apps         each application's level and mute, then each of its streams
+  app          set one application's level or mute; it cannot undo either
+  watch        print one line per output or stream change, until the daemon
+               goes away
 ";
 
 fn run(arguments: &[OsString]) -> io::Result<()> {
@@ -690,6 +715,7 @@ mod tests {
                 include_str!("../../td-busd/src/app_policy.rs"),
             ),
             ("alsa.rs", include_str!("alsa.rs")),
+            ("control.rs", include_str!("control.rs")),
             ("device.rs", include_str!("device.rs")),
             ("mixer.rs", include_str!("mixer.rs")),
             ("pcm.rs", include_str!("pcm.rs")),

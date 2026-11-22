@@ -1321,7 +1321,7 @@ fn report_disconnect(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::proto::command;
@@ -1333,7 +1333,19 @@ mod tests {
         policy.role(peer).is_some()
     }
 
-    fn socket_path(name: &str) -> PathBuf {
+    impl<S: AudioSink> Server<S> {
+        /// The output's level, and the first player's application level.
+        pub(crate) fn levels(&self) -> (u32, Option<(u32, bool)>) {
+            let app = self
+                .clients
+                .iter()
+                .find(|client| client.role == Role::Player)
+                .map(|client| client.session.app_level());
+            (self.mixer.master_volume(), app)
+        }
+    }
+
+    pub(crate) fn socket_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("td-audio-{}-{}", name, std::process::id()))
     }
 
@@ -1462,7 +1474,7 @@ mod tests {
 
     /// This test process's uid, read from `/proc/self/status` so the test needs
     /// no syscall of its own.
-    fn own_uid() -> u32 {
+    pub(crate) fn own_uid() -> u32 {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|text| {
@@ -1478,14 +1490,18 @@ mod tests {
         wire::control_frame(packet)
     }
 
-    fn build(command: u32, tag_value: u32, body: impl FnOnce(&mut tag::Writer)) -> Vec<u8> {
+    pub(crate) fn build(
+        command: u32,
+        tag_value: u32,
+        body: impl FnOnce(&mut tag::Writer),
+    ) -> Vec<u8> {
         let mut writer = tag::Writer::new();
         writer.u32(command).u32(tag_value);
         body(&mut writer);
         control(&writer.into_bytes())
     }
 
-    fn auth_packet() -> Vec<u8> {
+    pub(crate) fn auth_packet() -> Vec<u8> {
         build(command::AUTH, 0, |writer| {
             writer
                 .u32(35)
@@ -1494,7 +1510,7 @@ mod tests {
     }
 
     /// Read whatever the server has written, without blocking forever.
-    fn drain_socket(stream: &mut UnixStream) -> Vec<u8> {
+    pub(crate) fn drain_socket(stream: &mut UnixStream) -> Vec<u8> {
         stream.set_nonblocking(true).unwrap();
         let mut out = Vec::new();
         let mut buffer = [0u8; 4096];
@@ -1530,7 +1546,7 @@ mod tests {
         packets
     }
 
-    fn created_sink_input(bytes: &[u8]) -> Option<u32> {
+    pub(crate) fn created_sink_input(bytes: &[u8]) -> Option<u32> {
         let mut decoder = wire::Decoder::new();
         decoder.push(bytes);
         while let Some(frame) = decoder.next_frame() {
@@ -2016,11 +2032,11 @@ mod tests {
         server.shutdown();
     }
 
-    const BROWSER_UID: u32 = 65536;
+    pub(crate) const BROWSER_UID: u32 = 65536;
 
     /// A deployment policy whose browser account is `BROWSER_UID`, for a
     /// daemon running as `own`.
-    fn browser_policy(own: u32) -> Policy {
+    pub(crate) fn browser_policy(own: u32) -> Policy {
         Policy::deployment_policy(own, Ok(()), || {
             crate::app_policy::Policy::from_tables(
                 "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\n",
@@ -2034,7 +2050,7 @@ mod tests {
     /// A connection through the production admission path, with the
     /// credentials the kernel would report for `uid` and `pid`: one test
     /// process cannot be the browser's account itself.
-    fn admit_as(server: &mut Server<MemorySink>, uid: u32, pid: i32) -> UnixStream {
+    pub(crate) fn admit_as(server: &mut Server<MemorySink>, uid: u32, pid: i32) -> UnixStream {
         let (ours, theirs) = UnixStream::pair().unwrap();
         theirs.set_nonblocking(true).unwrap();
         server.admit(theirs, sys::Peer { pid, uid, gid: uid }, &mut false);
@@ -2279,7 +2295,7 @@ mod tests {
     }
 
     /// `create_request` with the stream named `name`.
-    fn named_create_request(tag_number: u32, name: &str) -> Vec<u8> {
+    pub(crate) fn named_create_request(tag_number: u32, name: &str) -> Vec<u8> {
         build(command::CREATE_PLAYBACK_STREAM, tag_number, |writer| {
             writer
                 .sample_spec(tag::SampleSpec {
@@ -2308,7 +2324,7 @@ mod tests {
         })
     }
 
-    fn client_name_packet(tag_number: u32, application: &str) -> Vec<u8> {
+    pub(crate) fn client_name_packet(tag_number: u32, application: &str) -> Vec<u8> {
         build(command::SET_CLIENT_NAME, tag_number, |writer| {
             writer.proplist(&[tag::text_property("application.name", application)]);
         })

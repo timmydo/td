@@ -657,7 +657,7 @@ pub fn text_property(key: &str, value: &str) -> Property {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
@@ -685,7 +685,7 @@ mod tests {
     /// Unix socket. The cookie bytes in `AUTH` are that run's real cookie and
     /// carry no meaning here — this server never reads one (§K.3 authenticates
     /// by `SO_PEERCRED` and parses the cookie only to consume its 256 bytes).
-    mod captured {
+    pub(crate) mod captured {
         /// `AUTH`, tag 0. Note the version word: `0xc0000023`.
         pub const AUTH: &str = "\
 4c000000084c000000004cc00000237800000100f75401b750382a5100436705420ed97d89cdd9ff\
