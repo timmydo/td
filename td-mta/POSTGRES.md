@@ -72,6 +72,7 @@ References give each mechanism's rules; use these entry points:
 | Accounts, devices and HTTPS authentication | [10. Accounts, devices and administration](#10-accounts-devices-and-administration) |
 | JMAP read snapshots, dispatch and downloads | [11. JMAP reads](#11-jmap-reads) |
 | Stored summaries, MIME evidence and search | [12. Derived read evidence and search](#12-derived-read-evidence-and-search) |
+| JMAP writes, uploads, drafts, submission and cancellation | [13. JMAP writes and submission requests](#13-jmap-writes-and-submission-requests) |
 | Account administration and identities | [Account administration workflow](#account-administration-workflow) |
 | Account-scoped HTTP authentication | [HTTPS account selection](#https-account-selection) |
 | Incoming mail across accounts | [Transactional incoming delivery](#transactional-incoming-delivery-across-accounts) |
@@ -80,6 +81,13 @@ References give each mechanism's rules; use these entry points:
 | MIME evidence and selective body verification | [Persistent MIME interpretation](#persistent-mime-interpretation-schema-34) |
 | Whole-body audit and progress | [Scheduled integrity scrubbing](#scheduled-whole-body-integrity-scrubbing) |
 | Backup, restore and deployment procedures | [Deployment](DEPLOYMENT.md) and [production operations](PRODUCTION.md) |
+
+Comments in td-mta's source still cite some former section numbers:
+
+| Former section | Now |
+| --- | --- |
+| 35 | [Expired upload lease reclamation](#expired-upload-lease-reclamation) |
+| 217 | [Receipt retention for HTTP writes](#receipt-retention-for-http-writes) |
 
 ## 1. Bootstrap and profiles
 
@@ -705,7 +713,7 @@ SELECT. Mail data and receipt tables require INSERT, UPDATE and DELETE,
 while schema, immutable configuration, selection receipts, bootstrap
 receipts, replica bookkeeping and reserved import tables are read-only.
 Upload leases require SELECT, INSERT and DELETE, so upload publication and
-relay retention can reclaim expired ones (section 35); any UPDATE, which
+relay retention can reclaim expired ones ([Expired upload lease reclamation](#expired-upload-lease-reclamation)); any UPDATE, which
 could extend a lease, refuses. The replica reader keeps SELECT and INSERT
 only on leases. The selection singleton permits only column-level UPDATE on
 `singleton`, which allows FOR SHARE policy fencing without changing its
@@ -3586,77 +3594,18 @@ original messages remain the source for rebuilding them.
   installation must supply the same extension version before mail is
   activated.
 
-## 32. Retained single-Email flag writes
+## 13. JMAP writes and submission requests
 
-Schema version 8 adds owner-private flag_receipts. The cold postgres_email_set
-boundary assigns optional seen/starred values to one existing Email. It is
-not wired to production JMAP. Section 33 adds separate batch entry points;
-section 43 adds single-destination mailbox replacement.
-Preparation binds an unpredictable operation ID and canonical digest to the
-profile binding, account, device, Email, optional expected sequence and flag
-assignments. The retained object contains no app password.
+This chapter covers every write the HTTPS JMAP service publishes to
+PostgreSQL: Email keyword and mailbox updates, Email deletion, root-folder
+creation and empty-folder deletion, blob uploads, td-mail drafts with and
+without attachments, EmailSubmission creation with its success filing, and
+whole-submission cancellation. It states the shared logical quota policy
+and usage counters those writes charge, how the fixed HTTPS body worker
+dispatches them, the per-family owners that retain an uncertain COMMIT and
+settle it, and how long the write receipts live.
 
-Fresh writes take the shared migration lock, then a shared configuration
-selection row lock, then the account write lock, and authenticate the device
-inside that read-committed transaction. Selection generation/version and JMAP
-role must still match the prepared profile. Account locking also serializes
-revocation. The expected state is compared under the same lock. Changed flags,
-Email history, Mailbox history for seen changes (including drafts), account
-sequence and receipt commit atomically with synchronous_commit=on. Star-only
-changes do not change Mailbox or Thread history. No-ops retain a receipt without
-advancing sequence. Full unsigned 64-bit state is preserved; overflow refuses.
-At most 256 memberships are admitted for a seen change.
-
-Owner-side receipt inspection takes an account shared lock before looking for
-the result, excluding an earlier writer's still-pending COMMIT. Historical
-receipts resolve even after policy changes or revocation; this does not
-authorize another mutation. The API is not a client authentication endpoint.
-COMMIT loss returns Indeterminate. Only the original Change can be
-inspected to recover its result (sections 79 and 165).
-Fresh operations refuse while 1024 receipts younger than a minute remain;
-publication first deletes older ones (section 217).
-The HTTP owner releases a confirmed result immediately. An uncertain write
-retains its original operation and publication endpoint for bounded
-same-account inspection (section 79). Receipts a crash orphans expire with the rest.
-All calls retain finite worker/deadline limits.
-An inspection that crosses its deadline refuses absence/errors, but preserves
-a confirmed historical receipt as known success.
-
-## 33. Bounded flag batches
-
-Schema 9 adds per-Email results to the shared flag receipt relation; prior
-single-Email receipts retain their digest and state and gain one Updated
-result. Existing DDL remains unchanged. The single-Email API preserves its
-request digest framing, missing-Email refusal and result shape.
-
-postgres_email_set::prepare_batch accepts at most 256 unique Email IDs in request
-order, with optional seen/star assignments and one optional expected state.
-The batch has one retained random operation and a separate digest domain.
-inspect_batch and publish_batch return per-Email Updated or NotFound results
-in request order, plus the original and resulting account sequence. Empty
-batches, missing Emails and already-satisfied assignments do not advance the
-sequence; their result is still retained. State mismatch refuses the whole
-batch. Single and batch entry points reject each other's prepared operations.
-
-One transaction and the existing policy/account/device fences cover the whole
-batch. Set-oriented array queries load at most 256 Email rows and 257 distinct
-Mailbox rows including the overflow sentinel. At most 256 affected Mailboxes
-are admitted. Keyword writes and history use bounded arrays rather than a
-round trip per Email. A changed batch advances state exactly once. Each changed
-Email and each affected Mailbox receives one history entry, even when several
-Emails share a Mailbox; Thread history is unchanged. Receipt results, history,
-flags and state commit together. The 1024-receipt account limit covers both
-single and batch operations. Lost COMMIT recovery retains the full result.
-
-The closed mutation worker admits 1088 input frames, one MiB total input,
-128 KiB per frame and 128 KiB output. Both single-Email and batch publication
-use this worker. Other workers retain their own bounds;
-SCRAM qualification and the original ten-second maximum deadline are unchanged.
-The finite larger frame count covers the two result sets and protocol overhead.
-Production JMAP dispatch and serving retention remain runtime integration work; this API
-is not a public authentication endpoint.
-
-## 34. Shared logical quota policy
+### Shared logical quota policy
 
 Every profile in a complete PostgreSQL configuration candidate must agree on
 five logical account limits: `disk.body_bytes`, `disk.blob_count`,
@@ -3672,80 +3621,319 @@ as passive values. Canonical source bytes already bind every explicit setting,
 so neither the version encoding nor the schema changes. A historical selection
 receipt remains historical success; it does not bypass revalidation for new
 runtime preparation. Lowering limits is configuration policy, not deletion or
-capacity reclamation. Runtime admission must compare durable usage and pending
-reservations against the selected limits before accepting more work.
+capacity reclamation. Every publication compares durable usage against the
+selected limits under its account lock before accepting more work; lowered
+limits refuse additional publication when any current usage exceeds its
+cap. Logical counters do not reserve server disk.
 
-This closes conflicting instance policy before shared accounting is activated.
-It does not yet implement database quota counters, reservations, publication,
-reclamation or serving. Those remain prerequisites for the runtime integration.
-
-## 35. Retained upload publication and shared usage
+### Account usage counters (schema 10)
 
 Schema version 10 adds `account_usage` and `upload_receipts`. Migration derives
 one usage row per account from existing bodies, leases and submissions in the
 same transaction as its ledger entry. Expired leases and completed submissions
-remain charged while retained (the account's next upload or relay
-retention reclaims expired leases, below; section 216 releases retired
-submissions); a body shared by
-submissions is charged once for queue bytes. New account
-bootstrap writes an all-zero usage row atomically.
-Every future body/reference mutation must adjust these counters under the
-account lock in the same transaction. Owner-side direct SQL is outside this
+remain charged while retained (the account's next upload or relay retention
+reclaims expired leases, [Expired upload lease reclamation](#expired-upload-lease-reclamation); section 216 releases retired
+submissions); a body shared by submissions is charged once for queue bytes.
+New account bootstrap writes an all-zero usage row atomically.
+
+Every body/reference mutation must adjust these counters under the account
+lock in the same transaction. Body and upload byte charges and the blob
+count advance atomically, with no process-local fallback. Guards refuse with
+Integrity rather than underflow. Owner-side direct SQL is outside this
 application-maintained accounting contract.
 
-`postgres_uploads` is a cold, bounded publication API for completed upload
-bytes. Preparation checks the selected profile's message ceiling (at most
-32 MiB), copies and hashes the body, allocates one Blob ID and operation ID,
-and binds the request digest to the epoch, account, configuration selection,
-profile, device, Blob ID, exact length/digest and configured upload lifetime.
-Clones share the single immutable body allocation. The preparation deadline is
-at most ten seconds. No password is retained or body exposed through Debug.
-This owner API does not admit remote ingress or reserve runtime memory slots.
+### Write publication transaction
 
-Publication qualifies a primary, holds the schema migration lock, then takes
-selection FOR SHARE and account FOR UPDATE in that order. It rechecks the
-selected generation/version and current device credentials, enforces all five
-shared quotas, and publishes body manifest/chunks, a Both-use upload lease,
-quota charges, the next full-u64 account sequence and the retained outcome in
-one synchronous transaction. It creates no Email or Thread. Blob IDs remain
-permanently reserved. Chunks are at most 64 KiB, sent in batches of eight;
-no database parameter carries a whole maximum-size message. The closed upload
-worker admits 40 MiB output and the mutation worker's one MiB/1088-frame input
-budget, including the same authentication/per-frame checks. Its original
-ten-second deadline covers the complete publication operation.
+Every write in this chapter is prepared outside the database and published
+as one retained operation. Preparation allocates an unpredictable random
+operation ID, and any object, Blob or submission IDs the write creates, and
+binds a domain-separated canonical request digest to the store epoch,
+account, configuration selection (generation and version), profile, device,
+the request's objects and its optional expected account state. Each family
+and mode has its own digest domain; one family's entry points reject
+another's prepared operations, and receipt result decoding rejects values
+from another operation mode. The prepared object retains no app password
+and is immutable; clones share its retained body bytes. Preparation and
+publication each have an original deadline of at most ten seconds; retry
+never extends an in-flight operation.
 
-Lease creation and expiry use the database clock and the profile's configured
-upload expiry interval. Receipts retain Blob ID, length, timestamps and old/new
-state. Inspection takes account FOR SHARE before reading, excluding an earlier
-publication still committing. Repeated publication resolves the same operation
-before new policy/device admission; a matching historical receipt is known
-success, not current permission to download or import. A mismatched digest or
-malformed receipt refuses. Lost COMMIT response is Indeterminate. Historical inspection uses the
-same prepared upload and waits behind the original transaction (section 165). At most 1024
-receipts younger than a minute are retained per account (section 217); the
-upload lease, not the receipt, governs access and upload expiry.
+A fresh publication qualifies a primary under the Runtime role, takes the
+shared migration lock, then the configuration selection row FOR SHARE, then
+the account row FOR UPDATE, in that order, inside a read-committed
+transaction. Under those locks it first looks up its own receipt: a
+matching receipt returns the historical outcome before fresh policy or
+device admission, and a mismatched digest or malformed receipt refuses.
+Before its transaction, publication still requires a well-formed presented
+credential naming the prepared device; only inspection needs none.
+Otherwise it rechecks that the selected generation/version and JMAP role
+still match the prepared profile, authenticates the device's current
+credential, and compares the optional expected account sequence. Account
+locking also serializes revocation, so revocation committed before that
+point prevents the write. Object changes, history, usage, the next
+full-u64 account sequence and the receipt commit together with
+synchronous_commit=on; sequence overflow refuses. A write that changes
+nothing retains a no-op receipt without advancing the sequence. Failure
+before commit rolls back bodies, ID reservations, metadata, usage and
+receipt together; Blob ID reservations are permanent once committed.
 
-Body and upload byte charges and the blob count advance atomically, with no
-process-local fallback. Lowered limits refuse additional publication when any
-current usage exceeds its cap. Logical counters do not reserve server disk.
+Owner-side receipt inspection takes the account row FOR SHARE before
+looking for the result, so it waits behind an earlier publication still
+committing. A matching historical receipt resolves even after policy
+replacement, credential revocation, object deletion or body retirement; it
+does not authorize another mutation or a new body read. A lost COMMIT
+response returns Indeterminate, and only the original prepared operation
+can be inspected to recover its result (section 165). An inspection that
+crosses its deadline refuses absence and errors, but preserves a confirmed
+historical receipt as known success. These are internal recovery APIs,
+not a client authentication endpoint.
+
+Body chunks are at most 64 KiB, sent in batches of eight; no database
+parameter carries a whole maximum-size message. Upload, draft and
+submission publication share the same private chunk writer and quota
+calculation.
+
+### HTTP write dispatch
+
+The fixed HTTPS body worker classifies each JMAP request before opening
+storage. A request with exactly one call to `Email/set`, `Mailbox/set` or
+`EmailSubmission/set`, or td-mail's two-call `Email/set` then
+`EmailSubmission/set` batch, is a write; every other request runs on the
+read path with its existing single snapshot and cannot invoke a mutation
+adapter. A write first opens an authenticated read snapshot to capture
+fresh account identity and state, then closes it before any mutation; the
+write adapters never open a native view. The read-only profile and its
+Session refuse writes, and uploads, outright.
+
+Each write family has one process-lifetime owner. `serve` creates one
+`postgres_http_updates::Pending` per process, shared by all accounts and
+API services, holding the Email mutation owner (updates, deletion and
+filing) and the folder, draft, submission, cancellation and upload
+owners. It is the process's only HTTP write owner; receipt sweeps rely on
+it fencing each family's publications ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)). Each owner admits at
+most one active or uncertain operation, serializes its family without
+waiting (a held owner is busy), and stores no password: the request's
+credential is borrowed for the synchronous call only. Owners live in
+process memory; a restart releases every owner and needs no local journal.
+The process memory ledger in RESOURCES.md itemizes upload ingress and its
+retained body but not the retained draft or submission bodies; qualifying
+those against the memory plan is a separate requirement.
+
+Every write charges the original HTTP request work meter and keeps that
+request's absolute deadline, capped at ten seconds for the database phase
+and five seconds for endpoint resolution. It reserves a foreground
+database slot before DNS. Typed output vectors and the complete response
+storage are reserved before effects. A transport failure on one resolved
+address retries the same prepared operation on the next address; no
+failure falls back to another profile, route or operation. Known outcomes
+survive a late local deadline poll. Completions carry only the actual
+original epoch and sequence, without a fabricated read-history floor or
+snapshot identity.
+
+Mailbox rights on a writable profile advertise `mayReadItems`,
+`mayAddItems`, `mayRemoveItems`, `maySetSeen` and `maySetKeywords`, and
+`mayDelete` for a roleless mailbox; `mayCreateChild`, `mayRename` and
+`maySubmit` are false. Rename and hierarchy creation are not supported.
+
+### Email keyword and mailbox updates
+
+Schema version 8 adds owner-private `flag_receipts`; schema 9 adds per-Email
+results to it. Single-Email receipts written before schema 9 retain their
+digest and state and gain one Updated result; existing DDL is unchanged.
+`postgres_email_set` keeps a single-Email entry point with its own request
+digest framing, missing-Email refusal and result shape, and a batch entry
+point; the single and batch entry points reject each other's prepared
+operations. HTTP `Email/set` uses the batch entry point.
+
+`prepare_batch` accepts at most 256 unique Email IDs in request order, each
+with optional seen/starred assignments and an optional single existing
+target mailbox, plus one optional expected state; duplicate IDs refuse. The
+target replaces all of that Email's memberships. Batch digest domain v2
+includes target presence and ID. `inspect_batch` and `publish_batch` return
+per-Email Updated, NotFound or InvalidMailbox results in request order,
+plus the original and resulting account sequence. Missing Emails return
+NotFound before destination validation; a missing destination returns
+InvalidMailbox and leaves that Email's flags and memberships unchanged.
+Empty batches, missing Emails, already-satisfied assignments and moves do
+not advance the sequence; their result is still retained. State mismatch
+refuses the whole batch.
+
+One transaction covers the whole batch. Set-oriented array queries load at
+most 256 Email rows and 257 distinct Mailbox rows including the overflow
+sentinel, and at most 256 memberships plus an overflow sentinel per moved
+Email, returning only bounded aggregates. At most 256 affected Mailboxes
+are admitted across the batch; a seen change admits at most 256
+memberships. Keyword writes and history use bounded arrays rather than a
+round trip per Email, and SQL work stays within the original deadline. A
+changed batch advances state exactly once. Each changed Email receives one
+Email history entry. Mailbox history covers removed and added memberships
+and every membership whose unread count changes, including drafts,
+deduplicated across Emails; star-only changes and a retained target whose
+seen state is unchanged need no Mailbox history. Removing other
+memberships while retaining an existing target preserves the target
+membership row and its sequence. Thread history is unchanged. Receipt
+results, history, flags, memberships and state commit together, and lost
+COMMIT recovery retains the full ordered result.
+
+The closed mutation worker admits 1088 input frames, one MiB total input,
+128 KiB per frame and 128 KiB output; Email updates, deletion, filing and
+the single-Email entry point all use it. SCRAM qualification and the
+ten-second maximum deadline apply.
+
+Over HTTP, the singleton `Email/set` adapter admits td-mail's keyword
+updates and `mailboxIds` replacement through the shared bounded request
+parser and response reservation, forwarding the one selected mailbox to
+the batch transaction. Unknown destinations are per-object
+invalidProperties; membership changes retain the original Email, Thread
+and body identities. The original request meter prepays bounded
+membership and history work before effects.
+
+### Email deletion
+
+`postgres_email_set::deletion::prepare` accepts at most 256 unique Email IDs
+and retains one opaque operation with its own digest domain. Its inspect
+and publish entry points return ordered Destroyed/NotFound results; empty
+or entirely missing batches retain a no-op receipt. The `flag_receipts`
+relation stores update, deletion and filing receipts under one 1024-receipt
+account limit.
+
+Bounded Email, affected-Mailbox and Thread result sets each admit at most
+256 rows. Per-Email keyword inspection admits 256 plus one sentinel, and
+multiple thread anchors refuse. Each removed Email receives destroyed
+history, each affected Mailbox updated history, and each touched Thread
+updated or destroyed history according to remaining Emails. One account
+sequence covers the complete batch.
+
+Memberships, keywords, anchors and receipt-recipient rows are removed with the
+Email. A body retires only after its last Email disappears and no retained
+lease or submission owns it, including expired leases not yet reclaimed
+([Expired upload lease reclamation](#expired-upload-lease-reclamation)) and completed submissions. Removing a body cascades its chunks
+and decrements body-byte and blob counters in the same transaction;
+upload/queue counters remain charged for their surviving owners. Counter
+underflow or inconsistency refuses the entire transaction. Blob identity
+tombstones remain, preventing ID reuse. Existing repeatable-read snapshots
+retain deleted metadata and body bytes. Expired upload leases are reclaimed
+by the next upload or relay retention ([Expired upload lease reclamation](#expired-upload-lease-reclamation)), settled submissions
+retire under section 216 and HTTP write receipts expire under
+[Receipt retention for HTTP writes](#receipt-retention-for-http-writes).
+
+HTTP `Email/set` destroy uses this transaction through the same Email
+mutation owner as updates; distinct update and deletion operation types
+are kept through publication and receipt settlement, and a historical
+receipt resolves only its original operation. Deletion prepays work for
+bounded keyword, membership, Thread-owner and blob-owner observations and
+validates result kinds before releasing the pending operation.
+
+### Root-folder creation
+
+Schema version 12 adds `mailbox_create_receipts`. The
+`postgres_mailbox_set` adapter prepares at most 256 root-folder names,
+using the shared bounded NFC/control/noncharacter validator. Invalid names
+become the existing empty-name marker before retaining and hashing the
+canonical request. Preparation retains random operation and object IDs and
+runs outside the transaction; over HTTP it spends the original request
+work meter for name validation and NFC.
+
+A locked account serializes exact root-name uniqueness; existing names and
+later duplicates in the batch report AlreadyExists, while invalid names
+report InvalidName. Successful rows use no parent or role, sort order zero
+and subscribed true. IDs must not collide with current mailboxes or
+retained mailbox history. All created rows, Mailbox/created history, one
+account-sequence increment and ordered results commit atomically. A batch
+with no created rows retains an unchanged state. The same account lock
+enforces the listing limit of 256 total mailboxes: a batch exceeding it
+refuses without retaining a receipt or changing any mailbox. The complete
+receipt binds the canonical request and generated IDs. Folder transactions
+have a one-MiB output ceiling for bounded names and a one-MiB/1088-frame
+input budget.
+
+HTTP `Mailbox/set` admits td-mail's name-only root creation as a singleton
+call; mixed method batches never enter this path. Publication prepays
+bounded row work and reserves result capacity before effects. The folder
+owner holds one exact operation through an uncertain COMMIT.
+
+### Empty folder deletion
+
+The `postgres_mailbox_set` transaction also accepts one prepared deletion.
+A distinct request-digest domain binds the target (or a valid foreign ID's
+absent local target), device, selected binding and optional expected state.
+It shares creation's account lock, current-device authorization, sequence
+checks, bounded receipt allowance and uncertain-COMMIT owner. The existing
+`mailbox_create_receipts` table stores both operations:
+17-byte result tags 4 through 8 represent destroyed, notFound, forbidden,
+mailboxHasChild and mailboxHasEmail. Created results retain tags 1 through 3.
+
+Only an empty, roleless leaf may be removed. Any role is protected; children
+and message memberships refuse deletion. A successful deletion removes the
+folder, adds one Mailbox destroyed history row and advances the account
+sequence once in the same transaction as its receipt. Refusals retain the
+old state. Replay and inspection return the exact historical result, without
+performing a second deletion or granting fresh authorization.
+
+The HTTP profile accepts a pure singleton destroy with optional ifInState.
+Mixed create/destroy, nonempty update, multiple destroy IDs and
+onDestroyRemoveEmails=true refuse before publication. Response capacity is
+reserved before mutation. Only a confirmed commit emits destroyed;
+uncertainty retains the prepared operation for bounded same-account
+inspection ([Uncertain HTTP writes and inline settlement](#uncertain-http-writes-and-inline-settlement)).
+
+### Upload publication
+
+`postgres_uploads` publishes completed upload bytes. Preparation checks the
+selected profile's message ceiling (at most 32 MiB), copies and hashes the
+body, allocates one Blob ID and operation ID, and binds the request digest
+to the epoch, account, configuration selection, profile, device, Blob ID,
+exact length/digest and configured upload lifetime. The preparation
+deadline is at most ten seconds, and the body is not exposed through Debug.
+`prepare_with_meter` uses the caller's original work meter and clock: it
+prepays retained body bytes, charges bounded hashing and copying
+separately, and charges request-digest input and a final deadline check.
+Exhausted work remains stopped across retries, including a later empty
+body, and the supplied preparation deadline can only shorten the meter's
+original deadline. The convenience `prepare` constructs its bounded meter
+and uses the same implementation. Preparation itself admits no ingress and
+reserves no memory; the HTTPS upload handler does ([HTTPS upload ingress](#https-upload-ingress)).
+
+Publication enforces all five shared quotas and publishes body
+manifest/chunks, a Both-use upload lease, quota charges, the next account
+sequence and the retained outcome in one synchronous transaction. It
+creates no Email or Thread. Blob IDs remain permanently reserved. The
+closed upload worker admits 40 MiB output and the mutation worker's one
+MiB/1088-frame input budget, including the same authentication/per-frame
+checks. Its original ten-second deadline covers the complete publication
+operation.
+
+Lease creation and expiry use the database clock and the profile's
+configured upload expiry interval. Receipts retain Blob ID, length,
+timestamps and old/new state. A matching historical upload receipt is
+known success, not current permission to download or import: the upload
+lease, not the receipt, governs access and upload expiry ([Authenticated blob downloads](#authenticated-blob-downloads)).
+
+Runtime grants on `leases` admit INSERT for publication and DELETE for
+reclamation and never UPDATE, including a column-only UPDATE grant; no
+serving path can extend a lease. Provisioning grants must match the
+roster before the runtime connection qualifies ([Runtime database logins](#runtime-database-logins)); no owner
+credential fallback is used for an upload.
+
+### Expired upload lease reclamation
 
 Nothing but this reclamation (here and on relay retention turns) removes a
-lease, and no Email or submission takes over an
-uploaded body (a draft copies attachment bytes into its own body), so without
-reclamation `upload_bytes` would only grow and the upload quota would be a
-lifetime budget. After device authentication and its receipt sweep, upload
+lease, and no Email or submission takes over an uploaded body (a draft
+copies attachment bytes into its own body), so without reclamation
+`upload_bytes` would only grow and the upload quota would be a lifetime
+budget. After device authentication and its receipt sweep, upload
 publication therefore deletes, under its account lock and before the quota
-charge, at most 64 of the account's leases (`RECLAIM_LEASES`) whose
-`expires_at` is at or before its database-clock sample, oldest expiry first,
-stopping before one would take the batch past 64 MiB (`RECLAIM_BYTES`); the
-first is always admitted. Each lease's whole body length leaves
-`upload_bytes` (the key admits one lease per body). A body no Email, lease or
-submission still reaches is then deleted with its chunks and released from
-`body_bytes` and `blob_count`, by the same statement Email deletion and
-section 216 use; a body still referenced elsewhere stays and is charged only
-there. Guards refuse with Integrity rather than underflow. `blob_ids` rows
-stay, so no Blob ID is reused. No change row or sequence step is written:
-leases and bodies carry no JMAP state.
+charge, one bounded batch: at most 64 of the account's leases
+(`RECLAIM_LEASES`) whose `expires_at` is at or before its database-clock
+sample, oldest expiry first, stopping before one would take the batch past
+64 MiB (`RECLAIM_BYTES`); the first is always admitted. Each lease's whole
+body length leaves `upload_bytes` (the key admits one lease per body). A
+body no Email, lease or submission still reaches is then deleted with its
+chunks and released from `body_bytes` and `blob_count`, by the same
+statement Email deletion and section 216 use; a body still referenced
+elsewhere stays and is charged only there. Guards refuse with Integrity
+rather than underflow. `blob_ids` rows stay, so no Blob ID is reused. No
+change row or sequence step is written: leases and bodies carry no JMAP
+state.
 
 If the quota charge then refuses with Quota and the batch reclaimed anything,
 publication commits the batch alone (and that call's receipt sweep) and still
@@ -3754,152 +3942,558 @@ rolls the batch back with the publication, including a deadline expiry while
 the batch and a large upload share the operation's deadline; the next upload
 repeats it, and small uploads still drain a backlog. Reclamation is
 idempotent.
-Expired leases already refuse downloads and draft attachment use
-([Authenticated blob downloads](#authenticated-blob-downloads) and section 37); deleting them changes neither, and a historical upload receipt still
-answers its own replay inside its minute. Relay retention (section 216) also
-runs the same batch, in a transaction of its own, on each retention turn, so an
-account a relay route serves recovers expired leases, and the body bytes and
-blob count they hold, without another upload: typically within ten minutes of
-expiry while the relay runs with a stable queue clock, and within about
-twenty minutes even while submission retirement keeps failing (section
-216), and a backlog drains a batch per round. An account no relay worker
-serves keeps them until its next upload.
-Their bytes never exceed the upload quota, though zero-length uploads can hold
-blob count.
-The candidate scan reads the account's leases (no expiry index), which the
-upload and blob-count quotas bound. Deleting leases needs the runtime DELETE
-grant of [Runtime database logins](#runtime-database-logins).
 
-## 37. Retained td-mail draft creation
+Expired leases already refuse downloads and draft attachment use
+([Authenticated blob downloads](#authenticated-blob-downloads) and [Draft attachments](#draft-attachments)); deleting them changes neither, and a historical
+upload receipt still answers its own replay inside its minute. Relay
+retention (section 216) also runs the same batch, in a transaction of its
+own, on each retention turn, so an account a relay route serves recovers
+expired leases, and the body bytes and blob count they hold, without
+another upload: typically within ten minutes of expiry while the relay
+runs with a stable queue clock, and within about twenty minutes even while
+submission retirement keeps failing (section 216), and a backlog drains a
+batch per round. An account no relay worker serves keeps them until its
+next upload. Their bytes never exceed the upload quota, though zero-length
+uploads can hold blob count. The candidate scan reads the account's leases
+(no expiry index), which the upload and blob-count quotas bound. Deleting
+leases needs the runtime DELETE grant ([Runtime database
+logins](#runtime-database-logins), [Shared runtime login
+privileges](#shared-runtime-login-privileges)).
+
+### HTTPS upload ingress
+
+The HTTPS upload endpoint receives length-delimited or chunked upload bytes
+on the fixed body worker, for a writable profile whose request account,
+device credential and JMAP role match the binding. The accepted size is
+the smallest of the profile's upload maximum, the message ceiling and
+32 MiB. Admission first applies the inline settlement of [Uncertain HTTP writes and inline settlement](#uncertain-http-writes-and-inline-settlement) under
+the request's meter and body deadline, then takes the upload owner's
+ingress permit, before 100 Continue or body allocation. One ingress permit
+excludes another body or preparation on that owner, which retains at most
+one bounded immutable body. The original request meter prepays bounded
+ingress and response storage, charges wire/decoded input, and carries
+through preparation/publication. Body idle, transfer and original
+deadlines never extend each other. No SQL transaction spans peer input.
+
+Known outcomes return the bounded upload JSON and admit authenticated raw
+blob download. An uncertain COMMIT returns an internal uncertain response
+whose bytes cannot be serialized. The HTTPS owner retires only that exchange
+without final success or temporary-failure output; the retained operation
+remains available for bounded same-account inspection. Reads and the
+service remain available.
+
+### Plain-text draft creation
 
 Schema version 11 adds bounded historical `draft_receipts` and an index for
-Email/Thread identity collision checks against retained history. Each account
-retains at most 1024 draft receipts younger than a minute (section 217).
-Explicit PUBLIC revocation also applies when the operator has permissive
-default table privileges.
+Email/Thread identity collision checks against retained history. Explicit
+PUBLIC revocation also applies when the operator has permissive default
+table privileges.
 
-`postgres_drafts` prepares the plain-text structured draft used by td-mail's
-Email/set creation. It reuses the existing composer, selected profile work
-limits and at-most-32-MiB message limit. Composition and SHA-256 finish before
-opening the publication transaction. The immutable prepared object retains
-body bytes, operation/object IDs and a digest binding the selected policy,
-account, device, mailbox, optional expected state and exact body. No app
-password is retained. Preparation and publication each have an original
-at-most-ten-second deadline; retry never extends an in-flight operation.
+`postgres_drafts` prepares the structured draft used by td-mail's
+`Email/set` creation. It reuses the existing composer, selected profile work
+limits and at-most-32-MiB message limit. Composition and SHA-256 finish
+before opening the publication transaction. The immutable prepared object
+retains body bytes, operation/object IDs and a digest binding the selected
+policy, account, device, mailbox, optional expected state and exact body.
+The entry point used over HTTP borrows the original work meter and runtime
+clock: composition, body hashing, retained thread anchors and request
+hashing spend that same allowance, no preparation step renews an exhausted
+budget, and a clock wrapper checks the shorter absolute preparation
+deadline on every composition turn. The convenience entry point constructs
+its own configured allowance and delegates to the same implementation;
+both retain the ten-second phase and selected message-size ceilings.
 
-Publication follows selection FOR SHARE then account FOR UPDATE, rechecks
-current policy and device authorization, and requires the selected mailbox
-and optional account state. It publishes body chunks, Email, one membership,
-$draft/$seen keywords, thread anchor, quota counters, account sequence and
-receipt in one synchronous transaction. Body and blob-count usage increase;
-no upload lease or queue charge is created. Upload and draft publication
-share the same private chunk writer and quota calculation. Thread selection
-checks nearest References, then In-Reply-To, then own Message-ID, with at
-most 32 entries per reference list and lowest Email ID for an anchor tie.
-Existing threads are never merged. The one new account sequence records
-Email creation, Thread creation/update and Mailbox update.
+Publication requires the selected mailbox and optional account state, and
+publishes body chunks, Email, one membership, `$draft`/`$seen` keywords,
+thread anchor, quota counters, account sequence and receipt in one
+synchronous transaction. Body and blob-count usage increase; no upload
+lease or queue charge is created. Thread selection checks nearest
+References, then In-Reply-To, then own Message-ID, with at most 32 entries
+per reference list and lowest Email ID for an anchor tie. Existing threads
+are never merged. The one new account sequence records Email creation,
+Thread creation/update and Mailbox update. Draft creation does not check
+the From address against account identities; submission input preparation
+enforces the author identity ([Submission input preparation](#submission-input-preparation)).
 
-Receipt inspection excludes a still-committing operation with an account
-shared lock. Matching historical success survives policy replacement and
-credential revocation without authorizing a new write. After a lost COMMIT response, historical inspection uses the same
-operation and checks for its receipt (section 165). Failure before commit
-rolls back bodies, ID reservation, metadata, usage and receipt together.
-This remains a cold storage API: HTTP dispatch, sender-identity policy,
-submission, runtime admission and the runtime integration remain work.
+Over HTTP, the singleton `Email/set` adapter accepts td-mail's structured
+draft shape, captures authenticated Email state, closes the read
+transaction before composition, and supplies that state to the shared
+response adapter. Publication rechecks device, profile, epoch, mailbox and
+optional sequence; completion carries the actual before epoch/sequence and
+the known durable result through response generation. The draft owner
+admits one composed or uncertain draft body, bounded by the selected
+message ceiling and the helper's 32-MiB cap; it is held before input
+parsing or composition, and the original request meter funds decoding,
+composition, hashing and prepaid publication work.
 
-## 42. Retained root-folder creation
+### Draft attachments
 
-Schema version 12 adds `mailbox_create_receipts`. The
-`postgres_mailbox_set` adapter prepares at most 256 root-folder names,
-using the shared bounded NFC/control/noncharacter validator. Invalid names become the existing empty-name marker before
-retaining and hashing the canonical request. Preparation retains random
-operation/object IDs and no device password. It runs outside the transaction
-under the selected profile's work limits and original deadline.
+The draft owner accepts td-mail's uploaded attachment descriptors and
+composes multipart/mixed with its existing text part. Each source is read
+through the verified PostgreSQL blob reader under the selected account and
+current device. An Email/submission reference or that device's unexpired
+upload lease is required; another device's upload is refused. The source
+bytes, length and digest are checked before composition. Publication
+rechecks each source manifest and access under the account lock with
+fresh device/configuration authorization; a lease that expired during
+composition cannot authorize publication.
 
-Publication fences selected policy, account state and current device in the
-same order as flag writes. A locked account serializes exact root-name
-uniqueness; existing names and later duplicates in the batch report
-AlreadyExists, while invalid names report InvalidName. Successful rows use
-no parent or role, sort order zero and subscribed true. IDs must not collide
-with current mailboxes or retained mailbox history. All created rows,
-Mailbox/created history, one account-sequence increment and ordered results
-commit atomically. A batch with no created rows retains an unchanged state.
-The same account lock enforces the listing limit of 256 total mailboxes.
-A batch exceeding that limit refuses without retaining a receipt or changing
-any mailbox. No generic hierarchy, rename or destroy flow is introduced.
+A retained Draft includes only the composed body and bounded source manifests,
+whose IDs, lengths and digests enter the operation digest. Unknown COMMIT
+uses the existing exact draft receipt and pending owner; successful receipt
+lookup remains historical evidence, independent of later source expiry.
+The input uploads retain their ordinary lease/cleanup lifecycle. Draft
+publication creates one new composed blob, not references to mutable parts.
 
-The complete receipt binds the canonical request and generated IDs and is
-checked before reauthorizing a fresh write. Owner-side inspection waits
-behind account publication; lost COMMIT response remains indeterminate until
-inspection of that same operation finds its receipt or proves its absence
-(section 165). Each account retains at most 1024 receipts younger than a
-minute (section 217). Folder transactions have a
-one-MiB output ceiling for bounded names and a one-MiB/1088-frame input budget.
-Preparation, publication and replay do not enable PostgreSQL serving.
+There are at most 64 attachments, with filename/type/description byte caps
+of 255/127/1024. Header controls and MIME parameter injection are refused.
+Names use RFC 2231 UTF-8 continuations; descriptions use the shared encoded
+header writer. Ordinary payloads and message/global use the shared base64
+encoder. message/rfc822 retains identity 8bit encoding and exact bytes,
+and its enclosing multipart explicitly declares 8bit,
+requiring CRLF, no NUL, lines no longer than 998 content octets, and no
+collision with the random 128-bit enclosing boundary. It is not silently
+rewritten or base64-encoded: the message/global allowance in
+[RFC 6532 section 3.5](https://www.rfc-editor.org/rfc/rfc6532.html#section-3.5)
+does not change message/rfc822's restrictions. Other message subtypes and
+multipart attachment types are refused.
 
-## 43. Atomic Email mailbox replacement
+One original ten-second-or-shorter request deadline covers resolution,
+source verification, composition and publication. Each body read reserves
+two foreground connection permits and prepays its bounded verification and
+replay work before I/O, including fallback addresses. Aggregate decoded
+source bytes stay within the profile's upload maximum and composed bytes
+within the selected message ceiling, each at most 32 MiB; raw sources are
+dropped before publication.
 
-The existing `postgres_email_set::Update` now accepts an optional existing
-account mailbox alongside seen/star assignments. A batch replaces each
-successful Email's memberships with that one target. Missing Emails return
-NotFound before destination validation; missing destinations return
-InvalidMailbox and leave that Email's flags and memberships unchanged.
-Already-satisfied moves are no-ops. Removing other memberships while retaining
-an existing target preserves the target membership row and its sequence.
+### Submission input preparation
 
-Batch digest domain v2 includes target presence and ID; existing single-Email
-flag preparation is unchanged. The same schema-9 receipt format admits the
-new per-object result byte, validated against the prepared move request.
-No schema migration or production dispatcher change is needed.
+`postgres_submission_input` freezes td-mail's implicit envelope and outgoing
+copy from one authenticated, verified Email snapshot. It selects the
+sending mailbox only through the immutable profile binding, checks optional
+account state, and retains the original Email/blob/thread identity. It
+performs no database write, queue reservation or SMTP responsibility.
 
-The account lock serializes moves, flags and account history. Set-oriented
-queries inspect at most 256 memberships plus an overflow sentinel per moved
-Email, returning only bounded aggregates. At most 256 affected Mailboxes are
-returned across the batch. SQL work remains subject to the original deadline.
-Mailbox history covers removed/added memberships and all previous memberships
-whose unread count changes, deduplicated across Emails. Retained targets need
-no Mailbox history unless seen changes. Changed Emails each get one history
-entry, Thread history is unchanged, and the account advances once. All rows,
-history and the ordered receipt commit together; uncertainty resolves through
-the original operation. Existing mutation-worker wire bounds are unchanged.
+A single original deadline and work meter cover header collection, envelope
+derivation and transmitted copying; the whole-body integrity pass is prepaid
+before the reader starts. Shared MIME scanning locates the bounded root header
+section. Existing submission_envelope and transmitted_headers enforce the
+configured author identity and recipient ceiling and strip root Bcc/Resent-Bcc.
+All remaining body bytes are copied without interpretation. Reads and copying
+use 4096-byte turns; header scratch is at most the configured header ceiling
+plus two separator bytes. The retained copy is at most 32 MiB and clones
+share it; at most 1000 copied recipient mailboxes are retained. Original
+stored bytes remain unchanged.
 
-## 44. Retained Email deletion
+The metered entry point borrows the original HTTP work meter and runtime
+clock. Before database entry it charges admission work and tightens the SQL
+deadline to the earlier caller or original meter deadline. The same
+allowance covers body verification, headers, implicit-envelope derivation,
+blind-recipient filtering and the retained outgoing copy. A phase clock
+keeps local processing inside the SQL preparation deadline without
+extending the original meter. The convenience entry point delegates to
+this path.
 
-`postgres_email_set` owns the single-Email flag, batch update and deletion
-adapters. `deletion::prepare` accepts at most 256 unique Email IDs and retains
-one opaque operation with a separate digest domain and no password. Its
-inspect/publish entry points return ordered Destroyed/NotFound results; empty
-or entirely missing batches retain a no-op receipt. The existing flag_receipts
-relation covers all three modes under one 1024-receipt account limit.
-Receipt result decoding rejects values from another operation mode. No schema
-migration is needed, and production serving remains unchanged.
+The result contains passive policy/source evidence, records the submitting
+profile's route, and holds no password or live snapshot. It grants no
+continuing device authority and no queue or delivery responsibility.
+Publication must recheck the source identity, optional state, selected
+generation and device under the account transaction; deletion, revocation
+or a configuration change after preparation can therefore refuse
+publication.
 
-The common transaction fences policy, account state and current device before
-fresh deletion. Bounded Email, affected-Mailbox and Thread result sets each
-admit at most 256 rows. Per-Email keyword inspection admits 256 plus one
-sentinel, and multiple thread anchors refuse. SQL work remains deadline-bound.
-Each removed Email receives destroyed history, each affected Mailbox updated
-history, and each touched Thread updated or destroyed history according to
-remaining Emails. One account sequence covers the complete batch.
+### Submission publication
 
-Memberships, keywords, anchors and receipt-recipient rows are removed with the
-Email. A body retires only after its last Email disappears and no retained
-lease or submission owns it, including expired leases not yet reclaimed
-(section 35) and completed submissions. Removing a body cascades its chunks
-and decrements body-byte and blob counters in the same transaction;
-upload/queue counters remain charged for their surviving owners. Counter
-underflow or inconsistency refuses the entire transaction. Blob identity
-tombstones remain, preventing ID reuse. Existing repeatable-read snapshots
-retain deleted metadata and body bytes.
+Schema version 14 adds owner-private `submission_receipts`.
+`postgres_submissions` assigns random operation, submission and blob IDs to
+a verified prepared input, retaining its bytes and a domain-separated
+request digest across retries. `prepare_with_meter` uses the request's
+original work meter and runtime clock for body and request hashing: each
+body chunk, fixed request field and length-delimited envelope string is
+charged before hashing, with both the original deadline and a bounded
+absolute phase deadline enforced. The convenience helper creates a
+configured allowance and delegates. Prepared input remains shared
+immutable storage; preparation does not copy the outgoing body or charge
+a second output allocation.
 
-Lost COMMIT response remains indeterminate until inspection of the same
-retained operation finds its receipt or proves its absence (section 165).
-Historical receipts remain inspectable after later policy change,
-revocation, object deletion or body retirement. This does not grant a fresh
-write or a new body read. The account's next upload or relay retention
-reclaims expired upload leases (section 35), section 216 retires settled
-submissions and
-section 217 expires HTTP write receipts.
+Publication locks configuration before the account, then freshly checks the
+selected generation/version, JMAP role, device and optional state. The source
+Email must still reference the verified blob/thread and manifest. It charges
+one outgoing body/blob, queue bytes and one submission against shared quotas.
+A database UTC timestamp supplies sendAt and checked five-day expiresAt.
+Outgoing chunks, submission, ordered initially Queued recipients, account
+sequence, submission-created history, usage and receipt commit together.
+The visible Email and its blind-recipient headers remain unchanged.
+
+Receipts expire independently of the source Email or queued submission
+([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)). Concurrent publication of one retained operation serializes
+through the account row. Lost COMMIT responses remain indeterminate until
+receipt inspection on the publishing primary finds the receipt or proves
+its absence (section 165). Historical success survives later revocation,
+source deletion or configuration replacement. Deleting the source after
+enqueueing does not cancel delivery or retire its separately owned
+outgoing body.
+
+The HTTPS submission owner admits one active or uncertain submission. It
+acquires the owner and foreground connection allowance before DNS, source
+reading or body preparation. Fresh Runtime qualification, account/device
+checks, original request work and a shared absolute deadline cover
+authenticated input preparation and queue publication. Transport retries
+retain the same prepared operation and submitting route; other failures
+do not fall back to another profile. One outgoing body is bounded by
+preparation's 32 MiB cap, alongside the temporary verified source during
+preparation. The HTTP mutation owner holds this submission owner
+separately from drafts and Email mutations.
+
+### Success filing after submission
+
+`postgres_email_set::filing` clears `$draft` and optionally removes one
+exact source membership and adds one destination. It preserves other
+memberships and keywords. Missing source membership or destination refuses
+the whole patch without clearing `$draft`; a concurrent unrelated move is
+never replaced. Clearing an unseen draft updates Mailbox state/history for
+every membership whose unread counts change, including retained folders
+and an already-present destination. A seen clear-only patch changes only
+Email history. An already-cleared Email records a no-op receipt without
+advancing its state.
+
+Filing shares the bounded Email receipt table, account serialization, fresh
+device authorization and policy fencing. Its distinct request digest binds
+both mailbox operands. Retaining the exact Filing permits historical
+recovery after an uncertain commit, even when authorization subsequently
+changes. Publication is a separate transaction from submission: refusal or
+rollback never retracts the durable queue entry, and no filing error
+replaces or rolls back the queue outcome. The caller must select only
+known successful submissions and report the independent implicit
+`Email/set` result.
+
+The HTTPS Email mutation owner accepts the filing operation alongside
+updates and deletion. The caller supplies a known successful submission's
+Email and optional source/destination pair. The original request meter
+funds bounded membership inspection and history updates before effects;
+fresh Runtime qualification, account/device checks, the current selected
+policy and the original deadline apply as for other Email writes.
+Uncertain filing retains its exact receipt operation in the same owner.
+
+### EmailSubmission/set request decoding
+
+The shared `submission_request` decoder borrows the parsed JSON arena and
+spends the original work meter under a non-extending phase deadline. It
+allocates no owned request or authority token. For creation it decodes
+only td-mail's `emailId`/`identityId` object and success-filing patch:
+remove `$draft`, optionally add the Sent membership and remove the original
+membership. Both mailbox operands survive decoding; a publisher must not
+interpret that patch as permission to replace an unrelated current
+mailbox. Literal and request-local Email references remain distinct. A
+valid opaque ID is retained without claiming it names a local object.
+
+For update it accepts exactly one property, `undoStatus: "canceled"`.
+Empty, non-object, multi-property, partial-recipient, nested, read-only and
+other undoStatus updates refuse. A repeated canceled update is
+syntactically valid; only publication can establish its no-change result.
+
+The decoder proves only syntax. It neither resolves creation IDs nor
+authorizes account, identity or mailbox access. Call-level account/state
+checks, creation-key binding, successful-submission selection, the
+selected device, current account state, whole-group eligibility,
+transaction reservation and the cancellation fence belong to the handler
+and the authenticated publishers. Unsupported fields and incomplete filing
+shapes are explicit refusals.
+
+### EmailSubmission/set dispatch
+
+A singleton `EmailSubmission/set` call selects either one creation, with an
+optional matching `onSuccessUpdateEmail` patch, or one whole-submission
+update. Mixed create/update, multiple creations or updates, cancellation
+filing hooks, `destroy` and other arguments refuse before effects. The
+account must be the authenticated account, and a scoped `ifInState` is
+validated before object work; a current state mismatch is a method-level
+stateMismatch.
+
+Creation resolves literal Email IDs or request-local creation IDs without
+granting Email access; the submission owner freshly authenticates and
+authorizes the account, source and identity and preserves the submitting
+profile's route. Response body and implicit-frame space are reserved
+before effects, under the original response and mutation meter. Known
+creation publishes its Submission ID and state independently of the later
+filing result. Filing uses the same meter and execution deadline and gets
+a separate `Email/set` response (or method error) under the original call
+ID. Filing refusal or uncertainty never rolls back the submission or
+changes its known result. Outer response I/O, deadline or exhausted
+original work can still prevent a reply; retained operations and td-mail
+reconciliation remain necessary. Indeterminate creation keeps its native
+fence and returns serverPartialFail without invoking filing. Initial
+creation mappings remain fallback-only; new successful request mappings
+shadow them.
+
+td-mail's ordered two-call batch, a singleton literal `Email/set` creation
+then an `EmailSubmission/set` creation, uses one response owner, creation
+map, work meter and execution deadline. A noncreation first call, or an
+update in the second call, refuses before effects. The second call
+resolves the first call's successful draft ID. Draft publication advances
+the state used by a later submission refusal; successful submission and
+filing retain their own transaction states. Each owner freshly authorizes
+its operation. These calls are independent transactions: a failed
+submission leaves its draft, and failed filing leaves a successful
+submission.
+
+Cancellation uses the bounded patch decoder. Unsupported patches become
+invalidProperties; well-formed unknown external IDs become notFound. A
+valid local cancellation passes the original execution deadline, meter,
+authenticated device and state precondition to the HTTPS cancellation
+owner. Dispatch reserves its complete response storage before invoking
+the owner. Known changed and no-change outcomes carry the receipt's
+actual old/new sequences, validate the full changed count and checked
+sequence adjacency, and remain retainable after the execution phase
+expires. CannotUnsend, transaction capacity and fence refusal project as
+cannotUnsend; missing and authorization failures project as notFound and
+forbidden. Work admission and connection errors remain method-level
+failures with no proven mutation. Unknown COMMIT or an inconsistent
+claimed success becomes serverPartialFail, never a fabricated refusal or
+success. Cancellation creates no creation ID or implicit `Email/set`
+response.
+
+### Submission capability in the JMAP Session
+
+`serve` builds each writable profile's Session with the sending
+constructor (`Session::mail_submission`): Submission appears in global and
+account capabilities and primaryAccounts, `maxDelayedSend` is zero and
+`submissionExtensions` is empty. A `--read-only` profile uses
+`Session::mail_read_only`, which advertises no Submission and permits only
+its closed read method allowlist. Capability bytes participate in the
+Session state digest, and the request parser accepts exactly the
+capabilities in the document. The Session itself grants no authority.
+Identity/get and submission reconciliation reads use the same admission
+path as other reads.
+
+### Cancellation receipts (schema 26)
+
+Schema version 26 adds independently retained cancellation receipts keyed by
+account and operation. Each binds a request digest and submission identity,
+records the whole recipient count (1 through 1000), the changed count, original
+and resulting account sequences, and the resulting completedAt observation.
+A no-change result preserves the sequence and records zero changed recipients;
+a changing result advances it. The publisher enforces exact checked
+adjacency, full ordinal coverage and the all-or-refuse cancellation rules.
+The completion timestamp is signed like the submission's existing timestamp:
+canceling a completed failure must preserve its exact historical observation.
+
+The receipt references its account but deliberately not the live submission,
+so eventual authorized submission deletion cannot erase settlement history.
+Ordinary runtime mail DML grants include this table; owner initialization and
+migration remain private. Already wholly canceled submissions are idempotent
+successes.
+
+### Whole-submission cancellation publication
+
+`postgres_submission_cancel` has two preparations. The frontend preparation
+used by the HTTPS service binds the account, selected configuration,
+profile, device, submission, optional expected state and a random
+operation; it does not manufacture a relay claim or acquire its lease, and
+a JMAP-only profile can cancel account submissions while the relay runs in
+another process or is offline. The route-owner preparations bind a random
+operation to the relay's current route-owner claim, generation and
+submission, optionally with a client device; the client profile must
+belong to the same account, epoch and selected configuration as the
+owner, and a relay-only profile cannot supply client authority. These
+route-owner entry points remain internal library APIs: the relay worker
+does not call them, and they do not establish client or operator
+authorization by themselves.
+
+Preparation can bind the caller's expected store epoch and account
+sequence. An epoch mismatch refuses preparation; the optional sequence is
+included in the retained request digest, with absence distinct from zero,
+and unconditional operations, like internal ones without a client
+identity, keep their digest format. The request digest
+binds any client identity; no password or authentication result lives in
+the prepared operation.
+
+Historical settlement precedes live policy and owner checks: a committed
+operation replays after its own sequence advance or later account changes,
+survives submission deletion and device revocation, performs no new
+cancellation, and never invokes transport closure. Its receipt records
+the original expected sequence. A fresh publication holds the
+selected-policy and account locks (and, for a route owner, the route
+lock) through reservation, any transport closure and commit. A
+device-bound publication requires that device's app password and rechecks
+its account-bound verifier and revocation under the account lock, before
+group reservation, local transport closure or writes; device revocation
+takes the same lock, so it cannot race a previously cached authentication
+into a write. Missing, malformed, incorrect and other-device credentials
+refuse identically. The internal publication entry point cannot publish a
+fresh device-bound request without credentials, and the authenticated
+entry point refuses preparations that lack client identity. The supplied
+credential is decoded into the existing zero-on-drop secret owner for
+this call only. The expected sequence is checked under the account lock
+before group reservation, transport closure or writes, including for an
+already-canceled no-op.
+
+Before any closure, publication validates the complete ordinal group with
+the shared row codec and queue-state validator. Any Accepted, uncertain or
+AcceptancePossible recipient refuses the whole operation as cannotUnsend;
+cancellation never promises recall of delivered mail. It bounds aggregate
+text before fetching rows, reserves and encodes the prospective
+whole-group rows, and checks the transaction byte and operation ceilings.
+The conservative allowance is 128 bytes per recipient beyond its text plus
+4096 bytes for submission, change, account, attempt retirement and
+settlement. A thousand fresh recipients fit; large retained replies may
+refuse without closing transport. This is bounded logical transaction
+capacity and staging memory, not a reservation of physical PostgreSQL disk
+or WAL space. The connection has two MiB aggregate input and 2048 frames,
+unchanged per-frame/authentication limits and 128 KiB output. A
+route-owner publication then invokes its supplied closure, which must
+close/fence the owned transport locally within the original deadline, with
+no database work or SMTP round trips. The frontend publication can cancel
+old route destinations belonging to the same account and needs no
+cross-process socket control or database request queue.
+
+Publication changes the whole group to Canceled, retires a route owner's
+locally fenced attempt, advances the account sequence once and records CHANGE and settlement in the same transaction.
+An untouched `Prepared` attempt of a matching remote owner retains
+settlement custody as described in section 123; a fenced or progressed
+attempt becomes inactive in the cancellation transaction. Actual replies,
+attempt history, diagnostic text, existing completion time and
+failure-notice state are preserved. Cancellation creates no notice. A
+wholly canceled group retains a no-change receipt without closing
+transport or advancing sequence. Ownership and deadline are checked again
+before COMMIT; unknown COMMIT resolves the same operation. Receipts age
+from their publication, not the group's completion ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)).
+
+Every later relay phase/terminator admission uses that same account fence,
+so a stale or remote worker cannot publish AcceptancePossible after
+cancellation. The worker closes on its next failed admission; already
+buffered partial body bytes are not a completed SMTP delivery. The
+scheduler treats a missing fenced phase publication as a retired attempt
+after settling any unknown receipt, rather than retrying it forever, and
+the recovery path likewise tolerates retired attempts. A canceled attempt
+does not clear route failures as a successful delivery.
+
+### HTTPS cancellation owner
+
+The fixed HTTPS worker's cancellation owner holds at most one active or
+uncertain operation. It validates its loaded JMAP profile, account, device
+credential shape and optional epoch before admission; the publisher checks
+current device authority, selected configuration and account state under
+its locks. No request can choose another profile's database or route. The
+service cancels through the frontend preparation; the owner's route-owner
+entry point, which takes the relay owner's claim, generation and an
+idempotent local abort callback, is not called by the serving runtime.
+
+The worker preserves the request/meter's original absolute deadline, with a
+ten-second database phase and a five-second resolver phase. Before database
+work it charges each attempted address for the receipt/publication
+connection ceilings (three MiB plus 192 KiB of protocol I/O and 8192
+records, including runtime admission and whole-group validation). A
+transport fallback spends another charge and never refreshes the deadline
+or substitutes another operation. A local abort callback must be
+idempotent: a connection failure after local closure but before COMMIT
+can retry the same operation. It performs no SQL or SMTP round trips and
+is invoked only after complete reservation. Neither password nor callback
+survives the foreground call.
+
+Absence at the publishing endpoint releases an uncertain cancellation for
+frontend and route-owner operations alike. Restart needs no local journal:
+durable canceled state is an idempotent update, and a rolled-back request
+can be issued again.
+
+### Uncertain HTTP writes and inline settlement
+
+Every HTTP write owner (Email update, deletion and filing; folder creation
+and deletion; draft; upload; submission; cancellation) obeys the same
+custody rule. Known success or refusal releases the prepared operation.
+An uncertain COMMIT retains the exact prepared operation with the endpoint
+its COMMIT went to; no transparent replay replaces it and no owner
+republishes it. The original request still stops admission on an
+uncertain write; an uncertain upload retires its exchange as described in
+[HTTPS upload ingress](#https-upload-ingress). Reads and the service remain available.
+
+Settlement inspects that exact retained operation under Runtime
+qualification and the existing account lock that excludes a still-running
+COMMIT. It connects only to the endpoint the operation was published to,
+never resolving again or falling back, because the share lock proves
+nothing on another server (section 165). It borrows no app password and
+does not authorize or retry a mutation. A confirmed receipt returns its
+operation ID and complete original outcome and releases the owner;
+absence at the publishing endpoint releases it with nothing to return; a
+failed inspection or deadline leaves the original operation retained. A
+confirmed success survives a late local deadline poll. Settlement after
+device revocation still confirms without credentials or a transport
+callback.
+
+The service settles only inline. A new write of the same family for the
+same account inspects the retained operation first, for one minute of
+monotonic time after the ambiguous result (the receipt retention period).
+A different account or a later write releases the retained data once it
+acquires the family lock, before charging or opening a settlement
+connection; the previous operation's result stays unknown, and the new
+call uses its own authorization, expected state, operation ID and
+transaction. Overlapping active writes still contend for that one lock.
+
+For inline inspection the current write prepays each connection from its
+meter, 1088 records for one inspection (cancellation charges its own
+connection ceilings instead). A refused charge returns that refusal,
+Capacity or Deadline, rather than busy. Settlement then runs under the
+write's deadline capped at three seconds, so an unreachable endpoint
+cannot hold the owner, worker and a foreground slot for the whole
+request, and that slot is released before the write takes its own. The
+write is admitted only if settlement empties the owner; otherwise it is
+refused as busy, except that a frontend cancellation reports the
+settlement failure itself. The monotonic limit only bounds local
+admission. Receipt expiry uses database time, and another process serving
+the same account can sweep an expired receipt ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)).
+
+Each owner also exposes a `settle` method that inspects with a separately
+supplied settlement connection allowance, never foreground slots, under
+one original deadline capped at ten seconds; its caller must retain the
+returned outcome as its own recovery workflow requires. The serving
+runtime does not call it. Retained prepared handles are never
+client-supplied operation IDs, and settlement is not a public endpoint:
+an HTTP adapter must authenticate a request before exposing settlement.
+
+### Receipt retention for HTTP writes
+
+Six HTTP write families keep receipts: Email update, deletion and filing
+(`flag_receipts`), folder creation and deletion (`mailbox_create_receipts`),
+drafts, uploads, submissions and cancellations (`draft_receipts`,
+`upload_receipts`, `submission_receipts`, `submission_cancel_receipts`).
+Each ceiling stays 1,024 per account. A publication samples the database
+clock once under its account write lock, stamps its receipt with it
+(`send_at` for a submission, `created_at` otherwise), first deletes only that
+account's receipts of its own family older than one minute before the
+sample, then refuses with Capacity only while 1,024 younger ones remain. A
+full ledger is a per-minute flood bound, never a lifetime one; td-mail's
+sends, attachments and folder writes are not limited over an account's
+life. Capacity inspection counts only receipts inside the minute; an
+idle account keeps expired ones until its next publication of that family.
+
+A receipt is no JMAP idempotency record: operation IDs are random per
+prepared request, and a client that lost a response reconciles
+(section 165). It serves only the publication's own replay, inside its
+ten-second deadline, and settlement of an uncertain COMMIT by the owner
+holding it. While holding it, the process does not sweep that family's
+receipts for that account, because the process's single write owner
+fences each family's publications. A fresh write can instead release
+local custody under [Uncertain HTTP writes and inline settlement](#uncertain-http-writes-and-inline-settlement), without determining the old outcome.
+Another instance serving the same account can sweep an expired receipt
+before inspection. A missing receipt then cannot distinguish rollback
+from expired evidence. The owner never republishes and the reply already
+sent stands. A restart releases every owner. No other reader exists: the
+upload lease, not its receipt, governs downloads and upload expiry; the
+relay and section 216 address submissions by ID; a cancellation receipt
+ages from its publication, not the group's completion. After expiry an
+operation is not replayable, and no owner republishes one.
+
+Schema 41 adds `created_at` without a default to `flag_receipts`,
+`mailbox_create_receipts` and `submission_cancel_receipts`; draft and upload
+receipts already stored the publication's database time, and submission
+receipts its `send_at`, which equals publication time only because sending
+has no delayed release (FUTURERELEASE); adding one needs a separate stamp.
+Existing rows of the three new columns read 0, and older stamped rows keep
+their time, so receipts an older binary left expire on the account's next
+publication of their family with no operator procedure. Schema-40 binaries
+cannot serve schema 41; upgrade with the fenced procedure, so no owner of the
+older binary survives to settle against them. Each publication scans at most
+the account's ledger (no stamp index), which the ceiling keeps small.
 
 ## 45. Shared receiving header preparation
 
@@ -4076,61 +4670,6 @@ FROM traces CROSS JOIN LATERAL regexp_matches(prefix,
 GROUP BY 1, 2, 3 ORDER BY 4 DESC, 2, 3, 1;
 ```
 
-## 47. Verified submission input preparation
-
-The inert postgres_submission_input worker freezes td-mail's implicit
-envelope and outgoing copy from one authenticated, verified Email snapshot.
-It selects the sending mailbox only through the immutable profile binding,
-checks optional account state, and retains the original Email/blob/thread
-identity. No database write, queue reservation or SMTP responsibility occurs.
-
-A single original deadline and work meter cover header collection, envelope
-derivation and transmitted copying; the whole-body integrity pass is prepaid
-before the reader starts. Shared MIME scanning locates the bounded root header
-section. Existing submission_envelope and transmitted_headers enforce the
-configured author identity and recipient ceiling and strip root Bcc/Resent-Bcc.
-All remaining body bytes are copied without interpretation. Reads and copying
-use 4096-byte turns; header scratch is at most the configured header ceiling
-plus two separator bytes. The retained copy is at most 32 MiB and clones
-share it; at most 1000 copied recipient mailboxes are retained. Original
-stored bytes remain unchanged.
-
-The result contains passive policy/source evidence and no password or live
-snapshot. It grants no continuing device authority. Publication must
-recheck the source identity, optional state, selected generation and device
-under the account transaction, enforce shared quotas, and atomically publish
-the outgoing blob, submission, recipients, history and operation receipt.
-Deletion, revocation or a configuration change after preparation can therefore
-refuse publication. Section 48 supplies the owner-side enqueue transaction;
-runtime memory admission remains separate work.
-
-## 48. Retained submission publication
-
-Schema version 14 adds owner-private submission_receipts. The inert
-postgres_submissions worker assigns random operation, submission and blob IDs
-to a verified prepared input, retaining its bytes and a domain-separated
-request digest across retries. No client endpoint or relay worker is enabled.
-
-Publication locks configuration before the account, then freshly checks the
-selected generation/version, JMAP role, device and optional state. The source
-Email must still reference the verified blob/thread and manifest. It charges
-one outgoing body/blob, queue bytes and one submission against shared quotas.
-A database UTC timestamp supplies sendAt and checked five-day expiresAt.
-Outgoing chunks, submission, ordered initially Queued recipients, account
-sequence, submission-created history, usage and receipt commit together.
-The visible Email and its blind-recipient headers remain unchanged.
-
-Receipts are bounded to 1024 per account younger than a minute (section 217)
-and expire independently of the source Email or queued submission. Concurrent
-publication of one retained operation serializes through the account row. Lost
-COMMIT responses remain indeterminate until receipt inspection on the
-publishing primary finds the receipt or proves its absence (section 165); a
-digest mismatch refuses replay. Historical success survives later revocation,
-source deletion or configuration replacement. Deleting the source after
-enqueueing does not cancel delivery or retire its separately owned outgoing
-body. Runtime admission, dispatch, fenced multi-instance queue ownership and
-activation remain runtime integration work.
-
 ## 49. Selected named-route evidence
 
 `postgres_routes` builds bounded, redacted route evidence from a validated
@@ -4302,434 +4841,6 @@ separate activation prerequisite. A backwards last-attempt timestamp refuses.
 Runtime clock discontinuity validation and the monotonic restart guard of
 the minimum retry interval still precede any actual retry. Receipt storage has a 1024-per-account
 cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
-
-## 78. Prepared singleton flag requests
-
-The prepared HTTPS backend admits td-mail's standalone Email/set keyword
-updates through the shared bounded request parser and response reservation.
-It closes its authenticated read snapshot before mutation and reserves a
-connection slot before endpoint resolution. Runtime connections check the selected
-profile, account, device secret and optional Email state under transaction
-locks. Read-only batches retain their existing single snapshot. Mixed batches
-cannot invoke this mutation adapter. Draft creation remains outside this
-prepared endpoint; §80 connects mailbox moves and §81 connects deletion.
-
-One process-lifetime Pending owner serializes flag mutations without waiting.
-An uncertain COMMIT retains the exact Change and its publication endpoint.
-The same account's next flag write can settle it first (section 79). No
-transparent replay replaces it. Known outcomes survive late local deadline
-expiry. The owner contains no password. Production startup and restart
-recovery remain cutover requirements; this adapter is not a production serving
-entry point.
-
-The real td-mail PostgreSQL fixture now marks read, stars, marks unread and
-unstars the delivered message, querying fresh state after every result. It
-also forces a COMMIT error and verifies that the next write settles the
-absent receipt and publishes afresh without stopping reads, and that a write
-after the fault clears succeeds. Mailbox rights advertise seen and
-keyword updates; §80 adds membership rights while structural rights stay false.
-
-## 79. Prepared flag receipt settlement
-
-Pending::settle inspects the exact retained Change under runtime-role
-qualification and the existing account lock that excludes a still-running
-COMMIT. It connects only to the endpoint the Change was published to, never
-resolving again or falling back, with a separately supplied settlement
-connection allowance and one original deadline capped at ten seconds. It
-borrows no app password and does not authorize or retry a mutation.
-
-A confirmed receipt returns its operation ID and complete original outcome,
-then releases the flag-write slot. Absence at the publishing endpoint
-releases the slot with nothing to return (section 165). A failed inspection
-leaves the original Change available for another inspection. A confirmed
-success survives a late local deadline poll. The caller must retain the returned outcome as required
-by its own recovery workflow.
-
-Every HTTP write owner (sections 82, 84, 89, 101 and 130 name the others)
-inspects the retained operation inline only for a new write to the same
-account, for one minute of monotonic time after the ambiguous result. A
-different account or a later write releases the retained data once it
-acquires the family lock, before charging or opening a settlement
-connection. Overlapping active writes still contend for that one lock. The previous operation's result
-stays unknown. The new call uses its own authorization, expected state,
-operation ID and transaction. The original request still stops admission
-on an uncertain write. No owner republishes that operation.
-
-For inline inspection the current write prepays each connection from its
-meter, 1088 records for one inspection (cancellation charges its section
-130 ceilings instead). A refused charge returns that refusal, Capacity or Deadline,
-rather than busy. Settlement then runs under the write's deadline capped
-at three seconds, so an unreachable endpoint cannot hold the owner,
-worker and a foreground slot for the whole request, and that slot is
-released before the write takes its own. The write is admitted only if
-settlement empties the owner; otherwise it is refused as busy, except that
-a frontend cancellation reports the settlement failure (section 214).
-The monotonic limit only bounds local admission. Receipt expiry uses database
-time, and another process serving the same account can sweep an expired
-receipt (section 217).
-
-The real-client fixture checks that absence clears uncertainty. A second
-prepared owner loses a COMMIT acknowledgement to a deadline and later settles
-the committed receipt while both foreground read slots are held, proving that
-settlement has separate connection admission.
-
-## 80. Prepared moves between existing mailboxes
-
-The singleton Email/set adapter also accepts td-mail's mailboxIds replacement.
-It forwards the one selected mailbox to the existing bounded PostgreSQL batch
-transaction. Device/profile/state fences, mailbox existence checks, membership
-replacement, Email and affected Mailbox history, and the original receipt
-remain atomic. Unknown destinations are per-object invalidProperties, and
-membership changes retain the original Email, Thread and body identities.
-
-Prepared HTTP mailbox rights advertise add/remove alongside seen/keyword
-updates. Section 82 connects root-folder creation. Rename and
-submission remain unsupported.
-The same uncertainty owner and settlement mechanism cover combined flag/move
-requests under the account and time limits of section 79. The real-client fixture prepares an
-Archive folder through the existing storage helper, moves Inbox to Archive
-and back, checks database membership and unchanged flags, and queries the
-same Email/body ID after each move. This does not activate production serving.
-
-## 81. Prepared Email deletion
-
-The singleton Email/set endpoint connects td-mail's destroy action to the
-existing PostgreSQL deletion transaction. It retains distinct update and
-deletion operation types through publication and receipt settlement; a
-historical receipt resolves only its original operation. Both share the same
-nonwaiting mutation owner and connection admission. Authentication, selected
-profile, expected state, per-object absence, history, last-owner body removal
-and quota release remain governed by the existing transaction.
-
-Both protocol completions carry only the original epoch/sequence, without a
-fabricated read history floor. Typed output vectors reserve their bounded
-capacity before effects. Deletion prepays work for bounded keyword,
-membership, Thread-owner and blob-owner observations, validates result kinds
-before releasing the pending operation, and preserves known COMMIT results
-through late local expiry.
-
-The real td-mail fixture delivers a second message and permanently deletes it,
-checks authoritative Email and quota state, and confirms the first message
-still reads and downloads. A delayed deletion COMMIT is settled through its
-original receipt and releases the final body quota. Draft creation and
-production PostgreSQL activation remain separate.
-
-## 82. Prepared root-folder creation
-
-Singleton Mailbox/set now connects td-mail's name-only root creation to the
-existing PostgreSQL transaction. Preparation spends the original HTTP work
-meter for name validation and NFC; publication prepays bounded row work,
-reserves result capacity and a database slot before DNS, and rechecks runtime
-role, profile, account, device and expected state under the original deadline.
-Mixed method batches never enter this mutation path or native storage.
-
-A dedicated bounded owner retains one exact Change through uncertain COMMIT.
-The account and time limits of section 79 apply. Receipt settlement inspects only the publishing endpoint, with
-separately admitted capacity or inline before the next folder write
-(section 79), and never republishes. A found receipt or proven absence
-releases the owner and errors preserve it; confirmed outcomes survive local
-expiry. The encompassing prepared mutation owner keeps both operation
-families across requests. Restart persistence remains required before
-runtime integration.
-
-Mailbox completion exposes only the original epoch and sequence, without a
-fabricated snapshot identity. The real td-mail fixture creates Archive, rejects
-its duplicate, lists it and moves mail through it. A delayed creation COMMIT
-proves exact receipt settlement and one durable folder; a rolled-back one is
-released inline by the next creation. Hierarchy creation and renaming remain
-outside this td-mail milestone.
-Singleton deletion uses the same owner as described below.
-
-## 83. Caller-funded draft preparation
-
-The retained plain-text draft helper has an entry point that borrows the
-original work meter and runtime clock. Composition, body hashing, retained
-thread anchors and request hashing spend that same allowance; no preparation
-step renews an exhausted budget. A clock wrapper checks the shorter absolute
-preparation deadline on every composition turn. Both entry points retain the
-ten-second phase and selected message-size ceilings. The cold convenience
-entry point constructs its own configured allowance and delegates to the same
-implementation.
-
-The caller still owns memory admission for the bounded retained body, fresh
-device authorization and publication capacity. This helper does not activate
-HTTP creation. The PostgreSQL draft fixture checks exhausted record/output
-budgets and expired original/phase deadlines refuse before publication, then
-publishes a caller-funded draft through the existing receipt, body, thread and
-history checks.
-
-## 84. Prepared HTTP plain-text drafts
-
-The singleton Email/set service now accepts td-mail's existing structured
-plain-text draft shape. It captures authenticated Email state, closes the
-read transaction before composition, and supplies that state to the shared
-response adapter without opening a native view. Publication rechecks device,
-profile, epoch, mailbox and optional sequence. Completion carries the actual
-before epoch/sequence and known durable result through response generation.
-
-The prepared owner admits one composed or uncertain draft body, bounded by the
-selected message ceiling and the helper's 32-MiB cap. It is held before input
-parsing or composition; the original request meter funds decoding, composition,
-hashing and prepaid publication work. A foreground database slot is reserved
-before DNS. No app password survives the synchronous call. Other mutation
-families retain their independent bounded owners. Runtime memory-plan
-qualification and durable restart ownership remain runtime integration work.
-
-Uncertain COMMIT retains the original Draft and its publication endpoint
-under section 79's account and time limits. Settlement inspects that exact receipt there,
-with separately admitted database capacity or inline before the next draft
-(section 79); a found receipt or proven absence releases the owner and an
-error preserves it. It does not publish again. The HTTP fixture creates and
-retrieves a draft, refuses a stale state without effects, downloads its
-immutable message, settles a delayed commit and releases a rolled-back one
-inline before the next draft. This
-activates no production service, attachment upload or submission capability.
-
-## 85. Caller-funded submission input
-
-Submission input preparation can borrow the original HTTP work meter and
-runtime clock. Before database entry it charges admission work and tightens
-the SQL deadline to the earlier caller or original meter deadline. The same
-allowance covers body verification, headers, implicit-envelope derivation,
-blind-recipient filtering and the retained outgoing copy. A phase clock keeps
-local processing inside the SQL preparation deadline, without extending the
-original meter. The cold convenience entry point delegates to this path.
-
-The returned input still records the submitting profile's route and grants no
-queue or delivery responsibility. Connection and retained-memory admission,
-publication work, fresh device authorization and receipt ownership remain the
-runtime caller's obligations. The local PostgreSQL fixture verifies exhausted
-work and both deadline refusals, then checks caller-funded input through the
-existing privacy, source-state, route and queue-publication evidence.
-
-## 86. td-mail submission request decoding
-
-The inert submission_request decoder borrows the parsed JSON arena and spends
-its original work meter under a non-extending phase deadline. It decodes only
-td-mail's emailId/identityId creation object and success-filing patch: remove
-$draft, optionally add the Sent membership and remove the original membership.
-Both mailbox operands survive decoding; a later publisher must not interpret
-that patch as permission to replace an unrelated current mailbox.
-
-Literal and request-local Email references remain distinct. A valid opaque ID
-is retained without claiming it names a local object. The decoder neither
-resolves creation IDs nor authorizes account, identity or mailbox access.
-Call-level account/state checks, creation-key binding, successful-submission
-selection, publication and the separate implicit Email/set response remain
-handler work. Unsupported fields and incomplete filing shapes are explicit
-refusals. No Submission capability or serving path is enabled by this decoder.
-
-## 87. Retained success filing
-
-The inert postgres_email_set::filing helper clears $draft and optionally
-removes one exact source membership and adds one destination. It preserves
-other memberships and keywords. Missing source membership or destination
-refuses the whole patch without clearing $draft; a concurrent unrelated move
-is never replaced. Clearing an unseen draft updates Mailbox state/history
-for every membership whose unread counts change, including retained folders
-and an already-present destination. A seen clear-only patch changes only
-Email history. An already-cleared Email records a no-op receipt without
-advancing its state.
-
-Filing shares the bounded Email receipt table, account serialization, fresh
-device authorization and policy fencing. Its distinct request digest binds
-both mailbox operands. Retaining the exact Filing permits historical recovery
-after an uncertain commit, even when authorization subsequently changes.
-Publication is a separate transaction from submission: refusal or rollback
-never retracts the durable queue entry. The caller must select only known
-successful submissions and report the independent implicit Email/set result.
-This helper does not activate Submission or the HTTP sending flow.
-
-The local PostgreSQL submission fixture proves rollback leaves the queue and
-Email intact, exact receipt recovery after delayed COMMIT, preservation of an
-unrelated membership, missing-source refusal, clear-only/no-op behavior, and
-digest-conflict detection. Caller resource admission remains an activation
-obligation.
-
-## 88. Caller-funded submission publication preparation
-
-The inert postgres_submissions::prepare_with_meter helper uses the request's
-original work meter and runtime clock for body and request hashing. Each body
-chunk, fixed request field and length-delimited envelope string is charged
-before hashing, with both the original deadline and a bounded absolute phase
-deadline enforced. The cold helper creates a configured allowance and
-delegates. Prepared input remains shared immutable storage; this step does
-not copy the outgoing body or charge a second output allocation.
-
-The local submission publication fixture checks exhausted records, a body
-larger than remaining I/O, original and phase deadline refusals, and continued
-consumption of an already-used meter. Its successful result feeds the existing
-concurrent publication, receipt, routing and failure evidence. This preparation
-does not acquire database capacity, publish mail or enable Submission; those
-remain caller obligations, alongside retained-memory admission.
-
-## 89. Fixed-worker submission ownership
-
-The inert postgres_http_submissions adapter admits one active or uncertain
-submission per retained owner. It acquires the owner and foreground connection
-allowance before DNS, source reading or body preparation. Fresh Runtime
-qualification, account/device checks, original request work, and a shared
-absolute deadline cover authenticated preparation and queue publication.
-Transport retries retain the same prepared operation and submitting route;
-other failures do not fall back to another profile.
-
-An uncertain COMMIT retains the exact immutable submission under the
-account and time limits of section 79. The owner stores no application password. Its settlement method
-uses independent connection capacity to inspect the historical receipt at
-the publishing endpoint, and the next submission settles inline (section 79).
-Confirmed outcomes and proven absence release the owner; errors retain it.
-One outgoing body is bounded by preparation's 32 MiB cap, alongside
-the temporary verified source during preparation. The HTTP mutation owner
-holds this submission owner separately from drafts and Email mutations.
-
-The local PostgreSQL fixture uses the restricted Runtime login to check
-publication, the submitting route, prepublication budget/device/deadline
-refusals, rollback, delayed COMMIT fencing, exact receipt settlement while
-foreground capacity is occupied, and inline release of a rolled-back COMMIT
-before the next submission. JMAP dispatch, implicit success filing,
-durable startup ownership and capability activation remain separate work.
-
-## 91. Fixed-worker success filing
-
-The prepared HTTPS Email mutation owner accepts the exact success-filing
-operation alongside flags, moves and deletion. The caller supplies a known
-successful submission's Email and optional source/destination pair. Filing
-uses its own Email transaction and response completion; no filing error
-replaces or rolls back the queue outcome.
-
-The original request meter funds bounded membership inspection and history
-updates before effects. Fresh Runtime qualification, account/device checks,
-the current selected policy and the original deadline apply as for other
-Email writes. Uncertain filing retains its exact receipt operation in the
-same owner. It can be inspected inline under section 79 or with independent
-capacity, without obtaining another application password.
-
-The local PostgreSQL fixture verifies exhausted work, transaction rollback
-without queue or draft loss, delayed-COMMIT fencing, settlement with occupied
-foreground capacity, the final membership/draft state, and missing-source
-refusal. This adapter does not yet connect the JMAP implicit response or
-advertise Submission.
-
-## 96. Prepared singleton submission mutation
-
-Prepared dispatch accepts one EmailSubmission/set creation with an optional
-matching onSuccessUpdateEmail patch. It resolves literal Email IDs or
-request-local creation IDs without granting Email access; the fixed worker
-freshly authenticates and authorizes the account, source and identity and
-preserves the submitting profile's route. Mixed draft/send batches, updates,
-cancellation and destroy remain unconnected, as do capability advertising
-and production PostgreSQL selection.
-
-Response body and implicit-frame space are reserved before effects, under
-the original response and mutation meter. Known creation publishes its
-Submission ID and state independently of the later filing result. Filing
-uses the same meter and execution deadline and gets a separate Email/set
-response (or method error) under the original call ID. Filing refusal or
-uncertainty never rolls back the submission or changes its known result.
-Outer response I/O, deadline or exhausted original work can still prevent a
-reply; retained operations and td-mail reconciliation remain necessary.
-Indeterminate creation keeps its native fence and returns serverPartialFail
-without invoking filing. Initial creation mappings remain fallback-only;
-new successful request mappings shadow them.
-
-## 97. Prepared td-mail draft-and-submit batch
-
-Prepared dispatch accepts td-mail's ordered singleton literal Email/set
-creation then EmailSubmission/set request. A noncreation first call refuses
-before effects. The batch uses one response owner, creation map, work
-meter and execution deadline. The second call resolves the first call's
-successful draft ID. Draft publication advances the state used by a later
-submission refusal; successful submission and filing retain their own
-transaction states. Each worker freshly authorizes its operation. These
-calls are independent transactions: a failed submission leaves its draft,
-and failed filing leaves a successful submission. This does not advertise
-Submission or activate the production PostgreSQL backend.
-
-## 98. Prepared HTTP submission dispatch
-
-The PostgreSQL HTTP adapter can admit the Submission capability and
-routes a singleton EmailSubmission/set or td-mail's draft-and-submit batch
-to the prepared mutation dispatcher. It releases its fresh authenticated
-snapshot before mutations, retains the original response owner and deadline,
-and uses the shared pending owners for draft, submission and filing. Read
-requests can use Identity/get and submission reconciliation through the same
-admission path. The active receive/JMAP service does not yet advertise
-Submission; the explicit real-client sending fixture qualifies this adapter.
-
-## 99. Prepared plain-text sending Session and real-client qualification
-
-A separate Session constructor describes the prepared PostgreSQL td-mail
-sending profile: Submission appears in global and account capabilities and
-primaryAccounts, delayed sending is zero and submission extensions are
-empty. The active mail-access constructor stays unchanged. Capability bytes
-participate in the Session state digest. The constructor itself grants no
-authority and activates no production listener.
-
-The real-client sending fixture exercises discovery, Identity/get, Sent
-folder selection/creation, plain-text draft creation, durable submission,
-independent success filing and message retrieval through the native td-mail
-and isolated fetch processes. A deliberately failed local draft retirement
-leaves td-mail's send record in place; its next attempt reconciles through
-submission query/get and retires the draft without adding a submission.
-Queue rows retain the desktop submitting profile's smarthost route. No SMTP
-relay, attachments, cloud-provider failover or runtime integration is claimed.
-
-## 100. Caller-funded upload preparation
-
-`postgres_uploads::prepare_with_meter` retains completed ingress using the
-caller's original work meter and clock. It prepays retained body bytes,
-charges bounded hashing and copying separately, and charges request-digest
-input and a final deadline check. Exhausted work remains stopped across
-retries, including a later empty body. The supplied preparation deadline can
-only shorten the meter's original deadline; no database work or new allowance
-is introduced. The cold convenience wrapper constructs its bounded meter and
-uses the same implementation. Memory/concurrency admission, HTTPS upload
-receipt ownership and production activation remain separate work.
-
-## 101. Fixed-worker upload ownership
-
-The inert `postgres_http_uploads` owner publishes completed, caller-admitted
-upload bytes under the original meter and deadline. One process-lifetime
-pending owner excludes concurrent preparation and retains at most one bounded
-immutable body on uncertain COMMIT. Publication rechecks current device and
-profile policy. Known outcomes release the owner; uncertainty keeps the exact
-operation under the account and time limits of section 79. No password survives the call.
-
-Receipt settlement uses a runtime-qualified connection to the publishing
-endpoint only, with separate connection capacity or inline at the next
-upload's admission (section 79). A confirmed receipt releases the fence and
-returns the original operation/outcome; proven absence releases it with
-nothing to return. After a failed inspection the next upload applies
-section 79's account and time limits. Settlement does not replay or
-authorize publication. The runtime caller
-still owns ingress memory, response retention and startup/recovery scheduling.
-No HTTPS upload endpoint or production backend is activated by this owner.
-
-The runtime privilege roster permits INSERT on upload leases for publication,
-beside their existing SELECT permission. UPDATE and DELETE remain refused,
-including column-only UPDATE grants. Provisioning grants must match this
-roster before the runtime connection qualifies; no owner credential fallback
-is used for an upload.
-
-## 102. Prepared HTTPS upload receipt
-
-The prepared PostgreSQL HTTPS adapter receives length-delimited or chunked
-upload bytes on the fixed body worker. One ingress permit excludes another
-body or preparation on that pending owner. Admission applies section 79 before 100 Continue or body allocation.
-Inline inspection uses the request's meter and body deadline. The original
-request meter prepays bounded
-ingress and response storage, charges wire/decoded input, and carries through
-preparation/publication. Body idle, transfer and original deadlines never
-extend each other. No SQL transaction spans peer input. Publication rechecks
-current device/profile policy before creating the lease and receipt.
-
-Known outcomes return the bounded upload JSON and admit authenticated raw
-blob download. An uncertain COMMIT returns an internal uncertain response
-whose bytes cannot be serialized. The HTTPS owner retires only that exchange
-without final success or temporary-failure output; the retained operation
-remains available for bounded same-account inspection. Reads and the service remain
-available. Attachment composition and complete recovery qualification remain
-separate requirements.
 
 ## 103. Caller-funded receiving preparation
 
@@ -5379,199 +5490,6 @@ with the shared health/receipt caps and a final owner/time check. Recipient
 results and account sequence are unchanged. Unknown COMMIT settles the original
 operation. A successful SMTP handoff does not prove final mailbox delivery;
 this operation starts no scheduler or transport and cannot authorize a send.
-
-## 126. Prepared whole-submission cancellation settlement
-
-Schema version 26 adds independently retained cancellation receipts keyed by
-account and operation. Each binds a request digest and submission identity,
-records the whole recipient count (1 through 1000), the changed count, original
-and resulting account sequences, and the resulting completedAt observation.
-A no-change result preserves the sequence and records zero changed recipients;
-a changing result advances it. The publisher must enforce exact checked
-adjacency, full ordinal coverage and the all-or-refuse cancellation rules.
-The completion timestamp is signed like the submission's existing timestamp:
-canceling a completed failure must preserve its exact historical observation.
-
-The receipt references its account but deliberately not the live submission,
-so eventual authorized submission deletion cannot erase settlement history.
-Ordinary runtime mail DML grants include this table; owner initialization and
-migration remain private. This increment provides no cancellation API or
-transport fence. The future publisher must lock current policy/account/route,
-reject any Accepted, uncertain or AcceptancePossible recipient, reserve the
-whole mutation before fencing, preserve replies and existing notice/completion
-state, and atomically publish canceled recipients, attempt custody as
-described in section 123, CHANGE
-and settlement. Already wholly canceled submissions are idempotent successes.
-
-## 127. Whole-submission cancellation publication
-
-A prepared cancellation binds a random operation ID to its current route
-owner, generation and submission. Historical settlement precedes live policy
-and owner checks, survives submission deletion, and never invokes transport
-closure. New publication holds policy/account/route locks through reservation,
-transport closure and commit. The supplied closure must close/fence the owned
-transport locally within the original deadline, with no database work or SMTP
-round trips. This
-internal route-owner entry point does not establish client or operator
-authorization.
-
-Before invoking that closure, publication validates the complete ordinal group
-with the shared row codec and queue-state validator. Accepted, uncertain or
-AcceptancePossible recipients refuse. It bounds aggregate text before fetching
-rows, reserves and encodes the prospective whole-group rows, and checks the
-transaction byte and operation ceilings. The conservative allowance is 128
-bytes per recipient beyond its text plus 4096 bytes for submission, change,
-account, attempt retirement and settlement. A thousand fresh recipients fit;
-large retained replies may refuse without closing transport. This is bounded
-logical transaction capacity and staging memory, not a reservation of physical
-PostgreSQL disk or WAL space. The connection has two MiB aggregate input and
-2048 frames, unchanged per-frame/authentication limits and 128 KiB output.
-
-Publication changes the whole group to Canceled, retires the locally
-fenced owner’s attempt,
-advances the account sequence once and records CHANGE and settlement in the
-same transaction. Actual replies, attempt history, diagnostic text, existing
-completion time and failure-notice state are preserved. Cancellation creates
-no notice. A wholly canceled group retains a no-change receipt without closing
-transport or advancing sequence. Ownership and deadline are checked again
-before COMMIT; unknown COMMIT resolves the same operation. At most 1024
-receipts younger than a minute are retained per account, aged from their
-publication, not the group's completion (section 217). Stale attempt
-publication cannot cross into AcceptancePossible after retirement. No HTTP
-endpoint, scheduler or transport is activated by this increment.
-
-## 128. Conditional whole-submission cancellation
-
-Cancellation preparation can bind the caller's expected store epoch and
-account sequence. An epoch mismatch refuses preparation; a fresh publication
-checks the sequence under the account lock before group reservation, transport
-closure or writes. This check also applies to an already-canceled no-op.
-The optional sequence is included in the retained request digest, with absence
-distinct from zero. Unconditional operations retain their existing digest.
-
-Historical receipt settlement still precedes live-state checks: a committed
-conditional cancellation replays after its own sequence advance or later
-account changes. Its receipt must record the original expected sequence.
-This is the storage precondition needed for ifInState, not client credential
-authorization or an activated EmailSubmission/set update endpoint.
-
-## 129. Device-authorized cancellation publication
-
-Client cancellation preparation binds a selected JMAP profile and device ID
-alongside the relay owner's claim, submission and optional account state.
-Both profiles must belong to the same account, epoch and selected configuration.
-A relay-only profile cannot supply client authority. The request digest binds
-that client identity; no password or authentication result lives in the
-prepared operation. Internal operations retain their prior digest format.
-
-Fresh client publication requires that device's app password and rechecks its
-account-bound verifier and revocation under the account lock, before group
-reservation, local transport closure or writes. Device revocation takes the
-same lock, so it cannot race a previously cached authentication into a write.
-Missing, malformed, incorrect and other-device credentials refuse identically.
-The internal publication entry point cannot publish a fresh device-bound
-request without credentials; the authenticated entry point refuses preparations
-that lack client identity. Existing policy, ownership and state fences remain.
-
-Known receipt replay still settles without live device authority, including
-after revocation: it performs no new cancellation. These are trusted worker
-APIs whose retained prepared handles are not client-supplied operation IDs;
-an HTTP adapter must authenticate the request before exposing settlement.
-The supplied credential is decoded into the existing zero-on-drop secret
-owner for this call only. No HTTP dispatch, credential format, administration
-policy, scheduler or transport is activated or changed.
-
-## 130. Bounded client cancellation owner
-
-The fixed HTTPS worker's prepared cancellation adapter owns at most one active
-or uncertain operation. It validates its loaded JMAP profile, account, device
-credential shape and optional epoch before admission. The trusted relay owner
-supplies the current claim and generation; the publisher checks current device
-authority, selected configuration, account state and route ownership under its
-existing locks. No request can choose another profile's database or route.
-
-The worker preserves the request/meter's original absolute deadline, with a
-ten-second database phase and a five-second resolver phase. Before database
-work it charges each attempted address for the receipt/publication connection
-ceilings (three MiB plus 192 KiB of protocol I/O and 8192 records, including
-runtime admission and whole-group validation). A transport fallback spends
-another charge, never refreshes the deadline or substitutes another operation.
-The local abort callback must be idempotent: a connection failure after local
-closure but before COMMIT can retry the same operation. It still performs no
-SQL or SMTP round trips and is invoked only after complete reservation.
-
-Known success or refusal releases the prepared operation; unknown COMMIT
-retains it with its publication endpoint under section 79. During the
-same-account inspection window the next cancellation settles it inline
-(section 214); a route-owner cancellation is refused as busy while it
-stays uncertain. Settlement only inspects the exact historical receipt at
-that endpoint; a found receipt or proven absence (section 165) releases it,
-while deadline and errors keep it retained. Confirmation releases it
-without credentials or a transport callback, including after device
-revocation. Neither password nor callback survives the foreground call.
-These are internal owner APIs, not a public settlement endpoint; production
-dispatch, relay-worker ownership/restart custody and runtime integration
-remain separate work.
-
-## 131. Borrowed cancellation patch decoding
-
-The shared submission request decoder accepts exactly one update property,
-`undoStatus: "canceled"`. Empty, non-object, multi-property, partial-recipient,
-nested, read-only and other undoStatus updates refuse. Decoding borrows the
-already bounded JSON arena and charges the original work meter and deadline;
-it allocates no owned request or authority token.
-
-This proves only patch syntax. The selected device, current account state,
-whole-group eligibility, transaction reservation and transport fence remain
-the authenticated publisher's responsibility. A repeated canceled update is
-syntactically valid; only publication can establish its no-change result.
-Dispatch and error projection remain separate from this input boundary.
-
-## 132. Prepared JMAP cancellation dispatch
-
-The prepared singleton EmailSubmission/set path can receive a trusted
-cancellation adapter alongside its creation and filing adapters. A request
-selects one creation or one whole-submission update; mixed operations,
-multiple updates and cancellation filing hooks refuse before effects. The
-ordinary HTTP adapter supplies no cancellation owner yet, so this adds no
-route-worker control or production endpoint activation.
-
-Cancellation validates account and scoped ifInState before object work, then
-uses the bounded patch decoder. Unsupported patches become invalidProperties;
-well-formed unknown external IDs become notFound. A valid local cancellation
-passes the original execution deadline, meter, authenticated device and state
-precondition to the trusted adapter. That adapter must own the current relay
-claim and local transport fence, recheck current authority/state through the
-publisher, and retain unknown COMMIT exactly as the bounded worker requires.
-
-Dispatch reserves its complete response storage before invoking the owner.
-Known changed and no-change outcomes carry the receipt's actual old/new
-sequences, validate the full changed count and checked sequence adjacency,
-and remain retainable after the execution phase expires. CannotUnsend,
-transaction capacity and fence refusal project as cannotUnsend; missing and
-authorization failures project as notFound and forbidden. Work admission and
-connection errors remain method-level failures with no proven mutation.
-Unknown COMMIT or an inconsistent claimed success becomes serverPartialFail,
-never a fabricated refusal or success. A current state mismatch remains a
-method-level stateMismatch. Cancellation creates no creation ID or implicit
-Email/set response in this increment.
-
-## 133. Real PostgreSQL cancellation dispatch qualification
-
-The real database scenario now drives validated JMAP requests through response
-preflight, the retained-response coordinator, prepared dispatch, the concrete
-route adapter and authenticated cancellation publication. It checks current
-ifInState, unsupported patches, Accepted-recipient refusal before fencing,
-whole-group success and idempotent no-change responses. Wire old/new states
-are checked against the actual committed sequences; calls retain escaped IDs,
-produce no creation IDs or implicit filing response, and release response
-ownership after encoding in small chunks.
-
-A delayed COMMIT forces serverPartialFail while the worker retains the exact
-operation. Later independent receipt inspection confirms its original state
-and single sequence advance. No uncertain response becomes a guessed refusal
-or success. Private response trees use the shared TempDir guard. This qualifies
-the prepared internal path, not production HTTP/relay ownership or cutover.
 
 ## 134. Bounded route candidate discovery
 
@@ -6485,13 +6403,13 @@ repair loop treats absence the same way.
 
 The fixed HTTPS worker's owners obey the same order and treat absence the
 same way: Email update, deletion and filing, folder, draft, upload,
-submission and cancellation (sections 32, 35, 37, 42, 44, 48, 91 and 214).
+submission and cancellation ([Email keyword and mailbox updates](#email-keyword-and-mailbox-updates), [Expired upload lease reclamation](#expired-upload-lease-reclamation), [Plain-text draft creation](#plain-text-draft-creation), [Root-folder creation](#root-folder-creation), [Email deletion](#email-deletion), [Submission publication](#submission-publication), [Success filing after submission](#success-filing-after-submission) and [Whole-submission cancellation publication](#whole-submission-cancellation-publication)).
 Each retains an uncertain operation with the endpoint its COMMIT went to
 and inspects only there, never resolving again or falling back, because
 the share lock proves nothing on another server. Within the account and
-time limits of section 79, a new write inspects the retained operation.
+time limits of [Uncertain HTTP writes and inline settlement](#uncertain-http-writes-and-inline-settlement), a new write inspects the retained operation.
 A found receipt or absence releases it. Only publication in the same family
-sweeps expired receipts (section 217).
+sweeps expired receipts ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)).
 
 Once released, the family is no longer fenced, and the server does not
 deduplicate a second draft or submission of the same Email. A client whose
@@ -6509,7 +6427,7 @@ primary, and an HTTP owner inspects only the endpoint it
 published to; and no path deletes such a receipt while its operation can
 still be pending, beyond the bounded sweeps of sections 52, 120, 123, 216
 and 218 and the HTTP families' sweeps by another instance serving the same
-account (section 217). Any further sweep of attempt, phase, recovery,
+account ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)). Any further sweep of attempt, phase, recovery,
 expiry or HTTP-family receipts must respect that.
 
 This is a bounded settlement job, not a renewal of any expired transport owner.
@@ -7465,7 +7383,7 @@ and device authorization. No account row lock, write or repair is performed.
 Body bytes and blob count include every live blob manifest, including a
 zero-length blob. Upload bytes count each manifest with an existing lease;
 expired leases count until the account's next upload or relay retention
-reclaims them (section 35). Queue bytes count each manifest
+reclaims them ([Expired upload lease reclamation](#expired-upload-lease-reclamation)). Queue bytes count each manifest
 referenced as a transmitted blob by a submission, once even if several
 submissions reference it. Queue submission count includes every durable
 submission, including completed ones retained in the database. Reserved blob
@@ -8008,130 +7926,6 @@ ownership. A pending COMMIT therefore cannot trip the next candidate
 read's shorter lock timeout. Failure to establish current ownership still
 stops the service; the next notice scan uses the durable Stored marker.
 
-## 214. Live JMAP cancellation across processes
-
-The HTTP service supplies an authenticated cancellation adapter for a
-singleton `EmailSubmission/set` update with `undoStatus: "canceled"`.
-A JMAP-only profile can cancel account submissions while the relay runs in
-another process or is offline. The frontend preparation binds the account,
-selected configuration, device, submission, optional state and random
-operation. It does not manufacture a relay claim or acquire its lease.
-The existing internal route-owner API retains its owner and local-close
-checks.
-
-Frontend publication holds the selected-policy and account locks, verifies
-the current credential, and uses the same complete-group reservation,
-recipient validation, attempt retirement, change record and receipt as the
-route-owner API. It can cancel old route destinations belonging to the same
-account. Any Accepted, uncertain or AcceptancePossible recipient refuses the
-whole operation as cannotUnsend. It never promises recall of delivered mail.
-An untouched Prepared attempt of a matching remote owner retains settlement custody
-as described in section 123. A fenced or progressed attempt becomes
-inactive in the cancellation transaction.
-Every later relay phase/terminator admission uses that same account fence,
-so a remote worker cannot publish AcceptancePossible after cancellation.
-The worker closes on its next failed admission; already buffered partial
-body bytes are not a completed SMTP delivery. No cross-process socket
-control or new database request queue is needed.
-
-The scheduler treats a missing fenced phase publication as a retired
-attempt after settling any unknown receipt, rather than retrying it forever.
-The unchanged recovery path likewise tolerates retired attempts. A canceled
-attempt does not clear route failures as a successful delivery.
-
-The HTTPS worker retains one unknown operation. Within section 79's
-same-account inspection window a new cancellation charges and inspects
-that receipt under its own request/meter
-limits. Receipt inspection takes the account lock behind the unknown COMMIT:
-Stored confirms success; absence proves rollback (section 165) and releases
-the pending slot, for frontend and route-owner operations alike. A frontend
-request reports a settlement failure; a route owner's is refused as busy.
-Restart needs no local journal: durable canceled state is an idempotent
-update, and a rolled-back request can be issued again. No password or
-transport callback is retained.
-
-Native qualification covers both prepared-owner and frontend JMAP dispatch,
-state mismatch, cannotUnsend, a thousand recipients, repeated cancellation,
-and lost COMMIT response settlement. The executable fixture uses separate
-JMAP/relay processes, cancels queued work with the relay offline and an
-active attempt before MAIL's reply, checks transport closure before another
-command, refuses accepted mail, and includes restart and account auditing.
-
-## 215. Structured attachment sending
-
-The live draft owner accepts td-mail's uploaded attachment descriptors and
-composes multipart/mixed with its existing text part. Each source is read
-through the verified PostgreSQL blob reader under the selected account and
-current device. An Email/submission reference or that device's unexpired
-upload lease is required. The source bytes, length and digest are checked
-before composition. Publication rechecks each source manifest and access
-under the account lock with fresh device/configuration authorization; a
-lease that expired during composition cannot authorize publication.
-
-A retained Draft includes only the composed body and bounded source manifests,
-whose IDs, lengths and digests enter the operation digest. Unknown COMMIT
-uses the existing exact draft receipt and pending owner; successful receipt
-lookup remains historical evidence, independent of later source expiry.
-The input uploads retain their ordinary lease/cleanup lifecycle. Draft
-publication creates one new composed blob, not references to mutable parts.
-
-There are at most 64 attachments, with filename/type/description byte caps
-of 255/127/1024. Header controls and MIME parameter injection are refused.
-Names use RFC 2231 UTF-8 continuations; descriptions use the shared encoded
-header writer. Ordinary payloads and message/global use the shared base64
-encoder. message/rfc822 retains identity 8bit encoding and exact bytes,
-and its enclosing multipart explicitly declares 8bit,
-requiring CRLF, no NUL, lines no longer than 998 content octets, and no
-collision with the random 128-bit enclosing boundary. It is not silently
-rewritten or base64-encoded: the message/global allowance in
-[RFC 6532 section 3.5](https://www.rfc-editor.org/rfc/rfc6532.html#section-3.5)
-does not change message/rfc822's restrictions. Other message subtypes and
-multipart attachment types are refused.
-
-One original ten-second-or-shorter request deadline covers resolution,
-source verification, composition and publication. Each body read reserves
-two foreground connection permits and prepays its bounded verification and
-replay work before I/O, including fallback addresses. Aggregate decoded
-source bytes and composed bytes each stay within the selected message
-ceiling (at most 32 MiB); raw sources are dropped before publication.
-RESOURCES.md records this additional transient memory and work admission.
-
-The native td-mail send fixture uploads binary and forwarded-message files,
-composes/sends them, reconciles a retained send without duplication, and
-compares downloaded attachment bytes and UTF-8 names. It refuses another
-device's upload and a lease expired after preparation without publishing an
-Email. The foreground-service fixture uploads through HTTPS and verifies
-binary attachment DATA at its local TLS smart host. Unit cases cover empty
-parts, invalid metadata, source-line/boundary refusals and exact output caps.
-
-## Empty folder deletion
-
-The `postgres_mailbox_set` transaction also accepts one prepared deletion.
-A distinct request-digest domain binds the target (or a valid foreign ID's
-absent local target), device, selected binding and optional expected state.
-It shares creation's account lock, current-device authorization, sequence
-checks, bounded receipt allowance and uncertain-COMMIT owner. The existing
-`mailbox_create_receipts` table stores both operations without a schema change:
-17-byte result tags 4 through 8 represent destroyed, notFound, forbidden,
-mailboxHasChild and mailboxHasEmail. Created results retain tags 1 through 3.
-
-Only an empty, roleless leaf may be removed. Any role is protected; children
-and message memberships refuse deletion. A successful deletion removes the
-folder, adds one Mailbox destroyed history row and advances the account
-sequence once in the same transaction as its receipt. Refusals retain the
-old state. Replay and inspection return the exact historical result, without
-performing a second deletion or granting fresh authorization.
-
-The HTTP profile accepts a pure singleton destroy with optional ifInState.
-Mixed create/destroy, nonempty update, multiple destroy IDs and
-onDestroyRemoveEmails=true refuse before publication. Response capacity is
-reserved before mutation. Only a confirmed commit emits destroyed; uncertainty
-retains the prepared operation for bounded same-account inspection
-(section 79). The real-client fixture covers deletion, missing and
-foreign IDs, protected Inbox, nonempty folders and parents. Native transaction
-checks cover stale state, revoked authorization and exact receipt replay; a
-delayed deletion COMMIT exercises owner settlement and one history row.
-
 ## Application diagnostic retention (schema 29)
 
 `postgres_logs.sql` adds `application_log_state` and `application_logs`.
@@ -8167,7 +7961,7 @@ are also reclaimed independently, at attempt publication (section 218), so
 submissions still retrying or inside retention do not hold the attempt
 caps.
 Submission and cancellation receipts expire a minute after publication on
-their own (section 217) and expiry receipts an hour after (section 120), so
+their own ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)) and expiry receipts an hour after (section 120), so
 the deletes below usually find none of them; the rest wait for this
 retention.
 The submission retirement step deletes, in one transaction, the
@@ -8208,7 +8002,7 @@ per submission and advances the account sequence, so state strings change
 and the submission ID collision check still finds the ID.
 
 The relay also reclaims expired upload leases as upload publication does
-(section 35), releases abandoned route owners and canceled custody
+([Expired upload lease reclamation](#expired-upload-lease-reclamation)), releases abandoned route owners and canceled custody
 (section 123), and reclaims idle attempts and their receipts (section 218).
 Each step uses its own transaction with the same claim, fence and clock
 check. An empty batch rolls back. A corrupt upload counter can refuse a
@@ -8270,57 +8064,6 @@ that expires is still reclaimed and committed alone. It checks the
 stale-owner, clock and released-owner refusals of both steps, exactly which
 rows, blobs and receipts go and stay, the Destroyed changes, the sequence
 advance and the usage audit. A unit test pins the batch bounds.
-
-## 217. Receipt retention for HTTP writes (schema 41)
-
-Six HTTP write families keep receipts: Email update, deletion and filing
-(`flag_receipts`), folder creation and deletion (`mailbox_create_receipts`),
-drafts, uploads, submissions and cancellations (`draft_receipts`,
-`upload_receipts`, `submission_receipts`, `submission_cancel_receipts`).
-Each ceiling stays 1,024 per account. A publication samples the database
-clock once under its account write lock, stamps its receipt with it
-(`send_at` for a submission, `created_at` otherwise), first deletes only that
-account's receipts of its own family older than one minute before the
-sample, then refuses with Capacity only while 1,024 younger ones remain. A
-full ledger is a per-minute flood bound, never a lifetime one; td-mail's
-sends, attachments and folder writes are not limited over an account's
-life. Capacity inspection counts only receipts inside the minute; an
-idle account keeps expired ones until its next publication of that family.
-
-A receipt is no JMAP idempotency record: operation IDs are random per
-prepared request, and a client that lost a response reconciles (section
-165). It serves only the publication's own replay, inside its ten-second
-deadline, and settlement of an uncertain COMMIT by the owner holding it.
-While holding it, the process does not sweep that family's receipts for
-that account. A fresh write can instead release local custody under section
-79, without determining the old outcome. Another instance serving the same
-account can sweep an expired receipt before inspection. A missing receipt
-then cannot distinguish rollback from expired evidence. The owner never
-republishes and the reply already sent stands. A restart releases every owner. No other reader exists: the upload lease, not its receipt, governs downloads
-and upload expiry; the relay and section 216 address submissions by ID; a
-cancellation receipt ages from its publication, not the group's completion.
-After expiry an operation is not replayable, and no owner republishes one.
-
-Schema 41 adds `created_at` without a default to `flag_receipts`,
-`mailbox_create_receipts` and `submission_cancel_receipts`; draft and upload
-receipts already stored the publication's database time, and submission
-receipts its `send_at`, which equals publication time only because sending
-has no delayed release (FUTURERELEASE); adding one needs a separate stamp.
-Existing rows of the three new columns read 0, and older stamped rows keep
-their time, so receipts an older binary left expire on the account's next
-publication of their family with no operator procedure. Schema-40 binaries
-cannot serve schema 41; upgrade with the fenced procedure, so no owner of the
-older binary survives to settle against them. Each publication scans at most
-the account's ledger (no stamp index), which the ceiling keeps small.
-
-The family fixtures fill each ledger with receipts stamped now and still
-expect Capacity, backdate them a literal 61 seconds, then require the next
-publication to succeed, every expired receipt of the account to go, and
-both a 30-second-old receipt and another account's expired one to stay;
-capacity inspection must count only live receipts. The HTTP submission
-owner fixture backdates a held operation's committed receipt; while inline
-settlement cannot get a read slot, the next submission is refused rather
-than published, and settlement then still finds the receipt.
 
 ## 218. Reclamation of retired attempts
 

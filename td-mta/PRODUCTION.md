@@ -804,25 +804,27 @@ whole-body check; a clean scrub does not replace a backup or restore test.
 
 From schema 41 an account's Email mutation, folder, draft, upload,
 submission and cancellation receipts expire a minute after publication, and
-the family's next publication deletes them (POSTGRES.md section 217). A full
+the family's next publication deletes them (POSTGRES.md, [Receipt retention
+for HTTP writes](POSTGRES.md#receipt-retention-for-http-writes)). A full
 ledger refuses that family with `storageWorkLimit` only while 1,024 receipts
 younger than a minute remain; it needs no operator action. Receipts an older
-binary left expire on the account's next publication of their family after the
-fenced upgrade. Do not delete receipts by hand.
+binary left expire on the account's next publication of their family after
+the fenced upgrade. Do not delete receipts by hand.
 
 ## Upload lease reclamation grant
 
 Each upload deletes a bounded batch of the account's expired upload leases
-and releases their quota (POSTGRES.md section 35), so the runtime login needs
-DELETE on `td_mta.leases`. A binary with this reclamation refuses a runtime
-login without that grant, and an older binary refuses one with it, so this
-update is not binary-only. With all five MTA processes stopped as for
-activation, grant it as the schema owner on the primary, and to a replica
-database's runtime login too, then run the candidate's `runtime-check` and
-`config-check` before switching the link. Run `usage-inspect` for each
-account first: an account whose usage counters disagree with its leases
-refuses every upload until repaired, because reclamation releases counters
-before charging:
+and releases their quota (POSTGRES.md, [Expired upload lease
+reclamation](POSTGRES.md#expired-upload-lease-reclamation)), so the runtime
+login needs DELETE on `td_mta.leases`. A binary with this reclamation
+refuses a runtime login without that grant, and an older binary refuses one
+with it, so this update is not binary-only. With all five MTA processes
+stopped as for activation, grant it as the schema owner on the primary, and
+to a replica database's runtime login too, then run the candidate's
+`runtime-check` and `config-check` before switching the link. Run
+`usage-inspect` for each account first: an account whose usage counters
+disagree with its leases refuses every upload until repaired, because
+reclamation releases counters before charging:
 
 ```sql
 GRANT DELETE ON td_mta.leases TO td_mta_runtime;
