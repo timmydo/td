@@ -11,16 +11,21 @@ checked on 2026-10-27; search schedules were enabled on 2026-10-30. Update this 
 From the development machine, use the dedicated SSH key:
 
 ```text
-ssh -o IdentitiesOnly=yes -i ~/.ssh/td_mta_systemd_test timmy@172.179.0.6
+ssh -o IdentitiesOnly=yes -i KEY ADMIN@HOST
 ```
 
-The remote `timmy` account can administer the services with `sudo`. The daemon
-runs as `td-mta`. SSH does not grant access to the former Stalwart host merely
-because its old DNS name now points here.
+`HOST`, `ADMIN` and `KEY` stand for the host's address, its administrator
+account and the dedicated key file. The operator keeps their values in
+private notes outside this repository. `./td-mta/deploy` compiles in its
+own copies of them (`td-mta/src/bin/td-mta-deploy/`), so the notes must
+agree with that source. The `ADMIN` account can administer
+the services with `sudo`. The daemon runs as `td-mta`. SSH does not grant
+access to the former Stalwart host merely because its old DNS name now
+points here.
 
 | Item | Location or name |
 | --- | --- |
-| Source checkout | `/home/timmy/src/td` |
+| Source checkout | `/home/ADMIN/src/td` |
 | Selected executable | `/opt/td-mta/bin/td-mta` (symlink) |
 | Retained binaries and build notices | `/opt/td-mta/lib/td-mta/releases/` |
 | Installed maintenance helper | `/opt/td-mta/bin/td-mta-operator` |
@@ -173,7 +178,7 @@ Use the same operations options that generate readiness, backup, certificate,
 search and scrub status jobs, adding:
 
 ```text
---notify-recipient timmy@882015.xyz
+--notify-recipient OPERATOR_MAILBOX
 --notify-connection-file /var/lib/td-mta/mail/owner-connection
 --notify-epoch CURRENT_EPOCH
 --notify-smtp 127.0.0.1:25
@@ -189,12 +194,14 @@ use an external relay. It reports sampled refusals and interruptions, native
 suppression, readiness, certificate and configured maintenance checks,
 process-counter differences, operational capacity and free disk space. Inspect
 their oneshot results and journal, not only enabled timers. Direct external
-alerts use Migadu SMTP to `timmyd983@gmail.com`, bypassing local submission.
-The private `alerts` configuration and `alert-smtp.conf` credential live beside
+alerts use Migadu SMTP to the operator's external address, bypassing local
+submission; that address is recorded with the other private values. The
+private `alerts` configuration and `alert-smtp.conf` credential live beside
 the notification state. Capacity pressure, new SMTP publication failures,
 failed inspections and recovery follow the bounded policy in DEPLOYMENT.md.
 A broken host or network still requires an off-host heartbeat monitor.
-The daily digest remains local mail to `timmy@882015.xyz`.
+The daily digest remains local mail to `OPERATOR_MAILBOX`, the operator's
+mailbox on this host, recorded with the other private values.
 
 The private configuration and bounded receipts are in
 `/var/lib/td-mta/mail/.operations/notifications/`, owned by `td-mta`. Run the
@@ -271,9 +278,10 @@ no space. Recovery archives remain retained data, not disposable cache.
 
 ## Retired Stalwart source and recovery copies
 
-The former AWS source at `54.244.239.235` is retained for recovery, with
-`stalwart.service` disabled and stopped. Its old public mail listeners are
-closed; `td-mta-stalwart-defer.service` remains enabled on port 25 and sends
+The former AWS source, whose address is in the operator's private notes,
+is retained for recovery, with `stalwart.service` disabled and stopped.
+Its old public mail listeners are closed;
+`td-mta-stalwart-defer.service` remains enabled on port 25 and sends
 only SMTP `421`, so a sender using a stale address must retry instead of
 leaving mail on the retired source. The precutover HTTP-01 proxy
 `td-mta-acme-precutover.service` is disabled; Azure handles public certificate
@@ -293,8 +301,8 @@ provisional import receipts therefore do not claim full state equality.
 The old source's original configuration and applied network fence are retained
 under `/var/lib/td-mta/operator/cutover-preparation/`; retirement receipts are
 under `/var/lib/td-mta/operator/retirement-20261027/` on that host. Its SSH
-identity is separate from Azure's: use the old IP with its retained, verified
-host key, not the MX DNS names that now resolve to Azure. The VM has not been
+identity is separate from Azure's: use its address from the private notes
+with its retained, verified host key, not the MX DNS names that now resolve to Azure. The VM has not been
 terminated. Restarting Stalwart or restoring old DNS is not a rollback of
 mail accepted by td-mta; follow [MIGRATION.md](MIGRATION.md)'s reconciliation
 requirements before reopening a source writer.
@@ -332,7 +340,7 @@ machine's local handoff path. Do not assume that remote is usable on Azure.
 Fetch the public backup explicitly (its `main` must contain the chosen commit):
 
 ```text
-cd /home/timmy/src/td
+cd /home/ADMIN/src/td
 git fetch https://github.com/timmydo/td.git main
 git log -1 FETCH_HEAD
 ```
@@ -355,7 +363,7 @@ candidate_release=$(readlink -f "$candidate/bin/td-mta")
 sha256sum "$candidate_release"
 ```
 
-Run the build as `timmy`, with the host Rust/C toolchain on PATH. No custom
+Run the build as `ADMIN`, with the host Rust/C toolchain on PATH. No custom
 compiler store paths or secret build environment are needed. Retain the host
 libraries used by this native build. Do not use `sudo` for compilation. The
 candidate release includes the build input receipt and dependency notices.
