@@ -7448,7 +7448,8 @@ mod tests {
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled. td-authd includes the
-        // application policy to bind a credential to the ledger's uid.
+        // application policy to bind a credential to the ledger's uid, and
+        // td-web the bus client and codec for its link intake.
         assert_eq!(
             readers_of("td-busd"),
             [
@@ -7460,7 +7461,8 @@ mod tests {
                 "td-login",
                 "td-open",
                 "td-portal",
-                "td-secret"
+                "td-secret",
+                "td-web"
             ]
         );
         // td-authd compiles td-boot's admission record codec by `#[path]`.

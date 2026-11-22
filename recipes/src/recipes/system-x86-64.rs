@@ -35,7 +35,8 @@ use crate::shared::{
     TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_ACCOUNT_MARKER, TD_SANDBOX_KERNEL_MARKER,
     TD_SETUP_LIVE_MARKER, TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER,
-    TD_UTIL_RUNTIME_MARKER, TD_WEB_BOOT_MARKER, TD_WEB_ENTRY, TD_WEB_NAME, UUTILS_RUNTIME_MARKER,
+    TD_UTIL_RUNTIME_MARKER, TD_WEB_BOOT_MARKER, TD_WEB_ENTRY, TD_WEB_LINK_MARKER,
+    TD_WEB_LINK_TARGET, TD_WEB_NAME, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -399,6 +400,11 @@ const FIREFOX_FETCH_WAIT_SECS: u16 = (svc_timeouts::APPLICATION_FETCH
 /// grant-request asks for its grant at most this many times, a second
 /// apart, each answer bounded at 5 seconds, inside its unit's bound.
 const GRANT_REQUEST_ATTEMPTS: u32 = 8;
+/// How often web-link-evidence asks, a second apart: td-open, while td-web
+/// takes its bus name on a thread of its own after its window; then the
+/// layout, while td-web paints the link's page, and the portal's log.
+const WEB_LINK_OPEN_ATTEMPTS: u32 = 5;
+const WEB_LINK_ATTEMPTS: u32 = 10;
 /// The directory of the human's grant-request grants Firefox, read-only,
 /// and grant-evidence revokes.
 const GRANT_EVIDENCE_DIRECTORY: &str = "Pictures";
@@ -1637,6 +1643,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "news-evidence",
     "web",
     "web-evidence",
+    "web-link-evidence",
     "shell-workspace",
     "placement-evidence",
     "setup",
@@ -1725,6 +1732,10 @@ mod svc_timeouts {
     pub const APPLICATION_EVIDENCE: u32 = 60;
     /// One control-channel request: a line in, and a line or a short report out.
     pub const APPLICATION_PLACE: u32 = 30;
+    /// web-link-evidence's bounded attempts: td-open's, each within its own
+    /// 30-second deadline and a second apart, then the layout's and the
+    /// portal log's, a second apart (pinned beside the unit's test).
+    pub const WEB_LINK_EVIDENCE: u32 = 240;
     /// td-software's install of an installed Firefox, through the control
     /// socket and root: a check against the host's feed that finds both
     /// refs where they are, polled a second at a time.
@@ -2540,6 +2551,24 @@ fn build_desktop_td_svc_conf() -> String {
          requires=web\n\
          timeout={application_evidence}\n\
          \n\
+         # A link the human's own process asks the portal to give td-web:\n\
+         # news's td-open with `--with web` sets `td.handler=web`, and the\n\
+         # portal finds td-web's `org.td.web.*` name beside Firefox's, has the\n\
+         # broker place its owner in the web application, and calls its\n\
+         # OpenURL, which td-web takes from the portal alone. td-fetchd refuses\n\
+         # the loopback link at once, so the window shows its error page,\n\
+         # titled by the link. Each step is asked again a second apart, a\n\
+         # bounded number of times, while td-web takes its name and paints;\n\
+         # the portal's log must record the link opened for td-web. The caller\n\
+         # is unconfined (`app=-`): no application opens a link unasked.\n\
+         [web-link-evidence]\n\
+         type=oneshot\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; package=$(/bin/rg -o -r \"\\$1\" \"^{news_name}\\t(.+)$\" /etc/td-applications.tsv) || {{ /bin/td-util printf \"web-link-evidence: no {news_name} package\\n\"; exit 1; }}; n=0; while :; do if said=$(/bin/td-login exec-primary -- /bin/env DBUS_SESSION_BUS_ADDRESS=unix:path={bus_socket} \"$package/files/bin/td-open\" --with web {web_link} 2>&1); then break; fi; n=$((n+1)); [ \"$n\" -lt {web_link_open_attempts} ] || {{ /bin/td-util printf \"web-link-evidence: the portal did not hand td-web the link: %s\\n\" \"$said\"; exit 1; }}; /bin/td-util sleep 1; done; n=0; while :; do layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout 2>&1) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{web_program} title={web_link} - td-web\" && break; n=$((n+1)); [ \"$n\" -lt {web_link_attempts} ] || {{ /bin/td-util printf \"web-link-evidence: td-web did not show the link: %s\\n\" \"$layout\"; exit 1; }}; /bin/td-util sleep 1; done; n=0; while :; do /bin/rg -qF \"TD-PORTAL-OPEN-URI app=- scheme=https handler=web response=0 outcome=opened\" {portal_service_log} && break; n=$((n+1)); [ \"$n\" -lt {web_link_attempts} ] || {{ /bin/td-util printf \"web-link-evidence: the portal did not record the opening\\n\"; exit 1; }}; /bin/td-util sleep 1; done; /bin/echo {web_link_marker}'\n\
+         after=web-evidence,portal,firefox-tls-setup\n\
+         requires=web,portal\n\
+         timeout={web_link_evidence}\n\
+         \n\
          # The view returns to the first workspace once the applications are\n\
          # decided, ready or not, so Firefox maps beside the shell.\n\
          [shell-workspace]\n\
@@ -2915,6 +2944,11 @@ fn build_desktop_td_svc_conf() -> String {
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
         web_marker = TD_WEB_BOOT_MARKER,
+        web_link_marker = TD_WEB_LINK_MARKER,
+        web_link = TD_WEB_LINK_TARGET,
+        web_link_attempts = WEB_LINK_ATTEMPTS,
+        web_link_open_attempts = WEB_LINK_OPEN_ATTEMPTS,
+        web_link_evidence = svc_timeouts::WEB_LINK_EVIDENCE,
         fetch_marker = TD_FETCH_BOOT_MARKER,
         application_settle = APPLICATION_SETTLE_SECS,
         application_workspace = TERMINAL_APPLICATION_WORKSPACE,
@@ -8826,6 +8860,34 @@ mod tests {
                 .uid_of(td_engine::workload_accounts::Kind::Application, TD_WEB_NAME),
             Some(WEB_UID)
         );
+        // Its link evidence: news's td-open asks the portal for td-web, and
+        // the window and the portal's log must show the link opened there.
+        let exec = unit_key("web-link-evidence", "exec").unwrap_or_default();
+        for part in [
+            AUTOTEST_CMDLINE_TOKEN.to_string(),
+            format!("--with web {TD_WEB_LINK_TARGET} "),
+            format!("/bin/grep -q \"{WINDOW_RECORD}td-web title={TD_WEB_LINK_TARGET} - td-web\""),
+            "handler=web response=0 outcome=opened".to_string(),
+            format!("/bin/echo {TD_WEB_LINK_MARKER}'"),
+        ] {
+            assert!(exec.contains(&part), "{part}: {exec}");
+        }
+        assert_eq!(
+            unit_key("web-link-evidence", "requires").as_deref(),
+            Some("web,portal")
+        );
+        assert_eq!(
+            unit_key("web-link-evidence", "timeout").as_deref(),
+            Some(svc_timeouts::WEB_LINK_EVIDENCE.to_string().as_str())
+        );
+        // td-open's own deadline for one portal answer (td-open/src/main.rs).
+        let td_open_deadline_secs = 30;
+        // td-open's attempts each within td-open's deadline, then the
+        // layout's and the log's polls, a second apart, with headroom.
+        assert!(
+            WEB_LINK_OPEN_ATTEMPTS * (td_open_deadline_secs + 1) + WEB_LINK_ATTEMPTS * 3 + 10
+                <= svc_timeouts::WEB_LINK_EVIDENCE
+        );
         // Its evidence is news's, but td-jail is asked as the account whose
         // delegated cgroup holds the jail, not as the login user.
         let exec = unit_key("web-evidence", "exec").unwrap_or_default();
@@ -9811,6 +9873,7 @@ mod tests {
                                     | "mail"
                                     | "news"
                                     | "web"
+                                    | "web-link-evidence"
                                     | "shell-workspace"
                             ) =>
                     {
@@ -9847,6 +9910,7 @@ mod tests {
             "terminal",
             "web",
             "web-evidence",
+            "web-link-evidence",
         ];
         expected.sort();
         assert_eq!(skipped, expected);
@@ -10330,6 +10394,10 @@ mod tests {
             ("web-fetch", vec!["td-firstboot", "netup"]),
             ("web", vec!["busd", "web-fetch", "applications-workspace"]),
             ("web-evidence", vec!["web", "firefox-tls-setup"]),
+            (
+                "web-link-evidence",
+                vec!["web-evidence", "portal", "firefox-tls-setup"],
+            ),
             ("shell-workspace", vec!["mail", "news", "web"]),
             (
                 "placement-evidence",
@@ -10398,21 +10466,22 @@ mod tests {
         }
     }
 
-    /// The image ships exactly ONE application that holds a bus name. This is a
-    /// review tripwire on a second packaged bus-policy surface, not a proof
-    /// that the bus has one peer.
+    /// The image ships exactly TWO applications that hold a bus name, Firefox
+    /// and web, each with its oracle. This is a review tripwire on a third
+    /// packaged bus-policy surface, not a proof that the bus has two peers.
     ///
     /// td-jail binds `/run/td-bus/1000/bus` into every jail because the broker is
     /// the policy boundary. Well-known names, match rules, per-caller filtering
     /// and per-instance admission have landed, a jailed caller is told no
-    /// host pid, and the descriptor budget is charged per admission key. What
-    /// remains is that no boot oracle drives two applications' traffic on one
-    /// live bus: the entry that lifts this count brings that oracle. The
-    /// other applications ship with no bus policy at all: mail, news and web
-    /// are static td-owned programs with no D-Bus client, which the broker would
-    /// admit as a peer that sees and addresses only the portal and itself,
-    /// and the two surfaces it could once reach are now the closed gaps §D
-    /// names.
+    /// host pid, and the descriptor budget is charged per admission key. web's
+    /// link intake lifted the count to two and brought web-link-evidence, the
+    /// portal's call to the second holder beside Firefox's; a message one
+    /// application's peer routes to another's without the portal is still no
+    /// oracle's, so the entry that lifts this count again brings its own. mail
+    /// and news ship with no bus policy at all: their one D-Bus client is
+    /// td-open's or td-secret's portal call, which the broker admits as a peer
+    /// that sees and addresses only the portal and itself, and the two surfaces
+    /// it could once reach are now the closed gaps §D names.
     ///
     /// Which is NOT what this counts, and the gap is stated here rather than
     /// left for a reader to assume away. A package count does not bound peers:
@@ -10426,7 +10495,7 @@ mod tests {
     /// would not have to read. APPLICATIONS.md §D carries the rest of the
     /// sentence, including what the tripwire does not cover.
     #[test]
-    fn the_image_ships_one_bus_holding_application_until_remaining_bus_sharing_gaps_land() {
+    fn the_image_ships_bus_holding_applications_only_with_their_oracles() {
         let bus_holders: Vec<&str> = SHIPPED_APPLICATIONS
             .iter()
             .filter(|application| {
@@ -10439,16 +10508,18 @@ mod tests {
             .collect();
         assert_eq!(
             bus_holders,
-            vec![FIREFOX_NAME],
-            "a second application holding a bus name would be the first \
-             two-application traffic on one live bus, which no boot oracle \
-             drives yet: the entry that lifts this count brings the oracle. \
-             See APPLICATIONS.md §D for the limits of this tripwire"
+            vec![FIREFOX_NAME, TD_WEB_NAME],
+            "a third application holding a bus name would be traffic no boot \
+             oracle drives: web's is driven by web-link-evidence, a portal \
+             call to the second holder beside Firefox's. The entry that lifts \
+             this count brings its oracle. See APPLICATIONS.md §D for the \
+             limits of this tripwire"
         );
-        // Every other shipped application holds no bus name; the broker
-        // would admit it as a peer that sees and addresses only the portal
-        // and itself. mail, news and web are td-owned source builds on the
-        // data-only static runtime, each in a td-ui window of its own.
+        // Every other shipped application holds no bus name but web's link
+        // intake's; the broker would admit it as a peer that sees and
+        // addresses only the portal and itself. mail, news and web are
+        // td-owned source builds on the data-only static runtime, each in a
+        // td-ui window of its own.
         for application in SHIPPED_APPLICATIONS
             .iter()
             .filter(|application| application.name != FIREFOX_NAME)
@@ -10458,7 +10529,16 @@ mod tests {
                 .application_permissions
                 .as_ref()
                 .expect("a shipped application declares its permissions");
-            assert_eq!(permissions.session_bus().count(), 0, "{}", application.name);
+            let names = permissions
+                .session_bus()
+                .map(|(name, access)| format!("{name}={access:?}"))
+                .collect::<Vec<_>>();
+            let expected: &[&str] = if application.name == TD_WEB_NAME {
+                &["org.td.web.*=Own"]
+            } else {
+                &[]
+            };
+            assert_eq!(names, expected, "{}", application.name);
             // They draw in td-ui windows of their own and hold no terminal.
             assert!(
                 !permissions.terminal(),

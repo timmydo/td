@@ -3899,7 +3899,7 @@ mod tests {
     pub(super) fn service_state() -> ServiceState {
         ServiceState {
             application_policy: Some(app_policy::Policy::from_tables(
-                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnews\tservice\t\n",
+                "td-bus-applications-v2\t1000\nfirefox\tservice\torg.mozilla.firefox\nmail\tservice\t\nnews\tservice\t\nweb\tservice\t\n",
                 "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\napplication\tnews\t65538\napplication\tweb\t65540\n",
             ).unwrap()),
             ..ServiceState::default()

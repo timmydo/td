@@ -1,14 +1,16 @@
 //! org.freedesktop.portal.OpenURI: an `http` or `https` link goes to the
-//! running Firefox through its remote-control `OpenURL`; `file` and every
-//! other scheme are refused. `OpenFile`'s descriptor is copied into
-//! Firefox's handoff directory (`handoff.rs`) and Firefox is handed the
-//! copy the same way (APPLICATIONS.md §E row 4).
+//! running browser the caller names, Firefox by default and td-web when
+//! the request's `td.handler` option is `web`; `file` and every other
+//! scheme are refused. `OpenFile`'s descriptor is copied into Firefox's
+//! handoff directory (`handoff.rs`) and Firefox is handed the copy the same
+//! way; td-web opens no file (APPLICATIONS.md §E row 4).
 //!
 //! The handler is found on the bus, not started: the portal lists the names
-//! under Firefox's `org.mozilla.firefox.*` grant, resolves each one's owner
-//! in turn, and calls the first owner the broker places in the Firefox jail
-//! at Firefox's assigned UID. A same-uid process holding such a name outside
-//! the jail is not the browser: it is passed over and never called.
+//! under the handler's grant, `org.mozilla.firefox.*` or `org.td.web.*`,
+//! resolves each one's owner in turn, and calls the first owner the broker
+//! places in the handler's jail at its assigned UID. A same-uid process
+//! holding such a name outside the jail is not the browser: it is passed
+//! over and never called.
 
 use super::*;
 
@@ -29,12 +31,46 @@ const MAX_CANDIDATES: usize = 8;
 /// not answered: the broker keeps each in its pending-reply table until an
 /// answer or a departure, so a hung browser must not exhaust the portal's.
 const MAX_BROWSER_CALLS: usize = 8;
-const BROWSER: &str = "firefox";
-const REMOTE_PREFIX: &str = "org.mozilla.firefox.";
-const REMOTE_PATH: &str = "/org/mozilla/firefox/Remote";
-const REMOTE_INTERFACE: &str = "org.mozilla.firefox";
-const REMOTE_MEMBER: &str = "OpenURL";
 const FAILED: u32 = 2;
+/// The option naming the handler, a td extension the specification's rule
+/// for unknown options lets another portal ignore.
+const HANDLER_OPTION: &str = "td.handler";
+
+/// The browser a link is handed to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Handler {
+    /// Firefox's remote control: `OpenURL(ay)` with its command line.
+    Firefox,
+    /// td-web's link intake (td-web/src/links.rs): `OpenURL(s)`.
+    Web,
+}
+
+impl Handler {
+    /// The option's value naming a handler.
+    fn named(value: &str) -> Option<Self> {
+        match value {
+            "firefox" => Some(Self::Firefox),
+            "web" => Some(Self::Web),
+            _ => None,
+        }
+    }
+
+    /// The application the broker must place the name's owner in.
+    fn app_id(self) -> &'static str {
+        match self {
+            Self::Firefox => "firefox",
+            Self::Web => "web",
+        }
+    }
+
+    /// The names under the handler's grant start so, a suffix following.
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Firefox => "org.mozilla.firefox.",
+            Self::Web => "org.td.web.",
+        }
+    }
+}
 
 /// Where a request is: each stage waits on one outstanding call.
 #[derive(Debug, PartialEq)]
@@ -54,6 +90,7 @@ pub(super) struct Pending {
     /// `http`, `https`, or `file` for an OpenFile copy: the record's only
     /// trace of what was opened.
     scheme: &'static str,
+    handler: Handler,
     app: Option<String>,
     stage: Stage,
     /// Names still to try, the next last.
@@ -83,6 +120,14 @@ struct Parsed<'a> {
     uri: &'a str,
     https: bool,
     token: Option<&'a str>,
+    handler: Handler,
+}
+
+/// The options a request's handling reads.
+#[derive(Debug, PartialEq)]
+struct Options<'a> {
+    token: Option<&'a str>,
+    handler: Handler,
 }
 
 /// Why a URI is not one this portal opens, as `(error, text)`.
@@ -133,8 +178,13 @@ fn parse<'a>(call: &'a Message<'a>) -> Result<Parsed<'a>, Refusal> {
         return Err(refusal("the parent window handle is too long"));
     }
     let https = link(uri)?;
-    let token = token(options, false)?;
-    Ok(Parsed { uri, https, token })
+    let Options { token, handler } = read_options(options, false)?;
+    Ok(Parsed {
+        uri,
+        https,
+        token,
+        handler,
+    })
 }
 
 fn bus_call(
@@ -183,26 +233,38 @@ fn command_line(uri: &str) -> Option<Vec<u8>> {
     Some(buffer)
 }
 
-fn open_call(serial: u32, unique: &str, uri: &str) -> io::Result<Vec<u8>> {
-    let line =
-        command_line(uri).ok_or_else(|| io::Error::other("the browser command line overflowed"))?;
-    message::Builder::method_call(
-        Endian::Little,
-        REMOTE_PATH,
-        Some(REMOTE_INTERFACE),
-        REMOTE_MEMBER,
-    )
-    .destination(unique)
-    .serial(serial)
-    .body("ay", |writer| {
-        writer.array("y", |writer| {
-            writer.append(&line);
-            Ok(())
-        })
-    })
-    .map_err(wire_error)?
-    .encode()
-    .map_err(message_error)
+fn open_call(serial: u32, unique: &str, handler: Handler, uri: &str) -> io::Result<Vec<u8>> {
+    let builder = match handler {
+        Handler::Firefox => {
+            let line = command_line(uri)
+                .ok_or_else(|| io::Error::other("the browser command line overflowed"))?;
+            message::Builder::method_call(
+                Endian::Little,
+                "/org/mozilla/firefox/Remote",
+                Some("org.mozilla.firefox"),
+                "OpenURL",
+            )
+            .body("ay", |writer| {
+                writer.array("y", |writer| {
+                    writer.append(&line);
+                    Ok(())
+                })
+            })
+        }
+        Handler::Web => message::Builder::method_call(
+            Endian::Little,
+            "/org/td/web",
+            Some("org.td.web"),
+            "OpenURL",
+        )
+        .body("s", |writer| writer.string(uri)),
+    };
+    builder
+        .map_err(wire_error)?
+        .destination(unique)
+        .serial(serial)
+        .encode()
+        .map_err(message_error)
 }
 
 fn refuse(
@@ -239,15 +301,18 @@ pub(super) fn refuse_open_file(connection: &mut Connection, call: &Message<'_>) 
     )
 }
 
-/// The `handle_token` of `options`, checking the types of the options this
-/// interface defines and ignoring the rest, as the specification asks.
-/// For a file `writable` must be false: Firefox is handed a read-only copy.
-/// A link ignores it, as the specification does.
-fn token<'a>(options: &'a wire::Seq<'a>, file: bool) -> Result<Option<&'a str>, Refusal> {
+/// The `handle_token` and `td.handler` of `options`, checking the types of
+/// the options this interface defines and ignoring the rest, as the
+/// specification asks. For a file `writable` must be false: Firefox is
+/// handed a read-only copy. A link ignores it, as the specification does.
+/// `td.handler` names `firefox`, the default, or `web`, once; a file is
+/// Firefox's alone.
+fn read_options<'a>(options: &'a wire::Seq<'a>, file: bool) -> Result<Options<'a>, Refusal> {
     let entries = options
         .values(MAX_PORTAL_OPTIONS)
         .map_err(|_| refusal("the request has too many options"))?;
     let mut token = None;
+    let mut handler = None;
     for entry in &entries {
         let pair = entry
             .as_seq()
@@ -257,12 +322,27 @@ fn token<'a>(options: &'a wire::Seq<'a>, file: bool) -> Result<Option<&'a str>, 
             return Err(refusal("a request option has the wrong shape"));
         };
         let expected = match *key {
-            "handle_token" | "activation_token" => "s",
+            "handle_token" | "activation_token" | HANDLER_OPTION => "s",
             "writable" | "ask" => "b",
             _ => continue,
         };
         if value.signature() != expected {
             return Err(refusal("a request option has the wrong type"));
+        }
+        if *key == HANDLER_OPTION {
+            let values = value
+                .values(1)
+                .map_err(|_| refusal("td.handler has a malformed variant"))?;
+            let (Some(Value::Str(text)), None) = (values.first(), handler) else {
+                return Err(refusal("td.handler must appear once as a string"));
+            };
+            let named =
+                Handler::named(text).ok_or_else(|| refusal("td.handler names firefox or web"))?;
+            if file && named != Handler::Firefox {
+                return Err((UNSUPPORTED_OPEN, "td-web opens links, not files"));
+            }
+            handler = Some(named);
+            continue;
         }
         if *key == "writable" {
             if file && value.values(1).ok().as_deref() == Some(&[Value::Bool(true)][..]) {
@@ -287,7 +367,10 @@ fn token<'a>(options: &'a wire::Seq<'a>, file: bool) -> Result<Option<&'a str>, 
         }
         token = Some(*text);
     }
-    Ok(token)
+    Ok(Options {
+        token,
+        handler: handler.unwrap_or(Handler::Firefox),
+    })
 }
 
 /// OpenFile: copies the one descriptor into Firefox's handoff directory,
@@ -303,7 +386,7 @@ pub(super) fn begin_file(
         .sender
         .ok_or_else(|| io::Error::other("OpenFile has no broker sender"))?;
     let token = match parse_file(call) {
-        Ok(token) => token,
+        Ok(options) => options.token,
         Err(why) => return refuse(connection, call, owner, why),
     };
     let [file] = files.as_slice() else {
@@ -322,16 +405,23 @@ pub(super) fn begin_file(
         Ok(copied) => copied,
         Err(text) => {
             state.handles.retire(&path);
-            eprintln!("TD-PORTAL-OPEN-URI app=- scheme=file response=- outcome=not-copied");
+            eprintln!(
+                "TD-PORTAL-OPEN-URI app=- scheme=file handler=firefox response=- outcome=not-copied"
+            );
             return refuse(connection, call, owner, (UNSUPPORTED_OPEN, text));
         }
     };
-    start(connection, state, call, owner, path, copied.url, "file")
+    let link = Link {
+        uri: copied.url,
+        scheme: "file",
+        handler: Handler::Firefox,
+    };
+    start(connection, state, call, owner, path, link)
 }
 
 /// OpenFile's arguments: an empty or bounded parent, exactly one received
 /// descriptor at index 0, and options.
-fn parse_file<'a>(call: &'a Message<'a>) -> Result<Option<&'a str>, Refusal> {
+fn parse_file<'a>(call: &'a Message<'a>) -> Result<Options<'a>, Refusal> {
     if !exact_signature(call, "sha{sv}") {
         return Err(refusal(
             "OpenFile takes a parent, one file descriptor and options",
@@ -345,7 +435,7 @@ fn parse_file<'a>(call: &'a Message<'a>) -> Result<Option<&'a str>, Refusal> {
     if parent.len() > MAX_PARENT_BYTES {
         return Err(refusal("the parent window handle is too long"));
     }
-    token(options, true)
+    read_options(options, true)
 }
 
 /// Why a new request from `owner` is refused for the request bound, if it is.
@@ -383,15 +473,19 @@ pub(super) fn begin(
     let Some(path) = reserve(connection, state, call, owner, parsed.token)? else {
         return Ok(());
     };
-    start(
-        connection,
-        state,
-        call,
-        owner,
-        path,
-        parsed.uri.to_string(),
+    let link = Link {
+        uri: parsed.uri.to_string(),
         scheme,
-    )
+        handler: parsed.handler,
+    };
+    start(connection, state, call, owner, path, link)
+}
+
+/// What a request hands a browser, and which browser.
+struct Link {
+    uri: String,
+    scheme: &'static str,
+    handler: Handler,
 }
 
 /// Reserves the caller's Request, or refuses the call and returns None.
@@ -426,16 +520,20 @@ fn reserve(
 }
 
 /// Answers the call with its reserved Request `path` and asks who the
-/// caller is: the first stage of handing `uri` to the browser.
+/// caller is: the first stage of handing `link` to its browser.
 fn start(
     connection: &mut Connection,
     state: &mut ServiceState,
     call: &Message<'_>,
     owner: &str,
     path: String,
-    uri: String,
-    scheme: &'static str,
+    link: Link,
 ) -> io::Result<()> {
+    let Link {
+        uri,
+        scheme,
+        handler,
+    } = link;
     if call.flags & message::FLAG_NO_REPLY_EXPECTED == 0 {
         let serial = connection.next_serial()?;
         connection.write_frame(&method_return(
@@ -457,6 +555,7 @@ fn start(
             endian: call.endian,
             uri,
             scheme,
+            handler,
             app: None,
             stage: Stage::Caller,
             candidates: Vec::new(),
@@ -467,9 +566,9 @@ fn start(
     connection.write_frame(&query)
 }
 
-/// The held names under Firefox's remote-control grant, in order, at most
+/// The held names under `handler`'s grant, in order, at most
 /// `MAX_CANDIDATES` of them.
-fn remote_names(reply: &Message<'_>) -> Vec<String> {
+fn remote_names(reply: &Message<'_>, handler: Handler) -> Vec<String> {
     let [Value::Array(names)] = reply.args() else {
         return Vec::new();
     };
@@ -479,7 +578,7 @@ fn remote_names(reply: &Message<'_>) -> Vec<String> {
         .into_iter()
         .filter_map(|name| name.as_str())
         .filter(|name| {
-            name.strip_prefix(REMOTE_PREFIX)
+            name.strip_prefix(handler.prefix())
                 .is_some_and(|rest| !rest.is_empty())
                 && name::valid_well_known_name(name)
         })
@@ -574,7 +673,7 @@ pub(super) fn reply(
             pending.candidates = if failed {
                 Vec::new()
             } else {
-                remote_names(reply)
+                remote_names(reply, pending.handler)
             };
             pending.candidates.reverse();
             return next_candidate(connection, state, pending);
@@ -599,7 +698,7 @@ pub(super) fn reply(
                 .ok()
                 .flatten()
                 .as_deref()
-                == Some(BROWSER);
+                == Some(pending.handler.app_id());
             if !browser {
                 pending.impostor = true;
                 return next_candidate(connection, state, pending);
@@ -608,7 +707,7 @@ pub(super) fn reply(
                 return finish(connection, state, pending, FAILED, "browser-unresponsive");
             }
             let serial = connection.next_serial()?;
-            let call = open_call(serial, &unique, &pending.uri)?;
+            let call = open_call(serial, &unique, pending.handler, &pending.uri)?;
             (Stage::Open { unique }, (serial, call))
         }
         Stage::Open { .. } => {
@@ -692,9 +791,10 @@ fn finish(
 
 fn record(pending: &Pending, response: u32, outcome: &str) -> String {
     format!(
-        "TD-PORTAL-OPEN-URI app={} scheme={} response={response} outcome={outcome}",
+        "TD-PORTAL-OPEN-URI app={} scheme={} handler={} response={response} outcome={outcome}",
         pending.app.as_deref().unwrap_or("-"),
         pending.scheme,
+        pending.handler.app_id(),
     )
 }
 
@@ -869,12 +969,12 @@ mod tests {
         expected.extend_from_slice(&22i32.to_le_bytes());
         expected.extend_from_slice(b"/\0firefox\0https://e.example/\0");
         assert_eq!(line, expected);
-        let frame = open_call(5, ":1.9", "https://e.example/").unwrap();
+        let frame = open_call(5, ":1.9", Handler::Firefox, "https://e.example/").unwrap();
         let (message, _) = message::decode(&frame, 0).unwrap();
         assert_eq!(message.fields.destination, Some(":1.9"));
-        assert_eq!(message.fields.path, Some(REMOTE_PATH));
-        assert_eq!(message.fields.interface, Some(REMOTE_INTERFACE));
-        assert_eq!(message.fields.member, Some(REMOTE_MEMBER));
+        assert_eq!(message.fields.path, Some("/org/mozilla/firefox/Remote"));
+        assert_eq!(message.fields.interface, Some("org.mozilla.firefox"));
+        assert_eq!(message.fields.member, Some("OpenURL"));
         assert_eq!(message.fields.signature, Some("ay"));
         let [Value::Array(bytes)] = message.args() else {
             panic!("OpenURL carries one byte array");
@@ -903,7 +1003,7 @@ mod tests {
         let pick = |list: &[&str]| {
             let frame = names(list);
             let (message, _) = message::decode(&frame, 0).unwrap();
-            remote_names(&message)
+            remote_names(&message, Handler::Firefox)
         };
         assert_eq!(
             pick(&[
@@ -1049,6 +1149,195 @@ mod tests {
             message.fields.member.unwrap_or_default().to_string(),
             message.fields.destination.map(str::to_string),
         )
+    }
+
+    /// An OpenURI call naming `handler` in its `td.handler` option.
+    fn open_for(uri: &str, handler: &str) -> Vec<u8> {
+        call("ssa{sv}", |writer| {
+            writer.string("")?;
+            writer.string(uri)?;
+            writer.array("{sv}", |writer| {
+                writer.dict_entry(|writer| {
+                    writer.string("handle_token")?;
+                    writer.variant("s", |writer| writer.string("t1"))
+                })?;
+                writer.dict_entry(|writer| {
+                    writer.string(HANDLER_OPTION)?;
+                    writer.variant("s", |writer| writer.string(handler))
+                })
+            })
+        })
+    }
+
+    /// The handler a call's options name, or why they are refused.
+    fn handler_of(frame: &[u8]) -> Result<Handler, Refusal> {
+        let (message, _) = message::decode(frame, 0).unwrap();
+        parse(&message).map(|parsed| parsed.handler)
+    }
+
+    /// `td.handler` names Firefox, the default, or td-web, once, as a
+    /// string; anything else is refused before any handle is taken.
+    #[test]
+    fn the_handler_option_names_firefox_or_web() {
+        assert_eq!(
+            handler_of(&open("https://e.example/", None)),
+            Ok(Handler::Firefox)
+        );
+        assert_eq!(
+            handler_of(&open_for("https://e.example/", "firefox")),
+            Ok(Handler::Firefox)
+        );
+        assert_eq!(
+            handler_of(&open_for("https://e.example/", "web")),
+            Ok(Handler::Web)
+        );
+        for named in ["Web", "chromium", ""] {
+            assert!(
+                handler_of(&open_for("https://e.example/", named)).is_err(),
+                "{named}"
+            );
+        }
+        let twice = call("ssa{sv}", |writer| {
+            writer.string("")?;
+            writer.string("https://e.example/")?;
+            writer.array("{sv}", |writer| {
+                for named in ["web", "web"] {
+                    writer.dict_entry(|writer| {
+                        writer.string(HANDLER_OPTION)?;
+                        writer.variant("s", |writer| writer.string(named))
+                    })?;
+                }
+                Ok(())
+            })
+        });
+        assert!(handler_of(&twice).is_err());
+        let typed = call("ssa{sv}", |writer| {
+            writer.string("")?;
+            writer.string("https://e.example/")?;
+            writer.array("{sv}", |writer| {
+                writer.dict_entry(|writer| {
+                    writer.string(HANDLER_OPTION)?;
+                    writer.variant("b", |writer| {
+                        writer.bool(true);
+                        Ok(())
+                    })
+                })
+            })
+        });
+        assert!(handler_of(&typed).is_err());
+    }
+
+    /// OpenFile is Firefox's alone: `td.handler=web` with a file is
+    /// NotSupported, never opened in Firefox instead; `firefox` is admitted.
+    #[test]
+    fn a_file_for_td_web_is_refused() {
+        let options = |handler: &str| {
+            let frame = open_for("https://e.example/", handler);
+            let (message, _) = message::decode(&frame, 0).unwrap();
+            let [_, _, Value::Array(options)] = message.args() else {
+                panic!("OpenURI carries a parent, the link and options");
+            };
+            read_options(options, true).map(|options| options.handler)
+        };
+        assert_eq!(
+            options("web"),
+            Err((UNSUPPORTED_OPEN, "td-web opens links, not files"))
+        );
+        assert_eq!(options("firefox"), Ok(Handler::Firefox));
+    }
+
+    /// A link for td-web goes to the first name under td-web's grant whose
+    /// owner the broker places in the `web` application, as `OpenURL(s)`;
+    /// a Firefox owner holding such a name is passed over, and Firefox's
+    /// own names are not td-web's.
+    #[test]
+    fn a_link_for_td_web_goes_to_td_webs_intake() {
+        let mut broker = Broker::new();
+        let frame = open_for("https://e.example/a", "web");
+        let (call, _) = message::decode(&frame, 0).unwrap();
+        begin(&mut broker.connection, &mut broker.state, &call).unwrap();
+        broker.next();
+        let query = broker.next();
+        broker.answer(
+            &query,
+            BUS_NAME,
+            false,
+            "a{sv}",
+            credentials(65537, Some("mail")),
+        );
+        let list = broker.next();
+        assert_eq!(member(&list).0, "ListNames");
+        broker.answer(&list, BUS_NAME, false, "as", |writer| {
+            writer.array("s", |writer| {
+                for name in [
+                    "org.mozilla.firefox.p",
+                    "org.td.web",
+                    "org.td.web.a",
+                    "org.td.web.p42",
+                ] {
+                    writer.string(name)?;
+                }
+                Ok(())
+            })
+        });
+        // The first candidate, held by Firefox: passed over.
+        let owner = broker.next();
+        let (owner_call, _) = message::decode(&owner, 0).unwrap();
+        assert_eq!(owner_call.args(), vec![Value::Str("org.td.web.a")]);
+        broker.answer(&owner, BUS_NAME, false, "s", |writer| writer.string(":1.8"));
+        let identity = broker.next();
+        broker.answer(
+            &identity,
+            BUS_NAME,
+            false,
+            "a{sv}",
+            credentials(65536, Some("firefox")),
+        );
+        let owner = broker.next();
+        let (owner_call, _) = message::decode(&owner, 0).unwrap();
+        assert_eq!(owner_call.args(), vec![Value::Str("org.td.web.p42")]);
+        broker.answer(&owner, BUS_NAME, false, "s", |writer| writer.string(":1.9"));
+        let identity = broker.next();
+        broker.answer(
+            &identity,
+            BUS_NAME,
+            false,
+            "a{sv}",
+            credentials(65540, Some("web")),
+        );
+        let open = broker.next();
+        let (open_call, _) = message::decode(&open, 0).unwrap();
+        assert_eq!(open_call.fields.destination, Some(":1.9"));
+        assert_eq!(open_call.fields.path, Some("/org/td/web"));
+        assert_eq!(open_call.fields.interface, Some("org.td.web"));
+        assert_eq!(open_call.fields.member, Some("OpenURL"));
+        assert_eq!(open_call.args(), vec![Value::Str("https://e.example/a")]);
+        broker.answer(&open, ":1.9", false, "", |_| Ok(()));
+        assert_eq!(response(&broker.next()), 0);
+    }
+
+    /// With no td-web holding a name under its grant, a link for it fails;
+    /// it does not fall back to Firefox.
+    #[test]
+    fn a_link_for_td_web_never_falls_back_to_firefox() {
+        let mut broker = Broker::new();
+        let frame = open_for("https://e.example/a", "web");
+        let (call, _) = message::decode(&frame, 0).unwrap();
+        begin(&mut broker.connection, &mut broker.state, &call).unwrap();
+        broker.next();
+        let query = broker.next();
+        broker.answer(
+            &query,
+            BUS_NAME,
+            false,
+            "a{sv}",
+            credentials(65537, Some("mail")),
+        );
+        let list = broker.next();
+        broker.answer(&list, BUS_NAME, false, "as", |writer| {
+            writer.array("s", |writer| writer.string("org.mozilla.firefox.p"))
+        });
+        assert_eq!(response(&broker.next()), FAILED);
     }
 
     /// Drives one request from the call to the browser's question.
@@ -1629,6 +1918,7 @@ mod tests {
             endian: Endian::Little,
             uri: "https://secret.example/token".into(),
             scheme: "https",
+            handler: Handler::Firefox,
             app: Some("news".into()),
             stage: Stage::Open {
                 unique: ":1.9".into(),
@@ -1640,8 +1930,17 @@ mod tests {
         let line = record(&pending, 0, "opened");
         assert_eq!(
             line,
-            "TD-PORTAL-OPEN-URI app=news scheme=https response=0 outcome=opened"
+            "TD-PORTAL-OPEN-URI app=news scheme=https handler=firefox response=0 outcome=opened"
         );
         assert!(!line.contains("secret"));
+        let for_web = Pending {
+            handler: Handler::Web,
+            app: None,
+            ..pending
+        };
+        assert_eq!(
+            record(&for_web, 0, "opened"),
+            "TD-PORTAL-OPEN-URI app=- scheme=https handler=web response=0 outcome=opened"
+        );
     }
 }

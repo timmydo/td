@@ -1449,6 +1449,15 @@ pub const TD_NEWS_BOOT_MARKER: &str = "TD-NEWS-RUNNING";
 // the workload ledger's account with its own fetch service's directory
 // bound, and its stage 2 holds its allowlist's name.
 pub const TD_WEB_BOOT_MARKER: &str = "TD-WEB-RUNNING";
+// Printed by the `web-link-evidence` unit under the autotest token once a
+// link the human's own process asked the portal to give td-web
+// (`td-open --with web`) was routed to td-web's bus name beside Firefox's,
+// td-web's window shows it, and the portal's log records it opened for
+// td-web: the first portal call to a second bus-holding application.
+pub const TD_WEB_LINK_MARKER: &str = "TD-WEB-LINK-OPENED";
+// The link it hands td-web: loopback, which td-fetchd refuses at once, so
+// the window shows its error page titled by the link and needs no network.
+pub const TD_WEB_LINK_TARGET: &str = "https://127.0.0.1/td-web-link";
 // Printed by the `fetch-evidence` unit under the autotest token once
 // td-fetchd's probe, as the UI user, has asked the fetch service for a
 // loopback URL and received the policy's exact refusal: the socket is

@@ -332,6 +332,9 @@ const TD_NEWS_BOOT_MARKER: &str = td_recipe::shared::TD_NEWS_BOOT_MARKER;
 // Printed by the `web-evidence` unit as mail's and news's are, td-jail asked as
 // td-web's own account, whose cgroup holds the jail.
 const TD_WEB_BOOT_MARKER: &str = td_recipe::shared::TD_WEB_BOOT_MARKER;
+// Printed by the `web-link-evidence` unit once the portal handed td-web a
+// link the human's own process asked td-web for, and td-web showed it.
+const TD_WEB_LINK_MARKER: &str = td_recipe::shared::TD_WEB_LINK_MARKER;
 const TD_APPLICATIONS_PLACED_MARKER: &str = td_recipe::shared::TD_APPLICATIONS_PLACED_MARKER;
 
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
@@ -702,6 +705,7 @@ struct ConsoleEvidence {
     td_mail_running: bool,
     td_news_running: bool,
     td_web_running: bool,
+    td_web_link_opened: bool,
     td_applications_placed: bool,
     persist_write: bool,
     persist_read: bool,
@@ -2481,15 +2485,24 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
-    if !result.evidence.td_web_running {
+    if !result.evidence.td_web_running || !result.evidence.td_web_link_opened {
+        let said = |seen| if seen { "seen" } else { "absent" };
         return Err(format!(
-            "td-web's running marker was absent ({TD_WEB_BOOT_MARKER:?}) — its \
+            "td-web's evidence was incomplete: running marker {TD_WEB_BOOT_MARKER:?} {}, \
+             link marker {TD_WEB_LINK_MARKER:?} {}. Without the first, its \
              launch as its own account (its workload ledger row, td-firstboot's home \
              and runtime directory for it), \
              its own fetch service's directory, its jail, or the program itself failed \
              within the settle window, its window never reported ready, or its stage 2 \
-             did not hold its allowlist's name (--probe-application-filter). \
+             did not hold its allowlist's name (--probe-application-filter). Without \
+             the second, the portal did not hand td-web the link td-open asked td-web \
+             for (td-web took no `org.td.web.*` name, the broker did not place its \
+             owner in the web application, or td-web refused the portal's call), \
+             td-web's window never showed it, or the portal's log did not record it \
+             opened for td-web; web-link-evidence's own line says which. \
              Last serial output:\n{}",
+            said(result.evidence.td_web_running),
+            said(result.evidence.td_web_link_opened),
             tail(&result.console, 80)
         ));
     }
@@ -6914,6 +6927,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_MAIL_BOOT_MARKER),
         exact_line_window(TD_NEWS_BOOT_MARKER),
         exact_line_window(TD_WEB_BOOT_MARKER),
+        exact_line_window(TD_WEB_LINK_MARKER),
         exact_line_window(TD_APPLICATIONS_PLACED_MARKER),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
@@ -7532,6 +7546,12 @@ fn latch_console_evidence_from(
         &mut evidence.td_web_running,
         buf,
         TD_WEB_BOOT_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_web_link_opened,
+        buf,
+        TD_WEB_LINK_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -11961,6 +11981,7 @@ mod tests {
             TD_MAIL_BOOT_MARKER,
             TD_NEWS_BOOT_MARKER,
             TD_WEB_BOOT_MARKER,
+            TD_WEB_LINK_MARKER,
             TD_APPLICATIONS_PLACED_MARKER,
         ]
     }
@@ -12331,6 +12352,7 @@ mod tests {
         evidence.td_mail_running = true;
         evidence.td_news_running = true;
         evidence.td_web_running = true;
+        evidence.td_web_link_opened = true;
         evidence.td_applications_placed = true;
         evidence.td_txt_runtime = true;
         evidence.td_util_runtime = true;
@@ -12979,8 +13001,19 @@ mod tests {
         let complaint = validate(&boot(without_web))
             .expect_err("a boot missing td-web's marker must be rejected");
         assert!(
-            complaint.contains(&format!("({TD_WEB_BOOT_MARKER:?})")),
+            complaint.contains(&format!("{TD_WEB_BOOT_MARKER:?} absent"))
+                && complaint.contains(&format!("{TD_WEB_LINK_MARKER:?} seen")),
             "the rejection must name td-web's marker: {complaint}"
+        );
+
+        let mut without_link = healthy_evidence();
+        without_link.td_web_link_opened = false;
+        let complaint = validate(&boot(without_link))
+            .expect_err("a boot missing td-web's link marker must be rejected");
+        assert!(
+            complaint.contains(&format!("{TD_WEB_LINK_MARKER:?} absent"))
+                && complaint.contains(&format!("{TD_WEB_BOOT_MARKER:?} seen")),
+            "the rejection must name td-web's link marker: {complaint}"
         );
 
         let mut without_placement = healthy_evidence();
@@ -13002,6 +13035,7 @@ mod tests {
                 evidence.td_mail_running,
                 evidence.td_news_running,
                 evidence.td_web_running,
+                evidence.td_web_link_opened,
                 evidence.td_applications_placed,
                 evidence.td_software_install,
                 evidence.td_grant_request,
@@ -13014,6 +13048,7 @@ mod tests {
             TD_MAIL_BOOT_MARKER,
             TD_NEWS_BOOT_MARKER,
             TD_WEB_BOOT_MARKER,
+            TD_WEB_LINK_MARKER,
             TD_APPLICATIONS_PLACED_MARKER,
             TD_SOFTWARE_INSTALL_MARKER,
             TD_GRANT_REQUEST_MARKER,
@@ -13031,7 +13066,7 @@ mod tests {
                 format!("\n..{marker}\n"),
             ] {
                 latch_console_evidence(&mut evidence, noise.as_bytes(), b"target");
-                assert_eq!(latched(&evidence), [false; 9], "accepted {noise:?}");
+                assert_eq!(latched(&evidence), [false; 10], "accepted {noise:?}");
             }
             // Both line endings the console can carry.
             let terminator = if index == 1 { "\n" } else { "\r\n" };
@@ -13040,7 +13075,7 @@ mod tests {
                 format!("\n{marker}{terminator}").as_bytes(),
                 b"target",
             );
-            let mut expected = [false; 9];
+            let mut expected = [false; 10];
             if let Some(slot) = expected.get_mut(index) {
                 *slot = true;
             }

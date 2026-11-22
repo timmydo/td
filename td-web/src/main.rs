@@ -4,15 +4,82 @@
 #![forbid(unsafe_code)]
 
 mod app;
+// The bus address and authentication line, and the codec every td bus
+// client shares, for the link intake (`links.rs`).
+#[path = "../../td-busd/src/bus_client.rs"]
+// Its own tests, compiled here too, keep their unwraps and panics.
+#[cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
+#[allow(
+    dead_code,
+    reason = "the shared bus client is broader than the link intake"
+)]
+mod bus_client;
 mod document;
 mod fetch;
+mod links;
 #[cfg(test)]
 mod made;
 mod memory;
+#[path = "../../td-busd/src/message.rs"]
+// Its own tests, compiled here too, keep their unwraps and panics.
+#[cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
+#[allow(
+    dead_code,
+    reason = "the shared broker codec is broader than one client"
+)]
+mod message;
+#[path = "../../td-busd/src/name.rs"]
+// Its own tests, compiled here too, keep their unwraps and panics.
+#[cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
+#[allow(
+    dead_code,
+    reason = "the shared broker codec is broader than one client"
+)]
+mod name;
 mod picture;
 mod pictures;
 mod save;
 mod subresource;
+#[path = "../../td-busd/src/wire.rs"]
+// Its own tests, compiled here too, keep their unwraps and panics.
+#[cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
+#[allow(
+    dead_code,
+    reason = "the shared broker codec is broader than one client"
+)]
+mod wire;
 mod worker;
 
 use std::ffi::OsString;

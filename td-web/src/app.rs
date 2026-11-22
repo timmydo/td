@@ -62,6 +62,12 @@ const ACROSS: i64 = 4;
 const LOADING_WAIT_MS: u64 = 50;
 /// The most of the control socket's requests one turn answers.
 const CONTROL_PER_TURN: usize = 4;
+/// Links the portal handed td-web opened each turn: as many as may wait.
+const LINKS_PER_TURN: usize = 4;
+/// How often an idle window looks for a link the portal handed td-web: a
+/// quarter second, which a person does not wait on, rather than the
+/// loading pace for the whole life of the shipped program.
+const LINKS_WAIT_MS: u64 = 250;
 const IDLE_WAIT_MS: u64 = 1000;
 /// The least viewport, in ems of td-ui's prose size: a narrower pane
 /// shows the page's left and scrolls across it.
@@ -445,6 +451,8 @@ pub struct App {
     /// The seam served on a control socket (`control`), when started
     /// with one.
     control: Option<Control<Payload>>,
+    /// Links the portal hands td-web (`links.rs`), when it takes them.
+    links: Option<Receiver<String>>,
     /// A press the seam delivered and has not released: its moves are
     /// the drag's, as the window's are while its button is held.
     driven_press: bool,
@@ -666,6 +674,7 @@ impl App {
             drag_scrolled: None,
             scratch,
             control: None,
+            links: None,
             driven_press: false,
         })
     }
@@ -2697,6 +2706,7 @@ impl Handler for App {
         }
         self.drag_scroll(now);
         self.serve_control();
+        self.take_links();
         self.flow()
     }
 
@@ -2711,6 +2721,8 @@ impl Handler for App {
             || self.control.is_some()
         {
             LOADING_WAIT_MS
+        } else if self.links.is_some() {
+            LINKS_WAIT_MS
         } else {
             IDLE_WAIT_MS
         }
@@ -2883,6 +2895,32 @@ impl App {
         }
     }
 
+    /// Opens the links the portal has handed td-web since the last turn,
+    /// each as a typed address: one taken while another loads supersedes
+    /// it, as a second typed address does.
+    fn take_links(&mut self) {
+        let Some(links) = self.links.take() else {
+            return;
+        };
+        let mut open = true;
+        for _ in 0..LINKS_PER_TURN {
+            match links.try_recv() {
+                Ok(link) => {
+                    self.open(&link);
+                    self.redraw = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    open = false;
+                    break;
+                }
+            }
+        }
+        if open {
+            self.links = Some(links);
+        }
+    }
+
     /// Answers at most `CONTROL_PER_TURN` of what the control socket
     /// asked, through the paths the window's own inputs take; a worker
     /// that stopped is said once and let go.
@@ -2946,6 +2984,10 @@ pub fn run(start: Option<String>, control: Option<PathBuf>) -> Result<(), String
     let mut app = App::new(Arc::new(fetch::Service), surface, prose.clone())?;
     app.home = std::env::var_os("HOME").map(PathBuf::from);
     app.control = control;
+    app.links = crate::links::start(
+        std::env::var_os(crate::links::SETTING).as_deref(),
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
+    );
     if let Some(start) = start {
         app.open(&start);
     }
@@ -3198,6 +3240,31 @@ mod tests {
     /// `count` paragraphs, `line N` each.
     fn numbered(count: usize) -> String {
         (0..count).map(|n| format!("<p>line {n}</p>")).collect()
+    }
+
+    /// A link the portal handed td-web opens as a typed address, the page
+    /// it replaces kept in history; of two taken in one turn the later is
+    /// the navigation. Once the intake ends, none is taken.
+    #[test]
+    fn links_handed_to_td_web_open_in_the_window() {
+        let mut app = app(site());
+        let (links, window) = mpsc::sync_channel(4);
+        app.links = Some(window);
+        links.send("https://example.org/".to_string()).unwrap();
+        settle(&mut app);
+        links.send("HTTPS://EXAMPLE.ORG/a".to_string()).unwrap();
+        settle(&mut app);
+        assert_eq!(app.address.text(), "https://example.org/a");
+        assert_eq!(history(&app).0, vec!["https://example.org/".to_string()]);
+        links
+            .send("https://example.org/missing".to_string())
+            .unwrap();
+        links.send("https://example.org/".to_string()).unwrap();
+        settle(&mut app);
+        assert_eq!(app.address.text(), "https://example.org/");
+        drop(links);
+        app.poll(0);
+        assert!(app.links.is_none());
     }
 
     #[test]

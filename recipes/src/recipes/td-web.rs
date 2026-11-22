@@ -17,6 +17,7 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&[
             "td-av1",
             "td-avif",
+            "td-busd",
             "td-charset",
             "td-css",
             "td-dom",
@@ -61,6 +62,7 @@ mod tests {
             Some(vec![
                 "td-av1".into(),
                 "td-avif".into(),
+                "td-busd".into(),
                 "td-charset".into(),
                 "td-css".into(),
                 "td-dom".into(),

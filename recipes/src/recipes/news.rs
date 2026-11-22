@@ -37,9 +37,9 @@ pub fn recipe() -> Recipe {
     // window the program draws in as well as the one the jail requires of
     // every application. No terminal grant: the reader draws through
     // td-ui, and a pty would be a descriptor nothing reads. No bus name:
-    // the opener is a portal client, which the default grant admits, and
-    // the image's one bus-holding application stays Firefox
-    // (system-x86-64's tripwire).
+    // the opener is a portal client, which the default grant admits; the
+    // image's bus-holding applications are Firefox and web, each with its
+    // oracle (system-x86-64's tripwire).
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))

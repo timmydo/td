@@ -15,8 +15,10 @@
 //! `$BROWSER` and `$OPENER`: td-ui's opener runs it with a link or a
 //! `file://` URL, and td-mail's attachment opener with a path. A link goes
 //! to `OpenURI`; a file is opened here, in the application's own view, and
-//! its descriptor goes to `OpenFile`, which copies it for the browser. The
-//! portal, not this program, decides what is opened and by whom.
+//! its descriptor goes to `OpenFile`, which copies it for the browser.
+//! `--with firefox` or `--with web` asks for that browser by the request's
+//! `td.handler` option; without it the portal's default, Firefox, opens
+//! it. The portal, not this program, decides what is opened and by whom.
 
 // The bus address, bounded connect and SASL opening every td client shares.
 #[path = "../../td-busd/src/bus_client.rs"]
@@ -61,7 +63,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use wire::{Endian, Value};
 
-const USAGE: &str = "usage: td-open LINK|FILE-URL|PATH";
+const USAGE: &str = "usage: td-open [--with firefox|web] LINK|FILE-URL|PATH";
+/// The portal's option naming the browser (td-portal/src/open_uri.rs).
+const HANDLER_OPTION: &str = "td.handler";
 const BUS: &str = "org.freedesktop.DBus";
 const BUS_PATH: &str = "/org/freedesktop/DBus";
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
@@ -173,11 +177,28 @@ fn hex(digit: u8) -> Option<u8> {
     }
 }
 
+/// The browser asked for, if any, and the one thing to open.
+fn arguments(arguments: &[OsString]) -> Result<(Option<&'static str>, &OsString), String> {
+    match arguments {
+        [argument] => Ok((None, argument)),
+        [flag, handler, argument] if flag == "--with" => {
+            let handler = match handler.to_str() {
+                Some("firefox") => "firefox",
+                Some("web") => "web",
+                _ => return Err(USAGE.into()),
+            };
+            Ok((Some(handler), argument))
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
 fn run(arguments: Vec<OsString>) -> Result<(), String> {
-    let [argument] = arguments.as_slice() else {
-        return Err(USAGE.into());
-    };
+    let (handler, argument) = self::arguments(&arguments)?;
     let target = target(argument)?;
+    if matches!(target, Target::File(_)) && handler == Some("web") {
+        return Err("td-web opens links, not files".into());
+    }
     let address = std::env::var("DBUS_SESSION_BUS_ADDRESS")
         .map_err(|_| "no session bus in this environment")?;
     let uid = fs::metadata("/proc/self")
@@ -187,6 +208,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         &bus_path(&address)?,
         uid,
         &target,
+        handler,
         Instant::now()
             .checked_add(DEADLINE)
             .ok_or("deadline overflow")?,
@@ -373,7 +395,13 @@ fn one_string(frame: &[u8], signature: &str) -> Result<String, String> {
     }
 }
 
-fn open(bus: &Path, uid: u32, target: &Target, deadline: Instant) -> Result<(), String> {
+fn open(
+    bus: &Path,
+    uid: u32,
+    target: &Target,
+    handler: Option<&str>,
+    deadline: Instant,
+) -> Result<(), String> {
     let stream = connect(bus, deadline)?;
     let mut client = Client {
         stream,
@@ -396,7 +424,14 @@ fn open(bus: &Path, uid: u32, target: &Target, deadline: Instant) -> Result<(), 
             writer.dict_entry(|writer| {
                 writer.string("handle_token")?;
                 writer.variant("s", |writer| writer.string(TOKEN))
-            })
+            })?;
+            match handler {
+                Some(handler) => writer.dict_entry(|writer| {
+                    writer.string(HANDLER_OPTION)?;
+                    writer.variant("s", |writer| writer.string(handler))
+                }),
+                None => Ok(()),
+            }
         })
     };
     // The portal sends the Response to this connection directly, which the
@@ -537,6 +572,61 @@ mod tests {
     fn arguments_are_exactly_one_link() {
         assert_eq!(run(Vec::new()).unwrap_err(), USAGE);
         assert_eq!(run(vec!["a".into(), "b".into()]).unwrap_err(), USAGE);
+        let list = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        let given = list(&["--with", "web", "https://e.example/"]);
+        assert_eq!(
+            arguments(&given).unwrap(),
+            (Some("web"), &OsString::from("https://e.example/"))
+        );
+        let given = list(&["--with", "firefox", "https://e.example/"]);
+        assert_eq!(arguments(&given).unwrap().0, Some("firefox"));
+        for wrong in [
+            &["--with", "chromium", "https://e.example/"][..],
+            &["--with", "web"],
+            &["--handler", "web", "https://e.example/"],
+            &["https://e.example/", "--with", "web"],
+        ] {
+            assert_eq!(arguments(&list(wrong)).unwrap_err(), USAGE, "{wrong:?}");
+        }
+        // td-web opens no file.
+        let path = std::env::current_exe().unwrap();
+        let given = vec!["--with".into(), "web".into(), path.into_os_string()];
+        assert_eq!(run(given).unwrap_err(), "td-web opens links, not files");
+    }
+
+    /// `--with` names the browser in the request's `td.handler` option, beside
+    /// its handle token; without it the option is absent.
+    #[test]
+    fn the_browser_asked_for_rides_in_the_options() {
+        let handlers = |call: &[u8]| {
+            let (call, _) = message::decode(call, 0).unwrap();
+            let [_, _, Value::Array(options)] = call.args() else {
+                panic!("OpenURI carries a parent, the link and options");
+            };
+            options
+                .values(8)
+                .unwrap()
+                .iter()
+                .filter_map(|entry| {
+                    let pair = entry.as_seq()?.values(2).ok()?;
+                    let [Value::Str(key), Value::Variant(value)] = pair.as_slice() else {
+                        return None;
+                    };
+                    let values = value.values(1).ok()?;
+                    let text = values.first()?.as_str()?;
+                    Some(format!("{key}={text}"))
+                })
+                .collect::<Vec<_>>()
+        };
+        let (socket, worker) = broker("with-web", request(vec![(":1.2", 0)], false));
+        let target = link("https://example.org/a");
+        open(&socket, 1000, &target, Some("web"), deadline()).unwrap();
+        let call = finish(&socket, worker);
+        assert_eq!(handlers(&call), ["handle_token=td_open", "td.handler=web"]);
+        let (socket, worker) = broker("without", request(vec![(":1.2", 0)], false));
+        open(&socket, 1000, &target, None, deadline()).unwrap();
+        let call = finish(&socket, worker);
+        assert_eq!(handlers(&call), ["handle_token=td_open"]);
     }
 
     /// One message to the client, as the broker would forward it.
@@ -740,7 +830,14 @@ mod tests {
     #[test]
     fn the_link_goes_to_the_portal_and_its_success_is_the_answer() {
         let (socket, worker) = broker("success", request(vec![(":1.9", 2), (":1.2", 0)], false));
-        open(&socket, 1000, &link("https://example.org/a"), deadline()).unwrap();
+        open(
+            &socket,
+            1000,
+            &link("https://example.org/a"),
+            None,
+            deadline(),
+        )
+        .unwrap();
         let call = finish(&socket, worker);
         let (call, _) = message::decode(&call, 0).unwrap();
         assert_eq!(call.fields.destination, Some(PORTAL));
@@ -755,7 +852,14 @@ mod tests {
     #[test]
     fn a_response_before_the_reply_is_still_the_answer() {
         let (socket, worker) = broker("first", request(vec![(":1.2", 0)], true));
-        open(&socket, 1000, &link("https://example.org/a"), deadline()).unwrap();
+        open(
+            &socket,
+            1000,
+            &link("https://example.org/a"),
+            None,
+            deadline(),
+        )
+        .unwrap();
         finish(&socket, worker);
     }
 
@@ -764,7 +868,14 @@ mod tests {
         for (code, text) in [(2, "could not open"), (1, "cancelled")] {
             let (socket, worker) =
                 broker(&format!("code{code}"), request(vec![(":1.2", code)], false));
-            let error = open(&socket, 1000, &link("https://example.org/"), deadline()).unwrap_err();
+            let error = open(
+                &socket,
+                1000,
+                &link("https://example.org/"),
+                None,
+                deadline(),
+            )
+            .unwrap_err();
             assert!(error.contains(text), "{error}");
             finish(&socket, worker);
         }
@@ -773,7 +884,14 @@ mod tests {
     #[test]
     fn the_bus_answering_for_the_portal_fails_at_once() {
         let (socket, worker) = broker("bus", Answer::BusError);
-        let error = open(&socket, 1000, &link("https://example.org/"), deadline()).unwrap_err();
+        let error = open(
+            &socket,
+            1000,
+            &link("https://example.org/"),
+            None,
+            deadline(),
+        )
+        .unwrap_err();
         assert_eq!(error, "org.freedesktop.DBus.Error.NoReply: the portal left");
         finish(&socket, worker);
     }
@@ -787,7 +905,14 @@ mod tests {
         };
         let (socket, worker) = broker("other", answer);
         let started = Instant::now();
-        let error = open(&socket, 1000, &link("https://example.org/"), deadline()).unwrap_err();
+        let error = open(
+            &socket,
+            1000,
+            &link("https://example.org/"),
+            None,
+            deadline(),
+        )
+        .unwrap_err();
         assert!(error.contains("another request"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(4));
         finish(&socket, worker);
@@ -804,6 +929,7 @@ mod tests {
             &socket,
             1000,
             &link("https://example.org/"),
+            None,
             Instant::now() + Duration::from_millis(200),
         )
         .unwrap_err();
@@ -876,7 +1002,7 @@ mod tests {
         let Target::File(file) = target(&path.clone().into()).unwrap() else {
             panic!("a path is a file");
         };
-        open(&socket, 1000, &Target::File(file), deadline()).unwrap();
+        open(&socket, 1000, &Target::File(file), None, deadline()).unwrap();
         let call = finish(&socket, worker);
         let (call, _) = message::decode(&call, 1).unwrap();
         assert_eq!(call.fields.member, Some("OpenFile"));

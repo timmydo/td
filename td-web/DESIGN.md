@@ -10,7 +10,8 @@ td-web is td's own web browser: a td-ui program, built from source in
 td's target graph, that reads documents on the web. It complements
 Firefox and does not replace it today. Firefox stays td's browser for
 the scripted web and stays the default handler for links other
-programs open (`td-portal`'s OpenURI names it, §7). td-web is designed
+programs open (`td-portal`'s OpenURI names it, §7); a program may ask
+the portal for td-web instead, link by link. td-web is designed
 so that it could later grow to replace Firefox; the decisions that keep
 that open are stated where they are made, and the roadmap (§11) says
 what a replacement would need.
@@ -25,14 +26,17 @@ and any later script engine must be an interpreter: td-web never maps
 executable memory and never carries a JIT (§2).
 
 What td-web does not do, so a reader can say so: it runs no script,
-plugin or WebAssembly; it does not speak to the bus, the portal or the
-audio service; it listens on no socket but td-ui's control socket, and
-that only when run on a host with one (§8, "Driving"); it keeps no
+plugin or WebAssembly; it speaks to the session bus only to hold its
+link-intake name and take the calls by which the portal hands it a
+link (§7), and calls no portal or audio service; it listens on no socket but td-ui's
+control socket, and that only when run on a host with one (§8,
+"Driving"); it keeps no
 cookie, cache or history on disk in its first increments (§6), and
 writes no file but one the person saves into
 a Downloads the human granted it (§5, "Saving"); it has no GPU path
 (td-ui renders in software, td-ui/DESIGN.md "The GPU path"); and it is
-not registered as `BROWSER` or as the OpenURI target.
+not registered as `BROWSER`, nor the OpenURI target unless a caller asks
+for it (§7).
 
 ## 2. Trust and build
 
@@ -103,6 +107,9 @@ Its permissions keyfile grants:
 [Context]
 sockets=wayland;fetch
 
+[Session Bus Policy]
+org.td.web.*=own
+
 [Resources]
 memory-high=671088640
 memory-max=805306368
@@ -115,8 +122,10 @@ td-web keeps nothing between runs, and a later increment that does keeps
 its state in the account's own home, which is private to it. In
 WORKLOADS.md's terms td-web is already the target shape: an account of
 its own (its reserved row carries into the workload ledger), a private
-home, and none of the human's files but what the human grants. No bus
-names, no environment and no terminal.
+home, and none of the human's files but what the human grants. One
+bus name, under the `org.td.web.*` suffix grant, and one environment
+entry, `WEB_LINKS_FROM=portal`, both the link intake's (§7); no
+terminal.
 
 **Downloads.** The human's files reach td-web only through the workload
 grant table (WORKLOADS.md, "Grants"; td-authd/DESIGN.md, "Workload grant
@@ -283,7 +292,8 @@ recipe's `-C panic`), and a render thread found gone is started again.
 `memory-high` throttles before `memory-max` ends the jail. The tasks
 hold the window's thread, td-ui's, the render thread, `MAX_WORKERS`
 fetches and `MAX_SUBRESOURCES` subresource fetches (§10,
-"Subresources"), 11, with room, since td-svc does not restart a
+"Subresources"), 11, and the link intake's thread with its passing
+connect thread (§7), 13, with room, since td-svc does not restart a
 program that exits on the cap. One CPU, twice news's, since a page is
 made and laid out again on the render thread while the window's paints
 (§10).
@@ -298,7 +308,9 @@ reaches for another operating-system facility, in td-web or a crate it
 links, derives the list again, or that path fails in the jail. The
 control socket (§8, "Driving") is such a path: its `bind`, `listen`
 and `accept4` are off the list, and the jail never starts td-web with
-one. Saving (§5) is held to that list: it reads its mount table and
+one. The link intake's bus connection (§7) is on it as it stands: an
+`AF_UNIX` `connect` with read and write timeouts, then reads and writes;
+it negotiates no descriptor passing and sends no signal. Saving (§5) is held to that list: it reads its mount table and
 creates, writes, syncs, empties and unlinks a file (`openat`, `read`, `write`,
 `fsync`, `ftruncate`, `statx`, `unlink`), calls td-ui's shared-memory
 buffers and theme file already make, and renames and links nothing,
@@ -575,13 +587,48 @@ never in the login user's.
 
 ## 7. Other programs
 
-Firefox remains `BROWSER` for td's applications and the OpenURI target
-(`td-portal/src/open_uri.rs`). td-web is started from its launcher card,
-as every service-account application is (it has no `/bin` name); the
-program takes an optional URL argument, `td-web [--control-socket
-PATH] [URL]`, which hosts and tests use (the socket is §8's
-"Driving"). Making td-web a handler for links, or offering a choice
-of handler, is a later decision and an amendment to td-portal's design.
+Firefox remains `BROWSER` for td's applications and the OpenURI
+target by default (`td-portal/src/open_uri.rs`). td-web is started from
+its launcher card, as every service-account application is (it has no
+`/bin` name); the program takes an optional URL argument, `td-web
+[--control-socket PATH] [URL]`, which hosts and tests use (the socket is
+§8's "Driving").
+
+A program may ask for td-web link by link: `td-open --with web LINK`
+sets the OpenURI request's `td.handler` option to `web`, and the portal
+hands the link to td-web rather than Firefox (APPLICATIONS.md §E row 4).
+td-web's side is its link intake (`links.rs`), on only when
+`WEB_LINKS_FROM=portal`, which the `web` application's manifest sets, so
+td-web run on a host takes nothing from that host's bus. The intake
+connects to the session bus on a thread of its own and takes
+`org.td.web.p<pid>` under the `org.td.web.*` grant, else, held already,
+`org.td.web.u<unique>` from the unique name the bus gave it, which the
+bus never gives twice. The jail's pid namespace makes the first nearly
+constant, so a same-uid process can hold it first; one that foresaw the
+second too would keep the intake off, which the login user's own
+processes can do to td-web in many ways. It serves `OpenURL(s)` at
+`/org/td/web` on interface `org.td.web`, and nothing else. The portal authenticates td-web by its broker credentials
+before calling; td-web in turn takes a call only from the present owner
+of `org.freedesktop.portal.Desktop`, which the broker reserves to
+td-portal, asking the bus for that owner on each call, so neither
+another application (which the broker would not route) nor the login
+user's own unjailed processes (which it would) can hand td-web a link.
+The link must be `http` or `https`, with no whitespace or control
+character, within the portal's 8192-byte bound, as the portal admits
+one; the window opens it as a typed address, which td-url encodes or
+refuses further, replacing the page shown, which stays in history
+behind it. At most four links wait for the window, and a fifth is
+refused as busy; up to four calls that arrive while the intake asks the
+bus something wait to be answered after, and a fifth is refused as
+busy. A frame larger than 64 KiB, which no portal call is, is read past
+and dropped; a failure stops the intake, said once on stderr, and
+td-web runs on. While the intake runs an idle window looks for links
+every quarter second. A burst of traffic or a slow bus while the intake
+asks who the portal is leaves that call refused, to be asked again, and
+the intake running; the bus's late answer is passed over.
+Like Firefox, td-web is found, not started: a link for a td-web that is
+not running fails, and the caller is told so (APPLICATIONS.md §W.9).
+td-web opens no file, so `OpenFile` stays Firefox's.
 
 ## 8. Window and keys
 
@@ -2427,8 +2474,8 @@ order; each is its own design amendment when it starts:
   (td-page/DESIGN.md §4), styled, fetching nothing, its links opened in
   the configured browser with their real target shown first. To come:
   a choice per link between td-web and Firefox (Return or a press for
-  the default, with Shift for the other), which makes td-web a portal
-  link handler (§7); `cid:` pictures from the message's own parts;
+  the default, with Shift for the other), through the portal's handler
+  option (§7); `cid:` pictures from the message's own parts;
   remote content only when asked for; and its pages made off the
   window's thread.
 - **Primary selection**: the page's selection offered as the primary

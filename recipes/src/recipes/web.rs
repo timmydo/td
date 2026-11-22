@@ -8,7 +8,7 @@
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::launcher::LauncherDeclaration;
-use td_engine::permissions::{PermissionPolicy, PermissionSocket};
+use td_engine::permissions::{BusAccess, PermissionPolicy, PermissionSocket};
 
 const APPLICATION_NAME: &str = crate::shared::TD_WEB_NAME;
 const APPLICATION_ENTRY: &str = crate::shared::TD_WEB_ENTRY;
@@ -22,11 +22,20 @@ const PROGRAM_RECIPE: &str = "td-web";
 /// it), copied from the `td-charset-notice` recipe into the package.
 const CHARSET_NOTICE: &str = "{in:td-charset-notice}/share/licenses/td-charset/LICENSE-WHATWG";
 const CHARSET_NOTICE_SHIPPED: &str = "{out}/files/share/licenses/td-charset/LICENSE-WHATWG";
+/// td-web's link intake (td-web/src/links.rs): the setting that turns it
+/// on, and the names it holds one of.
+const LINKS_SETTING: &str = "WEB_LINKS_FROM";
+const LINKS_FROM: &str = "portal";
+const LINKS_NAMES: &str = "org.td.web.*";
 
 pub fn recipe() -> Recipe {
-    // No environment: td-web is no other program's `BROWSER`, and opens
-    // nothing through one of its own (td-web/DESIGN.md §7).
-    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY) else {
+    // td-web is no other program's `BROWSER`, and opens nothing through
+    // one of its own; it takes the links the portal's OpenURI hands it
+    // when a caller asks for td-web (td-web/DESIGN.md §7, APPLICATIONS.md
+    // §E row 4), which this setting turns on.
+    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY)
+        .and_then(|declaration| declaration.with_environment(LINKS_SETTING, LINKS_FROM))
+    else {
         return invalid_recipe("declaration");
     };
     let Ok(launcher) = LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
@@ -35,7 +44,8 @@ pub fn recipe() -> Recipe {
     };
     // The fetch socket, its one way to the network (no `shared=network`),
     // and the Wayland socket it draws in. No filesystem grant: it keeps
-    // nothing between runs. No terminal and no bus name. `memory-high` is
+    // nothing between runs. No terminal. One bus name, under `org.td.web.*`,
+    // where the portal finds td-web to hand it a link. `memory-high` is
     // 640 MiB for td-web's worst on a 3840x2160 output, 645 MB: its own
     // memory with three window buffers (145 MB), td-ui's atlas pages
     // (13.5), a 16 MiB body for each of four fetches out (67.1), four
@@ -50,6 +60,7 @@ pub fn recipe() -> Recipe {
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
+        .and_then(|permissions| permissions.with_session_bus(LINKS_NAMES, BusAccess::Own))
         .and_then(|permissions| permissions.with_memory_high(640 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(768 * 1024 * 1024))
         .and_then(|permissions| permissions.with_pids_max(32))
@@ -128,8 +139,12 @@ mod tests {
         assert_eq!(declaration.runtime(), "static-runtime");
         assert_eq!(declaration.entry(), APPLICATION_ENTRY);
         assert_eq!(declaration.alias(), None);
-        // Not BROWSER, and no opener shipped beside it.
-        assert_eq!(declaration.environment().count(), 0);
+        // Not BROWSER, and no opener shipped beside it: the link intake's
+        // setting alone.
+        assert_eq!(
+            declaration.environment().collect::<Vec<_>>(),
+            vec![("WEB_LINKS_FROM", "portal")]
+        );
         assert_eq!(
             recipe.inputs,
             Some(vec![PROGRAM_RECIPE.into(), "td-charset-notice".into()])
@@ -147,10 +162,10 @@ mod tests {
             .expect("permissions");
         assert!(!permissions.network());
         assert!(!permissions.terminal());
-        assert_eq!(permissions.session_bus().count(), 0);
+        assert_eq!(permissions.session_bus().count(), 1);
         assert_eq!(
             permissions.to_keyfile(),
-            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Resources]\nmemory-high=671088640\nmemory-max=805306368\npids-max=32\ncpu-max=100000 100000\n"
+            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Session Bus Policy]\norg.td.web.*=own\n\n[Resources]\nmemory-high=671088640\nmemory-max=805306368\npids-max=32\ncpu-max=100000 100000\n"
         );
         let steps = recipe.steps.as_ref().expect("steps");
         for (file, dest) in [
