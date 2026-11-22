@@ -1250,7 +1250,7 @@ impl Session {
         id: FileId,
         target: Option<Location>,
         bytes: Vec<u8>,
-        mut step: impl FnMut(Stage, &File) -> io::Result<()>,
+        step: impl FnMut(Stage, &File) -> io::Result<()>,
     ) -> Result<()> {
         let entry = self.entry(id)?;
         self.admit(entry.bytes.len(), bytes.len())?;
@@ -1279,92 +1279,14 @@ impl Session {
                 "path belongs to another open association",
             ));
         }
-        verify_destination(location, expected, &entry.bytes)?;
-        let mut temporary = Temporary::create(location)?;
-        let mut published = false;
-        let mut publication_attempted = false;
-        let result = (|| -> Result<Stamp> {
-            step(Stage::Write, &temporary.file)?;
-            temporary.file.write_all(&bytes)?;
-            step(Stage::Metadata, &temporary.file).map_err(metadata_error)?;
-            let mode = if let Some(old) = expected {
-                let meta = temporary.file.metadata()?;
-                if meta.uid() != old.uid || meta.gid() != old.gid {
-                    fchown(&temporary.file, Some(old.uid), Some(old.gid))
-                        .map_err(metadata_error)?;
-                }
-                old.mode & 0o7777
-            } else {
-                0o600
-            };
-            temporary
-                .file
-                .set_permissions(Permissions::from_mode(mode))
-                .map_err(metadata_error)?;
-            let meta = temporary.file.metadata()?;
-            if meta.mode() & 0o7777 != mode
-                || expected.is_some_and(|s| s.uid != meta.uid() || s.gid != meta.gid())
-            {
-                return Err(Failure::new(
-                    Kind::Metadata,
-                    "temporary ownership or permissions did not match",
-                ));
-            }
-            require_no_attributes(&temporary.file)?;
-            let prepared = Stamp::read(&meta);
-            step(Stage::SyncFile, &temporary.file)?;
-            temporary.file.sync_all()?;
-            step(Stage::Recheck, &temporary.file)?;
-            verify_destination(location, expected, &entry.bytes)?;
-            check_temporary(&temporary)?;
-            step(Stage::Publish, &temporary.file)?;
-            publication_attempted = true;
-            if expected.is_some() {
-                fs::rename(&temporary.path, &location.path)?;
-                temporary.named = false;
-            } else {
-                fs::hard_link(&temporary.path, &location.path).map_err(|e| {
-                    if e.kind() == io::ErrorKind::AlreadyExists {
-                        Failure::new(Kind::Exists, "destination was created concurrently")
-                    } else {
-                        e.into()
-                    }
-                })?;
-            }
-            published = true;
-            step(Stage::Unlink, &temporary.file)?;
-            temporary.cleanup()?;
-            step(Stage::SyncParent, &location.parent)?;
-            location.parent.sync_all()?;
-            step(Stage::Readback, &temporary.file)?;
-            let stamp = Stamp::read(&temporary.file.metadata()?);
-            stamp.replaceable()?;
-            if stamp.len != bytes.len() as u64
-                || stamp.uid != prepared.uid
-                || stamp.gid != prepared.gid
-                || stamp.mode != prepared.mode
-            {
-                return Err(Failure::new(Kind::Conflict, "published metadata changed"));
-            }
-            require_no_attributes(&temporary.file)?;
-            compare_stable(&temporary.file, &stamp, &bytes)?;
-            check_name(location, &stamp)?;
-            Ok(stamp)
-        })();
-        let stamp = match result {
-            Ok(stamp) => stamp,
-            Err(mut error) => {
-                error.published = published;
-                error.publication_attempted = publication_attempted;
-                if let Err(cleanup) = temporary.cleanup() {
-                    error.residual = Some(temporary.path.clone());
-                    error
-                        .detail
-                        .push_str(&format!("; temporary cleanup failed: {cleanup}"));
-                }
-                return Err(error);
-            }
-        };
+        let (stamp, file) = publish(
+            location,
+            expected,
+            &bytes,
+            0o600,
+            || verify_destination(location, expected, &entry.bytes),
+            step,
+        )?;
         // No fallible allocation or admission remains after publication.
         let entry = self
             .entries
@@ -1374,11 +1296,212 @@ impl Session {
             entry.location = location;
         }
         entry.stamp = Some(stamp);
-        entry._baseline_file = Some(temporary.file);
+        entry._baseline_file = Some(file);
         entry.bytes = bytes;
         entry.rename_uncertain = false;
         Ok(())
     }
+}
+
+/// A writable workspace target, pinned from preflight through publication.
+pub struct WorkspaceReplacement {
+    location: Location,
+    stamp: Stamp,
+    writable: File,
+}
+
+impl WorkspaceReplacement {
+    pub fn inspect(path: &Path, observed: &Metadata) -> Result<Self> {
+        if !observed.is_file() {
+            return Err(Failure::new(Kind::NotRegular, "expected a regular file"));
+        }
+        let stamp = Stamp::read(observed);
+        stamp.replaceable()?;
+        let location = Location::resolve(&fs::canonicalize(path)?)?;
+        check_name(&location, &stamp)?;
+        let writable = OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+            .open(&location.path)?;
+        require_no_attributes(&writable)?;
+        let target = Self {
+            location,
+            stamp,
+            writable,
+        };
+        target.check(path)?;
+        Ok(target)
+    }
+
+    fn check(&self, path: &Path) -> Result<()> {
+        if Stamp::read(&fs::metadata(path)?) != self.stamp
+            || Stamp::read(&self.writable.metadata()?) != self.stamp
+        {
+            return Err(Failure::new(
+                Kind::Conflict,
+                "file changed before replacement",
+            ));
+        }
+        check_name(&self.location, &self.stamp)
+    }
+
+    pub fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let (stamp, _file) = publish(
+            &self.location,
+            Some(&self.stamp),
+            bytes,
+            0,
+            || self.check(path),
+            |_, _| Ok(()),
+        )?;
+        confirm_workspace_path(path, &stamp)
+    }
+}
+
+/// Publish a new workspace file with exclusive creation and the caller's umask.
+pub fn create_workspace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    create_workspace_file_with(path, bytes, |_, _| Ok(()))
+}
+
+fn create_workspace_file_with(
+    path: &Path,
+    bytes: &[u8],
+    step: impl FnMut(Stage, &File) -> io::Result<()>,
+) -> Result<()> {
+    let location = Location::resolve(path)?;
+    let mode = copy_mode(&location, 0o666)?;
+    let (stamp, _file) = publish(
+        &location,
+        None,
+        bytes,
+        mode,
+        || {
+            let named = Location::resolve(path)?;
+            if named.parent_identity != location.parent_identity {
+                return Err(Failure::new(
+                    Kind::Conflict,
+                    "destination directory changed",
+                ));
+            }
+            verify_destination(&location, None, &[])
+        },
+        step,
+    )?;
+    confirm_workspace_path(path, &stamp)
+}
+
+fn confirm_workspace_path(path: &Path, stamp: &Stamp) -> Result<()> {
+    let checked = fs::metadata(path).map_err(Failure::from).and_then(|meta| {
+        if Stamp::read(&meta) == *stamp {
+            Ok(())
+        } else {
+            Err(Failure::new(
+                Kind::Conflict,
+                "workspace path changed after publication",
+            ))
+        }
+    });
+    checked.map_err(|mut error| {
+        error.publication_attempted = true;
+        error.published = true;
+        error
+    })
+}
+
+fn publish(
+    location: &Location,
+    expected: Option<&Stamp>,
+    bytes: &[u8],
+    new_mode: u32,
+    verify: impl Fn() -> Result<()>,
+    mut step: impl FnMut(Stage, &File) -> io::Result<()>,
+) -> Result<(Stamp, File)> {
+    verify()?;
+    let mut temporary = Temporary::create(location)?;
+    let mut published = false;
+    let mut publication_attempted = false;
+    let result = (|| -> Result<Stamp> {
+        step(Stage::Write, &temporary.file)?;
+        temporary.file.write_all(bytes)?;
+        step(Stage::Metadata, &temporary.file).map_err(metadata_error)?;
+        let mode = if let Some(old) = expected {
+            let meta = temporary.file.metadata()?;
+            if meta.uid() != old.uid || meta.gid() != old.gid {
+                fchown(&temporary.file, Some(old.uid), Some(old.gid)).map_err(metadata_error)?;
+            }
+            old.mode & 0o7777
+        } else {
+            new_mode
+        };
+        temporary
+            .file
+            .set_permissions(Permissions::from_mode(mode))
+            .map_err(metadata_error)?;
+        let meta = temporary.file.metadata()?;
+        if meta.mode() & 0o7777 != mode
+            || expected.is_some_and(|s| s.uid != meta.uid() || s.gid != meta.gid())
+        {
+            return Err(Failure::new(
+                Kind::Metadata,
+                "temporary ownership or permissions did not match",
+            ));
+        }
+        require_no_attributes(&temporary.file)?;
+        let prepared = Stamp::read(&meta);
+        step(Stage::SyncFile, &temporary.file)?;
+        temporary.file.sync_all()?;
+        step(Stage::Recheck, &temporary.file)?;
+        verify()?;
+        check_temporary(&temporary)?;
+        step(Stage::Publish, &temporary.file)?;
+        publication_attempted = true;
+        if expected.is_some() {
+            fs::rename(&temporary.path, &location.path)?;
+            temporary.named = false;
+        } else {
+            fs::hard_link(&temporary.path, &location.path).map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    Failure::new(Kind::Exists, "destination was created concurrently")
+                } else {
+                    e.into()
+                }
+            })?;
+        }
+        published = true;
+        step(Stage::Unlink, &temporary.file)?;
+        temporary.cleanup()?;
+        step(Stage::SyncParent, &location.parent)?;
+        location.parent.sync_all()?;
+        step(Stage::Readback, &temporary.file)?;
+        let stamp = Stamp::read(&temporary.file.metadata()?);
+        stamp.replaceable()?;
+        if stamp.len != bytes.len() as u64
+            || stamp.uid != prepared.uid
+            || stamp.gid != prepared.gid
+            || stamp.mode != prepared.mode
+        {
+            return Err(Failure::new(Kind::Conflict, "published metadata changed"));
+        }
+        require_no_attributes(&temporary.file)?;
+        compare_stable(&temporary.file, &stamp, bytes)?;
+        check_name(location, &stamp)?;
+        Ok(stamp)
+    })();
+    let stamp = match result {
+        Ok(stamp) => stamp,
+        Err(mut error) => {
+            error.published = published;
+            error.publication_attempted = publication_attempted;
+            if let Err(cleanup) = temporary.cleanup() {
+                error.residual = Some(temporary.path.clone());
+                error
+                    .detail
+                    .push_str(&format!("; temporary cleanup failed: {cleanup}"));
+            }
+            return Err(error);
+        }
+    };
+    Ok((stamp, temporary.file))
 }
 
 fn validate(bytes: &[u8]) -> Result<()> {
@@ -1474,13 +1597,13 @@ fn visit_bytes(
     stamp: &Stamp,
     mut visit: impl FnMut(usize, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    if stamp.len > text::MAX_FILE_BYTES as u64 {
-        return Err(Failure::new(Kind::Limit, "file exceeds 16 MiB"));
-    }
+    // The caller bounded a read or checked equality to an in-memory slice.
+    let length = usize::try_from(stamp.len)
+        .map_err(|_| Failure::new(Kind::Limit, "file exceeds address space"))?;
     let mut scratch = [0; 8192];
     let mut offset = 0usize;
-    while offset < stamp.len as usize {
-        let count = (stamp.len as usize - offset).min(scratch.len());
+    while offset < length {
+        let count = (length - offset).min(scratch.len());
         let part = scratch
             .get_mut(..count)
             .ok_or_else(|| Failure::new(Kind::Limit, "read size overflow"))?;
@@ -3172,6 +3295,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_creation_rechecks_the_callers_parent_before_and_after_publication() {
+        for (change_at, published) in [(Stage::Recheck, false), (Stage::Readback, true)] {
+            let dir = td_fs::TempDir::new("workspace-create").unwrap();
+            let old = dir.path().join("old");
+            let new = dir.path().join("new");
+            let alias = dir.path().join("alias");
+            fs::create_dir(&old).unwrap();
+            fs::create_dir(&new).unwrap();
+            symlink(&old, &alias).unwrap();
+            let error = create_workspace_file_with(&alias.join("file"), b"new", |stage, _| {
+                if stage == change_at {
+                    fs::remove_file(&alias)?;
+                    symlink(&new, &alias)?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(error.published, published);
+            assert_eq!(old.join("file").exists(), published);
+            assert!(!alias.join("file").exists());
+        }
+    }
+
+    #[test]
     fn every_injected_failure_retains_baseline_and_reports_publication() {
         for absent in [false, true] {
             for fail in [
@@ -3184,12 +3331,11 @@ mod tests {
                 Stage::SyncParent,
                 Stage::Readback,
             ] {
-                let directory = Directory::new();
-                let path = if absent {
-                    directory.path("file")
-                } else {
-                    directory.write("file", b"original")
-                };
+                let directory = td_fs::TempDir::new("publish-failure").unwrap();
+                let path = directory.path().join("file");
+                if !absent {
+                    fs::write(&path, b"original").unwrap();
+                }
                 let mut session = Session::default();
                 let id = session.open(&path).unwrap();
                 let baseline = session.bytes(id).unwrap().to_vec();
@@ -3198,6 +3344,7 @@ mod tests {
                         if stage == fail {
                             if stage == Stage::Write {
                                 file.write_all_at(b"partial", 0)?;
+                                return Err(io::Error::from_raw_os_error(28));
                             }
                             return Err(io::Error::other("injected I/O failure"));
                         }
@@ -3220,7 +3367,7 @@ mod tests {
                     assert_eq!(fs::read(&path).unwrap(), b"original");
                 }
                 assert!(error.residual.is_none());
-                directory.no_temporaries();
+                Directory::check_no_temporaries(directory.path());
             }
         }
     }

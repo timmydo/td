@@ -2,7 +2,8 @@ use crate::types::Recipe;
 
 /// td-agent, the coding agent's window (td-agent/DESIGN.md), built for the
 /// image as the other toolkit consumers are: a static Cargo build of its own
-/// tree with its path dependencies staged beside it, td-compositor for the
+/// tree with its path dependencies staged beside it, including the editor
+/// file publisher used by its workspace tools. It stages td-compositor for the
 /// font and wire sources td-ui mounts, engine for the SHA-256 td-agent
 /// mounts and td-png's checksums, td-inflate for its decoder, td-util for its DEFLATE
 /// encoder, and td-test-compositor, the native harness its tests use, which
@@ -15,6 +16,7 @@ pub fn recipe() -> Recipe {
         .local_source("td-agent")
         .local_source_trees(&[
             "td-civil",
+            "td-editor",
             "td-encoding",
             "td-fetch-client",
             "td-fs",
@@ -56,6 +58,7 @@ mod tests {
             r.local_source_trees,
             Some(vec![
                 "td-civil".into(),
+                "td-editor".into(),
                 "td-encoding".into(),
                 "td-fetch-client".into(),
                 "td-fs".into(),

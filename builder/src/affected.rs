@@ -7490,8 +7490,8 @@ mod tests {
         );
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
         // td-mail and td-news take their document pane from td-ui's editor
-        // core; nothing reads td-editor.
-        assert!(readers_of("td-editor").is_empty(), "{readers:?}");
+        // core; td-agent uses the editor file publisher.
+        assert_eq!(readers_of("td-editor"), ["td-agent"]);
         // Public VM retention-ref and guest workspace paths also spell td-vm/.
         // Authd's fixed task-terminal directory joins the compositor and guest
         // helper as a conservative textual reader of the VM crate.
@@ -11119,16 +11119,18 @@ mod tests {
         for target in ["check", "recipe-checks"] {
             assert!(targets.contains(&target.to_string()), "{targets:?}");
         }
-        // The document pane td-mail and td-news embed is td-ui's editor
-        // core, so nothing reads the editor: its change runs its own
-        // commands, its native case and the workspace's, and no other
-        // crate's.
+        // An editor change also reaches the agent's file tools and their readers.
         let commands = cargo_test_cmds(&root, &paths).unwrap();
-        assert_eq!(commands.len(), 6, "{commands:?}");
-        assert!(commands
-            .iter()
-            .filter_map(|c| c.split("--manifest-path ").nth(1))
-            .all(|rest| rest.starts_with("td-editor/Cargo.toml")));
+        let mut expected = cargo_test_cmds(&root, &["td-agent/src/files.rs".into()]).unwrap();
+        for command in gate_cmds() {
+            if cmd_manifest_crate(&command) == Some("td-editor") && !expected.contains(&command) {
+                expected.push(command);
+            }
+        }
+        assert_eq!(
+            commands.iter().collect::<std::collections::BTreeSet<_>>(),
+            expected.iter().collect()
+        );
         assert!(commands
             .iter()
             .any(|c| c.starts_with("cargo test --frozen ")));

@@ -853,8 +853,8 @@ td-agent/src/egress.rs	allocating-conversion	8
 td-agent/src/egress.rs	allocation-macro	12
 td-agent/src/egress.rs	heap-owner	4
 td-agent/src/egress.rs	unchecked-growth-or-clone	15
-td-agent/src/files.rs	allocating-conversion	30
-td-agent/src/files.rs	allocation-macro	74
+td-agent/src/files.rs	allocating-conversion	29
+td-agent/src/files.rs	allocation-macro	69
 td-agent/src/files.rs	heap-owner	2
 td-agent/src/files.rs	unchecked-growth-or-clone	34
 td-agent/src/git.rs	allocating-conversion	68

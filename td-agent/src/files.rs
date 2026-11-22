@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use td_editor::files::WorkspaceReplacement;
+
 use crate::sha256::{to_base16, Sha256};
 
 /// The most lines one `read_file` shows.
@@ -394,31 +396,19 @@ fn unchanged(shown: &str, now: &str, expected: Option<&str>) -> Result<(), Strin
     }
 }
 
-/// Writes `bytes` to `path`, in place, so its mode and links stay; a
-/// `fresh` file is made, and refused if something is there by now.
-fn put(path: &Path, shown: &str, bytes: &[u8], fresh: bool) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    // Not waiting on a FIFO put where the file was looked at.
-    options.write(true).custom_flags(O_NONBLOCK);
-    if fresh {
-        options.create_new(true);
-    } else {
-        options.truncate(true);
-    }
-    let mut file = options.open(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::AlreadyExists => {
-            format!("{shown} appeared while it was being written; read it with read_file")
+fn put(
+    path: &Path,
+    shown: &str,
+    bytes: &[u8],
+    observed: Option<&fs::Metadata>,
+) -> Result<(), String> {
+    let result = match observed {
+        Some(meta) => {
+            WorkspaceReplacement::inspect(path, meta).and_then(|target| target.write(path, bytes))
         }
-        _ => format!("{shown}: {e}"),
-    })?;
-    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
-        return Err(format!(
-            "{shown} is not a regular file (a device, FIFO or socket); write_file takes a regular file"
-        ));
-    }
-    file.write_all(bytes)
-        .and_then(|()| file.flush())
-        .map_err(|e| format!("{shown}: {e}"))
+        None => td_editor::files::create_workspace_file(path, bytes),
+    };
+    result.map_err(|e| td_alloc::format(format_args!("{shown}: {e}")).unwrap_or_default())
 }
 
 /// `write_file`: creates `path`, with its missing directories, or replaces
@@ -428,14 +418,14 @@ pub fn write(path: &Path, content: &str, expected: Option<&str>) -> Result<Writt
     let _held = MUTATIONS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let created = match fs::metadata(path) {
+    let observed = match fs::metadata(path) {
         Ok(meta) if meta.is_dir() => {
             return Err(format!("{shown} is a directory; write_file writes a file"))
         }
-        Ok(_) => {
+        Ok(meta) => {
             let now = digest_file(path)?;
             unchanged(&shown, &now, expected)?;
-            false
+            Some(meta)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if fs::symlink_metadata(path).is_ok() {
@@ -446,14 +436,14 @@ pub fn write(path: &Path, content: &str, expected: Option<&str>) -> Result<Writt
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
             }
-            true
+            None
         }
         Err(e) => return Err(format!("{shown}: {e}")),
     };
-    put(path, &shown, content.as_bytes(), created)?;
+    put(path, &shown, content.as_bytes(), observed.as_ref())?;
     Ok(Written {
         digest: digest(content.as_bytes()),
-        created,
+        created: observed.is_none(),
         replaced: 1,
         bytes: content.len() as u64,
     })
@@ -515,7 +505,7 @@ pub fn edit(
     } else {
         text.replacen(old, new, 1)
     };
-    put(path, &shown, changed.as_bytes(), false)?;
+    put(path, &shown, changed.as_bytes(), Some(&meta))?;
     Ok(Written {
         digest: digest(changed.as_bytes()),
         created: false,
@@ -542,6 +532,7 @@ enum Landing {
         at: PathBuf,
     },
     Update {
+        target: WorkspaceReplacement,
         at: PathBuf,
         text: String,
     },
@@ -617,13 +608,6 @@ pub fn patch(
                 "{shown} is a second name of a file the patch already changes; a patch changes each file once"
             ));
         }
-        if in_place {
-            OpenOptions::new()
-                .write(true)
-                .custom_flags(O_NONBLOCK)
-                .open(at)
-                .map_err(|e| format!("{shown} cannot be written: {e}"))?;
-        }
         Ok(meta)
     };
     // The file's text, as `edit` reads it: bounded, unchanged since this
@@ -672,7 +656,13 @@ pub fn patch(
                 let text = grammar::apply(&shown, &text_of(&at, &shown, path)?, hunks)?;
                 bounded(&shown, &text)?;
                 match to {
-                    None => Landing::Update { at, text },
+                    None => {
+                        let target = WorkspaceReplacement::inspect(&at, &meta).map_err(|e| {
+                            td_alloc::format(format_args!("{shown} cannot be written: {e}"))
+                                .unwrap_or_default()
+                        })?;
+                        Landing::Update { at, text, target }
+                    }
                     Some(to) => {
                         let to = resolve(to)?;
                         absent(&to, &to.display().to_string(), "*** Move to")?;
@@ -700,13 +690,15 @@ pub fn patch(
         let landed = match &landing {
             Landing::Add { at, text } => {
                 let shown = at.display().to_string();
-                parent(at).and_then(|()| put(at, &shown, text.as_bytes(), true))
+                parent(at).and_then(|()| put(at, &shown, text.as_bytes(), None))
             }
             Landing::Delete { at } => {
                 fs::remove_file(at).map_err(|e| format!("{}: {e}", at.display()))
             }
-            Landing::Update { at, text } => {
-                put(at, &at.display().to_string(), text.as_bytes(), false)
+            Landing::Update { at, text, target } => {
+                target.write(at, text.as_bytes()).map_err(|e| {
+                    td_alloc::format(format_args!("{}: {e}", at.display())).unwrap_or_default()
+                })
             }
             Landing::Move { at, to, text, mode } => {
                 let shown = to.display().to_string();
@@ -722,7 +714,8 @@ pub fn patch(
                         .map_err(|e| format!("{shown}: {e}"))?;
                     let moved = (&made)
                         .write_all(text.as_bytes())
-                        .and_then(|()| fs::set_permissions(to, fs::Permissions::from_mode(*mode)))
+                        .and_then(|()| made.set_permissions(fs::Permissions::from_mode(*mode)))
+                        .and_then(|()| made.sync_all())
                         .map_err(|e| format!("{shown}: {e}"))
                         .and_then(|()| {
                             fs::remove_file(at).map_err(|e| format!("{}: {e}", at.display()))
@@ -1140,6 +1133,57 @@ mod tests {
         assert!(read(&dir.0, None, None)
             .unwrap_err()
             .contains("glob lists a directory"));
+    }
+
+    #[test]
+    fn a_patch_refuses_an_unreplaceable_update_before_deleting_anything() -> std::io::Result<()> {
+        let dir = td_fs::TempDir::new("patch-hardlink")?;
+        let keep = dir.path().join("keep");
+        let shared = dir.path().join("shared");
+        fs::write(&keep, b"keep")?;
+        fs::write(&shared, b"old\n")?;
+        fs::hard_link(&shared, dir.path().join("alias"))?;
+        let patch_text = format!("*** Begin Patch\n*** Delete File: {}\n*** Update File: {}\n-old\n+new\n*** End Patch\n", keep.display(), shared.display());
+        let expected = [
+            (keep.display().to_string(), digest(b"keep")),
+            (shared.display().to_string(), digest(b"old\n")),
+        ];
+        let err = patch(
+            &crate::patch::parse(&patch_text).unwrap(),
+            &expected,
+            &|p| Ok(PathBuf::from(p)),
+        )
+        .unwrap_err();
+        assert!(err.contains("one link"), "{err}");
+        assert_eq!(fs::read(keep)?, b"keep");
+        Ok(())
+    }
+
+    #[test]
+    fn edits_preserve_symlinks_and_refuse_to_split_hard_links() -> std::io::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = td_fs::TempDir::new("agent-safe-edit")?;
+        let path = directory.path().join("script");
+        let link = directory.path().join("link");
+        let alias = directory.path().join("alias");
+        fs::write(&path, b"old")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750))?;
+        std::os::unix::fs::symlink(&path, &link)?;
+        fs::hard_link(&path, &alias)?;
+        let before = fs::metadata(&path)?;
+        assert!(write(&link, "new", Some(&digest(b"old"))).is_err());
+        assert_eq!(fs::read(&alias)?, b"old");
+        assert_eq!(fs::metadata(&path)?.ino(), before.ino());
+        fs::remove_file(&alias)?;
+        edit(&link, "old", "new", false, Some(&digest(b"old"))).unwrap();
+        assert!(fs::symlink_metadata(&link)?.is_symlink());
+        assert_eq!(fs::read(&path)?, b"new");
+        let after = fs::metadata(&path)?;
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode()),
+            (before.uid(), before.gid(), before.mode())
+        );
+        Ok(())
     }
 
     #[test]

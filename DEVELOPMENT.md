@@ -1199,10 +1199,8 @@ must supply an identifiable trusted path or the optional endpoint refuses.
 A roster crate declaring `native-compositor-tests = true` in its gate
 metadata adds a native process-test command to both the host preflight and
 gate 325. It requires the discovered `td-compositor` crate. The command is
-attributed to the consumer for affected-check narrowing: an editor-only
-change builds its compositor test tool without selecting the compositor's
-own suites or bringing the compositor into the recipe-check scope, which
-names the editor alone. For the cargo narrowing, compositor changes select
+attributed to the consumer for affected-check narrowing: a consumer change builds its compositor test tool. The editor file
+publisher also reaches the agent recipe and the agent's Cargo readers. For the cargo narrowing, compositor changes select
 declared native-test consumers as readers even without shared source files.
 
 `td-builder gate-crates native-compositor --manifest-path CRATE/Cargo.toml`

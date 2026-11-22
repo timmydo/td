@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "td-alloc",
  "td-civil",
+ "td-editor",
  "td-encoding",
  "td-fetch-client",
  "td-fs",
@@ -31,6 +32,15 @@ version = "0.1.0"
 [[package]]
 name = "td-civil"
 version = "0.1.0"
+
+[[package]]
+name = "td-editor"
+version = "0.1.0"
+dependencies = [
+ "td-civil",
+ "td-remote",
+ "td-ui",
+]
 
 [[package]]
 name = "td-encoding"

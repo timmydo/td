@@ -72,13 +72,13 @@ measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
 
 td-agent is its own crate, `td-agent/`, and its own static binary, built by
-td's pinned Rust toolchain. Its manifest declares thirteen
-dependencies, all td crates by path: `td-civil`, `td-encoding`,
+td's pinned Rust toolchain. Its manifest declares
+dependencies, all td crates by path: `td-alloc`, `td-sandbox`, `td-civil`, `td-editor`, `td-encoding`,
 `td-fetch-client`, `td-fs`, `td-html`, `td-jpeg`, `td-json`,
 `td-markdown`, `td-png`, `td-remote`, for its frames, `td-toml`,
 `td-ui` and `td-url`, whose strict URLs `web_fetch` judges a
-destination by, and its lock lists exactly those, its dev-dependency
-`td-test-compositor` and td-agent. The person's pictures are read by td-png and
+destination by, and its lock lists their path closure and its dev-dependency
+`td-test-compositor`. The person's pictures are read by td-png and
 td-jpeg, the decoders td-ui's other programs share, one too large to
 send is written anew by td-jpeg's encoder, and each is sent in base64
 by td-encoding's (§6, Pictures). It
@@ -7070,7 +7070,14 @@ characters naming how many more it had. Bytes that are not UTF-8 are
 shown replaced and said; a NUL in the first 8 KiB makes the file binary,
 shown as no lines with its size and digest. An empty file and an offset
 past the end are said. A write creates missing parent directories and
-writes the file in place, so its mode and links stay; it is not atomic.
+stages bytes beside the destination using the editor’s file transaction.
+It syncs them before publication and syncs the parent afterward. New
+files are published exclusively with ordinary creation permissions.
+Updates follow symlinks and preserve the target owner, group and mode.
+A hard-linked target, set-ID file or unsupported extended attributes
+refuse replacement before publication. Replacement requires permission
+to write both the file and its directory. A post-publication failure
+reports that the destination may already contain the new bytes.
 `edit_file` takes UTF-8 files of at most 8 MiB, counted as read, naming
 `sed` for others, and refuses an empty `old_string` and one equal to
 `new_string`.
@@ -7104,7 +7111,7 @@ newline; an added one ends each line with one. A file it updates has
 `edit_file`'s bounds (UTF-8, 8 MiB), and its hunks apply to the very
 bytes whose digest was checked; a delete reads no text. The tool host
 holds its one mutation lock while it reads, checks and computes every
-file, opening each it changes in place for writing, so a read-only
+file, opening each update target for writing, so a read-only
 file or mount is found before anything lands, and then writes them in
 the patch's order. Adds and moves make their file exclusively, with
 missing directories. A move makes its target with its source's mode,

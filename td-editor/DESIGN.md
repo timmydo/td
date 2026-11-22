@@ -395,6 +395,13 @@ metadata is outside this profile, provided the new temporary inode passes
 inspection too. Inherited extended ACLs or automatically supplied labels on
 that inode are refused, not silently removed.
 
+The agent file tools use the same staging, sync and publication sequence.
+For these byte writes the caller supplies the destination metadata observed
+before checking its contents. The publisher checks that observation and
+write access to the resolved target, and uses the caller’s original path
+to recheck a followed symlink before publication. New files use an empty
+creation-mode probe for the caller’s umask.
+
 Linux may hide attribute names from the caller's credentials, so an empty
 list is not proof that privileged/hidden attributes are absent. The supported
 profile is ordinary user text with no such hidden metadata; files depending
