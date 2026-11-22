@@ -302,10 +302,10 @@ The old source's original configuration and applied network fence are retained
 under `/var/lib/td-mta/operator/cutover-preparation/`; retirement receipts are
 under `/var/lib/td-mta/operator/retirement-20261027/` on that host. Its SSH
 identity is separate from Azure's: use its address from the private notes
-with its retained, verified host key, not the MX DNS names that now resolve to Azure. The VM has not been
-terminated. Restarting Stalwart or restoring old DNS is not a rollback of
-mail accepted by td-mta; follow [MIGRATION.md](MIGRATION.md)'s reconciliation
-requirements before reopening a source writer.
+with its retained, verified host key, not the MX DNS names that now resolve
+to Azure. The VM has not been terminated. Restarting Stalwart or restoring old DNS is not a rollback of
+mail accepted by td-mta; follow "Rolling back to the retired source" below
+before reopening a source writer.
 
 The 2026-10-27 isolated restore drill used scheduled archive
 `backup-1793082157-3498609.dump`. PostgreSQL restored all tables and constraints
@@ -328,6 +328,43 @@ archive remains in `/mnt/backup/test/td-mta/copies`. The JSON report
 exact digest. Scratch under the same private recovery root was removed.
 This was a one-time drill. The development machine's daily pull and weekly
 restore schedules still require provisioning and enablement.
+
+### Rolling back to the retired source
+
+Keep the retired source and the rollback materials until the owner accepts
+the migration and its retention period; terminating the VM or deleting them
+waits for that decision.
+
+Fence td-mta writers and delivery before taking the rollback export.
+Preserve all target-only messages and local changes; restoring only the old
+Stalwart snapshot would lose mail accepted after the switch. Export and
+inventory the quiet td-mta account, retain exact raw bodies and metadata,
+and reconcile into the rollback server using retained object mappings to
+avoid duplicate imports. Independently export and compare the rollback
+destination. The td-mta side uses MIGRATION.md's export, verify, inventory
+and compare commands; writing into Stalwart has no command in this
+repository and uses tooling kept outside it.
+
+Stalwart 0.15.2 returns received times at whole-second precision:
+`2026-10-22T07:47:21.998Z` becomes `2026-10-22T07:47:21Z`. The owner
+accepts that loss of fractional seconds for an emergency rollback. Report
+it as an accepted difference while preserving the exact td-mta export; do
+not round comparison timestamps to conceal it. `migration compare` checks
+received times exactly and fails with one fixed diagnostic that does not say
+what differs, so it fails on this loss too. Establishing that received-time
+precision is the only difference takes a separate manual comparison of the
+two manifests. Every other message and metadata difference requires
+investigation and resolution before routing changes.
+
+Do not send queued submissions twice while moving responsibility between
+services. DNS caches can deliver to either host during the transition, so
+keep a deliberate queue, defer and drain policy on the one that is not
+accepting. Stop `td-mta-stalwart-defer.service` before Stalwart accepts on
+port 25 again. Never leave two independent writable mail stores and assume
+a later export will merge them. Restore routing and client endpoints only
+after the destination and queue ownership are verified. Keep both stores
+and the exact rollback archive for investigation; rollback does not
+authorize deleting evidence.
 
 ## Choose and build an update
 
