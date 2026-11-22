@@ -17,6 +17,7 @@ use td_page::fonts::Measure;
 use td_page::page::{Laid, Want};
 use td_page::paint::{self, Frame, Marks, Scratch};
 use td_page::pipeline::{self, Page, Refusal};
+use td_page::view::{Pane, View};
 use td_ui::prose::{Faces, Metrics};
 use td_ui::raster::{Draw, Primitive, Rect, Scale, TextFamily, BORDER, PAPER};
 
@@ -30,6 +31,60 @@ const INSET: i64 = 8;
 /// and the rule's own height, in device pixels at scale one.
 const GAP: i64 = 6;
 const RULE: i64 = 1;
+
+/// The bases a link is resolved against when the message names none:
+/// one name under `.invalid`, which no host has, by both schemes. A link
+/// that resolves to a different scheme against each took its scheme from
+/// the base, so was relative, `//host` too, and is refused.
+const NO_BASE_HTTPS: &str = "https://relative.invalid/";
+const NO_BASE_HTTP: &str = "http://relative.invalid/";
+
+/// The most of a link's host the status row shows; a longer one keeps
+/// only its end, where the name it is registered under is, after an
+/// ellipsis: its start, which the sender chooses, could name anyone.
+const HOST_SHOWN: usize = 32;
+
+/// `target`, an absolute URL in printable ASCII, as the status row shows
+/// it: its host, port included, cut to its end past `HOST_SHOWN`, so a
+/// long host cannot push its own end off the row.
+fn shown_target(target: &str) -> Option<String> {
+    let after = target.find("://")? + 3;
+    let rest = target.get(after..)?;
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let host = rest.get(..end)?;
+    if host.len() <= HOST_SHOWN {
+        return td_alloc::format(format_args!("{target}")).ok();
+    }
+    let tail = host.len() - (HOST_SHOWN - 1);
+    td_alloc::format(format_args!(
+        "{}\u{2026}{}{}",
+        target.get(..after)?,
+        host.get(tail..)?,
+        rest.get(end..)?,
+    ))
+    .ok()
+}
+
+/// What a link resolved to: an `http` or `https` URL and its fragment, or
+/// why it is not opened.
+fn fetched(reference: td_url::Reference) -> Result<(td_url::Url, Option<String>), String> {
+    match reference {
+        td_url::Reference::Fetch { url, fragment } => Ok((url, fragment)),
+        td_url::Reference::Other { scheme } => {
+            Err(td_alloc::format(format_args!("a {scheme} link")).unwrap_or_default())
+        }
+    }
+}
+
+/// A line's top and bottom below a page's top, in device pixels.
+fn line_span(laid: &Laid, line: u32, scale: i64) -> Option<(i64, i64)> {
+    let line = laid.lines().get(usize::try_from(line).ok()?)?;
+    let s = scale as f64;
+    Some((
+        (line.y * s).floor() as i64,
+        ((line.y + line.height) * s).ceil() as i64,
+    ))
+}
 
 /// How far a laid page reaches below its top, in device pixels.
 fn bottom(laid: &Laid, scale: i64) -> i64 {
@@ -65,6 +120,18 @@ pub struct Paged {
     page_top: i64,
     /// Scrolled down, in device pixels.
     y: i64,
+    /// The page's focused link and the one under the pointer, by their
+    /// index among its links.
+    focus: Option<usize>,
+    hover: Option<usize>,
+    /// The pointer as last seen, and whether a key has stepped the focus
+    /// since: until the pointer moves, the link under it is not the one
+    /// shown, so the status row and Return speak of the focused one.
+    pointer: Option<(i64, i64)>,
+    stepped: bool,
+    /// A press named the link under it: its button held, td-ui reports no
+    /// pointer, and the link stays named until the pointer is seen again.
+    named: bool,
     /// The HTML was longer than td-mail's input limit and cut at it.
     cut: bool,
     /// The limit the message's HTML was refused by at every rung, when it
@@ -140,6 +207,11 @@ impl Paged {
             head_height,
             page_top: head_height + (2 * GAP + RULE) * s,
             y: 0,
+            focus: None,
+            hover: None,
+            pointer: None,
+            stepped: false,
+            named: false,
             cut: markup.len() < html.len(),
             refused,
             measure: RefCell::new(measure),
@@ -230,6 +302,187 @@ impl Paged {
         self.y != was
     }
 
+    /// The page's top in the window, as scrolled.
+    fn page_y(&self) -> i64 {
+        self.rect.y - self.y + self.page_top
+    }
+
+    /// The link under a window point, by its index among the page's
+    /// links: on the page below the rule alone.
+    pub fn link_at(&self, x: i64, y: i64) -> Option<usize> {
+        band(self.rect, self.page_y(), i64::MAX).filter(|page| page.contains(x, y))?;
+        let laid = self.page.laid.as_deref()?;
+        // td-page's view of the page alone, scrolled so its frame is the
+        // one `emit` paints it in.
+        let view = View {
+            y: self.y - self.page_top,
+            ..View::default()
+        };
+        let pane = Pane {
+            rect: self.rect,
+            inset: INSET * self.scale,
+            scale: self.scale,
+            line: self.line,
+        };
+        let mut measure = self.measure.try_borrow_mut().ok()?;
+        view.link_at(laid, &mut measure, &pane, x, y)
+    }
+
+    /// The link under `at`, a window point or none; whether that changed.
+    /// After a key step it is none until the pointer moves; after a press
+    /// named a link, an absent pointer leaves it named.
+    pub fn hover(&mut self, at: Option<(i64, i64)>) -> bool {
+        if at.is_none() && self.named {
+            return false;
+        }
+        self.named = false;
+        if at != self.pointer {
+            self.stepped = false;
+        }
+        self.pointer = at;
+        let hover = at
+            .filter(|_| !self.stepped)
+            .and_then(|(x, y)| self.link_at(x, y));
+        let changed = hover != self.hover;
+        self.hover = hover;
+        changed
+    }
+
+    /// The focused link let go; whether there was one.
+    pub fn unfocus(&mut self) -> bool {
+        self.focus.take().is_some()
+    }
+
+    /// Focuses the next or previous link, scrolling it into the body;
+    /// with none focused, from the body: the first link whose line starts
+    /// at its top or below, or the last ending at its bottom or above,
+    /// else round. False when the page has no link.
+    pub fn step_link(&mut self, forward: bool) -> bool {
+        let Some(laid) = self.page.laid.as_deref() else {
+            return false;
+        };
+        let links = laid.links();
+        let count = links.len();
+        if count == 0 {
+            return false;
+        }
+        let (scale, page_top, y) = (self.scale, self.page_top, self.y);
+        let height = i64::from(self.rect.height);
+        let span = |line: u32| {
+            line_span(laid, line, scale).map(|(top, bottom)| (page_top + top, page_top + bottom))
+        };
+        let next = match (self.focus, forward) {
+            (None, true) => links
+                .iter()
+                .position(|&(_, line)| span(line).is_some_and(|(top, _)| top >= y))
+                .unwrap_or(0),
+            (None, false) => links
+                .iter()
+                .rposition(|&(_, line)| span(line).is_some_and(|(_, bottom)| bottom <= y + height))
+                .unwrap_or(count - 1),
+            (Some(at), true) => (at + 1) % count,
+            (Some(at), false) => (at + count - 1) % count,
+        };
+        let shown = links.get(next).and_then(|&(_, line)| span(line));
+        self.focus = Some(next);
+        self.hover = None;
+        self.stepped = true;
+        self.named = false;
+        if let Some((top, bottom)) = shown {
+            if top < self.y {
+                self.y = top;
+            } else if bottom > self.y + height {
+                self.y = bottom - height;
+            }
+            self.y = self.y.clamp(0, self.most());
+        }
+        true
+    }
+
+    /// Opens link `at` in `browser` (`td_ui::open::url`): what the status
+    /// row says of it.
+    pub fn open(&self, at: usize, browser: Option<&str>) -> Option<String> {
+        let said = match self.target(at) {
+            Ok(target) => match td_ui::open::url(&target, browser) {
+                Ok(program) => td_alloc::format(format_args!("opened {target} with {program}")),
+                Err(why) => td_alloc::format(format_args!("link not opened: {why}")),
+            },
+            Err(why) => td_alloc::format(format_args!("link not opened: {why}")),
+        };
+        said.ok()
+    }
+
+    /// Opens the link the status row names, as `open`: Return's. None
+    /// when it names none.
+    pub fn open_shown(&self, browser: Option<&str>) -> Option<String> {
+        self.open(self.shown_link()?, browser)
+    }
+
+    /// A press at a window point: the link under it opened, as `open`,
+    /// when it is the one the status row names; another link is named
+    /// first and opened by the next press. None off every link.
+    pub fn press(&mut self, x: i64, y: i64, browser: Option<&str>) -> Option<String> {
+        let at = self.link_at(x, y)?;
+        if self.shown_link() == Some(at) {
+            return self.open(at, browser);
+        }
+        self.pointer = Some((x, y));
+        self.stepped = false;
+        self.named = true;
+        self.hover = Some(at);
+        td_alloc::format(format_args!("press again to open it")).ok()
+    }
+
+    /// What the status row says of the link under the pointer, else the
+    /// focused one: where it goes, a long host cut in its middle, or why
+    /// it does not.
+    pub fn link_note(&self) -> Option<String> {
+        match self.target(self.shown_link()?) {
+            Ok(target) => shown_target(&target),
+            Err(why) => td_alloc::format(format_args!("not opened: {why}")).ok(),
+        }
+    }
+
+    /// The link the pointer is over, else the focused one.
+    pub fn shown_link(&self) -> Option<usize> {
+        self.hover.or(self.focus)
+    }
+
+    /// Where link `at` goes, as the browser is given it: its `href`
+    /// resolved by td-url against the message's `<base href>` when that
+    /// is an absolute URL, an `http` or `https` URL in td-url's printable
+    /// ASCII, its fragment kept when that is printable ASCII without a
+    /// backslash too. A link relative to no base, `//host` included, of
+    /// another scheme or one td-url refuses says why it is not opened.
+    pub fn target(&self, at: usize) -> Result<String, String> {
+        let laid = self.page.laid.as_deref().ok_or("no page is laid out")?;
+        let &(node, _) = laid.links().get(at).ok_or("no such link")?;
+        let tree = laid.tree();
+        let href = tree.href(node).ok_or("the link names no target")?.trim();
+        let base = tree
+            .base()
+            .and_then(|base| td_url::Url::parse(base.trim()).ok());
+        let (url, fragment) = match base {
+            Some(base) => fetched(td_url::resolve(&base, href)?)?,
+            None => {
+                let https = td_url::Url::parse(NO_BASE_HTTPS)?;
+                let http = td_url::Url::parse(NO_BASE_HTTP)?;
+                let (url, fragment) = fetched(td_url::resolve(&https, href)?)?;
+                let (other, _) = fetched(td_url::resolve(&http, href)?)?;
+                if url.https != other.https {
+                    return Err("a link relative to the message, which names no base".into());
+                }
+                (url, fragment)
+            }
+        };
+        let fragment = fragment.filter(|f| f.bytes().all(|b| b.is_ascii_graphic() && b != b'\\'));
+        match fragment {
+            Some(fragment) => td_alloc::format(format_args!("{}#{fragment}", url.text()))
+                .map_err(|_| "no memory for the link".into()),
+            None => Ok(url.text()),
+        }
+    }
+
     /// The body painted: paper, the head, the rule, then the page, each
     /// clipped to its own band, so nothing the message lays out, wherever
     /// it places it, reaches the head or the rule.
@@ -276,9 +529,18 @@ impl Paged {
                 band(self.rect, top + self.page_top, i64::MAX),
             ),
         ];
-        for (page, y, clip) in parts {
+        let link = self.shown_link();
+        for (index, (page, y, clip)) in parts.into_iter().enumerate() {
             let (Some(laid), Some(clip)) = (page.laid.as_deref(), clip) else {
                 continue;
+            };
+            // The focused or hovered link, drawn as selected, on the page.
+            let marks = Marks {
+                link: link
+                    .filter(|_| index == 1)
+                    .and_then(|at| laid.links().get(at))
+                    .map(|&(node, _)| node),
+                ..Marks::default()
             };
             let Some(damage) = damage.intersection(clip) else {
                 continue;
@@ -298,7 +560,7 @@ impl Paged {
                 &mut measure,
                 &frame,
                 damage,
-                &Marks::default(),
+                &marks,
                 &mut scratch,
                 sink,
             );
@@ -609,6 +871,303 @@ mod tests {
         held.show("m", "Subject: Hi", "<p>a", wider, one, None);
         assert!(held.get().is_some());
         assert_eq!(held.note(), None);
+    }
+
+    /// The first window point over link `at`, scanning the body.
+    fn point_on(paged: &Paged, at: usize) -> Option<(i64, i64)> {
+        let bottom = BODY.y + i64::from(BODY.height);
+        (BODY.y..bottom).step_by(2).find_map(|y| {
+            (BODY.x..BODY.x + i64::from(BODY.width))
+                .step_by(4)
+                .find(|&x| paged.link_at(x, y) == Some(at))
+                .map(|x| (x, y))
+        })
+    }
+
+    /// A link is found under the pointer on the page alone, never on the
+    /// head: a header that names a link is td-mail's text.
+    #[test]
+    fn a_link_is_found_on_the_page_and_not_the_head() {
+        let paged = made(
+            "Subject: see https://e.example/head",
+            "<p>before <a href='https://e.example/one'>the first</a> after",
+        );
+        let (x, y) = point_on(&paged, 0).expect("the link is under some point");
+        assert!(y >= BODY.y + paged.page_top);
+        assert_eq!(paged.target(0).as_deref(), Ok("https://e.example/one"));
+        for y in BODY.y..BODY.y + paged.page_top {
+            assert_eq!(paged.link_at(x, y), None, "{x},{y}");
+        }
+        assert_eq!(paged.link_at(BODY.x - 1, y), None);
+        // A link the message lays out over the head, clipped from view,
+        // is not under the pointer there either.
+        let over = made(
+            "Subject: Hi",
+            "<a href='https://e.example/up' style='display:block;margin-top:-40px'>up</a>",
+        );
+        assert!(over.target(0).is_ok());
+        for y in BODY.y..BODY.y + over.page_top {
+            for x in (BODY.x..BODY.x + 200).step_by(2) {
+                assert_eq!(over.link_at(x, y), None, "{x},{y}");
+            }
+        }
+    }
+
+    /// Where a link goes is td-url's reading of its `href`: an absolute
+    /// `http` or `https` URL, its fragment kept; a relative one against the
+    /// message's absolute `<base href>` alone; any other scheme, a
+    /// relative link with no base, or one td-url refuses, not opened.
+    #[test]
+    fn a_links_target_is_td_urls_reading_of_its_href() {
+        let target = |html: &str| made("Subject: Hi", html).target(0);
+        assert_eq!(
+            target("<a href=' HTTPS://E.example/a b#part '>x</a>").as_deref(),
+            Ok("https://e.example/a%20b#part")
+        );
+        assert_eq!(
+            target("<base href='https://e.example/dir/'><a href='page'>x</a>").as_deref(),
+            Ok("https://e.example/dir/page")
+        );
+        let relative = target("<a href='/page'>x</a>").unwrap_err();
+        assert!(relative.contains("relative"), "{relative}");
+        let relative = target("<base href='/dir/'><a href='page'>x</a>").unwrap_err();
+        assert!(relative.contains("relative"), "{relative}");
+        assert_eq!(
+            target("<a href='mailto:me@e.example'>x</a>").unwrap_err(),
+            "a mailto link"
+        );
+        assert_eq!(
+            target("<a href='javascript:alert(1)'>x</a>").unwrap_err(),
+            "a javascript link"
+        );
+        assert!(target("<a href='https://\u{e9}.example/'>x</a>").is_err());
+        assert!(target("<a>no target</a>").is_err());
+    }
+
+    /// l and L step the focus through the page's links in order and round,
+    /// scrolling the focused one into the body; the link focused or under
+    /// the pointer is named in the status row and drawn as selected.
+    #[test]
+    fn the_focus_steps_through_the_links_and_shows_them() {
+        let mut html = String::from("<p><a href='https://e.example/0'>zero</a>");
+        for n in 1..200 {
+            html.push_str(&format!("<p>line {n}"));
+        }
+        html.push_str("<p><a href='https://e.example/1'>one</a>");
+        let mut paged = made("Subject: Hi", &html);
+        let plain = draws(&paged);
+        assert_eq!(paged.link_note(), None);
+        assert!(paged.step_link(true));
+        assert_eq!(paged.focus, Some(0));
+        assert_eq!(paged.link_note().as_deref(), Some("https://e.example/0"));
+        assert_ne!(
+            draws(&paged),
+            plain,
+            "the focused link is drawn as selected"
+        );
+        assert!(paged.step_link(true));
+        assert_eq!(paged.focus, Some(1));
+        assert!(paged.y > 0, "scrolled to the second link");
+        assert!(text(&paged).contains("one"));
+        assert!(paged.step_link(true));
+        assert_eq!(paged.focus, Some(0));
+        assert!(text(&paged).contains("zero"), "and back to the first");
+        assert!(paged.step_link(false));
+        assert_eq!(paged.focus, Some(1));
+        assert!(paged.unfocus());
+        assert!(!paged.unfocus());
+        // With none focused, back from the bottom is the last link shown.
+        assert!(paged.step_link(false));
+        assert_eq!(paged.focus, Some(1));
+        // The pointer's link is named before the focused one.
+        paged.scroll_to(false);
+        let (x, y) = point_on(&paged, 0).unwrap();
+        assert!(paged.hover(Some((x, y))));
+        assert!(!paged.hover(Some((x, y))));
+        assert_eq!(paged.link_note().as_deref(), Some("https://e.example/0"));
+        assert!(paged.hover(None));
+        assert_eq!(paged.link_note().as_deref(), Some("https://e.example/1"));
+        let mut none = made("Subject: Hi", "<p>no link");
+        assert!(!none.step_link(true));
+        assert_eq!(none.focus, None);
+    }
+
+    /// The link under a point is the one painted there as the page is
+    /// scrolled: scrolled down, it is found as far up; scrolled away, at
+    /// no point of the body.
+    #[test]
+    fn a_link_is_found_where_the_page_is_scrolled_to() {
+        let mut html = String::from("<p>above<p><a href='https://e.example/x'>there</a>");
+        for n in 0..200 {
+            html.push_str(&format!("<p>line {n}"));
+        }
+        let mut paged = made("Subject: Hi", &html);
+        let (x, y) = point_on(&paged, 0).unwrap();
+        assert!(paged.scroll_by(37));
+        assert_eq!(paged.link_at(x, y - 37), Some(0));
+        paged.scroll_to(true);
+        assert_eq!(point_on(&paged, 0), None);
+    }
+
+    /// With no link focused, l starts at the first link whose line begins
+    /// in the body or below, and L at the last ending in it or above, from
+    /// wherever the body is scrolled.
+    #[test]
+    fn a_step_with_none_focused_starts_from_the_body() {
+        let mut html = String::new();
+        for at in 0..3 {
+            html.push_str(&format!(
+                "<p><a href='https://e.example/{at}'>link {at}</a>"
+            ));
+            for n in 0..100 {
+                html.push_str(&format!("<p>line {n}"));
+            }
+        }
+        let mut paged = made("Subject: Hi", &html);
+        assert!(paged.step_link(true) && paged.step_link(true));
+        assert_eq!(paged.focus, Some(1));
+        let y = paged.y;
+        assert!(y > 0);
+        assert!(paged.unfocus());
+        assert!(paged.step_link(true));
+        assert_eq!(paged.focus, Some(1), "forward from a body showing link 1");
+        assert!(paged.unfocus());
+        assert!(paged.step_link(false));
+        assert_eq!(paged.focus, Some(1), "back from a body showing link 1");
+        assert_eq!(paged.y, y, "already shown, nothing scrolls");
+    }
+
+    /// After a key step the status row and Return speak of the focused
+    /// link, not the one under a pointer at rest, until the pointer
+    /// moves; a press on a link the row does not name names it, and the
+    /// next press opens it.
+    #[test]
+    fn the_row_names_what_return_and_a_press_open() {
+        let mut paged = made(
+            "Subject: Hi",
+            "<p><a href='https://e.example/first'>first</a>\
+             <p><a href='https://e.example/big' style='display:block;height:300px'>big</a>",
+        );
+        let at = point_on(&paged, 1).unwrap();
+        assert!(paged.hover(Some(at)));
+        assert_eq!(paged.link_note().as_deref(), Some("https://e.example/big"));
+        assert!(paged.step_link(true));
+        assert_eq!(paged.focus, Some(0));
+        paged.hover(Some(at));
+        assert_eq!(
+            paged.link_note().as_deref(),
+            Some("https://e.example/first")
+        );
+        assert_eq!(
+            paged.open_shown(Some("true")).as_deref(),
+            Some("opened https://e.example/first with true")
+        );
+        // A press on the link under the pointer, not the one named.
+        assert_eq!(
+            paged.press(at.0, at.1, Some("true")).as_deref(),
+            Some("press again to open it")
+        );
+        assert_eq!(paged.link_note().as_deref(), Some("https://e.example/big"));
+        // Its button held, td-ui reports no pointer; the link stays named,
+        // and is under the pointer again at the release.
+        assert!(!paged.hover(None));
+        assert_eq!(paged.link_note().as_deref(), Some("https://e.example/big"));
+        paged.hover(Some(at));
+        assert_eq!(paged.link_note().as_deref(), Some("https://e.example/big"));
+        assert_eq!(
+            paged.press(at.0, at.1, Some("true")).as_deref(),
+            Some("opened https://e.example/big with true")
+        );
+        assert_eq!(paged.press(BODY.x - 1, at.1, Some("true")), None);
+        // A moved pointer is followed again.
+        assert!(paged.unfocus());
+        assert!(paged.step_link(true));
+        assert_eq!(paged.focus, Some(0));
+        paged.hover(Some(at));
+        assert_eq!(
+            paged.link_note().as_deref(),
+            Some("https://e.example/first")
+        );
+        paged.hover(Some((at.0 + 1, at.1)));
+        assert_eq!(paged.link_note().as_deref(), Some("https://e.example/big"));
+        assert_eq!(paged.hover, Some(1));
+    }
+
+    /// A host too long for the status row keeps only its end, where the
+    /// name it is registered under is.
+    #[test]
+    fn a_long_host_keeps_its_end_in_the_row() {
+        let host = format!("www.bank.example.{}.evil.example", "a".repeat(60));
+        let mut paged = made(
+            "Subject: Hi",
+            &format!("<a href='https://{host}:8443/path'>x</a>"),
+        );
+        assert!(paged.step_link(true));
+        let note = paged.link_note().unwrap();
+        assert_eq!(
+            paged.target(0).unwrap(),
+            format!("https://{host}:8443/path")
+        );
+        assert!(note.starts_with("https://\u{2026}"), "{note}");
+        assert!(!note.contains("bank"), "{note}");
+        assert!(note.ends_with(".evil.example:8443/path"), "{note}");
+        assert_eq!(
+            note.chars().count(),
+            "https://".len() + HOST_SHOWN + "/path".len()
+        );
+        let mut short = made("Subject: Hi", "<a href='https://e.example/p'>x</a>");
+        assert!(short.step_link(true));
+        assert_eq!(short.link_note().as_deref(), Some("https://e.example/p"));
+    }
+
+    /// A `//host` link takes its scheme from the base: with none it is
+    /// relative and refused, as a path is; with one it is that scheme. An
+    /// absolute link to the placeholder's name is no relative one; a
+    /// fragment with a backslash, which the opener refuses, is dropped.
+    #[test]
+    fn a_scheme_relative_link_needs_a_base() {
+        let target = |html: &str| made("Subject: Hi", html).target(0);
+        for href in [
+            "//evil.example/x",
+            "\\\\evil.example\\x",
+            "/\\evil.example/x",
+        ] {
+            let why = target(&format!("<a href='{href}'>x</a>")).unwrap_err();
+            assert!(why.contains("relative"), "{href}: {why}");
+        }
+        assert_eq!(
+            target("<base href='http://e.example/'><a href='//evil.example/x'>x</a>").as_deref(),
+            Ok("http://evil.example/x")
+        );
+        assert_eq!(
+            target("<a href='https://relative.invalid/x'>x</a>").as_deref(),
+            Ok("https://relative.invalid/x")
+        );
+        assert_eq!(
+            target("<a href='https://e.example/#a\\b'>x</a>").as_deref(),
+            Ok("https://e.example/")
+        );
+    }
+
+    /// A link not opened says why in the status row's words.
+    #[test]
+    fn a_link_not_opened_says_why() {
+        let paged = made("Subject: Hi", "<a href='mailto:me@e.example'>x</a>");
+        assert_eq!(
+            paged.open(0, Some("/nonexistent/browser")).as_deref(),
+            Some("link not opened: a mailto link")
+        );
+        let paged = made("Subject: Hi", "<a href='https://e.example/'>x</a>");
+        let said = paged.open(0, Some("/nonexistent/browser")).unwrap();
+        assert!(said.starts_with("link not opened: "), "{said}");
+        assert_eq!(paged.open_shown(None), None, "no link named");
+    }
+
+    /// Every draw the pages make, as text to compare.
+    fn draws(paged: &Paged) -> String {
+        let mut out = String::new();
+        paged.emit(BODY, &mut |draw| out.push_str(&format!("{draw:?}\n")));
+        out
     }
 
     /// Host measurement (README.md, "Memory"), release build: each hostile

@@ -90,6 +90,7 @@ dependencies = [
  "td-test-compositor",
  "td-toml",
  "td-ui",
+ "td-url",
 ]
 
 [[package]]

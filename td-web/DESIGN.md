@@ -2424,10 +2424,13 @@ order; each is its own design amendment when it starts:
   composition naming a picture's factor would let the seam's `frame`
   draw one as the window does.
 - **HTML mail.** td-mail shows a message's HTML through td-page
-  (td-page/DESIGN.md §4), styled, fetching nothing. To come: `cid:`
-  pictures from the message's own parts, links taken in the pane and
-  opened outside it with their real target shown, remote content only
-  when asked for, and its pages made off the window's thread.
+  (td-page/DESIGN.md §4), styled, fetching nothing, its links opened in
+  the configured browser with their real target shown first. To come:
+  a choice per link between td-web and Firefox (Return or a press for
+  the default, with Shift for the other), which makes td-web a portal
+  link handler (§7); `cid:` pictures from the message's own parts;
+  remote content only when asked for; and its pages made off the
+  window's thread.
 - **Primary selection**: the page's selection offered as the primary
   selection, and a middle click pasting it into the address row, once
   td-ui's widget window binds it and delivers the middle button.

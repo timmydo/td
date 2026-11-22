@@ -845,9 +845,14 @@ impl EmailView {
             } else {
                 ""
             };
+            let page_hint = if self.page_html().is_some() {
+                " l/L:link"
+            } else {
+                ""
+            };
             format!(
-                "q:back n/p:unread j/k:scroll r:reply R:reply-all F:forward h:html{}{}{} a:archive d:delete m:move J:spam H:ham S:score ?:help",
-                att_hint, expire_hint, url_hint
+                "q:back n/p:unread j/k:scroll r:reply R:reply-all F:forward h:html{}{}{}{} a:archive d:delete m:move J:spam H:ham S:score ?:help",
+                page_hint, att_hint, expire_hint, url_hint
             )
         };
         match self.status_message {
@@ -998,6 +1003,33 @@ impl View for EmailView {
 
         match key {
             Key::Char('q') => ViewAction::Pop,
+            // Over a page: l and L focus its next and previous link,
+            // Return opens the one the status row names, Escape lets the
+            // focus go.
+            Key::Char(c @ ('l' | 'L')) if self.page_html().is_some() => {
+                let stepped = self
+                    .page
+                    .get_mut()
+                    .is_some_and(|page| page.step_link(c == 'l'));
+                if !stepped {
+                    self.status_message =
+                        td_alloc::format(format_args!("No link on this page")).ok();
+                }
+                ViewAction::Continue
+            }
+            Key::Enter if self.page_html().is_some() => {
+                let browser = self.browser.as_deref();
+                if let Some(said) = self.page.get().and_then(|page| page.open_shown(browser)) {
+                    self.status_message = Some(said);
+                }
+                ViewAction::Continue
+            }
+            Key::Escape if self.page_html().is_some() => {
+                if let Some(page) = self.page.get_mut() {
+                    page.unfocus();
+                }
+                ViewAction::Continue
+            }
             // n/p are next/previous unread; with no unread message to go to
             // they read on, as j/k do.
             Key::Char('n') => {
@@ -1590,6 +1622,31 @@ mod tests {
             result: Box::new(Ok(other)),
         });
         assert!(page_of(&view).is_some());
+    }
+
+    /// Over a page l focuses its first link and Return opens it in the
+    /// configured browser; Escape lets the focus go, and Return then opens
+    /// nothing. A page with no link says so.
+    #[test]
+    fn l_focuses_a_link_and_return_opens_it() {
+        let mut view = parts_view(None, Some("<p><a href='https://e.example/x'>a link</a>"));
+        assert!(held(&mut view));
+        view.handle_key(Key::Enter, 10);
+        assert_eq!(view.status_message, None, "no link focused");
+        view.handle_key(Key::Char('l'), 10);
+        view.handle_key(Key::Enter, 10);
+        assert_eq!(
+            view.status_message.as_deref(),
+            Some("opened https://e.example/x with true")
+        );
+        view.status_message = None;
+        view.handle_key(Key::Escape, 10);
+        view.handle_key(Key::Enter, 10);
+        assert_eq!(view.status_message, None);
+        let mut bare = parts_view(None, Some("<p>no link here"));
+        assert!(held(&mut bare));
+        bare.handle_key(Key::Char('L'), 10);
+        assert_eq!(bare.status_message.as_deref(), Some("No link on this page"));
     }
 
     /// A message with a plain part is shown as it, and `h` shows its

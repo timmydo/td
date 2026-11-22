@@ -1259,6 +1259,18 @@ impl Session {
                 }
             }
         }
+        // The link under the pointer or focused on a page leads the row,
+        // over any note: nothing opens that the row has not named.
+        let link = slot
+            .view
+            .page()
+            .and_then(Held::get)
+            .and_then(Paged::link_note);
+        if let Some(link) = link {
+            if let Ok(status) = td_alloc::format(format_args!("{link} | {}", scene.status)) {
+                scene.status = status;
+            }
+        }
         scene
     }
 
@@ -1941,6 +1953,30 @@ impl Session {
         if self.pane.hover(rect.and(at)) {
             self.redraw();
         }
+        self.hover_page();
+    }
+
+    /// Points a page at the link under the pointer, Control held or not,
+    /// which it draws as selected and the status row names: with the mouse
+    /// on and no dropdown or finder over the frame. A press is delivered
+    /// before its button ends the motion, so a link pressed is the one
+    /// named.
+    fn hover_page(&mut self) {
+        let open = self.mouse && self.menu.is_none() && self.chooser.is_none();
+        let on_page = self.pointer_at.filter(|&(x, y)| {
+            open && self
+                .shape()
+                .and_then(|shape| shape.layout.page)
+                .is_some_and(|page| page.contains(x, y))
+        });
+        let hovered = self
+            .stack
+            .top_mut()
+            .and_then(|slot| slot.view.page_mut())
+            .is_some_and(|page| page.hover(on_page));
+        if hovered {
+            self.redraw();
+        }
     }
 
     fn pointer(&mut self, phase: PointerPhase, x: i64, y: i64, extend: bool, follow: bool) {
@@ -1963,6 +1999,21 @@ impl Session {
         if phase == PointerPhase::Press && self.sidebar.focused {
             self.sidebar.focused = false;
             self.redraw();
+        }
+        // A press on a page's link opens it, Control held or not, once
+        // the status row names it: the page takes no other press.
+        if phase == PointerPhase::Press && shape.layout.page.is_some_and(|page| page.contains(x, y))
+        {
+            let browser = self.setup.browser.as_deref();
+            let said = self
+                .stack
+                .top_mut()
+                .and_then(|slot| slot.view.page_mut())
+                .and_then(|page| page.press(x, y, browser));
+            if let Some(said) = said {
+                self.note(said);
+                return;
+            }
         }
         // A view asking about its draft has the pointer too: the bar's
         // labels answer, and the pane is not touched meanwhile.
@@ -2258,6 +2309,7 @@ impl Handler for Session {
 
     fn motion(&mut self, at: Option<(i64, i64)>) {
         self.pointer_at = at;
+        self.hover_page();
     }
 
     fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> Flow {
@@ -2311,7 +2363,11 @@ impl Handler for Session {
                 // A repeated Cut must not delete the next line. Other
                 // repeats remain kill-ring-only while Paste is pending.
                 Input::Key { chord, repeat } => {
-                    if !(repeat && chord == "C-x") {
+                    // A held C-x is one; a held Return over a page opens
+                    // its link once, not a browser a repeat.
+                    let held = repeat
+                        && (chord == "C-x" || (chord == "Return" && self.shown_page().is_some()));
+                    if !held {
                         self.chord(chord);
                     }
                     if repeat && chord != "C-x" {
@@ -4064,7 +4120,8 @@ mod frame_tests {
             Vec::new(),
             "Archive".to_string(),
             "Trash".to_string(),
-            None,
+            // Never the environment's opener: `true` opens nothing.
+            Some("true".to_string()),
         );
         session.act(ViewAction::Push(Box::new(view)));
         let part = crate::jmap::types::BodyPart {
@@ -4182,6 +4239,110 @@ mod frame_tests {
                 .starts_with("HTML past 512 KiB not shown; h: text | "),
             "{status}"
         );
+    }
+
+    /// Over a page's link the pointer names its target first in the status
+    /// row, and a press opens it through the configured browser, the note
+    /// saying what the opener answered.
+    #[test]
+    fn a_pages_link_is_named_under_the_pointer_and_a_press_opens_it() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        session.setup.browser = Some("/nonexistent/td-mail-browser".to_string());
+        show_html(
+            &mut session,
+            &resp_tx,
+            "<p>see <a href='https://e.example/there'>the place</a>",
+        );
+        session.prepare_frame();
+        let rect = session.shape().unwrap().layout.page.unwrap();
+        // A press on the head opens nothing.
+        press(&mut session, rect.x + 2, rect.y + 2);
+        let shown = session.shown();
+        assert!(!shown.contains("opened") && !shown.contains("press again"));
+        let at = page_point(&session, 0).expect("a point over the link");
+        // The link leads the row over a note, too.
+        session.note("an earlier note".to_string());
+        session.motion(Some(at));
+        let shown = session.shown();
+        let status = shown.lines().last().unwrap_or_default();
+        assert!(
+            status
+                .trim_start()
+                .starts_with("https://e.example/there | an earlier note"),
+            "{status}"
+        );
+        press(&mut session, at.0, at.1);
+        let shown = session.shown();
+        assert!(
+            shown.contains("link not opened: "),
+            "the opener's answer: {shown}"
+        );
+        // A held Return opens nothing a repeat; Return opens the link named.
+        let repeat = Input::Key {
+            chord: "Return",
+            repeat: true,
+        };
+        session.input(repeat, &mut NoClipboard);
+        assert!(!session.shown().contains("opened"));
+        key(&mut session, "Return");
+        let shown = session.shown();
+        // The view's own browser, `show_html`'s `true`.
+        assert!(
+            shown.contains("opened https://e.example/there with true"),
+            "{shown}"
+        );
+    }
+
+    /// The first window point over a shown page's link `at`.
+    fn page_point(session: &Session, at: usize) -> Option<(i64, i64)> {
+        let rect = session.shape()?.layout.page?;
+        let page = session.shown_page()?;
+        (rect.y..rect.y + i64::from(rect.height))
+            .step_by(2)
+            .find_map(|y| {
+                (rect.x..rect.x + i64::from(rect.width))
+                    .step_by(4)
+                    .find(|&x| page.link_at(x, y) == Some(at))
+                    .map(|x| (x, y))
+            })
+    }
+
+    /// With the pointer at rest over one link, l focuses another and the
+    /// row names that; a press on the pointer's link then names it, and
+    /// the next press opens it.
+    #[test]
+    fn a_step_names_the_focused_link_over_the_pointers() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        session.setup.browser = Some("/nonexistent/td-mail-browser".to_string());
+        show_html(
+            &mut session,
+            &resp_tx,
+            "<p><a href='https://e.example/first'>first</a>\
+             <p><a href='https://e.example/second'>second</a>",
+        );
+        session.prepare_frame();
+        let at = page_point(&session, 1).expect("a point over the second link");
+        session.motion(Some(at));
+        let status = |session: &mut Session| {
+            let shown = session.shown();
+            shown
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .trim_start()
+                .to_string()
+        };
+        assert!(status(&mut session).starts_with("https://e.example/second | "));
+        key(&mut session, "l");
+        assert!(status(&mut session).starts_with("https://e.example/first | "));
+        press(&mut session, at.0, at.1);
+        let row = status(&mut session);
+        assert!(
+            row.starts_with("https://e.example/second | press again to open it"),
+            "{row}"
+        );
+        press(&mut session, at.0, at.1);
+        assert!(session.shown().contains("link not opened: "));
     }
 
     /// A Control-press on a link in a message opens it through the

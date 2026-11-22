@@ -58,10 +58,10 @@ indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 # the HTTP Basic credential, the fetch service's client, HTML rendering
 # as text and, through td-page, as a styled page, JSON for JMAP and the
 # CLI, the cache's key/value store, td-txt's regex
-# engine for the rules, TOML for the configuration and rules files, and
-# the shared UI toolkit, through which alone the widget window the client
+# engine for the rules, TOML for the configuration and rules files, the
+# shared UI toolkit, through which alone the widget window the client
 # draws in and the editor pane it reads and composes a message in reach
-# this crate.
+# this crate, and td-url, which resolves a page's links as td-web does.
 [dependencies]
 td-alloc = { path = "../td-alloc" }
 td-civil = { path = "../td-civil" }
@@ -75,6 +75,7 @@ td-page = { path = "../td-page" }
 td-regex = { path = "../td-regex" }
 td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }
+td-url = { path = "../td-url" }
 
 [dev-dependencies]
 td-test-compositor = { path = "../td-test-compositor" }

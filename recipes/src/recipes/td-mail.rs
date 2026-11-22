@@ -136,6 +136,7 @@ mod tests {
             "td-test-compositor",
             "td-toml",
             "td-ui",
+            "td-url",
         ] {
             assert!(manifest.contains(&format!("{sibling} = {{ path = \"../{sibling}\" }}")));
         }

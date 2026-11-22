@@ -177,6 +177,15 @@ pub const EMAIL_VIEW: Table = Table {
             "Open the link under the pointer in the browser",
         ),
         (
+            "click",
+            "open_page_link",
+            "Open the page's link the status row names, else name it",
+        ),
+        ("l", "next_link", "Focus the page's next link"),
+        ("L", "previous_link", "Focus the page's previous link"),
+        ("Return", "open_link", "Open the link the status row names"),
+        ("Escape", "unfocus_link", "Let the focused link go"),
+        (
             "h",
             "toggle_html",
             "HTML as its page or as text, or the plain part",

@@ -70,10 +70,30 @@ the reading keys, the page keys and the wheel, so a head of any length,
 with v's raw headers, is read in full. For a message whose only body is
 HTML, h moves between the page and the text rendering; with a
 plain part, between that part and the page; another message opens as
-its page again. Links are opened through b's list, which the text
-rendering makes; the digits that open a numbered link directly do
-nothing over a page, where the numbers are not shown. The page does not
-yet take presses, focus or selection, and does not scroll across.
+its page again.
+
+A page's links open in the configured browser, outside td-mail, and
+nothing opens that the status row has not named first. The link under
+the pointer, else the focused one, is drawn as selected and its target
+leads the status row, over any note: where it really goes, as td-url
+reads its `href`, not the text it shows, a host too long for the row
+shown by its end alone, after an ellipsis. A press on the named link opens
+it, Control held or not; a press on another names it, and the next
+opens it. l and L focus the next and previous link, scrolling it into
+view, and until the pointer moves the row names the focused link, not
+the one under a pointer at rest; Return opens the named link, once
+however long it is held, and Escape lets the focus go. An `http` or
+`https` link opens, its fragment kept when it is printable ASCII
+without a backslash; a relative link, `//host` included, opens only
+against the message's own absolute `<base href>`, since a message has
+no address of its own; a link of another scheme (`mailto`,
+`javascript`) or one td-url refuses, a host outside ASCII say, is not
+opened and the status row says why. A
+link td-mail's own head names is text, not a link. b's list, which the
+text rendering makes, still lists every URL; the digits that open a
+numbered link directly do nothing over a page, where the numbers are
+not shown. The page takes no other press yet, has no selection, and does
+not scroll across.
 
 A page is made within a 32 MiB budget (`ui::page::BUDGET`). One past it
 steps down td-page's ladder: without its styles, then as its text, and

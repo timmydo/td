@@ -67,8 +67,8 @@ td-web, and td-mail's message view (td-mail/README.md, "HTML mail"
 and "Memory"): a page made from a message's HTML part alone, styles
 on, pictures and every sheet it names off, on td-mail's window thread
 within a budget of its own measured against td-mail's jail, with
-td-mail's head as a text page above it. `cid:` pictures from the
-message's own parts and links taken in the pane remain planned
-(td-web/DESIGN.md §11). Each is its own amendment, and the one that
-makes a rule here caller-neutral moves that rule from td-web/DESIGN.md
-to this file.
+td-mail's head as a text page above it, its links taken in the pane
+and opened outside it. `cid:` pictures from the message's own parts
+remain planned (td-web/DESIGN.md §11). Each is its own amendment, and
+the one that makes a rule here caller-neutral moves that rule from
+td-web/DESIGN.md to this file.
