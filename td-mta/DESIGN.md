@@ -1777,7 +1777,7 @@ header evidence does not detect later corruption in an unrequested body tail
 and grants no body pin. Qualified stored search fields likewise answer
 searches without current body verification, under the digest/version and
 fallback contract in POSTGRES.md. Body projections, previews and downloads
-retain their documented current-byte verification. POSTGRES.md section 73 owns cache admission and lifetime; its persistent
+retain their documented current-byte verification. POSTGRES.md, "Worker-local verified header projections", owns cache admission and lifetime; its persistent
 summary section owns digest/version binding, publication and rebuilding.
 
 
@@ -3074,7 +3074,7 @@ context on the owning thread. It never lives on the network reactor or in an
 account-sized cache. The native PostgreSQL context owns one existing read
 permit, establishes fresh authority in a new transaction for every job, and
 rolls back before response output. Bounded HTTP input/output turns also retire
-expired idle sessions locally, without SQL or a background task. POSTGRES.md section 73 owns its finite
+expired idle sessions locally, without SQL or a background task. POSTGRES.md, "Retained HTTPS API read sessions", owns its finite
 session, protocol and cleanup bounds. Mutations retain their existing separate
 publication and uncertain-COMMIT paths.
 

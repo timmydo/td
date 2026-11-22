@@ -8239,20 +8239,21 @@ with properties [id, blobId], without MIME parsing. Derived attachment locators
 are provisional until successful response publication; the HTTPS direct-part
 route below validates them independently before download.
 
-One method meter covers property recognition, every requested message and all
-MIME phases under the original execution deadline. The original retention
-meter separately charges response work/I/O, once per staged output chunk;
-MIME turns observe its deadline without double-billing its record grant.
-Every body is verified and pinned
-under the same account view before interpretation. Header-only PostgreSQL
-Email/get may instead reuse a worker-local serialized projection from a
-previously fully verified identical immutable blob. Fresh authority and current
-metadata are still required; POSTGRES.md section 73 defines the exact key,
-bounds and historical-verification limitation. Body-derived properties never
-use this cache. Per-message HeaderBudget,
-metadata buffers and short reborrows allow sequential part interpretation;
-there is no new meter per part, decoder or preview. Four-KiB output staging
-avoids scalar-sized file writes. Both snapshot and execution admission precede
+One method meter covers property recognition, every requested message and
+all MIME phases under the original execution deadline. The original
+retention meter separately charges response work/I/O, once per staged output
+chunk; MIME turns observe its deadline without double-billing its record
+grant. Every body is verified and pinned under the same account view before
+interpretation. Header-only PostgreSQL Email/get may instead reuse a
+worker-local serialized projection from a previously fully verified
+identical immutable blob. Fresh authority and current metadata are still
+required; POSTGRES.md, [Worker-local verified header
+projections](POSTGRES.md#worker-local-verified-header-projections), defines
+the exact key, bounds and historical-verification limitation. Body-derived
+properties never use this cache. Per-message HeaderBudget, metadata buffers
+and short reborrows allow sequential part interpretation; there is no new
+meter per part, decoder or preview. Four-KiB output staging avoids
+scalar-sized file writes. Both snapshot and execution admission precede
 publication; a failed method rolls back its entire unpublished list.
 
 Deterministic interpreter/capacity refusals are serverFail/messageInterpretation;

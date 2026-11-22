@@ -70,6 +70,8 @@ References give each mechanism's rules; use these entry points:
 | Connections, bootstrap files, runtime logins and `serve` | [8. Connection, bootstrap and serving startup](#8-connection-bootstrap-and-serving-startup) |
 | Schema ledger, configuration versions and selection | [9. Schema ledger, roles and configuration](#9-schema-ledger-roles-and-configuration) |
 | Accounts, devices and HTTPS authentication | [10. Accounts, devices and administration](#10-accounts-devices-and-administration) |
+| JMAP read snapshots, dispatch and downloads | [11. JMAP reads](#11-jmap-reads) |
+| Stored summaries, MIME evidence and search | [12. Derived read evidence and search](#12-derived-read-evidence-and-search) |
 | Account administration and identities | [Account administration workflow](#account-administration-workflow) |
 | Account-scoped HTTP authentication | [HTTPS account selection](#https-account-selection) |
 | Incoming mail across accounts | [Transactional incoming delivery](#transactional-incoming-delivery-across-accounts) |
@@ -2226,99 +2228,1363 @@ account or grants relay permission. No schema migration is required:
 import, check and select a configuration with the new aliases, and each
 serving instance drains and reloads into it ("Foreground serve command").
 
-## 28. Authenticated mailbox observations
+## 11. JMAP reads
 
-`postgres_mailboxes::list` is an inert worker-side storage operation, not a
-selected runtime backend. It takes the expected epoch/account and app password,
-verifies the primary/schema barrier, and begins one read-only repeatable-read
-transaction. The shared device verifier runs inside that transaction, before
-account state and mailbox contents are read. A revoked or wrong-account token
-returns no mailbox data. A revocation after snapshot admission may allow that
-bounded observation to finish; its returned device ID grants no later authority.
-Configuration/profile admission and runtime credentials remain runtime integration work.
+Every JMAP read, blob download and read-side reconciliation query runs
+on a freshly authenticated, finite, read-only repeatable-read snapshot of
+the writer endpoint (section 3). This chapter specifies the process-local
+read connection slots, snapshot admission and custody, the bounded storage
+reads a snapshot offers, verified body custody, the HTTPS path that
+authenticates and executes requests on the fixed body workers, the
+per-method read projections and blob downloads. `serve` constructs one
+`postgres_http_api::Service` per account binding and origin; the live
+HTTPS service dispatches Core/echo, Mailbox/get, Mailbox/changes,
+Email/get, Email/query, Email/changes, Thread/get, Thread/changes,
+Identity/get, EmailSubmission/get and EmailSubmission/query through the
+read dispatcher below, together with the replica methods of
+"Replica source inventory windows". Mutations use the separate
+publication adapters; they share only authentication and the method
+boundary in [Read snapshots before mutations](#read-snapshots-before-mutations).
 
-The result owns at most 256 mailbox rows, in binary ID order, with account
-sequence/floor and total/unread Email and Thread counts from the same snapshot.
-Unread excludes both seen and draft Emails; a Thread is unread when at least
-one member in that mailbox is unread. A closed query limits returned rows to
-257 to detect overflow without returning a partial listing. The mailbox-only
-transport allows 512 frames within the ordinary one MiB input and 128 KiB
-individual-frame ceilings; other operations retain their previous budgets.
-Counts are grouped across memberships of the bounded selected mailbox set,
-with account-scoped Email, Thread and keyword joins. Empty mailboxes retain
-zero counts. This avoids requiring a separate aggregate execution for each
-mailbox without retaining per-email rows in the caller. Database aggregate
-work is subject to the statement and whole-operation limits, not a promise
-of bounded server scan cardinality.
+### Read connection slots
 
-Rows pass shared mailbox-format validation, sequence checks and bounded parent
-hierarchy validation. Count inputs must have valid referenced Emails/Threads
-and change positions no newer than the captured sequence. Missing/cyclic
-parents, future changes, invalid fields or capacity exhaustion fail the entire
-observation. Retained strings use fallible bounded allocation. The absolute
-caller deadline (at most ten seconds) covers connection, authentication, SQL
-and decoding, and is checked again before any result escapes. The connection
-and snapshot close before return; results cannot be extended into a later
+`postgres_read::ReadSlots` reserves 1..256 process-local read connections.
+Acquisition uses at most eight atomic compare/exchange attempts and returns
+Busy on exhaustion or contention, without a queue, connection attempt or
+retry. `serve` sizes one pool from the configured `storage_views` limit.
+HTTP snapshots, retained API and download sessions, uploads, the HTTP
+mutation adapters and their inline settlement, and SMTP receiving
+(readiness observation, publication and the retained storage session)
+all acquire their connections from it. Only the relay keeps separate
+permits for its own settlement. A permit is released only after the
+connection it covers has dropped.
+
+### Authenticated read snapshots
+
+`postgres_read::Snapshot` admits the selected JMAP profile and current
+device, then retains one primary repeatable-read snapshot across Email
+metadata, mailbox membership, keyword windows, mailbox listings, query
+pages, thread windows, change history and verified body callbacks. One
+private admission helper serves every snapshot. All results bind the same
+account sequence and history floor. The handle and connection cannot
+escape their owner; returned passive values confer no authority on later
+operations.
+
+`Snapshot::open_resolved` reserves a read slot before selecting addresses
+for the protected bootstrap endpoint and qualifying the runtime
+connection. The same slot and original finite allowance cover resolution,
+all attempted addresses, authentication and snapshot ownership. Only
+transport connection failures advance to another resolved address;
+policy, credential, schema and database failures have no fallback. The
+selected bootstrap profile must match the binding, and the binding must
+enable the JMAP role. Resolution has a five-second cap within the
+original request allowance; the ten-second worker ceiling can only
+shorten that allowance. No connection or DNS queue is created, and all
+failed paths release their slot after closing owned work.
+
+`Snapshot::open_runtime` requires the binding's runtime connection mode
+(replica read for a read-only binding) and acquires a
+slot before connecting. Both runtime constructors return an owned,
+thread-confined snapshot after primary/schema/privilege qualification and
+fresh profile/device admission. The connection drops before the slot is
+returned; failed opening releases both. Neither the deadline, protocol
+budgets, snapshot identity nor sticky read failure can be renewed by
+retaining or borrowing this owner. The worker must drop it when the
+bounded method finishes; server idle-transaction expiry and local checks
+remain additional limits. No live view crosses worker threads.
+
+`postgres_read::with_snapshot` uses the same implementation with a
+private one-slot pool and bounds custody to its callback; its caller
+(submission input preparation, fixtures) owns outer worker admission. It
+does not require Runtime mode, but owner credentials cannot reach a
+snapshot through the runtime constructors. A retained HTTPS API session
+lends its connection to a borrowed snapshot instead
+([Retained HTTPS API read sessions](#retained-https-api-read-sessions)); the session, not the snapshot, then holds the slot.
+
+Every method and final callback completion checks the original connection
+and deadline. A failed operation retires the whole view, including when
+its caller swallows the error. Missing Email metadata remains a normal
+absent result. Concurrent writes or retirement cannot splice new metadata
+or body bytes into an admitted read. Current profile/device authority is
+checked at admission; revocation does not extend or invalidate an already
+admitted finite snapshot. The read worker's byte/frame caps apply across
+all methods and bodies, without replenishment. A snapshot grants no
+listener or publication authority.
+
+### Read worker budgets and deadlines
+
+A private connection worker drives successive closed queries
+synchronously; it never replenishes deadlines or transport budgets between
+queries. Probe, material, configuration, schema and standalone mailbox
+operations keep their own budgets and mutation-outcome semantics; the
+standalone mailbox transport allows 512 frames within the ordinary one MiB
+input and 128 KiB individual-frame ceilings. Snapshot and body operations
+have a 256 MiB total input budget, 8192 frames, 512 KiB output and the
+unchanged 128 KiB individual frame/authentication limits. The total
+includes initial verification and later reads, so sufficiently many cache
+misses refuse rather than consume unlimited wire or driver memory. These
+are wire budgets, not resident allocations. A snapshot's deadline is at
+most ten seconds; a body connection admits at most thirty, the HTTPS
+download cap.
+
+Cache-hit and callback-return checks drain available connection messages
+without a SQL round trip and retain terminal failures; a queued notice
+cannot conceal a subsequent connection error. The worker tracks actual
+socket byte progress beneath TLS: consuming an encrypted header can return
+Pending before yielding plaintext, so it retries immediately after that
+progress and parks only when the socket made none. The same rule drives
+connection setup and query polling, without extending any allowance.
+Database query failures report I/O failure; corruption remains a
+row-shape or digest failure.
+
+The worker's original `Instant` deadline remains authoritative through
+connection, qualification and query polling. Its TLS transport uses
+whole-millisecond ticks, so the initial remaining allowance rounds upward
+when deriving that secondary cap. Rounding downward could expire TLS first
+by a fraction of a millisecond, losing the worker's deadline
+classification in a generic driver error. This does not extend the worker
+allowance: each poll still checks the exact original `Instant`, and phase
+tightening (`Snapshot::constrain_deadline`) can only shorten it. An
+unrepresentable transport tick is refused.
+
+### Snapshot metadata and value windows
+
+Email metadata reads validate the manifest, chunk count and referenced
+thread without reading MIME body bytes. Membership and keyword windows are
+ordered, exclusive-after, and limited to 256 values plus one validated
+overflow row. An empty window alone does not prove Email existence.
+Membership reads check the referenced mailbox and both change sequences;
+keyword values use the local syntax validator.
+
+Email/get prefetches passive metadata in windows of at most sixteen
+requested IDs using one typed, account-scoped query. Its explicit
+seventeen-row ceiling and strict returned-ID ordering reject duplicates or
+unexpected rows. Every returned row passes the same manifest, chunk-count,
+referenced-thread and sequence validator as a single lookup, and must
+match the exact snapshot identity. A fixed window retains requested IDs
+and explicit absent results; only complete successful validation replaces
+the old window. Request order, duplicate handling and notFound assembly
+remain in the JMAP layer.
+
+The snapshot also retains its last successful metadata record for
+unprefetched single reads. Both caches check the original connection,
+deadline and sticky failure on every access and cannot cross a snapshot
+or method reopening. Prefetching does not authorize body output: body
+callbacks still verify the same snapshot's bytes.
+
+For selected mailboxIds and keywords, two additional typed, account-scoped
+batch queries prefetch bounded prefixes for the same IDs. Each lateral
+subquery aggregates at most nine values and their validation fields into
+one protocol row, rather than spending one protocol frame per value and
+repeating it during fallback. Sets shorter than nine are complete; a
+nine-value prefix is conservatively marked has_more. Cached reads can
+return a short page, and requests at or beyond its tail continue through
+the paginated reader. No returned prefix value is reread. Unselected sets
+issue no query. Every retained value, reference and change sequence
+receives the same validation as an individual read; unknown IDs,
+duplicate/unsorted values, unequal arrays and excess rows fail the
+snapshot. Empty sets are explicit and do not prove Email existence.
+Cached pages preserve exclusive-after ordering and has_more, and retain
+the same connection, deadline and sticky-error checks. The value window is
+cleared when metadata is replaced and never crosses a snapshot. The
+nine-value and sixteen-ID limits bound only the optimization, not mailbox
+capabilities. Metadata, membership, keyword and chunk reads send fixed
+parameter types with the query, avoiding a separate prepare/describe
+exchange without changing row validation or limits.
+
+### Verified Email body reads
+
+Body bytes reach a reader only after verification on the snapshot that
+resolved them. The snapshot body entries (`with_pinned_body`,
+`with_interpreted_body` and the qualified `with_projected_body`) resolve
+the Email in the snapshot's account. `postgres_body::with_email` is the
+equivalent standalone one-snapshot entry: it verifies the primary/schema
+barrier and app password inside one read-only repeatable-read transaction
+before resolving that Email's body, but admits no configuration or role.
+Expected epoch, account and Email ID grant no authority. Only an Email in
+that account admits a body through these entries; upload leases and
+standalone transmission blobs are admitted only by blob downloads
+([Authenticated blob downloads](#authenticated-blob-downloads)). Snapshot body callbacks and downloads share one complete
+SHA-256 verifier and chunk replay cache, on the snapshot's own connection
+and original deadline.
+
+Before callback admission the reader validates the captured account
+sequence/floor, Email/Thread/Blob references and change positions, length
+and chunk count. It reads contiguous 64 KiB chunks in batches of at most
+eight, checks exact lengths and ordinals, and verifies the entire SHA-256
+before admitting the callback. Later reads rely on PostgreSQL preserving
+those bytes in the same snapshot; chunks are not independently hashed
+again on replay. Storage/server corruption after verification is outside
+that guarantee. Empty bodies still require the correct empty digest. The
+caller may impose a smaller size ceiling within the 64 MiB stored-body
+maximum (`postgres_body::MAX_BODY_BYTES`).
+
+The synchronous `BlobReader` callback retains that exact database snapshot
+and migration lock. Reads reuse at most eight cached chunk rows, so small
+MIME reads do not refetch a whole database chunk every time. Cache misses
+use the same connection and snapshot; there is no reconnect or replacement
+view. Invalid reads, database failure and expiry are sticky, including
+when a callback attempts to swallow the error. The original deadline
+covers setup, verification, callback work and final return. Callers must
+bound their own CPU and I/O by that deadline. `with_email` is a finite
+one-shot operation; its budgets do not qualify HTTP transfer limits.
+
+`with_interpreted_body` and the qualified `with_projected_body` path,
+whose callbacks build provisional output and cannot publish or admit new
+work, group connection-health polling across resident pin checks and
+cached body reads. They share one counter: a full driver check occurs at
+least every 64 checkpoints. Every checkpoint still checks sticky failure
+and the original body/worker deadlines immediately. Cache misses check
+connection health before and after SQL; verification and callback
+completion retain unconditional checks. An unknown disconnect may
+therefore permit bounded provisional work, but never successful
+publication. Ordinary verified pins, downloads and relay sources retain
+unconditional connection checks on every read.
+
+### Bulk body verification
+
+The verified body reader hashes all chunks with td-crypto's opaque
+`BulkSha256`, backed by td-primitives' SHA-256, which uses the CPU's SHA
+extensions where present. It retains one digest context only for the
+verification pass, feeding the 64 KiB chunks from batches of at most
+eight. The account, immutable snapshot, ordinal/extent checks, final
+constant-time digest comparison and original deadline are unchanged.
+Error or unwind retires the digest and refuses the verified pin. Empty
+bodies still require the SHA-256 empty digest. The worker checks its
+original deadline around each bounded chunk batch; a chunk's hashing is
+not independently cancellable. The digest context is inline and bounded
+by active workers. This path is not an allocation-free primitive. Other
+digest callers retain the owned implementation, and storage bytes are
+unchanged.
+
+### Verified body custody for MIME readers
+
+`Snapshot::with_pinned_body` lends the opaque `PinnedBlob` to a bounded
+callback only after PostgreSQL's full length/chunk/digest check. It
+retains the same snapshot worker, body manifest, Blob ID and original
+finite deadline. The internal source boundary is crate-private; external
+callers cannot turn an arbitrary `BlobReader` or passive metadata into a
+pin. Reads and explicit freshness checks preserve sticky failures, and
+callback completion checks the pin again. No callback result grants
+output after expiry, connection loss or a swallowed pin failure.
+
+`postgres_body::with_pinned_blob` provides the same custody for
+downloads. It retains the account-reference/upload-lease authorization
+and fresh primary reauthorization after verification, before lending the
+pin. The `with_blob` entry delegates to it.
+
+The shared `store_fs::PinnedBlob` borrows a verified PostgreSQL chunk
+reader. Root-header, MIME structure, body-value and attachment readers
+retain that borrow through their original request scope. There is no
+local-database variant, body copy, renewed work meter or renewed deadline.
+The chunk-verifying pin for qualified MIME projections is specified in
+[Chunk-verified MIME projections](#chunk-verified-mime-projections).
+
+### Shared verified Email MIME projection
+
+`jmap_request::dispatch::write_verified_email` runs the Email/get header,
+preview, body-list, body-value and attachment-locator encoders over a
+verified pin. It emits comma-prefixed members beside the caller's stored
+fields and framing, with the same bounded scratch, 4096-byte buffered
+output and original work meter. It checks source custody before entry and
+after final flush; MIME readers retain the pin through their own bounded
+turns. Message size is checked before projection. The shared boundary
+reconciles the original meter after every projection result, preserving
+deadline/capacity classification through nested MIME errors. There is no
+alternate parser.
+
+`EmailProjection` retains at most 64 bounded header-property names and
+the field selections. Inclusion uses the original property parser and work
+allowance; `stored()` supplies the stored-field projection
+([Stored Email projection](#stored-email-projection)). The trusted `EmailOutput` owner must enforce its original
+response admission/deadline and retain provisional bytes. A failed
+projection cannot publish its partial output. PostgreSQL integrity
+verification uses the original body worker's finite connection budgets
+before entry; projection does not renew them or reverify/copy the whole
+body.
+
+### Mailbox listings and counts
+
+`postgres_read::Snapshot::mailbox_listing` reads the bounded mailbox
+hierarchy and counts through the same authenticated connection and
+repeatable-read snapshot as Email metadata and bodies. Its original
+policy/device admission, account state, deadline and connection budgets
+remain in force; errors retire the view. `postgres_mailboxes::list` is a
+standalone authenticated observation over the same closed query and
+validators: it takes the expected epoch/account and app password,
+verifies the primary/schema barrier, begins one read-only repeatable-read
+transaction and runs the shared device verifier inside it, before account
+state and mailbox contents are read. It admits no configuration, profile
+or runtime role; serving reads use the snapshot listing. A revoked or
+wrong-account token returns no mailbox data. A revocation after snapshot
+admission may allow that bounded observation to finish; its returned
+device ID grants no later authority.
+
+A listing owns at most 256 mailbox rows, in binary ID order, with account
+sequence/floor and total/unread Email and Thread counts from the same
+snapshot. Unread excludes both seen and draft Emails; a Thread is unread
+when at least one member in that mailbox is unread. The closed query
+limits returned rows to 257 to detect overflow without returning a
+partial listing; overflow is refused. Counts are grouped across
+memberships of the bounded selected mailbox set, with account-scoped
+Email, Thread and keyword joins. Empty mailboxes retain zero counts. This
+avoids a separate aggregate execution for each mailbox without retaining
+per-email rows in the caller. Database aggregate work is subject to the
+statement and whole-operation limits, not a promise of bounded server
+scan cardinality.
+
+Rows pass shared mailbox-format validation, sequence checks and bounded
+parent hierarchy validation. Count inputs must have valid referenced
+Emails/Threads and change positions no newer than the captured sequence.
+Missing/cyclic parents, future changes, invalid fields or capacity
+exhaustion fail the entire observation. Retained strings use fallible
+bounded allocation. The standalone observation's absolute caller deadline
+(at most ten seconds) covers connection, authentication, SQL and decoding,
+and is checked again before any result escapes. Its connection and
+snapshot close before return; results cannot be extended into a later
 snapshot or used as a mutation authorization.
 
-## 29. Verified Email body snapshots
+`mailbox_response::encode_object` projects a checked passive Mailbox row
+and snapshot-bound counts without opening storage, using the shared
+`MailboxCounts` value. Counts must match the supplied account/epoch/state
+identity and mailbox ID. This catches accidental cross-view substitution;
+passive values are not authorization. The caller retains and checks the
+original admitted view before publishing output.
 
-`postgres_body::with_email` prepares the message-reading boundary without
-selecting a production backend. Its expected epoch, account and Email ID do
-not grant authority: it verifies the primary/schema barrier and app password
-inside one read-only repeatable-read transaction before resolving that Email's
-body. Only an Email in that account admits a body; upload leases and standalone
-transmission blobs remain outside this operation. Configuration/role admission
-and bounded runtime pools are still runtime integration work.
+### Stored Email projection
 
-Before callback admission it validates the captured account sequence/floor,
-Email/Thread/Blob references and change positions, length and chunk count. It
-reads contiguous 64 KiB chunks in batches of at most eight, checks exact lengths
-and ordinals, and verifies the entire SHA-256 before admitting the callback.
-Later reads rely on PostgreSQL preserving those bytes in the same snapshot;
-chunks are not independently hashed again on replay. Storage/server corruption
-after verification is outside that guarantee. Empty bodies still require the
-correct empty digest. The caller
-may impose a smaller size ceiling within the existing 32 MiB maximum.
+The stored-field encoder consumes `email_response::Source`, implemented by
+PostgreSQL's admitted `Snapshot`, with passive metadata and value-window
+types. PostgreSQL maps its body manifest length to stored size and uses
+its snapshot queries for mailbox memberships and keywords. No MIME parsing
+or body reads are added.
 
-The synchronous BlobReader callback retains that exact database snapshot and
-migration lock. Reads reuse at most eight cached chunk rows, so small MIME
-reads do not refetch a whole database chunk every time. Cache misses use the
-same connection and snapshot; there is no reconnect or replacement view.
-Invalid reads, database failure and expiry are sticky, including when a
-callback attempts to swallow the error. The original deadline covers setup,
-verification, callback work and final return. As with the current verified
-blob callback, callers must bound their own CPU and I/O by that deadline.
+The encoder checks the retained view around every bounded sink callback,
+keeps each emission at 512 bytes or less, and pages sets in windows of at
+most 256 values. Metadata and every window must name the requested Email;
+windows must match the metadata snapshot identity. Output stays
+provisional until successful completion and the enclosing request's final
+checks. PostgreSQL read failures retain their typed errors; sink/format
+errors use `postgres_read::Error::Output` and do not imply database
+publication.
 
-`with_interpreted_body` and the qualified `with_projected_body` path, whose
-callbacks build provisional output and cannot publish or admit new work,
-group connection-health polling across
-resident pin checks and cached body reads. They share one counter: a full
-driver check occurs at least every 64 checkpoints. Every checkpoint still
-checks sticky failure and the original body/worker deadlines immediately.
-Cache misses check connection health before and after SQL; verification and
-callback completion retain unconditional checks. An unknown disconnect may
-therefore permit bounded provisional work, but never successful publication.
-Ordinary verified pins, downloads and relay sources retain unconditional
-connection checks on every read.
+### Snapshot Email query pages
 
-A private connection worker can drive successive closed queries synchronously;
-it never replenishes deadlines or transport budgets between queries. Existing
-probe/material/configuration/schema/mailbox operations retain their original
-budgets and mutation-outcome semantics. Body operations have a 128 MiB total
-input budget, 8192 frames, 512 KiB output and the unchanged 128 KiB individual
-frame/authentication limits. The total includes initial verification and later
-reads, so sufficiently many cache misses refuse rather than consume unlimited
-wire or driver memory. Cache-hit and callback-return checks drain available
-connection messages without a SQL round trip and retain terminal failures; a
-queued notice cannot conceal a subsequent connection error. The worker tracks
-actual socket byte progress beneath TLS: consuming an encrypted header can
-return Pending before yielding plaintext, so it retries immediately after
-that progress and parks only when the socket made none. The same rule drives
-connection setup and query polling, without extending any allowance. Database query
-failures report I/O failure; corruption remains a row-shape or digest failure.
-This is a finite cold operation, not a reusable pool or
-an assertion that future HTTP transfer limits are already qualified.
+`postgres_read::Snapshot::query_emails` supplies td-mail's Email/query
+shapes: all mail or one mailbox, optional receivedAt date bounds, received
+date ascending/descending, nonnegative position, a bounded page and
+optional total. Equal dates always sort by ascending Email ID. A foreign
+wire mailbox can be represented by the explicit empty scope. Text search
+uses the separate candidate pages of [Indexed search candidates](#indexed-search-candidates).
+
+The account's B-tree on `(account, received_at DESC, id ASC)` supplies the
+default newest-first order. PostgreSQL can stop once it finds enough
+qualifying Emails. For ascending dates it can scan the index backwards and
+sort equal-date groups by ascending ID. A selective mailbox may use its
+membership index first. Large offsets still skip rows, and a requested
+total counts all matches. The index consumes database, WAL and physical
+backup space on the primary and each replica. Logical dumps carry its
+definition and rebuild it during restore; account body quotas measure
+message storage separately.
+
+The page and its query state use the same authenticated repeatable-read
+snapshot as metadata and body reads. Closed SQL filters by account,
+mailbox and date bounds before ordering; optional totals count the same
+filtered relation. The page ceiling is 1024 IDs plus one validated
+overflow row. Zero limit is valid; a position above PostgreSQL's signed
+row-count range returns an empty page while retaining the requested
+position and optional total. Returned rows, including overflow, validate
+ordering and change sequences. Failed query operations retire the view
+even if callers swallow the error. Server statement limits and the
+original worker deadline bound sorting, counting and offset work; worker
+byte/frame limits remain shared across the whole view.
+
+### Snapshot thread member windows
+
+`postgres_read::Snapshot::thread_emails` reads one thread's members in
+ascending received-date and Email-ID order, strictly after an optional
+coordinate. Shared passive `ports::ThreadEmail` and `ThreadEmails` values
+carry no storage authority. The window ceiling is 256 members plus one
+validated overflow row.
+
+An absent stored thread returns `None`; an empty stored thread returns an
+empty window, leaving the JMAP rule that hides empty threads to the
+protocol adapter. Thread and returned member change sequences must not
+exceed the snapshot. All reads, including repeated windows after
+concurrent deletion, retain the same account state, worker budget and
+deadline. Invalid limits or other read errors retire the view.
+
+### Change-history pages
+
+`Snapshot::changes` reads detached Mailbox/Thread/Email/Submission change
+pages under the authenticated snapshot; `postgres_changes::read` is the
+standalone entry that opens its own snapshot. Admission checks the
+selected JMAP profile generation/version, epoch and current device, then
+binds the account sequence and retained history floor. State tokens
+convey no authority. Wrong account/epoch, future or pruned state refuses.
+
+The `jmap_changes` transaction-aligned merger reads through a small
+history-source interface. PostgreSQL seeks the native
+account/kind/sequence/operation index in batches of at most 128 rows. Each
+row validates ordering, sequence, operation, action and object identity.
+The merger preserves whole sequence groups, folds repeated object changes
+and rejects a first group exceeding the requested page limit. At most 1024
+final changes plus one bounded transaction group are retained. An empty
+kind advances to the pinned account sequence without scanning unrelated
+kinds.
+
+All polls, including cached rows and completion, check the original
+deadline and terminal connection state, and use the read worker's
+budgets without replenishment between batches. The merger gets at most
+4096 polls, leaving room below the wire-frame ceiling for setup and batch
+replies. If that work bound prevents completion, return
+cannotCalculateChanges so td-mail refreshes its state instead of retrying
+the same folding history forever. Other connection/deadline failures
+still refuse the whole page; no partial results escape or resume on a
+different snapshot. Authorization and policy are admitted at snapshot
+start; the finite read may finish after concurrent revocation.
+
+### Submission reconciliation reads
+
+The authenticated snapshot exposes historical submission identity metadata
+and bounded identity/time query pages for td-mail reconciliation. Metadata
+retains the original Email, Thread and sending Identity IDs and sendAt
+even if the current Email has been deleted; those IDs confer no body
+access. Each row's changed sequence must belong to the pinned account
+view.
+
+Query windows use inclusive after and exclusive before against immutable
+sendAt, either date direction and ascending raw SubmissionId ties. Pages
+have at most 1024 returned IDs plus one lookahead, an optional
+same-snapshot total, and account/epoch/sequence/interpretation-bound
+Submission query state. The original read slot, SQL worker, authenticated
+snapshot and absolute deadline remain in force; a failure poisons the
+view. EmailSubmission/get and EmailSubmission/query ([EmailSubmission/get dispatch](#emailsubmissionget-dispatch),
+[EmailSubmission/query dispatch](#emailsubmissionquery-dispatch)) consume these reads; no recipient status projection exists.
+
+### HTTPS authentication off the network reactor
+
+The HTTPS adapter hands admitted credential work to one fixed
+authentication worker through a bounded backend interface, so connection,
+authentication and SQL work never run on the network reactor. Origin/rate
+admission precedes the handoff; lookup and completion retain the request's
+original finite deadline. Client-owned credentials survive the initial
+device observation for subsequent fresh storage authorization. Ordinary
+responses and EventSource clear them before output; other client
+retirement also clears them.
+
+`postgres_http_auth::Authentication` implements that worker's credential
+interface. Its bounded registry selects an account binding, and fresh
+snapshots check configuration, store epoch, maintenance and device. The
+connection lifecycle, connect-time qualification, idle recovery and finite
+reuse bounds are specified in
+[Retained HTTPS authentication sessions](#retained-https-authentication-sessions). DNS runs on connection
+admission rather than on every lookup. Later operations require their own
+fresh authorization and publication fence.
+
+One nonblocking mutex bounds concurrent lookup, including DNS; contention
+returns Busy without a queue. The original HTTPS deadline converts through
+the same `RuntimeClock` origin without a fresh allowance. A ten-second
+lookup ceiling and five-second DNS ceiling only shorten it. Results are
+refused after expiry. Malformed and inactive/wrong credentials return no
+principal; configuration, schema, privilege and connection failures
+remain service errors, not invalid-password observations. Errors carry no
+endpoint, secret or provider text.
+
+EventSource uses that worker's PostgreSQL session to verify the selected
+configuration, account and device and capture the account sequence in one
+read-only transaction. Before sending headers it checks the password, then
+discards it. An open stream retains a digest derived from the
+authenticated device row. Each subsequent observation checks that digest
+and revocation status. Observations expire five seconds after their start,
+including time spent reading the database. The network thread pauses
+output until the next observation succeeds. DESIGN.md and RESOURCES.md own
+the worker lifecycle and connection limits.
+
+### Request credentials at the body-worker boundary
+
+Upload, download and API requests borrow the original bounded Basic
+credential owner for the synchronous backend call. The initial device ID
+remains an observation; PostgreSQL consumers freshly authenticate the
+presented bytes under their operation's original deadline and policy
+fence, and the presented credential's device must equal the observed one.
+The handoff copies no secret and allocates no credential storage.
+Completion clears the owner before close, drain or refusal handling,
+including failed backend calls. EventSource retains its credential-free
+contract.
+
+### Shared HTTPS API framing
+
+The HTTPS API backend delegates bounded body reception, JSON validation,
+response preflight and final retained-response encoding to the shared
+`https_api::Exchange` helper. The backend reserves response retention
+before body reception. The helper offers an authorization hook after body
+reception; the PostgreSQL backend leaves it empty, because fresh read
+authority is established by the request's snapshot after bounded input
+preparation. All exchange, transfer, idle and execution deadlines remain
+anchored to their start points. The helper owns no database authority and
+selects no backend.
+
+The helper keeps the execution deadline strictly before the outer
+response deadline, including short original request allowances. It caps
+execution one clock tick before the outer limit without extending either
+budget. This preserves response retention's phase-ordering contract; the
+one-tick separation does not promise transmission time after expiry.
+
+### Response retention without a mail database
+
+`ResponseCoordinator` owns one cold, empty RequestSpool and a
+process-local response quota ledger. Construction consumes the spool and
+refuses occupied or retired slots; it opens no mail database and grants
+no mail authority. Its only reservation surface is response bytes.
+PostgreSQL remains responsible for durable quotas; the local ledger cannot
+reserve bodies, uploads or delivery responsibility.
+
+Retention reserves the full cap before file creation, preserves original
+work/deadline accounting and prepaid mutation output, and unlinks before
+returning quota credit. Failed cleanup retains the full charge and retires
+the slot; ledger failure stops admission. There are no native-view or
+external-sort hooks; PostgreSQL method adapters supply their
+authenticated snapshots and bounded queries. The service supplies this
+coordinator to the dispatcher.
+
+### HTTPS API read backend
+
+`postgres_http_api::Service` connects the fixed HTTPS body-worker
+interface to the shared bounded HTTP framing and the PostgreSQL read
+dispatcher. Its Session, profile binding and resource plan must agree;
+HTTPS, response retention and dispatch share one `RuntimeClock`. After
+bounded reception the execution deadline is further capped at ten seconds.
+A request of exactly one Email/set, Mailbox/set or EmailSubmission/set
+call, or td-mail's Email/set followed by EmailSubmission/set, takes the
+mutation path ([Read snapshots before mutations](#read-snapshots-before-mutations)); every other request is a read batch. Uploads
+and mutations use the separate publication adapters; their write
+connections are not retained by the read cache.
+
+Original credentials stay borrowed through body preparation and fresh
+primary snapshot authentication. The observed device ID must match their
+syntax, but only the fresh snapshot grants read authority. Final snapshot
+validation and rollback precede response output; temporary response quota
+remains charged through output and cleanup. No database work runs on the
+network reactor, no success escapes a failed snapshot, and uncertain
+response cleanup stops admission.
+
+### Retained HTTPS API read sessions
+
+For API reads, each fixed HTTPS body worker retains at most one read
+connection for its last account and configured origin, holding one read
+permit. Connection admission performs DNS, schema and runtime-role
+qualification and retains the shared migration lock. Each job begins a
+fresh read-only repeatable-read transaction, checks epoch, maintenance,
+selected configuration and the complete presented credential, and
+acknowledges ROLLBACK before output. Only the clean connection and its
+permit survive; no snapshot, body pin or authority does. The standalone
+backend entry (a backend without a worker) opens a snapshot per request
+and closes its connection after the job.
+
+API read sessions admit at most eight jobs within sixty seconds, each
+under the original ten-second execution deadline. Per-job wire allowances
+are 256 MiB input, 512 KiB output and 8192 frames; finite connection
+totals are eight times those limits, with no parser/authentication reset.
+These are wire budgets, not resident allocations. Owning-thread
+maintenance retires exhausted or near-expiry sessions between jobs and
+during bounded HTTP input/output turns. Slow progressing peers cannot
+retain an expired idle database session. The local hook issues no SQL;
+active database jobs keep their original finite deadline and release
+their transaction before response output. Account or origin changes,
+uploads, downloads and mutations discard the retained reader before
+acquiring other storage capacity. Observable idle disconnects reconnect
+before job submission; failures after submission retire the connection
+without replaying the job. Worker exit closes retained resources on the
+same thread before releasing their read permits. Account count does not
+multiply retained sessions.
+
+### Worker-local verified header projections
+
+Each fixed HTTPS body worker may retain serialized root-header members for
+header-only Email/get selections, separately from its finite database
+session. The cache survives connection rotation, API mutations and
+API/download switches; account/origin replacement, uploads and worker
+teardown drop it. Its immutable Service binding fixes profile,
+configuration and interpretation limits.
+
+Every lookup follows fresh transaction authentication and current Email
+and blob metadata validation. The key contains account, epoch, blob ID,
+length, full SHA-256 digest and the exact ordered header property
+spellings, including modifiers and case. Email IDs, thread IDs, flags,
+memberships, dates and other stored fields are never served from this
+cache. Removed Email objects remain notFound; cached headers grant neither
+account access nor body-pin authority.
+
+A hit reuses historical interpretation of the same immutable blob. It
+does not re-read chunks or detect subsequent corruption of an unrequested
+tail. Full body projections, previews, raw downloads and attachment
+downloads still verify current requested bytes. Qualified MIME
+projections may use chunk verification
+([Chunk-verified MIME projections](#chunk-verified-mime-projections)). Qualified stored
+search fields may answer without body reads; search fallback and
+downloads retain full verification. Header-cache misses preserve
+whole-body precharge and verification. Hits charge bounded lookup and
+copy/output work and check the original snapshot, retention and method
+deadlines. Cache output remains provisional until normal final snapshot
+validation and response publication.
+
+Only a successful projection whose outer pin verification also completes
+may stage an entry. Staged entries are invisible to lookups until the
+enclosing read transaction completes acknowledged rollback and final
+checks. Failure or unwinding discards pending entries. No transaction,
+credential, snapshot or body pin is retained. Earlier independently
+verified projections can survive an ordinary later per-method JMAP refusal
+if the enclosing read job succeeds.
+
+The configured index_cache_bytes budget is divided across the actual
+bounded HTTPS body-worker count. Each share includes entry-vector
+capacity, exact property signatures, resident and staged fragments, active
+capture, and old plus replacement allocation during capture growth. At
+most 256 entries and 64 KiB per fragment are retained. FIFO eviction,
+allocation failure, oversized fragments or a tiny configured budget merely
+bypass caching. The memory reservation is unchanged; this is a bounded
+optional optimization, not a persistent database index or a latency
+guarantee.
+
+### Read snapshots before mutations
+
+A successful `Snapshot::finish_method` validates and consumes an owned
+snapshot, closing its PostgreSQL connection before returning a
+`BetweenMethods` reservation. No body pin can survive that transition.
+The reservation keeps the connection slot until it reopens or drops; this
+is conservative capacity accounting, not a retained database transaction.
+A borrowed snapshot has no reservation to return.
+
+Reopening performs bounded endpoint resolution, runtime-role
+qualification and full device secret authentication against the original
+profile/account binding. It captures a new account state. The original
+deadline is capped once at read admission and never extended by closing or
+reopening. The reservation stores no password and refuses a different
+device ID. Every failed reopen releases its capacity. A failed snapshot
+cannot produce a reservation. `open_resolved` admits every uncached
+snapshot through this reopen path.
+
+A mutation request first opens a snapshot, which authenticates the device
+and captures the account state its dispatcher reports; it then finishes
+that snapshot and drops the reservation before the mutation adapters
+acquire their own capacity. No read snapshot spans a mutation. A read
+batch keeps its single snapshot for every method; a write method inside
+it returns unknownMethod. A read-only Session (`serve --read-only`)
+refuses the whole request as Forbidden before dispatch when any call is
+outside its allowlist (Core/echo, the Mailbox, Email and Thread read
+methods and the two TdReplica methods), and a read-only binding refuses
+a Session that is not read-only.
+
+### PostgreSQL read dispatch
+
+`dispatch::run_with_postgres_read` accepts a freshly authenticated
+runtime snapshot and a response retention owner. Core/echo and the read
+methods use the whole-request admission, argument parser, result
+references, method-error handling and retained response encoder.
+Identity/get, EmailSubmission/get and EmailSubmission/query additionally
+require Submission in the request's `using`; the replica methods require
+their capability. Every other method, including Mailbox/query and
+Mailbox/queryChanges, returns unknownMethod; it never falls through to a
+write path.
+
+The dispatcher converts its execution tick using the response owner's
+`RuntimeClock` and tightens both the snapshot and SQL worker deadlines
+before any dispatch. This can only shorten the original allowance; a
+subsequent call cannot extend it or clear a terminal error. Nested
+storage expiry keeps its executionDeadline classification.
+
+Losing the snapshot is terminal for the read batch, including
+execution-phase expiry: the final snapshot check discards the entire
+retained result and returns the deadline error. Argument and
+unsupported-method errors still produce per-method replies while the
+snapshot remains usable. The HTTP adapter settles such terminal refusal
+without publishing any prefix of the discarded batch.
+
+### Mailbox/get dispatch
+
+Mailbox/get obtains bounded names, hierarchy and counts from the batch
+snapshot, uses its identity for state, and uses the shared object
+encoder. Explicit IDs retain request order and duplicate/notFound
+behavior; null IDs select the bounded mailbox list. Snapshot checks
+precede and follow the operation and the batch. All response bytes remain
+provisional until those checks succeed. myRights always grants
+mayReadItems; mayAddItems, mayRemoveItems, maySetSeen and maySetKeywords
+follow whether the Session permits Email updates (it does unless
+read-only), mayDelete additionally requires a mailbox without a role, and
+mayCreateChild, mayRename and maySubmit are false.
+
+### Email/get dispatch
+
+Email/get uses the shared argument parser, selections, ID planning,
+result references, response framing and notFound handling on the batch
+snapshot. Stored fields use the shared Email encoder; MIME and header
+fields use the verified-pin encoder.
+
+Null IDs use one bounded PostgreSQL query page; an account larger than
+the method object allowance refuses rather than silently truncating.
+Requested IDs retain their order and deduplication. Body verification
+prepays the per-method byte/record allowance before obtaining the
+PostgreSQL pin. The snapshot additionally retains its connection budget
+and shortened execution deadline. A projection/output refusal does not
+poison a healthy snapshot; body integrity or connection failure remains
+terminal. Provisional bytes are published only after both projection and
+final snapshot checks.
+
+### Email/query dispatch
+
+Email/query uses td-mail's argument parser and result framing with the
+snapshot query. Supported filters are inMailbox, after, before and at
+most one text condition, in one condition or a flat AND of conditions;
+minSize 0 is accepted as no filter. Date bounds are strict UTC
+whole-second values, inclusive after and exclusive before against
+receivedAt. Repeated date bounds intersect;
+foreign mailbox IDs and empty time windows match nothing. Distinct local
+mailbox conditions refuse rather than guessing their multi-membership
+intersection. Unknown filters, nested operators and non-AND operators
+refuse; malformed shapes and dates refuse. The date decoder is shared
+with submission queries, including its numeric-position checks.
+collapseThreads true is refused. receivedAt ordering with ascending-ID
+ties, position, bounded limit and optional total retain their semantics.
+Query state comes from the same admitted snapshot as the returned IDs;
+queryChanges is unsupported. A text condition uses chapter 12's search
+path.
+
+The same snapshot filters both the optional total and ordered page,
+preserving account isolation, receivedAt/EmailId ordering, lookahead and
+the original SQL deadline. No local external-sort files are used:
+database query limits and the original snapshot worker budget bound reads,
+and the shared response owner bounds retained JSON. Final snapshot and
+execution checks precede publication. A result reference into the query
+IDs feeds the same snapshot's Email/get.
+
+### Thread/get dispatch
+
+Thread/get accepts td-mail's explicit IDs with the shared argument
+validation, projection (id and emailIds), result references and response
+encoder. Ordered membership windows come from the batch snapshot. Missing
+or empty threads are notFound; state and final snapshot checks bind the
+complete retained result to that view. The original execution deadline
+and output allowance cover every page. Omitted or null IDs are refused as
+invalidArguments: account-wide thread enumeration is not supported.
+
+### Object changes dispatch
+
+Mailbox/changes, Email/changes and Thread/changes use the
+transaction-aligned history merger on the batch snapshot. The shared
+argument parser, state validation, page encoding and errors are those of
+td-mail's JMAP layer. The PostgreSQL reader does not open another
+connection or refresh its snapshot between methods. Each history poll
+charges the original HTTP response work allowance and checks the
+execution deadline; the 4096-poll history bound also applies.
+
+A foreign, stale or wrong-kind state returns cannotCalculateChanges
+without poisoning a healthy snapshot, so later methods can continue.
+Database, integrity, work and deadline failures remain terminal for the
+read batch. Final snapshot checks precede publication.
+
+### Identity/get dispatch
+
+JMAP-profile preparation retains the bounded visible Identity catalog
+beside the immutable selected binding. Other role profiles do not
+allocate this catalog. The same resolved PostgreSQL identity/signature
+text drives the canonical visible-state digest and object encoder; no
+local-file fallback or second representation exists.
+
+Read dispatch serves Identity/get through its freshly authenticated
+snapshot, when the request names Submission in `using`, and checks that
+snapshot before publishing the result. Account, epoch, selected
+configuration and deadline remain bound to that snapshot, while identity
+state depends on the visible configuration digest rather than the mail
+sequence. Catalog handles alone confer no live authorization. The Session
+advertises Submission unless the service is read-only.
+
+### EmailSubmission/get dispatch
+
+Read dispatch accepts EmailSubmission/get only with Submission in the
+request's `using` list. Its shape is td-mail's explicit IDs and explicit
+id/emailId properties; id is always returned. Missing and opaque foreign
+IDs appear in notFound, duplicate IDs are coalesced, foreign accounts are
+refused, and bounded result references retain their normal request
+semantics. Omitted/null IDs or properties and other properties are
+explicitly invalidArguments, not a partial full-object projection.
+Enumeration and recipient/status properties are not supported.
+
+The projection uses the batch snapshot and original response/work
+allowance, returns its Submission data state and historical Email IDs,
+and checks the view before publishing.
+
+### EmailSubmission/query dispatch
+
+Read dispatch accepts EmailSubmission/query with Submission in `using`.
+Its bounded filter is one identityIds entry and mandatory after/before
+UTC whole-second dates, inclusive/exclusive against sendAt. Opaque
+foreign identities match nothing. Unsupported filter forms, sorts,
+malformed dates and negative positions refuse explicitly. Sorting
+supports sendAt in either direction; ascending raw SubmissionId breaks
+ties.
+
+Pages respect the configured query bound and the storage maximum of 1024,
+return the pinned Submission query state and optional same-snapshot
+total, and support result references into subsequent explicit
+EmailSubmission/get calls. The original snapshot, SQL deadline and
+response meter cover every page; publication checks the snapshot again.
+Generic query filters and queryChanges are not supported.
+
+### Authenticated blob downloads
+
+`postgres_body::with_pinned_blob` shares the Email reader's bounded chunk
+verifier and replay cache. Its read-only repeatable-read snapshot binds
+the account state, manifest, chunk count and bytes. It accepts a current
+JMAP profile and device credential. An Email or transmitted-submission
+reference in that account admits the body; otherwise the snapshot must
+contain an unexpired upload lease owned by that device. A Blob ID or
+upload receipt alone grants no access. Lease expiry uses the database
+clock.
+
+Before calling the consumer, the complete body must pass SHA-256
+verification. A separate primary transaction then rechecks the store
+epoch, current profile selection and device credential under
+selection/account shared locks, in that order. It checks the retained
+upload expiry against current database time. Revocation or policy
+replacement during verification therefore refuses the callback. Once
+admitted, a callback can finish after revocation or retirement within its
+original deadline; it retains the verified snapshot throughout. No read
+retries onto a different snapshot after output begins.
+
+Both connections share the original operation deadline; the standalone
+reauthorization connection is further capped at ten seconds. Each
+retains its finite frame and byte budgets. Callback errors, swallowed
+reader errors, expired deadlines and failed snapshot connections cannot
+become success.
+
+### HTTPS blob downloads
+
+The HTTPS backend serves raw blobs and direct MIME-part locators through
+the shared download encoder. Target account and observed device must
+match before connection admission. It reserves two read slots before
+endpoint resolution: one for the verified body snapshot, one for fresh
+primary reauthorization before the callback. Both runtime connections
+qualify the database role. The snapshot, MIME processing and transmission
+share the original deadline capped at thirty seconds; no reconnect renews
+that budget. The fixed worker may reuse the two clean sessions under
+[Retained HTTPS download sessions](#retained-https-download-sessions); every request still establishes
+fresh snapshot authority.
+
+Whole-body digest verification and account-reference/upload-lease policy
+remain `postgres_body::with_pinned_blob` responsibilities. Forged locators
+are checked against the verified MIME tree and decoded length is counted
+before headers. A single foreground work meter covers interpretation and
+replay; no full-message resident buffer is introduced. Only transport
+connection failures before response output try another resolved address.
+Permits are released only after their sockets drop, including failed
+writes. A worker without a retained pair needs two free slots and refuses
+immediately if either is unavailable. Active body custody survives
+callback output; the idle checker may retire during that output.
+Standalone callers release both connections when the operation ends.
+
+### Retained HTTPS download sessions
+
+Each fixed HTTPS body worker keeps either its API read cache or a pair of
+download sessions, never both. Account or origin changes, uploads and
+worker exit discard that state. Standalone download callers keep the
+one-shot path. The pair contains a body reader and a separate
+current-authorization reader. Each is Runtime-qualified once under a
+shared migration lock. Every job checks epoch and maintenance, then the
+account, configuration, credential and database-clock conditions. Only
+clean idle connections survive a request; no snapshot, row lock or
+authorization result does.
+
+Each download starts a fresh repeatable-read body snapshot, authenticates
+and verifies the complete digest, then uses a separate READ COMMITTED
+transaction for current configuration, account, credential and
+upload-expiry checks. The authorization transaction acknowledges ROLLBACK
+before output. The body snapshot remains through verification and replay,
+then acknowledges ROLLBACK before its connection is reusable. Neither a
+failed job nor a failed retirement replays an admitted request. Failure
+after response output closes the exchange.
+
+The authorization session retains the ordinary 64-turn, immutable
+60-second profile, with 1 MiB input, 64 KiB output and 1088 frames per
+turn. The body session uses the eight-turn body profile and its
+independent cumulative wire ceilings; initial qualification consumes the
+first protocol window. Body turns may use the 30-second
+verification/replay deadline; ordinary read turns still have their
+ten-second maximum. A non-body session cannot admit a body-duration turn.
+Both sessions must cover the original request deadline before
+verification begins. Idle disconnect replacement is permitted only before
+admission; no failed SQL or response is retried transparently. Every
+failed download retires both sessions.
+
+Reserve both read permits before DNS, or two transient permits for a
+standalone call. After a successful download, the worker checks the
+shared read-slot count. If the pool is full, it retires its authorization
+connection and releases that permit. With spare capacity it can keep both
+sessions warm. Other jobs may acquire a released permit immediately.
+Cache borrows prevent retirement of the active body reader during output.
+Sender maintenance can retire the idle checker during slow response
+writes; fixed-worker maintenance retires either idle session between
+requests. The retained connections never authorize one another's next
+transaction.
+
+## 12. Derived read evidence and search
+
+PostgreSQL keeps three kinds of optional, rebuildable evidence derived
+from immutable message bytes: common-header summaries, MIME
+interpretation descriptors and complete normalized search fields, the
+last with a trigram-indexed candidate text. Each row is bound to the
+blob's length and whole-body digest and to a versioned interpretation;
+missing, incompatible or malformed evidence always falls back to verified
+body interpretation and never changes a result. This chapter specifies
+the rows, their trust limits, how reads qualify and use them, how
+publication and owner commands prepare them, the indexed search candidate
+filter and explicit partial-search results. Evidence is never a body pin
+or a current body-integrity proof; raw downloads and
+"Scheduled whole-body integrity scrubbing" retain whole-body
+verification.
+
+### Persistent common-header summaries (schema 33)
+
+`blob_summaries` holds rebuildable From, To, Cc and Subject JSON values,
+in that fixed order, independently of mutable Email metadata or request
+property order. Each account/blob has at most one row, bound to body
+length, complete body digest and interpretation version 1. Version 1 uses
+the shared header parser with a 256-KiB header ceiling, its aggregate
+interpretation limits, four fields of at most 16 KiB each, and finite
+preparation work. Changing these interpretation semantics requires a
+version bump. Different configured header ceilings, unsupported
+properties, absent rows, incompatible versions, digest/length mismatches
+or malformed JSON use verified parsing.
+
+The shared blob publication boundary derives these values from its
+already owned immutable bytes and stores them in the same transaction as
+the blob. SMTP, drafts, imports and local notices therefore retain the
+original durable publication boundary. Parsing examines only the bounded
+header prefix; it does not decode attachments or compute previews. An
+unrenderable/oversized summary is optional and is omitted, leaving the
+original message available through ordinary interpretation. Publication
+deadlines still apply to this additional work; summary SQL failure cannot
+leave a partially committed delivery.
+
+An authenticated read fetches at most sixteen summary rows for the
+current metadata window, under the original snapshot, account and
+deadline. Only header-only selections of these four properties use them.
+All Email existence, flags, thread IDs, dates and memberships still come
+from that snapshot. JSON values pass bounded framing and root-kind
+validation before output; final snapshot validation and response
+publication are unchanged. `summary_reuse` counts successful persisted
+summary uses in the performance report. No body chunks are read or body
+I/O precharged for a summary hit.
+
+These rows are historical interpretation evidence, like the worker-local
+header cache ([Worker-local verified header projections](#worker-local-verified-header-projections)), not
+current body integrity evidence. They neither create a body pin nor
+detect subsequent corruption of an unrequested attachment. Body
+projections, previews and downloads retain current verification;
+qualified body-bearing Email/get may use the chunk-verification contract
+of [Chunk-verified MIME projections](#chunk-verified-mime-projections). Search may use the
+qualified stored-field contract of [Complete search-field evidence](#complete-search-field-evidence)
+without body reads. Account/blob foreign keys and cascading deletion
+remove summaries when the authoritative blob is removed. There is no
+external cache service, credential cache or shared mutable response
+object.
+
+### Persistent MIME interpretation (schema 34)
+
+`blob_interpretations` holds optional, rebuildable MIME evidence per
+account and blob. Version 1 fixes the parser limits at 256 KiB of
+aggregate headers, 1024 parts and depth 32. Its explicit 56-byte part
+records preserve preorder, parent, entity/body/type extents, decoded size,
+media, encoding and diagnostics. A domain-separated SHA-256 binds the
+table, aggregate header count and one SHA-256 per 64-KiB body chunk to the
+whole-body digest and length. This is publication evidence, not a MAC or
+independent protection against a database writer replacing both data and
+evidence. Semantic parser changes require an interpretation version bump.
+
+Delivery, upload, draft, submission and import preparation derive
+evidence from their owned immutable bytes before the publication
+transaction. SMTP preparation remains serialized with publication. Locally
+composed failure notices derive their evidence within their bounded
+transaction. Evidence insertion shares the blob's durable transaction;
+optional parsing failure omits the row, while SQL failure refuses
+publication. The original job deadline still governs preparation. No
+background worker is started.
+
+Metered publication prepays a finite child allowance from the original
+job before parsing, hashing or encoding. Each dimension reserves at most
+half of the remaining credit, further capped by input-size bounds; unused
+or failed cache work is not refunded. This leaves credit for publication
+without giving the cache new admission. Insufficient credit omits optional
+evidence and preserves the verified-parser fallback. Standalone import,
+notice and owner backfill preparation has a finite 512-MiB I/O,
+64-million-record and 128-MiB decoded-output allowance per message under
+its original deadline. Decoded-size work is distinct from the much smaller
+retained evidence and page-output caps.
+
+### Chunk-verified MIME projections
+
+For a body-bearing Email/get, the original authenticated snapshot loads
+at most one interpretation row at a time. Matching version, limits, length
+and digest, bounded format, checksum and tree extents are checked before
+use. Missing or incompatible evidence falls back to the full MIME
+traversal. A hit admits the private chunk-verifying pin. Each cache miss
+fetches only the chunks intersecting the requested span, at most eight
+64-KiB chunks per batch, and verifies every returned ordinal, length and
+SHA-256 before exposing any bytes. The complete manifest binds these
+hashes to the selected blob's length and whole-body digest. Empty bodies
+still require the empty SHA-256. This trusts publication-derived
+interpretation evidence, not a freshly recomputed whole-body hash:
+corruption in an unrequested attachment may remain undetected by a text
+projection. The manifest checksum is not a MAC.
+
+The parser rereads entity headers at stored extents and checks their
+endpoints and aggregate count. Current headers supply names, MIME labels
+and dispositions; cached descriptors skip body traversal and encoded-size
+counting. Requested text and previews pass through the same
+chunk-verifying reader. Header or chunk inconsistency after qualification
+fails closed, with no retry under a new snapshot. Missing, malformed or
+incompatible evidence takes the full-body verification and parsing path.
+The bounded chunk cache, original work precharges (including conservative
+full-body I/O credit), deadline, authorization and final response checks
+remain in force. No selected-read result is promoted into the fully
+verified header cache.
+
+`structure_reuse` counts successful qualified table reuse. `chunk_verify`
+measures requested batch SQL, framing and hash verification, distinct
+from `body_verify` for complete-body reads. Raw and attachment downloads,
+uncached search fallback and integrity auditing retain full-body
+verification.
+
+### Summary and structure backfill
+
+`postgres summary-backfill --connection-file OWNER --epoch E --account A`
+rebuilds one finite page of Email-referenced blobs, including replacing
+existing summaries. It can repair malformed derived rows as well as fill
+gaps. `--limit N` selects 1..16 blobs (default 16); `--after BLOB`
+resumes after the previously reported cursor. One page verifies at most
+64 MiB of full bodies, retains one bounded header prefix at a time, and
+writes at most 256 KiB of derived values within the ordinary ten-second
+owner job. Reports contain `scanned`, `written`, `skipped`,
+`verified_bytes`, `after` and `done`, never header contents. Skipped
+unrenderable messages advance the cursor without fabricating a summary.
+Only known COMMIT returns success and an advanceable cursor; failures
+preserve the caller's previous cursor, and an unknown COMMIT is reported
+explicitly. Replaying the same page is safe because these are replaceable
+derived rows, not mail publication or outbound effects. Run pages
+serially, retaining each successful cursor, until `done`; a later version
+rebuild starts again without `--after`. New delivery does not wait for
+this administrative backfill.
+
+`summary-backfill --structure` additionally rebuilds MIME evidence under
+the same owner authority, snapshot, cursor and known-COMMIT rules. It
+streams one verified body through bounded header, part and chunk buffers;
+it does not allocate a whole-message buffer. The 64-MiB verification and
+256-KiB derived-output page caps cover both kinds of evidence. Reports
+add `structures_written` and `structures_skipped`; a skipped MIME
+interpretation does not prevent rebuilding a valid header summary, or
+vice versa. Reduce the page limit if parsing reaches the original finite
+deadline. New messages require no scheduled backfill. Cascading blob
+deletion removes both kinds of evidence, and neither changes account
+sequence or Email history. `--search` additionally prepares search
+evidence ([Search-field backfill](#search-field-backfill)).
+
+### Complete search-field evidence
+
+Schema 35 adds `blob_search`, keyed by `(account,blob_id)` with cascading
+blob deletion. Version 1 stores the complete field-local Unicode lowercase
+and whitespace normalization produced by the search traversal. Its fixed
+interpretation limits are 256 KiB of headers, 1024 MIME parts and depth
+32; other configured limits use the uncached path. Collection must finish
+all searchable sources, including late embedded-message validation,
+before any row can be written. Binary attachment contents are excluded.
+
+At most 8 MiB of UTF-8 text and 65,536 fields are retained, encoded as
+repeated big-endian u32 byte lengths and UTF-8 values, at most 8,650,752
+bytes. The row binds parser version, original body length and SHA-256. A
+separate SHA-256 covers the domain `td-mta-search-fields-v1` followed by
+NUL, original digest, big-endian u64 body length, big-endian u64 encoded
+length and encoded fields. This is corruption detection, not a MAC or
+protection against the database owner. Like summaries, the row is trusted
+derived interpretation evidence. After qualifying its version, body
+identity, framing and field digest in the authenticated snapshot, search
+matches these fields without rereading the original body. This grants no
+body pin and is not a body-integrity audit; raw downloads and explicit
+scrubs retain their original verification. For a selected candidate,
+missing, incompatible, malformed or checksum-invalid evidence falls back
+to the original parser; it never means no match. Database errors still
+fail the request. [Indexed search candidates](#indexed-search-candidates) separately defines
+the trust placed in rows excluded by the index.
+
+Publication does not prepare search rows: only the owner commands below
+do. New or oversized messages, and messages not yet prepared, use the
+bounded verified-body fallback, which may still exhaust the original
+method allowance. This cache avoids repeated MIME interpretation and
+whole-body reads for qualified rows; schema 40 additionally narrows
+candidates through [Indexed search candidates](#indexed-search-candidates).
+
+### Search-field reads and work charges
+
+Reads use the authenticated snapshot, bounded metadata and at most 132
+chunks of 64 KiB. Candidate interpretation prefetches passive Email
+metadata in windows of at most sixteen IDs. Search descriptors (version,
+body identity, encoded length and field digest) are read once per window
+with explicit negative entries for missing evidence, deduplicated by blob.
+Replacing the metadata window drops these descriptors; they never survive
+the snapshot. Passive window validation can inspect candidates beyond an
+early match, but encoded fields and bodies are loaded only for the
+candidate being matched. No mailbox or keyword values are prefetched for
+search. Descriptor batching neither authorizes body reads nor changes
+verification or work charges.
+
+Before loading fields the original method meter is charged four times the
+encoded length in I/O units for transfer, copying, hashing and decoding,
+and one plus the 4096-byte batch count in records, even if matching later
+stops early. Decoding additionally charges one record and checks the
+method deadline before each field descriptor and allocation. A work
+refusal remains an explicit error, not permission to retry the uncached
+path. Normalized matching processes at most 4096 UTF-8 bytes per batch,
+charging one work record and `bytes * (1 + 2 * pattern_count)` I/O units
+before matching, with deadline checks on both sides. One method meter
+covers all candidates. Only uncached fallback prepays whole-body
+verification work; retained-field reads pay their encoded transfer, hash,
+decode and matching charges instead. Early matching is safe only because
+collection already validated the entire interpretation. Phrase
+boundaries, ordering, pagination, totals and explicit resource refusals
+are unchanged. The resource plan reserves an additional 20 MiB for each
+body/search job, including encoded/decoded buffers and field descriptors;
+CONFIG.md records the default-plan increase.
+
+### Search-field backfill
+
+Owner `postgres summary-backfill --search` prepares these rows alongside
+header summaries, optionally with `--structure`. The interpreted pin
+batches at most 64 cached source checks between driver polls, while
+retaining per-check deadlines and full checks at cache misses and
+completion. Text decoding samples the monotonic work clock at the fixed
+scalar-batch boundary, with original source checks before batches and on
+completion; UTC sampling is not needed for work admission. The cursor,
+verified-body page cap, transaction and known-COMMIT publication rules of
+[Summary and structure backfill](#summary-and-structure-backfill) apply. Search
+output has a separate 17,301,504-byte aggregate page cap for encoded
+fields plus candidate text. Each interpretation has 512 MiB of I/O work,
+64 Mi records and 128 MiB of output work under the original finite
+operation deadline; these are work allowances, not resident buffers. The
+dedicated owner connection allows 24 MiB of output framing for encoded
+fields and candidate text, while runtime connection bounds are unchanged.
+Candidate text is built from encoded fields after releasing the decoded
+collector, with one additional allocation bounded by the encoded length.
+A refused interpretation removes obsolete search evidence and increments
+`searches_skipped`; successful writes increment `searches_written`. A
+timeout or transaction failure yields no usable cursor.
+
+Search preparation distinguishes an interpretation refusal or a permanent
+representation limit (8 MiB normalized text or 65,536 fields) from
+operational failure. The former leaves no search row and advances the
+backfill cursor as a skip; the message retains the read fallback.
+Failures reported by collection as operational errors,
+encoding/allocation failures, clock/deadline failure, invalid internal
+framing, and digest-provider errors abort the page instead of deleting
+evidence and reporting a skip. Final pin, clock and work checks take
+precedence over an otherwise skippable result. No partial normalized
+fields are published. This classification does not make a skipped message
+an empty search result or claim that existing compatible evidence has
+been audited. The CLI reports fixed `preparation-deadline`,
+`preparation-capacity` and `preparation-crypto` categories for the
+corresponding failures. Lower-level parser refusals retain their
+interpretation classification; this is not a redesign of every parser's
+error vocabulary.
+
+### Missing-search preparation pages
+
+`postgres search-prepare-page --connection-file FILE --epoch HEX`
+prepares missing search evidence across accounts. `--limit N` selects one
+through sixteen bodies (default sixteen). Optional `--after ACCOUNT:BLOB`
+requires `--through ACCOUNT:BLOB`, with after no greater than through.
+Keys are pairs of canonical hexadecimal IDs ordered by account, then blob.
+The first page without through captures the greatest current blob key,
+including unreferenced blobs. Continuations retain that upper bound;
+arrivals behind the cursor or above the bound await a fresh cycle. Pages
+are separate repeatable-read snapshots, not a source-completeness
+certificate.
+
+Only Email-referenced blobs lacking a row with the current parser
+version, matching body length and digest, and non-NULL candidate text are
+selected. Empty candidate text qualifies. This is preparation, not an
+audit of existing fields or candidate text; explicit `summary-backfill
+--search` remains the repair operation. The query may examine a large
+already-prepared prefix: the statement deadline bounds discovery, not a
+constant row-work allowance.
+
+Each owner-only page verifies at most 64 MiB of bodies and retains at
+most 17,301,504 bytes of encoded search fields plus candidate text across
+writes. One body is interpreted at a time. A fully verified body deferred
+by the encoded-output bound counts in `verified_bytes` but does not
+advance `after`. The page uses the bounded search-backfill connection and
+interpretation allowances. Its CLI has a shared ten-second
+connection/operation deadline. Permanent interpretation refusals advance
+as skips and remove incompatible evidence; operational failures and
+corruption abort the page. No such failure is reported as a skipped
+message.
+
+The JSON receipt contains store epoch, search version,
+scanned/written/skipped counts, verified bytes, after/through keys and
+done. It is emitted only after known synchronous COMMIT. A connection
+failure during COMMIT reports `commit-unknown`, without a usable
+continuation. Callers persist progress only after success and bind it to
+epoch and search version. Done ends this bounded cycle; it does not mean
+that every message has searchable content. This page command writes no
+durable progress file.
+
+### Scheduled search preparation
+
+`postgres search-prepare --state-dir PATH --epoch HEX --connection-file
+FILE` runs one sixteen-body missing-search page. A dedicated private
+directory holds an atomically replaced, synced progress file under the
+exclusive operational-state lock. State binds the store epoch and search
+interpretation version; mismatches refuse rather than silently reusing a
+cursor. A cycle retains its upper bound, counts and last confirmed cursor.
+After completion, invocations wait five minutes before starting another
+cycle. Unsupported interpretations remain explicit skips and can be
+retried in later cycles. They neither block preparation of other messages
+nor certify completeness.
+
+Before database work the job persists an in-flight marker with the last
+confirmed cursor and upper bound. After an interrupted or unacknowledged
+page, the next scheduled invocation uses that checkpoint. Each page
+verifies the database epoch under the schema lock and selects only
+missing or incompatible search evidence. Rows already prepared by a
+committed page are skipped. Before the first confirmed page, the upper
+bound is selected again. Only confirmed page results contribute to the
+cycle counters.
+
+A failed attempt leaves the cursor in place and reports its error. If an
+earlier page was in flight, its marker survives a failed retry. A
+confirmed page clears both the marker and the operational failure. The
+optional `postgres search-prepare-resume` command can still verify the
+epoch and clear an in-flight marker without running a page. It leaves
+failure status set until a page succeeds.
+
+`postgres search-prepare-status --state-dir PATH --epoch HEX` needs no
+database credentials. It reports counts, timestamps, continuation and
+in-flight/failure flags. Health requires a completed cycle within a day
+and no unresolved failure or uncertainty. Status and workers persist clock
+observations and refuse clock rollback. File loss removes freshness
+evidence; it is not interpreted as a completed cycle. DEPLOYMENT.md
+describes optional supervisor generation.
+
+### Indexed search candidates
+
+Schema 40 requires PostgreSQL 17's trusted `pg_trgm` extension, version
+1.6. The owner migration creates it in a private `td_mta_trgm` schema,
+with no PUBLIC schema privileges, and adds a GIN index on
+`blob_search.candidate_text` under deterministic `C` collation. The
+extension must be available in the server installation; initialization
+or upgrade fails atomically if it is missing or an existing
+extension/schema conflicts. There is no download or runtime DDL. This is
+an explicitly approved server extension dependency, not a Rust
+dependency. Runtime SQL uses ordinary LIKE, not similarity search or
+caller-selected operators, and needs no namespace creation privileges.
+
+The nullable candidate text joins the complete normalized fields with LF
+boundaries and replaces NUL with LF because PostgreSQL text excludes NUL.
+It is at most 8 MiB plus 65,536 boundary bytes. Owner search backfill
+writes fields, digest and candidate text in the same transaction. Rows
+written before schema 40 start with NULL candidate text and require
+another `--search` backfill or scheduled preparation. No partial or
+refused interpretation produces an indexed row. New arrivals continue
+through fallback until explicit or scheduled preparation. This adds
+stored derived text and GIN storage; it does not change account body
+quotas or promise a fixed database size.
+
+A parsed query may select one required term as a candidate filter. It
+must contain three consecutive ASCII alphanumeric characters,
+guaranteeing an extractable trigram even with a C locale, and contain no
+NUL. The longest eligible term is encoded as a literal LIKE substring,
+escaping percent, underscore and backslash. Other terms, short or
+punctuation-only searches, and non-ASCII-only terms still use the
+field-local matcher; without an eligible term the query retains the
+bounded scan. Configurations with incompatible interpretation limits also
+retain that scan.
+
+Within the original authenticated snapshot, each candidate page combines
+indexed matches with every blob lacking compatible indexed evidence. Both
+branches apply mailbox/date scope before combining rows; they never
+materialize account-wide candidates before narrowing a scoped search.
+Indexed pages hold at most 256 candidates; unindexed scans retain their
+32-candidate page bound. Version, body length and digest mismatches,
+absent rows and NULL candidate text enter fallback; they are never
+silently omitted. The branches are disjoint and retain
+account/mailbox/date scope, ordering, candidate offset and final result
+pagination. Both branches execute under the original database deadline.
+Every selected candidate then runs the field-local matcher against
+qualified complete fields, or verified-body fallback. The LIKE filter
+alone never authorizes a match, so phrases and multi-term semantics are
+unchanged.
+
+Like ordinary indexed metadata, negative candidate evidence trusts the
+stored projection and PostgreSQL's index correctness. A query does not
+hash every excluded row or audit its body; doing so would defeat the
+index. Candidate field validation detects corruption in loaded evidence,
+not arbitrary damage to excluded text. This is not a current-body or
+complete-index integrity certificate. Explicit search backfill rebuilds
+the projection from fully verified bodies. Raw downloads and whole-body
+scrubs retain their verification boundaries.
+
+### Explicit partial-search results
+
+The session advertises `https://timmydouglas.com/ns/mail-search-partial`
+globally and for its account. A request must name it in `using` to permit
+Email/query text search to continue past a per-message
+`messageInterpretation` refusal. Without that opt-in, the same refusal
+fails the whole method. This changes neither parser acceptance nor stored
+search evidence: an unsearchable message remains unindexed and its
+original body remains available.
+
+An opted-in Email/query response includes unsigned `searchSkipped`: the
+number of unsearchable candidate messages encountered while computing
+that page, including the matched prefix preceding its requested position.
+Counts on later pages overlap and must not be added together. A positive
+count makes the returned IDs explicitly incomplete; omit `total` even
+when calculateTotal was requested. Position and ordering apply to known
+matches. A page that ends before examining the remaining candidates
+cannot certify those later messages as searchable, even when its own
+count is zero. Non-search queries report zero.
+
+Only the per-message interpretation refusal is skippable. Body integrity,
+storage, database, deadline and exhausted work/output bounds still fail
+the request. The original authenticated snapshot and method meter remain
+in force; skipping a message renews neither. No unsearchable message
+becomes an empty successful search row, a proven nonmatch or an
+index-completeness receipt. The capability is an explicit query-mode
+distinction; successful matching, ordering and immutable interpretation
+versions are unchanged.
+
+The td-mail client opts in only for text queries on an advertising
+account, rejects unsolicited partial inventory, and shows known matches
+with a persistent incomplete-results warning. Its filtered list responses
+do not replace the unfiltered folder cache. CLI results and warning logs
+expose the skipped count.
+
+### Derived-evidence schema upgrades
+
+Each derived-evidence schema upgrade is explicit and fenced: stop serving
+instances, use the owner schema upgrade workflow, grant the runtime role
+ordinary mail access to any new table, and restart the upgraded binary.
+Retain a consistent pre-upgrade backup for recovery. Existing messages
+remain readable before backfill. Backups include derived rows, but the
+original messages remain the source for rebuilding them.
+
+- Schema 33 (`blob_summaries`): a rollback binary must understand schema
+  33; do not restart a schema-32 binary against the upgraded ledger.
+- Schema 34 (`blob_interpretations`): schema-33 binaries cannot serve
+  schema 34.
+- Schema 35 (`blob_search`): schema-34 binaries cannot serve schema 35.
+- Schema 40 (`pg_trgm` candidate index): schema-39 binaries cannot serve
+  schema 40. Backups and restores must include the whole database,
+  including `td_mta_trgm` and the extension declaration; restoring only
+  the `td_mta` schema is insufficient. The restored PostgreSQL
+  installation must supply the same extension version before mail is
+  activated.
 
 ## 32. Retained single-Email flag writes
 
@@ -2488,8 +3754,8 @@ rolls the batch back with the publication, including a deadline expiry while
 the batch and a large upload share the operation's deadline; the next upload
 repeats it, and small uploads still drain a backlog. Reclamation is
 idempotent.
-Expired leases already refuse downloads and draft attachment use (sections 36
-and 37); deleting them changes neither, and a historical upload receipt still
+Expired leases already refuse downloads and draft attachment use
+([Authenticated blob downloads](#authenticated-blob-downloads) and section 37); deleting them changes neither, and a historical upload receipt still
 answers its own replay inside its minute. Relay retention (section 216) also
 runs the same batch, in a transaction of its own, on each retention turn, so an
 account a relay route serves recovers expired leases, and the body bytes and
@@ -2503,31 +3769,6 @@ blob count.
 The candidate scan reads the account's leases (no expiry index), which the
 upload and blob-count quotas bound. Deleting leases needs the runtime DELETE
 grant of [Runtime database logins](#runtime-database-logins).
-
-## 36. Authenticated blob downloads
-
-`postgres_body::with_blob` shares the Email reader's bounded chunk verifier
-and replay cache. Its read-only repeatable-read snapshot binds the account
-state, manifest, chunk count and bytes. It accepts a current JMAP profile and
-device credential. An Email or transmitted-submission reference in that
-account admits the body; otherwise the snapshot must contain an unexpired
-upload lease owned by that device. A Blob ID or upload receipt alone grants
-no access. Lease expiry uses the database clock.
-
-Before calling the consumer, the complete body must pass SHA-256 verification.
-A separate primary transaction then rechecks the store epoch, current profile
-selection and device credential under selection/account shared locks, in that
-order. It checks the retained upload expiry against current database time.
-Revocation or policy replacement during verification therefore refuses the
-callback. Once admitted, a callback can finish after revocation or retirement
-within its original deadline; it retains the verified snapshot throughout.
-No read retries onto a different snapshot after output begins.
-
-Both connections share the original at-most-ten-second operation deadline;
-each retains its existing finite frame and byte budgets. Callback errors,
-swallowed reader errors, expired deadlines and failed snapshot connections
-cannot become success. This cold boundary does not yet connect production
-HTTPS dispatch or replace runtime connection and worker admission.
 
 ## 37. Retained td-mail draft creation
 
@@ -2565,143 +3806,6 @@ operation and checks for its receipt (section 165). Failure before commit
 rolls back bodies, ID reservation, metadata, usage and receipt together.
 This remains a cold storage API: HTTP dispatch, sender-identity policy,
 submission, runtime admission and the runtime integration remain work.
-
-## 38. Authenticated change-history pages
-
-`postgres_changes` reads detached Mailbox/Thread/Email/Submission change
-pages under one authenticated primary repeatable-read snapshot. It checks
-the selected JMAP profile generation/version, epoch and current device,
-then binds the account sequence and retained history floor. State tokens
-convey no authority. Wrong account/epoch, future or pruned state refuses.
-
-The existing `jmap_changes` transaction-aligned merger now accepts a small
-history-source interface. PostgreSQL seeks the native account/kind/sequence/operation index
-in batches of at most 128 rows. Each row validates ordering, sequence,
-operation, action and object identity. The merger preserves whole sequence
-groups, folds repeated object changes and rejects a first group exceeding
-the requested page limit. At most 1024 final changes plus one bounded
-transaction group are retained. An empty kind advances to the pinned account
-sequence without scanning unrelated kinds.
-
-All polls, including cached rows and completion, check the original
-at-most-ten-second deadline and terminal connection state. This cold API
-uses the existing read worker's 128 MiB/8192-frame input and 512 KiB output
-ceilings without replenishment between batches. The merger gets at most
-4096 polls, leaving room below the wire-frame ceiling for setup and batch
-replies. If that work bound prevents completion, return cannotCalculateChanges
-so td-mail refreshes its state instead of retrying the same folding history
-forever. Other connection/deadline failures still refuse the whole page;
-no partial results escape or resume on a different snapshot.
-Authorization and policy are admitted at snapshot start; the finite read
-may finish after concurrent revocation. HTTP dispatch and runtime connection
-admission remain part of the runtime integration.
-
-## 39. Shared Email read snapshots
-
-`postgres_read::with_snapshot` admits the selected JMAP profile and current
-device, then retains one primary repeatable-read snapshot across Email
-metadata, mailbox membership, keyword windows and verified body callbacks.
-The common private snapshot admission helper also serves change-history
-reads. All results bind the same account sequence and history floor. The
-handle and connection cannot escape the outer callback; returned passive
-values confer no authority on later operations.
-
-Email metadata reads validate the manifest, chunk count and referenced thread
-without reading MIME body bytes. Membership and keyword windows are ordered,
-exclusive-after, and limited to 256 values plus one validated overflow row.
-An empty window alone does not prove Email existence. Membership reads check
-the referenced mailbox and both change sequences; keyword values use the
-existing local syntax validator. Body callbacks reuse the same complete
-SHA-256 verifier and chunk replay cache as existing downloads, on this
-snapshot's connection and original deadline.
-
-Email/get prefetches passive metadata in windows of at most sixteen requested
-IDs using one typed, account-scoped query. Its explicit seventeen-row ceiling
-and strict returned-ID ordering reject duplicates or unexpected rows. Every
-returned row passes the same manifest, chunk-count, referenced-thread and
-sequence validator as a single lookup, and must match the exact snapshot
-identity. A fixed window retains requested IDs and explicit absent results;
-only complete successful validation replaces the old window. Request order,
-duplicate handling and notFound assembly remain in the JMAP layer.
-
-The snapshot also retains its existing last successful metadata record for
-unprefetched single reads. Both caches still check the original connection,
-deadline and sticky failure on every access and cannot cross a snapshot or
-method reopening. Prefetching does not authorize body output: body callbacks
-still verify the same snapshot's complete bytes. For selected mailboxIds and
-keywords, two additional typed, account-scoped batch queries prefetch bounded
-prefixes for the same IDs. Each lateral subquery aggregates at most nine
-values and their validation fields into one protocol row. This avoids
-spending one protocol frame per value and then repeating it during fallback.
-Sets shorter than nine are complete; a nine-value prefix is conservatively
-marked has_more. Cached reads can return a short page, and requests at or
-beyond its tail continue through the existing paginated reader. No returned
-prefix value is reread. Unselected sets issue no query. Every retained value,
-reference and change sequence receives the same validation as an individual
-read; unknown IDs, duplicate/unsorted values, unequal arrays and excess rows
-fail the snapshot. Empty sets are explicit and do not prove Email existence.
-Cached pages preserve exclusive-after ordering and has_more, and retain the
-same connection, deadline and sticky-error checks. The value window is cleared
-when metadata is replaced and never crosses a snapshot. The nine-value and
-sixteen-ID limits bound only the optimization, not mailbox capabilities. Metadata, membership, keyword and chunk
-reads send fixed parameter types with the query, avoiding a separate
-prepare/describe exchange without changing row validation or limits.
-
-Every method and final callback completion checks the original connection and
-deadline. A failed operation retires the whole view, including when its caller
-swallows the error. Missing Email metadata remains a normal absent result.
-Concurrent writes or retirement cannot splice new metadata or body bytes into
-an admitted read. Current profile/device authority is checked at admission;
-revocation does not extend or invalidate an already admitted finite snapshot.
-The existing read-worker byte/frame caps apply across all methods and bodies,
-without replenishment. This snapshot grants no independent listener or publication authority.
-
-## 40. Snapshot-bound Email query pages
-
-`postgres_read::Snapshot::query_emails` supplies the existing td-mail inbox
-query shapes: all mail or one mailbox, received date ascending/descending,
-nonnegative position, a bounded page and optional total. Equal dates always
-sort by ascending Email ID, preserving the existing query interpretation.
-A foreign wire mailbox can be represented by the explicit empty scope.
-No text-search, thread collapse or new client feature is added here.
-
-The account's B-tree on `(account, received_at DESC, id ASC)` supplies
-the default newest-first order. PostgreSQL can stop once it finds enough
-qualifying Emails. For ascending dates it can scan the index backwards
-and sort equal-date groups by ascending ID. A selective mailbox may use
-its membership index first. Large offsets still skip rows, and a requested
-total counts all matches. The index consumes database, WAL and physical
-backup space on the primary and each replica. Logical dumps carry its
-definition and rebuild it during restore; account body quotas measure
-message storage separately.
-
-The page and its query state use the same authenticated repeatable-read
-snapshot as metadata and body reads. Closed SQL filters by account and
-mailbox before ordering; optional totals count the same filtered relation.
-The page ceiling is 1024 IDs plus one validated overflow row. Zero limit is
-valid; a position above PostgreSQL's signed row-count range returns an empty
-page while retaining the requested position and optional total. Returned rows,
-including overflow, validate ordering and change sequences. Failed query
-operations retire the view even if callers swallow the error.
-
-Server statement limits and the original worker deadline bound sorting,
-counting and offset work; worker byte/frame limits remain shared across the
-whole view. The PostgreSQL Email/query dispatcher uses this read boundary.
-
-## 41. Snapshot-bound thread member windows
-
-`postgres_read::Snapshot::thread_emails` reads one thread's members in
-ascending received-date and Email-ID order, strictly after an optional
-coordinate. Shared passive `ports::ThreadEmail` and `ThreadEmails` values
-carry no storage authority. The window ceiling remains 256 members plus one validated overflow row.
-
-An absent stored thread returns `None`; an empty stored thread returns an
-empty window, leaving the existing JMAP rule that hides empty threads to the
-protocol adapter. Thread and returned member change sequences must not exceed
-the snapshot. All reads, including repeated windows after concurrent deletion,
-retain the same account state, worker budget and deadline. Invalid limits or
-other read errors retire the view. This supplies storage for td-mail's
-Thread/get without activating PostgreSQL production dispatch.
 
 ## 42. Retained root-folder creation
 
@@ -3199,468 +4303,6 @@ Runtime clock discontinuity validation and the monotonic restart guard of
 the minimum retry interval still precede any actual retry. Receipt storage has a 1024-per-account
 cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
 
-## 58. Mailbox projection from the admitted read snapshot
-
-`postgres_read::Snapshot::mailbox_listing` reads the bounded mailbox hierarchy
-and counts through the same authenticated connection and repeatable-read
-snapshot as Email metadata and bodies. Its original policy/device admission,
-account state, deadline and connection budgets remain in force. It reuses the
-closed mailbox query and validators of the separate mailbox observation;
-errors retire the view. At most 256 mailboxes escape, with overflow refused.
-
-`mailbox_response::encode_object` projects a checked passive Mailbox row and
-snapshot-bound counts without opening storage. Both the local adapter and
-PostgreSQL use this encoder and the shared `MailboxCounts` value. Counts must
-match the supplied account/epoch/state identity and mailbox ID. This catches
-accidental cross-view substitution; passive values are not authorization.
-The caller retains and checks the original admitted view before publishing
-output. The local wrapper still checks its snapshot before and after encoding.
-This prepares existing JMAP output for cutover; it activates no listener.
-
-## 59. Stored Email projection on the admitted snapshot
-
-The stored-field encoder consumes `email_response::Source`, implemented by
-the existing local view and PostgreSQL's admitted `Snapshot`. Both adapters
-share the passive metadata and value-window types; the native adapter remains
-a forwarding wrapper over its existing reads. PostgreSQL maps its body
-manifest length to stored size and uses its existing snapshot queries for
-mailbox memberships and keywords. No MIME parsing or body reads are added.
-
-The encoder checks the retained view around every bounded sink callback,
-keeps each emission at 512 bytes or less, and pages sets in windows of at
-most 256 values. Metadata and every window must name the requested Email;
-windows must match the metadata snapshot identity. Output stays provisional
-until successful completion and the enclosing request's final checks.
-PostgreSQL read failures retain their typed errors; sink/format errors use
-`postgres_read::Error::Output` and do not imply database publication.
-The same-snapshot fixture exercises stored output across a concurrent Email
-removal, a later absent object, multi-page keywords and a refusing output sink.
-Service admission remains part of the runtime integration.
-
-## 60. Worker-owned read views and fixed admission slots
-
-`postgres_read::ReadSlots` reserves 1..256 process-local read connections.
-Acquisition uses at most eight atomic compare/exchange attempts and returns
-Busy on exhaustion or contention, without a queue, connection attempt or
-retry. The service must size this pool from its admitted resources and keep
-health/reconnect and settlement capacity separate. This is a read-slot
-primitive, not the full service's outage or connection-pool activation.
-
-`Snapshot::open_runtime` requires Runtime connection mode and acquires a
-slot before connecting. It returns an owned, thread-confined snapshot after
-primary/schema/privilege qualification and fresh profile/device admission.
-The connection drops before the slot is returned. Failed opening releases
-both. Neither the deadline, protocol budgets, snapshot identity nor sticky
-read failure can be renewed by retaining or borrowing this owner. The worker
-must drop it when the bounded method finishes; server idle-transaction expiry
-and local checks remain additional limits. No live view crosses worker threads.
-
-The existing `with_snapshot` preparation helper uses the same implementation
-with one local slot and still bounds custody to its callback. Its caller
-continues to own outer worker admission. This preserves preparation fixtures
-without allowing owner credentials through the runtime constructor. The real
-read fixture checks exhaustion before a second connection, server-side closure
-on drop, slot recovery after failed authentication and owner-mode refusal.
-No serving listener is activated by these ownership changes.
-
-## 61. Verified body custody for existing MIME readers
-
-`Snapshot::with_pinned_body` lends the existing opaque `PinnedBlob` to a
-bounded callback only after PostgreSQL's full length/chunk/digest check.
-It retains the same snapshot worker, body manifest, Blob ID and original
-finite deadline. The internal source boundary is crate-private; external
-callers cannot turn an arbitrary `BlobReader` or passive metadata into a pin.
-Reads and explicit freshness checks preserve sticky failures, and callback
-completion checks the pin again. No callback result grants output after
-expiry, connection loss or a swallowed pin failure.
-
-`postgres_body::with_pinned_blob` provides the same custody for downloads.
-It retains the existing account-reference/upload-lease authorization and
-fresh primary reauthorization after verification, before lending the pin.
-The compatibility `with_blob` entry delegates to it. The download fixture
-checks pin identity/digest alongside its original empty, multi-chunk and
-maximum-body replay and cross-device/revocation refusals.
-
-The shared `store_fs::PinnedBlob` borrows a verified PostgreSQL chunk reader.
-Root-header, MIME structure, body-value and attachment readers retain that
-borrow through their original request scope. There is no local-database
-variant, body copy, renewed work meter or renewed deadline. Unit MIME tests
-use a bounded memory implementation of the same verified-source interface.
-
-The real read fixture collects root headers through the existing MIME
-reader after another connection deletes the source Email/body. It checks
-pin identity/digest, original body bytes, sticky expiry even when swallowed
-by the callback, and refusal to grant a pin for corrupt bytes. The shared MIME fixtures use bounded memory sources; real PostgreSQL
-fixtures separately qualify database custody.
-
-## 62. Shared verified Email MIME projection
-
-`jmap_request::dispatch::write_verified_email` runs the existing Email/get
-header, preview, body-list, body-value and attachment-locator encoders over
-a verified pin supplied by either storage adapter. It emits comma-prefixed
-members beside the caller's stored fields and framing, with the same bounded
-scratch, 4096-byte buffered output and original work meter. It checks source
-custody before entry and after final flush; MIME readers retain the pin
-through their own bounded turns. Message size is checked before projection.
-The shared boundary reconciles the original meter after every projection
-result, preserving deadline/capacity classification through nested MIME
-errors. There is no new HTML/MIME feature or alternate parser.
-
-`EmailProjection` retains at most 64 bounded header-property names and the
-existing field selections. Inclusion uses the original property parser and
-work allowance; `stored()` supplies the same stored-field projection used
-by the local dispatcher. The trusted `EmailOutput` owner must enforce its
-original response admission/deadline and retain provisional bytes. A failed
-projection cannot publish its partial output. PostgreSQL integrity verification
-continues to use the original body worker's finite connection budgets before
-entry; projection does not renew them or reverify/copy the whole body.
-
-The local dispatcher performs its existing funded verification then invokes
-this shared projection. The PostgreSQL snapshot fixture invokes it after a
-concurrent source deletion and checks subject/address, decoded preview/text,
-body lists and locator output, plus a refusing response sink. Full native
-validation still exercises the real td-mail client against the active local
-service. PostgreSQL protocol/service activation remains the runtime integration.
-
-## 63. HTTPS authentication off the network reactor
-
-The active HTTPS adapter now hands admitted credential work to one fixed
-authentication worker through a bounded backend interface. This prepares
-PostgreSQL lookup without putting connection, authentication or SQL work on
-the network reactor. Origin/rate admission precedes the handoff; lookup and
-completion retain the request's original finite deadline. Client-owned
-credentials survive the initial device observation for subsequent fresh
-storage authorization. Ordinary responses and EventSource clear them before
-output; other client retirement also clears them.
-
-EventSource uses that worker's PostgreSQL session to verify the selected
-configuration, account and device and capture the account sequence in one
-read-only transaction. Before sending headers it checks the password, then
-discards it. An open stream retains a digest derived from the authenticated
-device row. Each subsequent observation checks that digest and revocation
-status. Observations expire five seconds after their start, including time
-spent reading the database. The network thread pauses output until the next
-observation succeeds. DESIGN.md and RESOURCES.md own the worker lifecycle
-and connection limits.
-
-## 64. Request credentials at the body-worker boundary
-
-Upload, download and API requests now borrow the original bounded Basic
-credential owner for the synchronous backend call. The initial device ID
-remains an observation; PostgreSQL consumers must freshly authenticate the
-presented bytes under their operation's original deadline and policy fence.
-The handoff copies no secret and allocates no credential storage. Completion
-clears the owner before close, drain or refusal handling, including failed
-backend calls. EventSource retains its existing credential-free contract.
-
-The active PostgreSQL backend authenticates at this operation boundary. The
-HTTPS framing fixture checks the presented password against the observed
-device on the body worker for all three operations, including second-device
-requests; PostgreSQL fixtures separately prove database revocation fences.
-
-## 65. PostgreSQL HTTPS authentication adapter
-
-`postgres_http_auth::Authentication` implements the fixed HTTPS worker's
-credential interface. Its bounded registry selects an account binding, and
-fresh snapshots check configuration, store epoch, maintenance and device.
-The current connection lifecycle, connect-time qualification, idle recovery
-and finite reuse bounds are specified under Retained HTTPS authentication
-sessions. DNS runs on connection admission rather than on every lookup.
-Later operations require their own fresh authorization and publication fence.
-
-One nonblocking mutex bounds concurrent lookup, including DNS; contention
-returns Busy without a queue. The original HTTPS deadline converts through
-the same RuntimeClock origin without a fresh allowance. A ten-second lookup
-ceiling and five-second DNS ceiling only shorten it. Results are refused
-after expiry. Malformed and inactive/wrong credentials return no principal;
-configuration, schema, privilege and connection failures remain service
-errors, not invalid-password observations. Errors carry no endpoint, secret
-or provider text. The native fixture checks these distinctions, revocation,
-lock contention, deadlines and subsequent successful lookup.
-
-## 66. Response retention without a mail database
-
-`ResponseCoordinator` owns one cold, empty RequestSpool and a process-local
-response quota ledger. Construction consumes the spool and refuses occupied
-or retired slots; it opens no mail database and grants no mail authority.
-Its only reservation surface is response bytes. PostgreSQL remains
-responsible for durable quotas; the local ledger cannot reserve bodies,
-uploads or delivery responsibility.
-
-Retention reserves the full cap before file creation, preserves original
-work/deadline accounting and prepaid mutation output, and unlinks before
-returning quota credit. Failed cleanup retains the full charge and retires
-the slot; ledger failure stops admission. Legacy native-view and external-sort
-hooks are removed. PostgreSQL method adapters supply their authenticated
-snapshots and bounded queries.
-
-The active service supplies this coordinator to the dispatcher. Fixtures
-cover complete echo output, quota saturation, prepaid output, successful
-cleanup, replacement-file uncertainty and sticky clock failure.
-
-## 67. Prepared PostgreSQL Mailbox/get dispatch
-
-`dispatch::run_with_postgres_read` accepts a freshly authenticated runtime
-snapshot and a response retention owner. Core/echo and connected Mail methods
-use the existing whole-request admission, argument parser, result references,
-method-error handling and retained response encoder. Unconnected methods return
-unknownMethod at this preparation boundary; they never fall through to the
-local database. The active service uses this backend.
-
-Mailbox/get obtains bounded names, hierarchy and counts from that snapshot,
-uses its identity for state, and uses the shared object encoder. Explicit
-IDs retain request order and duplicate/notFound behavior; null IDs select
-the bounded mailbox list. Snapshot checks precede and follow the operation
-and the batch. All response bytes remain provisional until those checks
-succeed. Read-only fixtures advertise read-only rights; the prepared HTTP
-flag endpoint in §78 advertises seen/keyword rights explicitly. The temporary
-read seam and native path are removed at cutover.
-
-The dispatcher converts its execution tick using the response owner's
-RuntimeClock and tightens both the snapshot and SQL worker deadlines before
-any dispatch. This can only shorten the original allowance; a subsequent
-call cannot extend it or clear a terminal error. Nested mailbox expiry keeps
-its executionDeadline classification.
-
-Losing the snapshot is terminal for this prepared read batch, including
-execution-phase expiry: the final snapshot check discards the entire retained
-result and returns the deadline error. Argument and unsupported-method errors
-still produce per-method replies while the snapshot remains usable. The
-runtime HTTP adapter must settle such terminal refusal without publishing
-any prefix of the discarded batch.
-
-## 68. Prepared PostgreSQL Email/get dispatch
-
-The prepared read dispatcher also connects Email/get to its authenticated
-snapshot. The existing argument parser, selections, ID planning, result
-references, response framing and notFound handling remain shared with the
-local adapter. Stored fields use the shared Email encoder; MIME and header
-fields use the existing verified-pin encoder. No new client features or
-interpretation rules are introduced.
-
-Null IDs use one bounded PostgreSQL query page; an account larger than the
-method object allowance refuses rather than silently truncating. Requested
-IDs retain their order and deduplication. Body verification prepays the
-existing per-method byte/record allowance before obtaining the PostgreSQL
-pin. The snapshot additionally retains its connection budget and shortened
-execution deadline. A projection/output refusal does not poison a healthy
-snapshot; body integrity or connection failure remains terminal. Provisional
-bytes are published only after both projection and final snapshot checks.
-
-## 69. Prepared PostgreSQL Email/query dispatch
-
-Email/query reuses the existing td-mail argument parser and result framing
-with the PostgreSQL snapshot query. The supported inMailbox filter,
-receivedAt ordering with ascending-ID ties, position, bounded limit and
-optional total retain their existing semantics. Query state comes from the
-same admitted snapshot as the returned IDs; query changes remain unsupported.
-
-The PostgreSQL path requires no local external-sort files: database query
-limits and the original snapshot worker budget bound reads, and the shared
-response owner bounds retained JSON. Final snapshot and execution checks
-precede publication. A result reference into the query IDs feeds the same
-snapshot's Email/get without client-visible storage-specific handling.
-
-## 70. Exact worker expiry and transport ticks
-
-The PostgreSQL worker's original Instant deadline remains authoritative
-through connection, qualification and query polling. Its TLS transport uses
-whole-millisecond ticks, so the initial remaining allowance rounds upward
-when deriving that secondary cap. Rounding downward could expire TLS first
-by a fraction of a millisecond, losing the worker's deadline classification
-in a generic driver error. This does not extend the worker allowance: each
-poll still checks the exact original Instant, and phase tightening can only
-shorten it. An unrepresentable transport tick is refused.
-
-## 71. Shared HTTPS API framing
-
-The existing HTTPS API backend now delegates bounded body reception, JSON
-validation, response preflight and final retained-response encoding to a
-shared exchange helper. The backend still reserves storage before body
-reception and supplies the same fresh authorization at the receive boundary
-and before dispatch. All exchange, transfer, idle and execution deadlines
-remain anchored to their existing start points.
-
-This prepares the PostgreSQL HTTP backend to reuse the exact request and
-response path. The helper owns no database authority and selects no backend;
-the active receive/JMAP service constructs these owners.
-
-## 72. Reserved fresh runtime reads
-
-`Snapshot::open_resolved` reserves a process-local read slot before selecting
-addresses for the protected bootstrap endpoint and qualifying the runtime
-connection. The same slot and original finite allowance cover
-resolution, all attempted addresses, authentication and snapshot ownership.
-Only transport connection failures advance to another resolved address;
-policy, credential, schema and database failures have no fallback.
-
-The selected bootstrap profile must match the prepared binding. Resolution
-has a five-second cap within the original request allowance; the existing
-ten-second worker ceiling can only shorten that allowance. No connection or
-DNS queue is created, and all failed paths release their slot after closing
-owned work. Health and settlement retain independent admission capacity at
-runtime integration. This entry prepares HTTP workers; it activates no role.
-
-## 73. HTTP read backend
-
-`postgres_http_api::Service` connects the fixed HTTPS body-worker interface
-to the shared bounded HTTP framing and PostgreSQL read dispatcher. Its Session, profile binding and
-resource plan must agree; HTTPS, response retention and dispatch share one
-RuntimeClock. Read dispatch includes Core, mailbox, email, thread and change
-methods. Uploads and mutations use the separate publication adapters below;
-their write connections are not retained by the read cache.
-
-Original credentials stay borrowed through body preparation and fresh primary
-snapshot authentication. The observed device ID must match their syntax, but
-only the fresh snapshot grants read authority. For API reads, each fixed HTTPS body worker
-retains at most one read connection for its last account and configured origin, holding one existing
-read permit. Connection admission performs DNS, schema and runtime-role
-qualification and retains the shared migration lock. Each job begins a fresh
-read-only repeatable-read transaction, checks epoch, maintenance, selected
-configuration and the complete presented credential, and acknowledges ROLLBACK
-before output. Only the clean connection and its permit survive; no snapshot,
-body pin or authority does. The standalone backend entry still closes its
-connection after the job.
-
-API read sessions admit at most eight jobs within sixty seconds, each under
-the original ten-second execution deadline. Per-job wire allowances remain
-256 MiB input, 512 KiB output and 8192 frames; finite connection totals are
-eight times those limits, with no parser/authentication reset. These are wire
-budgets, not resident allocations. Owning-thread maintenance retires exhausted
-or near-expiry sessions between jobs and during bounded HTTP input/output
-turns. Slow progressing peers cannot retain an expired idle database session.
-The local hook issues no SQL; active database jobs keep their original finite
-deadline and release their transaction before response output. Account or origin changes, uploads,
-downloads and mutations discard the retained reader before acquiring other
-storage capacity. Observable idle disconnects reconnect before job submission;
-failures after submission retire the connection without replaying the job.
-Worker exit closes retained resources on the same thread before releasing
-their read permits. Account count does not multiply retained sessions.
-
-Final snapshot validation and rollback precede response output; temporary
-response quota remains charged through output and cleanup. No database work runs on the
-network reactor, no success escapes a failed snapshot, and uncertain response
-cleanup stops admission.
-
-Shared HTTP framing keeps the execution deadline strictly before the outer
-response deadline, including short original request allowances. It caps
-execution one clock tick before the outer limit without extending either
-budget. This preserves response retention's phase-ordering contract; the
-one-tick separation does not promise transmission time after expiry.
-### Worker-local verified header projections
-
-Each fixed HTTPS body worker may retain serialized root-header members for
-header-only Email/get selections, separately from its finite database session.
-The cache survives connection rotation, API mutations and API/download switches;
-account/origin replacement, uploads and worker teardown drop it. Its immutable
-Service binding fixes profile, configuration and interpretation limits.
-
-Every lookup follows fresh transaction authentication and current Email and
-blob metadata validation. The key contains account, epoch, blob ID, length,
-full SHA-256 digest and the exact ordered header property spellings, including
-modifiers and case. Email IDs, thread IDs, flags, memberships, dates and other
-stored fields are never served from this cache. Removed Email objects remain
-notFound; cached headers grant neither account access nor body-pin authority.
-
-A hit reuses historical interpretation of the same immutable blob. It does not
-re-read chunks or detect subsequent corruption of an unrequested tail. Full
-body projections, previews, raw downloads and attachment downloads still
-verify current requested bytes. Qualified MIME projections may use chunk
-verification as specified below. Qualified stored search fields may answer
-without body reads; search fallback and downloads retain full verification. Header-cache misses preserve whole-body precharge and verification. Hits charge bounded lookup and copy/output work
-and check the original snapshot, retention and method deadlines. Cache output
-remains provisional until normal final snapshot validation and response
-publication.
-
-Only a successful projection whose outer pin verification also completes may
-stage an entry. Staged entries are invisible to lookups until the enclosing
-read transaction completes acknowledged rollback and final checks. Failure
-or unwinding discards pending entries. No transaction, credential, snapshot or
-body pin is retained. Earlier independently verified projections can survive
-an ordinary later per-method JMAP refusal if the enclosing read job succeeds.
-
-The configured index_cache_bytes budget is divided across the actual bounded
-HTTPS body-worker count. Each share includes entry-vector capacity, exact
-property signatures, resident and staged fragments, active capture, and old
-plus replacement allocation during capture growth. At most 256 entries and
-64 KiB per fragment are retained. FIFO eviction, allocation failure, oversized
-fragments or a tiny configured budget merely bypass caching. The existing
-memory reservation is unchanged; this is a bounded optional optimization,
-not a persistent database index or a latency guarantee.
-
-## 74. Prepared HTTP downloads
-
-The prepared HTTP backend serves raw blobs and direct MIME-part locators
-through the existing shared download encoder. Target account and observed
-device must match before connection admission. It reserves two read slots
-before endpoint resolution: one for the verified body snapshot, one for fresh primary
-reauthorization before the callback. Both runtime connections qualify the
-database role. The snapshot, MIME processing and transmission share the
-original deadline capped at thirty seconds; no reconnect renews that budget.
-The fixed worker may reuse the two clean sessions under the retained-download
-contract below; every request still establishes fresh snapshot authority.
-
-Whole-body digest verification and account-reference/upload-lease policy
-remain `postgres_body::with_pinned_blob` responsibilities. Forged locators
-are checked against the verified MIME tree and decoded length is counted
-before headers. A single foreground work meter covers interpretation and
-replay; no full-message resident buffer is introduced. Permits are released
-only after their sockets drop, including failed writes. A worker without a
-retained pair needs two free slots and refuses immediately if either is
-unavailable. Active body custody survives callback output; the idle checker
-may retire during that output. Standalone callers release both connections
-when the operation ends.
-
-## 75. Prepared PostgreSQL Thread/get dispatch
-
-The prepared read dispatcher accepts td-mail's explicit Thread/get IDs using
-its existing argument validation, projection, result references and response
-encoder. Ordered membership windows come from the same authenticated
-PostgreSQL snapshot. Missing or empty threads are notFound; state and final
-snapshot checks bind the complete retained result to that view. The original
-execution deadline and output allowance cover every page.
-
-Omitted or null IDs are refused as invalidArguments on this prepared path;
-td-mail supplies explicit IDs, and account-wide thread enumeration is outside
-this increment. The active receive/JMAP service uses the PostgreSQL backend.
-The real-client PostgreSQL fixture also retrieves the delivered message by
-its thread ID and checks the returned ID and body.
-
-## 76. Prepared PostgreSQL object changes
-
-Mailbox/changes, Email/changes and Thread/changes use the existing
-transaction-aligned history merger on the authenticated batch snapshot.
-The shared argument parser, state validation, page encoding and errors stay
-unchanged. The PostgreSQL reader does not open another connection or refresh
-its snapshot between methods. Each history poll charges the original HTTP
-response work allowance and checks the execution deadline; the existing
-4096-poll history bound also applies.
-
-A foreign, stale or wrong-kind state returns cannotCalculateChanges without
-poisoning a healthy snapshot, so later methods can continue. Database,
-integrity, work and deadline failures remain terminal for this prepared read
-batch. Final snapshot checks precede publication. Production activation and
-mutation coordination remain separate.
-
-## 77. Read boundaries for prepared method coordination
-
-A successful Snapshot::finish_method consumes and closes the PostgreSQL
-connection before returning a BetweenMethods reservation. No body pin can
-survive that transition. The connection slot remains reserved until the next
-method reopens it or drops the reservation; this is conservative capacity
-accounting, not a retained database transaction.
-
-Reopening performs bounded endpoint resolution, runtime-role qualification and full device
-secret authentication against the original profile/account binding. It
-captures a new account state. The original deadline is capped once at read
-admission and never extended by closing or reopening. The reservation stores
-no password and refuses a different device ID. Every failed reopen releases
-its capacity. A failed snapshot cannot produce a reservation.
-
-This supplies a boundary for future mixed read/write batches. Existing
-read-only HTTP dispatch retains its single snapshot; no mutation endpoint
-or production PostgreSQL service is activated here.
-
 ## 78. Prepared singleton flag requests
 
 The prepared HTTPS backend admits td-mail's standalone Email/set keyword
@@ -3947,27 +4589,6 @@ foreground capacity is occupied, and inline release of a rolled-back COMMIT
 before the next submission. JMAP dispatch, implicit success filing,
 durable startup ownership and capability activation remain separate work.
 
-## 90. Prepared PostgreSQL Identity/get
-
-Cold JMAP-profile preparation retains the existing bounded visible Identity
-catalog beside the immutable selected binding. Other role profiles do not
-allocate this catalog. The same resolved PostgreSQL identity/signature text
-drives the existing canonical visible-state digest and object encoder; no
-local-file fallback or second representation is introduced.
-
-Prepared read dispatch serves Identity/get through its freshly authenticated
-PostgreSQL snapshot and checks that snapshot before publishing the result.
-Account, epoch, selected configuration
-and deadline remain bound to that snapshot, while identity state depends on
-the visible configuration digest rather than the mail sequence. Catalog
-handles alone confer no live authorization.
-
-The read-dispatch fixture explicitly admits Submission to test identity
-listing, selected/missing IDs, result-reference lookup, signature bytes and
-foreign-account refusal alongside the normal Mail methods. HTTPS capability
-admission and the Session remain unchanged: this increment does not advertise
-Submission before sending and reconciliation are connected.
-
 ## 91. Fixed-worker success filing
 
 The prepared HTTPS Email mutation owner accepts the exact success-filing
@@ -3988,70 +4609,6 @@ without queue or draft loss, delayed-COMMIT fencing, settlement with occupied
 foreground capacity, the final membership/draft state, and missing-source
 refusal. This adapter does not yet connect the JMAP implicit response or
 advertise Submission.
-
-## 92. Prepared submission reconciliation reads
-
-The authenticated PostgreSQL Snapshot exposes historical submission identity
-metadata and bounded identity/time query pages for td-mail reconciliation.
-Metadata retains the original Email, Thread and sending Identity IDs and
-sendAt even if the current Email has been deleted; those IDs confer no body
-access. Each row's changed sequence must belong to the pinned account view.
-
-Query windows use inclusive after and exclusive before against immutable
-sendAt, either date direction and ascending raw SubmissionId ties. Pages have
-at most 1024 returned IDs plus one lookahead, an optional same-snapshot total,
-and account/epoch/sequence/interpretation-bound Submission query state. The
-original read slot, SQL worker, authenticated snapshot and absolute deadline
-remain in force; a failure poisons the view. No JMAP dispatch, capability,
-recipient status projection or PostgreSQL service activation is activated.
-
-## 93. Prepared td-mail submission-get projection
-
-Prepared PostgreSQL read dispatch accepts EmailSubmission/get only with
-Submission in the admitted request's using list. Its implemented shape is
-td-mail's explicit IDs and explicit id/emailId properties; id is always
-returned. Missing and opaque foreign IDs appear in notFound, duplicate IDs
-are coalesced, foreign accounts are refused, and bounded result references
-retain their normal request semantics. Omitted/null IDs or properties and
-other properties are explicitly invalidArguments, not a partial full-object
-projection. Enumeration and recipient/status properties remain unconnected.
-
-The projection uses the same fresh authenticated Snapshot and original
-response/work allowance, returns its Submission data state and historical
-Email IDs, and checks the view before publishing. HTTPS capability admission
-and Session advertising remain unchanged; this is not sending activation.
-
-## 94. Prepared td-mail submission query
-
-Prepared PostgreSQL read dispatch accepts EmailSubmission/query with
-Submission in using. Its bounded filter is one identityIds entry and
-mandatory after/before UTC whole-second dates, inclusive/exclusive against
-sendAt. Opaque foreign identities match nothing. Unsupported filter forms,
-sorts, malformed dates and negative positions refuse explicitly. Sorting
-supports sendAt in either direction; ascending raw SubmissionId breaks ties.
-
-Pages respect the configured query bound and the storage maximum of 1024,
-return the pinned Submission query state and optional same-snapshot total,
-and support result references into subsequent explicit Submission/get calls.
-The original snapshot, SQL deadline and response meter cover every page;
-publication checks the snapshot again. This preparation does not advertise
-Submission or activate sending, generic query filters or queryChanges.
-
-## 95. Prepared Email reconciliation windows
-
-PostgreSQL Email/query supports td-mail's fallback filing search: inMailbox,
-after and before in one condition or a flat AND of conditions. Date bounds
-are strict UTC whole-second values, inclusive after and exclusive before
-against receivedAt. Repeated date bounds intersect; foreign mailbox IDs and
-empty time windows match nothing. Distinct local mailbox conditions refuse rather
-than guessing their multi-membership intersection. Unknown filters, nested
-operators and non-AND operators refuse; malformed shapes and dates refuse.
-
-The same snapshot filters both the optional total and ordered page, preserving
-account isolation, receivedAt/EmailId ordering, lookahead and the original
-SQL deadline. The date decoder is shared with submission queries, including
-its numeric-position checks. This is an inert PostgreSQL read preparation;
-it does not enable Submission or the runtime integration.
 
 ## 96. Prepared singleton submission mutation
 
@@ -8256,198 +8813,6 @@ and successful deadline and protocol-window checks. Expiry maintenance and
 clean idle retirement use the existing bounded termination allowance; an
 unfinished or failed job never gains time through cleanup.
 
-## Retained HTTPS download sessions
-
-Each fixed HTTPS body worker keeps either its API read cache or a pair of
-download sessions, never both. Account or origin changes, uploads and worker
-exit discard that state. Standalone download callers keep the one-shot path.
-The pair contains a body reader and a separate current-authorization reader.
-Each is Runtime-qualified once under a shared migration lock. Every job checks
-epoch and maintenance, then the existing account, configuration, credential
-and database-clock conditions. Only clean idle connections survive a request;
-no snapshot, row lock or authorization result does.
-
-Each download starts a fresh repeatable-read body snapshot, authenticates and
-verifies the complete digest, then uses a separate READ COMMITTED transaction
-for current configuration, account, credential and upload-expiry checks. The
-authorization transaction acknowledges ROLLBACK before output. The body
-snapshot remains through verification and replay, then acknowledges ROLLBACK
-before its connection is reusable. Neither a failed job nor a failed retirement
-replays an admitted request. Failure after response output closes the exchange.
-
-The authorization session retains the ordinary 64-turn, immutable 60-second
-profile, with 1 MiB input, 64 KiB output and 1088 frames per turn. The body
-session uses the existing eight-turn body profile and its independent cumulative
-wire ceilings; initial qualification consumes the first protocol window.
-Body turns may use the existing 30-second verification/replay deadline; ordinary
-read turns still have their ten-second maximum. A non-body session cannot admit
-a body-duration turn. Both sessions must cover the original request deadline
-before verification begins. Idle disconnect replacement is permitted only before
-admission; no failed SQL or response is retried transparently. Every failed
-download retires both sessions.
-
-Reserve both read permits before DNS, or two transient permits for a standalone
-call. After a successful download, the worker checks the shared read-slot count.
-If the pool is full, it retires its authorization connection and releases that
-permit. With spare capacity it can keep both sessions warm. Other jobs may
-acquire a released permit immediately. Cache borrows prevent retirement of the
-active body reader during output. Sender maintenance can retire the idle
-checker during slow response writes; fixed-worker maintenance retires either
-idle session between requests. The retained connections never authorize one
-another's next transaction.
-
-## Bulk body verification
-
-The verified body reader hashes all chunks with td-crypto's opaque
-`BulkSha256`, backed by td-primitives' SHA-256, which uses the CPU's SHA
-extensions where present.
-It retains one digest context only for the verification pass, feeding the
-existing 64 KiB chunks from batches of at most eight. The account, immutable
-snapshot, ordinal/extent checks, final constant-time digest comparison and
-original deadline remain unchanged. Error or unwind retires the digest and
-refuses the verified pin. Empty bodies still require the SHA-256 empty digest.
-The worker checks its original deadline around each bounded chunk batch;
-a chunk's hashing is not independently cancellable. The digest context is
-inline and bounded by active workers.
-This path is not an allocation-free primitive. Other digest callers retain
-the existing owned implementation and storage bytes are unchanged.
-
-## Persistent common-header summaries (schema 33)
-
-`blob_summaries` holds rebuildable From, To, Cc and Subject JSON values, in
-that fixed order, independently of mutable Email metadata or request property
-order. Each account/blob has at most one row, bound to body length, complete
-body digest and interpretation version 1. Version 1 uses the existing shared
-header parser with a 256-KiB header ceiling, its aggregate interpretation
-limits, four fields of at most 16 KiB each, and finite preparation work.
-Changing these interpretation semantics requires a version bump. Different
-configured header ceilings, unsupported properties, absent rows, incompatible
-versions, digest/length mismatches or malformed JSON use verified parsing.
-
-The shared blob publication boundary derives these values from its already
-owned immutable bytes and stores them in the same transaction as the blob.
-SMTP, drafts, imports and local notices therefore retain the original durable
-publication boundary. Parsing examines only the bounded header prefix; it does
-not decode attachments or compute previews. An unrenderable/oversized summary
-is optional and is omitted, leaving the original message available through
-existing behavior. Publication deadlines still apply to this additional work;
-summary SQL failure cannot leave a partially committed delivery.
-
-An authenticated read fetches at most sixteen summary rows for the current
-metadata window, under the original snapshot, account and deadline. Only
-header-only selections of these four properties use them. All Email existence,
-flags, thread IDs, dates and memberships still come from that snapshot. JSON
-values pass bounded framing and root-kind validation before output; final
-snapshot validation and response publication remain unchanged. `summary_reuse`
-counts successful persisted summary uses in the existing performance report.
-No body chunks are read or body I/O precharged for a summary hit.
-
-These rows are historical interpretation evidence, like the existing memory
-cache, not current body integrity evidence. They neither create a body pin nor
-detect subsequent corruption of an unrequested attachment. Body projections,
-previews and downloads retain current verification; qualified body-bearing
-Email/get may use the chunk-verification contract below. Search may use the
-qualified stored-field contract below without body reads. Account/blob foreign
-keys and cascading deletion remove summaries when the authoritative blob is
-removed. There is no external cache service, credential cache or shared mutable
-response object.
-
-`postgres summary-backfill --connection-file OWNER --epoch E --account A`
-rebuilds one finite page of Email-referenced blobs, including replacing
-existing summaries. It can repair malformed derived rows as well as fill gaps. `--limit N`
-selects 1..16 blobs (default 16); `--after BLOB` resumes after the previously
-reported cursor. One page verifies at most 64 MiB of full bodies, retains one
-bounded header prefix at a time, and writes at most 256 KiB of derived values
-within the ordinary ten-second owner job. Reports contain `scanned`, `written`,
-`skipped`, `verified_bytes`, `after` and `done`, never header contents. Skipped
-unrenderable messages advance the cursor without fabricating a summary. Only
-known COMMIT returns success and an advanceable cursor; failures preserve the
-caller's previous cursor, and an unknown COMMIT is reported explicitly. Replaying
-the same page is safe because these are replaceable derived rows, not mail
-publication or outbound effects. Run pages serially, retaining each successful
-cursor, until `done`; a later version rebuild starts again without `--after`.
-New delivery does not wait for this administrative backfill.
-
-Schema upgrade remains explicit: stop serving instances, use the owner schema
-upgrade workflow, grant the runtime role the new table's ordinary mail access,
-and restart the upgraded binary. Existing messages remain readable before
-backfill. Backups include derived rows, but the original messages remain the
-source for rebuilding them. A rollback binary must understand schema 33; do
-not restart a schema-32 binary against the upgraded ledger.
-
-## Persistent MIME interpretation (schema 34)
-
-`blob_interpretations` holds optional, rebuildable MIME evidence per account
-and blob. Version 1 fixes the parser limits at 256 KiB of aggregate headers,
-1024 parts and depth 32. Its explicit 56-byte part records preserve preorder,
-parent, entity/body/type extents, decoded size, media, encoding and diagnostics.
-A domain-separated SHA-256 binds the table, aggregate header count and one
-SHA-256 per 64-KiB body chunk to the whole-body digest and length. This is
-publication evidence, not a MAC or independent protection against a database
-writer replacing both data and evidence. Semantic parser changes require an
-interpretation version bump.
-
-Delivery, upload, draft, submission and import preparation derive evidence
-from their owned immutable bytes before the publication transaction. SMTP
-preparation remains serialized with publication. Locally composed failure
-notices derive their evidence within their existing bounded transaction.
-Evidence insertion shares the blob's durable transaction; optional parsing
-failure omits the row, while SQL failure refuses publication. The original job
-deadline still governs preparation. No extra background worker is started.
-
-Metered publication prepays a finite child allowance from the original job
-before parsing, hashing or encoding. Each dimension reserves at most half of
-the remaining credit, further capped by input-size bounds; unused or failed
-cache work is not refunded. This leaves credit for publication without giving
-the cache new admission. Insufficient credit omits optional evidence and
-preserves the verified-parser fallback. Standalone import, notice and owner
-backfill preparation has a finite 512-MiB I/O, 64-million-record and 128-MiB
-decoded-output allowance per message under its original deadline. Decoded-size
-work is distinct from the much smaller retained evidence and page-output caps.
-
-For a body-bearing Email/get, the original authenticated snapshot loads at
-most one interpretation row at a time. Matching version, limits, length and
-digest, bounded format, checksum and tree extents are checked before use.
-Missing or incompatible evidence falls back to the existing MIME traversal.
-A hit admits the private chunk-verifying pin. Each cache miss fetches only
-the chunks intersecting the requested span, at most eight 64-KiB chunks per
-batch, and verifies every returned ordinal, length and SHA-256 before exposing
-any bytes. The complete manifest binds these hashes to the selected blob's
-length and whole-body digest. Empty bodies still require the empty SHA-256.
-This trusts publication-derived interpretation evidence, not a freshly
-recomputed whole-body hash: corruption in an unrequested attachment may remain
-undetected by a text projection. The manifest checksum is not a MAC.
-
-The parser rereads entity headers at stored extents and checks their endpoints
-and aggregate count. Current headers supply names, MIME labels and dispositions;
-cached descriptors skip body traversal and encoded-size counting. Requested
-text and previews pass through the same chunk-verifying reader. Header or
-chunk inconsistency after qualification fails closed, with no retry under a
-new snapshot. Missing, malformed or incompatible evidence takes the original
-full-body verification and parsing path. The bounded chunk cache, original
-work precharges (including conservative full-body I/O credit), deadline,
-authorization and final response checks remain in force. No selected-read
-result is promoted into the fully verified header cache.
-
-`structure_reuse` counts successful qualified table reuse. `chunk_verify`
-measures requested batch SQL, framing and hash verification, distinct from
-`body_verify` for complete-body reads. Raw and attachment downloads, uncached
-search fallback and integrity auditing retain full-body verification. Periodic integrity
-scrubbing is an independently activated operator schedule described below.
-
-`summary-backfill --structure` additionally rebuilds MIME evidence under the
-same owner authority, snapshot, cursor and known-COMMIT rules as summary
-backfill. It streams one verified body through bounded header, part and chunk
-buffers; it does not allocate a whole-message buffer. The existing 64-MiB
-verification and 256-KiB derived-output page caps cover both kinds of evidence.
-Reports add `structures_written` and `structures_skipped`; a skipped MIME
-interpretation does not prevent rebuilding a valid header summary, or vice
-versa. Reduce the page limit if parsing reaches the original finite deadline.
-New messages require no scheduled backfill. Cascading blob deletion removes
-both kinds of evidence, and neither changes account sequence or Email history.
-Schema-33 binaries cannot serve schema 34; use the explicit fenced upgrade
-procedure and retain a consistent pre-upgrade backup for recovery.
-
 ## Scheduled whole-body integrity scrubbing
 
 `postgres blob-scrub-page` is an owner-only, read-only primary audit page.
@@ -8533,157 +8898,6 @@ chunks, through the same snapshot and metadata prefetch as Email/get. Catch-up
 and deletion authority remain separate synchronization work. Source Session
 advertises `inventoryBaseFence: true`; discovery requires it so an older source
 cannot silently weaken the starting-state guarantee.
-
-## Complete search-field evidence
-
-Schema 35 adds `blob_search`, keyed by `(account,blob_id)` with cascading blob
-deletion. Version 1 stores the complete field-local Unicode lowercase and
-whitespace normalization produced by the existing search traversal. Its fixed
-interpretation limits are 256 KiB of headers, 1024 MIME parts and depth 32;
-other configured limits use the original uncached path. Collection must finish
-all searchable sources, including late embedded-message validation, before
-any row can be written. Binary attachment contents remain excluded.
-
-At most 8 MiB of UTF-8 text and 65,536 fields are retained, encoded as repeated
-big-endian u32 byte lengths and UTF-8 values, at most 8,650,752 bytes. The row
-binds parser version, original body length and SHA-256. A separate SHA-256
-covers the domain `td-mta-search-fields-v1` followed by NUL, original digest,
-big-endian u64 body length, big-endian u64 encoded length and encoded fields.
-This is corruption detection, not a MAC or protection against the database
-owner. Like summaries, the row is trusted derived interpretation evidence.
-After qualifying its version, body identity, framing and field digest in the
-authenticated snapshot, search matches these fields without rereading the
-original body. This grants no body pin and is not a body-integrity audit;
-raw downloads and explicit scrubs retain their original verification.
-For a selected candidate, missing, incompatible, malformed or checksum-invalid
-evidence falls back to the original parser; it never means no match.
-Database errors still fail the request. The indexed candidate contract below
-separately defines the trust placed in rows excluded by the index.
-
-Reads use the authenticated snapshot, bounded metadata and at most 132 chunks
-of 64 KiB. Candidate interpretation prefetches passive Email metadata in
-windows of at most sixteen IDs. Search descriptors (version, body identity,
-encoded length and field digest) are read once per window with explicit
-negative entries for missing evidence, deduplicated by blob. Replacing the
-metadata window drops these descriptors; they never survive the snapshot.
-Passive window validation can inspect candidates beyond an early match, but
-encoded fields and bodies are loaded only for the candidate being matched.
-No mailbox or keyword values are prefetched for search. Descriptor batching
-neither authorizes body reads nor changes verification or work charges.
-Before loading fields the original method meter is charged four
-times the encoded length in I/O units for transfer, copying, hashing and
-decoding, and one plus the 4096-byte batch count in records, even if matching
-later stops early. Decoding additionally charges one record and checks the
-method deadline before each field descriptor and allocation. A work refusal
-remains an explicit error, not permission to retry the uncached path. Normalized matching processes at most 4096 UTF-8 bytes per batch,
-charging one work record and `bytes * (1 + 2 * pattern_count)` I/O units before
-matching, with deadline checks on both sides. One method meter covers all
-candidates. Only uncached fallback prepays whole-body verification work;
-retained-field reads pay their encoded transfer, hash, decode and matching
-charges instead. Early matching is safe only because collection already
-validated the entire interpretation. Phrase boundaries, ordering, pagination,
-totals and explicit resource refusals remain unchanged. The resource plan reserves
-an additional 20 MiB for each body/search job, including encoded/decoded
-buffers and field descriptors; CONFIG.md records the default-plan increase.
-
-Owner `postgres summary-backfill --search` prepares these rows alongside
-header summaries, optionally with `--structure`. The existing interpreted pin
-batches at most 64 cached source checks between driver polls, while retaining
-per-check deadlines and full checks at cache misses and completion. Text
-decoding samples the monotonic work clock at the existing fixed scalar-batch
-boundary, with original source checks before batches and on completion; UTC
-sampling is not needed for work admission. Existing cursor, verified-body
-page cap, transaction and known-COMMIT publication rules apply. Search output
-has a separate 17,301,504-byte aggregate page cap for encoded fields plus
-candidate text. Each interpretation has
-512 MiB of I/O work, 64 Mi records and 128 MiB of output work under the original
-finite operation deadline; these are work allowances, not resident buffers.
-The dedicated owner connection allows 24 MiB of output framing for encoded
-fields and candidate text, while runtime connection bounds remain unchanged.
-Candidate text is built from encoded fields after releasing the decoded
-collector, with one additional allocation bounded by the encoded length. A refused interpretation removes obsolete
-search evidence and increments `searches_skipped`; successful writes increment
-`searches_written`. A timeout or transaction failure yields no usable cursor.
-
-Search preparation runs through owner commands, optionally scheduled as below.
-Publication does not yet prepare search rows. New or oversized
-messages retain the existing search behavior. This cache avoids repeated MIME
-interpretation and whole-body reads for qualified rows. Schema 40 additionally
-narrows candidates through the index below; unindexed or incompatible rows
-retain bounded fallback and may still exhaust the original method allowance.
-Schema-34 binaries cannot serve schema 35; upgrade with fencing and a
-consistent pre-upgrade backup.
-
-### Missing-search preparation pages
-
-`postgres search-prepare-page --connection-file FILE --epoch HEX`
-prepares missing search evidence across accounts. `--limit N` selects one
-through sixteen bodies (default sixteen). Optional `--after ACCOUNT:BLOB`
-requires `--through ACCOUNT:BLOB`, with after no greater than through.
-Keys are pairs of canonical hexadecimal IDs ordered by account, then blob.
-The first page without through captures the greatest current blob key,
-including unreferenced blobs. Continuations retain that upper bound; arrivals
-behind the cursor or above the bound await a fresh cycle. Pages are separate
-repeatable-read snapshots, not a source-completeness certificate.
-
-Only Email-referenced blobs lacking a row with the current parser version,
-matching body length and digest, and non-NULL candidate text are selected.
-Empty candidate text qualifies. This is preparation, not an audit of existing
-fields or candidate text; explicit `summary-backfill --search` remains the
-repair operation. The query may examine a large already-prepared prefix:
-the statement deadline bounds discovery, not a constant row-work allowance.
-
-Each owner-only page verifies at most 64 MiB of bodies and retains at most
-17,301,504 bytes of encoded search fields plus candidate text across writes.
-One body is interpreted at a time. A fully verified body deferred by the
-encoded-output bound counts in `verified_bytes` but does not advance `after`.
-The page uses the existing bounded search-backfill connection and interpretation
-allowances. Its CLI has a shared ten-second connection/operation deadline.
-Permanent interpretation refusals advance as skips and remove incompatible
-evidence; operational failures and corruption abort the page. No such failure
-is reported as a skipped message.
-
-The JSON receipt contains store epoch, search version, scanned/written/skipped
-counts, verified bytes, after/through keys and done. It is emitted only after
-known synchronous COMMIT. A connection failure during COMMIT reports
-`commit-unknown`, without a usable continuation. Callers persist progress only
-after success and bind it to epoch and search version. Done ends this bounded
-cycle; it does not mean that every message has searchable content. This page
-command writes no durable progress file.
-
-### Scheduled search preparation
-
-`postgres search-prepare --state-dir PATH --epoch HEX --connection-file FILE`
-runs one sixteen-body missing-search page. A dedicated private directory holds
-an atomically replaced, synced progress file under the existing exclusive
-operational-state lock. State binds the store epoch and search interpretation
-version; mismatches refuse rather than silently reusing a cursor. A cycle
-retains its upper bound, counts and last confirmed cursor. After completion,
-invocations wait five minutes before starting another cycle. Unsupported
-interpretations remain explicit skips and can be retried in later cycles.
-They neither block preparation of other messages nor certify completeness.
-
-Before database work the job persists an in-flight marker with the last
-confirmed cursor and upper bound. After an interrupted or unacknowledged
-page, the next scheduled invocation uses that checkpoint. Each page verifies
-the database epoch under the schema lock and selects only missing or
-incompatible search evidence. Rows already prepared by a committed page
-are skipped. Before the first confirmed page, the upper bound is selected
-again. Only confirmed page results contribute to the cycle counters.
-
-A failed attempt leaves the cursor in place and reports its error. If an
-earlier page was in flight, its marker survives a failed retry. A confirmed
-page clears both the marker and the operational failure. The optional
-`postgres search-prepare-resume` command can still verify the epoch and
-clear an in-flight marker without running a page. It leaves failure status
-set until a page succeeds.
-
-`postgres search-prepare-status --state-dir PATH --epoch HEX` needs no database
-credentials. It reports counts, timestamps, continuation and in-flight/failure
-flags. Health requires a completed cycle within a day and no unresolved failure
-or uncertainty. Status and workers persist clock observations and refuse clock
-rollback. File loss removes freshness evidence; it is not interpreted as a
-completed cycle. DEPLOYMENT.md describes optional supervisor generation.
 
 ## Replica source mode
 
@@ -8812,109 +9026,3 @@ explicit 256-folder union capacity boundary. The operation never removes Email
 memberships to force a folder deletion or claims completeness while retirement
 is pending. A schema-38 binary cannot serve schema 39; retain a consistent
 backup and use the fenced upgrade procedure. No replica service is activated.
-
-## Indexed search candidates
-
-Schema 40 requires PostgreSQL 17's trusted `pg_trgm` extension, version 1.6.
-The owner migration creates it in a private `td_mta_trgm` schema, with no
-PUBLIC schema privileges, and adds a GIN index on `blob_search.candidate_text`
-under deterministic `C` collation. The extension must be available in the
-server installation; initialization or upgrade fails atomically if it is
-missing or an existing extension/schema conflicts. There is no download or
-runtime DDL. This is an explicitly approved server extension dependency,
-not a Rust dependency. Runtime SQL uses ordinary LIKE, not similarity search
-or caller-selected operators, and needs no namespace creation privileges.
-
-The nullable candidate text joins the complete normalized fields with LF
-boundaries and replaces NUL with LF because PostgreSQL text excludes NUL.
-It is at most 8 MiB plus 65,536 boundary bytes. Owner search backfill writes
-fields, digest and candidate text in the same transaction. Existing rows
-start with NULL candidate text and require another `--search` backfill.
-No partial or refused interpretation produces an indexed row. New arrivals
-continue through fallback until explicit or scheduled preparation. This adds
-stored derived text and GIN storage; it does
-not change account body quotas or promise a fixed database size.
-
-Search preparation distinguishes an interpretation refusal or a permanent
-representation limit (8 MiB normalized text or 65,536 fields) from operational
-failure. The former leaves no search row and advances the explicit backfill
-cursor as a skip; the message retains the existing read fallback. Failures
-reported by collection as operational errors, encoding/allocation failures,
-clock/deadline failure, invalid internal framing, and digest-provider errors
-abort the page instead of deleting evidence
-and reporting a skip. Final pin, clock and work checks take precedence over
-an otherwise skippable result. No partial normalized fields are published.
-This classification does not make a skipped message an empty search result
-or claim that existing compatible evidence has been audited.
-The CLI reports fixed `preparation-deadline`, `preparation-capacity` and
-`preparation-crypto` categories for the corresponding failures. Lower-level
-parser refusals retain the existing interpretation classification; this is
-not a redesign of every parser's error vocabulary.
-
-A parsed query may select one required term as a candidate filter. It must
-contain three consecutive ASCII alphanumeric characters, guaranteeing an
-extractable trigram even with a C locale, and contain no NUL. The longest
-eligible term is encoded as a literal LIKE substring, escaping percent,
-underscore and backslash. Other terms, short or punctuation-only searches,
-and non-ASCII-only terms still use the existing matcher; without an eligible
-term the query retains the bounded scan. Configurations with incompatible
-interpretation limits also retain that scan.
-
-Within the original authenticated snapshot, each candidate page combines
-indexed matches with every blob lacking compatible indexed evidence. Both
-branches apply mailbox/date scope before combining rows; they never materialize
-account-wide candidates before narrowing a scoped search. Indexed pages hold
-at most 256 candidates; unindexed scans retain their 32-candidate page bound. Version,
-body length and digest mismatches, absent rows and NULL candidate text enter
-fallback; they are never silently omitted. The branches are disjoint and
-retain account/mailbox/date scope, ordering, candidate offset and final result
-pagination. Both branches execute under the original database deadline.
-Every selected candidate then runs the existing field-local matcher against
-qualified complete fields, or verified-body fallback. The LIKE filter alone
-never authorizes a match, so phrases and multi-term semantics are unchanged.
-
-Like ordinary indexed metadata, negative candidate evidence trusts the stored
-projection and PostgreSQL's index correctness. A query does not hash every
-excluded row or audit its body; doing so would defeat the index. Candidate
-field validation detects corruption in loaded evidence, not arbitrary damage
-to excluded text. This is not a current-body or complete-index integrity
-certificate. Explicit search backfill rebuilds the projection from fully
-verified bodies. Raw downloads and whole-body scrubs retain their existing
-verification boundaries.
-
-Upgrade only with all instances fenced and a consistent pre-upgrade backup.
-Schema-39 binaries cannot serve schema 40. Backups and restores must include
-the whole database, including `td_mta_trgm` and the extension declaration;
-restoring only the `td_mta` schema is insufficient. The restored PostgreSQL
-installation must supply the same extension version before mail is activated.
-
-## Explicit partial-search results
-
-The session advertises `https://timmydouglas.com/ns/mail-search-partial`
-globally and for its account. A request must name it in `using` to permit
-Email/query text search to continue past a per-message `messageInterpretation`
-refusal. Without that opt-in, the same refusal fails the whole method. This
-changes neither parser acceptance nor stored search evidence: an unsearchable
-message remains unindexed and its original body remains available.
-
-An opted-in Email/query response includes unsigned `searchSkipped`: the number
-of unsearchable candidate messages encountered while computing that page,
-including the matched prefix preceding its requested position. Counts on later
-pages overlap and must not be added together. A positive count makes the
-returned IDs explicitly incomplete; omit `total` even when calculateTotal was
-requested. Position and ordering apply to known matches. A page that ends before
-examining the remaining candidates cannot certify those later messages as
-searchable, even when its own count is zero. Non-search queries report zero.
-
-Only the per-message interpretation refusal is skippable. Body integrity,
-storage, database, deadline and exhausted work/output bounds still fail the
-request. The original authenticated snapshot and method meter remain in force;
-skipping a message renews neither. No unsearchable message becomes an empty
-successful search row, a proven nonmatch or an index-completeness receipt.
-The capability is an explicit query-mode distinction; successful matching,
-ordering and immutable interpretation versions are unchanged.
-
-The td-mail client opts in only for text queries on an advertising account,
-rejects unsolicited partial inventory, and shows known matches with a persistent
-incomplete-results warning. Its filtered list responses do not replace the
-unfiltered folder cache. CLI results and warning logs expose the skipped count.
