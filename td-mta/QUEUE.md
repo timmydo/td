@@ -241,14 +241,14 @@ body-reader implementation or the body-transfer constructor.
 
 Encoded output accumulates in one 16384-byte caller cell, matching the TLS
 plaintext write ceiling. Each turn reads at most one 4096-byte source cell,
-performs one bounded DATA codec poll, or attempts one TLS operation. Source implementations must bound
-their own I/O by the original deadline. Short nonzero reads continue from the
-exact returned offset; early EOF, oversized reads, length drift, malformed
-framing and work/time refusal abort the transport. Completion consumes the
-codec and flushes all declared body output. The retained BodySent has no
-terminator API: durable AcceptancePossible and final-outcome capacity still
-precede any future terminator handoff. This prepares protocol machinery and
-does not activate the relay scheduler.
+performs one bounded DATA codec poll, or attempts one TLS operation. Source
+implementations must bound their own I/O by the original deadline. Short
+nonzero reads continue from the exact returned offset; early EOF, oversized
+reads, length drift, malformed framing and work/time refusal abort the
+transport. Completion consumes the codec and flushes all declared body output.
+The retained BodySent has no terminator API: durable AcceptancePossible and
+final-outcome capacity precede the terminator handoff, which only the
+FinalResult owner performs.
 
 Transaction and WAL reservations cover the whole selected batch and its CHANGE. The
 maximum encoded recipient row is 9019 bytes; a PUT adds 12 operation-header
@@ -266,14 +266,15 @@ If these reservations cannot be obtained, abort before handing off terminator
 bytes; do not create an uncertain outcome merely because admission is full.
 Sync/I/O failure after handoff remains inherently uncertain despite capacity.
 
-The prepared PostgreSQL publisher's durable logical final-result reservation
-is specified in POSTGRES.md §142. AcceptancePossible reserves the selected
-DATA subset's sequence and alternative receipt capacity against every competing
-writer. Recovery or expiry consumes the same durable claim atomically with its
-outcome. This does not supply the separate local runtime reservations or permit
-terminator handoff; the prepared BodySent boundary remains closed. The local
-connection/work allowance and preallocated reply evidence are specified in
-POSTGRES.md §§143–144; both remain passive and require separate live ownership.
+The relay publisher's durable logical final-result reservation is
+specified in POSTGRES.md, [Durable final-result reservations (schema
+27)](POSTGRES.md#durable-final-result-reservations-schema-27).
+AcceptancePossible reserves the selected DATA subset's sequence and
+alternative receipt capacity against every competing writer. Recovery or
+expiry consumes the same durable claim atomically with its outcome. The
+final DATA handoff also needs the local connection/work allowance and
+preallocated reply evidence specified in POSTGRES.md, [Final-result capacity
+reservation](POSTGRES.md#final-result-capacity-reservation).
 
 If PostgreSQL COMMIT has an indeterminate result, retain the pending
 operation and settle its durable receipt before retry, as POSTGRES.md specifies;

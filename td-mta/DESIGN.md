@@ -1244,7 +1244,7 @@ the runtime must still enforce live queue/route fences. The prepared native
 PostgreSQL MAIL adapter additionally requires the authenticated session's
 process-local policy ID to match the TLS generation created with the attempt's
 selected-profile Binding. That ID is passive provenance, never persisted
-queue authority. POSTGRES.md section 183 owns this bound-path check.
+queue authority. POSTGRES.md, [TLS policy provenance before MAIL](POSTGRES.md#tls-policy-provenance-before-mail) owns this bound-path check.
 
 The prepared AUTH exchange consumes that fresh-EHLO session and borrows the
 original work meter and credential strings. Prefer advertised PLAIN; select
@@ -1277,7 +1277,7 @@ The inert native Prepared connector now composes configured resolution,
 numeric dialing, implicit TLS or required STARTTLS, fresh EHLO and AUTH.
 It binds same-load profile provenance before network work and rechecks native
 authority before credentials, retaining an opaque same-session MAIL handoff.
-POSTGRES.md section 185 owns its custody and failure contract. AUTH refusals
+POSTGRES.md, [Configured relay connection setup](POSTGRES.md#configured-relay-connection-setup) owns its custody and failure contract. AUTH refusals
 may expose an isolated complete peer rejection code; partial, multiline,
 malformed or current-cell-tailed input supplies no such classification.
 Only actual 535 selects this connector's Auth repair continuation.
@@ -1286,7 +1286,7 @@ bound MAIL, ordered RCPT, DATA, verified-source Body and final publication.
 It retains closed phase-specific evidence and passive interruption custody
 on failure; callers settle actual replies and unknown Pending before any
 recovery. It does not select jobs, schedule retries or activate PostgreSQL.
-POSTGRES.md §186 specifies the handoff and its bounded qualification.
+POSTGRES.md, [Relay attempt lifecycle](POSTGRES.md#relay-attempt-lifecycle) specifies the handoff and its bounded qualification.
 
 
 Credential cells and caller strings must not enter logs; no secure-erasure

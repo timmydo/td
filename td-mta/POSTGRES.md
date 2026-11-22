@@ -77,6 +77,7 @@ References give each mechanism's rules; use these entry points:
 | Account-scoped HTTP authentication | [HTTPS account selection](#https-account-selection) |
 | Incoming mail across accounts | [Transactional incoming delivery](#transactional-incoming-delivery-across-accounts) |
 | Submission queue, relay scheduling, route health and retention | [15. Submission queue, relay scheduling and route health](#15-submission-queue-relay-scheduling-and-route-health) |
+| One relay attempt from `Prepared` to final result | [16. Relay attempt execution and custody](#16-relay-attempt-execution-and-custody) |
 | Durable list summaries | [Persistent common-header summaries](#persistent-common-header-summaries-schema-33) |
 | MIME evidence and selective body verification | [Persistent MIME interpretation](#persistent-mime-interpretation-schema-34) |
 | Whole-body audit and progress | [Scheduled integrity scrubbing](#scheduled-whole-body-integrity-scrubbing) |
@@ -89,6 +90,7 @@ Comments in td-mta's source still cite some former section numbers:
 | 35 | [Expired upload lease reclamation](#expired-upload-lease-reclamation) |
 | 120 | [Expiry receipt retention](#expiry-receipt-retention) |
 | 123 | [Route-health receipt retention and the lease window](#route-health-receipt-retention-and-the-lease-window) |
+| 165 | [Unknown-COMMIT settlement and proof of absence](#unknown-commit-settlement-and-proof-of-absence); for HTTPS writes, [Settlement of retained HTTPS writes](#settlement-of-retained-https-writes) |
 | 213 | [Compact failure notices and the quota margin](#compact-failure-notices-and-the-quota-margin) |
 | 217 | [Receipt retention for HTTP writes](#receipt-retention-for-http-writes) |
 | 218 | [Reclamation of retired attempts](#reclamation-of-retired-attempts) |
@@ -134,36 +136,36 @@ writable primary, as [REPLICATION.md](REPLICATION.md) specifies.
 ## 2. Schema, configuration and trust
 
 Use an application-owned schema with parameterized, closed SQL behind typed
-storage interfaces. Runtime credentials receive the required data privileges,
-not schema ownership or DDL privileges. Explicit initialization/migration uses
-a separate owner credential, an exclusive database migration lock, and a
-version/checksum ledger. Initialize only when the application namespace is
-absent; refuse even an existing empty namespace and never replace a store.
-Incompatible upgrades require all instances to drain and stop; no mixed-version
-deployment is supported. Serving database connections acquire a shared
-session-level advisory lock on the fixed migration key before checking schema
-compatibility and retain it until closure. A one-shot operation uses that
-connection's verified schema version and store epoch. Every reconnect verifies
-the ledger and the requested role anew. Owner preparation opens without this
-qualification and checks the schema required by its operation.
-Retained Body/Envelope validators
-(sections 180 and 187) instead take the same key's shared transaction-level
-lock on each turn, fully revalidate schema/epoch and Runtime access before
-application reads, and acknowledge rollback before returning. The fixed HTTPS
-authentication worker, HTTPS API read workers and foreground relay idle reader acquire the
-session lock at connection admission,
-qualifies the schema and runtime role once, and retains that lock until closure.
-Their jobs still check epoch, maintenance and selected configuration;
-authentication observes credentials and idle reads observe route ownership
-in fresh snapshots, acknowledging rollback before reuse. Body/Envelope
-validators retain their per-turn qualification and release their migration
-locks between turns.
-The migrator takes the conflicting exclusive lock with a finite
-deadline and refuses while a serving session or validation turn holds a shared
-lock. After migration, a returning old process must reacquire the appropriate
-shared lock and validate the new schema before application SQL; stale pools
-cannot bypass the barrier. This requires direct sessions, not
-transaction-pooling proxies.
+storage interfaces. Runtime credentials receive the required data
+privileges, not schema ownership or DDL privileges. Explicit
+initialization/migration uses a separate owner credential, an exclusive
+database migration lock, and a version/checksum ledger. Initialize only when
+the application namespace is absent; refuse even an existing empty namespace
+and never replace a store. Incompatible upgrades require all instances to
+drain and stop; no mixed-version deployment is supported. Serving database
+connections acquire a shared session-level advisory lock on the fixed
+migration key before checking schema compatibility and retain it until
+closure. A one-shot operation uses that connection's verified schema version
+and store epoch. Every reconnect verifies the ledger and the requested role
+anew. Owner preparation opens without this qualification and checks the
+schema required by its operation. Retained Body/Envelope validators ([Body
+validation turns](#body-validation-turns) and [Retained envelope
+validator](#retained-envelope-validator)) instead take the same key's shared
+transaction-level lock on each turn, fully revalidate schema/epoch and
+Runtime access before application reads, and acknowledge rollback before
+returning. The fixed HTTPS authentication worker, HTTPS API read workers and
+foreground relay idle reader acquire the session lock at connection
+admission, qualifies the schema and runtime role once, and retains that lock
+until closure. Their jobs still check epoch, maintenance and selected
+configuration; authentication observes credentials and idle reads observe
+route ownership in fresh snapshots, acknowledging rollback before reuse.
+Body/Envelope validators retain their per-turn qualification and release
+their migration locks between turns. The migrator takes the conflicting
+exclusive lock with a finite deadline and refuses while a serving session or
+validation turn holds a shared lock. After migration, a returning old
+process must reacquire the appropriate shared lock and validate the new
+schema before application SQL; stale pools cannot bypass the barrier. This
+requires direct sessions, not transaction-pooling proxies.
 
 Configuration has immutable validated generations and one transactional
 active-generation pointer. Shared domains, aliases, identities and routes
@@ -793,18 +795,19 @@ Preparation remains the default of the protected bootstrap parser and all
 operator commands. Runtime mode authenticates TLS/SCRAM, checks primary and
 durability settings, acquires the shared migration lock, validates the
 current schema and checks the dedicated runtime role/table privileges and
-the maintenance barrier (section 205) before admitting an operation's SQL.
-A new connection repeats all of those checks; a previous cold receipt never
+the maintenance barrier (section 205) before admitting an operation's SQL. A
+new connection repeats all of those checks; a previous cold receipt never
 substitutes for them. Retained sessions (the HTTPS authentication worker,
 HTTPS API read workers and the foreground relay idle reader) hold that
-qualification and migration lock for their finite connection lifetimes,
-with fresh job fences as specified under "Retained HTTPS authentication
-sessions" and section 2. Other operation-owned connections hold the lock
-through their operation. BodyChecks instead authenticates at open and
-performs this qualification inside every closed validation transaction
-(section 2 and section 180), before any Body queries. No prior turn
-supplies cached qualification. Mail helpers still enforce their own epoch,
-current configuration, device, snapshot and publication fences.
+qualification and migration lock for their finite connection lifetimes, with
+fresh job fences as specified under "Retained HTTPS authentication sessions"
+and section 2. Other operation-owned connections hold the lock through their
+operation. BodyChecks instead authenticates at open and performs this
+qualification inside every closed validation transaction (section 2 and
+[Body validation turns](#body-validation-turns)), before any Body queries.
+No prior turn supplies cached qualification. Mail helpers still enforce
+their own epoch, current configuration, device, snapshot and publication
+fences.
 
 Qualification failure closes the connection before the application callback
 runs, with separate redacted schema/role/privilege/maintenance errors. It
@@ -1689,19 +1692,20 @@ TLS generation reservation remains in its original domain and is released
 on failure. The returned resolved text contains secrets and has no
 diagnostic dump.
 
-Each explicit binding retains passive identifiers, limits and that
-account's selected sending identity IDs/mailboxes. At most 64 mailboxes of
-at most 254 bytes are copied from the validated configuration; binding
-clones share that immutable catalog. Diagnostic formatting redacts the
-mailboxes. The header and SMTP recipient limits come from the same
-selected profile. Identity lookup is configuration evidence, not sending
-authority: submission publication must freshly fence the selection and
-current device. JMAP bindings also share the bounded visible Identity
-catalog, including public text/HTML signature bytes. No relay credentials
-or signature source paths enter the binding; diagnostic formatting redacts
-the visible catalog. A relay binding also retains the process-local relay
-policy identity from this exact prepared TLS generation (section 183); it
-contains no credentials or TLS lease.
+Each explicit binding retains passive identifiers, limits and that account's
+selected sending identity IDs/mailboxes. At most 64 mailboxes of at most 254
+bytes are copied from the validated configuration; binding clones share that
+immutable catalog. Diagnostic formatting redacts the mailboxes. The header
+and SMTP recipient limits come from the same selected profile. Identity
+lookup is configuration evidence, not sending authority: submission
+publication must freshly fence the selection and current device. JMAP
+bindings also share the bounded visible Identity catalog, including public
+text/HTML signature bytes. No relay credentials or signature source paths
+enter the binding; diagnostic formatting redacts the visible catalog. A
+relay binding also retains the process-local relay policy identity from this
+exact prepared TLS generation ([TLS policy provenance before
+MAIL](#tls-policy-provenance-before-mail)); it contains no credentials or
+TLS lease.
 
 Before returning, a final primary observation rejects a selection already
 superseded during preparation. This does not freeze future changes:
@@ -3681,16 +3685,17 @@ nothing retains a no-op receipt without advancing the sequence. Failure
 before commit rolls back bodies, ID reservations, metadata, usage and
 receipt together; Blob ID reservations are permanent once committed.
 
-Owner-side receipt inspection takes the account row FOR SHARE before
-looking for the result, so it waits behind an earlier publication still
-committing. A matching historical receipt resolves even after policy
-replacement, credential revocation, object deletion or body retirement; it
-does not authorize another mutation or a new body read. A lost COMMIT
-response returns Indeterminate, and only the original prepared operation
-can be inspected to recover its result (section 165). An inspection that
-crosses its deadline refuses absence and errors, but preserves a confirmed
-historical receipt as known success. These are internal recovery APIs,
-not a client authentication endpoint.
+Owner-side receipt inspection takes the account row FOR SHARE before looking
+for the result, so it waits behind an earlier publication still committing.
+A matching historical receipt resolves even after policy replacement,
+credential revocation, object deletion or body retirement; it does not
+authorize another mutation or a new body read. A lost COMMIT response
+returns Indeterminate, and only the original prepared operation can be
+inspected to recover its result ([Settlement of retained HTTPS
+writes](#settlement-of-retained-https-writes)). An inspection that crosses
+its deadline refuses absence and errors, but preserves a confirmed
+historical receipt as known success. These are internal recovery APIs, not a
+client authentication endpoint.
 
 Body chunks are at most 64 KiB, sent in batches of eight; no database
 parameter carries a whole maximum-size message. Upload, draft and
@@ -4132,13 +4137,15 @@ sequence, submission-created history, usage and receipt commit together.
 The visible Email and its blind-recipient headers remain unchanged.
 
 Receipts expire independently of the source Email or queued submission
-([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)). Concurrent publication of one retained operation serializes
-through the account row. Lost COMMIT responses remain indeterminate until
-receipt inspection on the publishing primary finds the receipt or proves
-its absence (section 165). Historical success survives later revocation,
-source deletion or configuration replacement. Deleting the source after
-enqueueing does not cancel delivery or retire its separately owned
-outgoing body.
+([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)).
+Concurrent publication of one retained operation serializes through the
+account row. Lost COMMIT responses remain indeterminate until receipt
+inspection on the publishing primary finds the receipt or proves its absence
+([Settlement of retained HTTPS
+writes](#settlement-of-retained-https-writes)). Historical success survives
+later revocation, source deletion or configuration replacement. Deleting the
+source after enqueueing does not cancel delivery or retire its separately
+owned outgoing body.
 
 The HTTPS submission owner admits one active or uncertain submission. It
 acquires the owner and foreground connection allowance before DNS, source
@@ -4419,15 +4426,15 @@ uncertain write; an uncertain upload retires its exchange as described in
 Settlement inspects that exact retained operation under Runtime
 qualification and the existing account lock that excludes a still-running
 COMMIT. It connects only to the endpoint the operation was published to,
-never resolving again or falling back, because the share lock proves
-nothing on another server (section 165). It borrows no app password and
-does not authorize or retry a mutation. A confirmed receipt returns its
-operation ID and complete original outcome and releases the owner;
-absence at the publishing endpoint releases it with nothing to return; a
-failed inspection or deadline leaves the original operation retained. A
-confirmed success survives a late local deadline poll. Settlement after
-device revocation still confirms without credentials or a transport
-callback.
+never resolving again or falling back, because the share lock proves nothing
+on another server ([Settlement of retained HTTPS
+writes](#settlement-of-retained-https-writes)). It borrows no app password
+and does not authorize or retry a mutation. A confirmed receipt returns its
+operation ID and complete original outcome and releases the owner; absence
+at the publishing endpoint releases it with nothing to return; a failed
+inspection or deadline leaves the original operation retained. A confirmed
+success survives a late local deadline poll. Settlement after device
+revocation still confirms without credentials or a transport callback.
 
 The service settles only inline. A new write of the same family for the
 same account inspects the retained operation first, for one minute of
@@ -4476,21 +4483,23 @@ life. Capacity inspection counts only receipts inside the minute; an
 idle account keeps expired ones until its next publication of that family.
 
 A receipt is no JMAP idempotency record: operation IDs are random per
-prepared request, and a client that lost a response reconciles
-(section 165). It serves only the publication's own replay, inside its
-ten-second deadline, and settlement of an uncertain COMMIT by the owner
-holding it. While holding it, the process does not sweep that family's
-receipts for that account, because the process's single write owner
-fences each family's publications. A fresh write can instead release
-local custody under [Uncertain HTTP writes and inline settlement](#uncertain-http-writes-and-inline-settlement), without determining the old outcome.
-Another instance serving the same account can sweep an expired receipt
-before inspection. A missing receipt then cannot distinguish rollback
-from expired evidence. The owner never republishes and the reply already
-sent stands. A restart releases every owner. No other reader exists: the
-upload lease, not its receipt, governs downloads and upload expiry; the
-relay and [Retention of settled submissions](#retention-of-settled-submissions) address submissions by ID; a cancellation receipt
-ages from its publication, not the group's completion. After expiry an
-operation is not replayable, and no owner republishes one.
+prepared request, and a client that lost a response reconciles ([Settlement
+of retained HTTPS writes](#settlement-of-retained-https-writes)). It serves
+only the publication's own replay, inside its ten-second deadline, and
+settlement of an uncertain COMMIT by the owner holding it. While holding it,
+the process does not sweep that family's receipts for that account, because
+the process's single write owner fences each family's publications. A fresh
+write can instead release local custody under [Uncertain HTTP writes and
+inline settlement](#uncertain-http-writes-and-inline-settlement), without
+determining the old outcome. Another instance serving the same account can
+sweep an expired receipt before inspection. A missing receipt then cannot
+distinguish rollback from expired evidence. The owner never republishes and
+the reply already sent stands. A restart releases every owner. No other
+reader exists: the upload lease, not its receipt, governs downloads and
+upload expiry; the relay and [Retention of settled
+submissions](#retention-of-settled-submissions) address submissions by ID; a
+cancellation receipt ages from its publication, not the group's completion.
+After expiry an operation is not replayable, and no owner republishes one.
 
 Schema 41 adds `created_at` without a default to `flag_receipts`,
 `mailbox_create_receipts` and `submission_cancel_receipts`; draft and upload
@@ -4822,1842 +4831,6 @@ The test uses bounded TLS wire buffers and per-I/O waits, verifies the server
 name and does not change production trust, client authentication or gateway
 policy. This is prepared PostgreSQL integration evidence; production backend
 selection and deployment qualification remain unchanged.
-
-## 136. Verified active-attempt transmitted bytes
-
-The prepared attempt API can admit its immutable transmitted body through a
-bounded read-only repeatable-read snapshot. The opaque Dispatch binds the
-account, route, destination, owner, generation, attempt and request digest.
-Fresh primary admission checks current policy, unexpired route ownership and
-that exact active attempt before snapshot work. Pre-MAIL classification
-([Relay scheduling turn](#relay-scheduling-turn)) and post-354 DATA each open
-and verify a separate snapshot. Each snapshot binds the live submission and
-blob manifest; the shared blob reader verifies contiguous chunks, total length
-and SHA-256 before exposing any bytes to the callback.
-
-A second fresh primary admission after verification refuses cancellation,
-retirement, ownership loss or policy change observed before that check. Both
-admissions release account/route locks before replay. After the second
-admission, a fresh check of the original snapshot and deadline precedes the
-callback, so snapshot loss during admission cannot enter it. The callback retains one
-immutable snapshot under the original absolute deadline, even if later
-cancellation completes the submission and fences the attempt. It receives
-passive metadata and a bounded BlobReader, not transport authority: current transport ownership and durable
-Body/AcceptancePossible phase publications remain prerequisites for SMTP.
-
-The caller reserves connection and body-work capacity. The existing ten-second
-connection limit, 32 MiB body limit, bounded chunk batches and fixed protocol
-budgets cover this prepared operation. No deadline or snapshot is renewed.
-The authenticated device-body path shares manifest decoding without changing
-its authorization or upload-lease checks. No delivery scheduler is activated.
-
-The real PostgreSQL scenario proves digest-checked replay, size/deadline
-refusal, unpublished/retired attempt refusal and corruption rejection before
-callback admission. Cancellation through an independent connection inside the
-callback proves that replay holds no account lock, while the admitted snapshot
-continues to return the same bytes within its deadline. A controlled source
-fault during admission checks that deadline or connection loss suppresses the
-callback before it can act.
-
-## 137. Bounded initial attempt envelopes
-
-The prepared attempt API reads an initial envelope only while every retained
-batch ordinal remains InFlight in Prepared for that exact active attempt.
-Current policy, account and route-owner locks cover the complete bounded read;
-route identity, destination, live due submission, account sequences and final
-lease validity are checked before returning. At most 100 recipients are copied
-with fallible reservations in the receipt's original ordinal order. Strict
-shared mailbox syntax validates recipient addresses and any nonempty reverse
-path; an empty reverse path remains representable. The uncertainty latch is
-returned unchanged as passive per-recipient metadata.
-
-Partial recipient results or later DATA phases refuse reconstruction. The
-worker must retain its admitted envelope for the existing transport; these
-values never authorize a new or repeated SMTP transaction. Queue-clock and
-transport admission, phase publication, interruption recovery and cancellation
-remain separate boundaries. No lock survives the call and no account sequence
-or attempt state changes. Body and envelope reads share exact active-attempt
-receipt validation, including its request digest and owner identity.
-
-Real PostgreSQL cases cover the 100-recipient bound, stable ordinal/address
-mapping, read-only state, unpublished and retired attempts, empty and malformed
-reverse paths, malformed recipients, inconsistent Prepared fields, partial RCPT
-refusal and Body-phase refusal. No scheduler or SMTP transport is activated.
-
-## 138. Mandatory clock admission for attempt publication
-
-Fresh and retry publication now require the caller's persistent process queue
-clock guard and monotonic adapter. Under current policy and the route-owner
-lock, publication pairs database UTC with the adapter's monotonic tick and
-checks the applicable guard status before selecting recipients. The locked
-database sample reaches the guard before owner-clock or lease refusal, so a
-failed ownership check cannot hide a discontinuity from the persistent hold.
-Fresh work is
-allowed at startup; retries require the minimum retry interval of stable
-monotonic time ([Minimum retry interval (schema 42)](#minimum-retry-interval-schema-42)). A clock
-discontinuity or primary-change hold continues to refuse dispatch until the
-existing explicit confirmation rules are satisfied. The adapter's UTC field
-is never used for queue decisions.
-
-After staging all recipient, submission, change and attempt rows, publication
-rechecks unexpired ownership, database time and the same guard immediately
-before issuing COMMIT. A backward time step within the transaction or elapsed
-submission expiry refuses publication. Failure rolls back the whole staged
-change. Guard access uses try_lock, so contention or poisoning refuses rather
-than waiting outside the connection deadline. No guard lock spans SQL awaits.
-
-Historical receipt settlement precedes clock admission and still grants no
-permission to transmit. An unknown COMMIT retains the same attempt identity;
-SMTP admission must independently revalidate current runtime ownership and
-clock state. There is no unguarded publication entry point. Runtime callers
-must share one guard across dispatch and expiry and notify it of primary
-changes; this increment activates no scheduler or administrator endpoint.
-
-Real PostgreSQL cases prove startup retry refusal, discontinuity holds,
-clock-adapter failure, guard contention, holds despite owner-clock/lease
-refusal followed by restored ownership, and rollback when a discontinuity is
-observed only after the recipient updates. Historical settlement succeeds
-without consulting a failed clock. Existing publication fixtures explicitly
-simulate the stable interval while retaining their storage/receipt assertions.
-
-## 139. Bounded relay attempt publication custody
-
-The prepared relay dispatch worker owns one active or uncertain publication at
-an admitted primary address. It requires a Runtime-mode connection, shares the
-caller's persistent queue guard and runtime monotonic clock, and reserves one
-connection slot before preparing an attempt. Each operation prepays two MiB
-plus 192 KiB of protocol I/O and 4096 records for receipt inspection, publication,
-runtime admission and bounded recipient staging. The earliest input deadline,
-work-meter deadline or ten-second phase limit covers all connection work.
-There is no waiter queue, address fallback or hidden DNS operation.
-
-Known success transfers the opaque Dispatch and passive receipt to the caller;
-known refusal releases the prepared identity. Unknown COMMIT retains exactly
-that Dispatch and refuses another publication. Independent settlement capacity
-only inspects the retained receipt: errors keep it, a matching receipt
-releases custody without changing account state, and proven absence (section
-165) releases it so the scheduler rederives from durable state. Settlement never
-republishes, constructs a replacement attempt or authorizes SMTP. Recovery and
-current transport admission remain separate operations.
-
-The trusted caller selects the primary and owns primary-change notification,
-process-lifetime pending custody, runtime clock/guard sharing and scheduler
-admission. No client-controlled address, credential or route enters this API;
-the supplied Claim binds current policy and the prepared route. Connection
-credentials are borrowed for each call and are not retained with the attempt.
-Production scheduler wiring and runtime integration remain separate work.
-
-The real PostgreSQL fixture checks preparation-mode refusal, exhausted work,
-original deadlines, startup retry hold, fresh publication and envelope access,
-unknown-COMMIT blocking, retained deadline/capacity failures, released
-custody after a rolled-back COMMIT, and historical settlement without a
-second account-sequence increment.
-
-## 140. Bounded relay phase publication custody
-
-The prepared dispatch worker uses one shared pending-operation slot for
-attempt preparation and durable Body, AcceptancePossible or result changes.
-An uncertain commit of either kind blocks both kinds of publication. The
-retained operation includes its exact attempt, phase, subset, replies and
-digest; settlement only inspects that operation's receipt. Admission refusal
-and database errors retain it. A matching receipt releases custody and
-returns a tagged historical result without a second state mutation; proven
-absence (section 165) releases it. Passive evidence changes are then
-published afresh; a live Body or AcceptancePossible plan was consumed with
-its closed transport, so the relay falls back to recovery from durable phase.
-
-Phase publication and settlement prepay three MiB plus 128 KiB of I/O and
-4096 records, covering the two bounded connections, their protocol input,
-the batch writer's one-MiB output ceiling, receipt output and staging.
-Attempt preparation retains its two-MiB-plus-192-KiB allowance. Both use the
-same Runtime-only connection admission, independently reserved settlement
-slots and earliest original job/meter/ten-second deadline. No credential or
-new worker is retained in pending state.
-
-The caller supplies actual SMTP evidence from its current attempt and closes
-transport when a phase COMMIT is unknown. Known publication and recovered
-receipts remain passive: neither authorizes more SMTP output, renews a lease
-or acquires the separate final-outcome capacity required before terminator
-handoff. Current transport/ownership fencing and runtime activation remain
-separate work. No SQL, schema or persisted phase semantics change here.
-
-## 141. Shared account sequence admission
-
-Every state-changing account publisher uses one shared next-sequence check
-inside its existing account transaction. After acquiring the account row in
-the established lock order, it rereads the exact sequence and floor under
-that lock, refuses a stale observation or invalid floor, and computes the
-next unsigned 64-bit value with checked arithmetic. Exhaustion refuses the
-whole mutation; no signed PostgreSQL integer conversion or wrap is allowed.
-No-op mailbox/Email updates and already-completed cancellation preserve their
-sequence. Historical receipt validation does not allocate another sequence.
-
-The additional bounded query uses the same connection, original deadline and
-protocol ceilings. It commits nothing by itself and retains no lock beyond
-the caller's transaction. This consolidates the admission point needed for
-durable result reservations described below; it does not enable SMTP
-terminator handoff. Route revisions, configuration generations and other
-independent counters retain their existing checked arithmetic.
-
-The shared account-sequence query adds a bounded round trip to a changing
-publication. Mutation workers allow 1088 frames, including fixed headroom for
-statement-close and COMMIT responses, so the maximum Email deletion batch fits; aggregate bytes, per-frame/authentication limits, output
-allowances and the original deadline remain unchanged.
-
-## 142. Durable logical final-result capacity
-
-Schema version 27 adds private final-result reservations keyed by account and
-attempt, with the exact ordered DATA subset (at most 100 ordinals). Its foreign
-key to the immutable attempt binds the submission, route, destination and
-owner fence; the schema ledger binds the store epoch. Runtime mail DML grants
-include the new table. Upgrade refuses any old InFlight/AcceptancePossible
-recipient: resolve those attempts using the old binary before upgrading. It
-does not manufacture capacity promises for previously published phases.
-
-AcceptancePossible now allocates one future account-sequence increment and
-one slot in each alternative acceptance, refusal, recovery and expiry receipt
-quota, atomically with the phase change. All thirteen account-sequence writers
-preserve the aggregate outstanding claims under the account row lock. The
-shared query reads claims with sequence/floor in one round trip. Every writer
-of those four receipt classes admits actual receipts plus outstanding claims
-against its existing 1024-row ceiling. Claims are bounded by that same ceiling;
-all counts use bounded indexed account scans. These are credits for a future
-increment, not preassigned sequence values.
-
-A final positive/negative DATA result validates and consumes precisely its
-reserved subset in the same transaction as recipient state, CHANGE and receipt.
-Current-owner interruption and later-owner recovery consume the exact remaining
-AcceptancePossible subset while recovering the whole bounded attempt. Expiry
-prioritizes one reserved subset and expires it completely in one transaction,
-even when its ordinals straddle an ordinary 100-row sweep boundary. Ordinary
-pending recipients wait for later sweeps. Prepared recipients outside the DATA
-subset have no remote-acceptance obligation and no reservation promise.
-
-Consumption occurs before shared sequence/receipt admission inside the same
-transaction. A conflict, expiry hold, clock refusal or failed commit rolls it
-back. Unknown COMMIT settles the retained operation; historical replay never
-allocates or consumes a second claim. Lease expiry or owner takeover alone
-cannot release capacity. Cancellation already refuses AcceptancePossible rows.
-The attempt foreign key also prevents removal of an outstanding claim's owner
-record. Physical disk/WAL availability and database connectivity are not
-reserved, and synchronous failure after remote acceptance remains uncertain.
-
-This is durable logical capacity only. The relay must still retain independent
-local connection/work/reply capacity, its original attempt deadline and live
-ownership before terminator handoff. Passive phase receipts remain historical
-evidence; BodySent still exposes no terminator API, and no scheduler is enabled.
-
-## 143. Retained local final-result work
-
-The prepared relay publication worker can reserve one process-local connection
-slot and prepay the existing phase I/O/record allowance for a named attempt's
-final positive or negative DATA result. Its non-cloneable FinalWork retains
-that slot until consumption or drop. Consumption accepts only that attempt's
-phase 4/5 Change, uses the already held slot and allowance, and cannot renew
-the reservation's original job/meter/ten-second deadline. A held slot reduces
-ordinary publication capacity, so publishing AcceptancePossible while holding
-it requires another ordinary slot. Settlement still uses independent capacity.
-
-The reservation borrows its original worker, connection configuration and
-pending-operation owner. An unresolved operation refuses reservation or
-consumption. Publication uses the same bounded native phase transaction and
-transfers an uncertain COMMIT request into Pending for historical settlement.
-No second pending queue is introduced. Abandoning an unused local allowance
-releases its connection slot but does not refund charged work or remove any
-durable reservation.
-
-This reserves connection/work capacity only. Bounded reply storage and native
-publication allocations remain separate, as do durable logical claims and live
-ownership. FinalWork does not authorize SMTP output, and a returned receipt
-may be historical. BodySent remains closed; this increment enables no scheduler
-or terminator handoff.
-
-## 144. Preallocated final-reply evidence
-
-An admitted relay worker can prepare a non-cloneable FinalReply before
-AcceptancePossible for an exact ordered subset of 1..100 recipients. It owns
-one 4096-byte reply buffer per recipient and both possible final-phase digest
-prefixes. Consuming it accepts only a normalized genuine 2xx, 4xx or 5xx final
-DATA reply, fills those existing buffers, and returns the ordinary immutable
-phase Change. Invalid ordinal sets, oversized/control-bearing replies and
-non-final reply classes refuse. It grants neither publication nor SMTP authority.
-
-Change now shares its private immutable fields through Arc. Native receipt
-inspection and publication clone that owner rather than allocate copies of the
-reply/ordinal vectors. The request digest format stays identical to ordinary
-accepted/refused construction, so either form settles or replays the other's
-receipt. DATA-command refusal still completes its private fields before
-exposing a Change; no shared fields can be mutated afterward.
-
-FinalReply finishing uses retained string capacities and inline SHA-256 states.
-It does not allocate new reply buffers or a new Change owner. Native database
-connections, commit markers and bounded SQL rows remain separate allocations;
-this does not promise allocation-free database publication or physical disk/WAL
-availability. The local FinalWork allowance, durable logical claim and live
-ownership are still separate prerequisites. BodySent remains closed and no
-scheduler or terminator path is enabled.
-
-## 145. New AcceptancePossible publication
-
-The native phase API and bounded publication worker expose publish_new_possible
-for phase 3 only. It refuses every existing matching receipt, both during the
-initial lookup and again under the publication transaction's account locks.
-This closes the race where a receipt appears between those checks. Ordinary
-publish and inspect retain historical idempotent settlement behavior. Wrong
-phases refuse, and differing request digests retain their existing conflict
-behavior. The actual new transaction uses the same policy/owner checks, exact
-subset validation, durable capacity claim and synchronous COMMIT path.
-
-The worker retains uncertain COMMIT in its existing Pending slot, using the
-same original deadlines and bounded work admission. Settling that request
-returns only historical evidence; a later new-publication call still refuses
-its receipt. No retry silently turns settlement into new publication.
-
-Known new publication is a prerequisite for future handoff construction, not
-SMTP permission by itself. Independent local work/reply capacity and current
-ownership remain required. No caller-provided Outcome can authorize output;
-BodySent remains closed and no scheduler or terminator path is enabled.
-
-## 146. Bound final-result custody
-
-The publication worker can reserve a non-cloneable FinalPlan that binds one
-exact attempt, owner/generation and ordered recipient subset to both FinalReply
-storage and FinalWork capacity. Its consuming publish_possible operation uses
-the new-only phase-3 path, retaining the local owner only after a known new
-commit. Existing receipts refuse; uncertain COMMIT transfers the exact phase
-request to Pending and releases local capacity. Settlement cannot manufacture
-a FinalResult. A second ordinary connection slot is needed during publication.
-
-FinalResult privately retains the original request, reply storage, work and
-passive receipt. Its consuming record operation accepts only actual normalized
-final DATA reply text; it constructs and publishes the result for the retained
-subset without a caller-supplied replacement Change, fresh slot or work charge.
-The original job/meter/ten-second reservation deadline caps phase publication
-and result consumption; later admission cannot extend it. Expiry after a known
-phase commit refuses the local owner and leaves durable recovery responsible
-for the unresolved phase. Dropping either owner releases local capacity only.
-
-This connects capacity and known publication, not transport authority. Live
-owner/queue-clock admission and custody of the matching SMTP body transaction
-remain required before terminator handoff. Passive outcomes cannot construct
-these private owners. BodySent remains closed and no scheduler is enabled.
-
-## 147. Queue-clock observation for new phase publication
-
-The bounded worker's new AcceptancePossible path observes authoritative
-PostgreSQL UTC through the process's persistent queue-clock Guard. It pairs
-each observation with the original runtime monotonic clock and ignores the
-adapter's wall time. It checks under the owner lock on admission and again
-immediately before COMMIT, requiring current ownership and an unexpired
-submission at the second check. A backward transaction-time observation also
-refuses. The same database-time admission helper serves initial attempt
-publication; its fresh/retry policy is unchanged.
-
-A clock hold, invalid sample or busy guard refuses the new phase. The SQL
-transaction rolls back recipients, sequence, receipt and durable capacity
-claim, but the process-local clock observation survives. Database time is
-observed before owner-clock/lease refusal, so a failed transaction cannot hide
-a discontinuity. Unknown COMMIT still transfers to Pending. Historical receipt
-inspection and ordinary publication remain historical paths, and duplicate
-new requests still refuse before obtaining any continuing authority.
-
-This is publication admission, not a live transport grant. The low-level
-unobserved phase API remains storage machinery; known new publication alone
-never permits SMTP output. Current ownership/clock validation and matching
-transport custody at actual handoff remain outstanding; BodySent stays closed.
-
-## 148. Live AcceptancePossible state checks
-
-A retained FinalResult can recheck its exact phase request through a bounded
-native transaction. It requires current policy and owner, the persistent queue
-clock, healthy/due route state, the exact receipt, an active matching attempt,
-an uncompleted/unexpired submission, the entire still-InFlight phase-3 subset,
-and its exact durable final-result reservation. Remaining Prepared recipients
-outside that subset are permitted; no other outside phase is. A historical receipt alone is
-insufficient. Account/configuration/owner locks end before the call returns;
-the operation changes no recipient, receipt, reservation or account sequence.
-
-The worker uses another ordinary connection slot and prepaid bounded work,
-while retaining its final-publication slot. Pending operations refuse the
-check. The original final-work deadline caps the operation. A final owner/clock
-observation also checks submission expiry and time regression. Its returned
-local limit starts before that database observation and subtracts one
-millisecond for timestamp rounding, then caps remaining lease/submission time
-by the original deadline. Database response latency cannot extend that limit.
-An expired response refuses rather than returning an already elapsed bound.
-
-The result is a passive observation, not a transferable SMTP grant. A paused
-worker or policy/takeover change can still race a later write as section 4
-explains. The future transport owner must call this path internally, retain the
-matching body transaction and final-result capacity, and abort on refusal;
-caller-supplied receipts or Instants cannot authorize terminator output.
-BodySent remains closed and no scheduler is enabled.
-
-## 149. Retained final-publication failures
-
-FinalResult recording returns a non-cloneable FinalFailure when publication
-fails. Once genuine normalized final reply text has been prepared, that failure
-retains the exact immutable Change and original FinalWork slot/deadline. A
-known database refusal no longer discards the actual reply or local capacity.
-Invalid reply preparation has no retained final evidence. Debug output exposes
-only the error, not reply text or connection credentials.
-
-An explicit retry prepays another bounded phase I/O/record allowance while
-using the held slot. It cannot replace the attempt, subset or reply, and its
-deadline can only shorten the original work limit. Budget, deadline and Pending
-refusals return the still-retained failure owner. There is no automatic retry
-or new job lifetime. Unknown COMMIT also keeps the exact request in Pending;
-that operation must settle historically before another publication can proceed.
-
-Success releases the local owner. Explicit drop abandons local custody and
-releases its slot; it neither consumes nor deletes the durable reservation.
-The bounded runtime must retain or settle its actual reply before dropping
-that responsibility, and recovery remains conservative after a crash. The
-low-level FinalWork consuming API remains storage machinery; future handoff
-uses the retained FinalResult failure path. No terminator API is opened here.
-
-## 150. Final DATA transport handoff
-
-The prepared PostgreSQL handoff consumes a non-cloneable FinalResult and the
-matching completed BodySent. Only known new AcceptancePossible publication
-can construct that result owner. The trusted runtime remains responsible for
-the immutable body source, actual 354, durable Body fence and matching attempt
-and recipient subset; BodySent alone proves encoding/flush, not those facts.
-This opens the previously closed terminator boundary through this owner only;
-no scheduler or production PostgreSQL backend is activated.
-
-BodySent retains its original clock and deadline. Handoff requires identity
-with the worker's runtime clock, keeps that body deadline and the original
-final-work Instant cap, and borrows separate wire and database work meters
-through completion. The command adapter privately frames exactly `.CRLF` into
-three reserved bytes and reuses the existing bounded write/flush/reply parser.
-Its public command enum still exposes no terminator or raw command.
-
-Before each terminator write or flush turn, the owner internally rechecks its
-exact live AcceptancePossible state. Each check charges bounded database work
-and uses a second ordinary slot while final-publication capacity stays held.
-The returned lease/submission cap can only shorten the retained local limit;
-original monotonic deadlines are checked before and after transport turns.
-A refused check aborts transport. Database locks never span network work, and
-section 4's pause/takeover and already-buffered-byte race remains explicit.
-
-After flush, only bounded reply reading remains. A complete actual 2xx, 4xx
-or 5xx reply is published through retained FinalResult capacity before reporting
-completion. Once the command owner returns a complete reply, later deadline
-expiry is handled by retained publication refusal; it cannot discard the reply. No later live-state check substitutes for collecting that reply.
-Non-final, malformed, truncated or out-of-budget replies refuse without an
-invented result. Publication failure returns FinalFailure with the exact
-reply and held slot, plus the closed transport buffers; unknown COMMIT also
-remains in Pending. Completion is a passive durable receipt and closed buffers,
-never a reusable session. Callers must retain/settle failed publication custody.
-
-Real paired-TLS tests cover exact terminator framing, fragmented final replies,
-publication ordering and retention, non-final/malformed/truncated refusal,
-live admission refusal, original work expiry, clock mismatch and exhausted
-wire capacity. The existing real PostgreSQL worker fixture independently
-qualifies native live checks and retained final-result publication/retry.
-
-## 151. Native final-handoff integration fixture
-
-The real PostgreSQL queue fixture drives fresh attempts through the public
-prepared relay components on paired verified TLS connections. It publishes
-Prepared before connecting, reads the matching envelope, performs EHLO and
-PLAIN authentication, and sends actual MAIL/RCPT/DATA commands. Actual positive
-RCPT evidence supplies the Body transition after 354. The immutable stored
-transmitted body is verified and streamed through BodyExchange under the same
-runtime clock and original attempt deadline.
-
-Final capacity is reserved before body handoff. Known new AcceptancePossible
-publication supplies FinalResult; the public final exchange sends the terminator
-and publishes the actual 250. The peer checks that PostgreSQL still records
-phase 3 when the terminator arrives, before sending its reply. The fixture
-requires exactly one terminator and inspects the matching durable final receipt.
-A second transaction injects a final-receipt INSERT refusal, retains the exact
-reply owner, removes the fixture fault and explicitly retries that publication.
-
-This qualifies composition of native phase/result ownership and real SMTP TLS
-transport. Fixture policy and credentials are prepared explicitly, and address
-selection uses a local socket pair. It does not qualify resolver/scheduler
-activation or switch the production backend. Existing isolated component tests
-cover the broader malformed reply, live refusal and uncertainty cases.
-
-## 152. Live Body storage validation
-
-The prepared phase API can publish a known new Body transition with the same
-persistent queue-clock observation used for AcceptancePossible: admission and
-pre-COMMIT checks both use database UTC paired with the runtime monotonic
-adapter. Existing receipts refuse the new-only path. Ordinary publication and
-inspection remain historical settlement, including after later phases.
-
-Live Body validation shares the bounded current-state reader with
-AcceptancePossible. It requires the exact receipt, active attempt and selected
-InFlight Body subset under current policy, owner, route-health and clock checks.
-The retained positive RCPT text must match each selected recipient's stored
-reply through the SHA-256 witness specified in section 179; data replies are
-absent and changed sequences equal the Body receipt.
-Prepared recipients outside the selected subset remain permitted. Durable final
-capacity is required only for AcceptancePossible, where it is reserved.
-
-The returned local deadline conservatively bounds the current owner lease and
-submission expiry without extending the input limit. All locks end before
-return; validation neither mutates queue state nor grants lasting SMTP
-authority. The trusted caller still owns actual 354, the matching immutable
-source, original transport deadlines and validation before body output. This
-storage increment does not wire a body transport owner or activate a scheduler.
-Section 4's pause/takeover and already-buffered-byte limitation remains.
-
-The real PostgreSQL fixture exercises both phase readers and clock-observed
-publication paths, including clock jumps before and after staging, adapter
-failure, persistent holds, wrong-phase and duplicate refusal, missing receipts,
-changed policy/owner/health/expiry, and exact Body RCPT mismatch. Historical
-Body receipt replay and final-capacity checks retain their existing coverage.
-
-## 153. Bounded Body publication ownership
-
-The prepared dispatch worker constructs a non-cloneable BodyResult only after
-known new clock-observed Body publication. Its immutable change binds the exact
-attempt, owner generation, subset and actual RCPT replies. Publication prepays
-the bounded phase allowance and acquires one ordinary slot; the owner retains
-the original earliest job/meter/ten-second Instant limit, not that slot.
-Unknown COMMIT keeps the exact change in the shared Pending barrier and returns
-no BodyResult. Historical settlement cannot reconstruct one, and duplicate
-new-only publication refuses even after settlement or explicit owner drop.
-
-Each current-state check independently prepays the Body-check allowance in
-section 179, acquires an ordinary slot, checks Pending and uses the native live
-Body reader. The shared
-admission helper also serves FinalResult without changing its retained final
-capacity. No fresh meter or later lease renewal can extend the original owner
-limit. A later phase refuses Body validation. Dropping an owner releases local
-custody only; it does not alter durable phase or recovery state.
-
-The real PostgreSQL worker cases cover mode, budget, slot and deadline refusal,
-exact charging, known new ownership, original expiry, unknown COMMIT retention,
-historical settlement and duplicate refusal. The paired SMTP TLS fixture uses
-BodyResult after actual 354 and validates it before the immutable body transfer;
-after AcceptancePossible it requires Body validation to refuse. This is an
-initial caller check, not yet a body transport owner enforcing every write or
-flush. Actual source matching, repeated transport fencing and scheduler/backend
-activation remain separate work.
-
-## 154. Final capacity derived from Body custody
-
-BodyResult can be consumed into a non-cloneable BodyPlan that pairs its exact
-Body operation with final-result capacity. The phase-3 change and preallocated
-final reply derive internally from that Body change's claim, generation,
-attempt and ordered recipient subset; the caller supplies no replacement
-identity or subset. Reservation uses the same worker, original input deadline
-and earliest retained Body limit, further shortened by reservation admission.
-
-BodyPlan keeps one ordinary slot for final publication while every live Body
-check acquires another and prepays its own bounded work. Its checks use the
-combined limit, so a new meter cannot extend either original Body ownership or
-a shorter reservation bound. Drop or refusal releases only local capacity.
-After the matching body is transferred, consuming the plan publishes known new
-AcceptancePossible through the existing FinalPlan path. Uncertainty remains in
-Pending and yields no FinalResult; historical settlement grants no new owner.
-
-The caller still owns actual 354, immutable source matching, body completion
-and checks before each transport write or flush. This binds the two storage
-owners; it does not yet implement the body transport wrapper or activate the
-scheduler. Existing low-level trusted APIs remain available as storage and
-protocol machinery.
-
-The real PostgreSQL worker fixture checks held-slot exclusion, inherited Body
-expiry despite a fresh meter, refusal to publish after expiry, and slot release.
-The native paired-TLS fixture derives final capacity from BodyResult, refuses
-live checks while the remaining ordinary slot is occupied, then checks Body,
-streams its immutable bytes and completes the same retained final handoff.
-
-## 155. Native Body transport handoff
-
-The prepared PostgreSQL body wrapper consumes BodyPlan, an authenticated
-session and the matching admitted immutable source. It constructs the bounded
-body encoder with the owner's runtime clock and original deadline, borrowing
-separate wire and database meters. The trusted caller still owns actual 354,
-compatible MAIL mode and source/session matching. This activates no scheduler
-or production backend.
-
-Before each body write or flush turn, the wrapper internally checks the exact
-live Body state through the reserved plan. Section 181's retained owner
-prepays its finite check allowance and holds a second ordinary slot while
-final capacity stays held; individual turns spend prepaid credits. The returned
-lease/submission bound only shortens its local cap. Original Instant limits
-are checked before and after every transfer turn. Refusal closes
-the transport and releases local ownership. Locks do not span network work;
-section 4's pause/takeover and buffered-byte limitation remains unchanged.
-
-After all declared bytes are encoded and flushed, the wrapper internally
-publishes known new AcceptancePossible using the matching reserved plan.
-Publication refusal closes the transport; unknown COMMIT remains in Pending
-and yields no final owner. Known success returns a non-separable completed-body
-and FinalResult pair. That pair can start the existing final handoff or close
-its transport; callers cannot substitute a different body or result owner.
-No terminator is emitted by the body wrapper itself.
-
-Paired-TLS tests check admission before every write/flush, exact transparency
-without a terminator, refusal before any output, shortened expiry, malformed
-body input and failed possible publication. The full native PostgreSQL/TLS
-fixture now uses the wrapper through actual final-result publication and
-retained-reply retry. These are bounded correctness cases, not maximum-size
-throughput qualification. Full live checks reread selected reply witnesses
-per write/flush through the prepaid retained connection in section 181. Their
-cumulative cost must fit its finite allowance and the original deadline.
-Large-body throughput requires explicit qualification before activation.
-
-## 156. Observed Prepared-envelope admission
-
-The native observed-envelope reader shares the untouched Prepared validation
-with the passive envelope reader. Retried Prepared rows retain the previous
-attempt's replies as required by [Due-retry publication](#due-retry-publication); neither reader treats those
-historical replies as progress in the new attempt. It additionally observes database UTC through
-the caller's shared queue-clock guard before reading the envelope and again
-under the final owner check. Clock failure, a discontinuity or a retained hold
-refuses; failed transactions do not roll back the process guard. Fresh route
-health admission refuses backoff and repair holds.
-
-The returned Instant is the minimum of the caller's original limit and the
-remaining owner lease/submission lifetime measured from the start of the final
-owner query, discarding one millisecond for database timestamp rounding. A
-backwards final timestamp, exhausted lifetime or expired returned bound refuses.
-The reader changes no durable queue state, and all database locks end before
-return. The envelope and deadline are passive observations: historical receipts
-cannot reconstruct transport ownership. A bounded Prepared worker owner and
-SMTP envelope orchestration remain separate work; no scheduler is activated.
-
-Real PostgreSQL cases cover both clock observations, persistent holds, failed
-clock adapters, guard contention, route backoff and repair, original deadline
-and submission-expiry caps, unchanged account sequence, malformed envelope
-rows, partial RCPT publication, advancement to Body and valid retry envelopes
-that retain previous replies.
-
-## 157. Bounded Prepared publication custody
-
-The worker can publish a Prepared attempt through a new-only path and retain a
-non-cloneable PreparedResult only after a known new commit. Both the initial
-receipt lookup and the locked recheck refuse historical replay on this path.
-The original historical publication API remains passive. Unknown COMMIT keeps
-the exact Dispatch in the shared Pending barrier and returns no owner;
-settlement cannot construct one.
-
-PreparedResult retains the worker, exact publication and earliest original
-job/meter/ten-second Instant cap. It exposes passive identity/outcome references
-and a bounded observed-envelope read. Each read checks Pending and original
-expiry, prepays the attempt allowance and acquires an ordinary slot, then uses
-the native observed reader with the retained cap. A new meter or lease renewal
-cannot extend the original bound. No slot or database lock remains held after
-the read. Drop releases local custody only.
-
-The returned envelope and conservative deadline are still passive evidence.
-SMTP envelope orchestration must retain its minimum bound and carry the
-original job limit into later Body custody; this increment does not compose
-that transport owner or activate a scheduler. Trusted low-level phase APIs
-remain separate.
-
-Native worker cases cover runtime mode, budgets, slots, exact read charging,
-original expiry despite a fresh meter, Pending exclusion, uncertain commit
-retention and historical settlement. Storage cases require new-only replay to
-refuse while historical publication still returns the exact receipt.
-
-## 158. Prepared-to-Body deadline and identity continuity
-
-A PreparedResult can be consumed after actual 354 to publish Body for its own
-claim, generation and attempt. The caller supplies only the actual accepted
-RCPT replies; the native phase transaction still validates their ordered
-subset against the original batch. The worker clamps publication itself to
-the retained Prepared Instant limit and original input deadline, and any new
-BodyResult retains that same combined bound. Entering DATA cannot refresh the
-job allowance. The final reservation and body/final transport wrappers already
-carry that bound onward.
-
-Known new Body publication returns BodyResult and the matching passive
-Dispatch for immutable body reading. An error returns no Body owner; uncertain
-COMMIT retains the exact phase operation in Pending. The caller still owns
-actual SMTP evidence, the matching source/session and minimum observed lease
-bounds during earlier envelope transport. This does not implement that
-transport orchestration or activate a scheduler.
-
-The native TLS fixture uses this handoff after actual 354 and checks that Body
-admission never exceeds the earlier Prepared bound even when the supplied
-wire/input deadline is longer. It then transfers the verified immutable body
-and exercises actual final publication and retained-reply retry. Worker tests
-also require the handoff to refuse an expired Prepared owner despite a fresh
-meter.
-
-## 159. Retained initial envelope and minimum observed cap
-
-Consuming PreparedResult through initial envelope admission produces a
-non-cloneable EnvelopePlan. It pairs that exact bounded envelope with the
-Prepared owner and clamps the owner's limit to the returned native lease,
-submission and work bound. The public envelope view is borrowed passive data;
-callers cannot replace the stored envelope or construct a plan from a receipt.
-
-A subsequent untouched-envelope check charges and reads through the same
-native path, requires the complete envelope to equal the retained one, and
-only shortens the stored limit. A new meter or renewed lease cannot enlarge
-that minimum. Consuming the plan into Body carries this bound through the
-existing Prepared handoff and final-result chain.
-
-These checks apply while all original recipients remain untouched Prepared.
-They do not reconstruct an envelope after partial RCPT publication, implement
-SMTP command sequencing or prove actual 354. Those transport duties remain
-with the caller until native envelope orchestration is composed. No scheduler
-or production backend is activated.
-
-Native worker tests cover identity substitution refusal and retention of the
-original view, a shortened observation followed by a longer fresh meter,
-capacity/slot/Pending refusal and expiry. The real SMTP/TLS fixture uses the
-retained envelope for MAIL/RCPT and consumes the plan after actual 354 before
-running the existing Body and final-result wrappers.
-
-## 160. Reserved negative envelope-command reply storage
-
-CommandReply reserves bounded normalized-reply cells and hash contexts before
-MAIL or DATA-command transmission. The MAIL reservation fixes the complete
-Prepared ordinal batch; the DATA reservation fixes the actually accepted
-RCPT subset and retains its positive replies. Finishing consumes only an
-actual normalized 4xx/5xx reply, fills the existing cells and preserves the
-existing command-receipt digest. Positive or interim replies cannot become
-negative evidence. Identity, command stage and subset cannot be replaced at
-finish. At most 100 recipients and 4096 bytes per reply remain the bounds.
-
-These objects contain passive evidence storage, not live Prepared custody,
-transport permission, database capacity or a publication retry owner. They
-are preparation for envelope orchestration: callers still reserve database
-work and retain the resulting Change across failed publication. Native SQL
-allocation remains separate. No scheduler or backend is activated.
-
-The native command fixture exercises both reply classes at both command
-stages through these reservations, with maximum-sized distinct RCPT replies
-and message refusals, partial DATA subsets, stale ownership, transaction
-failure and uncertain COMMIT. Inspection through the legacy constructors
-must find the same receipt, pinning digest compatibility.
-
-## 161. Bound MAIL evidence and retained publication failures
-
-EnvelopePlan can reserve a non-cloneable MailPlan before MAIL transmission.
-The reservation derives the complete Prepared ordinal batch, attempt and
-owner generation from retained publication custody. It pairs the envelope
-with CommandReply storage and exposes the same bounded untouched-envelope
-checks. A normalized actual positive MAIL reply consumes the reservation
-back into the original envelope owner without extending its deadline.
-
-A genuine normalized negative MAIL reply first fills the retained evidence,
-then attempts ordinary bounded native publication. Every admission or database
-failure after preparation returns CommandFailure holding the exact immutable
-Change, original worker and minimum deadline. Invalid reply preparation has
-no retained evidence. Debug output exposes the error only. Explicit retry
-prepays fresh work and acquires an ordinary slot; an admitted shorter meter
-shortens the retained limit even if publication fails. No deadline can renew.
-Unknown COMMIT also remains in the worker's existing Pending owner and must
-settle before another publication attempt. The failed owner adds no second
-pending queue or held connection slot.
-
-These owners do not send SMTP or prove that supplied replies came from their
-session. The caller still owns actual MAIL sequencing, fresh checks before
-output, compatible body mode and connection closure on refusal. Dropping
-CommandFailure abandons local evidence, not durable queue responsibility;
-the runtime must retain or settle it. No scheduler or backend is activated.
-
-The native SMTP/TLS fixture consumes actual positive MAIL before its existing
-Body/final path. A real negative MAIL reply survives a transaction refusal,
-empty retry budget and occupied slots before successful publication with the
-same receipt. A separately shortened owner retains an actual negative reply
-after expiry and refuses revival by a fresh meter.
-
-## 162. Bound DATA-command result alternatives
-
-EnvelopePlan can reserve a non-cloneable DataPlan for a nonempty ordered
-subset of its admitted recipients and their actual positive RCPT replies.
-Recipients outside the retained envelope refuse before DATA. Construction
-prepares both the exact Body request and negative DATA-command reply storage
-under the retained claim, generation and attempt; no later recipient list or
-RCPT text can replace them. The existing untouched-envelope checks retain the
-minimum original bound through this owner.
-
-Only an actual normalized 354 consumes the plan into new clock-observed Body
-publication. The private Prepared handoff uses the already retained Change,
-preserving all existing deadline, novelty, Pending and live-phase checks.
-A genuine normalized 4xx/5xx instead fills the reserved refusal evidence and
-uses CommandFailure to retain it across failed publication or retry. Both
-paths keep the original identity and deadline; neither admits new SMTP work
-from a historical receipt.
-
-This owner still relies on the caller for actual DATA sequencing, matching
-session, fresh pre-output checks and connection closure on refusal. Negative
-RCPT publication ordering remains an envelope-orchestration responsibility;
-untouched-envelope checks cannot reconstruct a partially progressed batch.
-No scheduler or production backend is activated.
-
-The native SMTP/TLS fixture publishes Body from actual 354 through DataPlan,
-retains an actual negative DATA reply across database refusal and retry,
-refuses a recipient outside the retained envelope before DATA, and rejects
-an actual non-354 reply without publishing Body.
-
-## 163. Reserved per-recipient SMTP evidence
-
-RcptReplies reserves one maximum normalized reply cell for each ordered
-recipient in an initial attempt batch, at most 100. It retains the exact
-claim, generation, attempt and ordinal sequence. Recording accepts only the
-next ordinal and an actual normalized 2xx/4xx/5xx reply, moving a reserved cell
-into positive or negative storage without a new reply allocation. Invalid
-input leaves the next ordinal and all earlier evidence unchanged.
-
-Consuming finish closes collection and reports whether every planned RCPT
-received a reply. It exposes retained positive evidence and, when any negative
-replies were collected, one immutable ordinary RCPT-refusal Change with the
-existing digest encoding. A partial collection is usable only after the
-caller has fenced its interrupted session; publication cannot be followed by
-more RCPT commands for that attempt because there is only one refusal receipt.
-No positive-RCPT persistence, transport permission, database admission, or
-phase owner is created by this passive collector. The orchestration of
-interruption and positive-reply persistence remains separate work.
-
-The native PostgreSQL fixture uses the collector for mixed and all-negative
-batches, including 100 maximum-size distinct replies, and compares publication
-receipts against the existing constructor. It exercises invalid input without
-losing earlier evidence, partial collections, all-positive collections, and
-continues the positive subset through Body using its retained actual text.
-
-## 164. Positive RCPT evidence on current-owner interruption
-
-Current-owner recovery can retain an ordered subset of actual positive RCPT
-replies that has not yet reached Body. interrupted_with_rcpt binds at most
-100 normalized 4096-byte replies to the exact retained recovery operation;
-a domain-separated digest includes their ordinals and text. The existing
-no-evidence interruption and abandoned-recovery encodings stay unchanged.
-
-Publication requires every supplied recipient to remain InFlight/Prepared
-under the current attempt and owner fence. A foreign, settled, Body or
-AcceptancePossible recipient refuses the whole operation. Within the existing
-atomic recovery transaction, supplied positive replies replace prior RCPT
-history and clear prior DATA history before the ordinary interruption state
-transition. Other recipients retain their recorded evidence, and earlier
-uncertainty remains latched. This cannot establish Body or authorize new SMTP
-output: the caller must first close or fence the interrupted session.
-
-The publisher uses the existing bounded batch client so 100 maximum-size
-reply parameters fit within its one-MiB output allowance. Input remains one
-MiB/1088 frames and the original ten-second deadline cannot renew. Existing
-replay, expiry hold, receipt capacity, sequence and unknown-COMMIT rules apply.
-
-The real PostgreSQL fixture covers partial evidence with untouched history,
-refusal of replacing Body/Possible replies, maximum-size old and new reply
-cells, stale/foreign/invalid input, expiry hold, rollback, delayed-COMMIT
-settlement, exact replay and preservation of earlier uncertainty.
-
-## 165. Bounded recovery publication and settlement custody
-
-Dispatches accepts a retained recovery operation only after the caller has
-closed or fenced the affected transport. It prepays ordinary PHASE_IO work
-and 4096 records under the supplied job/meter deadline, acquires an ordinary
-slot, and publishes through the native recovery transaction. Known success
-returns only a passive receipt. A known failure releases Pending; the caller
-retains an operation clone for explicit retry.
-
-Unknown COMMIT leaves the exact recovery operation in the same single Pending
-owner used by dispatch, phase and route-failure publication (section 184).
-All new dispatch, phase, recovery, route-failure and final-capacity work
-stays blocked. Settlement prepays fresh work
-and uses the caller's independent settlement slots to inspect that exact
-receipt; an error retains custody, and a found receipt or proven absence
-clears it. Settlement never republishes or creates continuing SMTP authority.
-
-Absence is proof because of lock order. Every publication this barrier holds
-(attempt, phase, recovery, route failure, route acquisition, expiry) takes the
-account row FOR UPDATE before it writes its receipt and sends COMMIT, and
-every inspection takes that row FOR SHARE before it reads the receipt under a
-fresh READ COMMITTED snapshot. Settlement starts only after the uncertain call
-returned, so its share lock waits until the uncertain transaction committed or
-rolled back, and a missing receipt then means it rolled back; a receipt kind
-with bounded retention ([Route-owner acquisition receipt
-retention](#route-owner-acquisition-receipt-retention), [Expiry receipt
-retention](#expiry-receipt-retention), [Route-health receipt retention and the
-lease window](#route-health-receipt-retention-and-the-lease-window) and
-[Reclamation of retired attempts](#reclamation-of-retired-attempts)) can also
-read absent once it expired. Either way the operation is not retained, and
-holding the barrier would only wedge the worker while it keeps renewing its
-lease. The caller then publishes the same passive change afresh, under the
-same fences as any first publication, or rederives from durable state: the
-scheduler's next turn finds a committed attempt through active-attempt
-discovery and otherwise dispatches anew. The relay's route success and repair
-loop treats absence the same way.
-
-The fixed HTTPS worker's owners obey the same order and treat absence the
-same way: Email update, deletion and filing, folder, draft, upload,
-submission and cancellation ([Email keyword and mailbox updates](#email-keyword-and-mailbox-updates), [Expired upload lease reclamation](#expired-upload-lease-reclamation), [Plain-text draft creation](#plain-text-draft-creation), [Root-folder creation](#root-folder-creation), [Email deletion](#email-deletion), [Submission publication](#submission-publication), [Success filing after submission](#success-filing-after-submission) and [Whole-submission cancellation publication](#whole-submission-cancellation-publication)).
-Each retains an uncertain operation with the endpoint its COMMIT went to
-and inspects only there, never resolving again or falling back, because
-the share lock proves nothing on another server. Within the account and
-time limits of [Uncertain HTTP writes and inline settlement](#uncertain-http-writes-and-inline-settlement), a new write inspects the retained operation.
-A found receipt or absence releases it. Only publication in the same family
-sweeps expired receipts ([Receipt retention for HTTP writes](#receipt-retention-for-http-writes)).
-
-Once released, the family is no longer fenced, and the server does not
-deduplicate a second draft or submission of the same Email. A client whose
-create response was lost must therefore reconcile before retrying, as
-td-mail does for submissions by querying its identity and sendAt interval
-(DESIGN.md). Loss of the old endpoint can delay another write to the same
-account during the one-minute inspection window. Releasing the local
-slot leaves the original result indeterminate.
-
-The proof needs four things this design must keep: every publisher of these
-kinds locks the account row FOR UPDATE before COMMIT and every inspector locks
-it FOR SHARE before reading the receipt; lock and statement timeouts surface
-as errors, which retain custody; all of them use the single pinned primary,
-and an HTTP owner inspects only the endpoint it published to; and no path
-deletes such a receipt while its operation can still be pending, beyond the
-bounded sweeps of [Route-owner acquisition receipt
-retention](#route-owner-acquisition-receipt-retention), [Fenced expiry
-publication](#fenced-expiry-publication), [Route failure
-publication](#route-failure-publication), [Retention of settled
-submissions](#retention-of-settled-submissions) and [Reclamation of retired
-attempts](#reclamation-of-retired-attempts) and the HTTP families' sweeps by
-another instance serving the same account ([Receipt retention for HTTP
-writes](#receipt-retention-for-http-writes)). Any further sweep of attempt,
-phase, recovery, expiry or HTTP-family receipts must respect that.
-
-This is a bounded settlement job, not a renewal of any expired transport owner.
-No production scheduler or backend is activated.
-
-The real PostgreSQL fixture checks runtime mode, budget/deadline/slot refusal,
-exact work charging, known rollback and retry, delayed COMMIT, blocked new
-work and historical settlement while ordinary capacity is occupied. It
-verifies preserved positive replies, attempt retirement, and an unchanged
-account sequence during receipt inspection.
-
-## 166. RCPT collection bound to admitted envelope custody
-
-EnvelopePlan reserves RcptPlan from its own complete admitted ordinal batch,
-claim, generation and attempt. The plan exposes only the next retained
-recipient, records ordered actual replies through RcptReplies, and performs
-fresh untouched-envelope checks while retaining the original minimum cap.
-Actual command sequencing, session matching and pre-output checks remain
-caller responsibilities.
-
-Finishing pairs passive evidence with that same envelope owner. Only a
-complete collection with at least one accepted recipient can reserve DATA;
-it derives both DATA alternatives from retained positive replies and returns
-any exact negative-RCPT Change alongside the DataPlan. The original cap follows
-DATA custody. A planning failure retains the complete RcptResult so invalid
-partial/all-negative choices or allocation failures do not discard replies.
-
-After closing or fencing the matching session, consuming interruption planning
-instead returns the exact negative refusal and, when recipients remain, a
-current-owner recovery request carrying retained positive replies. A complete
-all-refused batch needs only its refusal, which retires the attempt. Partial
-collections cannot create DATA custody. These are passive settlement requests,
-not a renewal of transport ownership.
-
-The caller publishes negative RCPT evidence before Body, DATA refusal or
-interruption recovery, stops on unknown COMMIT, and retains actual DATA replies
-across any failed negative-RCPT publication. Untouched-envelope current checks
-remain invalid after partial publication. These planning helpers do not perform
-SMTP orchestration or activate a production scheduler/backend.
-
-The paired SMTP/TLS fixture uses the bound collector and retained positives
-for DATA, exercises mixed acceptance/refusal through final handoff, settles an
-all-refused batch without DATA, and interrupts after one positive reply while
-preserving its evidence. Failed DATA planning retains both partial and
-all-negative results for their correct settlement.
-
-## 167. Negative DATA custody across RCPT-refusal publication
-
-RcptDataPlan can capture an actual negative DATA reply into its preallocated
-command cells before either database operation is admitted. Private fields
-prevent substituting either half of the pair; explicit into_parts retains the
-existing caller-managed path and its evidence/order obligations. The caller fences
-the matching SMTP session first. It then publishes any negative RCPT subset
-before the negative DATA result. Both exact operations stay together on a
-known failure; a successful RCPT publication is removed from the retained
-sequence. Unknown COMMIT stays in the existing Pending owner and blocks retry
-until inspection settles it. Receipt replay can only continue passive result
-publication, never SMTP output.
-
-Retries retain the original identity, actual replies and minimum admitted
-limit across both steps. An empty budget, occupied slot or expired deadline
-preserves that custody and cannot renew the cap. This is not post-expiry
-settlement or general SMTP orchestration; no backend is activated. Existing
-low-level paths retain their explicit caller responsibilities.
-
-The native paired TLS fixture captures a mixed RCPT/negative-DATA exchange,
-forces rollback at either publication, checks intermediate state and retained
-identity, refuses retry with an empty budget, and then verifies both exact
-results and attempt retirement.
-
-## 168. Passive command evidence after bounded retry custody
-
-CommandFailure and RcptCommandFailure may consume their retained actual
-negative command evidence into immutable passive Change requests after the
-matching SMTP session is closed or fenced. The paired form preserves any
-unpublished negative RCPT step before its exact DATA-command result. Invalid
-input that never created retained evidence yields None. Extraction allocates
-no reply storage and carries no transport owner, connection permit or deadline.
-
-Original command retries still cannot renew their earliest admitted cap.
-Separate settlement explicitly admits fresh bounded database work through the
-same Dispatches/Pending owner and publishes the preceding refusal first. An
-unresolved COMMIT continues to block publication until exact receipt inspection;
-extraction neither clears Pending nor declares an uncertain operation absent.
-Native publication still verifies current durable ownership and phase, or an
-exact retained receipt. Expired route ownership, replacement, cancellation and
-receipt-retention expiry are not bypassed. This separates a local SMTP work
-cap from passive database settlement; it never revives SMTP output permission.
-
-The real TLS/PostgreSQL fixture verifies expired MAIL refusal and mixed DATA
-refusals whose preceding RCPT step either failed or committed. Normal retries
-remain expired despite a fresh meter; extracted evidence then settles through
-fresh database admission and produces exact stored replies and retired attempts.
-A delayed RCPT COMMIT case additionally extracts the pair while Pending is
-occupied, verifies that command publication stays blocked, inspects the exact
-receipt through an independent settlement slot, and only then replays the
-passive refusal and publishes the retained DATA result.
-
-## 169. Interrupted Body publication with exact RCPT evidence
-
-A separately domain-separated interrupted_with_body_rcpt request handles a
-fenced session whose Body publication may have completed. It retains the same
-bounded ordered actual-positive subset as interrupted_with_rcpt. Under current
-ownership and recipient locks, each supplied member must be Prepared or Body.
-Prepared members receive the retained actual RCPT and clear prior DATA;
-already-Body members must already contain byte-identical RCPT evidence and no
-DATA reply, and are not rewritten. Supplied AcceptancePossible, mismatching,
-foreign or settled members refuse. Existing interrupted_with_rcpt remains
-Prepared-only; its digest and ordinary recovery encodings are unchanged.
-
-The request then applies ordinary interrupted recovery atomically with its
-receipt, preserving uncertainty and existing retry/expiry rules. It does not
-infer a missing COMMIT: the bounded worker still blocks on Pending until exact
-receipt inspection. This supplies passive evidence settlement before or after
-Body without manufacturing a transport owner from history.
-
-Native fixtures cover an entirely Body positive subset, mixed Body/Prepared
-members, mismatching replies, AcceptancePossible refusal, expiry hold, rollback
-of replies and sequence, delayed COMMIT inspection/replay, and attempt retirement.
-
-## 170. Positive DATA handoff retains failed publication evidence
-
-RcptDataPlan reserves its boxed DATA owner before the command. After actual
-normalized 354, its bound handoff publishes any negative RCPT subset first and
-then only a new observed Body transition, with the original minimum cap. Only
-known new publication before that cap yields BodyResult and the matching
-immutable-body request. Historical receipts never create output custody.
-
-Every failure retains the exact plan and its actual positive replies, plus any
-RCPT refusal not known committed. The caller closes or fences the SMTP session.
-The failure exposes no transport retry or owner extraction; it can only plan
-passive interruption using interrupted_with_body_rcpt. Allocation or validation
-failure preserves that custody. The recovery handles Prepared members or exact
-already-Body evidence after a known or uncertain publication; Pending still
-blocks all publication until exact unknown-COMMIT inspection. Negative RCPT
-settlement precedes recovery. No result reconstruction permits output.
-
-The paired TLS/PostgreSQL fixture uses this handoff for mixed successful DATA,
-forces known failure at either publication and delayed Body COMMIT, then fences
-the session and verifies retained actual replies and complete retirement through
-passive recovery. Production scheduling and backend activation remain deferred.
-
-## 171. Passive final DATA evidence after local reservation expiry
-
-FinalFailure may consume its retained genuine final DATA Change after transport
-has closed. Extraction moves existing immutable evidence and releases the held
-local connection permit; it neither releases the durable final-result claim nor
-clears Pending. Invalid reply input that never created retained evidence yields
-None. The value conveys no SMTP session, output owner, work allowance or deadline.
-
-Bounded retry still refuses renewal of its original cap. Separate passive
-publication must prepay fresh ordinary work and obtain a slot through the same
-Dispatches/Pending owner. Uncertain COMMIT blocks until independent receipt
-inspection, and durable ownership, phase, receipt and final-capacity checks still
-apply. A retained receipt is historical only. Confirmed result publication or
-ordinary durable recovery consumes the final claim, never evidence extraction.
-
-The native SMTP/TLS fixture forces final-result rollback, expires its retained
-retry cap, verifies that extraction frees the local slot while preserving exact
-evidence, and settles through fresh admission. A delayed-COMMIT retry additionally
-keeps Pending occupied across extraction and requires independent inspection
-before exact historical replay.
-
-## 172. Bound native MAIL exchange
-
-postgres_relay_mail binds a reserved MailPlan to one authenticated relay
-Session for the duration of MAIL. Before command construction it requires the
-session's policy identity to match the TLS generation prepared with the
-attempt's private selected-profile binding (section 183). The adapter selects
-the exact admitted reverse path, runtime clock and original deadline. SevenBit
-frames MAIL FROM; EightBit frames
-BODY=8BITMIME only when the session retained the negotiated capability. It
-borrows the caller's original wire and database meters through the exchange.
-
-Every write and flush turn first rechecks the exact untouched Prepared envelope
-through the original owner. Its local cap may only shorten. Database locks
-never span transport calls. Direct low-level plans close each observation
-connection; configured attempts retain the admitted validator in section 188.
-Each turn uses the existing bounded
-command parser and wire budget; before/after transport checks remain in force.
-The pause/takeover and already-buffered-byte boundary in section 4 is unchanged.
-
-An actual normalized 2xx reply returns the same session, original envelope and
-MAIL mode together. Only the internal RCPT adapter can split this owner;
-external callers continue through the typed RCPT entry or close transport.
-Fresh checks remain required before each command.
-An actual 4xx/5xx reply enters the preallocated negative MAIL publication before
-any further database admission. Known failure retains exact CommandFailure;
-unknown COMMIT also stays in Pending. Rejection, protocol/admission failure and
-publication failure close transport and return its buffers. Other reply classes
-refuse without invented evidence. No returned durable receipt is a live owner.
-
-The real PostgreSQL/TLS fixture exercises exact sender framing, positive MAIL,
-durable negative MAIL, negative-publication rollback and retained retry, occupied
-connection slots and changed envelope identity before output, expired local custody, unadvertised EightBit,
-and a non-final reply class. Interrupted Prepared attempts are recovered only
-after transport closes. This adapter does not activate production dispatch or
-claim complete envelope orchestration or maximum-message throughput.
-
-## 173. Ordered RCPT exchange from successful MAIL
-
-postgres_relay_rcpt begins only from the bound MAIL Accepted owner. It reserves
-all maximum reply cells before the first RCPT, derives each address and ordinal
-from the admitted batch, and keeps the same session and MAIL mode. Every command
-borrows fresh scratch cells and the caller's wire/database meters. A returned
-Cursor permits only the next exact recipient; no separate session, recipient
-address or replacement identity enters this path. Original clock/deadline and
-the shortest admitted local cap survive between commands.
-
-Every write/flush turn rechecks the untouched Prepared envelope before output.
-No negative RCPT publication occurs while collection continues. Complete actual
-2xx/4xx/5xx replies returned by the command parser enter reserved ordered storage before checking whether the
-local cap permits continuation. A wire, current-state, deadline or parser
-failure closes transport and finishes the earlier collection into passive
-RcptResult evidence; a finish-time crypto/integrity error is reported separately
-instead of inventing evidence. Explicit Cursor/Exchange closure follows the
-same fence-before-interruption order. A failed initial reservation closes MAIL
-transport without inventing any RCPT reply.
-
-An actual 421 is retained and closes immediately, even on the last RCPT
-after earlier positive replies; it never returns another command or DATA
-owner (RFC 5321 sections 3.8 and 4.2.2). Complete all-negative collection
-closes automatically and returns passive
-results for ordinary negative publication, with no DATA session. A complete
-batch with positives retains its exact RcptResult, same session and mode; the
-internal DATA stage must reserve its alternatives and check authority before
-output. Its split is crate-private; external callers use the typed DATA
-continuation. Completed.close fences and retains evidence for passive interruption. Fresh passive settlement must
-publish collected negatives before recovery through the same Pending owner.
-Neither receipt nor collected reply evidence reconstructs output authority.
-
-Native PostgreSQL/TLS cases cover mixed and all-negative batches, closure after
-a positive or negative first reply, invalid next reply, occupied slots and
-changed envelope identity before the next command, and original cap expiry
-between commands, plus intermediate/final 421 shutdown. They verify exact
-commands, no further output on admission
-refusal, retained reply texts and fenced recovery. Production dispatch, DATA
-orchestration and maximum-message throughput remain separate work.
-
-## 174. Bound DATA exchange after complete ordered RCPT
-
-postgres_relay_data begins only from postgres_relay_rcpt::Completed, preserving
-the same authenticated session and MAIL mode. It reserves the bound DATA
-alternatives before command output and keeps the original runtime clock,
-deadline and shrinking cap. Each write/flush turn rechecks the untouched
-Prepared envelope; preceding negative RCPT replies remain unpublished until
-actual DATA completion. Existing bounded parser and work-meter checks apply.
-
-An actual complete 354 returned by the command parser enters ordered negative
-RCPT publication and new observed Body publication through RcptDataPlan. Only
-known new observed Body before the retained cap returns BodyResult, matching
-Dispatch, same session and mode. Historical receipts or uncertain commits never
-construct this handoff. Its consuming reserve_body operation binds final
-capacity before BodyReady begins transfer with the same session and MAIL mode.
-BodyReady binds matching immutable source admission as specified in section 182.
-No body bytes or terminator are sent by this command adapter.
-
-An actual negative DATA reply fences the socket before settlement while keeping
-the parser's existing normalized reply storage readable. A crate-private abort
-on command Reply provides this ordering without a reply copy. Ordered refusal
-publication retains the exact RcptCommandFailure on failure. Other reply classes,
-wire failure, stale authority, deadline or capacity refusal close transport and
-retain the bound RCPT plan as passive RcptBodyFailure for interruption planning.
-Initial reservation failure closes and preserves RcptFailure. No refusal returns
-a live session; unknown COMMIT remains in Pending, and passive settlement uses
-its existing ordered publication and independent inspection rules.
-
-Native PostgreSQL/TLS fixtures drive actual bound MAIL and mixed RCPT into DATA.
-They cover known new Body with matching final-capacity reservation, permanent
-and 421 temporary DATA rejection, rollback at negative RCPT/Body/DATA publication,
-slot refusal before DATA output, and an invalid positive DATA status. Each path
-verifies exact reply persistence and retirement after transport closure. Shared
-RCPT fixture drivers are used by both adapters. Full body/final transfer remains
-separately qualified by its existing native fixture; production activation and
-maximum-message throughput are not claimed here.
-
-## 175. Bound envelope through immutable body and final settlement
-
-The native final-handoff fixture now drives the successful transfer, final
-publication rollback, expired final custody, and unknown final COMMIT cases
-through the bound MAIL, ordered RCPT and DATA adapters. The same authenticated
-session passes through their typed completions into the existing immutable
-body reader and body/final transport adapters. The actual DATA completion's
-MAIL mode is carried into body encoding. Exact wire commands and positive
-replies are checked before body transfer; matching attempt identity, the
-shrinking Prepared cap, final-capacity admission, Possible before terminator,
-and exact final settlement remain asserted by the existing fixture.
-
-These four cases cover the composed small-message path, including passive
-final evidence extraction and independent unknown-commit inspection. Existing
-negative-envelope and interrupted-publication cases retain their focused
-low-level paths. This test composition adds no production dispatcher, cached
-authority, output-owner reconstruction, allocation policy or deadline change.
-The maximum-message throughput limitation in section 155 still applies.
-
-## 176. Passive complete reply evidence on post-read refusal
-
-A command turn that fully parses and finishes a normalized reply before its
-post-operation clock or meter check fails still refuses the operation. The
-command Refusal closes transport and releases native TLS ownership first,
-then retains a borrowed view of the existing normalized output cell as passive
-evidence.
-Its reply accessor supplies the actual code and text; it has no session or
-continuation operation. Incomplete, malformed, truncated and trailing-byte
-input cannot populate that evidence, and pre-operation or write/flush failures
-retain no invented reply. Existing pre/post checks and bounded work charges
-remain in force.
-
-Bound MAIL and DATA adapters capture complete negative replies from this
-closed refusal through their existing retained publication owners. Ordered
-RCPT captures any complete valid recipient result before returning fenced
-interruption custody. The final adapter records complete 2xx/4xx/5xx evidence
-through FinalResult. Publication still uses the original allowance and deadline;
-expired or otherwise refused publication preserves its existing failure owner,
-and unknown COMMIT stays in Pending. Positive MAIL and DATA replies from an
-expired operation never construct a live envelope or Body handoff.
-
-The paired TLS regression cases expire the command clock after the read that
-finishes positive, negative and DATA-continuation replies, and distinguish
-partial and trailing-byte input. This extends evidence retention at the parser
-boundary without granting output authority or changing production activation.
-
-## 177. DATA custody through final reservation and body start
-
-Completed no longer splits live Body, session and MAIL mode into independent
-parts. Its reserve_body operation reserves final capacity against that exact
-BodyResult and returns BodyReady with the same session and mode. A refused
-reservation closes transport and returns the existing body-transfer Refusal;
-it grants no body or terminator output. Ordinary interrupted-Body recovery still
-owns durable retirement after that closure.
-
-BodyReady exposes the matching passive Dispatch for immutable body admission
-and the existing live phase check. Its consuming with_source verifies the exact
-Dispatch and supplies a callback-scoped BodySourceReady; that owner's begin
-passes its private BodyPlan, session, mode and verified source to the adapter. Original shrinking
-limits, per-write checks, Possible publication before terminator and final
-evidence custody remain unchanged. Explicit buffer extraction closes the
-session and drops local reservation custody. No historical receipt constructs
-either live owner.
-
-The native composed success, final rollback, expiry and unknown-COMMIT cases
-use this handoff. A new mixed-RCPT case occupies both local slots after DATA,
-then verifies failed final reservation closes transport without body output,
-preserves Body state and permits fenced recovery. Section 182 binds the
-immutable-source boundary and its separate connection/body-work admission.
-The maximum-message throughput limitation in section 155 remains explicit.
-Production dispatch remains inactive.
-
-## 178. TLS-sized body output cells
-
-The bounded body adapter accumulates 16384 encoded bytes before a full-cell
-write, matching the existing TLS plaintext ceiling. Its source cell remains
-4096 bytes and each codec poll remains limited to 256 transitions. Exact
-partial-write offsets, pre/post deadlines and work charges remain unchanged.
-Every write attempt and flush still performs its existing fresh live Body
-check. Full cells can require up to fourfold fewer successful writes than
-4096-byte cells; Pending/partial writes and flushes prevent a universal
-fourfold check-count claim.
-
-Paired TLS tests cross CRLF over the input boundary and a dot-stuffed line
-start over the output boundary, retaining a partial final cell. The native
-composed relay fixture transfers a 64000-byte immutable body, checks exact
-dot transparency and its sole terminator, and persists the actual final reply
-under the original ten-second cap and existing meters. This is a bounded
-larger-message qualification, not a maximum-32-MiB throughput claim. Full
-per-write validation and evidence reads remain as in section 155; section 181
-binds the checks to one prepaid connection.
-
-## 179. Compact live Body reply witnesses
-
-The live Body reader projects the SHA-256 of each RCPT reply's UTF-8 bytes and
-whether DATA text is present. Each selected row must have a non-null 32-byte
-digest equal to the digest of its retained, validated positive reply and no
-DATA text. Equality now relies on SHA-256 collision resistance, consistent
-with existing stored-body and operation-receipt digests. The original request
-digest and receipt representation do not change. PostgreSQL's pg_catalog.sha256
-and pg_catalog.convert_to supply the witness; no extension is required.
-
-The query retains exact sorted subset membership, phase, publication receipt,
-active attempt, encoded membership, sequence/floor, reason, retry, policy,
-owner, health, queue-clock and expiry checks. Unselected Prepared rows retain
-their existing handling. AcceptancePossible keeps its full positive reply
-validation and final-capacity checks.
-
-Standalone dispatch checks open fresh qualified connections; retained body
-transfer uses section 181's prepaid profile. Body acknowledges transaction
-rollback before returning (section 180); Possible releases locks by connection
-closure. Standalone Body uses at most 1 MiB input, 1088 frames
-and 64 KiB output, including authentication and runtime qualification. The
-frame allowance is the same in preparation mode. Dispatch prepays 1 MiB plus
-128 KiB and 4096 records: both protocol byte ceilings plus the existing 64 KiB
-margin. Publication, final reservation and Possible checks keep their original
-allowances. No counter is replenished and no deadline or slot rule changes.
-
-Native cases check 100 distinct maximum-size replies, including multibyte text
-and HTAB, under runtime qualification; a one-byte change, null reply and
-unexpected maximum DATA text refuse. Exact Body-check budget exhaustion is
-tested independently of publication charges. Existing state, policy, ownership,
-clock and deadline corruption cases remain. This reduces response volume and
-per-check charging; finite record and turn limits still preclude a
-maximum-message throughput claim.
-
-## 180. Closed Body validation turns
-
-`BodyChecks` binds one authenticated PostgreSQL connection to the exact Body
-change, clock guard and original absolute deadline. It is non-cloneable and
-thread-bound because its worker waker targets the opening thread. It exposes
-only passive validation; it owns no SMTP authority, connection permit or work
-meter. Trusted callers retain connection capacity and admission. Standalone
-dispatch checks open one such connection per check; the body transport uses
-the prepaid retained owner in section 181. Production dispatch remains inactive.
-
-Each turn begins a READ COMMITTED transaction and obtains the migration key's
-shared transaction-scoped lock before inspecting the full schema ledger and
-store epoch. Runtime mode repeats the dedicated role and privilege checks on
-every turn. It then takes the original policy/account locks and performs all
-existing Body checks from section 179. The ordinary owner begin path retains
-its session-lock behavior; this dedicated path never recursively acquires that
-session lock. Successful validation awaits ROLLBACK completion, releasing the
-migration and row locks, and checks its resulting limit again before return.
-A refused check, failed cleanup, expired deadline or broken connection closes
-the worker permanently; a later call returns the retained error without SQL.
-
-The standalone 1 MiB input, 1088 frames, 64 KiB output and ten-second cap span
-the entire connection, including all turns. The retained transfer profile in
-section 181 separately prepays its larger finite connection budget. A successful rollback replenishes no
-counter and extends no deadline. A returned limit can only tighten the next
-turn's cap. Runtime authentication is connection-bound; schema, durability,
-role, privileges and live dispatch conditions are rechecked each turn.
-The schema, role, policy, owner, health, receipt and recipient reads use
-explicit PostgreSQL parameter types so the driver can send each query in
-one round trip without separately preparing and closing a statement. SQL
-ordering, lock lifetimes and fresh observations are unchanged; no result
-is cached between validation turns. The same single-round-trip calls cover
-primary read snapshot selection and account state, device-token reads, body
-reauthorization, Email/query pagination/counts and thread membership windows.
-Their nullable parameters retain explicit bytea or bigint types; predicates,
-ordering, result-cardinality checks and authorization boundaries are unchanged.
-
-HTTPS uses up to three body workers, each retaining its own request snapshot,
-credentials and original deadline. The worker count reserves two read slots
-per concurrent exchange for verification plus fresh authorization. Session
-API concurrency advertises this same configured worker count; upload
-concurrency remains one because the native ingress buffer is shared. A
-separate upload permit refuses overlapping uploads with 429 before backend
-admission. When at least two workers exist, transfers may occupy all but
-one; the final capacity remains available for API work. The default three
-workers allow two downloads alongside an API request. No read
-result or authority crosses workers. Existing pending-publication guards
-still serialize or refuse conflicting mutations; parallel readers do not
-promise parallel writes or change unknown-COMMIT settlement.
-
-Native fixtures verify two checks on one backend, idle state after rollback,
-and an independent connection acquiring exclusive migration and conflicting
-row locks between turns. Policy, runtime-role, privilege and reply changes refuse the
-next check and remain terminal after repair. Repetition exhausts the original
-protocol allowance; time expiry retains the original cap. Terminating the
-backend after the final live clock observation but before rollback produces
-no successful observation. This qualifies a reusable validation boundary,
-not a scheduler or maximum-body throughput.
-
-## 181. Prepaid Body-transfer validation connection
-
-Starting the bound Body transport consumes BodyPlan into a private retained
-owner. Its admission uses the verified source's actual length L, bounded by
-32 MiB, rather than the caller's maximum. A valid CRLF source expands to at
-most E = L + floor(L/3) bytes under dot transparency. The finite check count
-is 2 * ceil(E/16384) + 1 flush + 8 additional I/O attempts. Each cell
-reserves plaintext acceptance and a separate TLS-record tail drain: the
-16 KiB socket write cap is smaller than a full encrypted record. The extra
-attempts cover further partial or Pending writes/flushes, not retries or
-guaranteed progress.
-Every attempted write or flush consumes a check, including those that make
-no progress. Unused allowance is not returned.
-
-Before connecting, admission prepays that count times 1 MiB plus 128 KiB I/O
-and 4096 records. Checked arithmetic derives the same count's cumulative
-PostgreSQL input (1 MiB each), output (64 KiB each) and frames (1088 each).
-A 32 MiB source admits at most 5471 checks: 6154.875 MiB I/O and 22409216
-records. These are finite work counters, not resident-memory reservations.
-One ordinary ReadPermit covers the retained validator separately from final
-capacity. The original Body/meter cap only tightens; no connection, turn or
-window renews it.
-
-Each turn additionally admits at most 1 MiB input, 64 KiB output and 1088
-frames, with authentication included in the first window. Available idle
-traffic drains against the preceding window before the next is granted.
-Only acknowledged rollback permits a later window, and the finite source
-budget bounds grants independently of the dispatch check counter. Parser
-state and authentication survive boundaries. Aggregate counters only
-decrease, and protocol failure permanently refuses further grants.
-
-Each write or flush spends a credit, checks Pending and the original
-meter/deadline, then performs the full section 180 transaction with fresh
-qualification and live fences. Exhaustion refuses before SQL or new SMTP
-output; no hidden reconnect, counter replenishment or deadline extension is
-available. Failure closes SMTP and drops the validator before releasing its
-permit. On body completion that order precedes Possible publication, leaving
-the second slot available beside the final reservation. The earliest limit
-carries into Possible and final custody. Standalone Body/Possible profiles
-are unchanged.
-
-Native fixtures preserve the two-slot pool, 64000-byte transfers and the same
-idle validator across checks. A near-worst-case 1000002-byte dot/CRLF source
-exercises 1333336 encoded bytes under the original ten-second job limit, with
-initial database budgets covering all phases and no replenishment. Separate
-144000-byte cases deliberately lack the complete prepaid admission: they
-stop before body output with Capacity, Body durable, Pending empty and slots
-returned. One byte or record short of admission refuses before connecting.
-The source snapshot separately retains its own migration lock while reading.
-This qualifies bounded transfers, not maximum-32-MiB throughput, arbitrary
-backpressure or production activation.
-
-## 182. Bound immutable source and explicit source admission
-
-BodyReady.with_source selects only its private Dispatch through the existing
-verified attempt-body reader. Its callback receives BodySourceReady, which
-privately joins the verified reader to the same actual DATA session, MAIL
-mode and final reservation. Its begin accepts no replacement source. The
-callback drives source-scoped Exchange/Progress to Ready and returns unit or
-a transfer Refusal. Scoped wrappers privately borrow a completion sink owned
-by with_source; Ready stores the final handoff there and exposes no final
-operation or completion owner to the callback. Only successful callback and
-post-callback source validation release Completed for final SMTP. The lower trusted body adapter retains its explicit matching-input
-contract for focused interruption fixtures.
-
-Before any source connection, admission checks Pending, Runtime mode and the
-original shrinking limit, prepays 131 MiB I/O and 32768 records, and acquires
-two slots from a distinct body pool. Aliasing the ordinary pool refuses. The
-snapshot profile allows 128 MiB input and 512 KiB output; each of two fresh
-admission profiles allows 1 MiB input and 64 KiB output. The work charge covers
-130.625 MiB of protocol ceilings plus 384 KiB margin, not resident memory.
-Two slots cover the second admission overlapping the immutable snapshot.
-Both remain held until the reader returns and destroys its connections. The
-ordinary two-slot pool still covers final custody and retained Body validation.
-No budget or deadline replenishes. Source admission shortens the retained
-BodyPlan limit, so a shorter source allowance also bounds final custody.
-
-The wrapper retains BodyReady outside verification until callback entry, and
-retains the callback result and private completion sink outside the reader's
-post-callback source check.
-Failure before entry closes the original session. Failure after completion
-closes Completed and returns its buffers without a terminator; durable
-Possible remains conservative. An already returned transfer Refusal keeps its
-original error and buffers even if the later source check fails. Callback
-success without stored completion refuses. A callback error after Ready
-explicitly closes the stored completion and returns its actual buffers.
-Source read failures do not invent an uncertain publication or replace Pending.
-
-Native composed fixtures use the bound source path with exact admitted work.
-They cover one-byte/record-short admission, a one-slot pool, aliasing ordinary
-slots, a source size refusal, snapshot termination after body completion, and a
-shorter source deadline that remains binding before final SMTP. A transfer
-refusal followed by snapshot loss retains the transfer error and buffers.
-Callback success without Ready refuses; callback error after Ready closes the
-private final handoff and returns its buffers. Refusals close the session, preserve the expected Body/Possible phase and send
-no terminator. Source slots are reusable before final exchange or recovery.
-The 64000-byte success still uses the original ordinary message allowance;
-source work is explicitly separate. This adds no production dispatcher or
-maximum-message throughput claim.
-
-## 183. Selected TLS provenance before MAIL
-
-Selected-profile loading records the exact process-local relay TlsPolicyId
-from the TLS generation prepared by that same load. It inspects only the
-reserved owner's ID and borrowed payload, without publishing or exposing its
-TLS lease. Non-relay bindings have no relay policy identity. Binding clones carry this passive
-identity through Claim, Dispatch and MailPlan; no database digest, receipt,
-schema or persisted generation contains it.
-
-Before constructing MAIL, postgres_relay_mail compares Session.policy_id()
-to the plan's private expected identity. Mismatch closes the authenticated
-transport and returns buffers with Forbidden before any MAIL output or new
-database operation. The caller cannot supply a substitute expected ID.
-Generation identities are process-wide and never reused in that process;
-matching host, port, route or credentials cannot substitute for this match.
-The session still proves TLS and AUTH against its retained policy. Original
-selection, ownership, route-health, envelope, clock and work checks remain
-mandatory; local policy identity supplies no renewed queue authority.
-
-Successful MAIL and RCPT owners no longer expose public split operations.
-Only their internal next-stage adapters separate fields; external callers
-continue through bound RCPT/DATA or close and retain passive evidence. Body
-mode remains the caller's existing explicit SevenBit/EightBit choice, with
-negotiated 8BITMIME and encoder validation unchanged.
-
-Native composed fixtures publish and use the exact TLS generation from the
-PostgreSQL profile load. Same-profile transfers still succeed. Separately
-prepared same-destination generations, including rotated credentials, are
-authenticated to the fixture but refuse before MAIL; durable Prepared and
-Pending remain unchanged and buffers return. Existing envelope/deadline
-refusals remain covered. Compile-fail examples pin external split refusal.
-This is preparation for the eventual runtime; no relay scheduling or backend
-activation is enabled.
-
-## 184. Ordered retirement of a failed Prepared attempt
-
-PreparedResult.into_failed consumes pre-MAIL authority into a non-cloneable
-FailedPrepared continuation. The caller first closes all failed transport and
-classifies the actual remote failure. Local capacity, cancellation and invalid
-configuration are not automatically remote Network or Auth failures. This
-owner derives both the route-health change and one interrupted-recovery
-request from its private Dispatch; it accepts no replacement claim, fence,
-attempt or recovery operation. Preparation failures retain passive custody.
-Both requests exist before either publication starts.
-
-Each step runs at most one bounded publication or exact receipt inspection.
-Health must complete before recovery retires recipients. A known failure
-retains that publication stage for explicit retry. An unknown health or
-recovery COMMIT moves the exact request into the existing Pending barrier
-and switches the continuation to receipt inspection for that stage. Errors
-keep inspecting; a receipt proven absent (section 165) returns the stage to
-publication of the same request, which the still-active attempt admits
-idempotently. A validated
-health receipt advances to recovery; only validated recovery completion
-returns the combined passive outcome. Repeated completed steps do no I/O.
-
-The continuation never accepts public Settlement data as authority. It
-inspects its own retained request and matches an occupied Pending slot by
-private request identity, not merely attempt ID; another operation refuses
-Busy. If ordinary Pending.settle already cleared the slot, by a found receipt or
-proven absence, the continuation reinstalls its exact request and inspects it
-again. Empty Pending alone proves neither success nor rollback. Inspection
-and matching slot clearance occur under the existing Pending mutex. No second
-pending queue is introduced.
-
-After transport is fenced, passive steps may receive fresh bounded deadlines
-and work even when the original SMTP cap has expired. Runtime admission,
-the supplied and meter deadlines, the ten-second connection ceiling and
-ordinary ownership/selection/expiry fences still apply. Publication uses
-ordinary capacity; inspection uses a separately reserved settlement pool,
-which must not alias the ordinary pool. No Prepared owner, session or
-transport permission can be reconstructed from this continuation.
-
-Native PostgreSQL/TLS cases cover actual AUTH refusal and its repair hold,
-Network backoff, TLS repair hold, settlement after SMTP expiry, known health
-and recovery rollback, delayed and rolled-back commits, generic
-settlement followed by exact reinspection, budget/deadline/slot refusal,
-ordinary-slot occupancy during inspection, unrelated Pending preservation,
-and recovery expiry-wait marker. They assert health before retirement, one health
-count and one recovery sequence change, retained Prepared on early failures,
-and candidate refusal by backoff/repair after retirement. This activates
-no scheduler or PostgreSQL backend and changes no schema.
-
-## 185. Configured relay setup bound to Prepared custody
-
-The inert postgres_relay_connect adapter consumes one PreparedResult and a
-PublishedProfile. Cold Prepared.publish constructs that bundle from its own
-Binding, resolved configuration and successfully published TLS generation.
-Publication in another generation domain refuses and returns the original
-preparation. The retired generation remains an explicit cold-disposal result.
-No caller can assemble a bundle from separately loaded credentials or policies.
-
-Before network setup, reserve the existing MailPlan and its negative-reply
-storage. Compare its private policy identity to the bundled relay policy
-before DNS, TCP or credential output. Resolve only the configured relay name
-through the configured numeric DNS servers, dial bounded returned addresses,
-and use the matched policy's endpoint and TLS mode. Required STARTTLS keeps
-the plaintext greeting, EHLO offer and upgrade on the same socket, discards
-plaintext capabilities, and requires a fresh verified TLS EHLO before AUTH.
-Implicit TLS also requires verified TLS, greeting and EHLO before AUTH.
-
-All setup uses the original worker RuntimeClock and the minimum of the
-Prepared limit, original deadline and remaining wire-meter deadline. Instant
-limits convert down to whole milliseconds, never extending them. The wire
-deadline first tightens retained Prepared custody before database admission;
-MAIL entry likewise tightens it before its native check. Fresh native
-authority checks run before resolution, after resolution before dialing,
-before AUTH and before entering MAIL. No database connection or lock survives
-an authority check into DNS, dialing, TLS or AUTH work. After the final MAIL
-entry observation, section 188 admits the retained envelope validator; its
-transactions and locks still end before every SMTP transport call. A fence is an observation, not a claim
-that remote SMTP output and database revocation are atomic.
-
-Successful setup returns opaque ConnectedPrepared. Its session and MailPlan
-cannot be split; only bound MAIL or explicit closure consumes it. MAIL entry
-retains the existing refusal and any command evidence plus passive recovery
-identity. Every setup refusal closes transport and returns reusable buffers.
-A private Dispatch retained before consuming admission produces only closed
-interruption recovery; failed recovery preparation returns that same passive
-owner. An isolated complete actual 535 AUTH reply instead creates the ordered
-FailedPrepared Auth continuation. Local budget, invalid configuration,
-unsupported capabilities and ambiguous network/TLS errors do not infer a
-remote health classification. There is no automatic retry or alternate AUTH.
-
-Native fixtures exercise configured DNS and actual TCP in both TLS modes,
-then the existing 64,000-byte bound envelope/source/final chain. Separate
-cases prove foreign-domain publication refusal, policy mismatch and empty
-work before DNS/TCP, ownership expiry before AUTH with no credential output,
-blocked SQL under shorter setup and MAIL-entry wire deadlines, and actual
-AUTH refusal followed by health-before-recovery settlement.
-Setup adds no scheduler or backend activation. The source-sized Body allowance
-and ten-second native job cap still require qualification for maximum-sized
-messages and backpressure before the relay runtime can be called usable.
-
-## 186. One bounded configured relay attempt
-
-The inert postgres_relay_attempt driver consumes ConnectedPrepared and runs
-bound MAIL, ordered RCPT, DATA, immutable source transfer, Possible and final
-publication on the caller's admitted worker. The same wire/database meters
-and reusable command/body cells span the attempt. Source work and its separate
-two-slot pool remain explicit. Source completion stays inside the existing
-private sink until snapshot postvalidation releases final authority.
-
-Only durable actual MAIL, DATA or final results return Completed. All other
-stops close transport and return the existing phase-specific evidence owner
-plus passive interruption custody retained from the connector's private
-Dispatch. No caller can substitute a session, attempt or live phase owner.
-The driver neither settles failures nor invents remote-health classifications.
-
-Stopped is a trusted runtime handoff, not an automatic recovery instruction.
-Preserve and publish actual negative/final evidence and inspect any unknown
-Pending first. RCPT uses its positive-reply-aware interruption conversion;
-DATA planning and Body failures use their corresponding evidence-aware
-conversions. Discard generic fallback if settlement retires the attempt.
-Otherwise it addresses only unresolved durable state. Durable Possible stays
-uncertain even when source postvalidation fails before a terminator is sent.
-
-Pending commands sleep at most five milliseconds under the captured upper
-cap. Body transfer waits only when a Write/Flush turn still has Write/Flush
-work afterward; pure source/codec turns and completed writes leading back
-to encoding proceed immediately. This phase hint is crate-private and
-supplies no authority. The next existing phase advance owns any tighter
-deadline and exact refusal evidence. The driver adds no fresh budgets, renewed deadlines, connection
-pool, thread, scheduler, retry or backend activation. Source-sized Body
-admission retains the maximum-message/backpressure limitations in section 181.
-
-Native configured fixtures exercise both TLS modes with one wire meter from
-setup through final delivery: 64,000-byte mixed-recipient success, a
-1,000,002-byte near-worst-case dot/CRLF source, prepaid
-144,000-byte Body refusal, mixed RCPT interruption preserving the unanswered
-recipient, immutable-reader failure after Possible with no terminator, and
-an unknown final commit retaining actual reply evidence for inspection.
-They assert exact durable recipient outcomes, empty Pending after settlement,
-and returned ordinary/source pool capacity. These cases qualify the bounded
-driver, not maximum-sized messages or arbitrary peer backpressure.
-
-Successful MAIL/RCPT/DATA command writes, completed flushes and partial
-reply reads immediately continue through the existing bounded advance
-operation. A private per-turn progress hint resets before each advance and
-is set only for validated positive-length writes or reads, or a completed
-flush. Pending writes, flushes and reads retain their existing polling waits.
-Every advance keeps its before/after deadline checks, per-turn work charge,
-one TLS operation and at most 512 parsed bytes. Fresh authority checks
-before every attempted command write/flush remain unchanged. The hint grants
-no transport or publication authority and cannot carry progress into an
-idle turn. Removing reply-read waits alone does not establish full-recipient
-throughput; section 188 qualifies the combined retained-validation path.
-
-## 187. Retained untouched-envelope observations
-
-The passive EnvelopeChecks owner authenticates one thread-bound connection
-for observations of an exact active Prepared attempt. Each check starts a
-new READ COMMITTED transaction, obtains the transaction-scoped migration
-lock, inspects schema and store epoch, requalifies Runtime role/privileges,
-and locks selected policy and account state. It then runs the same complete
-envelope-validation implementation as standalone observations: live route
-ownership, queue clock, health, active receipt, submission and all selected
-recipient fields, followed by a fresh expiry observation.
-
-A successful turn acknowledges ROLLBACK and checks the resulting conservative
-local deadline before returning. The returned envelope is fresh passive
-evidence; its caller must compare it with the admitted envelope before any
-SMTP action. A valid address change is observable, not cached or silently
-accepted as transport authority. No transaction, migration lock or row lock
-spans returned control. Authentication persists, but authority does not.
-
-The original deadline only shrinks. Input bytes, protocol frames and output
-bytes in standalone EnvelopeChecks::open are cumulative over the connection:
-1 MiB, 1088 frames and 64 KiB, respectively. No successful turn renews them.
-The configured bound profile in section 188 prepays finite per-turn windows
-within a separate aggregate ceiling. Validation, protocol, rollback
-or expiry failure closes permanently, including after later database repair.
-The caller owns work admission and connection capacity. This passive API
-neither supplies SMTP authority nor adds a scheduler or activates PostgreSQL.
-
-Native tests exercise 100 selected Prepared recipients, backend reuse, idle
-ROLLBACK state, independently obtainable conflicting locks, selected-policy,
-role, privilege, recipient-phase and owner-generation fences, fresh address
-observations, cumulative exhaustion, original expiry, and backend termination
-after the last live clock observation but before acknowledged rollback.
-
-## 188. Prepaid configured envelope validation
-
-ConnectedPrepared::begin_mail first tightens its deadline and performs the
-existing fresh standalone observation. It then prepays one finite envelope
-validation profile and reserves one ordinary ReadPermit before entering MAIL.
-The thread-bound validator follows successful MAIL, ordered RCPT and DATA
-custody. Direct low-level plans retain their standalone observation behavior;
-all configured attempts use this retained path. Authentication persists, but
-every attempted command write or flush still runs the complete fresh checks
-from section 187, compares every admitted envelope field and acknowledges
-ROLLBACK before transport. No transaction or database lock spans SMTP I/O.
-
-For N selected recipients, admission covers 2*(N+2)+8 checks: write and flush
-for MAIL, each RCPT and DATA, plus eight additional partial/Pending attempts.
-N is checked against the existing 1..=100 attempt bound. Each check has at most
-1 MiB protocol input, 64 KiB output and 1088 frames. The first includes
-connection authentication; available idle traffic consumes the previous
-window before the next one starts. Only acknowledged successful rollback
-closes a window. Aggregate counters and the finite turn count never refill.
-These are the same checked budget and protocol-window implementation used by
-Body validation, with independently derived envelope and source profiles.
-
-Prepayment charges each check 1 MiB+128 KiB I/O and 4096 records. At 100
-recipients this is 212 turns, 238.5 MiB I/O and 868352 records; the protocol
-ceilings are 212 MiB input, 13.25 MiB output and 230656 frames. These are
-cumulative work bounds, not retained allocations. Each attempted check still
-checks Pending and both original and current meter deadlines, consumes one
-credit and only tightens the local cap. Failure permanently closes the
-retained validation state; it cannot reconnect or fall back to standalone
-checks. No deadline or meter is renewed.
-
-The worker is destroyed before its ordinary permit is released. Closure
-precedes negative command publication, actual 354 publication, Body/source
-admission and every passive failure/evidence handoff. Successful positive
-RCPT custody alone may carry the validator into DATA. Partial RCPT results,
-421, explicit close, planning failures and failed DATA custody retain evidence
-without retaining the validation connection or permit. Existing final-result
-and source reservations remain independent.
-
-Native fixtures exercise repeated backend identity and idle ROLLBACK after
-MAIL and RCPT, independent conflicting migration/row locks, exact one-byte
-and one-record-short prepayment refusal before MAIL output, and DATA outcomes
-while another ordinary slot is held. Both slots must be reusable while failed
-publication evidence is still retained. The configured full-attempt fixture
-also exercises the 100-recipient boundary and maximal normalized RCPT text
-under the original cap. Relay process scheduling remains unimplemented.
-
-## 189. Productive command output pacing
-
-The configured driver also skips its fixed polling delay after a command
-write reports validated progress or a flush completes. The next bounded
-advance still performs its fresh database authority check before any further
-write or flush. Partial writes consume the existing finite validation-turn
-allowance; no-progress attempts still wait. Every turn retains the original
-meter and before/after deadline checks, with no additional transport call.
-At 100 recipients this removes the fixed waits after the 204 ordinary
-MAIL/RCPT/DATA write and flush turns. It does not extend the ten-second cap
-or change final DATA terminator custody or pacing.
-
-The paired TLS test drives successful command output, an idle reply turn,
-a productive partial reply and another idle turn, proving that the hint
-resets rather than carrying output or read progress into an idle operation.
-
-## 190. Admitted route-candidate discovery
-
-Dispatches::candidates wraps the existing route scanner in the same bounded
-worker admission as attempt publication. Only Runtime connections enter;
-Pending must be empty and its nonblocking operation guard spans the read.
-Each page prepays 1 MiB+128 KiB protocol I/O and 4096 records, reserves one
-ordinary ReadPermit, and uses the minimum of the supplied deadline, current
-meter deadline and ten-second operation cap. Slot or work exhaustion refuses
-without waiting, and successful reads must still finish before that cap.
-The database connection closes before the slot returns. No read installs,
-clears or settles a Pending operation.
-
-Fresh, retry and expiry pages retain the scanner's existing policy, ownership,
-route-health, active-attempt, ordering and cursor rules. Pages contain at most
-64 passive hints, not reservations or SMTP authority. A new scheduling pass
-still restarts pagination. Candidate timestamps do not update or bypass the
-persistent queue-clock guard; Prepared/expiry publication must independently
-recheck the clock, current policy, owner and exact durable state. No scheduler,
-transport or production backend is activated.
-
-The native dispatch fixture compares admitted pages with the standalone
-scanner and checks one-byte/one-record-short and nonrenewing exact budgets,
-expired input/meter deadlines, preparation-mode refusal, stale ownership,
-cursor binding, slot exhaustion/reclamation and unchanged account state.
-An existing delayed Prepared COMMIT verifies all three scan kinds refuse
-while the exact unresolved operation remains in Pending.
-
-## 191. Admitted route acquisition and retained uncertainty
-
-Dispatches::acquire_route admits one exact prepared Claim through the worker's
-Runtime-only connection, original input/meter deadline and ten-second cap.
-It prepays 2 MiB+192 KiB I/O and 4096 records for receipt inspection and
-possible publication, reserving one ordinary slot across both sequential
-connections. Admission refusal installs no Pending operation. The claim then
-moves into the shared Pending guard before database work. Known success and
-definite failure clear custody; an unknown COMMIT retains the exact claim.
-No further scan, attempt, phase or acquisition can pass that barrier.
-
-Pending::identity replaces its attempt-only accessor with a closed identity
-sum: Attempt, RouteClaim or Expiry. Existing attempt publication, recovery and
-route failure identities are unchanged. Pending::settle uses independently
-admitted capacity to inspect the retained claim receipt, with no acquisition
-replay. Errors preserve custody; a matching receipt clears it and returns
-Settlement::RouteClaim, and proven absence (section 165) clears it without a
-settlement. The receipt is retained only for [Route-owner acquisition receipt
-retention](#route-owner-acquisition-receipt-retention)'s hour after its lease,
-so absence settled later may also mean an expired receipt; the caller's
-retried acquisition then takes a fresh generation, which is safe under
-[Route-owner acquisition receipt
-retention](#route-owner-acquisition-receipt-retention). This path has only
-test callers. The grant is historical evidence only, even when returned by a
-known acquisition. Fresh current-owner and attempt admission must still
-precede SMTP, and an expired or released receipt cannot revive an owner. Known
-committed results are not converted into deadline refusals.
-
-The native route-owner fixture exercises short and nonrenewing budgets,
-expired input/meter deadlines, mode refusal, ordinary/settlement slot pressure,
-known stale receipt replay, definite busy refusal and delayed acquisition
-COMMIT. All candidate kinds and further worker publication refuse while the
-claim remains unresolved, and inspection-only settlement then clears it. These
-cases preserve account sequence and leave both slot pools reusable.
-
-## 192. Admitted expiry and retained uncertainty
-
-`Dispatches::expire` brings one prepared queue-expiry operation under the
-relay worker's existing Runtime, original deadline, work-meter, ordinary-slot
-and Pending admission. The caller must close its route's SMTP transport
-before expiry, including the current owner's attempt. This worker entry point
-activates no scheduler and grants no transport authority.
-
-Admission prepays the existing receipt inspection and possible publication
-connection ceilings. The shared Pending slot takes the exact owned Expiry
-before SQL; its public identity is `Identity::Expiry(SubmissionExpiryId)`.
-Known publication or historical replay returns the outcome and clears
-custody; definite failure clears custody; an unknown COMMIT retains the
-operation and excludes every further worker operation. Independent settlement
-capacity can inspect only that exact receipt. Errors retain the barrier;
-`Settlement::Expiry` clears it on a matching historical outcome, and proven
-absence (section 165) clears it for the next expiry turn to rederive.
-Settlement never retries publication or changes recipient state.
-
-The underlying expiry transaction retains fresh policy and owner fencing,
-the queue-clock admission rules of [Runtime queue clock guard](#runtime-queue-clock-guard) and [Clock-guarded expiry admission](#clock-guarded-expiry-admission),
-process-local and database-wide spacing, at most 100 recipients, current
-attempt reservation handling, uncertainty preservation and one account
-sequence change. Admission does not confirm or replace the shared clock
-guard. Every expiry clock-guard access uses nonblocking lock acquisition;
-contention refuses as Clock(Invalid) without waiting for another holder. Historical receipt replay may settle during a new clock hold because
-it cannot perform another expiry mutation.
-
-The native submission fixture starts a real runtime clock and database-UTC
-guard during setup, waits out any remaining hold while renewing the current route lease,
-then explicitly confirms
-it before the expiry exercise. It drives the existing delayed-COMMIT expiry
-through this worker, including separate settlement
-capacity, blocked worker operations, pre-SQL admission refusals, unconfirmed
-clock refusal, historical replay, nonrenewing budgets and reclaimed slots.
-The existing recipient-state and sequence assertions remain in force.
 
 ## 199. Historical account usage audit
 
@@ -7502,16 +5675,17 @@ backup and use the fenced upgrade procedure. No replica service is activated.
 ## 15. Submission queue, relay scheduling and route health
 
 This chapter specifies how queued EmailSubmission responsibility reaches a
-smart host. It covers the route each submission is bound to, the
-database-wide route-owner lease, attempt publication and every durable
-SMTP phase and outcome, recovery of interrupted attempts, the queue clock
-guard and clock-guarded expiry, shared route health, the foreground relay
-worker that schedules all of this across accounts, local terminal-delivery
-notices, and the retention that keeps every per-account cap a rate bound
-rather than a lifetime limit. Section 4 states the ownership model these
-mechanisms implement; QUEUE.md owns the recipient state machine and retry
-policy. The relay's bounded SMTP exchange, phase custody and final-result
-capacity are specified in section 136 through section 192.
+smart host. It covers the route each submission is bound to, the database-wide
+route-owner lease, attempt publication and every durable SMTP phase and
+outcome, recovery of interrupted attempts, the queue clock guard and
+clock-guarded expiry, shared route health, the foreground relay worker that
+schedules all of this across accounts, local terminal-delivery notices, and
+the retention that keeps every per-account cap a rate bound rather than a
+lifetime limit. Section 4 states the ownership model these mechanisms
+implement; QUEUE.md owns the recipient state machine and retry policy. The
+relay's bounded SMTP exchange, phase custody and final-result capacity are
+specified in [16. Relay attempt execution and
+custody](#16-relay-attempt-execution-and-custody).
 
 ### Named-route evidence
 
@@ -7578,16 +5752,17 @@ wrong routes and different destinations cannot expose an outgoing body.
 Account state, changed sequences, manifest and chunk coverage must be
 valid.
 
-The shared body verifier checks the entire bounded outgoing blob before
-the callback receives its reader. Verification and replay share the
-original snapshot and deadline. No Email or device credential is needed:
-queued responsibility survives source deletion and device revocation. The
-database credential and selected relay profile authorize this internal
-read. A read is passive evidence, including after a policy change during
-its snapshot; it grants no attempt ownership or right to transmit. The
-relay itself reads transmitted bytes through the attempt-scoped read of
-section 136, which additionally binds the active attempt; this
-route-scoped read has no runtime caller.
+The shared body verifier checks the entire bounded outgoing blob before the
+callback receives its reader. Verification and replay share the original
+snapshot and deadline. No Email or device credential is needed: queued
+responsibility survives source deletion and device revocation. The database
+credential and selected relay profile authorize this internal read. A read
+is passive evidence, including after a policy change during its snapshot; it
+grants no attempt ownership or right to transmit. The relay itself reads
+transmitted bytes through the attempt-scoped read of [Verified
+transmitted-body snapshots](#verified-transmitted-body-snapshots), which
+additionally binds the active attempt; this route-scoped read has no runtime
+caller.
 
 ### Route-owner leases and fencing (schema 16)
 
@@ -7629,21 +5804,22 @@ any replacement attempt ([Abandoned-attempt recovery (schema 18)](#abandoned-att
 
 Acquisition receipts are retained for a bounded time, not for life. An
 acquisition that passes its replay, policy, Busy and Clock checks first
-deletes, under the account write lock, the account's receipts whose
-recorded first lease ended more than one hour (`RECEIPT_RETENTION_MS`)
-before its locked database time; a later refusal rolls that back. Renewal
-does not extend a receipt, and none is needed then: a claim replays its
-receipt only to settle its own acquisition while it holds no grant. The
-relay retries ungranted slots each round, subject to the five-second wait
-after a capacity refusal. A claim retried more than an hour after its
-lease ended may find its receipt swept by another acquisition and then
-acquires afresh under a higher generation; the unused earlier generation
-was never live authority, since every fence compares the owner row's
-generation, boot and operation. Otherwise the old receipt replays,
-observation reports it stale and the relay replaces the claim.
-Inspect-only settlement of an acquisition (section 191) after that hour
-may read an expired receipt as absent; it then releases custody, and the
-retried acquisition takes a fresh generation as above.
+deletes, under the account write lock, the account's receipts whose recorded
+first lease ended more than one hour (`RECEIPT_RETENTION_MS`) before its
+locked database time; a later refusal rolls that back. Renewal does not
+extend a receipt, and none is needed then: a claim replays its receipt only
+to settle its own acquisition while it holds no grant. The relay retries
+ungranted slots each round, subject to the five-second wait after a capacity
+refusal. A claim retried more than an hour after its lease ended may find
+its receipt swept by another acquisition and then acquires afresh under a
+higher generation; the unused earlier generation was never live authority,
+since every fence compares the owner row's generation, boot and operation.
+Otherwise the old receipt replays, observation reports it stale and the
+relay replaces the claim. Inspect-only settlement of an acquisition ([Route
+acquisition through the relay
+worker](#route-acquisition-through-the-relay-worker)) after that hour may
+read an expired receipt as absent; it then releases custody, and the retried
+acquisition takes a fresh generation as above.
 
 The cap therefore bounds acquisitions in any hour plus one lease, not per
 account lifetime. The relay releases on every exit and acquires once per
@@ -7761,8 +5937,10 @@ on guessed state. Receipt storage has a 2048-per-account ceiling; a
 retired attempt's receipts are reclaimed with it ([Reclamation of retired attempts](#reclamation-of-retired-attempts)).
 
 These are durable facts, not continuing permission to transmit. The relay
-must retain current ownership and its monotonic transport fence, and
-reserve final-outcome capacity (section 142) before allowing a terminator.
+must retain current ownership and its monotonic transport fence, and reserve
+final-outcome capacity ([Durable final-result reservations (schema
+27)](#durable-final-result-reservations-schema-27)) before allowing a
+terminator.
 
 ### Positive final DATA outcomes (schema 20)
 
@@ -8033,7 +6211,8 @@ through the receipt, never a replacement result. Callers must close and fence
 the route's transport first, including an interrupted current-owner attempt,
 share the process guard and report any primary change they detect. The relay
 meets this by expiring only at the start of a scheduling turn, when it holds
-no SMTP transport, and through `Dispatches::expire` (section 192).
+no SMTP transport, and through `Dispatches::expire` ([Expiry through the relay
+worker](#expiry-through-the-relay-worker)).
 
 ### Expiry receipt retention
 
@@ -8042,16 +6221,18 @@ receipts are keyed by submission, not attempt, and submission retirement
 ([Retention of settled submissions](#retention-of-settled-submissions))
 removes them only a month after the submission completes. Every admission of
 the expiry receipt kind, by an expiry publication or by an AcceptancePossible
-reservation (section 142), first deletes, under the account write lock, that
-account's expiry receipts published more than an hour (`RECEIPT_RETENTION_MS`,
-the route-health receipt margin of [Route-health receipt retention and the
-lease window](#route-health-receipt-retention-and-the-lease-window)) before
-the database clock, then counts the rest with outstanding claims against the
-1,024 ceiling: a per-hour flood bound, not a lifetime one, and expiry
-publication is already serialized at one per database second across accounts.
-While an account's ceiling is full, its further expiries and every
-AcceptancePossible reservation (so every delivery reaching DATA) refuse
-Capacity until receipts age past the hour.
+reservation ([Durable final-result reservations (schema
+27)](#durable-final-result-reservations-schema-27)), first deletes, under the
+account write lock, that account's expiry receipts published more than an hour
+(`RECEIPT_RETENTION_MS`, the route-health receipt margin of [Route-health
+receipt retention and the lease
+window](#route-health-receipt-retention-and-the-lease-window)) before the
+database clock, then counts the rest with outstanding claims against the 1,024
+ceiling: a per-hour flood bound, not a lifetime one, and expiry publication is
+already serialized at one per database second across accounts. While an
+account's ceiling is full, its further expiries and every AcceptancePossible
+reservation (so every delivery reaching DATA) refuse Capacity until receipts
+age past the hour.
 
 A receipt serves only replay inside publication and settlement of that
 operation's uncertain COMMIT. A relay process holds one Pending for every
@@ -8351,31 +6532,35 @@ attempt. Fresh and retry selection alternates independently for each account.
 A route-health refusal of the candidate read (a paused or backed-off route)
 ends the turn. Expiry scans always precede dispatch.
 
-Passive active-attempt discovery is fenced to the current account, route
-and destination and reads at most two rows, refusing multiple active
-owners. An attempt from an earlier generation is recovered as abandoned
-([Abandoned-attempt recovery (schema 18)](#abandoned-attempt-recovery-schema-18)); one this generation left active, including a `Prepared`
-commit whose response or deadline was lost locally, uses current-owner
-interruption after transport closure. Possible acceptance remains
-uncertain. Known MAIL/DATA/final refusal and RCPT evidence are settled
-before generic recovery. Unknown COMMIT retains the exact Pending owner and
-blocks subsequent work until its receipt is observed or proven absent
-(section 165). Absence authorizes no SMTP replay: the step republishes the
-same durable change or rederives from durable state, and active-attempt
-discovery still finds any committed attempt. A requested stop may abandon
-unresolved custody; durable phase recovery on restart remains
-conservative.
+Passive active-attempt discovery is fenced to the current account, route and
+destination and reads at most two rows, refusing multiple active owners. An
+attempt from an earlier generation is recovered as abandoned
+([Abandoned-attempt recovery (schema
+18)](#abandoned-attempt-recovery-schema-18)); one this generation left
+active, including a `Prepared` commit whose response or deadline was lost
+locally, uses current-owner interruption after transport closure. Possible
+acceptance remains uncertain. Known MAIL/DATA/final refusal and RCPT
+evidence are settled before generic recovery. Unknown COMMIT retains the
+exact Pending owner and blocks subsequent work until its receipt is observed
+or proven absent ([Unknown-COMMIT settlement and proof of
+absence](#unknown-commit-settlement-and-proof-of-absence)). Absence
+authorizes no SMTP replay: the step republishes the same durable change or
+rederives from durable state, and active-attempt discovery still finds any
+committed attempt. A requested stop may abandon unresolved custody; durable
+phase recovery on restart remains conservative.
 
 Authentication and TLS failures publish a route pause; network failures
-publish route backoff ([Route failure publication](#route-failure-publication)). Durably accepted final DATA resets
-consecutive route failures. Success and repair retain exact operations and
-inspect unknown COMMIT before further work; a receipt proven absent
-(section 165) returns them to publication, and a lock timeout on the
-configuration, account or route owner row, as while the uncertain COMMIT
-still runs, or a statement failure in the owner or schema checks is
-retried like a lost connection until stop is requested rather than
-stopping the relay; a lasting one also fails lease renewal, which stops
-it. Other errors still stop it at once.
+publish route backoff ([Route failure
+publication](#route-failure-publication)). Durably accepted final DATA
+resets consecutive route failures. Success and repair retain exact
+operations and inspect unknown COMMIT before further work; a receipt proven
+absent ([Unknown-COMMIT settlement and proof of
+absence](#unknown-commit-settlement-and-proof-of-absence)) returns them to
+publication, and a lock timeout on the configuration, account or route owner
+row, as while the uncertain COMMIT still runs, or a statement failure in the
+owner or schema checks is retried like a lost connection until stop is
+requested rather than stopping the relay; a lasting one also fails lease
+renewal, which stops it. Other errors still stop it at once.
 
 Under the original `Prepared` cap, the worker inspects each transmitted
 chunk for non-ASCII octets while computing its digest. It selects
@@ -8585,8 +6770,9 @@ finishing a newer request. No timer clears a repair hold.
 
 Shutdown closes foreground custody and joins renewal before one bounded
 multi-account release transaction. Expiring leases remain the fallback if
-cleanup cannot complete. After a successful drain and release the relay
-may publish a clean queue-clock checkpoint ([Queue clock checkpoint and confirmation](#queue-clock-checkpoint-and-confirmation)).
+cleanup cannot complete. After a successful drain and release the relay may
+publish a clean queue-clock checkpoint ([Queue clock checkpoint and
+confirmation](#queue-clock-checkpoint-and-confirmation)).
 
 ### Local terminal-delivery notices
 
@@ -8732,25 +6918,30 @@ per submission and advances the account sequence, so state strings change
 and the submission ID collision check still finds the ID.
 
 Deleting attempt-family receipts is one of the bounded sweeps
-section 165 admits. Relay operations on these kinds are settled before the
-worker does anything else, and none targets a submission completed 30
-days earlier; a settlement that outlived that would read absence, release
-custody, and its republication would find the attempt or submission
-Missing. An HTTP submission settlement that outlived it reads absence and
-releases the owner, which never republishes, so only the fence lifts. A
-cancellation of an old Failed group whose COMMIT response was lost,
-settled after the group retired, reads absence and its retry reports
-notFound, although the cancellation took effect.
+[Unknown-COMMIT settlement and proof of
+absence](#unknown-commit-settlement-and-proof-of-absence) admits. Relay
+operations on these kinds are settled before the worker does anything else,
+and none targets a submission completed 30 days earlier; a settlement that
+outlived that would read absence, release custody, and its republication
+would find the attempt or submission Missing. An HTTP submission settlement
+that outlived it reads absence and releases the owner, which never
+republishes, so only the fence lifts. A cancellation of an old Failed group
+whose COMMIT response was lost, settled after the group retired, reads
+absence and its retry reports notFound, although the cancellation took
+effect.
 
 ### Relay retention cycle
 
 Besides submission retirement, the relay reclaims expired upload leases as
-upload publication does ([Expired upload lease reclamation](#expired-upload-lease-reclamation)), releases abandoned route owners and
-canceled custody ([Route-health capacity and dispatch admission](#route-health-capacity-and-dispatch-admission)), and reclaims idle attempts and their
-receipts ([Reclamation of retired attempts](#reclamation-of-retired-attempts)). Each step uses its own transaction with the same
-claim, fence and clock check. An empty batch rolls back. A corrupt upload
-counter can refuse a lease batch while the other three transactions still
-commit.
+upload publication does ([Expired upload lease
+reclamation](#expired-upload-lease-reclamation)), releases abandoned route
+owners and canceled custody ([Route-health capacity and dispatch
+admission](#route-health-capacity-and-dispatch-admission)), and reclaims idle
+attempts and their receipts ([Reclamation of retired
+attempts](#reclamation-of-retired-attempts)). Each step uses its own
+transaction with the same claim, fence and clock check. An empty batch rolls
+back. A corrupt upload counter can refuse a lease batch while the other three
+transactions still commit.
 
 On idle and active account turns the four transactions share one
 ten-second deadline within the 30-second owner lease. Each cycle runs the
@@ -8787,13 +6978,12 @@ clock confirmation before time-based cleanup.
 
 ### Reclamation of retired attempts
 
-Submission retirement ([Retention of settled
-submissions](#retention-of-settled-submissions)) happens only a month after
-completion, so it alone would leave the per-account caps on attempts (1,024),
-phase receipts (2,048) and RCPT, command, acceptance, refusal and recovery
-receipts (1,024 each) as lifetime limits: ordinary sending, or a few
-submissions retrying for days, would fill them and refuse every later dispatch
-with Capacity. Attempts are therefore reclaimed on their own.
+Submission retirement ([Retention of settled submissions](#retention-of-settled-submissions)) happens only a month after
+completion, so it alone would leave the per-account caps on attempts
+(1,024), phase receipts (2,048) and RCPT, command, acceptance, refusal and
+recovery receipts (1,024 each) as lifetime limits: ordinary sending, or a
+few submissions retrying for days, would fill them and refuse every later
+dispatch with Capacity. Attempts are therefore reclaimed on their own.
 
 Fresh and retry attempt publication first calls
 `postgres_attempt_reclamation::reclaim` in the same transaction. One statement
@@ -8829,7 +7019,8 @@ recipients.
 
 ### Safety of retired-attempt reclamation
 
-A deleted receipt reads absent, which section 165 treats as settled; a
+A deleted receipt reads absent, which [Unknown-COMMIT settlement and proof of
+absence](#unknown-commit-settlement-and-proof-of-absence) treats as settled; a
 republication then finds the attempt Missing, which the relay's phase,
 recovery and route-health loops treat as done. Reclaiming is therefore safe
 only while nothing pending can still settle against the attempt. A delayed
@@ -8839,23 +7030,25 @@ route name, so the publishing owner owns every attempt on its route. Its
 worker publishes only with nothing Pending (`Dispatches::publish_with` refuses
 Busy) and settles phase, recovery and route failure or success before its next
 dispatch, so the route's retired attempts have nothing pending at any age. A
-failed `Prepared` continuation (section 184) can still be inspecting its
-recovery after generic settlement cleared Pending; the relay steps it to
-completion inline, a caller must not publish another attempt before it
-completes, and its loop treats a recovery that finds the attempt Missing as
-complete. That is the lease-window argument of [Route-health receipt retention
-and the lease window](#route-health-receipt-retention-and-the-lease-window)
-for the route's own health receipts, with the same reliance on a superseded
-owner stopping when its lease renewal fails. Another route's owner may still
-be settling, so its retired attempts keep the hour [Route-health receipt
-retention and the lease
-window](#route-health-receipt-retention-and-the-lease-window) gives their
-health receipts, measured from preparation as there: an attempt retired late
-becomes reclaimable sooner, losing at most a passive outcome (only committed
-retirement makes an attempt reclaimable, so an absent receipt with a Missing
-republication always means its effect is durable). A final reservation is
-outcome-unknown custody (section 142) and keeps its attempt; a reservation
-therefore holds its attempt against reclamation.
+failed `Prepared` continuation ([Ordered retirement after a remote setup
+failure](#ordered-retirement-after-a-remote-setup-failure)) can still be
+inspecting its recovery after generic settlement cleared Pending; the relay
+steps it to completion inline, a caller must not publish another attempt
+before it completes, and its loop treats a recovery that finds the attempt
+Missing as complete. That is the lease-window argument of [Route-health
+receipt retention and the lease
+window](#route-health-receipt-retention-and-the-lease-window) for the route's
+own health receipts, with the same reliance on a superseded owner stopping
+when its lease renewal fails. Another route's owner may still be settling, so
+its retired attempts keep the hour [Route-health receipt retention and the
+lease window](#route-health-receipt-retention-and-the-lease-window) gives
+their health receipts, measured from preparation as there: an attempt retired
+late becomes reclaimable sooner, losing at most a passive outcome (only
+committed retirement makes an attempt reclaimable, so an absent receipt with a
+Missing republication always means its effect is durable). A final reservation
+is outcome-unknown custody ([Durable final-result reservations (schema
+27)](#durable-final-result-reservations-schema-27)) and keeps its attempt; a
+reservation therefore holds its attempt against reclamation.
 
 Every other reader of attempt rows reads only active ones (phase and
 recovery publication, active-attempt discovery, route failure,
@@ -8908,3 +7101,1409 @@ milliseconds between failure and next attempt; recipient retry admission
 ([Due-retry publication](#due-retry-publication)) takes the same bound. Schema-41 binaries cannot serve
 schema 42; the upgrade only widens constraints, so no existing row needs
 repair.
+
+## 16. Relay attempt execution and custody
+
+This chapter specifies one outbound SMTP attempt as the foreground relay
+worker runs it against PostgreSQL: the admission and Pending custody that
+every worker operation shares, queue-clock and account-sequence admission,
+durable final-result capacity, `Prepared` publication and envelope custody,
+configured connection setup, the MAIL, RCPT and DATA exchanges, Body
+publication and the immutable body transfer, AcceptancePossible and the final
+DATA reply, retained failure evidence, interruption and recovery, settlement
+of an unknown COMMIT, retirement after a remote setup failure, and the
+worker's candidate, route-acquisition and expiry entry points. [Relay worker
+lifecycle and resources](#relay-worker-lifecycle-and-resources), [Relay
+scheduling turn](#relay-scheduling-turn) and [Account rotation and idle
+backoff](#account-rotation-and-idle-backoff) own scheduling across turns and
+accounts; section 4 owns the ownership model.
+
+Every live check below is a fresh observation under current fences, not an
+atomic revocation of remote output. Database locks never span network work,
+and section 4's pause/takeover and already-buffered-byte limitation applies
+to each check unchanged.
+
+### Relay attempt lifecycle
+
+In one scheduling turn the relay worker (`postgres_relay_worker`) first
+settles any retained Pending operation, then runs at most one expiry batch,
+recovers any active attempt, and pages fresh or retry candidates. It publishes
+at most one `Prepared` attempt per turn through the new-only publication path,
+classifies the verified body before MAIL ([Relay scheduling
+turn](#relay-scheduling-turn)), sets the session up through
+`postgres_relay_connect::connect`, and runs it through
+`postgres_relay_attempt::drive`. A canceled submission has no outgoing body
+mode; the worker then publishes interruption recovery without connecting. A
+completed final DATA result is followed by route success publication ([Route
+success reset](#route-success-reset)); a stopped attempt is settled as
+described under "Settlement of a stopped attempt" below.
+
+The attempt passes through a chain of non-cloneable owners: PreparedResult,
+EnvelopePlan, MailPlan, ConnectedPrepared, the accepted MAIL owner, the RCPT
+cursor and its completion, the DATA alternatives, BodyResult, BodyPlan,
+BodyReady, BodySourceReady, the retained Body transfer and the completed
+body paired with FinalResult. Each owner carries the exact claim, owner
+generation and attempt of the one before it, and its limit is the earliest
+of every limit admitted so far: no owner can be built from a historical
+receipt or caller-supplied identity, and no step renews a deadline. All of
+them run synchronously on the worker's own thread. Lower-level trusted
+APIs (historical publication, unobserved phase publication, FinalWork
+consumption and the direct body adapter) remain storage and protocol
+machinery; the relay worker drives SMTP output only through the owner
+chain.
+
+The driver runs bound MAIL, ordered RCPT, DATA, immutable source transfer,
+AcceptancePossible and final publication on that admitted worker. The same
+wire and database meters and the same reusable command and body cells span
+the attempt; source work and its separate two-slot pool remain explicit.
+Source completion stays inside the private completion sink until snapshot
+postvalidation releases final authority. Only durable actual MAIL, DATA or
+final results return Completed. Every other stop closes transport and
+returns the phase-specific evidence owner plus passive interruption custody
+retained from the connector's private Dispatch. No caller can substitute a
+session, attempt or live phase owner. The driver itself neither settles
+failures nor invents remote-health classifications, adds no fresh budget,
+renewed deadline, connection pool, thread or retry, and never selects work:
+the worker owns those duties.
+
+### Relay worker admission
+
+Dispatches joins one Connection (the request, trust store, ordinary read
+slots and runtime clock), the process's shared queue-clock Guard and the
+single Pending slot. Every operation admitted through it requires a
+Runtime-mode connection and otherwise refuses Forbidden. Its limit is the
+earliest of the supplied deadline, the work meter's deadline and ten seconds
+from admission; an already expired limit refuses Deadline. Admission
+prepays a fixed I/O and record allowance on the meter, so exhaustion refuses
+Capacity before connecting, then acquires an ordinary slot without waiting.
+There is no waiter queue, address fallback or hidden DNS operation.
+
+The trusted caller selects the primary and shares its runtime clock with the
+guard; the foreground relay pins its startup primary for the service
+generation ([Relay worker lifecycle and
+resources](#relay-worker-lifecycle-and-resources)). No client-controlled
+address, credential or route enters this API: the supplied Claim binds
+current policy and the prepared route. Connection credentials are borrowed
+for each call and are never retained with an attempt or in Pending.
+
+| Operation | Prepaid I/O | Records | Slots |
+| --- | --- | --- | --- |
+| Candidate page | 1 MiB + 128 KiB | 4096 | one ordinary |
+| `Prepared` publication, standalone envelope read | 2 MiB + 192 KiB | 4096 | one ordinary |
+| Route acquisition, expiry | 2 MiB + 192 KiB | 4096 | one ordinary |
+| Phase, result, recovery, route failure, FinalWork, Possible check | 3 MiB + 128 KiB | 4096 | one ordinary |
+| Standalone Body check | 1 MiB + 128 KiB | 4096 | one ordinary |
+| Pre-MAIL body classification ([Relay scheduling turn](#relay-scheduling-turn)) | 3 × maximum body + 2 MiB + 192 KiB | 4096 + 1 per 4096 body bytes | one ordinary |
+| Immutable source admission | 131 MiB | 32768 | two body-source |
+| Retained envelope or Body validator | count × (1 MiB + 128 KiB) | count × 4096 | one ordinary |
+
+The 2 MiB + 192 KiB allowance covers receipt inspection, publication,
+runtime admission and bounded recipient staging. The 3 MiB + 128 KiB phase
+allowance covers the two bounded connections, their protocol input, the
+batch writer's one-MiB output ceiling, receipt output and staging.
+Settlement prepays the allowance of the operation it inspects. These are
+finite work counters, not resident-memory reservations.
+
+### Shared Pending barrier
+
+One Pending slot per worker holds the single unresolved operation of any
+kind: a `Prepared` Dispatch, a phase or result Change (Body,
+AcceptancePossible, final DATA, MAIL/RCPT/DATA refusal), a recovery, a route
+failure, a route Claim or an expiry. Each operation moves its exact request
+into the slot before SQL. Known success and definite failure clear it; an
+unknown COMMIT retains the exact operation, including its attempt, phase,
+subset, replies and digest. While the slot is occupied every candidate page,
+publication, phase, recovery, route-failure, acquisition, expiry,
+final-capacity reservation and live check refuses Busy. Access uses
+`try_lock`, so contention refuses rather than waits. `Pending::identity`
+returns a closed sum, Attempt, RouteClaim or Expiry (attempt publication,
+phase, recovery and route failure all report Attempt); no variant grants
+transport authority.
+
+The caller supplies actual SMTP evidence from its current attempt and closes
+transport when a phase COMMIT is unknown. Known publication and settled
+receipts remain passive: neither authorizes more SMTP output, renews a lease
+nor acquires the separate final-outcome capacity required before terminator
+handoff. No credential or worker is retained in pending state. Settlement is
+specified under "Unknown-COMMIT settlement and proof of absence" below.
+
+### Queue-clock admission for attempt and phase publication
+
+Fresh and retry `Prepared` publication, new Body publication, new
+AcceptancePossible publication and the observed-envelope reader all require
+the caller's persistent process queue-clock Guard and the runtime monotonic
+clock; there is no unguarded fresh or retry attempt publication entry point.
+Under current policy and the route-owner lock, each pairs authoritative
+PostgreSQL UTC with the monotonic tick and checks the applicable guard status
+before selecting recipients or reading the envelope. The locked database
+sample reaches the guard before owner-clock or lease refusal, so a failed
+ownership check or rolled-back transaction cannot hide a discontinuity from
+the persistent hold. The adapter's UTC field is never used for queue
+decisions.
+
+Fresh work is allowed at startup; retries require the minimum retry interval
+of stable monotonic time ([Minimum retry interval (schema
+42)](#minimum-retry-interval-schema-42)). A clock discontinuity or
+primary-change hold refuses dispatch until the explicit confirmation rules
+are satisfied. Every runtime caller shares one guard across dispatch and
+expiry. A caller that changes primary must notify the guard; the foreground
+relay instead pins one primary per service generation and starts a new guard
+on reload or restart.
+
+After staging, each publication rechecks unexpired ownership, database time
+and the same guard immediately before COMMIT. A backward time step within
+the transaction or elapsed submission expiry refuses, and failure rolls back
+every staged recipient, submission, change, sequence, receipt and durable
+capacity row; the process-local clock observation survives the rollback.
+Guard access uses `try_lock`, so contention or poisoning refuses rather than
+waiting beyond the connection deadline. No guard lock spans SQL awaits.
+
+Historical receipt settlement precedes clock admission and still grants no
+permission to transmit; ordinary publication and inspection remain
+historical paths. An unknown COMMIT retains the same attempt identity.
+Publication admission is not a transport grant: SMTP admission
+independently revalidates current ownership and clock state at each live
+check. The low-level unobserved phase API remains storage machinery.
+
+### Account sequence admission for publishers
+
+Every state-changing account publisher uses one shared next-sequence check
+inside its existing account transaction. After acquiring the account row in
+the established lock order, it rereads the exact sequence and floor under
+that lock, refuses a stale observation or invalid floor, and computes the
+next unsigned 64-bit value with checked arithmetic. Exhaustion refuses the
+whole mutation; no signed PostgreSQL integer conversion or wrap is allowed.
+No-op mailbox/Email updates and already-completed cancellation preserve
+their sequence. Historical receipt validation does not allocate another
+sequence. Route revisions, configuration generations and other independent
+counters retain their own checked arithmetic.
+
+The check is one bounded query on the same connection under the original
+deadline and protocol ceilings; it commits nothing by itself and retains no
+lock beyond the caller's transaction. It reads outstanding final-result
+claims with the sequence and floor in that one round trip. Mutation workers
+allow 1088 frames, including fixed headroom for statement-close and COMMIT
+responses, so the maximum Email deletion batch fits; aggregate bytes,
+per-frame/authentication limits, output allowances and the original
+deadline are unchanged.
+
+### Durable final-result reservations (schema 27)
+
+Schema version 27 adds private final-result reservations keyed by account
+and attempt, with the exact ordered DATA subset (at most 100 ordinals). Its
+foreign key to the immutable attempt binds the submission, route,
+destination and owner fence; the schema ledger binds the store epoch.
+Runtime mail DML grants include the table. Upgrade refuses any old
+InFlight/AcceptancePossible recipient: resolve those attempts using the old
+binary before upgrading. Upgrade does not manufacture capacity promises for
+previously published phases.
+
+AcceptancePossible allocates one future account-sequence increment and one
+slot in each alternative acceptance, refusal, recovery and expiry receipt
+quota, atomically with the phase change. All thirteen account-sequence
+writers preserve the aggregate outstanding claims under the account row
+lock. Every writer of those four receipt classes admits actual receipts plus
+outstanding claims against its existing 1024-row ceiling. Claims are
+bounded by that same ceiling; all counts use bounded indexed account scans.
+These are credits for a future increment, not preassigned sequence values.
+
+A final positive/negative DATA result validates and consumes precisely its
+reserved subset in the same transaction as recipient state, CHANGE and
+receipt. Current-owner interruption and later-owner recovery consume the
+exact remaining AcceptancePossible subset while recovering the whole bounded
+attempt. Expiry prioritizes one reserved subset and expires it completely
+in one transaction, even when its ordinals straddle an ordinary 100-row
+sweep boundary. Ordinary pending recipients wait for later sweeps.
+`Prepared` recipients outside the DATA subset have no remote-acceptance
+obligation and no reservation promise.
+
+Consumption occurs before shared sequence/receipt admission inside the same
+transaction. A conflict, expiry hold, clock refusal or failed commit rolls
+it back. Unknown COMMIT settles the retained operation; historical replay
+never allocates or consumes a second claim. Lease expiry or owner takeover
+alone cannot release capacity. Cancellation already refuses
+AcceptancePossible rows. The attempt foreign key prevents removal of an
+outstanding claim's owner record. Physical disk/WAL availability and
+database connectivity are not reserved, and synchronous failure after remote
+acceptance remains uncertain. This is durable logical capacity only: local
+connection, work and reply capacity, the original attempt deadline and live
+ownership are separate prerequisites of terminator handoff.
+
+### Verified transmitted-body snapshots
+
+An attempt admits its immutable transmitted body through a bounded read-only
+repeatable-read snapshot. The opaque Dispatch binds the account, route,
+destination, owner, generation, attempt and request digest. Fresh primary
+admission checks current policy, unexpired route ownership and that exact
+active attempt before snapshot work. Pre-MAIL classification ([Relay
+scheduling turn](#relay-scheduling-turn)) and post-354 DATA each open and
+verify a separate snapshot. Each snapshot binds the live submission and blob
+manifest; the shared blob reader verifies contiguous chunks, total length and
+SHA-256 before exposing any bytes to the callback.
+
+A second fresh primary admission after verification refuses cancellation,
+retirement, ownership loss or policy change observed before that check. Both
+admissions release account/route locks before replay, so replay holds no
+account lock. After the second admission, a fresh check of the original
+snapshot and deadline precedes the callback, so snapshot or connection loss
+during admission cannot enter it. The callback retains one immutable
+snapshot under the original absolute deadline, even if later cancellation
+completes the submission and fences the attempt. It receives passive
+metadata and a bounded BlobReader, not transport authority: current
+transport ownership and durable Body/AcceptancePossible phase publications
+remain prerequisites for SMTP.
+
+The caller reserves connection and body-work capacity. The ten-second
+connection limit, 32 MiB body limit, bounded chunk batches and fixed
+protocol budgets apply; no deadline or snapshot is renewed. The
+authenticated device-body path shares manifest decoding without changing its
+authorization or upload-lease checks.
+
+### `Prepared` attempt publication
+
+The worker publishes a `Prepared` attempt through a new-only path. Both the
+initial receipt lookup and the locked recheck refuse historical replay on
+this path; the original historical publication API remains passive. Known
+new success within the original job limit yields a non-cloneable
+PreparedResult. Known refusal releases the prepared identity. Unknown
+COMMIT keeps the exact Dispatch in Pending, returns no owner and refuses
+another publication; settlement cannot construct an owner. A known commit
+whose result returns after the job limit also yields no owner: the worker's
+active-attempt discovery finds and recovers that attempt on its next turn.
+
+PreparedResult retains the worker, the exact publication and the earliest
+original job/meter/ten-second Instant cap. The foreground worker supplies a
+120-second outer deadline and meters; the shorter ten-second admission cap
+binds the whole attempt, from setup through the final reply, and no later
+admission can extend it. PreparedResult exposes passive identity and outcome
+references and bounded observed-envelope reads. Dropping it releases local
+custody only.
+
+### Initial `Prepared` envelope reads
+
+An initial envelope is read only while every retained batch ordinal remains
+InFlight in `Prepared` for that exact active attempt. Current policy, account
+and route-owner locks cover the complete bounded read; route identity,
+destination, live due submission, account sequences and final lease validity
+are checked before returning. At most 100 recipients are copied with
+fallible reservations in the receipt's original ordinal order. Strict shared
+mailbox syntax validates recipient addresses and any nonempty reverse path;
+an empty reverse path remains representable. The uncertainty latch is
+returned unchanged as passive per-recipient metadata. Body and envelope
+reads share exact active-attempt receipt validation, including its request
+digest and owner identity.
+
+Retried `Prepared` rows retain the previous attempt's replies as required by
+[Due-retry publication](#due-retry-publication); no reader treats those
+historical replies as progress in the new attempt. Partial recipient results
+or later DATA phases refuse reconstruction: the worker retains its admitted
+envelope for the existing transport, and these values never authorize a new
+or repeated SMTP transaction. No lock survives the call, and no account
+sequence or attempt state changes.
+
+The observed reader additionally observes database UTC through the shared
+queue-clock guard before reading the envelope and again under the final
+owner check. Clock failure, a discontinuity or a retained hold refuses;
+failed transactions do not roll back the process guard. Fresh route-health
+admission refuses backoff and repair holds. The returned Instant is the
+minimum of the caller's original limit and the remaining owner
+lease/submission lifetime measured from the start of the final owner query,
+discarding one millisecond for database timestamp rounding. A backwards
+final timestamp, exhausted lifetime or expired returned bound refuses. The
+envelope and deadline are passive observations; historical receipts cannot
+reconstruct transport ownership.
+
+Each PreparedResult read checks Pending and original expiry, prepays the
+attempt allowance, acquires an ordinary slot, then uses the observed reader
+with the retained cap. A new meter or lease renewal cannot extend the
+original bound, and no slot or database lock remains held after the read.
+
+### Envelope custody and the minimum observed cap
+
+Consuming PreparedResult through initial envelope admission produces a
+non-cloneable EnvelopePlan. It pairs that exact bounded envelope with the
+`Prepared` owner and clamps the owner's limit to the returned lease,
+submission and work bound. The public envelope view is borrowed passive
+data; callers cannot replace the stored envelope or construct a plan from a
+receipt. Every later untouched-envelope check requires the complete fresh
+envelope to equal the retained one and only shortens the stored limit; a
+new meter or renewed lease cannot enlarge that minimum. These checks apply
+only while all original recipients remain untouched `Prepared`; they cannot
+reconstruct an envelope after partial RCPT publication.
+
+EnvelopePlan reserves each command-stage owner from its own retained state:
+
+- MailPlan derives the complete `Prepared` ordinal batch, attempt and owner
+  generation and pairs the envelope with negative MAIL reply storage. A
+  normalized actual positive MAIL reply consumes it back into the original
+  envelope owner without extending its deadline.
+- RcptPlan derives the complete admitted ordinal batch, claim, generation
+  and attempt, exposes only the next retained recipient, records ordered
+  actual replies, and performs fresh untouched-envelope checks under the
+  original minimum cap.
+- DataPlan takes a nonempty ordered subset of the admitted recipients and
+  their actual positive RCPT replies. Recipients outside the retained
+  envelope refuse before DATA. Construction prepares both the exact Body
+  request and negative DATA-command reply storage under the retained claim,
+  generation and attempt; no later recipient list or RCPT text can replace
+  them.
+
+Consuming any of these into Body carries the minimum bound through the
+`Prepared` handoff and the final-result chain.
+
+### Retained envelope validator
+
+Configured attempts validate every command write and flush through one
+retained EnvelopeChecks owner. ConnectedPrepared::begin_mail first tightens
+its deadline to the wire meter and performs a fresh standalone observation.
+It then prepays one finite envelope-validation profile and reserves one
+ordinary ReadPermit before entering MAIL. The thread-bound validator follows
+successful MAIL, ordered RCPT and DATA custody. Direct low-level plans open
+and close one standalone observation connection per check; all configured
+attempts use the retained path.
+
+The validator authenticates one thread-bound connection for observations of
+an exact active `Prepared` attempt. Each check starts a new READ COMMITTED
+transaction, obtains the migration key's transaction-scoped shared lock,
+inspects schema and store epoch, requalifies the Runtime role and
+privileges, and locks selected policy and account state. It then runs the
+same complete envelope-validation implementation as standalone
+observations: live route ownership, queue clock, health, active receipt,
+submission and all selected recipient fields, followed by a fresh expiry
+observation. A successful turn acknowledges ROLLBACK and checks the
+resulting conservative local deadline before returning. The returned
+envelope is fresh passive evidence; the owner compares every admitted field
+before any SMTP action, so a valid address change is observable, never
+cached or silently accepted. No transaction, migration lock or row lock
+spans returned control or SMTP I/O. Authentication persists; authority does
+not.
+
+For N selected recipients, admission covers 2*(N+2)+8 checks: write and
+flush for MAIL, each RCPT and DATA, plus eight additional partial/Pending
+attempts. N is checked against the 1..=100 attempt bound. Each check admits
+at most 1 MiB protocol input, 64 KiB output and 1088 frames. The first
+includes connection authentication; available idle traffic consumes the
+previous window before the next one starts, and only acknowledged
+successful rollback closes a window. Prepayment charges each check
+1 MiB + 128 KiB I/O and 4096 records. At 100 recipients this is 212 turns,
+238.5 MiB I/O and 868352 records; the protocol ceilings are 212 MiB input,
+13.25 MiB output and 230656 frames. These are cumulative work bounds, not
+retained allocations. The Body validator uses the same checked budget and
+protocol-window implementation with an independently derived profile.
+
+Each attempted check consumes one credit, checks Pending and both the
+original and current meter deadlines, and only tightens the local cap.
+Aggregate counters and the finite turn count never refill, and no deadline
+or meter is renewed. The standalone EnvelopeChecks::open profile is instead
+cumulative over its connection: 1 MiB input, 1088 frames and 64 KiB output,
+with no renewal by a successful turn. Validation, protocol, rollback or
+expiry failure closes the validator permanently, including after later
+database repair; it cannot reconnect or fall back to standalone checks.
+
+The validator is destroyed before its ordinary permit is released. Closure
+precedes negative command publication, actual 354 publication, Body/source
+admission and every passive failure or evidence handoff. Only successful
+positive RCPT custody carries the validator into DATA. Partial RCPT results,
+421, explicit close, planning failures and failed DATA custody retain
+evidence without retaining the validation connection or permit.
+Final-result and source reservations remain independent.
+
+### Configured relay connection setup
+
+`postgres_relay_connect` consumes one PreparedResult and the
+PublishedProfile the service loaded. Cold `Prepared.publish` constructs that
+bundle from its own Binding, resolved configuration and successfully
+published TLS generation. Publication in another generation domain refuses
+and returns the original preparation; the retired generation remains an
+explicit cold-disposal result. No caller can assemble a bundle from
+separately loaded credentials or policies.
+
+Before network setup the connector admits the initial envelope and reserves
+MailPlan with its negative-reply storage, then compares MailPlan's private
+policy identity to the bundled relay policy before DNS, TCP or credential
+output. It resolves only the configured relay name through the configured
+numeric DNS servers, dials bounded returned addresses, and uses the matched
+policy's endpoint and TLS mode. The worker retains the configured resolver's
+two-entry answer cache across attempts; the cache is bound to the
+configuration generation and runtime clock and drops an entry at its
+resolution's validity limit. Required STARTTLS keeps the plaintext
+greeting, EHLO offer and upgrade on the same socket, discards plaintext
+capabilities, and requires a fresh verified TLS EHLO before AUTH. Implicit
+TLS also requires verified TLS, greeting and EHLO before AUTH.
+
+All setup uses the original worker RuntimeClock and the minimum of the
+`Prepared` limit, original deadline and remaining wire-meter deadline.
+Instant limits convert down to whole milliseconds, never extending them.
+The wire deadline first tightens retained `Prepared` custody before database
+admission; MAIL entry likewise tightens it before its native check. Each
+setup turn charges the wire meter and pending turns sleep at most five
+milliseconds under that cap. Fresh native authority checks run before
+resolution, after resolution before dialing, before AUTH and before
+entering MAIL. No database connection or lock survives an authority check
+into DNS, dialing, TLS or AUTH work. After the final MAIL-entry observation
+the retained envelope validator is admitted; its transactions and locks
+still end before every SMTP transport call. A fence is an observation, not
+a claim that remote SMTP output and database revocation are atomic.
+
+Successful setup returns opaque ConnectedPrepared. Its session and MailPlan
+cannot be split; only bound MAIL or explicit closure consumes it. MAIL entry
+retains the exact refusal, any command evidence and passive recovery
+identity. There is no automatic retry or alternate AUTH mechanism.
+
+### TLS policy provenance before MAIL
+
+Selected-profile loading records the exact process-local relay TlsPolicyId
+from the TLS generation prepared by that same load. It inspects only the
+reserved owner's ID and borrowed payload, without publishing or exposing its
+TLS lease. Non-relay bindings have no relay policy identity. Binding clones
+carry this passive identity through Claim, Dispatch and MailPlan; no
+database digest, receipt, schema or persisted generation contains it.
+
+The connector compares it with the bundled relay policy before any network
+work, and before constructing MAIL `postgres_relay_mail` compares
+Session.policy_id() to the plan's private expected identity. Mismatch closes
+the authenticated transport and returns buffers with Forbidden before any
+MAIL output or new database operation; durable `Prepared` state and Pending
+are unchanged. The caller cannot supply a substitute expected ID.
+Generation identities are process-wide and never reused in that process;
+matching host, port, route or credentials, including rotated credentials for
+the same destination, cannot substitute for this match. The session still
+proves TLS and AUTH against its retained policy. Original selection,
+ownership, route-health, envelope, clock and work checks remain mandatory;
+local policy identity supplies no renewed queue authority.
+
+### Connection setup failures
+
+Every setup refusal closes transport and returns reusable buffers with its
+stage (admission, resolve, dial, STARTTLS, handshake, EHLO or AUTH) and
+error. The connector classifies only remote failures, and the worker records
+`relay_connection_failed` with that stage:
+
+- an isolated complete actual 535 AUTH reply selects the ordered
+  FailedPrepared continuation for an authentication failure;
+- a TLS error selects it for a TLS failure;
+- a DNS or socket I/O error, or a resolution deadline while the attempt's
+  cap remains live (a DNS idle timeout), selects it for a network failure.
+
+Local budget, deadline, invalid configuration, policy mismatch, unsupported
+capabilities, failed authority checks and other refusals do not infer a
+remote health classification. They return passive interruption custody
+derived from the Dispatch retained before consuming admission; failed
+recovery preparation returns that same passive owner. Partial, multiline,
+malformed or current-cell-tailed AUTH input supplies no rejection code. The
+worker publishes the interruption recovery, or steps FailedPrepared as
+described under "Ordered retirement after a remote setup failure".
+
+### Reserved command-reply evidence
+
+CommandReply reserves bounded normalized-reply cells and hash contexts
+before MAIL or DATA-command transmission. The MAIL reservation fixes the
+complete `Prepared` ordinal batch; the DATA reservation fixes the actually
+accepted RCPT subset and retains its positive replies. Finishing consumes
+only an actual normalized 4xx/5xx reply, fills the existing cells and
+preserves the command-receipt digest of the ordinary constructors, so either
+form finds the other's receipt. Positive or interim replies cannot become
+negative evidence. Identity, command stage and subset cannot be replaced at
+finish. At most 100 recipients and 4096 bytes per reply remain the bounds.
+
+RcptReplies reserves one maximum normalized reply cell for each ordered
+recipient in an initial attempt batch, at most 100, and retains the exact
+claim, generation, attempt and ordinal sequence. Recording accepts only the
+next ordinal and an actual normalized 2xx/4xx/5xx reply, moving a reserved
+cell into positive or negative storage without a new reply allocation.
+Invalid input leaves the next ordinal and all earlier evidence unchanged.
+Finishing closes collection and reports whether every planned RCPT received
+a reply. It exposes retained positive evidence and, when any negative
+replies were collected, one immutable ordinary RCPT-refusal Change with the
+existing digest encoding. A partial collection is usable only after the
+interrupted session is fenced; publication cannot be followed by more RCPT
+commands for that attempt because there is only one refusal receipt.
+
+These objects are passive evidence storage, not live `Prepared` custody,
+transport permission, database capacity or a publication retry owner. They
+do not prove that a supplied reply came from their session; the bound
+exchanges below supply that.
+
+### Bound MAIL exchange
+
+`postgres_relay_mail` binds a reserved MailPlan to one authenticated relay
+Session for the duration of MAIL. After the provenance check it selects the
+exact admitted reverse path, runtime clock and original deadline. SevenBit
+frames MAIL FROM; EightBit frames BODY=8BITMIME only when the session retained
+the negotiated capability. Body mode is the worker's SevenBit or EightBit
+choice from pre-MAIL classification ([Relay scheduling
+turn](#relay-scheduling-turn)), with negotiated 8BITMIME and encoder
+validation unchanged. The exchange borrows the original wire and database
+meters.
+
+Every write and flush turn first rechecks the exact untouched `Prepared`
+envelope through the original owner; its local cap may only shorten. Each
+turn uses the bounded command parser and wire budget, and before/after
+transport checks remain in force.
+
+An actual normalized 2xx reply returns the same session, original envelope
+and MAIL mode together. Only the internal RCPT adapter can split this owner;
+external callers continue through the typed RCPT entry or close transport,
+and fresh checks remain required before each command. An actual 4xx/5xx
+reply fills the preallocated negative MAIL evidence and enters its
+publication before any further database admission. Known publication
+failure retains the exact CommandFailure; unknown COMMIT also stays in
+Pending. Rejection, protocol or admission failure and publication failure
+close transport and return its buffers. Other reply classes refuse without
+invented evidence. No returned durable receipt is a live owner.
+
+### Ordered RCPT exchange
+
+`postgres_relay_rcpt` begins only from the bound MAIL Accepted owner. It
+reserves all maximum reply cells before the first RCPT, derives each address
+and ordinal from the admitted batch, and keeps the same session and MAIL
+mode. Every command borrows fresh scratch cells and the wire/database
+meters. A returned Cursor permits only the next exact recipient; no separate
+session, recipient address or replacement identity enters this path. The
+original clock and deadline and the shortest admitted local cap survive
+between commands. A failed initial reservation closes MAIL transport
+without inventing any RCPT reply.
+
+Every write/flush turn rechecks the untouched `Prepared` envelope before
+output. No negative RCPT publication occurs while collection continues.
+Complete actual 2xx/4xx/5xx replies returned by the command parser enter
+reserved ordered storage before the owner checks whether the local cap
+permits continuation. A wire, current-state, deadline or parser failure
+closes transport and finishes the earlier collection into passive RcptResult
+evidence; a finish-time crypto or integrity error is reported separately
+instead of inventing evidence. Explicit Cursor or exchange closure follows
+the same fence-before-interruption order.
+
+An actual 421 is retained and closes immediately, even on the last RCPT
+after earlier positive replies; it never returns another command or DATA
+owner (RFC 5321 sections 3.8 and 4.2.2). A complete all-negative collection
+closes automatically and returns passive results for ordinary negative
+publication, which retires the attempt without DATA. A complete batch with
+positives retains its exact RcptResult, session and mode; only a complete
+collection with at least one accepted recipient can reserve DATA. Planning
+derives both DATA alternatives from the retained positive replies and
+returns any exact negative-RCPT Change with them as one RcptDataPlan; a
+planning failure retains the complete RcptResult, so invalid partial or
+all-negative choices and allocation failures do not discard replies. The
+split into DATA is crate-private: external callers use the typed DATA
+continuation or close, which fences and retains evidence for passive
+interruption. Neither a receipt nor collected reply evidence reconstructs
+output authority.
+
+### DATA command exchange
+
+`postgres_relay_data` begins only from the complete ordered RCPT owner,
+preserving the same authenticated session and MAIL mode. It reserves the
+bound DATA alternatives before command output and keeps the original
+runtime clock, deadline and shrinking cap. Each write/flush turn rechecks
+the untouched `Prepared` envelope; the preceding negative RCPT replies
+remain unpublished until actual DATA completion.
+
+An actual complete 354 consumes the plan: ordered publication of any
+negative RCPT subset comes first, then new observed Body publication,
+through the already retained Change with the original minimum cap and all
+deadline, novelty, Pending and live-phase checks. Only known new Body
+before that cap returns BodyResult, the matching Dispatch for the immutable
+read, and the same session and mode; the actual DATA completion's MAIL mode
+is carried into body encoding. Historical receipts or uncertain commits
+never construct this handoff. Every failure on this path retains the exact
+plan and its actual positive replies, plus any RCPT refusal not known
+committed, as passive RcptBodyFailure; it exposes no transport retry or
+owner extraction and can only plan interruption with Body-aware RCPT
+evidence. No body bytes or terminator are sent by this command adapter.
+
+A genuine normalized 4xx/5xx DATA reply instead fences the socket before
+settlement while keeping the parser's normalized reply storage readable; a
+crate-private abort on the command Reply provides this ordering without a
+reply copy. The reply fills the reserved refusal cells before either
+database operation is admitted. Ordered settlement publishes the negative
+RCPT subset before the DATA-command result; both exact operations stay
+together on a known failure as RcptCommandFailure, and a successful RCPT
+publication is removed from the retained sequence. Other reply classes,
+wire failure, stale authority, deadline or capacity refusal close transport
+and retain the bound RCPT plan as passive RcptBodyFailure for interruption
+planning. Initial reservation failure closes and preserves RcptFailure. No
+refusal returns a live session; unknown COMMIT remains in Pending.
+RcptDataPlan's private fields prevent substituting either half of its pair;
+its explicit `into_parts` keeps the lower-level caller-managed path with the
+same evidence and ordering obligations.
+
+### Complete replies after a post-read refusal
+
+A command turn that fully parses and finishes a normalized reply before its
+post-operation clock or meter check fails still refuses the operation. The
+command Refusal closes transport and releases native TLS ownership first,
+then retains a borrowed view of the normalized output cell as passive
+evidence. Its reply accessor supplies the actual code and text; it has no
+session or continuation operation. Incomplete, malformed, truncated and
+trailing-byte input cannot populate that evidence, and pre-operation or
+write/flush failures retain no invented reply. Pre/post checks and bounded
+work charges remain in force.
+
+Bound MAIL and DATA adapters capture complete negative replies from this
+closed refusal through their retained publication owners. Ordered RCPT
+captures any complete valid recipient result before returning fenced
+interruption custody. The final adapter records complete 2xx/4xx/5xx
+evidence through FinalResult. Publication still uses the original allowance
+and deadline; expired or otherwise refused publication preserves its
+failure owner, and unknown COMMIT stays in Pending. Positive MAIL and DATA
+replies from an expired operation never construct a live envelope or Body
+handoff.
+
+### Command turn pacing
+
+Pending command turns sleep at most five milliseconds under the captured
+upper cap. Successful MAIL/RCPT/DATA command writes, completed flushes and
+partial reply reads continue immediately through the next bounded advance:
+a private per-turn progress hint resets before each advance and is set only
+for a validated positive-length write or read, or a completed flush.
+Pending writes, flushes and reads keep their polling waits. Every advance
+keeps its before/after deadline checks, per-turn work charge, one TLS
+operation and at most 512 parsed bytes, and the fresh authority check
+before every attempted command write or flush is unchanged; partial writes
+consume the finite validation-turn allowance. The hint grants no transport
+or publication authority and cannot carry progress into an idle turn. At
+100 recipients this removes the fixed waits after the 204 ordinary
+MAIL/RCPT/DATA write and flush turns.
+
+Body transfer waits only when a write/flush turn still has write/flush work
+afterward; pure source/codec turns and completed writes leading back to
+encoding proceed immediately. The final DATA exchange waits after every
+turn. The stale upper bound controls at most a five-millisecond wait, never
+SMTP authority; the next phase advance owns any tighter deadline and exact
+refusal evidence. Pacing never extends the ten-second cap.
+
+### Body publication from actual 354
+
+A PreparedResult is consumed after actual 354 to publish Body for its own
+claim, generation and attempt. Only the actual accepted RCPT replies are
+supplied; the phase transaction still validates their ordered subset
+against the original batch. The worker clamps publication to the retained
+`Prepared` limit and original input deadline, and the new BodyResult keeps
+that combined bound: entering DATA cannot refresh the job allowance.
+
+Body publication on this path is new-only and clock-observed: admission and
+pre-COMMIT checks both pair database UTC with the runtime monotonic clock.
+Existing receipts refuse, and duplicate new-only publication refuses even
+after settlement or explicit owner drop. Ordinary publication and
+inspection remain historical settlement, including after later phases.
+Publication prepays the phase allowance and acquires one ordinary slot; the
+non-cloneable BodyResult retains the original earliest job/meter/ten-second
+Instant limit, not that slot. Its immutable change binds the exact attempt,
+owner generation, subset and actual RCPT replies. Known new publication
+returns BodyResult and the matching passive Dispatch for the immutable body
+read. An error returns no Body owner; unknown COMMIT keeps the exact change
+in Pending, and historical settlement cannot reconstruct a BodyResult.
+Dropping an owner releases local custody only; it does not alter durable
+phase or recovery state.
+
+### Live Body checks and reply witnesses
+
+Live Body validation shares the bounded current-state reader with
+AcceptancePossible. Under current policy, owner, route-health and
+queue-clock checks it requires the exact receipt, active attempt and
+selected InFlight Body subset. Each selected row must project a non-null
+32-byte SHA-256 of its RCPT reply's UTF-8 bytes equal to the digest of the
+retained, validated positive reply, and no DATA text; equality relies on
+SHA-256 collision resistance, consistent with stored-body and
+operation-receipt digests. PostgreSQL's pg_catalog.sha256 and
+pg_catalog.convert_to supply the witness; no extension is required. Changed
+sequences must equal the Body receipt. The query retains exact sorted subset
+membership, phase, publication receipt, active attempt, encoded membership,
+sequence/floor, reason, retry, policy, owner, health, queue-clock and expiry
+checks. `Prepared` recipients outside the selected subset remain permitted. A
+later phase refuses Body validation. Durable final capacity is required
+only for AcceptancePossible, which keeps its full positive reply validation
+and final-capacity checks.
+
+The returned local deadline conservatively bounds the current owner lease
+and submission expiry without extending the input limit. All locks end
+before return; validation neither mutates queue state nor grants lasting
+SMTP authority. A standalone check independently prepays 1 MiB + 128 KiB
+and 4096 records (both protocol byte ceilings plus a 64 KiB margin),
+acquires an ordinary slot, checks Pending, and opens one fresh qualified
+connection limited to 1 MiB input, 1088 frames and 64 KiB output, including
+authentication and runtime qualification; the frame allowance is the same
+in preparation mode. No fresh meter or later lease renewal can extend the
+original owner limit. Body acknowledges transaction rollback before
+returning; Possible checks release locks by connection closure. Body
+transfer uses the retained validator under "Prepaid Body-transfer
+validation budget". The same admission helper serves FinalResult's live
+check without touching its retained final capacity.
+
+### Body validation turns
+
+BodyChecks binds one authenticated PostgreSQL connection to the exact Body
+change, clock guard and original absolute deadline. It is non-cloneable and
+thread-bound because its worker waker targets the opening thread. It exposes
+only passive validation and owns no SMTP authority, connection permit or
+work meter; its caller retains connection capacity and admission.
+
+Each turn begins a READ COMMITTED transaction and obtains the migration
+key's shared transaction-scoped lock before inspecting the full schema
+ledger and store epoch. Runtime mode repeats the dedicated role and
+privilege checks on every turn. It then takes the policy/account locks and
+performs every live Body check above. The ordinary owner begin path retains
+its session-lock behavior; this path never recursively acquires that
+session lock. Successful validation awaits ROLLBACK completion, releasing
+the migration and row locks, and checks its resulting limit again before
+return. A refused check, failed cleanup, expired deadline or broken
+connection closes the worker permanently; a later call returns the retained
+error without SQL, even after repair.
+
+The standalone 1 MiB input, 1088 frames, 64 KiB output and ten-second cap
+span the entire connection, including all turns. A successful rollback
+replenishes no counter and extends no deadline; a returned limit can only
+tighten the next turn's cap. Runtime authentication is connection-bound;
+schema, durability, role, privileges and live dispatch conditions are
+rechecked each turn, and no result is cached between turns.
+
+### Final-result capacity reservation
+
+FinalWork reserves one process-local connection slot and prepays the phase
+allowance for a named attempt's final positive or negative DATA result. It
+is non-cloneable and retains that slot until consumption or drop.
+Consumption accepts only that attempt's phase 4/5 Change, uses the held slot
+and allowance, and cannot renew the reservation's original
+job/meter/ten-second deadline. A held slot reduces ordinary capacity, so
+publishing AcceptancePossible or running a live check while holding it
+requires another ordinary slot; settlement uses independent capacity. The
+reservation borrows its original worker, connection configuration and
+Pending owner; an unresolved operation refuses reservation or consumption.
+Publication uses the bounded native phase transaction and moves an
+uncertain COMMIT into Pending; there is no second pending queue. Abandoning
+an unused allowance releases its slot but neither refunds charged work nor
+removes any durable reservation.
+
+FinalReply is prepared before AcceptancePossible for an exact ordered subset
+of 1..100 recipients. It owns one 4096-byte reply buffer per recipient and
+both possible final-phase digest prefixes. Consuming it accepts only a
+normalized genuine 2xx, 4xx or 5xx final DATA reply, fills those buffers and
+returns the ordinary immutable phase Change; invalid ordinal sets,
+oversized or control-bearing replies and non-final reply classes refuse.
+Change shares its private immutable fields through Arc, so receipt
+inspection and publication clone that owner rather than copy reply and
+ordinal vectors, and no field can change after a Change is exposed. The
+request digest format is identical to ordinary accepted/refused
+construction, so either form settles or replays the other's receipt.
+Finishing uses retained string capacities and inline SHA-256 states and
+allocates no new reply buffers or Change owner. Native database
+connections, commit markers and bounded SQL rows remain separate
+allocations; this does not promise allocation-free database publication or
+physical disk/WAL availability.
+
+FinalPlan binds one exact attempt, owner generation and ordered recipient
+subset to both FinalReply storage and FinalWork capacity. In the relay path it
+is derived from Body custody: after actual 354 the DATA owner's `reserve_body`
+consumes BodyResult into a non-cloneable BodyPlan whose phase-3 change and
+preallocated final reply derive internally from that Body change's claim,
+generation, attempt and ordered subset; no replacement identity or subset is
+supplied. Reservation uses the same worker, the original input deadline and
+the earliest retained Body limit, further shortened by reservation admission.
+BodyPlan keeps one ordinary slot for final publication while every live Body
+check acquires another and prepays its own work; checks use the combined
+limit, so a new meter cannot extend either the original Body bound or a
+shorter reservation bound. A refused reservation closes transport and returns
+the body-transfer Refusal; it grants no body or terminator output, and
+ordinary interrupted-Body recovery owns durable retirement after that closure.
+A successful reservation returns BodyReady with the same session and mode;
+DATA custody does not expose Body, session and MAIL mode as independent parts.
+
+### Immutable body source admission
+
+BodyReady exposes the matching passive Dispatch and the live Body check. Its
+consuming `with_source` selects only that private Dispatch through the
+verified attempt-body reader. The callback receives BodySourceReady, which
+privately joins the verified reader to the same actual DATA session, MAIL
+mode and final reservation; its `begin` accepts no replacement source. The
+callback drives the source-scoped exchange to Ready and returns unit or a
+transfer Refusal. Scoped wrappers privately borrow a completion sink owned
+by `with_source`; Ready stores the final handoff there and exposes no final
+operation or completion owner to the callback. Only callback success plus
+post-callback source validation release Completed for final SMTP. The lower
+trusted body adapter keeps its explicit matching-input contract for focused
+interruption cases.
+
+Before any source connection, admission checks Pending, Runtime mode and
+the original shrinking limit, prepays 131 MiB I/O and 32768 records, and
+acquires two slots from a distinct body-source pool; aliasing the ordinary
+pool refuses. The snapshot profile allows 128 MiB input and 512 KiB output;
+each of two fresh admission profiles allows 1 MiB input and 64 KiB output.
+The work charge covers 130.625 MiB of protocol ceilings plus 384 KiB margin,
+not resident memory. Two slots cover the second admission overlapping the
+immutable snapshot; both remain held until the reader returns and destroys
+its connections, and the snapshot retains its own migration lock while
+reading. The ordinary two-slot pool still covers final custody and retained
+Body validation. No budget or deadline replenishes. Source admission
+shortens the retained BodyPlan limit, so a shorter source allowance also
+bounds final custody.
+
+The wrapper retains BodyReady outside verification until callback entry,
+and retains the callback result and private completion sink outside the
+reader's post-callback source check. Failure before entry closes the
+original session. Failure after completion closes Completed and returns its
+buffers without a terminator; durable Possible remains conservative. An
+already returned transfer Refusal keeps its original error and buffers even
+if the later source check fails. Callback success without stored completion
+refuses. A callback error after Ready explicitly closes the stored
+completion and returns its actual buffers. Source read failures do not
+invent an uncertain publication or replace Pending. Explicit buffer
+extraction closes the session and drops local reservation custody. Source
+slots are reusable before final exchange or recovery.
+
+### Bound body transfer
+
+The body wrapper consumes BodyPlan, the authenticated session and the
+matching admitted immutable source. It constructs the bounded body encoder
+with the owner's runtime clock and original deadline, borrowing separate
+wire and database meters. The encoder accumulates 16384 encoded bytes, the
+TLS plaintext ceiling, before a full-cell write; its source cell is 4096
+bytes and each codec poll is limited to 256 transitions. Exact partial-write
+offsets, pre/post deadlines and work charges apply. Full cells can need up
+to fourfold fewer successful writes than 4096-byte cells; Pending/partial
+writes and flushes prevent a universal fourfold check-count claim.
+
+Before each body write or flush turn, the wrapper checks the exact live Body
+state through the retained validator, spending one prepaid credit while
+final capacity stays held. The returned lease/submission bound only shortens
+its local cap, and original Instant limits are checked before and after
+every transfer turn. Refusal closes the transport and releases local
+ownership.
+
+After all declared bytes are encoded and flushed, the wrapper drops the
+validator before releasing its permit and then publishes known new
+AcceptancePossible through the reserved plan; the second slot is thus
+available beside the final reservation, and the earliest limit carries into
+Possible and final custody. Publication refusal closes the transport;
+unknown COMMIT remains in Pending and yields no final owner. Known success
+returns a non-separable completed-body and FinalResult pair, which can start
+the final handoff or close its transport; no different body or result owner
+can be substituted. The body wrapper itself emits no terminator.
+
+The whole attempt runs under the ten-second `Prepared` cap. Bounded
+transfers up to a near-worst-case 1,000,002-byte dot/CRLF source (1,333,336
+encoded bytes) are qualified under that cap with initial database budgets
+covering all phases; this is not a maximum-32-MiB throughput or arbitrary
+peer-backpressure qualification.
+
+### Prepaid Body-transfer validation budget
+
+Starting the bound Body transport consumes BodyPlan into a private retained
+owner. Its admission uses the verified source's actual length L, bounded by
+32 MiB, rather than the caller's maximum. A valid CRLF source expands to at
+most E = L + floor(L/3) bytes under dot transparency. The finite check count
+is 2 * ceil(E/16384) + 1 flush + 8 additional I/O attempts. Each cell
+reserves plaintext acceptance and a separate TLS-record tail drain: the
+16 KiB socket write cap is smaller than a full encrypted record. The extra
+attempts cover further partial or Pending writes/flushes, not retries or
+guaranteed progress. Every attempted write or flush consumes a check,
+including those that make no progress. Unused allowance is not returned.
+
+Before connecting, admission prepays that count times 1 MiB + 128 KiB I/O
+and 4096 records. Checked arithmetic derives the same count's cumulative
+PostgreSQL input (1 MiB each), output (64 KiB each) and frames (1088 each).
+A 32 MiB source admits at most 5471 checks: 6154.875 MiB I/O and 22409216
+records. One ordinary ReadPermit covers the retained validator separately
+from final capacity. The original Body/meter cap only tightens; no
+connection, turn or window renews it.
+
+Each turn additionally admits at most 1 MiB input, 64 KiB output and 1088
+frames, with authentication included in the first window. Available idle
+traffic drains against the preceding window before the next is granted.
+Only acknowledged rollback permits a later window, and the finite source
+budget bounds grants independently of the check counter. Parser state and
+authentication survive boundaries. Aggregate counters only decrease, and
+protocol failure permanently refuses further grants.
+
+Each write or flush spends a credit, checks Pending and the original
+meter/deadline, then performs the full Body validation turn with fresh
+qualification and live fences. Exhaustion refuses before SQL or new SMTP
+output; no hidden reconnect, counter replenishment or deadline extension is
+available. A prepaid admission short by one byte or record refuses before
+connecting; a source whose transfer outgrows its admission stops before
+body output with Capacity, Body durable, Pending empty and slots returned.
+Failure closes SMTP and drops the validator before releasing its permit.
+Standalone Body and Possible profiles are unchanged.
+
+### New AcceptancePossible publication
+
+The phase API and worker expose `publish_new_possible` for phase 3 only. It
+refuses every existing matching receipt, both during the initial lookup and
+again under the publication transaction's account locks, which closes the
+race where a receipt appears between those checks. Wrong phases refuse, and
+differing request digests keep their conflict behavior. The new
+transaction uses the same policy/owner checks, exact subset validation,
+durable capacity claim, clock observation and synchronous COMMIT path.
+Ordinary publish and inspect keep historical idempotent settlement.
+
+FinalPlan's consuming `publish_possible` uses this path and retains the
+local owner only after a known new commit; it needs a second ordinary slot
+during publication. Existing receipts refuse; uncertain COMMIT moves the
+exact phase request to Pending and releases local capacity. Settling that
+request returns only historical evidence, a later new-publication call still
+refuses its receipt, and settlement cannot manufacture a FinalResult. No
+retry silently turns settlement into new publication, and no caller-provided
+Outcome can authorize output.
+
+FinalResult privately retains the original request, reply storage, work and
+passive receipt. Its consuming `record` accepts only actual normalized final
+DATA reply text and constructs and publishes the result for the retained
+subset without a replacement Change, fresh slot or work charge. The original
+job/meter/ten-second reservation deadline caps phase publication and result
+consumption; later admission cannot extend it. Expiry after a known phase
+commit refuses the local owner and leaves durable recovery responsible for
+the unresolved phase. Dropping either owner releases local capacity only.
+Passive outcomes cannot construct these private owners.
+
+A retained FinalResult rechecks its exact phase request through a bounded
+native transaction. It requires current policy and owner, the persistent
+queue clock, healthy/due route state, the exact receipt, an active matching
+attempt, an uncompleted and unexpired submission, the entire still-InFlight
+phase-3 subset, and its exact durable final-result reservation. Remaining
+`Prepared` recipients outside that subset are permitted; no other outside
+phase is. A historical receipt alone is insufficient. Locks end before the
+call returns, and the check changes no recipient, receipt, reservation or
+account sequence. It uses another ordinary slot and prepaid work while the
+final-publication slot stays held; Pending refuses it, and the original
+final-work deadline caps it. A final owner/clock observation also checks
+submission expiry and time regression. The returned local limit starts
+before that database observation and subtracts one millisecond for
+timestamp rounding, then caps remaining lease/submission time by the
+original deadline, so database response latency cannot extend it; an
+expired response refuses rather than returning an elapsed bound. The result
+is a passive observation, not a transferable grant: only the final handoff
+calls it internally, and caller-supplied receipts or Instants cannot
+authorize terminator output.
+
+### Final DATA terminator handoff
+
+The final handoff consumes a non-cloneable FinalResult and the matching
+completed BodySent; only known new AcceptancePossible publication can
+construct that result owner, and this is the only path that emits a DATA
+terminator. BodySent alone proves encoding and flush, not the immutable
+source, actual 354, durable Body fence or matching attempt and subset; the
+owner chain above supplies those. BodySent retains its original clock and
+deadline. The handoff requires identity with the worker's runtime clock,
+keeps that body deadline and the original final-work Instant cap, and
+borrows separate wire and database meters through completion. The command
+adapter privately frames exactly `.CRLF` into three reserved bytes and
+reuses the bounded write/flush/reply parser; its public command enum
+exposes no terminator or raw command.
+
+Before each terminator write or flush turn, the owner internally rechecks
+its exact live AcceptancePossible state, charging bounded database work and
+using a second ordinary slot while final-publication capacity stays held.
+The returned lease/submission cap can only shorten the retained local
+limit; original monotonic deadlines are checked before and after transport
+turns. A refused check aborts transport.
+
+After flush, only bounded reply reading remains, and no later live-state
+check substitutes for collecting the reply. A complete actual 2xx, 4xx or
+5xx reply is published through the retained FinalResult capacity before
+completion is reported. Once the command owner returns a complete reply,
+later deadline expiry is handled by retained publication refusal; it cannot
+discard the reply. Non-final, malformed, truncated or out-of-budget replies
+refuse without an invented result. Publication failure returns FinalFailure
+with the exact reply and held slot, plus the closed transport buffers;
+unknown COMMIT also remains in Pending. Completion is a passive durable
+receipt and closed buffers, never a reusable session.
+
+### Retained final-result failures
+
+FinalResult recording returns a non-cloneable FinalFailure when publication
+fails. Once genuine normalized final reply text has been prepared, that
+failure retains the exact immutable Change and the original FinalWork slot
+and deadline; a known database refusal does not discard the actual reply or
+local capacity. Invalid reply preparation has no retained final evidence.
+Debug output exposes only the error, not reply text or connection
+credentials.
+
+An explicit retry prepays another bounded phase allowance while using the
+held slot. It cannot replace the attempt, subset or reply, and its deadline
+can only shorten the original work limit. Budget, deadline and Pending
+refusals return the still-retained failure owner. There is no automatic
+retry or new job lifetime on this owner. Unknown COMMIT keeps the exact
+request in Pending; it must settle historically before another publication
+can proceed. Success releases the local owner. Explicit drop abandons local
+custody and releases its slot; it neither consumes nor deletes the durable
+reservation, and recovery remains conservative after a crash. The runtime
+must retain or settle the actual reply before dropping that
+responsibility.
+
+After transport has closed, FinalFailure may yield its retained genuine
+final DATA Change. Extraction moves the immutable evidence and releases the
+held local connection permit; it neither releases the durable final-result
+claim nor clears Pending. Input that never created retained evidence yields
+None. The value conveys no SMTP session, output owner, work allowance or
+deadline. Its separate passive publication prepays fresh ordinary work and
+obtains a slot through the same Dispatches and Pending owner; uncertain
+COMMIT blocks until independent receipt inspection, and durable ownership,
+phase, receipt and final-capacity checks still apply. A retained receipt is
+historical only. Confirmed result publication or ordinary durable recovery
+consumes the final claim, never evidence extraction. The relay worker
+extracts and publishes it this way ("Settlement of a stopped attempt").
+
+### Retained command failures and passive evidence
+
+A genuine normalized negative MAIL or DATA-command reply first fills its
+retained evidence, then attempts bounded native publication. Every
+admission or database failure after preparation returns CommandFailure (or,
+when a negative RCPT step precedes a DATA refusal, RcptCommandFailure)
+holding the exact immutable Change or Changes, original worker and minimum
+deadline. Invalid reply preparation has no retained evidence. Debug output
+exposes the error only. Explicit retry prepays fresh work and acquires an
+ordinary slot; an admitted shorter meter shortens the retained limit even if
+publication fails. An empty budget, occupied slot or expired deadline
+preserves custody and cannot renew the cap. Unknown COMMIT remains in the
+worker's Pending owner and must settle before another publication attempt;
+the failed owner adds no second pending queue or held connection slot.
+Dropping CommandFailure abandons local evidence, not durable queue
+responsibility; the runtime must retain or settle it.
+
+After the matching SMTP session is closed or fenced, CommandFailure and
+RcptCommandFailure may yield their retained actual negative command evidence
+as immutable passive Change requests. The paired form preserves any
+unpublished negative RCPT step before its exact DATA-command result.
+Extraction allocates no reply storage and carries no transport owner,
+connection permit or deadline, and it neither clears Pending nor declares an
+uncertain operation absent. Original command retries still cannot renew
+their earliest admitted cap; separate settlement admits fresh bounded
+database work through the same Dispatches/Pending owner and publishes the
+preceding refusal first. Native publication still verifies current durable
+ownership and phase, or an exact retained receipt; expired route ownership,
+replacement, cancellation and receipt-retention expiry are not bypassed.
+Receipt replay can only continue passive result publication, never SMTP
+output. This separates the local SMTP work cap from passive database
+settlement.
+
+### Current-owner interruption with RCPT evidence
+
+Current-owner recovery can retain an ordered subset of actual positive RCPT
+replies. `interrupted_with_rcpt` binds at most 100 normalized 4096-byte
+replies to the exact retained recovery operation; a domain-separated digest
+includes their ordinals and text. Publication requires every supplied
+recipient to remain InFlight/`Prepared` under the current attempt and owner
+fence; a foreign, settled, Body or AcceptancePossible recipient refuses the
+whole operation. Within the atomic recovery transaction, supplied positive
+replies replace prior RCPT history and clear prior DATA history before the
+ordinary interruption state transition. Other recipients retain their
+recorded evidence, and earlier uncertainty remains latched.
+
+A separately domain-separated `interrupted_with_body_rcpt` request handles a
+fenced session whose Body publication may have completed. It retains the
+same bounded ordered actual-positive subset. Under current ownership and
+recipient locks, each supplied member must be `Prepared` or Body. `Prepared`
+members receive the retained actual RCPT and clear prior DATA; already-Body
+members must already contain byte-identical RCPT evidence and no DATA reply,
+and are not rewritten. Supplied AcceptancePossible, mismatching, foreign or
+settled members refuse. `interrupted_with_rcpt` remains `Prepared`-only, and
+the no-evidence interruption and abandoned-recovery encodings are
+unchanged. Both requests apply ordinary interrupted recovery atomically with
+their receipt, preserving uncertainty and existing retry/expiry rules. They
+do not infer a missing COMMIT: Pending still blocks until exact receipt
+inspection.
+
+The publisher uses the bounded batch client so 100 maximum-size reply
+parameters fit within its one-MiB output allowance. Input remains one
+MiB/1088 frames, and the original ten-second deadline cannot renew. The
+usual replay, expiry hold, receipt capacity, sequence and unknown-COMMIT
+rules apply.
+
+The RCPT and DATA owners derive these requests only after the matching
+session is closed or fenced. RCPT interruption planning returns the exact
+negative refusal and, when recipients remain, a current-owner recovery
+request carrying the retained positive replies; a complete all-refused batch
+needs only its refusal, which retires the attempt. Partial collections cannot
+create DATA custody. A failed positive DATA handoff plans interruption with
+`interrupted_with_body_rcpt`, handling `Prepared` members or exact
+already-Body evidence after a known or uncertain publication. Negative RCPT
+evidence is published before Body, DATA refusal or interruption recovery,
+publication stops on unknown COMMIT, and actual DATA replies are retained
+across any failed negative-RCPT publication. Untouched-envelope checks
+remain invalid after partial publication. These are passive settlement
+requests, never a renewal of transport ownership: neither request can
+establish Body or authorize new SMTP output.
+
+### Relay recovery publication
+
+`Dispatches::publish_recovery` accepts a retained recovery operation only
+after the caller has closed or fenced the affected transport. It prepays the
+phase allowance under the supplied job/meter deadline, acquires an ordinary
+slot, and publishes through the native recovery transaction. Known success
+returns only a passive receipt. A known failure releases Pending; the
+caller retains an operation clone for explicit retry. Unknown COMMIT leaves
+the exact recovery in Pending. This is a bounded settlement job, not a
+renewal of any expired transport owner.
+
+### Unknown-COMMIT settlement and proof of absence
+
+An unknown COMMIT leaves the exact operation in the single Pending owner
+shared by attempt, phase, recovery, route-failure, route-acquisition and
+expiry publication, and all new dispatch, phase, recovery, route-failure,
+acquisition, expiry and final-capacity work stays blocked. `Pending::settle`
+prepays fresh work and uses the caller's independent settlement slots to
+inspect that exact receipt. An error retains custody; a found receipt or
+proven absence clears it. A matching receipt returns a tagged historical
+Settlement without a second state mutation or account-sequence change.
+Settlement never republishes, constructs a replacement operation or creates
+continuing SMTP authority. The worker settles before any other step of a
+turn and retries a failed inspection once a second until stop is requested.
+
+Absence is proof because of lock order. Every publication this barrier holds
+(attempt, phase, recovery, route failure, route acquisition, expiry) takes the
+account row FOR UPDATE before it writes its receipt and sends COMMIT, and
+every inspection takes that row FOR SHARE before it reads the receipt under a
+fresh READ COMMITTED snapshot. Settlement starts only after the uncertain call
+returned, so its share lock waits until the uncertain transaction committed or
+rolled back, and a missing receipt then means it rolled back; a receipt kind
+with bounded retention ([Route-owner acquisition receipt
+retention](#route-owner-acquisition-receipt-retention), [Expiry receipt
+retention](#expiry-receipt-retention), [Route-health receipt retention and the
+lease window](#route-health-receipt-retention-and-the-lease-window) and
+[Reclamation of retired attempts](#reclamation-of-retired-attempts)) can also
+read absent once it expired. Either way the operation is not retained, and
+holding the barrier would only wedge the worker while it keeps renewing its
+lease. The caller then publishes the same passive change afresh, under the
+same fences as any first publication, or rederives from durable state: the
+scheduler's next turn finds a committed attempt through active-attempt
+discovery and otherwise dispatches anew. Passive evidence changes are
+republished; a live Body or AcceptancePossible plan was consumed with its
+closed transport, so the relay falls back to recovery from the durable phase.
+The relay's route success and repair loop treats absence the same way.
+
+The proof needs four things this design must keep: every publisher of these
+kinds locks the account row FOR UPDATE before COMMIT and every inspector locks
+it FOR SHARE before reading the receipt; lock and statement timeouts surface
+as errors, which retain custody; all of them use the single pinned primary,
+and an HTTP owner inspects only the endpoint it published to; and no path
+deletes such a receipt while its operation can still be pending, beyond the
+bounded sweeps of [Route-owner acquisition receipt
+retention](#route-owner-acquisition-receipt-retention), [Expiry receipt
+retention](#expiry-receipt-retention), [Route-health receipt retention and the
+lease window](#route-health-receipt-retention-and-the-lease-window),
+[Retention of settled submissions](#retention-of-settled-submissions) and
+[Reclamation of retired attempts](#reclamation-of-retired-attempts) and the
+HTTP families' sweeps by another instance serving the same account ([Receipt
+retention for HTTP writes](#receipt-retention-for-http-writes)). Any further
+sweep of attempt, phase, recovery, expiry or HTTP-family receipts must respect
+that.
+
+### Settlement of retained HTTPS writes
+
+The fixed HTTPS worker's owners obey the same order and treat absence the
+same way: Email update, deletion and filing, folder, draft, upload,
+submission and cancellation ([Email keyword and mailbox
+updates](#email-keyword-and-mailbox-updates), [Expired upload lease
+reclamation](#expired-upload-lease-reclamation), [Plain-text draft
+creation](#plain-text-draft-creation), [Root-folder
+creation](#root-folder-creation), [Email deletion](#email-deletion),
+[Submission publication](#submission-publication), [Success filing after
+submission](#success-filing-after-submission) and [Whole-submission
+cancellation publication](#whole-submission-cancellation-publication)). Each
+retains an uncertain operation with the endpoint its COMMIT went to and
+inspects only there, never resolving again or falling back, because the
+share lock proves nothing on another server. Within the account and time
+limits of [Uncertain HTTP writes and inline
+settlement](#uncertain-http-writes-and-inline-settlement), a new write
+inspects the retained operation. A found receipt or absence releases it.
+Only publication in the same family sweeps expired receipts ([Receipt
+retention for HTTP writes](#receipt-retention-for-http-writes)); another
+process serving the same account may have swept an expired receipt before
+inspection, so absence then also covers expired evidence.
+
+Once released, the family is no longer fenced, and the server does not
+deduplicate a second draft or submission of the same Email. A client whose
+create response was lost must therefore reconcile before retrying, as
+td-mail does for submissions by querying its identity and sendAt interval
+(DESIGN.md). Loss of the old endpoint can delay another write to the same
+account during the one-minute inspection window. Releasing the local slot
+leaves the original result indeterminate.
+
+### Settlement of a stopped attempt
+
+A stopped attempt is a trusted runtime handoff, not an automatic recovery
+instruction. Its evidence names the stage (MAIL, RCPT, DATA, Body, source or
+final); the worker records `relay_step_failed` with that stage and settles
+it in this order:
+
+1. Publish actual negative or final evidence: a retained negative MAIL or
+   final DATA Change; for a DATA-command refusal, the negative RCPT subset
+   and then the DATA-command result; for an RCPT stop or DATA planning
+   failure, the collected negative RCPT refusal. Each publication first
+   settles Pending, uses ordinary phase publication with a fresh ten-second
+   cap and meter, and repeats once a second until it succeeds or the
+   attempt is already gone.
+2. Settle any unknown Pending.
+3. Publish the evidence-aware recovery: RCPT stops use the
+   positive-reply-aware interruption; DATA planning and Body-handoff
+   failures use their corresponding conversions.
+4. Otherwise, unless step 1 already retired the attempt, publish the generic
+   interruption from the driver's passive custody. It addresses only
+   unresolved durable state; durable Possible stays uncertain even when
+   source postvalidation fails before a terminator is sent.
+
+Recovery publication likewise settles Pending first and repeats once a
+second; a missing attempt means a committed recovery already retired it. A
+requested stop abandons custody that is still unresolved, and durable phase
+recovery on restart remains conservative. The worker then offers route
+success, which applies only when the attempt durably accepted final DATA
+([Route success reset](#route-success-reset)).
+
+### Ordered retirement after a remote setup failure
+
+`PreparedResult.into_failed`, reached from setup through MailPlan, consumes
+pre-MAIL authority into a non-cloneable FailedPrepared continuation after
+all failed transport is closed and the actual remote failure classified.
+Local capacity, cancellation and invalid configuration are not remote
+Network or Auth failures. The owner derives both the route-health change
+and one interrupted-recovery request from its private Dispatch; it accepts
+no replacement claim, fence, attempt or recovery operation. Preparation
+failures retain passive custody, and both requests exist before either
+publication starts.
+
+Each step runs at most one bounded publication or exact receipt inspection.
+Health must complete before recovery retires recipients. A known failure
+retains that publication stage for explicit retry. An unknown health or
+recovery COMMIT moves the exact request into Pending and switches the
+continuation to receipt inspection for that stage. Errors keep inspecting;
+a receipt proven absent returns the stage to publication of the same
+request, which the still-active attempt admits idempotently. A validated
+health receipt advances to recovery; only validated recovery completion
+returns the combined passive outcome. Repeated completed steps do no I/O.
+
+The continuation never accepts public Settlement data as authority. It
+inspects its own retained request and matches an occupied Pending slot by
+private request identity, not merely attempt ID; another operation refuses
+Busy. If ordinary `Pending::settle` already cleared the slot, by a found
+receipt or proven absence, the continuation reinstalls its exact request and
+inspects it again: empty Pending alone proves neither success nor rollback.
+Inspection and matching slot clearance occur under the Pending mutex; there
+is no second pending queue.
+
+After transport is fenced, passive steps may receive fresh bounded deadlines
+and work even when the original SMTP cap has expired. Runtime admission, the
+supplied and meter deadlines, the ten-second connection ceiling and ordinary
+ownership, selection and expiry fences still apply. Publication uses
+ordinary capacity; inspection uses a separately reserved settlement pool,
+which must not alias the ordinary pool (aliasing refuses Forbidden). No
+`Prepared` owner, session or transport permission can be reconstructed from
+this continuation. The worker steps it with a fresh ten-second cap and
+meter, pausing one second between unfinished steps, until it completes or a
+committed recovery is found to have retired the attempt; a requested stop
+abandons it. Authentication and TLS failures thus publish the route pause
+and network failures the backoff of [Route failure
+publication](#route-failure-publication) before the attempt's recipients are
+retired.
+
+### Route-candidate pages
+
+`Dispatches::candidates` wraps the route scanner in the worker admission
+above. Only Runtime connections enter; Pending must be empty and its
+nonblocking operation guard spans the read. Each page prepays
+1 MiB + 128 KiB protocol I/O and 4096 records, reserves one ordinary
+ReadPermit, and uses the minimum of the supplied deadline, current meter
+deadline and ten-second operation cap. Slot or work exhaustion refuses
+without waiting, and a successful read must still finish before that cap.
+The database connection closes before the slot returns. No read installs,
+clears or settles a Pending operation.
+
+Fresh, retry and expiry pages keep the scanner's policy, ownership,
+route-health, active-attempt, ordering and cursor rules ([Fresh and retry
+candidate discovery](#fresh-and-retry-candidate-discovery), [Expiry discovery
+during delivery pauses](#expiry-discovery-during-delivery-pauses)). Pages
+contain at most 64 passive hints, not reservations or SMTP authority, and a
+new scheduling pass restarts pagination. Candidate timestamps do not update or
+bypass the persistent queue-clock guard; `Prepared` and expiry publication
+independently recheck the clock, current policy, owner and exact durable
+state. The worker reads at most one expiry page and one fresh or retry page
+per turn, alternating fresh and retry work ([Relay scheduling
+turn](#relay-scheduling-turn)).
+
+### Route acquisition through the relay worker
+
+`Dispatches::acquire_route` admits one exact prepared Claim through the
+worker's Runtime-only connection, original input/meter deadline and ten-second
+cap. It prepays 2 MiB + 192 KiB I/O and 4096 records for receipt inspection
+and possible publication, reserving one ordinary slot across both sequential
+connections. Admission refusal installs no Pending operation. The claim then
+moves into Pending before database work. Known success and definite failure
+clear custody; an unknown COMMIT retains the exact claim, and no further scan,
+attempt, phase or acquisition can pass that barrier. Settlement inspects the
+retained claim receipt with independently admitted capacity and never replays
+acquisition. Errors preserve custody; a matching receipt clears it and returns
+`Settlement::RouteClaim`, and proven absence clears it without a settlement.
+The receipt is retained only for [Route-owner acquisition receipt
+retention](#route-owner-acquisition-receipt-retention)'s hour after its lease,
+so absence settled later may also mean an expired receipt; the caller's
+retried acquisition then takes a fresh generation, which is safe under
+[Route-owner acquisition receipt
+retention](#route-owner-acquisition-receipt-retention).
+
+This entry point has only test callers: the foreground worker acquires and
+renews its per-account claims directly through the route-owner store
+([Account leases and batch renewal](#account-leases-and-batch-renewal)).
+The grant is historical evidence only, even when returned by a known
+acquisition. Fresh current-owner and attempt admission must still precede
+SMTP, and an expired or released receipt cannot revive an owner. Known
+committed results are not converted into deadline refusals.
+
+### Expiry through the relay worker
+
+`Dispatches::expire` brings one prepared queue-expiry operation under the
+worker's Runtime, original-deadline, work-meter, ordinary-slot and Pending
+admission; in each turn where the account holds the shared expiry turn and the
+clock guard admits expiry, the foreground worker runs it before candidate
+dispatch ([Relay scheduling turn](#relay-scheduling-turn)). The route's SMTP
+transport, including the current owner's attempt, is closed before expiry; the
+worker never expires while it holds an attempt's transport. The entry point
+grants no transport authority.
+
+Admission prepays the 2 MiB + 192 KiB receipt-inspection and
+possible-publication allowance. Pending takes the exact owned Expiry before
+SQL; its public identity is `Identity::Expiry(SubmissionExpiryId)`. Known
+publication or historical replay returns the outcome and clears custody;
+definite failure clears custody; an unknown COMMIT retains the operation and
+excludes every further worker operation. Independent settlement capacity
+inspects only that exact receipt. Errors retain the barrier;
+`Settlement::Expiry` clears it on a matching historical outcome, and proven
+absence clears it for the next expiry turn to rederive. Settlement never
+retries publication or changes recipient state.
+
+The expiry transaction keeps fresh policy and owner fencing, the queue-clock
+admission rules of [Runtime queue clock guard](#runtime-queue-clock-guard)
+and [Clock-guarded expiry admission](#clock-guarded-expiry-admission),
+process-local and database-wide spacing, at most 100 recipients,
+current-attempt reservation handling, uncertainty preservation and one
+account-sequence change. Admission does not confirm or replace the shared
+clock guard. Every expiry clock-guard access uses nonblocking lock
+acquisition; contention refuses as Clock(Invalid) without waiting for
+another holder. Historical receipt replay may settle during a new clock hold
+because it cannot perform another expiry mutation.
+
+### Typed parameters for single-round-trip queries
+
+The schema, role, policy, owner, health, receipt and recipient reads of
+Body validation use explicit PostgreSQL parameter types so the driver can
+send each query in one round trip without separately preparing and closing
+a statement. SQL ordering, lock lifetimes and fresh observations are
+unchanged, and no result is cached between validation turns. The same
+single-round-trip calls cover primary read snapshot selection and account
+state, device-token reads, body reauthorization, Email/query pagination and
+counts and thread membership windows. Their nullable parameters keep
+explicit bytea or bigint types; predicates, ordering, result-cardinality
+checks and authorization boundaries are unchanged.
+
+### HTTPS body-worker concurrency
+
+HTTPS uses up to three body workers, each retaining its own request
+snapshot, credentials and original deadline. The worker count reserves two
+read slots per concurrent exchange for verification plus fresh
+authorization. Session API concurrency advertises this same configured
+worker count; upload concurrency remains one because the native ingress
+buffer is shared. A separate upload permit refuses overlapping uploads with
+429 before backend admission. When at least two workers exist, transfers may
+occupy all but one; the final capacity remains available for API work. The
+default three workers allow two downloads alongside an API request. No read
+result or authority crosses workers. Pending-publication guards still
+serialize or refuse conflicting mutations; parallel readers do not promise
+parallel writes or change unknown-COMMIT settlement.

@@ -4425,7 +4425,7 @@ The shared Pending enum retains one bounded Claim only after admission; its
 identity distinguishes attempt, route-claim and expiry operations. Settlement
 prepays the same conservative work bound on independently supplied slots,
 performs receipt inspection only, retains the claim on error and releases it
-on a found receipt or proven absence (POSTGRES.md section 165).
+on a found receipt or proven absence (POSTGRES.md, [Unknown-COMMIT settlement and proof of absence](POSTGRES.md#unknown-commit-settlement-and-proof-of-absence)).
 No waiting queue, connection retention or transport authority is added.
 
 The admitted queue-expiry worker uses the same two-connection conservative
@@ -4597,7 +4597,7 @@ replay and framing even on fallback. Composition and source/body digests
 charge the same meter separately. Refusal discards provisional bytes; the
 existing pending owner retains only the prepared message/manifests after an
 unknown COMMIT, within the account and time limits for subsequent writes
-(POSTGRES.md, [Uncertain HTTP writes and inline settlement](POSTGRES.md#uncertain-http-writes-and-inline-settlement) and section 165). Filename, media type and description limits are
+(POSTGRES.md, [Uncertain HTTP writes and inline settlement](POSTGRES.md#uncertain-http-writes-and-inline-settlement) and [Settlement of retained HTTPS writes](POSTGRES.md#settlement-of-retained-https-writes)). Filename, media type and description limits are
 255, 127 and 1024 bytes per part; composition uses fixed encoder/header
 scratch. This is a finite memory/work bound, not maximum-size throughput
 qualification.
