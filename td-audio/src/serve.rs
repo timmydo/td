@@ -15,7 +15,7 @@
 
 use crate::mixer::Mixer;
 use crate::proto::subscription;
-use crate::session::{Disconnect, Session};
+use crate::session::{Disconnect, GlobalRequest, Session};
 use crate::sink::{is_underrun, AudioSink, Spec};
 use crate::sys::{self, Interest, PollSet};
 use std::fmt;
@@ -227,6 +227,36 @@ const MAX_DAEMON_DIAGNOSTICS: usize = 16;
 const MAX_FRAMES_PER_CLIENT_PASS: usize = 32;
 const MAX_FRAMES_PER_PASS: usize = 256;
 
+/// The applications a connection can be a player for, each with a level of
+/// its own that the daemon keeps (§K.5) so it outlives the application's
+/// streams and connections. `Policy::role` makes only the browser's account
+/// a player, so this is the browser alone; a later player application is a
+/// row here, which keeps the table fixed and allocation-free.
+const PLAYER_APPLICATIONS: &[&str] = &[BROWSER];
+
+/// Unity and unmuted: an application the human has not turned down.
+const UNITY_LEVEL: (u32, bool) = (crate::mixer::VOLUME_NORM, false);
+
+/// Two distinct clients, mutably: the requester and the owner of what it
+/// asked about.
+fn pair_mut(
+    clients: &mut [Client],
+    first: usize,
+    second: usize,
+) -> Option<(&mut Client, &mut Client)> {
+    if first == second || first.max(second) >= clients.len() {
+        return None;
+    }
+    if first < second {
+        let (left, right) = clients.split_at_mut(second);
+        Some((left.get_mut(first)?, right.first_mut()?))
+    } else {
+        let (left, right) = clients.split_at_mut(first);
+        let second = left.get_mut(second)?;
+        Some((right.first_mut()?, second))
+    }
+}
+
 /// One connected client.
 struct Client {
     stream: UnixStream,
@@ -336,6 +366,9 @@ pub struct Server<S: AudioSink> {
     listener: UnixListener,
     path: PathBuf,
     clients: Vec<Client>,
+    /// The human's level per player application, by `PLAYER_APPLICATIONS`
+    /// position.
+    app_levels: [(u32, bool); PLAYER_APPLICATIONS.len()],
     mixer: Mixer,
     sink: S,
     policy: Policy,
@@ -376,6 +409,7 @@ impl<S: AudioSink> Server<S> {
             listener,
             path: path.to_path_buf(),
             clients: Vec::new(),
+            app_levels: [UNITY_LEVEL; PLAYER_APPLICATIONS.len()],
             mixer: Mixer::with_target_floor(spec, target_floor_frames),
             sink,
             policy,
@@ -612,9 +646,17 @@ impl<S: AudioSink> Server<S> {
             self.refused = self.refused.saturating_add(1);
             return;
         };
+        let mut session =
+            Session::new(self.spec, index).with_controller_role(role == Role::Controller);
+        if role == Role::Player {
+            // The role and the name come from the same policy row: the only
+            // player today is the browser's account.
+            session = session.with_application(BROWSER);
+            session.set_app_level(self.app_level(BROWSER), &mut self.mixer);
+        }
         self.clients.push(Client {
             stream,
-            session: Session::new(self.spec, index).with_output_control(role == Role::Controller),
+            session,
             peer,
             role,
             pending: Vec::new(),
@@ -668,53 +710,227 @@ impl<S: AudioSink> Server<S> {
                 requests.push((requester, request));
             }
         }
-        let (clients, mixer) = (&mut self.clients, &mut self.mixer);
         for (requester, request) in requests {
-            let index = match &request {
-                crate::session::GlobalRequest::Info { index, .. }
-                | crate::session::GlobalRequest::Volume { index, .. }
-                | crate::session::GlobalRequest::Mute { index, .. } => *index,
-            };
-            // A player's own streams never reach this router, so whatever it
-            // names here is another connection's or nobody's, and gets the
-            // same answer either way: an index that exists is not revealed.
-            let controller = clients
+            // Only a controller's session raises the list requests, and a
+            // player's own streams never reach this router, so whatever a
+            // player names here is another connection's or nobody's, and gets
+            // the same answer either way: an index that exists is not
+            // revealed.
+            let controller = self
+                .clients
                 .get(requester)
                 .is_some_and(|client| client.role == Role::Controller);
-            let owner = clients
-                .iter()
-                .position(|client| client.session.owns_sink_input(index))
-                .filter(|_| controller);
-            let Some(owner) = owner else {
-                if let Some(client) = clients.get_mut(requester) {
-                    client.session.reject_global_request(request);
-                }
-                continue;
-            };
-            if owner == requester {
-                if let Some(client) = clients.get_mut(requester) {
+            if !controller {
+                if let Some(client) = self.clients.get_mut(requester) {
                     client.session.reject_global_request(request);
                 }
                 continue;
             }
-            if requester < owner {
-                let (before_owner, from_owner) = clients.split_at_mut(owner);
-                if let (Some(requester), Some(owner)) =
-                    (before_owner.get_mut(requester), from_owner.first_mut())
-                {
-                    requester
-                        .session
-                        .complete_global_request(&mut owner.session, request, mixer);
+            match request {
+                GlobalRequest::SinkInputList { tag, version } => {
+                    self.reply_sink_input_list(requester, tag, version);
                 }
-            } else {
-                let (through_owner, after_owner) = clients.split_at_mut(requester);
-                if let (Some(owner), Some(requester)) =
-                    (through_owner.get_mut(owner), after_owner.first_mut())
-                {
-                    requester
-                        .session
-                        .complete_global_request(&mut owner.session, request, mixer);
+                GlobalRequest::ClientList { tag, version } => {
+                    self.reply_clients(requester, tag, version, None);
                 }
+                GlobalRequest::ClientInfo {
+                    tag,
+                    index,
+                    version,
+                } => {
+                    self.reply_clients(requester, tag, version, Some(index));
+                }
+                stream_request => self.route_stream_request(requester, stream_request),
+            }
+        }
+    }
+
+    /// Every connection's streams, in one reply to a controller. A player's
+    /// are shown at its application's level, which is the one a controller
+    /// sets.
+    fn reply_sink_input_list(&mut self, requester: usize, tag: u32, version: u32) {
+        let mut writer = crate::tag::Writer::new();
+        writer.u32(crate::proto::command::REPLY).u32(tag);
+        for client in &self.clients {
+            let level = (client.role == Role::Player).then(|| client.session.app_level());
+            client
+                .session
+                .write_sink_inputs(&mut writer, version, &self.mixer, level);
+        }
+        if let Some(client) = self.clients.get_mut(requester) {
+            client.session.deliver(tag, writer.as_bytes());
+        }
+    }
+
+    /// Every connection, or the one whose client index is `only`, in one
+    /// reply to a controller.
+    fn reply_clients(&mut self, requester: usize, tag: u32, version: u32, only: Option<u32>) {
+        let mut writer = crate::tag::Writer::new();
+        writer.u32(crate::proto::command::REPLY).u32(tag);
+        let mut found = false;
+        for client in &self.clients {
+            if only.is_none_or(|index| client.session.client_index() == index) {
+                client.session.write_client(&mut writer, version);
+                found = true;
+            }
+        }
+        let Some(client) = self.clients.get_mut(requester) else {
+            return;
+        };
+        if only.is_some() && !found {
+            client.session.fail(tag, crate::proto::error::NOENTITY);
+            return;
+        }
+        client.session.deliver(tag, writer.as_bytes());
+    }
+
+    /// A controller's request about one stream another connection owns.
+    ///
+    /// A controller's write to a controller's stream lands in that stream,
+    /// as it always has. One to a PLAYER's stream sets the human's level for
+    /// the player's application instead: a gain of its own that every stream
+    /// of that application plays under, that the application cannot see or
+    /// rewrite, and that its next stream starts at. A lookup of a player's
+    /// stream reports that level, the one the controller sets.
+    fn route_stream_request(&mut self, requester: usize, request: GlobalRequest) {
+        let index = match &request {
+            GlobalRequest::Info { index, .. }
+            | GlobalRequest::Volume { index, .. }
+            | GlobalRequest::Mute { index, .. } => *index,
+            GlobalRequest::SinkInputList { .. }
+            | GlobalRequest::ClientInfo { .. }
+            | GlobalRequest::ClientList { .. } => {
+                if let Some(client) = self.clients.get_mut(requester) {
+                    client.session.reject_global_request(request);
+                }
+                return;
+            }
+        };
+        let owner = self
+            .clients
+            .iter()
+            .position(|client| client.session.owns_sink_input(index))
+            .filter(|owner| *owner != requester);
+        let Some(owner) = owner else {
+            if let Some(client) = self.clients.get_mut(requester) {
+                client.session.reject_global_request(request);
+            }
+            return;
+        };
+        let player = self
+            .clients
+            .get(owner)
+            .is_some_and(|client| client.role == Role::Player);
+        match request {
+            GlobalRequest::Volume { tag, volumes, .. } if player => {
+                let volume = volumes
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(crate::mixer::VOLUME_NORM);
+                self.set_app_level(requester, owner, tag, |level| (volume, level.1));
+            }
+            GlobalRequest::Mute { tag, muted, .. } if player => {
+                self.set_app_level(requester, owner, tag, |level| (level.0, muted));
+            }
+            GlobalRequest::Info {
+                tag,
+                index,
+                version,
+            } if player => {
+                if let Some((requester, owner)) = pair_mut(&mut self.clients, requester, owner) {
+                    let level = Some(owner.session.app_level());
+                    requester.session.describe_foreign(
+                        &owner.session,
+                        tag,
+                        index,
+                        version,
+                        &self.mixer,
+                        level,
+                    );
+                }
+            }
+            request => {
+                if let Some((requester, owner)) = pair_mut(&mut self.clients, requester, owner) {
+                    requester.session.complete_global_request(
+                        &mut owner.session,
+                        request,
+                        &mut self.mixer,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The human's level for `application`, unity until one is set.
+    fn app_level(&self, application: &str) -> (u32, bool) {
+        PLAYER_APPLICATIONS
+            .iter()
+            .position(|name| *name == application)
+            .and_then(|at| self.app_levels.get(at).copied())
+            .unwrap_or(UNITY_LEVEL)
+    }
+
+    /// Change the human's level for the application `owner` runs: on every
+    /// connection of that application, and remembered for its later ones.
+    /// Then acknowledge the requester and, when the level changed, tell every
+    /// controller that each of the application's streams did. The player is
+    /// told nothing: in its view nothing changed.
+    fn set_app_level(
+        &mut self,
+        requester: usize,
+        owner: usize,
+        tag: u32,
+        change: impl FnOnce((u32, bool)) -> (u32, bool),
+    ) {
+        let found = self.clients.get(owner).and_then(|client| {
+            PLAYER_APPLICATIONS
+                .iter()
+                .position(|name| *name == client.session.application())
+        });
+        let (Some(at), Some(application)) = (
+            found,
+            found.and_then(|at| PLAYER_APPLICATIONS.get(at).copied()),
+        ) else {
+            // A player is named from this table at admission, so a player
+            // whose application is not in it is a daemon fault.
+            if let Some(client) = self.clients.get_mut(requester) {
+                client.session.fail(tag, crate::proto::error::INTERNAL);
+            }
+            return;
+        };
+        let Some(slot) = self.app_levels.get_mut(at) else {
+            return;
+        };
+        let before = *slot;
+        let (volume, muted) = change(before);
+        let level = (volume.min(crate::mixer::VOLUME_MAX), muted);
+        *slot = level;
+        let is_application = |client: &Client| {
+            client.role == Role::Player && client.session.application() == application
+        };
+        for client in self.clients.iter_mut() {
+            if is_application(client) {
+                client.session.set_app_level(level, &mut self.mixer);
+            }
+        }
+        if let Some(client) = self.clients.get_mut(requester) {
+            client.session.acknowledge(tag);
+        }
+        if level == before {
+            return;
+        }
+        for at in 0..self.clients.len() {
+            let indexes = match self.clients.get(at) {
+                Some(client) if is_application(client) => client.session.sink_input_indexes(),
+                _ => continue,
+            };
+            for index in indexes {
+                self.notify_controllers(
+                    None,
+                    subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+                    index,
+                );
             }
         }
     }
@@ -1303,8 +1519,12 @@ mod tests {
         decoder.push(bytes);
         let mut packets = Vec::new();
         while let Some(frame) = decoder.next_frame() {
-            if let Ok(wire::Frame::Control(packet)) = frame {
-                packets.push(packet);
+            match frame {
+                Ok(wire::Frame::Control(packet)) => packets.push(packet),
+                Ok(_) => {}
+                // A frame td-pulse refuses, such as one over `CONTROL_MAX`, is
+                // a failure to report, not one to retry forever.
+                Err(error) => panic!("the server sent a frame td-pulse refuses: {error:?}"),
             }
         }
         packets
@@ -2058,6 +2278,469 @@ mod tests {
         assert_eq!(subscription_events(&drain_socket(&mut watcher)), Vec::new());
     }
 
+    /// `create_request` with the stream named `name`.
+    fn named_create_request(tag_number: u32, name: &str) -> Vec<u8> {
+        build(command::CREATE_PLAYBACK_STREAM, tag_number, |writer| {
+            writer
+                .sample_spec(tag::SampleSpec {
+                    format: crate::proto::format::SAMPLE_S16LE,
+                    channels: 2,
+                    rate: 48_000,
+                })
+                .channel_map(&crate::session::CHANNEL_MAP)
+                .u32(tag::INVALID_INDEX)
+                .null_string()
+                .u32(tag::INVALID_INDEX)
+                .boolean(false)
+                .u32(tag::INVALID_INDEX)
+                .u32(tag::INVALID_INDEX)
+                .u32(tag::INVALID_INDEX)
+                .u32(0)
+                .cvolume(&[crate::mixer::VOLUME_NORM, crate::mixer::VOLUME_NORM]);
+            for _ in 0..9 {
+                writer.boolean(false);
+            }
+            writer.proplist(&[tag::text_property("media.name", name)]);
+            for _ in 0..7 {
+                writer.boolean(false);
+            }
+            writer.u8(0);
+        })
+    }
+
+    fn client_name_packet(tag_number: u32, application: &str) -> Vec<u8> {
+        build(command::SET_CLIENT_NAME, tag_number, |writer| {
+            writer.proplist(&[tag::text_property("application.name", application)]);
+        })
+    }
+
+    fn property_value(properties: &[tag::Property], key: &str) -> Option<String> {
+        properties
+            .iter()
+            .find(|property| property.key == key)
+            .map(|property| {
+                String::from_utf8_lossy(&property.value)
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
+    }
+
+    /// One sink-input entry as a version-35 reply writes it.
+    #[derive(Debug)]
+    struct SinkInputEntry {
+        index: u32,
+        name: String,
+        client: u32,
+        volume: Vec<u32>,
+        muted: bool,
+        properties: Vec<tag::Property>,
+    }
+
+    fn sink_input_entries(reply: &[u8]) -> Vec<SinkInputEntry> {
+        let mut reader = tag::Reader::new(reply);
+        reader.u32().unwrap();
+        reader.u32().unwrap();
+        let mut entries = Vec::new();
+        while reader.finish().is_err() {
+            let index = reader.u32().unwrap();
+            let name = reader.string().unwrap().unwrap_or_default();
+            reader.skip().unwrap();
+            let client = reader.u32().unwrap();
+            for _ in 0..3 {
+                reader.skip().unwrap();
+            }
+            let volume = reader.cvolume().unwrap();
+            for _ in 0..4 {
+                reader.skip().unwrap();
+            }
+            let muted = reader.boolean().unwrap();
+            let properties = reader.proplist().unwrap();
+            for _ in 0..4 {
+                reader.skip().unwrap();
+            }
+            entries.push(SinkInputEntry {
+                index,
+                name,
+                client,
+                volume,
+                muted,
+                properties,
+            });
+        }
+        entries
+    }
+
+    /// `(index, name, application.name)` per client-info entry.
+    fn client_entries(reply: &[u8]) -> Vec<(u32, String, Option<String>)> {
+        let mut reader = tag::Reader::new(reply);
+        reader.u32().unwrap();
+        reader.u32().unwrap();
+        let mut entries = Vec::new();
+        while reader.finish().is_err() {
+            let index = reader.u32().unwrap();
+            let name = reader.string().unwrap().unwrap_or_default();
+            reader.skip().unwrap();
+            reader.skip().unwrap();
+            let properties = reader.proplist().unwrap();
+            entries.push((index, name, property_value(&properties, "application.name")));
+        }
+        entries
+    }
+
+    /// A controller lists every stream and every connection. A player's
+    /// application is named from its uid, whatever it calls itself, and the
+    /// text it chose reaches the controller without control characters. A
+    /// player's own view is unchanged: the three list commands are ones this
+    /// server does not have, and its own stream is described exactly as
+    /// before, raw name and all.
+    #[test]
+    fn a_controller_lists_every_stream_and_client_and_a_player_lists_nothing() {
+        let (mut server, path) = server("lists");
+        server.policy = browser_policy(own_uid());
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut controller = UnixStream::connect(&path).unwrap();
+        for socket in [&mut player, &mut controller] {
+            socket.write_all(&auth_packet()).unwrap();
+        }
+        server.pass().unwrap();
+        player
+            .write_all(&client_name_packet(2, "td-update"))
+            .unwrap();
+        controller
+            .write_all(&client_name_packet(2, "td-mixer"))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut player);
+        let _ = drain_socket(&mut controller);
+        let hostile = "tab\u{1b}[2J\u{7}title";
+        player.write_all(&named_create_request(3, hostile)).unwrap();
+        controller
+            .write_all(&named_create_request(3, "a notification"))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let player_stream = created_sink_input(&drain_socket(&mut player)).unwrap();
+        let controller_stream = created_sink_input(&drain_socket(&mut controller)).unwrap();
+
+        // libpulse 17.0's own requests, as td-pulse's `captured_17` pins them
+        // (each tag 2, so one per round).
+        const SINK_INPUT_LIST: &str = "4c0000001e4c00000002";
+        const CLIENT_LIST: &str = "4c0000001c4c00000002";
+        const CLIENT_INFO_3: &str = "4c0000001b4c000000024c00000003";
+        let ask = |server: &mut Server<MemorySink>, socket: &mut UnixStream, hex: &str| {
+            socket.write_all(&control(&unhex(hex))).unwrap();
+            server.pass().unwrap();
+            server.pass().unwrap();
+            drain_socket(socket)
+        };
+        for probe in [SINK_INPUT_LIST, CLIENT_LIST, CLIENT_INFO_3] {
+            assert_eq!(
+                error_code(&ask(&mut server, &mut player, probe), 2),
+                Some(crate::proto::error::NOTIMPLEMENTED),
+                "player list probe {probe}"
+            );
+        }
+        player
+            .write_all(&build(command::GET_SINK_INPUT_INFO, 13, |writer| {
+                writer.u32(player_stream);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let own = sink_input_entries(&reply_packet(&drain_socket(&mut player), 13).unwrap());
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].name, hostile, "its own name, as it sent it");
+        assert_eq!(property_value(&own[0].properties, "application.name"), None);
+
+        let stream_list = ask(&mut server, &mut controller, SINK_INPUT_LIST);
+        let client_list = ask(&mut server, &mut controller, CLIENT_LIST);
+        let mut streams = sink_input_entries(&reply_packet(&stream_list, 2).unwrap());
+        streams.sort_by_key(|entry| entry.index);
+        let summary: Vec<(u32, &str, Option<String>)> = streams
+            .iter()
+            .map(|entry| {
+                (
+                    entry.index,
+                    entry.name.as_str(),
+                    property_value(&entry.properties, "application.name"),
+                )
+            })
+            .collect();
+        let mut expected = vec![
+            (player_stream, "tab[2Jtitle", Some("firefox".to_string())),
+            (
+                controller_stream,
+                "a notification",
+                Some("td-mixer".to_string()),
+            ),
+        ];
+        expected.sort_by_key(|entry| entry.0);
+        assert_eq!(summary, expected);
+        let player_entry = streams
+            .iter()
+            .find(|entry| entry.index == player_stream)
+            .unwrap();
+        assert_eq!(
+            property_value(&player_entry.properties, "media.name").as_deref(),
+            Some("tab[2Jtitle")
+        );
+        let mut clients = client_entries(&reply_packet(&client_list, 2).unwrap());
+        clients.sort();
+        let player_client = player_entry.client;
+        let names: Vec<(u32, &str)> = clients
+            .iter()
+            .map(|(index, name, _)| (*index, name.as_str()))
+            .collect();
+        assert!(names.contains(&(player_client, "firefox")), "{names:?}");
+        assert!(
+            names.iter().any(|(_, name)| *name == "td-mixer"),
+            "{names:?}"
+        );
+        assert_eq!(names.len(), 2);
+
+        controller
+            .write_all(&build(command::GET_CLIENT_INFO, 30, |writer| {
+                writer.u32(player_client);
+            }))
+            .unwrap();
+        controller
+            .write_all(&build(command::GET_CLIENT_INFO, 31, |writer| {
+                writer.u32(9_999);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let answers = drain_socket(&mut controller);
+        assert_eq!(
+            client_entries(&reply_packet(&answers, 30).unwrap()),
+            vec![(player_client, "firefox".into(), Some("firefox".into()))]
+        );
+        assert_eq!(
+            error_code(&answers, 31),
+            Some(crate::proto::error::NOENTITY)
+        );
+    }
+
+    /// The human's level for an application is the daemon's, and the
+    /// application cannot undo it: not by unmuting or raising its own stream,
+    /// not by opening another, and not by reconnecting. The controller sees
+    /// the level it set; the player sees its own, and is told nothing.
+    #[test]
+    fn an_application_cannot_undo_the_humans_mute() {
+        let (mut server, path) = server("app-mute");
+        server.policy = browser_policy(own_uid());
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut controller = UnixStream::connect(&path).unwrap();
+        for socket in [&mut player, &mut controller] {
+            socket.write_all(&auth_packet()).unwrap();
+        }
+        server.pass().unwrap();
+        let _ = drain_socket(&mut player);
+        let _ = drain_socket(&mut controller);
+        player.write_all(&named_create_request(3, "video")).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let first = created_sink_input(&drain_socket(&mut player)).unwrap();
+        player
+            .write_all(&build(command::SUBSCRIBE, 4, |writer| {
+                writer.u32(subscription::MASK_ALL);
+            }))
+            .unwrap();
+        controller
+            .write_all(&build(command::SUBSCRIBE, 4, |writer| {
+                writer.u32(subscription::MASK_ALL);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut player);
+        let _ = drain_socket(&mut controller);
+
+        let quarter = crate::mixer::VOLUME_NORM / 4;
+        let mut writes = build(command::SET_SINK_INPUT_VOLUME, 10, |writer| {
+            writer.u32(first).cvolume(&[quarter, quarter]);
+        });
+        writes.extend(build(command::SET_SINK_INPUT_MUTE, 11, |writer| {
+            writer.u32(first).boolean(true);
+        }));
+        controller.write_all(&writes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let answers = drain_socket(&mut controller);
+        assert_eq!(error_code(&answers, 10), None);
+        assert_eq!(error_code(&answers, 11), None);
+        let change = (
+            subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
+            first,
+        );
+        assert_eq!(subscription_events(&answers), vec![change; 2]);
+        assert_eq!(subscription_events(&drain_socket(&mut player)), Vec::new());
+
+        let ids = |server: &Server<MemorySink>| -> Vec<crate::mixer::StreamId> {
+            server
+                .clients
+                .iter()
+                .filter(|client| client.role == Role::Player)
+                .flat_map(|client| client.session.stream_ids())
+                .collect()
+        };
+        let levels = |server: &Server<MemorySink>| -> Vec<Option<(u32, bool)>> {
+            ids(server)
+                .into_iter()
+                .map(|id| server.mixer.app_level(id))
+                .collect()
+        };
+        assert_eq!(levels(&server), vec![Some((quarter, true))]);
+
+        // The application unmutes and raises its own stream, and opens
+        // another: every stream still plays under the human's mute.
+        let norm = crate::mixer::VOLUME_NORM;
+        let mut writes = build(command::SET_SINK_INPUT_MUTE, 20, |writer| {
+            writer.u32(first).boolean(false);
+        });
+        writes.extend(build(command::SET_SINK_INPUT_VOLUME, 21, |writer| {
+            writer.u32(first).cvolume(&[norm, norm]);
+        }));
+        writes.extend(named_create_request(22, "another"));
+        player.write_all(&writes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut player);
+        assert_eq!(levels(&server), vec![Some((quarter, true)); 2]);
+
+        // The controller sees its level; the player sees its own.
+        controller
+            .write_all(&build(command::GET_SINK_INPUT_INFO, 30, |writer| {
+                writer.u32(first);
+            }))
+            .unwrap();
+        player
+            .write_all(&build(command::GET_SINK_INPUT_INFO, 30, |writer| {
+                writer.u32(first);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let seen = sink_input_entries(&reply_packet(&drain_socket(&mut controller), 30).unwrap());
+        assert_eq!(
+            (seen[0].volume.clone(), seen[0].muted),
+            (vec![quarter; 2], true)
+        );
+        let own = sink_input_entries(&reply_packet(&drain_socket(&mut player), 30).unwrap());
+        assert_eq!(
+            (own[0].volume.clone(), own[0].muted),
+            (vec![norm; 2], false)
+        );
+
+        // Reconnecting starts at the human's level too.
+        drop(player);
+        for _ in 0..3 {
+            server.pass().unwrap();
+        }
+        assert!(ids(&server).is_empty());
+        let mut player = admit_as(&mut server, BROWSER_UID, 8);
+        player.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut player);
+        player.write_all(&named_create_request(3, "back")).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut player);
+        assert_eq!(levels(&server), vec![Some((quarter, true))]);
+
+        // Unmuting is the human's to do, and restores the level.
+        let latest = server
+            .clients
+            .iter()
+            .find(|client| client.role == Role::Player)
+            .and_then(|client| client.session.sink_input_indexes().first().copied())
+            .unwrap();
+        let _ = drain_socket(&mut controller);
+        controller
+            .write_all(&build(command::SET_SINK_INPUT_MUTE, 40, |writer| {
+                writer.u32(latest).boolean(false);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert_eq!(levels(&server), vec![Some((quarter, false))]);
+        // And setting what is already set announces nothing.
+        let _ = drain_socket(&mut controller);
+        controller
+            .write_all(&build(command::SET_SINK_INPUT_MUTE, 41, |writer| {
+                writer.u32(latest).boolean(false);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let answers = drain_socket(&mut controller);
+        assert_eq!(error_code(&answers, 41), None);
+        assert_eq!(subscription_events(&answers), Vec::new());
+    }
+
+    /// Every stream the mixer allows, each with the longest name the protocol
+    /// carries in all three of its names, lists in one reply that fits one
+    /// control frame, the most td-pulse's decoder accepts and a sixteenth of the
+    /// session's output bound, so the listing controller is not dropped; and
+    /// each name it is shown is cut to `DISPLAY_MAX` on a character boundary.
+    #[test]
+    fn a_full_table_of_maximum_length_names_lists_in_one_frame() {
+        let (mut server, path) = server("full-list");
+        let name: String = "é".repeat(tag::STRING_MAX / 2);
+        assert_eq!(name.len(), tag::STRING_MAX);
+        let per_client = crate::session::MAX_STREAMS_PER_CLIENT;
+        let owners = crate::mixer::MAX_STREAMS / per_client;
+        let mut sockets = Vec::new();
+        for owner in 0..owners {
+            let mut socket = admit_as(&mut server, own_uid(), 100 + owner as i32);
+            socket.write_all(&auth_packet()).unwrap();
+            socket.write_all(&client_name_packet(1, &name)).unwrap();
+            sockets.push(socket);
+        }
+        server.pass().unwrap();
+        for socket in &mut sockets {
+            let _ = drain_socket(socket);
+        }
+        // One create per owner per pass, so no socket buffer fills.
+        for stream in 0..per_client {
+            for socket in &mut sockets {
+                socket
+                    .write_all(&named_create_request(10 + stream as u32, &name))
+                    .unwrap();
+            }
+            server.pass().unwrap();
+            server.pass().unwrap();
+            for socket in &mut sockets {
+                let _ = drain_socket(socket);
+            }
+        }
+        assert_eq!(server.mixer.stream_count(), crate::mixer::MAX_STREAMS);
+        let mut lister = UnixStream::connect(&path).unwrap();
+        lister.write_all(&auth_packet()).unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut lister);
+        lister
+            .write_all(&build(command::GET_SINK_INPUT_INFO_LIST, 2, |_| {}))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let reply = reply_packet(&drain_socket(&mut lister), 2).expect("a list reply");
+        // One control frame: td-pulse, which the CLI and the panel read with,
+        // refuses a larger one, and the session bound is sixteen of these.
+        assert!(reply.len() <= wire::CONTROL_MAX, "{} bytes", reply.len());
+        assert_eq!(server.clients.len(), owners + 1, "nobody was disconnected");
+        let entries = sink_input_entries(&reply);
+        assert_eq!(entries.len(), crate::mixer::MAX_STREAMS);
+        let cut = "é".repeat(crate::session::DISPLAY_MAX / 2);
+        for entry in &entries {
+            assert_eq!(entry.name, cut);
+            assert_eq!(
+                property_value(&entry.properties, "application.name").as_deref(),
+                Some(cut.as_str())
+            );
+        }
+    }
+
     /// A controller whose one read holds a valid sink write and then a frame
     /// that breaks its schema is dropped in that pass. The level it set
     /// outlives it, so the event announcing the level must too.
@@ -2245,12 +2928,21 @@ mod tests {
             None,
             "a controller still reaches the player's stream"
         );
-        assert!(
-            subscription_events(&drain_socket(&mut player)).contains(&(
-                subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
-                own
-            )),
-            "and the player hears that its own stream changed"
+        // It reaches it as the application's level, a gain of the human's
+        // that the player neither sees nor hears about: the player's own mute
+        // stands, and nothing changed in its view.
+        assert_eq!(
+            subscription_events(&drain_socket(&mut player)),
+            Vec::new(),
+            "the player is not told about the human's level"
+        );
+        assert_eq!(
+            server
+                .clients
+                .iter()
+                .find(|client| client.role == Role::Player)
+                .map(|client| client.session.app_level()),
+            Some((crate::mixer::VOLUME_NORM, false))
         );
 
         drop(owner);

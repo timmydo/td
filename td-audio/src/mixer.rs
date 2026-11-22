@@ -153,6 +153,11 @@ struct Stream {
     /// conforming client cannot grow the queue beyond the bytes we granted.
     target_frames: u64,
     volume: u32,
+    /// The human's level for the application that owns this stream, and its
+    /// mute (§K.5): a gain of its own, multiplied after `volume`, which the
+    /// application sets and cannot reach. Unity for a controller's stream.
+    app_volume: u32,
+    app_muted: bool,
     /// THE position. Frames this stream has handed the mixer, ever.
     frames_accepted: u64,
     /// Frames of this stream's audio that have been mixed into the output.
@@ -441,6 +446,8 @@ impl Mixer {
             limit_frames: limit_frames.max(1),
             target_frames: limit_frames.max(1),
             volume: VOLUME_NORM,
+            app_volume: VOLUME_NORM,
+            app_muted: false,
             frames_accepted: 0,
             frames_mixed: 0,
             drain_mark: Some(0),
@@ -630,6 +637,22 @@ impl Mixer {
     pub fn set_volume(&mut self, id: StreamId, volume: u32) -> io::Result<()> {
         let stream = self.find_mut(id).ok_or_else(|| Self::missing(id))?;
         stream.volume = volume.min(VOLUME_MAX);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn app_level(&self, id: StreamId) -> Option<(u32, bool)> {
+        self.find(id)
+            .map(|stream| (stream.app_volume, stream.app_muted))
+    }
+
+    /// Set the application level a stream plays under. Separate from
+    /// `set_volume`, which is the application's own, so neither can overwrite
+    /// the other.
+    pub fn set_app_level(&mut self, id: StreamId, volume: u32, muted: bool) -> io::Result<()> {
+        let stream = self.find_mut(id).ok_or_else(|| Self::missing(id))?;
+        stream.app_volume = volume.min(VOLUME_MAX);
+        stream.app_muted = muted;
         Ok(())
     }
 
@@ -1012,7 +1035,11 @@ impl Mixer {
             stream.pending_contribution_end = available;
             stream.pending_blocks_short_start = !released;
             stream.running = true;
-            let gain = gain(stream.volume);
+            let gain = if stream.app_muted {
+                0.0
+            } else {
+                gain(stream.volume) * gain(stream.app_volume)
+            };
             for index in 0..available.saturating_mul(channels) {
                 let low = stream.queue.pop_front().unwrap_or(0);
                 let high = stream.queue.pop_front().unwrap_or(0);
@@ -2502,6 +2529,46 @@ mod tests {
         sink.start().unwrap();
         mixer.pump(&mut sink).unwrap();
         assert_eq!(sink.samples().first().copied(), Some(100));
+    }
+
+    /// The human's level for an application multiplies the stream's own
+    /// level, its mute silences whatever the stream's own is, and the
+    /// stream's own writes do not touch it.
+    #[test]
+    fn the_application_level_multiplies_and_its_mute_wins() {
+        let pass = |stream: u32, app: u32, app_muted: bool| {
+            let mut sink = MemorySink::new(Spec::fixed(), 64, 2);
+            let mut mixer = Mixer::new(Spec::fixed());
+            mixer.create(StreamId(1), 1000).unwrap();
+            mixer.set_volume(StreamId(1), stream).unwrap();
+            mixer.set_app_level(StreamId(1), app, app_muted).unwrap();
+            // The application's own write leaves the human's level alone.
+            mixer.set_volume(StreamId(1), stream).unwrap();
+            assert_eq!(mixer.app_level(StreamId(1)), Some((app, app_muted)));
+            mixer.write(StreamId(1), &stereo(&[6_400, 6_400])).unwrap();
+            sink.start().unwrap();
+            mixer.pump(&mut sink).unwrap();
+            sink.samples().first().copied()
+        };
+        let half = VOLUME_NORM / 2;
+        assert_eq!(pass(half, half, false), Some(100), "an eighth of an eighth");
+        assert_eq!(pass(VOLUME_NORM, VOLUME_NORM, false), Some(6_400));
+        assert_eq!(
+            pass(VOLUME_NORM, VOLUME_NORM, true),
+            Some(0),
+            "muted at full"
+        );
+        let mut mixer = Mixer::new(Spec::fixed());
+        mixer.create(StreamId(1), 1000).unwrap();
+        assert_eq!(
+            mixer.app_level(StreamId(1)),
+            Some((VOLUME_NORM, false)),
+            "unity until the human sets one"
+        );
+        mixer
+            .set_app_level(StreamId(1), VOLUME_NORM * 2, false)
+            .unwrap();
+        assert_eq!(mixer.app_level(StreamId(1)), Some((VOLUME_NORM, false)));
     }
 
     /// Mute silences the output and is a flag beside the level, so unmuting

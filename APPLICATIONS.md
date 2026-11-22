@@ -8844,10 +8844,32 @@ numbering, and from the daemon-wide stream, queue-reservation and client
 limits it meets; none of these names a stream, its client or its content.
 Roles do not reserve capacity: players can fill the client table and the
 stream and queue budgets against a later controller, as any admitted peer
-could before roles existed. A controller's volume or mute lands in the
-same per-stream value the owning application sets, so the application can
-undo it. td-agent's unconfined workspace runs as the human (WORKLOADS.md)
-and is therefore a controller.
+could before roles existed. td-agent's unconfined workspace runs as the
+human (WORKLOADS.md) and is therefore a controller.
+A controller lists every connection's streams and every connection, with
+`GET_SINK_INPUT_INFO_LIST`, `GET_CLIENT_INFO_LIST` and `GET_CLIENT_INFO`,
+captured from the pinned runtime's libpulse 17.0 and parsed back by its own
+`pactl`. A player's are the commands this server does not have, so its view
+is unchanged. A player's application is named from its uid's policy row,
+not from the `application.name` it sends. Text a controller is shown is
+stripped of control characters, bidirectional overrides and isolates,
+zero-width characters and line separators, and cut to 96 bytes on a
+character boundary, so a full table of 128 streams at the protocol's
+longest names lists in one control frame, the most td-pulse's decoder
+accepts; an assembled reply that would not fit one answers `TOOLARGE`. A
+controller's volume or mute on a controller's stream lands in that stream.
+On a player's stream it sets the human's level for the player's
+application instead: a gain and mute the daemon keeps, multiplied after the
+application's own volume, applied to every stream of the application as
+it is created and across reconnects, so nothing the application does
+undoes it. A controller sees that level for the application's streams,
+not the application's own volume or mute, which stays the application's
+to report, and every controller hears a change to it. The player sees its
+own volume and hears nothing, because nothing changed in its view. The
+level is reached through one of the application's streams, so a
+controller cannot set or read it while the application plays nothing. It
+lives only as long as the daemon: a restart, a lost device's included,
+starts every application at unity again, until persistence lands.
 A controller also sets the output's level and mute with `SET_SINK_VOLUME`
 and `SET_SINK_MUTE`, captured in both selector forms from the pinned
 runtime's libpulse 17.0, sees them in sink info, and every controller,

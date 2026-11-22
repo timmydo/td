@@ -250,6 +250,49 @@ pub enum GlobalRequest {
         index: u32,
         muted: bool,
     },
+    /// A controller's list of every connection's streams.
+    SinkInputList {
+        tag: u32,
+        version: u32,
+    },
+    /// A controller's lookup of one connection by client index.
+    ClientInfo {
+        tag: u32,
+        index: u32,
+        version: u32,
+    },
+    /// A controller's list of every connection.
+    ClientList {
+        tag: u32,
+        version: u32,
+    },
+}
+
+impl GlobalRequest {
+    /// The tag the requester's reply carries.
+    pub fn tag(&self) -> u32 {
+        match self {
+            Self::Info { tag, .. }
+            | Self::Volume { tag, .. }
+            | Self::Mute { tag, .. }
+            | Self::SinkInputList { tag, .. }
+            | Self::ClientInfo { tag, .. }
+            | Self::ClientList { tag, .. } => *tag,
+        }
+    }
+}
+
+/// How a sink-input entry is written for the connection that will read it.
+#[derive(Clone, Copy)]
+enum View<'a> {
+    /// The owner's own stream, exactly as it has always been described.
+    Own,
+    /// A controller's view: text sanitized and capped, the application named
+    /// by the daemon, and `level` in place of the stream's own when set.
+    Controller {
+        level: Option<(u32, bool)>,
+        application: &'a str,
+    },
 }
 
 struct ServiceUpdate {
@@ -275,11 +318,24 @@ pub struct Session {
     next_channel: u64,
     client_index: u32,
     subscribed: u32,
-    /// Whether this connection may set and see the output's level and mute.
-    /// Set by the daemon from the role fixed at accept (§K.5); false is the
-    /// player's view, in which the sink is always at unity and unmuted and a
-    /// write to it is a command this server does not have.
-    controls_output: bool,
+    /// Whether this connection is a controller (§K.5): it may set and see the
+    /// output's level and mute, and list every stream and client. Set by the
+    /// daemon from the role fixed at accept; false is the player's view, in
+    /// which the sink is always at unity and unmuted, and a sink write or a
+    /// list is a command this server does not have.
+    controller: bool,
+    /// The application name controllers are shown for this connection. A
+    /// player's is the daemon's, from its uid's application policy row, and
+    /// fixed: the `application.name` it sends is a claim, not an identity. A
+    /// controller's is the one it sends in `SET_CLIENT_NAME`.
+    sent_application: String,
+    fixed_application: Option<&'static str>,
+    /// The human's level and mute for this connection's application, which
+    /// the daemon keeps and every stream of it plays under. Unity for a
+    /// controller. Applied as each stream is created, so a new stream of a
+    /// muted application starts muted: the application cannot undo the
+    /// human's mute by opening another one.
+    app_level: (u32, bool),
     /// Sink-input and sink changes for the daemon to relay to the other
     /// connections' subscribers that are controllers.
     global_events: Vec<(u32, u32)>,
@@ -303,7 +359,10 @@ impl Session {
             next_channel: 0,
             client_index,
             subscribed: 0,
-            controls_output: false,
+            controller: false,
+            sent_application: String::new(),
+            fixed_application: None,
+            app_level: (VOLUME_NORM, false),
             global_events: Vec::new(),
             global_requests: Vec::new(),
             output_overflowed: false,
@@ -312,11 +371,96 @@ impl Session {
         }
     }
 
-    /// A controller's session: it may set the output's level and mute, and
-    /// sees them as they are.
-    pub fn with_output_control(mut self, controls: bool) -> Self {
-        self.controls_output = controls;
+    /// A controller's session: it may set and see the output's level and
+    /// mute, and list every stream and client.
+    pub fn with_controller_role(mut self, controller: bool) -> Self {
+        self.controller = controller;
         self
+    }
+
+    /// The application name the daemon derived from this connection's uid,
+    /// which its own `SET_CLIENT_NAME` cannot replace.
+    pub fn with_application(mut self, name: &'static str) -> Self {
+        self.fixed_application = Some(name);
+        self
+    }
+
+    pub fn application(&self) -> &str {
+        self.fixed_application.unwrap_or(&self.sent_application)
+    }
+
+    pub fn app_level(&self) -> (u32, bool) {
+        self.app_level
+    }
+
+    /// Set the human's level for this connection's application, and play
+    /// every stream it has under it.
+    pub fn set_app_level(&mut self, level: (u32, bool), mixer: &mut Mixer) {
+        self.app_level = level;
+        for stream in self.streams.values() {
+            let _ = mixer.set_app_level(stream.id, level.0, level.1);
+        }
+    }
+
+    /// Answer a routed request with a protocol error.
+    pub fn fail(&mut self, tag: u32, code: u32) {
+        self.error(tag, code);
+    }
+
+    /// Acknowledge a routed request with an empty reply.
+    pub fn acknowledge(&mut self, tag: u32) {
+        self.reply(tag, |_| {});
+    }
+
+    /// Send a reply the daemon assembled from several sessions' entries, or
+    /// `TOOLARGE` when it would not fit one control frame of td-pulse's:
+    /// its decoder, which td's own clients read with, refuses a larger frame
+    /// and drops the connection, though libpulse would accept one.
+    /// `DISPLAY_MAX` keeps today's full tables inside it.
+    pub fn deliver(&mut self, tag: u32, packet: &[u8]) {
+        if packet.len() > wire::CONTROL_MAX {
+            self.error(tag, error::TOOLARGE);
+            return;
+        }
+        self.send(packet);
+    }
+
+    /// Every stream of this connection as a controller sees it, for a list
+    /// reply. `level` replaces each stream's own level and mute: a player's
+    /// streams are shown at the level the human set for its application.
+    pub fn write_sink_inputs(
+        &self,
+        writer: &mut tag::Writer,
+        version: u32,
+        mixer: &Mixer,
+        level: Option<(u32, bool)>,
+    ) {
+        for stream in self.streams.values() {
+            self.write_sink_input(
+                writer,
+                version,
+                stream,
+                mixer,
+                View::Controller {
+                    level,
+                    application: self.application(),
+                },
+            );
+        }
+    }
+
+    /// This connection as a client-info entry.
+    pub fn write_client(&self, writer: &mut tag::Writer, version: u32) {
+        let mut buffer = [0u8; DISPLAY_MAX];
+        let name = display(self.application(), &mut buffer);
+        writer
+            .u32(self.client_index)
+            .string(name)
+            .u32(OWNER_MODULE)
+            .string(DRIVER);
+        if version >= 13 {
+            writer.proplist(&[tag::text_property("application.name", name)]);
+        }
     }
 
     /// The negotiated version, once authenticated.
@@ -376,6 +520,11 @@ impl Session {
         std::mem::take(&mut self.global_requests)
     }
 
+    /// Queue a request for the daemon to route after this read pass.
+    fn route(&mut self, request: GlobalRequest) {
+        self.global_requests.push(request);
+    }
+
     /// State a streamless control connection must retain across admission
     /// pressure. A subscriber is a live observer, and an unrouted request or
     /// event is work the server has not completed yet.
@@ -406,16 +555,15 @@ impl Session {
                 index,
                 version,
             } => {
-                let Some(stream) = owner
-                    .streams
-                    .values()
-                    .find(|stream| stream.sink_input_index == index)
-                    .cloned()
-                else {
-                    self.error(tag, error::NOENTITY);
-                    return;
-                };
-                self.reply_sink_input_info(tag, version, owner.client_index, &stream, mixer);
+                // The daemon routes a player's streams' lookups to
+                // `describe_foreign` instead, with the application's level.
+                self.describe_foreign(owner, tag, index, version, mixer, None);
+            }
+            GlobalRequest::SinkInputList { tag, .. }
+            | GlobalRequest::ClientInfo { tag, .. }
+            | GlobalRequest::ClientList { tag, .. } => {
+                // Daemon-wide; never routed to one owner.
+                self.error(tag, error::INTERNAL);
             }
             GlobalRequest::Volume {
                 tag,
@@ -447,12 +595,41 @@ impl Session {
     }
 
     pub fn reject_global_request(&mut self, request: GlobalRequest) {
-        let tag = match request {
-            GlobalRequest::Info { tag, .. }
-            | GlobalRequest::Volume { tag, .. }
-            | GlobalRequest::Mute { tag, .. } => tag,
+        self.error(request.tag(), error::NOENTITY);
+    }
+
+    /// Describe another connection's stream to this controller, at `level`
+    /// when the stream's application has one the human set.
+    pub fn describe_foreign(
+        &mut self,
+        owner: &Session,
+        tag: u32,
+        index: u32,
+        version: u32,
+        mixer: &Mixer,
+        level: Option<(u32, bool)>,
+    ) {
+        let Some(stream) = owner
+            .streams
+            .values()
+            .find(|stream| stream.sink_input_index == index)
+        else {
+            self.error(tag, error::NOENTITY);
+            return;
         };
-        self.error(tag, error::NOENTITY);
+        let mut writer = tag::Writer::new();
+        writer.u32(command::REPLY).u32(tag);
+        owner.write_sink_input(
+            &mut writer,
+            version,
+            stream,
+            mixer,
+            View::Controller {
+                level,
+                application: owner.application(),
+            },
+        );
+        self.send(writer.as_bytes());
     }
 
     /// The mixer's name for the stream this connection calls `channel`.
@@ -743,11 +920,27 @@ impl Session {
             command::GET_PLAYBACK_LATENCY => self.latency(reader, tag, version, mixer),
             command::SET_SINK_INPUT_VOLUME => self.set_volume(reader, tag, mixer),
             command::SET_SINK_INPUT_MUTE => self.set_mute(reader, tag, mixer),
-            command::SET_SINK_VOLUME if self.controls_output => {
-                self.set_sink_volume(reader, tag, mixer)
+            command::SET_SINK_VOLUME if self.controller => self.set_sink_volume(reader, tag, mixer),
+            command::SET_SINK_MUTE if self.controller => self.set_sink_mute(reader, tag, mixer),
+            command::GET_SINK_INPUT_INFO_LIST if self.controller => {
+                reader.finish().map_err(Disconnect::Schema)?;
+                self.route(GlobalRequest::SinkInputList { tag, version });
+                Ok(())
             }
-            command::SET_SINK_MUTE if self.controls_output => {
-                self.set_sink_mute(reader, tag, mixer)
+            command::GET_CLIENT_INFO_LIST if self.controller => {
+                reader.finish().map_err(Disconnect::Schema)?;
+                self.route(GlobalRequest::ClientList { tag, version });
+                Ok(())
+            }
+            command::GET_CLIENT_INFO if self.controller => {
+                let index = reader.u32().map_err(Disconnect::Schema)?;
+                reader.finish().map_err(Disconnect::Schema)?;
+                self.route(GlobalRequest::ClientInfo {
+                    tag,
+                    index,
+                    version,
+                });
+                Ok(())
             }
             command::UPDATE_PLAYBACK_STREAM_PROPLIST => self.update_proplist(reader, tag),
             _ => {
@@ -807,8 +1000,17 @@ impl Session {
         tag: u32,
         version: u32,
     ) -> Result<(), Disconnect> {
-        reader.proplist().map_err(Disconnect::Schema)?;
+        let properties = reader.proplist().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
+        if self.fixed_application.is_none() {
+            if let Some(name) = properties
+                .iter()
+                .find(|property| property.key == "application.name")
+                .and_then(|property| property_text(property).ok())
+            {
+                self.sent_application = name;
+            }
+        }
         let index = self.client_index;
         self.reply(tag, |writer| {
             if version >= 13 {
@@ -909,25 +1111,39 @@ impl Session {
             .find(|stream| stream.sink_input_index == index)
             .cloned()
         else {
-            self.global_requests.push(GlobalRequest::Info {
+            self.route(GlobalRequest::Info {
                 tag,
                 index,
                 version,
             });
             return Ok(());
         };
-        self.reply_sink_input_info(tag, version, self.client_index, &stream, mixer);
+        // A player sees its own stream as it always has; a controller sees
+        // its own the way it sees every stream in a list.
+        let mut writer = tag::Writer::new();
+        writer.u32(command::REPLY).u32(tag);
+        let view = if self.controller {
+            View::Controller {
+                level: None,
+                application: self.application(),
+            }
+        } else {
+            View::Own
+        };
+        self.write_sink_input(&mut writer, version, &stream, mixer, view);
+        self.send(writer.as_bytes());
         Ok(())
     }
 
-    fn reply_sink_input_info(
-        &mut self,
-        tag: u32,
+    fn write_sink_input(
+        &self,
+        writer: &mut tag::Writer,
         version: u32,
-        client: u32,
         stream: &Stream,
         mixer: &Mixer,
+        view: View<'_>,
     ) {
+        let client = self.client_index;
         let spec = stream.sample_spec;
         let queued_usec = mixer
             .timing(stream.id)
@@ -937,36 +1153,50 @@ impl Session {
             .timing(stream.id)
             .map(|timing| self.spec.frames_to_usec(timing.device_delay_frames))
             .unwrap_or(0);
-        self.reply(tag, |writer| {
-            writer
-                .u32(stream.sink_input_index)
-                .string(&stream.name)
-                .u32(OWNER_MODULE)
-                .u32(client)
-                .u32(SINK_INDEX)
-                .sample_spec(spec)
-                .channel_map(&CHANNEL_MAP)
-                .cvolume(&[stream.volume, stream.volume])
-                .usec(queued_usec)
-                .usec(device_usec)
-                .string("copy")
-                .string(DRIVER);
-            if version >= 11 {
-                writer.boolean(stream.muted);
-            }
-            if version >= 13 {
-                writer.proplist(&[tag::text_property("media.name", &stream.name)]);
-            }
-            if version >= 19 {
-                writer.boolean(stream.corked);
-            }
-            if version >= 20 {
-                writer.boolean(true).boolean(true);
-            }
-            if version >= 21 {
-                writer.format_info(format::ENCODING_PCM, &[]);
-            }
-        });
+        let mut name_buffer = [0u8; DISPLAY_MAX];
+        let mut application_buffer = [0u8; DISPLAY_MAX];
+        let (name, application, (volume, muted)) = match view {
+            View::Own => (stream.name.as_str(), None, (stream.volume, stream.muted)),
+            View::Controller { level, application } => (
+                display(&stream.name, &mut name_buffer),
+                Some(display(application, &mut application_buffer)),
+                level.unwrap_or((stream.volume, stream.muted)),
+            ),
+        };
+        writer
+            .u32(stream.sink_input_index)
+            .string(name)
+            .u32(OWNER_MODULE)
+            .u32(client)
+            .u32(SINK_INDEX)
+            .sample_spec(spec)
+            .channel_map(&CHANNEL_MAP)
+            .cvolume(&[volume, volume])
+            .usec(queued_usec)
+            .usec(device_usec)
+            .string("copy")
+            .string(DRIVER);
+        if version >= 11 {
+            writer.boolean(muted);
+        }
+        if version >= 13 {
+            match application {
+                None => writer.proplist(&[tag::text_property("media.name", name)]),
+                Some(application) => writer.proplist(&[
+                    tag::text_property("media.name", name),
+                    tag::text_property("application.name", application),
+                ]),
+            };
+        }
+        if version >= 19 {
+            writer.boolean(stream.corked);
+        }
+        if version >= 20 {
+            writer.boolean(true).boolean(true);
+        }
+        if version >= 21 {
+            writer.format_info(format::ENCODING_PCM, &[]);
+        }
     }
 
     fn subscribe(&mut self, mut reader: tag::Reader<'_>, tag: u32) -> Result<(), Disconnect> {
@@ -1147,6 +1377,7 @@ impl Session {
         if mixer
             .set_target_frames(id, target_frames)
             .and_then(|()| mixer.set_volume(id, if muted { 0 } else { volume }))
+            .and_then(|()| mixer.set_app_level(id, self.app_level.0, self.app_level.1))
             .and_then(|()| mixer.set_corked(id, corked))
             .and_then(|()| mixer.set_prebuffer(id, prebuffer_frames, true))
             .is_err()
@@ -1440,7 +1671,7 @@ impl Session {
             return Ok(());
         }
         if !self.owns_sink_input(index) {
-            self.global_requests.push(GlobalRequest::Volume {
+            self.route(GlobalRequest::Volume {
                 tag,
                 index,
                 volumes,
@@ -1469,8 +1700,7 @@ impl Session {
         let muted = reader.boolean().map_err(Disconnect::Schema)?;
         reader.finish().map_err(Disconnect::Schema)?;
         if !self.owns_sink_input(index) {
-            self.global_requests
-                .push(GlobalRequest::Mute { tag, index, muted });
+            self.route(GlobalRequest::Mute { tag, index, muted });
             return Ok(());
         }
         if !self.apply_mute(index, muted, mixer) {
@@ -1593,7 +1823,7 @@ impl Session {
     /// are for a controller, and unity and unmuted for a player, whose view
     /// of the one sink never changes.
     fn output_view(&self, mixer: &Mixer) -> (u32, bool) {
-        if self.controls_output {
+        if self.controller {
             (mixer.master_volume(), mixer.master_muted())
         } else {
             (VOLUME_NORM, false)
@@ -1759,6 +1989,52 @@ fn attribute_frames(requested: u32, default_ms: u64, spec: Spec, frame_bytes: u6
 /// resolves a decimal name as the index.
 const SINK_INDEX_NAME: &str = "0";
 
+/// The most bytes of any one name a controller is shown. A controller lists
+/// every stream at once, up to `mixer::MAX_STREAMS`, in one reply, and each
+/// entry carries a stream name, its `media.name` and an application name.
+/// Uncapped, at the protocol's string ceiling, that is most of a mebibyte,
+/// which the session output bound would refuse by disconnecting the
+/// controller; capped at 255 it was still 83 KB, over the one control frame
+/// td-pulse's decoder accepts. At 96 a full table of maximum names fits one
+/// frame, which a test pins.
+pub const DISPLAY_MAX: usize = 96;
+
+/// Whether a character may reach a controller's display. Control characters
+/// (C0, DEL, C1) would let a name drive a terminal; the bidirectional
+/// overrides, embeddings and isolates would let it reorder its own row and
+/// its neighbours'; zero-width characters and the line and paragraph
+/// separators would hide or break it.
+fn shown(character: char) -> bool {
+    !character.is_control()
+        && !matches!(
+            character,
+            '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// `text` as a controller may see it: control characters removed, since a
+/// stream name is chosen by the application and the human reads it in a
+/// terminal, and cut to `DISPLAY_MAX` bytes on a character boundary.
+/// Allocation-free: written into the caller's buffer.
+fn display<'a>(text: &str, buffer: &'a mut [u8; DISPLAY_MAX]) -> &'a str {
+    let mut length = 0;
+    for character in text.chars().filter(|character| shown(*character)) {
+        let end = length + character.len_utf8();
+        let Some(slot) = buffer.get_mut(length..end) else {
+            break;
+        };
+        character.encode_utf8(slot);
+        length = end;
+    }
+    buffer
+        .get(..length)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .unwrap_or("")
+}
+
 /// `PA_VOLUME_MAX`: the largest valid volume. `PA_VOLUME_INVALID` is the one
 /// value above it.
 const VOLUME_VALID_MAX: u32 = 0x7FFF_FFFF;
@@ -1868,6 +2144,57 @@ mod tests {
     use super::*;
     use crate::sink::{AudioSink, MemorySink};
 
+    /// Text a controller is shown cannot drive its terminal, reorder or hide
+    /// itself, and is cut whole at `DISPLAY_MAX`.
+    #[test]
+    fn a_controller_is_shown_text_without_control_characters_and_cut_whole() {
+        let mut buffer = [0u8; DISPLAY_MAX];
+        assert_eq!(
+            display("a\u{1b}[2Jb\u{7}c\u{7f}d\u{85}e\ttab\nline", &mut buffer),
+            "a[2Jbcdetabline"
+        );
+        // Two-byte characters: the cut lands on a boundary, never inside one.
+        let mut buffer = [0u8; DISPLAY_MAX];
+        assert_eq!(
+            display(&"é".repeat(100), &mut buffer),
+            "é".repeat(DISPLAY_MAX / 2)
+        );
+        let mut buffer = [0u8; DISPLAY_MAX];
+        let odd = format!("x{}", "é".repeat(100));
+        let shown = display(&odd, &mut buffer);
+        assert_eq!(
+            shown.len(),
+            DISPLAY_MAX - 1,
+            "the last é would not fit whole"
+        );
+        let mut buffer = [0u8; DISPLAY_MAX];
+        assert_eq!(display("", &mut buffer), "");
+        // Bidirectional overrides and isolates, zero-width characters and
+        // the line separators go too; ordinary non-Latin text stays.
+        let mut buffer = [0u8; DISPLAY_MAX];
+        assert_eq!(
+            display(
+                "a\u{202e}b\u{2066}c\u{2069}d\u{200b}e\u{200f}f\u{2028}g\u{feff}h\u{2060}日本",
+                &mut buffer
+            ),
+            "abcdefgh日本"
+        );
+    }
+
+    /// A reply the daemon assembles that would not fit one control frame is
+    /// refused with `TOOLARGE`, never sent for the client to drop the link.
+    #[test]
+    fn an_assembled_reply_over_one_frame_is_refused() {
+        let mut session = Session::new(Spec::fixed(), 0);
+        let mut writer = tag::Writer::new();
+        writer.u32(command::REPLY).u32(5);
+        session.deliver(5, writer.as_bytes());
+        assert_eq!(packets(&mut session).len(), 1, "a reply that fits is sent");
+        let oversized = vec![0u8; wire::CONTROL_MAX + 1];
+        session.deliver(5, &oversized);
+        assert_eq!(error_code(&mut session), error::TOOLARGE);
+    }
+
     /// The numeric name is the index written out, not a second sink.
     #[test]
     fn the_sinks_numeric_name_is_its_index() {
@@ -1912,8 +2239,11 @@ mod tests {
         decoder.push(&bytes);
         let mut out = Vec::new();
         while let Some(frame) = decoder.next_frame() {
-            if let Ok(Frame::Control(packet)) = frame {
-                out.push(packet);
+            match frame {
+                Ok(Frame::Control(packet)) => out.push(packet),
+                Ok(_) => {}
+                // A refused frame repeats forever; report it instead.
+                Err(error) => panic!("the session sent a frame td-pulse refuses: {error:?}"),
             }
         }
         out

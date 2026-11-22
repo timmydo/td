@@ -177,8 +177,18 @@ pub mod command {
     /// see 'no microphone' rather than a broken server".
     pub const GET_SOURCE_INFO_LIST: u32 = 24;
 
+    /// A `u32` client index. Captured from the pinned runtime's libpulse
+    /// 17.0 (`pa_context_get_client_info`).
+    pub const GET_CLIENT_INFO: u32 = 27;
+
+    /// Nothing. Captured from libpulse 17.0's `pactl list clients`.
+    pub const GET_CLIENT_INFO_LIST: u32 = 28;
+
     /// A `u32` index.
     pub const GET_SINK_INPUT_INFO: u32 = 29;
+
+    /// Nothing. Captured from libpulse 17.0's `pactl list sink-inputs`.
+    pub const GET_SINK_INPUT_INFO_LIST: u32 = 30;
 
     /// A `u32` mask. Captured with `0x02FF`, which is
     /// `PA_SUBSCRIPTION_MASK_ALL`.
@@ -339,7 +349,10 @@ pub fn command_name(command: u32) -> Option<&'static str> {
         command::GET_SINK_INFO => "GET_SINK_INFO",
         command::GET_SINK_INFO_LIST => "GET_SINK_INFO_LIST",
         command::GET_SOURCE_INFO_LIST => "GET_SOURCE_INFO_LIST",
+        command::GET_CLIENT_INFO => "GET_CLIENT_INFO",
+        command::GET_CLIENT_INFO_LIST => "GET_CLIENT_INFO_LIST",
         command::GET_SINK_INPUT_INFO => "GET_SINK_INPUT_INFO",
+        command::GET_SINK_INPUT_INFO_LIST => "GET_SINK_INPUT_INFO_LIST",
         command::SUBSCRIBE => "SUBSCRIBE",
         command::SET_SINK_VOLUME => "SET_SINK_VOLUME",
         command::SET_SINK_INPUT_VOLUME => "SET_SINK_INPUT_VOLUME",
@@ -441,6 +454,12 @@ mod tests {
         /// `pactl get-sink-volume 0`, tag 2: the same numeric name, which a
         /// Pulse server resolves as the index.
         pub const GET_SINK_INFO_BY_NUMBER_NAME: &str = "4c000000154c000000024cffffffff743000";
+        /// `pactl list sink-inputs`, tag 2: the command and tag alone.
+        pub const GET_SINK_INPUT_INFO_LIST: &str = "4c0000001e4c00000002";
+        /// `pactl list clients`, tag 2: the command and tag alone.
+        pub const GET_CLIENT_INFO_LIST: &str = "4c0000001c4c00000002";
+        /// `pa_context_get_client_info(3)`, tag 2: the client's index.
+        pub const GET_CLIENT_INFO: &str = "4c0000001b4c000000024c00000003";
     }
 
     /// Every fixture's first value is the command number this module pins. This
@@ -470,6 +489,15 @@ mod tests {
                 captured_17::GET_SINK_INFO_BY_NUMBER_NAME,
                 command::GET_SINK_INFO,
             ),
+            (
+                captured_17::GET_SINK_INPUT_INFO_LIST,
+                command::GET_SINK_INPUT_INFO_LIST,
+            ),
+            (
+                captured_17::GET_CLIENT_INFO_LIST,
+                command::GET_CLIENT_INFO_LIST,
+            ),
+            (captured_17::GET_CLIENT_INFO, command::GET_CLIENT_INFO),
             (
                 captured::GET_PLAYBACK_LATENCY,
                 command::GET_PLAYBACK_LATENCY,
@@ -757,7 +785,10 @@ mod tests {
             command::GET_SINK_INFO,
             command::GET_SINK_INFO_LIST,
             command::GET_SOURCE_INFO_LIST,
+            command::GET_CLIENT_INFO,
+            command::GET_CLIENT_INFO_LIST,
             command::GET_SINK_INPUT_INFO,
+            command::GET_SINK_INPUT_INFO_LIST,
             command::SUBSCRIBE,
             command::SET_SINK_VOLUME,
             command::SET_SINK_INPUT_VOLUME,

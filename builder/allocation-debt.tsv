@@ -1097,7 +1097,7 @@ td-audio/src/serve.rs	unchecked-growth-or-clone	21
 td-audio/src/session.rs	allocating-constructor	1
 td-audio/src/session.rs	allocating-conversion	4
 td-audio/src/session.rs	direct-reservation	1
-td-audio/src/session.rs	unchecked-growth-or-clone	10
+td-audio/src/session.rs	unchecked-growth-or-clone	8
 td-audio/src/sink.rs	allocating-conversion	1
 td-audio/src/sink.rs	unchecked-growth-or-clone	1
 td-audio/src/sys.rs	unchecked-growth-or-clone	1
