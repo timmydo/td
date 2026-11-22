@@ -78,9 +78,10 @@ References give each mechanism's rules; use these entry points:
 | Incoming mail across accounts | [Transactional incoming delivery](#transactional-incoming-delivery-across-accounts) |
 | Submission queue, relay scheduling, route health and retention | [15. Submission queue, relay scheduling and route health](#15-submission-queue-relay-scheduling-and-route-health) |
 | One relay attempt from `Prepared` to final result | [16. Relay attempt execution and custody](#16-relay-attempt-execution-and-custody) |
+| Audits, maintenance barrier, restore quarantine, scrubbing and retained diagnostics | [17. Maintenance, audit and recovery](#17-maintenance-audit-and-recovery) |
+| Local replica source binding and publication | [18. Replica source and follower storage](#18-replica-source-and-follower-storage) |
 | Durable list summaries | [Persistent common-header summaries](#persistent-common-header-summaries-schema-33) |
 | MIME evidence and selective body verification | [Persistent MIME interpretation](#persistent-mime-interpretation-schema-34) |
-| Whole-body audit and progress | [Scheduled integrity scrubbing](#scheduled-whole-body-integrity-scrubbing) |
 | Backup, restore and deployment procedures | [Deployment](DEPLOYMENT.md) and [production operations](PRODUCTION.md) |
 
 Comments in td-mta's source still cite some former section numbers:
@@ -795,19 +796,20 @@ Preparation remains the default of the protected bootstrap parser and all
 operator commands. Runtime mode authenticates TLS/SCRAM, checks primary and
 durability settings, acquires the shared migration lock, validates the
 current schema and checks the dedicated runtime role/table privileges and
-the maintenance barrier (section 205) before admitting an operation's SQL. A
-new connection repeats all of those checks; a previous cold receipt never
-substitutes for them. Retained sessions (the HTTPS authentication worker,
-HTTPS API read workers and the foreground relay idle reader) hold that
-qualification and migration lock for their finite connection lifetimes, with
-fresh job fences as specified under "Retained HTTPS authentication sessions"
-and section 2. Other operation-owned connections hold the lock through their
-operation. BodyChecks instead authenticates at open and performs this
-qualification inside every closed validation transaction (section 2 and
-[Body validation turns](#body-validation-turns)), before any Body queries.
-No prior turn supplies cached qualification. Mail helpers still enforce
-their own epoch, current configuration, device, snapshot and publication
-fences.
+the maintenance barrier ([Runtime maintenance barrier (schema
+28)](#runtime-maintenance-barrier-schema-28)) before admitting an
+operation's SQL. A new connection repeats all of those checks; a previous
+cold receipt never substitutes for them. Retained sessions (the HTTPS
+authentication worker, HTTPS API read workers and the foreground relay idle
+reader) hold that qualification and migration lock for their finite
+connection lifetimes, with fresh job fences as specified under "Retained
+HTTPS authentication sessions" and section 2. Other operation-owned
+connections hold the lock through their operation. BodyChecks instead
+authenticates at open and performs this qualification inside every closed
+validation transaction (section 2 and [Body validation
+turns](#body-validation-turns)), before any Body queries. No prior turn
+supplies cached qualification. Mail helpers still enforce their own epoch,
+current configuration, device, snapshot and publication fences.
 
 Qualification failure closes the connection before the application callback
 runs, with separate redacted schema/role/privilege/maintenance errors. It
@@ -1341,9 +1343,10 @@ TLS provider. Database version references are the only runtime material
 source; the old file-configuration serving path is removed.
 
 A managed (ACME) certificate request carries no material reference. The
-loader reads that certificate profile's active pair
-("8.121 Native ACME state and certificate pairs") once per load, pins
-it for both the chain and key requests, and refuses when the pair's
+loader reads that certificate profile's active pair ([Native ACME state and
+certificate pairs (schema
+30)](#native-acme-state-and-certificate-pairs-schema-30)) once per load,
+pins it for both the chain and key requests, and refuses when the pair's
 recorded settings differ from the configured ones. `serve` compares the
 pinned revisions with its watcher's observation before refreshing
 certificates on existing listeners.
@@ -2247,21 +2250,21 @@ serving instance drains and reloads into it ("Foreground serve command").
 
 ## 11. JMAP reads
 
-Every JMAP read, blob download and read-side reconciliation query runs
-on a freshly authenticated, finite, read-only repeatable-read snapshot of
-the writer endpoint (section 3). This chapter specifies the process-local
-read connection slots, snapshot admission and custody, the bounded storage
-reads a snapshot offers, verified body custody, the HTTPS path that
-authenticates and executes requests on the fixed body workers, the
-per-method read projections and blob downloads. `serve` constructs one
-`postgres_http_api::Service` per account binding and origin; the live
-HTTPS service dispatches Core/echo, Mailbox/get, Mailbox/changes,
-Email/get, Email/query, Email/changes, Thread/get, Thread/changes,
-Identity/get, EmailSubmission/get and EmailSubmission/query through the
-read dispatcher below, together with the replica methods of
-"Replica source inventory windows". Mutations use the separate
-publication adapters; they share only authentication and the method
-boundary in [Read snapshots before mutations](#read-snapshots-before-mutations).
+Every JMAP read, blob download and read-side reconciliation query runs on a
+freshly authenticated, finite, read-only repeatable-read snapshot of the
+writer endpoint (section 3). This chapter specifies the process-local read
+connection slots, snapshot admission and custody, the bounded storage reads
+a snapshot offers, verified body custody, the HTTPS path that authenticates
+and executes requests on the fixed body workers, the per-method read
+projections and blob downloads. `serve` constructs one
+`postgres_http_api::Service` per account binding and origin; the live HTTPS
+service dispatches Core/echo, Mailbox/get, Mailbox/changes, Email/get,
+Email/query, Email/changes, Thread/get, Thread/changes, Identity/get,
+EmailSubmission/get and EmailSubmission/query through the read dispatcher
+below, together with the replica methods of [Replica source inventory
+windows](#replica-source-inventory-windows). Mutations use the separate
+publication adapters; they share only authentication and the method boundary
+in [Read snapshots before mutations](#read-snapshots-before-mutations).
 
 ### Read connection slots
 
@@ -3146,18 +3149,18 @@ transaction.
 
 ## 12. Derived read evidence and search
 
-PostgreSQL keeps three kinds of optional, rebuildable evidence derived
-from immutable message bytes: common-header summaries, MIME
-interpretation descriptors and complete normalized search fields, the
-last with a trigram-indexed candidate text. Each row is bound to the
-blob's length and whole-body digest and to a versioned interpretation;
-missing, incompatible or malformed evidence always falls back to verified
-body interpretation and never changes a result. This chapter specifies
-the rows, their trust limits, how reads qualify and use them, how
-publication and owner commands prepare them, the indexed search candidate
-filter and explicit partial-search results. Evidence is never a body pin
-or a current body-integrity proof; raw downloads and
-"Scheduled whole-body integrity scrubbing" retain whole-body
+PostgreSQL keeps three kinds of optional, rebuildable evidence derived from
+immutable message bytes: common-header summaries, MIME interpretation
+descriptors and complete normalized search fields, the last with a
+trigram-indexed candidate text. Each row is bound to the blob's length and
+whole-body digest and to a versioned interpretation; missing, incompatible
+or malformed evidence always falls back to verified body interpretation and
+never changes a result. This chapter specifies the rows, their trust limits,
+how reads qualify and use them, how publication and owner commands prepare
+them, the indexed search candidate filter and explicit partial-search
+results. Evidence is never a body pin or a current body-integrity proof; raw
+downloads and [Scheduled whole-body integrity
+scrubbing](#scheduled-whole-body-integrity-scrubbing) retain whole-body
 verification.
 
 ### Persistent common-header summaries (schema 33)
@@ -4832,525 +4835,6 @@ name and does not change production trust, client authentication or gateway
 policy. This is prepared PostgreSQL integration evidence; production backend
 selection and deployment qualification remain unchanged.
 
-## 199. Historical account usage audit
-
-`postgres_usage_audit::inspect` compares the five stored account-usage counters
-with durable rows in one finite, read-only REPEATABLE READ primary snapshot.
-It checks the expected epoch under the shared schema barrier, captures the
-account sequence/floor, distinguishes a missing account from a missing usage
-row, and acknowledges ROLLBACK before the final deadline check. The returned
-identity and counts are historical observations, not quota admission or policy
-and device authorization. No account row lock, write or repair is performed.
-
-Body bytes and blob count include every live blob manifest, including a
-zero-length blob. Upload bytes count each manifest with an existing lease;
-expired leases count until the account's next upload or relay retention
-reclaims them ([Expired upload lease reclamation](#expired-upload-lease-reclamation)). Queue bytes count each manifest
-referenced as a transmitted blob by a submission, once even if several
-submissions reference it. Queue submission count includes every durable
-submission, including completed ones retained in the database. Reserved blob
-IDs without a live manifest contribute nothing. These are the same durable
-categories used by publication accounting and the initial usage migration.
-
-A mismatch in any counter, missing usage row, malformed sequence or negative
-result refuses the audit. Aggregate overflow or query failure also refuses;
-there is no truncation or inferred correction. The normal finite probe and
-statement bounds apply, as detailed in RESOURCES. A large account that cannot
-be checked within those bounds has no successful audit result.
-
-This is one component for future semantic verification. It does not validate
-body digests, metadata references, mailbox graphs, operation receipts,
-credentials, configuration or delivery outcomes, and cannot authorize restore
-or serving. The native fixture deliberately demonstrates that matching counters
-can coexist with a damaged body. It also checks account isolation, zero-length
-manifests, expired leases, shared queue references and refusal without repair.
-
-## 200. Explicit historical usage inspection command
-
-`postgres usage-inspect --connection-file PATH --epoch HEX --account ID`
-loads the protected owner-side connection file and invokes section 199's
-read-only counter audit for one explicit account and store epoch. It shares
-one DNS/connection/operation deadline across resolved-address attempts; only
-transport refusal permits another address. No profile is selected or served.
-
-Successful schema-1 JSON reports the account, epoch, snapshot sequence and
-history floor, plus `body_bytes`, `blob_count`, `upload_bytes`, `queue_bytes`
-and `queue_submissions`. `counters_consistent:true` describes that historical
-snapshot only. `semantic_verified:false` explicitly preserves the narrower
-scope: this command checks no body digests, metadata graph, retained receipts,
-configuration, credentials or restore safety. Success supplies no quota or
-serving authority and does not imply the counters remain current.
-
-Missing accounts, wrong epochs, absent or inconsistent counters, database
-failures and deadlines refuse with fixed error codes. Duplicate, missing and
-unknown arguments refuse before loading the connection file. There is no
-repair, force or all-accounts option. The command never prints credentials,
-body bytes or native database error text, and never changes counters or
-account sequence. The native process fixture checks JSON values, fixed
-refusals, malformed options and persistence of deliberately corrupted usage.
-
-## 201. Historical single-blob integrity audit
-
-`postgres_blob_audit::inspect` verifies one explicitly named account/blob in
-one finite read-only primary REPEATABLE READ snapshot under the expected store
-epoch and shared migration lock. The caller supplies trusted administrative
-connection access, not a device password. The preparation command in
-section 208 exposes this verification component, never a download or device
-authorization path; it returns only
-public manifest metadata and the snapshot account sequence/floor.
-
-The existing body reader checks manifest bounds, changed sequence, exact
-chunk count, ordered contiguous ordinals, chunk extents and the complete
-SHA-256, including the empty body digest. It uses the existing 32-MiB body
-ceiling and eight-chunk batches, not a message-sized buffer. The original
-connection budgets and deadline cover metadata, all body reads and an
-acknowledged ROLLBACK; a final deadline check precedes success. Missing rows,
-wrong epochs, corrupt manifests/bytes, database failures and timeouts refuse.
-Failure closes the private worker and never repairs any row.
-
-A successful result certifies only this body's historical snapshot. It does
-not check counters, owning Email/submission/lease references, other metadata,
-configuration, credentials or retained receipts. It provides no current quota
-or serving authority, complete-store certificate or restore approval. The
-native PostgreSQL fixture checks corrupt bytes and extents, ordinal gaps,
-manifest/sequence inconsistency, empty bodies, account isolation and absence
-of device credentials while pinning the narrower verification scope.
-
-## 202. Historical canonical metadata audit
-
-`postgres_metadata_audit::inspect` runs the shared `metadata_sweep` against
-all eleven canonical PostgreSQL metadata tables in one owner-side primary
-REPEATABLE READ, READ ONLY transaction. The expected epoch and shared
-migration lock precede the snapshot. The caller supplies trusted UTC and
-explicit row/parent-read limits; no device credential or serving profile is
-required. The private adapter cannot escape the worker or expose history
-reads. It refuses `next_change`; this is no change-history certificate.
-
-Account-scoped keyset reads return one row, in decoded `Key::compare` order.
-Compound text and import keys use their logical SQL column tuples and C
-collation, not transient length-prefixed encodings. PostgreSQL fields become
-shared typed rows and pass their canonical encoder/decoder and key checks.
-SMTP origins additionally read at most 1001 ordered receipt recipients,
-refusing count disagreement, ordinal gaps, excess or malformed receipt data.
-Receipt rows on a non-SMTP Email also refuse. Every canonical changed sequence
-must be no later than the captured account sequence; sequences retain all
-64 bits. Parent lookups stay in the same snapshot and account.
-
-The existing shared checks enforce local row rules, direct owning references,
-rooted mailbox chains and exact submission recipient coverage. Their report
-retains the snapshot identity and counts. It does not add policy checks that
-those shared checks lack (for example uniqueness of mailbox roles), audit
-usage counters, body bytes, credentials, configuration, retained operation or
-delivery receipts, or change history. No whole-store, restore, serving or
-current authority follows. Independently collected body/counter reports must
-not be presented as one consistent account snapshot.
-
-A dedicated preparation-only audit worker derives checked cumulative wire,
-frame and command allowances from the caller's logical bounds. It reserves
-`5 * rows + parent_reads + 64` turns for the three passes, direct references,
-parent walks, schema checks, table-end probes and acknowledged ROLLBACK.
-Each turn admits at most 1 MiB input, 64 KiB output and 1088 frames, including
-at most 1001 SMTP receipt rows. Authentication shares the first window.
-Only completion admits the next window; idle bytes remain charged to the
-previous window, cumulative counters never replenish, and failures are
-terminal. Counters allocate no proportional memory. The existing 128 KiB
-frame, SCRAM sequence, row decoder and fixed scratch bounds remain in force.
-Overflow or a counter that does not fit the host refuses before connection.
-
-The caller supplies one deadline no more than an hour away. Connection and
-authentication still have at most ten seconds, individual SQL statements
-five seconds and locks one second. The original audit deadline covers every
-turn and acknowledged ROLLBACK and is checked after worker destruction.
-No turn, address attempt or logical allowance renews time. Runtime workers
-retain their ordinary bounds and cannot use this owner path. Connection
-failure during metadata reads retains its connection classification rather
-than being reported as canonical metadata corruption. A large account may
-refuse without a partial success report.
-Failures close the connection and perform no repair. Native PostgreSQL
-coverage exercises every table, compound cursor order, malformed rows,
-mailbox cycles, recipient coverage, SMTP receipt framing, caller bounds,
-account isolation and the explicit body/counter exclusions.
-
-## 203. One-snapshot canonical account audit
-
-`postgres_account_audit::inspect` composes section 202's shared canonical
-metadata sweep, section 199's five usage-counter comparisons and section
-201's body verifier for every live blob manifest. They use the same primary
-REPEATABLE READ, READ ONLY transaction, expected epoch and shared migration
-lock. No independent audit reports are joined. A private metadata helper
-begins and retains that transaction; only the outer audit acknowledges
-ROLLBACK and checks the final original deadline after dropping its worker.
-
-After canonical metadata passes, the same transaction rejects duplicate
-non-null mailbox roles within this account. A single EXISTS query groups
-roles under C collation and returns one boolean; unassigned roles and other
-accounts do not conflict. This adds role uniqueness, not registry membership
-or full mailbox-policy validation, and retains no client-side role collection.
-
-The caller supplies trusted UTC, metadata row/parent limits and aggregate
-body count/byte limits. Body enumeration is account-scoped, ascending blob
-ID keyset pagination with one manifest at a time. It includes manifests with
-no Email, lease or submission owner and checks zero-length body digests.
-Every manifest passes the existing extent, changed-sequence and actual chunk
-count checks before the shared streaming verifier checks all bytes. Captured
-identity must match on every body. Aggregate limits are checked before each
-body is read. Verified body totals must agree with both metadata blob count
-and the audited usage totals before a report can succeed.
-
-The report contains historical canonical metadata, role uniqueness, counters
-and verified body totals. Role registry membership, other mailbox policy,
-configuration, credentials, retained operation/delivery receipts and change
-history remain uncertified. This is not a complete PostgreSQL semantic audit,
-restore approval, delivery permission or service admission. Failure returns
-no partial report and performs no repair. The audit worker adds
-`2 * max_blobs + ceil(max_bytes / 524288)` turns to the metadata allowance:
-one manifest per blob, one independent rounding allowance per blob and
-streamed eight-chunk reads. Final enumeration and usage/role queries fit the
-fixed reserve. Body buffers retain at most eight 64 KiB chunks regardless of
-the account size. The same per-turn and cumulative limits apply. Native
-coverage checks each component's refusal, unowned
-and empty bodies, aggregate limits and a concurrent-change oracle: while the
-metadata scan is blocked after snapshot capture, another session commits
-body corruption, incorrect usage, a duplicate mailbox role and a new sequence.
-The in-flight audit sees only its old consistent snapshot; fresh audits refuse
-the new damage. Null roles and duplicates in another account do not conflict.
-
-## 204. Explicit bounded account audit command
-
-`postgres account-audit --connection-file PATH --epoch HEX --account ID
---max-rows N --max-parent-reads N --max-blobs N --max-bytes N
-[--timeout-seconds N]` invokes section
-203's composed historical audit. Every bound is required, unsigned decimal
-with at most 20 ASCII digits and checked u64 range; zero is allowed. Duplicate,
-unknown, incomplete and malformed options refuse before opening the protected
-connection file. There is no profile, all-accounts, force or repair option.
-The command samples trusted process wall time once for metadata policy and
-shares one DNS/connection/operation deadline across address attempts. Only
-transport refusal permits another address, with no renewed deadline.
-
-Successful schema-1 JSON reports account, epoch, sequence and history floor,
-metadata row count, verified blob/byte totals and the five usage counters.
-`canonical_metadata_verified`, `mailbox_roles_unique`, `counters_consistent`
-and `body_digests_verified` are true for that historical snapshot only;
-`semantic_verified:false` preserves all section 203 exclusions. The report
-never approves restore or serving and grants no current authority. This
-command defaults to ten seconds. Optional `--timeout-seconds` accepts one
-unsigned decimal value from 1 through 3600; duplicates and values outside
-that range refuse before opening files. The explicit owner timeout does not
-change runtime service deadlines, per-statement bounds or the ten-second
-connection/authentication ceiling.
-
-Fixed error codes distinguish missing accounts, epochs, aggregate body
-limits, metadata checks, usage integrity, body checks and database failures.
-No SQL error text, credentials or body content is printed. The process
-fixture verifies JSON values, absent-account and epoch refusals, decimal and
-aggregate bounds, counter/body corruption and preservation of damaged rows.
-
-## 205. Runtime maintenance refusal foundation
-
-Migration 28 adds the owner-controlled `runtime_barrier` singleton, initially
-unblocked. The dedicated runtime role has SELECT only on this table, and the
-exact privilege qualification rejects broader column/table write authority.
-After role and privilege checks, common runtime qualification requires exactly
-one `(singleton=true, blocked=false)` row. A blocked or missing singleton
-refuses with the distinct maintenance error; query/type failures also refuse.
-
-This check applies to each new ordinary Runtime connection and retained
-validators' runtime qualification. HTTPS authentication performs a fresh
-maintenance fence in each job snapshot. Neither check revokes already-admitted
-network I/O or make a previously captured snapshot see newer rows. Existing
-operations retain their original finite limits and migration locks. Owner
-Preparation schema inspection remains available while the barrier is set;
-`runtime-check` remains a runtime qualification and refuses maintenance.
-
-Runtime qualification performs no entry, release, epoch renewal, delivery
-quarantine or recovery approval. Sections 206 and 207 specify owner entry.
-Owner transitions hold the exclusive migration lock and
-require external fencing of old instances and SMTP egress; shared locks prevent
-them from racing qualified database operations. A database flag cannot establish
-external fencing or decide duplicate-delivery risk. Recovery must not clear
-this barrier until its separately specified quarantine, credential/configuration
-and semantic-state requirements are satisfied.
-
-Prior migration bytes/checksums remain unchanged. Upgrade is atomic, preserves
-store epoch and existing state, and initializes the singleton only in the new
-migration. Native coverage includes upgrade from version 27 with obstruction
-rollback, blocked/missing runtime refusal, owner inspection and rejection of
-runtime write privilege. Fixture-only SQL toggles do not implement the future
-owner recovery transition protocol.
-
-## 206. Monotone owner maintenance entry
-
-`postgres_maintenance` adds bounded owner inspection and one-way barrier
-entry. The caller must provide the expected store epoch and explicitly
-attest that all old instances and SMTP egress are externally stopped/fenced.
-The typed attestation records a caller obligation; PostgreSQL cannot prove
-it. Section 207 exposes explicit preparation commands; production startup
-is unchanged.
-
-Entry forces READ COMMITTED and synchronous commit, acquires the exclusive
-transaction migration lock before checking the complete current ledger, and
-requires the authenticated session user to own the schema, ledger and barrier
-tables. A runtime credential cannot enter maintenance even if somebody has
-incorrectly granted it barrier UPDATE. Any shared or exclusive migration-lock
-holder makes entry refuse busy; it does not wait for or cancel live work.
-The singleton must exist and be well-formed. Entry never inserts missing
-state or changes the epoch, mail, configuration, credentials or receipts.
-
-Maintenance entry only transitions false to true. At the same epoch, observing
-true is already success and performs no UPDATE. Unacknowledged COMMIT is
-indeterminate, not rollback. Resolve it by inspection or repetition using the
-same expected epoch. Inspection holds a shared migration lock, so an original
-in-flight entry remains busy until it commits or rolls back. A false
-observation permits only the same monotone entry, not runtime activation.
-An acknowledged COMMIT remains known even if completing it crosses the
-caller deadline; a read/no-op result requires the final deadline check.
-
-The explicit recovery-release protocol below renews the store epoch while
-clearing the barrier and quarantining pending deliveries. It requires
-restored devices revoked and external configuration/fencing review; semantic
-verification and subsequent profile/credential activation remain explicit. This
-prevents an old entry retry from reblocking a reopened store. Direct owner
-SQL that clears the barrier without renewal violates this protocol. Barrier
-entry alone supplies no epoch renewal, delivery quarantine, resend decision,
-backup/restore verification or authority to open service.
-
-Native tests cover exact ownership, extra runtime grants, wrong epochs,
-shared/exclusive lock contention, unchanged mail and ledger state, repeated
-entry, missing state, a deferred-COMMIT timeout resolved at the
-same epoch, and stale retry refusal after a fixture-simulated epoch change.
-
-## 207. Explicit owner maintenance commands
-
-`postgres maintenance-inspect --connection-file PATH --epoch HEX` observes
-the owner barrier. `postgres maintenance-enter` requires the same arguments
-and the explicit `--instances-and-smtp-fenced` flag. The flag attests that
-all old instances and SMTP egress are externally stopped/fenced; it neither
-performs nor proves fencing. Duplicate, unknown and missing arguments refuse
-before opening the protected connection file. Inspection rejects that flag.
-Neither maintenance command has a force, profile selector or epoch-generation
-option. Recovery release is a separate owner command described below.
-
-Both commands use section 206's owner and expected-epoch checks, the existing
-protected bootstrap loader and one original DNS/connection deadline. Only a
-transport failure before any COMMIT attempt permits another resolved address;
-indeterminate entry is not silently replayed. Retain the exact epoch after
-uncertainty and inspect or repeat at that epoch as section 206 specifies.
-
-Schema-1 JSON reports the expected epoch, historical blocked state and
-`recovery_verified:false`. Errors use fixed codes without SQL, credentials or
-body contents; operation failures preserve the expected epoch in output.
-`indeterminate-inspect-maintenance` requires explicit outcome resolution.
-A false observation does not authorize opening service, and successful entry
-neither rotates an epoch nor quarantines deliveries or validates recovery.
-The commands expose preparation only and leave production startup unchanged.
-
-The native process fixture covers strict fencing arguments, owner refusal,
-epoch mismatch, initial/entered/repeated observations, preserved ledger epoch
-and refusal without repair after a missing singleton. Section 206's API
-fixture separately covers lost COMMIT acknowledgement and lock contention.
-
-## 208. Explicit historical single-blob audit command
-
-`postgres blob-audit --connection-file PATH --epoch HEX --account ID
---blob ID` invokes section 201's existing bounded verifier. All four flags
-are required exactly once. Unknown, duplicate, missing and malformed
-arguments refuse before opening the protected connection file. The command
-has no repair, download or profile option.
-
-Address resolution and body verification share the original ten-second
-deadline. Only pre-connection transport failure permits another resolved
-address; database or body failures do not renew work. The existing 32-MiB
-body ceiling, bounded chunk batches and worker byte/frame ceilings apply.
-
-Success JSON schema 1 identifies the epoch, account, blob, captured account
-sequence/history floor, verified byte count and manifest creation time.
-`body_digest_verified:true` describes that body's historical snapshot;
-`semantic_verified:false` excludes counters, references, other metadata,
-credentials, configuration and restore approval. No body bytes are emitted.
-Missing account or blob returns the same fixed `blob-not-found` code.
-Other failures retain fixed codes without SQL, database messages or secrets.
-No invocation changes rows or grants device or serving authority.
-
-The native command fixture checks exact report fields, account isolation,
-missing rows, wrong epochs, corrupt and empty body digests, argument refusal
-and absence of repair or credential output.
-
-## 209. Explicit historical canonical metadata audit command
-
-`postgres metadata-audit --connection-file PATH --epoch HEX --account ID
---max-rows N --max-parent-reads N [--timeout-seconds N]` exposes section
-202's canonical metadata verifier independently of body and usage checks.
-Connection, epoch, account and both logical bounds are required exactly once.
-The optional timeout follows section 204's 1 through 3600 second range and
-ten-second default. Limits use unsigned ASCII decimal with at most twenty
-digits
-and must fit u64; zero is valid and can cause a bounded scan refusal. Unknown,
-duplicate, missing and malformed arguments refuse before protected-file
-access. Body-limit flags belong to account-audit and are refused here.
-
-One trusted UTC sample supplies lease-reference policy. DNS and verification
-share the original selected deadline; DNS retains a five-second ceiling.
-Logical limits select section 202's finite cumulative worker allowance;
-no operation renews wire or time budgets. Only pre-connection transport
-failures permit
-address fallback. Failure emits fixed categories without SQL or secrets and
-never changes a row or returns a partial success report.
-
-Success JSON schema 1 identifies epoch, account, sequence, history floor,
-canonical row count and mailbox count. `canonical_metadata_verified:true`
-means the shared canonical row/reference/forest/recipient checks passed in
-one historical snapshot. `body_digests_verified:false` and
-`semantic_verified:false` preserve the narrower scope: body bytes, counters,
-mailbox-role uniqueness/registry, credentials, configuration, retained history
-and operation/delivery receipts are not certified. No serving or restore
-authority follows, and separate reports cannot be combined into one snapshot.
-
-The native command fixture checks report fields, account/epoch refusal,
-row/parent bounds, malformed mailbox refusal without repair, strict arguments
-and successful canonical checks despite invalid body digests, inconsistent
-usage counters and duplicate mailbox roles. Those exclusions are deliberate;
-the composed account-audit command supplies the broader checks in section 203.
-
-## 210. Historical canonical retained-history audit
-
-`postgres_history_audit::inspect` checks all physically retained change
-rows for one explicit epoch/account in one primary REPEATABLE READ,
-READ ONLY snapshot under the shared migration lock. It captures the account
-endpoint and history floor before scanning, requires floor <= endpoint and
-accepts an explicit total row limit. Zero is valid only when no rows remain.
-There is no command, device authorization or serving activation in this
-increment.
-
-The audit and authenticated change reader share one canonical row decoder:
-exact eight-byte nonzero unsigned sequence, operation 0..4095, supported
-Mailbox/Thread/Email/EmailSubmission kind, Created/Updated/Destroyed action
-and exact sixteen-byte object ID. Identity changes refuse. Both consumers
-check strict cursor order and the captured committed endpoint. Account
-keyset batches contain at most 128 rows, never a complete retained history.
-
-Rows at or below the floor may await physical reclamation and are valid.
-The audit validates them too and reports their count separately. A success
-reports only the captured identity and total/retired row counts after
-acknowledged ROLLBACK and a final original-deadline check. It does not prove
-that events are complete, actions match live objects, operation ordinals are
-contiguous, transaction history can reconstruct current state, or retained
-receipts are valid. No body, metadata, credential, restore or serving
-certificate follows. Separate reports are separate snapshots.
-
-The existing body-worker wire/frame ceilings and ten-second deadline cover
-the entire scan; a caller row allowance does not renew them. Exhaustion,
-malformed rows, future or zero sequences, wrong epoch, missing account or
-database failure refuse without repair or a partial report. Native fixtures
-cover multiple batches, exact row bounds, retired rows, account isolation,
-corrupt sequences, deliberate event-completeness exclusions and a concurrent
-commit after snapshot capture. The authenticated changes fixture qualifies
-the shared decoder through normal transaction-aligned paging.
-
-## Application diagnostic retention (schema 29)
-
-`postgres_logs.sql` adds `application_log_state` and `application_logs`.
-Both require runtime SELECT/INSERT/UPDATE/DELETE, without ownership, DDL,
-TRUNCATE or grant options; existing owner/runtime separation is unchanged.
-Stop all service instances for the explicit schema upgrade, upgrade with
-the owner connection preserving existing explicit grants, add grants on these two
-tables, run `runtime-check`, and restart on the matching executable. Never
-edit an existing migration checksum. Mail tables and retained mail are unchanged.
-
-OBSERVABILITY.md owns the 30-day age policy, fixed ring, rate/byte limits,
-loss counters and failure isolation. These records use asynchronous commit,
-may be lost or overwritten, and are never a source of delivery, recovery or
-publication authority. Log inspection is bounded and epoch-qualified:
-
-```text
-td-mta postgres logs --connection-file /private/owner-connection --epoch HEX --limit 100
-td-mta logging-status --runtime /private/runtime
-```
-
-Use the last returned `before` ID for the next page. The log relations have
-a physical high-water stop in addition to live-row bounds; PostgreSQL WAL,
-archive/replication retention, backups and whole-volume headroom still require
-normal operational limits and monitoring. A stopped diagnostic sink must not
-be treated as a reason to resend mail.
-
-## 8.121 Native ACME state and certificate pairs
-
-Schema 30 adds `acme_profiles`, sixteen fixed slots containing bounded private
-account/order state and one active certificate/key pair per named profile.
-Runtime qualification grants ordinary data access to this table; immutable
-operator configuration/material tables retain their existing read-only grants.
-[ACME.md](ACME.md) specifies the implemented single-endpoint routing restriction,
-lease/revision protocol, endpoint policy and retry/retention bounds.
-
-Claims check the schema/store epoch and serialize only short slot/ownership
-transactions. Every save matches the random owner, expected revision and
-unexpired database lease. Publication changes the active pair and pending state
-in the same statement. Uncertain outcomes are reloaded on the next ownership
-turn. No CA connection runs inside a database transaction. Managed material
-loaders fetch and pin the complete active pair once per profile and verify its
-settings digest against the configured directory, contact and exact name set.
-Different chain/key reads cannot observe different renewals. No arbitrary file
-path, material version, configuration selection or mail-delivery authority is
-created by this mapping.
-
-## 8.122 Restored-store delivery quarantine (schema 31)
-
-`td-mta postgres recovery-release` is an explicit owner operation after
-`maintenance-enter`. Keep old instances stopped and SMTP egress fenced
-throughout the recovery. The flags attest operator actions; they do not
-establish a network fence. This command never starts a service.
-
-Retain a fresh random 16-byte new epoch before publication, alongside the
-restored epoch. First inspect the restored accounts, bodies, counters and
-configuration, and revoke **every** restored device with `device-revoke`.
-The release refuses any still-active device, missing maintenance barrier,
-wrong epoch, invalid account floor, inconsistent pending submission or
-relation exceeding `--max-rows` (1 through 1,000,000). The bound applies to
-each rewritten mail/queue relation; the command retains its ten-second
-deadline. Failure before COMMIT rolls the entire operation back.
-
-```text
-td-mta postgres recovery-release --connection-file /private/owner-connection \
-  --epoch OLD_HEX --new-epoch FRESH_HEX --max-rows 100000 \
-  --instances-and-smtp-fenced --configuration-reviewed
-```
-
-Release changes Queued, InFlight, RetryWait and retryable OutcomeUnknown
-recipients into terminal OutcomeUnknown with explicit uncertainty and the Restored reason (schema 31).
-A backup may predate every attempt: this reason also permits an unattempted
-recipient with phase None, without inventing attempt history. Release clears
-retry times, completes
-those submissions and requests only local failure notices. Accepted, failed,
-canceled and already-terminal unknown results stay intact. Replies and attempt history
-remain available; active attempts, final reservations and route ownership are
-retired. Bodies and usage counters remain unchanged. Account history floors
-advance to current sequences, preventing access to pre-recovery incremental
-history under the new epoch. The ledger epoch changes and the maintenance
-barrier releases in the same transaction.
-
-Retain both epochs after an indeterminate result. Wait for the operation to
-settle, then inspect the schema and maintenance barrier. A new epoch with an
-open barrier identifies committed release; the old epoch with a closed
-barrier permits retry with the **same** new epoch. A busy migration lock is
-not a rollback. Any other state requires investigation. Never substitute a
-new epoch to hide uncertainty.
-
-Configuration encodings are epoch-bound: existing selected profiles fail to
-load after release. Import the reviewed private configuration sources as a
-new version under the fresh epoch, then explicitly select it using the next
-selection generation. Retain old configuration versions and receipts. Create
-fresh device credentials and verify mailbox reads before opening ingress or
-SMTP egress. Separately review database/bootstrap credentials, relay secrets,
-ACME account state and all changes or deliveries after the backup boundary.
-Quarantined submissions never retry automatically; deliberately submitting a
-new copy requires accepting duplicate-delivery risk.
-
-A release receipt reports quarantine counts, not full semantic integrity or
-successful service activation. The isolated restore fixture covers the
-archive round trip, rollback and ambiguous commit, epoch change and pending
-recipient quarantine. Hosted activation and off-host backup durability remain
-separate operational checks.
-
 ## Transactional incoming delivery across accounts
 
 An accepted SMTP envelope retains each address's pinned local account. The
@@ -5383,41 +4867,6 @@ per-frame, authentication, TLS and ten-second connection limits remain intact.
 The DATA
 worker's output meter includes the separate 2-MiB fanout metadata reservation,
 including when the configured message ceiling is smaller than that metadata.
-
-## Legacy message storage (schema 32)
-
-Owner-authorized migration may preserve raw messages up to 64 MiB. Schema 32
-widens only the immutable blob length and chunk ordinal constraints, retaining
-64 KiB chunks and at most 1024 chunks. Earlier migration checksums are unchanged;
-existing databases require the explicit owner schema upgrade. Ordinary SMTP,
-upload, draft and submission preparation keep their 32 MiB admission limits.
-Account quotas continue to charge every imported byte.
-
-The owner import connection admits at most 72 MiB outgoing bytes and 4096 input
-frames. Input bytes remain 1 MiB, or 4 MiB for the guarded new-only import.
-Stored-body verification and replay allow 256 MiB incoming bytes with the
-existing 8192-frame and 512 KiB outgoing limits. Raw JMAP downloads use the
-64 MiB stored-body ceiling; configured network admission limits do not hide
-successfully imported bodies. Authentication, per-frame bounds, deadlines and
-bounded chunk buffers remain in force. Email body/header projections and text
-search also use the stored-body ceiling rather than the current incoming
-message ceiling. MIME header, part, depth, work and output bounds remain
-independent and may still refuse an interpretation.
-
-Full stored-body verification and raw download have an absolute 30-second
-ceiling, including replay: the 64 MiB debug fixture exhausted ten seconds after
-verification alone consumed eight. Connection establishment and fresh device
-reauthorization retain their ten-second caps, shortened by the original body
-deadline. Ordinary JMAP snapshot methods retain their existing ten-second cap.
-Progress never renews an admitted operation's deadline.
-
-An owner Email import's write connection admits ten seconds plus up to twenty
-more in proportion to the body's share of the 64 MiB ceiling
-(`postgres_probe::import_duration`), reaching the same thirty seconds at the
-ceiling. The 64 MiB publication took about two seconds on an idle host and
-exceeded the former ten-second cap under heavy load. Receipt inspection,
-connection establishment and mailbox publication keep ten seconds, and a
-caller deadline above the scaled allowance is refused before any work.
 
 ## Retained SMTP worker session
 
@@ -5457,220 +4906,6 @@ next job reuses a connection only after acknowledged transaction termination
 and successful deadline and protocol-window checks. Expiry maintenance and
 clean idle retirement use the existing bounded termination allowance; an
 unfinished or failed job never gains time through cleanup.
-
-## Scheduled whole-body integrity scrubbing
-
-`postgres blob-scrub-page` is an owner-only, read-only primary audit page.
-It takes `--connection-file`, `--epoch`, optional `--limit` (default 128,
-maximum 256), and optional `--after ACCOUNT:BLOB --through ACCOUNT:BLOB`.
-Both key components are canonical hexadecimal IDs. A continuation requires
-its retained upper key. The first page captures the greatest `(account,id)`
-blob key in its repeatable-read snapshot. Each page holds the migration lock,
-checks the actual schema owner and epoch, verifies manifests, chunk layout
-and the original whole-body SHA-256, and ends with known ROLLBACK before
-returning progress. It reads all stored blobs, including unreferenced uploads;
-it does not rely on summaries or MIME interpretation evidence.
-
-A page attempts at most 64 MiB of valid advertised body lengths, streams one
-body at a time, and retains the original ten-second operation deadline and
-bounded connection framing. Corrupt metadata or bytes increment a bounded
-failure count and advance the cursor; only the first failed identity is
-retained. An operational, deadline or transport failure returns no publishable
-cursor. A replay is read-only. These are historical per-page observations,
-not one database-wide snapshot: concurrent deletion may remove a body before
-its page, and insertion behind a cursor belongs to the next cycle. No repair,
-mail deletion, metadata-integrity certificate or credential authority follows.
-
-`postgres blob-scrub` adds `--state-dir` and runs one page with locally retained
-progress. The pre-created private directory is locked and dedicated to this
-operation. It contains only `LOCK`, `state.json` and interrupted `partial`;
-files obey the protected operator-input contract. State is bounded to 8 KiB,
-versioned and epoch-bound, published by private create, file sync, rename and
-directory sync. A crash may replay a page but cannot skip one. Restored epochs
-require a fresh directory; old progress is not reused. Unknown entries,
-symlinks, malformed state and concurrent owners refuse. This state is an
-operator progress receipt, not authoritative mail data.
-
-A completed cycle waits 86,400 seconds before the next cycle. Each page
-records totals, the cursor, first corrupt identity and operational failure.
-Completed failure counts remain visible throughout the next cycle and clear
-only after a complete clean cycle. Failures return nonzero and structured
-JSON to the supervisor; progress also has structured JSON. The status command
-`postgres blob-scrub-status --state-dir PATH --epoch HEX` needs no database
-credentials. Both commands wait at most fifteen seconds for an overlapping
-invocation to release the state lock. This also lets a scheduled page tolerate
-the short status writer when both timers fire together; an owner that keeps
-the lock beyond that bound still causes a nonzero failure. It fails on known corruption, the last operational failure,
-missing completion, completion older than 172,800 seconds or backward wall
-clock observations. Every invocation, including status and waiting, persists
-the latest observed second before reporting freshness; a lower observation
-refuses rather than making a stale cycle appear fresh again. It never claims integrity of future writes or replaces
-backup/restore drills. These operator reports use the supervisor journal and
-private progress file, not the database application-log table.
-
-The installer operations generator can schedule one page per minute and a
-separate status check every fifteen minutes on systemd or Shepherd. Each
-invocation is bounded, the directory lock excludes overlap, and a failed page
-is retried on the next tick. Schedules require explicit generation and
-activation; normal serving does not enable background scrubbing implicitly.
-
-## Replica source inventory windows
-
-The snapshot read adapter can enumerate account-wide Email IDs for a future
-application-level replica. REPLICATION.md owns its coverage boundary. A first
-page captures the committed sequence and greatest ID together; continuation
-queries use `id > after AND id <= upper ORDER BY id`, under the existing
-account/ID primary key, with a maximum of 256 returned IDs and one lookahead.
-Rows changed after the starting sequence are left exclusively to change
-catch-up. This excludes post-base creations that could otherwise be copied and
-then disappear from a coalesced Created/Destroyed change page. Post-base updates
-to older objects are also omitted from inventory and recovered through changes.
-The SQL filter still selects revisions newer than the observed snapshot so the
-ordinary integrity check refuses them; corruption is not silently filtered out.
-This predicate bounds returned rows, not the number of index entries PostgreSQL
-may examine; the existing statement and operation deadlines still apply.
-Every page authenticates through its enclosing snapshot and rejects a source
-account, epoch or kind mismatch, a future starting sequence, expired history,
-or inverted bounds. Row revisions and strict ID ordering are validated before
-returning detached data. Storage, integrity and deadline failures latch the
-snapshot; ordinary cursor/limit validation refusals do not poison later methods
-in the same request. The adapter creates no retained transaction or retention lease; its
-enclosing snapshot keeps its ordinary caller-owned lifetime and deadline. No
-schema change is introduced by this adapter. REPLICATION.md specifies its
-authenticated HTTPS inventory/metadata extension and versioned cursor. Metadata
-returns the stored complete-body digest and exact timestamp without reading raw
-chunks, through the same snapshot and metadata prefetch as Email/get. Catch-up
-and deletion authority remain separate synchronization work. Source Session
-advertises `inventoryBaseFence: true`; discovery requires it so an older source
-cannot silently weaken the starting-state guarantee.
-
-## Replica source mode
-
-Schema 36 adds `replica_source`, an owner-writable singleton with canonical HTTPS
-origin (at most 4096 bytes), a 16-byte source epoch and protocol version 1.
-Runtime grants permit SELECT only. The ordinary runtime qualifier requires the
-row to be absent; a bound or invalid source refuses before mail SQL. This is a
-cold connection check, not another per-message query. Existing retained sessions
-keep their shared migration lock. Owner initialization takes its exclusive
-transaction counterpart, validates the local epoch and owner, and refuses
-accounts, selected configuration or ACME profiles before insertion. A matching
-binding can be inspected or repeated; a conflicting binding refuses. COMMIT
-uncertainty is retained explicitly. No source credentials or source operational
-configuration are stored in the identity row.
-
-[REPLICATION.md](REPLICATION.md) owns source identity, operator commands and the
-future local-copy contract. This foundation does not provide a synchronizer,
-read-only service, promotion or recovery qualification. Core mail tables and
-source/local JMAP state separation remain unchanged. A schema-35 binary cannot
-serve schema 36; use the documented fenced upgrade and consistent backup.
-
-## Replica account initialization
-
-Schema 37 adds `replica_accounts`, `replica_progress`, `replica_pending` and
-`replica_mailbox_receipts`. The owner-only account row binds its source and
-immutable seed digest and records explicit body-byte, blob, Email and receipt
-limits. Progress holds independent source Email replay and Mailbox state,
-inventory phase and counters. Pending work is bounded to one page per account,
-with at most 16384 ID bytes and a 128-byte completion bitmap. Mailbox receipts
-initially cover at most 256 folders. All four tables revoke PUBLIC access and
-ordinary runtime grants allow SELECT only. The separate replica publisher
-qualifier below admits its narrowly selected mutable control tables.
-
-The initializer takes the shared migration lock, checks local epoch, schema
-owner and the exact persisted source, and publishes one source account in a
-synchronous transaction. The core account insertion serializes concurrent
-initializations. A matching existing seed receipt returns without changing any
-later state; conflicts refuse. Batch typed SQL preserves mailbox IDs, parent
-relationships, roles, order and subscriptions, emits local Created history,
-records the source Inbox and zero usage, and persists the initial work page in
-the same commit. A failure before COMMIT leaves no partially created account;
-uncertain COMMIT remains explicit and may be settled using the retained seed.
-The owner connection has the existing reconciliation window: 2 MiB output,
-4 MiB input, 2048 frames and a finite ten-second cold operation deadline.
-
-[REPLICATION.md](REPLICATION.md) defines the page and checkpoint semantics.
-This increment publishes no Email bodies and adds no serving mode or copy CLI.
-Source credentials and transport authentication remain outside passive seed
-preparation. A schema-36 binary cannot serve schema 37; retain a consistent
-backup and follow the fenced upgrade procedure.
-
-## Replica Email publication
-
-Schema 38 adds `replica_email_receipts` and `replica_blob_identities`, both
-account-scoped and inaccessible to PUBLIC. Primary runtime grants are SELECT
-only. The separate replica runtime qualifier requires the exact source binding
-and mutable replica control grants; source identity and account limits remain
-owner-controlled. Its retained connection holds the migration lock and checks
-the local epoch and maintenance barrier per job. It offers closed typed
-publication only, never a caller-selected SQL operation.
-
-[REPLICATION.md](REPLICATION.md) owns the observation, receipt, quota and retry
-contract and the finite session/window bounds. One account-locked synchronous
-transaction publishes the full effect, local change history and its pending
-completion bit. No global checkpoint is advanced. Body garbage collection keeps
-an immutable identity receipt and core ID reservation; replica-only restoration
-requires matching length and digest. Normal publication retains fresh-ID refusal.
-Schema 44 charges receipts for live Emails and Blobs and
-backfills the Email identity tuple for visible messages. Deletions release
-capacity under the account lock. Permanent Blob identity evidence and
-cursor-based Email receipt reclamation are specified in REPLICATION.md. For a
-large existing replica, the schema owner can give the fenced
-`postgres schema-upgrade` operation `--timeout-seconds N` (1 through 3600,
-default 10). The single deadline covers connection and all migration work.
-PostgreSQL uses the remaining time for the migration transaction and its
-statements. New connections and lock acquisition keep their existing bounds.
-A schema-37 binary cannot serve schema 38. Use the fenced upgrade procedure and
-a consistent backup; this increment does not deploy or activate a local replica.
-
-## Replica pending-page transitions
-
-The retained replica session also admits the closed page-transition operation.
-It locks the core account, reloads validated progress, and requires the exact
-completed previous ticket before replacing pending work. The source replay
-cursor/phase update and complete next pending row commit together; local mail
-and JMAP sequences remain unchanged. Matching retries preserve the new page's
-existing completion bitmap. [REPLICATION.md](REPLICATION.md) defines cursor
-provenance, inventory-to-change catch-up and retry recognition. Schema 38 is
-unchanged; no unbounded queue or general SQL execution interface is added.
-
-## Replica runtime progress snapshots
-
-The replica-only retained session offers a closed progress inspection operation
-alongside publication and transition. It reads source-bound account progress in
-a repeatable-read, read-only transaction, then rolls back. Epoch, maintenance,
-source/account qualification and the same finite connection/turn windows apply.
-It shares the owner's progress decoder and returns no future writer authority.
-Malformed state or deadline failure retires the session and returns no snapshot;
-confirmed mutation COMMIT handling remains unchanged. The copy worker can load
-progress without holding the schema-owner password or opening a new database
-connection for each read.
-
-## Replica reuse of verified immutable Blobs
-
-A metadata-only replica effect can reuse an account-scoped live Blob only when
-its retained identity receipt and current manifest match source ID, length and
-digest. Existing Email identity checks remain mandatory. A missing live Blob
-for a new Email returns MissingBody without publication or progress; its
-acknowledged rollback allows reuse of the bounded session. Any rollback or
-deadline failure retires it. A retained identity without live bytes cannot
-publish mail. Raw storage is not rehashed for this metadata operation, matching
-the existing immutable-body/derived-metadata trust boundary. Publication with
-fresh bytes still requires the full verified body capability. No schema,
-ordinary fresh-ID publication or source checkpoint policy changes.
-
-## Replica mailbox graph publication
-
-Schema 39 adds indexes on mailbox receipt account/observation and current
-present account/ID. Tables and role grants remain unchanged. The replica-only
-session accepts a closed complete-graph operation under its existing finite
-budgets and the account lock. It validates source/account/generation, the
-initialized Inbox and observation ordering, and commits graph changes, local
-history, receipts, receipt usage and the completed Mailbox checkpoint together.
-[REPLICATION.md](REPLICATION.md) owns deferred retirement dependencies and the
-explicit 256-folder union capacity boundary. The operation never removes Email
-memberships to force a folder deletion or claims completeness while retirement
-is pending. A schema-38 binary cannot serve schema 39; retain a consistent
-backup and use the fenced upgrade procedure. No replica service is activated.
 
 ## 15. Submission queue, relay scheduling and route health
 
@@ -8507,3 +7742,799 @@ default three workers allow two downloads alongside an API request. No read
 result or authority crosses workers. Pending-publication guards still
 serialize or refuse conflicting mutations; parallel readers do not promise
 parallel writes or change unknown-COMMIT settlement.
+
+## 17. Maintenance, audit and recovery
+
+This chapter covers owner-side operations on a store outside ordinary service:
+read-only historical audits of one account and the commands that expose them,
+the runtime maintenance barrier and its owner entry, release of a restored
+store with delivery quarantine, and scheduled whole-body scrubbing. It also
+states the storage rules for application diagnostics, legacy imported message
+bodies and native ACME state. Every database command here uses the protected
+owner connection file; none grants device, quota or serving authority. Audit
+reports are historical observations of one snapshot. Separate reports are
+separate snapshots and must not be presented as one consistent account
+snapshot.
+
+### Historical account usage audit
+
+`postgres_usage_audit::inspect` compares the five stored account-usage counters
+with durable rows in one finite, read-only REPEATABLE READ primary snapshot.
+It checks the expected epoch under the shared schema barrier, captures the
+account sequence/floor, distinguishes a missing account from a missing usage
+row, and acknowledges ROLLBACK before the final deadline check. The returned
+identity and counts are historical observations, not quota admission or policy
+and device authorization. No account row lock, write or repair is performed.
+
+Body bytes and blob count include every live blob manifest, including a
+zero-length blob. Upload bytes count each manifest with an existing lease;
+expired leases count until the account's next upload or relay retention
+reclaims them ([Expired upload lease reclamation](#expired-upload-lease-reclamation)). Queue bytes count each manifest
+referenced as a transmitted blob by a submission, once even if several
+submissions reference it. Queue submission count includes every durable
+submission, including completed ones retained in the database. Reserved blob
+IDs without a live manifest contribute nothing. These are the same durable
+categories used by publication accounting and the initial usage migration.
+
+A mismatch in any counter, missing usage row, malformed sequence or negative
+result refuses the audit. Aggregate overflow or query failure also refuses;
+there is no truncation or inferred correction. The normal finite probe and
+statement bounds apply, as detailed in RESOURCES. A large account that cannot
+be checked within those bounds has no successful audit result.
+
+`usage-inspect` ([Usage inspection command](#usage-inspection-command))
+exposes this audit, and the composed account audit ([One-snapshot canonical
+account audit](#one-snapshot-canonical-account-audit)) includes it. By
+itself it does not validate body digests, metadata references, mailbox
+graphs, operation receipts, credentials, configuration or delivery outcomes,
+and cannot authorize restore or serving. Matching counters can coexist with
+a damaged body.
+
+### Historical single-blob integrity audit
+
+`postgres_blob_audit::inspect` verifies one explicitly named account/blob in
+one finite read-only primary REPEATABLE READ snapshot under the expected
+store epoch and shared migration lock. The caller supplies trusted
+administrative connection access, not a device password. `blob-audit`
+([Single-blob audit command](#single-blob-audit-command)) exposes this
+verifier; it is never a download or device authorization path. It returns
+only public manifest metadata and the snapshot account sequence/floor.
+
+The body reader checks manifest bounds, changed sequence, exact chunk count,
+ordered contiguous ordinals, chunk extents and the complete SHA-256, including
+the empty body digest. It uses the 64-MiB stored-body ceiling and eight-chunk
+batches, not a message-sized buffer. The original connection budgets and
+deadline cover metadata, all body reads and an acknowledged ROLLBACK; a final
+deadline check precedes success. Missing rows, wrong epochs, corrupt
+manifests/bytes, database failures and timeouts refuse. Failure closes the
+private worker and never repairs any row.
+
+A successful result certifies only this body's historical snapshot. It does
+not check counters, owning Email/submission/lease references, other metadata,
+configuration, credentials or retained receipts. It provides no current quota
+or serving authority, complete-store certificate or restore approval.
+
+### Historical canonical metadata audit
+
+`postgres_metadata_audit::inspect` runs the shared `metadata_sweep` against
+all eleven canonical PostgreSQL metadata tables in one owner-side primary
+REPEATABLE READ, READ ONLY transaction. The expected epoch and shared
+migration lock precede the snapshot. The caller supplies trusted UTC and
+explicit row/parent-read limits; no device credential or serving profile is
+required. The private adapter cannot escape the worker or expose history
+reads. It refuses `next_change`; this is no change-history certificate.
+
+Account-scoped keyset reads return one row, in decoded `Key::compare` order.
+Compound text and import keys use their logical SQL column tuples and C
+collation, not transient length-prefixed encodings. PostgreSQL fields become
+shared typed rows and pass their canonical encoder/decoder and key checks.
+SMTP origins additionally read at most 1001 ordered receipt recipients,
+refusing count disagreement, ordinal gaps, excess or malformed receipt data.
+Receipt rows on a non-SMTP Email also refuse. Every canonical changed sequence
+must be no later than the captured account sequence; sequences retain all
+64 bits. Parent lookups stay in the same snapshot and account.
+
+The shared checks enforce local row rules, direct owning references,
+rooted mailbox chains and exact submission recipient coverage. Their report
+retains the snapshot identity and counts. It does not add policy checks that
+those shared checks lack (for example uniqueness of mailbox roles), audit
+usage counters, body bytes, credentials, configuration, retained operation or
+delivery receipts, or change history. No whole-store, restore, serving or
+current authority follows.
+
+A dedicated owner-side audit worker derives checked cumulative wire,
+frame and command allowances from the caller's logical bounds. It reserves
+`5 * rows + parent_reads + 64` turns for the three passes, direct references,
+parent walks, schema checks, table-end probes and acknowledged ROLLBACK.
+Each turn admits at most 1 MiB input, 64 KiB output and 1088 frames, including
+at most 1001 SMTP receipt rows. Authentication shares the first window.
+Only completion admits the next window; idle bytes remain charged to the
+previous window, cumulative counters never replenish, and failures are
+terminal. Counters allocate no proportional memory. The 128 KiB
+frame, SCRAM sequence, row decoder and fixed scratch bounds remain in force.
+Overflow or a counter that does not fit the host refuses before connection.
+
+The caller supplies one deadline no more than an hour away. Connection and
+authentication still have at most ten seconds, individual SQL statements
+five seconds and locks one second. The original audit deadline covers every
+turn and acknowledged ROLLBACK and is checked after worker destruction.
+No turn, address attempt or logical allowance renews time. Runtime workers
+retain their ordinary bounds and cannot use this owner path. Connection
+failure during metadata reads retains its connection classification rather
+than being reported as canonical metadata corruption. A large account may
+refuse without a partial success report. Failures close the connection and
+perform no repair.
+
+### Historical retained-history audit
+
+`postgres_history_audit::inspect` checks all physically retained change
+rows for one explicit epoch/account in one primary REPEATABLE READ,
+READ ONLY snapshot under the shared migration lock. It captures the account
+endpoint and history floor before scanning, requires floor <= endpoint and
+accepts an explicit total row limit. Zero is valid only when no rows remain.
+No operator command exposes it, and it grants no device authorization or
+serving activation.
+
+The audit and the authenticated change reader share one canonical row
+decoder: exact eight-byte nonzero unsigned sequence, operation 0..4095,
+supported Mailbox/Thread/Email/EmailSubmission kind,
+Created/Updated/Destroyed action and exact sixteen-byte object ID. Identity
+changes refuse. Both consumers check strict cursor order and the captured
+committed endpoint. Account keyset batches contain at most 128 rows, never a
+complete retained history.
+
+Rows at or below the floor may await physical reclamation and are valid.
+The audit validates them too and reports their count separately. A success
+reports only the captured identity and total/retired row counts after
+acknowledged ROLLBACK and a final original-deadline check. It does not prove
+that events are complete, actions match live objects, operation ordinals are
+contiguous, transaction history can reconstruct current state, or retained
+receipts are valid. No body, metadata, credential, restore or serving
+certificate follows.
+
+The body worker's wire/frame ceilings and its deadline, at most 30 seconds, cover the entire scan; a caller row allowance does not renew them. Exhaustion,
+malformed rows, future or zero sequences, wrong epoch, missing account or
+database failure refuse without repair or a partial report. A commit after
+snapshot capture is invisible to the scan.
+
+### One-snapshot canonical account audit
+
+`postgres_account_audit::inspect` composes the canonical metadata sweep
+([Historical canonical metadata
+audit](#historical-canonical-metadata-audit)), the five usage-counter
+comparisons ([Historical account usage
+audit](#historical-account-usage-audit)) and the body verifier ([Historical
+single-blob integrity audit](#historical-single-blob-integrity-audit)) for
+every live blob manifest. They use the same primary REPEATABLE READ, READ
+ONLY transaction, expected epoch and shared migration lock. No independent
+audit reports are joined. A private metadata helper begins and retains that
+transaction; only the outer audit acknowledges ROLLBACK and checks the final
+original deadline after dropping its worker. An in-flight audit sees only
+its captured snapshot; damage committed after capture is visible only to a
+later audit.
+
+After canonical metadata passes, the same transaction rejects duplicate
+non-null mailbox roles within this account. A single EXISTS query groups
+roles under C collation and returns one boolean; unassigned roles and other
+accounts do not conflict. This adds role uniqueness, not registry membership
+or full mailbox-policy validation, and retains no client-side role collection.
+
+The caller supplies trusted UTC, metadata row/parent limits and aggregate
+body count/byte limits. Body enumeration is account-scoped, ascending blob
+ID keyset pagination with one manifest at a time. It includes manifests with
+no Email, lease or submission owner and checks zero-length body digests.
+Every manifest passes the extent, changed-sequence and actual chunk
+count checks before the shared streaming verifier checks all bytes. Captured
+identity must match on every body. Aggregate limits are checked before each
+body is read. Verified body totals must agree with both metadata blob count
+and the audited usage totals before a report can succeed.
+
+The report contains historical canonical metadata, role uniqueness, counters
+and verified body totals. Role registry membership, other mailbox policy,
+configuration, credentials, retained operation/delivery receipts and change
+history remain uncertified. This is not a complete PostgreSQL semantic audit,
+restore approval, delivery permission or service admission. Failure returns
+no partial report and performs no repair.
+
+The audit worker adds `2 * max_blobs + ceil(max_bytes / 524288)` turns to
+the metadata allowance: one manifest per blob, one independent rounding
+allowance per blob and streamed eight-chunk reads. Final enumeration and
+usage/role queries fit the fixed reserve. Body buffers retain at most eight
+64 KiB chunks regardless of the account size. The same per-turn and
+cumulative limits apply.
+
+### Usage inspection command
+
+`postgres usage-inspect --connection-file PATH --epoch HEX --account ID`
+loads the protected owner-side connection file and invokes the read-only
+counter audit ([Historical account usage
+audit](#historical-account-usage-audit)) for one explicit account and store
+epoch. It shares one DNS/connection/operation deadline across
+resolved-address attempts; only transport refusal permits another address.
+No profile is selected or served.
+
+Successful schema-1 JSON reports the account, epoch, snapshot sequence and
+history floor, plus `body_bytes`, `blob_count`, `upload_bytes`, `queue_bytes`
+and `queue_submissions`. `counters_consistent:true` describes that historical
+snapshot only. `semantic_verified:false` explicitly preserves the narrower
+scope: this command checks no body digests, metadata graph, retained receipts,
+configuration, credentials or restore safety. Success supplies no quota or
+serving authority and does not imply the counters remain current.
+
+Missing accounts, wrong epochs, absent or inconsistent counters, database
+failures and deadlines refuse with fixed error codes. Duplicate, missing and
+unknown arguments refuse before loading the connection file. There is no
+repair, force or all-accounts option. The command never prints credentials,
+body bytes or native database error text, and never changes counters or
+account sequence; deliberately corrupted usage persists after refusal.
+
+### Single-blob audit command
+
+`postgres blob-audit --connection-file PATH --epoch HEX --account ID --blob
+ID` invokes the bounded single-body verifier ([Historical single-blob
+integrity audit](#historical-single-blob-integrity-audit)). All four flags
+are required exactly once. Unknown, duplicate, missing and malformed
+arguments refuse before opening the protected connection file. The command
+has no repair, download or profile option.
+
+Address resolution and body verification share the original ten-second
+deadline. Only pre-connection transport failure permits another resolved
+address; database or body failures do not renew work. The 64-MiB stored-body
+ceiling, bounded chunk batches and worker byte/frame ceilings apply.
+
+Success JSON schema 1 identifies the epoch, account, blob, captured account
+sequence/history floor, verified byte count and manifest creation time.
+`body_digest_verified:true` describes that body's historical snapshot;
+`semantic_verified:false` excludes counters, references, other metadata,
+credentials, configuration and restore approval. No body bytes are emitted.
+Missing account or blob returns the same fixed `blob-not-found` code.
+Other failures retain fixed codes without SQL, database messages or secrets.
+No invocation changes rows or grants device or serving authority.
+
+### Canonical metadata audit command
+
+`postgres metadata-audit --connection-file PATH --epoch HEX --account ID
+--max-rows N --max-parent-reads N [--timeout-seconds N]` exposes the
+canonical metadata verifier ([Historical canonical metadata
+audit](#historical-canonical-metadata-audit)) independently of body and
+usage checks. Connection, epoch, account and both logical bounds are
+required exactly once. The optional timeout follows the account audit
+command's ([Account audit command](#account-audit-command)) 1 through 3600
+second range and ten-second default. Limits use unsigned ASCII decimal with
+at most twenty digits and must fit u64; zero is valid and can cause a
+bounded scan refusal. Unknown, duplicate, missing and malformed arguments
+refuse before protected-file access. Body-limit flags belong to
+account-audit and are refused here.
+
+One trusted UTC sample supplies lease-reference policy. DNS and verification
+share the original selected deadline; DNS retains a five-second ceiling.
+Logical limits select the metadata audit's finite cumulative worker
+allowance; no operation renews wire or time budgets. Only pre-connection
+transport failures permit address fallback. Failure emits fixed categories
+without SQL or secrets and never changes a row or returns a partial success
+report.
+
+Success JSON schema 1 identifies epoch, account, sequence, history floor,
+canonical row count and mailbox count. `canonical_metadata_verified:true`
+means the shared canonical row/reference/forest/recipient checks passed in
+one historical snapshot. `body_digests_verified:false` and
+`semantic_verified:false` preserve the narrower scope: body bytes, counters,
+mailbox-role uniqueness/registry, credentials, configuration, retained history
+and operation/delivery receipts are not certified. No serving or restore
+authority follows, and separate reports cannot be combined into one snapshot.
+Invalid body digests, inconsistent usage counters and duplicate mailbox
+roles therefore do not fail this command; the account audit command
+supplies those checks.
+
+### Account audit command
+
+`postgres account-audit --connection-file PATH --epoch HEX --account ID
+--max-rows N --max-parent-reads N --max-blobs N --max-bytes N
+[--timeout-seconds N]` invokes the composed one-snapshot account audit
+([One-snapshot canonical account
+audit](#one-snapshot-canonical-account-audit)). Every bound is required,
+unsigned decimal with at most 20 ASCII digits and checked u64 range; zero is
+allowed. Duplicate, unknown, incomplete and malformed options refuse before
+opening the protected connection file. There is no profile, all-accounts,
+force or repair option. The command samples trusted process wall time once
+for metadata policy and shares one DNS/connection/operation deadline across
+address attempts. Only transport refusal permits another address, with no
+renewed deadline.
+
+Successful schema-1 JSON reports account, epoch, sequence and history floor,
+metadata row count, verified blob/byte totals and the five usage counters.
+`canonical_metadata_verified`, `mailbox_roles_unique`, `counters_consistent`
+and `body_digests_verified` are true for that historical snapshot only;
+`semantic_verified:false` preserves all of the composed audit's exclusions.
+The report never approves restore or serving and grants no current
+authority. This command defaults to ten seconds. Optional
+`--timeout-seconds` accepts one unsigned decimal value from 1 through 3600;
+duplicates and values outside that range refuse before opening files. The
+explicit owner timeout does not change runtime service deadlines,
+per-statement bounds or the ten-second connection/authentication ceiling.
+
+Fixed error codes distinguish missing accounts, epochs, aggregate body
+limits, metadata checks, usage integrity, body checks and database failures.
+No SQL error text, credentials or body content is printed, and damaged rows
+are preserved.
+
+### Runtime maintenance barrier (schema 28)
+
+Migration 28 adds the owner-controlled `runtime_barrier` singleton, initially
+unblocked. The dedicated runtime role has SELECT only on this table, and the
+exact privilege qualification rejects broader column/table write authority.
+After role and privilege checks, common runtime qualification requires exactly
+one `(singleton=true, blocked=false)` row. A blocked or missing singleton
+refuses with the distinct maintenance error; query/type failures also refuse.
+
+This check applies to each new ordinary Runtime connection and retained
+validators' runtime qualification. HTTPS authentication performs a fresh
+maintenance fence in each job snapshot, and the retained SMTP storage session,
+retained mutation sessions and the replica publisher session check the barrier
+at the start of each job ([Replica publisher
+session](#replica-publisher-session)). Neither check revokes already-admitted
+network I/O or makes a previously captured snapshot see newer rows. Operations
+retain their original finite limits and migration locks. Owner Preparation
+schema inspection remains available while the barrier is set; `runtime-check`
+remains a runtime qualification and refuses maintenance.
+
+Runtime qualification performs no entry, release, epoch renewal, delivery
+quarantine or recovery approval. Owner entry ([Owner maintenance
+entry](#owner-maintenance-entry), [Maintenance
+commands](#maintenance-commands)) and recovery release ([Restored-store
+delivery quarantine (schema
+31)](#restored-store-delivery-quarantine-schema-31)) hold the exclusive
+migration lock and require external fencing of old instances and SMTP
+egress; shared locks prevent them from racing qualified database operations.
+A database flag cannot establish external fencing or decide
+duplicate-delivery risk. Recovery must not clear this barrier until its
+quarantine, credential/configuration and semantic-state requirements are
+satisfied; `recovery-release` is the only owner operation that clears it.
+
+Prior migration bytes/checksums remain unchanged. Upgrade is atomic, preserves
+store epoch and existing state, and initializes the singleton only in the new
+migration.
+
+### Owner maintenance entry
+
+`postgres_maintenance` provides bounded owner inspection and one-way barrier
+entry. The caller must provide the expected store epoch and explicitly
+attest that all old instances and SMTP egress are externally stopped/fenced.
+The typed attestation records a caller obligation; PostgreSQL cannot prove
+it. `maintenance-inspect` and `maintenance-enter` ([Maintenance
+commands](#maintenance-commands)) expose it; serving never enters or clears
+maintenance.
+
+Entry forces READ COMMITTED and synchronous commit, acquires the exclusive
+transaction migration lock before checking the complete current ledger, and
+requires the authenticated session user to own the schema, ledger and barrier
+tables. A runtime credential cannot enter maintenance even if somebody has
+incorrectly granted it barrier UPDATE. Any shared or exclusive migration-lock
+holder makes entry refuse busy; it does not wait for or cancel live work.
+The singleton must exist and be well-formed. Entry never inserts missing
+state or changes the epoch, mail, configuration, credentials or receipts.
+
+Maintenance entry only transitions false to true. At the same epoch, observing
+true is already success and performs no UPDATE. Unacknowledged COMMIT is
+indeterminate, not rollback. Resolve it by inspection or repetition using the
+same expected epoch. Inspection holds a shared migration lock, so an original
+in-flight entry remains busy until it commits or rolls back. A false
+observation permits only the same monotone entry, not runtime activation.
+An acknowledged COMMIT remains known even if completing it crosses the
+caller deadline; a read/no-op result requires the final deadline check.
+
+The recovery-release protocol ([Restored-store delivery quarantine (schema
+31)](#restored-store-delivery-quarantine-schema-31)) renews the store epoch
+while clearing the barrier and quarantining pending deliveries. It requires
+restored devices revoked and external configuration/fencing review; semantic
+verification and subsequent profile/credential activation remain explicit.
+This prevents an old entry retry from reblocking a reopened store. Direct
+owner SQL that clears the barrier without renewal violates this protocol.
+Barrier entry alone supplies no epoch renewal, delivery quarantine, resend
+decision, backup/restore verification or authority to open service.
+
+### Maintenance commands
+
+`postgres maintenance-inspect --connection-file PATH --epoch HEX` observes
+the owner barrier. `postgres maintenance-enter` requires the same arguments
+and the explicit `--instances-and-smtp-fenced` flag. The flag attests that
+all old instances and SMTP egress are externally stopped/fenced; it neither
+performs nor proves fencing. Duplicate, unknown and missing arguments refuse
+before opening the protected connection file. Inspection rejects that flag.
+Neither maintenance command has a force, profile selector or
+epoch-generation option. Recovery release is a separate owner command
+([Restored-store delivery quarantine (schema
+31)](#restored-store-delivery-quarantine-schema-31)).
+
+Both commands use the owner and expected-epoch checks above, the protected
+bootstrap loader and one original DNS/connection deadline. Only a
+transport failure before any COMMIT attempt permits another resolved address;
+indeterminate entry is not silently replayed. Retain the exact epoch after
+uncertainty and inspect or repeat at that epoch.
+
+Schema-1 JSON reports the expected epoch, historical blocked state and
+`recovery_verified:false`. Errors use fixed codes without SQL, credentials or
+body contents; operation failures preserve the expected epoch in output.
+`indeterminate-inspect-maintenance` requires explicit outcome resolution.
+A false observation does not authorize opening service, and successful entry
+neither rotates an epoch nor quarantines deliveries or validates recovery.
+Neither command starts or stops a service. A missing singleton refuses
+without repair.
+
+### Restored-store delivery quarantine (schema 31)
+
+`td-mta postgres recovery-release` is an explicit owner operation after
+`maintenance-enter`. Keep old instances stopped and SMTP egress fenced
+throughout the recovery. The flags attest operator actions; they do not
+establish a network fence. This command never starts a service.
+
+Retain a fresh random 16-byte new epoch before publication, alongside the
+restored epoch; it must differ from the restored epoch and must not be all
+zero. First inspect the restored accounts, bodies, counters and
+configuration, and revoke **every** restored device with `device-revoke`.
+The release refuses any still-active device, missing maintenance barrier,
+wrong epoch, invalid account floor, inconsistent pending submission or
+relation exceeding `--max-rows` (1 through 1,000,000). The bound applies to
+each rewritten mail/queue relation; the command retains its ten-second
+deadline. Failure before COMMIT rolls the entire operation back.
+
+```text
+td-mta postgres recovery-release --connection-file /private/owner-connection \
+  --epoch OLD_HEX --new-epoch FRESH_HEX --max-rows 100000 \
+  --instances-and-smtp-fenced --configuration-reviewed
+```
+
+Release changes Queued, InFlight, RetryWait and retryable OutcomeUnknown
+recipients into terminal OutcomeUnknown with explicit uncertainty and the
+Restored reason (schema 31). A backup may predate every attempt: this reason
+also permits an unattempted recipient with phase None, without inventing
+attempt history. Release clears retry times, completes those submissions and
+requests only local failure notices. Accepted, failed, canceled and
+already-terminal unknown results stay intact. Replies and attempt history
+remain available; active attempts, final reservations and route ownership are
+retired. Bodies and usage counters remain unchanged. Account history floors
+advance to current sequences, preventing access to pre-recovery incremental
+history under the new epoch. The ledger epoch changes and the maintenance
+barrier releases in the same transaction.
+
+Retain both epochs after an indeterminate result. Wait for the operation to
+settle, then inspect the schema and maintenance barrier. A new epoch with an
+open barrier identifies committed release; the old epoch with a closed
+barrier permits retry with the **same** new epoch. A busy migration lock is
+not a rollback. Any other state requires investigation. Never substitute a
+new epoch to hide uncertainty.
+
+Configuration encodings are epoch-bound: existing selected profiles fail to
+load after release. Import the reviewed private configuration sources as a
+new version under the fresh epoch, then explicitly select it using the next
+selection generation. Retain old configuration versions and receipts. Create
+fresh device credentials and verify mailbox reads before opening ingress or
+SMTP egress. Separately review database/bootstrap credentials, relay secrets,
+ACME account state and all changes or deliveries after the backup boundary.
+Quarantined submissions never retry automatically; deliberately submitting a
+new copy requires accepting duplicate-delivery risk.
+
+A release receipt reports quarantine counts, not full semantic integrity or
+successful service activation. Hosted activation and off-host backup
+durability remain separate operational checks.
+
+### Scheduled whole-body integrity scrubbing
+
+`postgres blob-scrub-page` is an owner-only, read-only primary audit page.
+It takes `--connection-file`, `--epoch`, optional `--limit` (default 128,
+maximum 256), and optional `--after ACCOUNT:BLOB --through ACCOUNT:BLOB`.
+Both key components are canonical hexadecimal IDs. A continuation requires
+its retained upper key. The first page captures the greatest `(account,id)`
+blob key in its repeatable-read snapshot. Each page holds the migration lock,
+checks the actual schema owner and epoch, verifies manifests, chunk layout
+and the original whole-body SHA-256, and ends with known ROLLBACK before
+returning progress. It reads all stored blobs, including unreferenced uploads;
+it does not rely on summaries or MIME interpretation evidence.
+
+A page attempts at most 64 MiB of valid advertised body lengths, streams one
+body at a time, and retains the original ten-second operation deadline and
+bounded connection framing. Corrupt metadata or bytes increment a bounded
+failure count and advance the cursor; only the first failed identity is
+retained. An operational, deadline or transport failure returns no publishable
+cursor. A replay is read-only. These are historical per-page observations,
+not one database-wide snapshot: concurrent deletion may remove a body before
+its page, and insertion behind a cursor belongs to the next cycle. No repair,
+mail deletion, metadata-integrity certificate or credential authority follows.
+
+`postgres blob-scrub` adds `--state-dir` and runs one page with locally retained
+progress. The pre-created private directory is locked and dedicated to this
+operation. It contains only `LOCK`, `state.json` and interrupted `partial`;
+files obey the protected operator-input contract. State is bounded to 8 KiB,
+versioned and epoch-bound, published by private create, file sync, rename and
+directory sync. A crash may replay a page but cannot skip one. Restored epochs
+require a fresh directory; old progress is not reused. Unknown entries,
+symlinks, malformed state and concurrent owners refuse. This state is an
+operator progress receipt, not authoritative mail data.
+
+A completed cycle waits 86,400 seconds before the next cycle. Each page
+records totals, the cursor, first corrupt identity and operational failure.
+Completed failure counts remain visible throughout the next cycle and clear
+only after a complete clean cycle. Failures return nonzero and structured
+JSON to the supervisor; progress also has structured JSON. The status command
+`postgres blob-scrub-status --state-dir PATH --epoch HEX` needs no database
+credentials. Both commands wait at most fifteen seconds for an overlapping
+invocation to release the state lock. This also lets a scheduled page tolerate
+the short status writer when both timers fire together; an owner that keeps
+the lock beyond that bound still causes a nonzero failure. Status fails on
+known corruption, the last operational failure, missing completion,
+completion older than 172,800 seconds or backward wall clock observations.
+Every invocation, including status and waiting, persists the latest observed
+second before reporting freshness; a lower observation refuses rather than
+making a stale cycle appear fresh again. It never claims integrity of future
+writes or replaces backup/restore drills. These operator reports use the
+supervisor journal and private progress file, not the database
+application-log table.
+
+The installer operations generator can schedule one page per minute and a
+separate status check every fifteen minutes on systemd or Shepherd. Each
+invocation is bounded, the directory lock excludes overlap, and a failed page
+is retried on the next tick. Schedules require explicit generation and
+activation; normal serving does not enable background scrubbing implicitly.
+
+### Application diagnostic retention (schema 29)
+
+`postgres_logs.sql` adds `application_log_state` and `application_logs`.
+Both require runtime SELECT/INSERT/UPDATE/DELETE, without ownership, DDL,
+TRUNCATE or grant options; owner/runtime separation is unchanged.
+Stop all service instances for the explicit schema upgrade, upgrade with
+the owner connection preserving existing explicit grants, add grants on
+these two tables, run `runtime-check`, and restart on the matching
+executable. Never edit an existing migration checksum. Mail tables and
+retained mail are unchanged by this migration.
+
+OBSERVABILITY.md owns the 30-day age policy, fixed ring, rate/byte limits,
+loss counters and failure isolation. These records use asynchronous commit,
+may be lost or overwritten, and are never a source of delivery, recovery or
+publication authority. Log inspection is bounded and epoch-qualified:
+
+```text
+td-mta postgres logs --connection-file /private/owner-connection --epoch HEX --limit 100
+td-mta logging-status --runtime /private/runtime
+```
+
+Use the last returned `before` ID for the next page. The log relations have
+a physical high-water stop in addition to live-row bounds; PostgreSQL WAL,
+archive/replication retention, backups and whole-volume headroom still require
+normal operational limits and monitoring. A stopped diagnostic sink must not
+be treated as a reason to resend mail.
+
+### Legacy message storage (schema 32)
+
+Owner-authorized migration may preserve raw messages up to 64 MiB. Schema 32
+widens only the immutable blob length and chunk ordinal constraints,
+retaining 64 KiB chunks and at most 1024 chunks. Earlier migration
+checksums are unchanged; existing databases require the explicit owner
+schema upgrade. Ordinary SMTP, upload, draft and submission preparation keep
+their 32 MiB admission limits. Account quotas continue to charge every
+imported byte.
+
+The owner import connection admits at most 72 MiB outgoing bytes and 4096 input
+frames. Input bytes remain 1 MiB, or 4 MiB for the guarded new-only import.
+Stored-body verification and replay allow 256 MiB incoming bytes with the
+8192-frame and 512 KiB outgoing limits. Raw JMAP downloads use the
+64 MiB stored-body ceiling; configured network admission limits do not hide
+successfully imported bodies. Authentication, per-frame bounds, deadlines and
+bounded chunk buffers remain in force. Email body/header projections and text
+search also use the stored-body ceiling rather than the current incoming
+message ceiling. MIME header, part, depth, work and output bounds remain
+independent and may still refuse an interpretation.
+
+Full stored-body verification and raw download have an absolute 30-second
+ceiling, including replay. Connection establishment and fresh device
+reauthorization retain their ten-second caps, shortened by the original body
+deadline. Ordinary JMAP snapshot methods retain their ten-second cap.
+Progress never renews an admitted operation's deadline.
+
+An owner Email import's write connection admits ten seconds plus up to twenty
+more in proportion to the body's share of the 64 MiB ceiling
+(`postgres_probe::import_duration`), reaching the same thirty seconds at the
+ceiling. Receipt inspection, connection establishment and mailbox
+publication keep ten seconds, and a caller deadline above the scaled
+allowance is refused before any work.
+
+### Native ACME state and certificate pairs (schema 30)
+
+Schema 30 adds `acme_profiles`, sixteen fixed slots containing bounded private
+account/order state and one active certificate/key pair per named profile.
+Runtime qualification grants ordinary data access to this table; immutable
+operator configuration/material tables retain their read-only grants.
+[ACME.md](ACME.md) specifies the single-endpoint routing restriction,
+lease/revision protocol, endpoint policy and retry/retention bounds.
+
+Claims check the schema/store epoch and serialize only short slot/ownership
+transactions. Every save matches the random owner, expected revision and
+unexpired database lease. Publication changes the active pair and pending state
+in the same statement. Uncertain outcomes are reloaded on the next ownership
+turn. No CA connection runs inside a database transaction. Managed material
+loaders fetch and pin the complete active pair once per profile and verify its
+settings digest against the configured directory, contact and exact name set.
+Different chain/key reads cannot observe different renewals. No arbitrary file
+path, material version, configuration selection or mail-delivery authority is
+created by this mapping.
+
+## 18. Replica source and follower storage
+
+This chapter covers the PostgreSQL side of application-level account
+replication: the inventory windows a source primary serves, the source
+binding that turns a local database into a follower, the follower's
+replica tables, and the closed operations of the replica publisher session.
+[REPLICATION.md](REPLICATION.md) owns the protocol, cursor, receipt, quota and
+retry contracts and the read service;
+[REPLICA-OPERATIONS.md](REPLICA-OPERATIONS.md) owns routine operation.
+Promotion, unbinding and recovery qualification are not provided
+(REPLICATION.md, "Recovery boundary").
+
+### Replica source inventory windows
+
+The snapshot read adapter enumerates account-wide Email IDs for the
+follower's copy worker. REPLICATION.md owns its coverage boundary. A first
+page captures the committed sequence and greatest ID together; continuation
+queries use `id > after AND id <= upper ORDER BY id`, under the
+account/ID primary key, with a maximum of 256 returned IDs and one lookahead.
+Rows changed after the starting sequence are left exclusively to change
+catch-up. This excludes post-base creations that could otherwise be copied and
+then disappear from a coalesced Created/Destroyed change page. Post-base updates
+to older objects are also omitted from inventory and recovered through changes.
+The SQL filter still selects revisions newer than the observed snapshot so the
+ordinary integrity check refuses them; corruption is not silently filtered out.
+This predicate bounds returned rows, not the number of index entries PostgreSQL
+may examine; the statement and operation deadlines still apply.
+
+Every page authenticates through its enclosing snapshot and rejects a source
+account, epoch or kind mismatch, a future starting sequence, expired history,
+or inverted bounds. Row revisions and strict ID ordering are validated before
+returning detached data. Storage, integrity and deadline failures latch the
+snapshot; ordinary cursor/limit validation refusals do not poison later
+methods in the same request. The adapter creates no retained transaction or
+retention lease; its enclosing snapshot keeps its ordinary caller-owned
+lifetime and deadline. It reads only core mail tables and adds nothing to the
+source's schema.
+
+REPLICATION.md specifies its authenticated HTTPS inventory/metadata extension
+and versioned cursor. Metadata returns the stored complete-body digest and
+exact timestamp without reading raw chunks, through the same snapshot and
+metadata prefetch as Email/get. An inventory page grants no deletion
+authority and advances no replica checkpoint; catch-up uses changes.
+Source Session advertises `inventoryBaseFence: true`; discovery requires it
+so an older source cannot silently weaken the starting-state guarantee.
+
+### Replica source binding (schema 36)
+
+Schema 36 adds `replica_source`, an owner-writable singleton with canonical
+HTTPS origin (at most 4096 bytes), a 16-byte source epoch and protocol
+version 1. Runtime grants permit SELECT only. The ordinary runtime qualifier
+requires the row to be absent; a bound or invalid source refuses before mail
+SQL. This is a cold connection check, not another per-message query. Retained
+sessions keep their shared migration lock. The replica reader and replica
+publisher qualify through their own modes, which require a valid binding
+(REPLICATION.md).
+
+Owner initialization (`replica-source-init`) takes its exclusive
+transaction migration lock, validates the local epoch and owner, and refuses
+accounts, selected configuration or ACME profiles before insertion. A matching
+binding can be inspected or repeated; a conflicting binding refuses. COMMIT
+uncertainty is retained explicitly. No source credentials or source
+operational configuration are stored in the identity row.
+
+Core mail tables are those of primary mode, and source and local JMAP state
+stay separate. A schema-35 binary cannot serve schema 36; use the documented
+fenced upgrade and consistent backup.
+
+### Replica account tables (schema 37)
+
+Schema 37 adds `replica_accounts`, `replica_progress`, `replica_pending` and
+`replica_mailbox_receipts`. The owner-only account row binds its source and
+immutable seed digest and records explicit body-byte, blob, Email and receipt
+limits. Progress holds independent source Email replay and Mailbox state,
+inventory phase and counters. Pending work is bounded to one page per account,
+with at most 16384 ID bytes and a 128-byte completion bitmap. Mailbox receipts
+initially cover at most 256 folders. All four tables revoke PUBLIC access and
+ordinary runtime grants allow SELECT only. The replica publisher qualifier
+([Replica publisher session](#replica-publisher-session)) admits its narrowly
+selected mutable control tables.
+
+The initializer behind `replica-account-init` takes the shared migration
+lock, checks local epoch, schema owner and the exact persisted source, and
+publishes one source account in a synchronous transaction. The core account
+insertion serializes concurrent initializations. A matching existing seed
+receipt returns without changing any later state; conflicts refuse. Batch
+typed SQL preserves mailbox IDs, parent relationships, roles, order and
+subscriptions, emits local Created history, records the source Inbox and
+zero usage, and persists the initial work page in the same commit. A failure
+before COMMIT leaves no partially created account; uncertain COMMIT remains
+explicit and may be settled using the retained seed. The owner connection
+has the reconciliation window: 2 MiB output, 4 MiB input, 2048 frames and a
+finite ten-second cold operation deadline.
+
+[REPLICATION.md](REPLICATION.md) defines the page and checkpoint semantics.
+Initialization publishes no Email bodies. Source credentials and transport
+authentication remain outside passive seed preparation. A schema-36 binary
+cannot serve schema 37; retain a consistent backup and follow the fenced
+upgrade procedure.
+
+### Replica publisher session
+
+A separate replica runtime qualifier requires the exact source binding and
+mutable replica control grants; source identity and account limits remain
+owner-controlled. Its retained connection holds the migration lock and checks
+the local epoch and maintenance barrier per job. It offers closed typed
+operations only, never a caller-selected SQL operation or an unbounded
+queue: Email publication, pending-page transition, mailbox graph
+publication and progress inspection. REPLICATION.md owns the finite
+session/window bounds.
+
+Progress inspection reads source-bound account progress in a
+repeatable-read, read-only transaction, then rolls back. Epoch, maintenance,
+source/account qualification and the same finite connection/turn windows
+apply. It shares the owner's progress decoder and returns no future writer
+authority. Malformed state or deadline failure retires the session and
+returns no snapshot; confirmed mutation COMMIT handling is unaffected. The
+copy worker loads progress this way, without holding the schema-owner
+password or opening a new database connection for each read.
+
+### Replica Email publication (schema 38)
+
+Schema 38 adds `replica_email_receipts` and `replica_blob_identities`, both
+account-scoped and inaccessible to PUBLIC. Primary runtime grants are SELECT
+only.
+
+[REPLICATION.md](REPLICATION.md) owns the observation, receipt, quota and
+retry contract. One account-locked synchronous transaction publishes the
+full effect, local change history and its pending completion bit. No global
+checkpoint is advanced. Body garbage collection keeps an immutable identity
+receipt and core ID reservation; replica-only restoration requires matching
+length and digest. Normal publication retains fresh-ID refusal.
+
+Schema 44 charges receipts for live Emails and Blobs and backfills the Email
+identity tuple for visible messages. Deletions release capacity under the
+account lock. Permanent Blob identity evidence and cursor-based Email
+receipt reclamation are specified in REPLICATION.md. For a large existing
+replica, the schema owner can give the fenced `postgres schema-upgrade`
+operation `--timeout-seconds N` (1 through 3600, default 10). The single
+deadline covers connection and all migration work. PostgreSQL uses the
+remaining time for the migration transaction and its statements. New
+connections and lock acquisition keep their bounds. A schema-37 binary
+cannot serve schema 38. Use the fenced upgrade procedure and a consistent
+backup.
+
+### Replica reuse of verified immutable Blobs
+
+A metadata-only replica effect can reuse an account-scoped live Blob only when
+its retained identity receipt and current manifest match source ID, length and
+digest. Email identity checks remain mandatory. A missing live Blob
+for a new Email returns MissingBody without publication or progress; its
+acknowledged rollback allows reuse of the bounded session. Any rollback or
+deadline failure retires it. A retained identity without live bytes cannot
+publish mail. Raw storage is not rehashed for this metadata operation, matching
+the immutable-body/derived-metadata trust boundary. Publication with
+fresh bytes still requires the full verified body capability. Reuse changes
+no schema, ordinary fresh-ID publication or source checkpoint policy.
+
+### Replica pending-page transitions
+
+The page-transition operation locks the core account, reloads validated
+progress, and requires the exact completed previous ticket before replacing
+pending work. The source replay cursor/phase update and complete next
+pending row commit together; local mail and JMAP sequences remain unchanged.
+Matching retries preserve the new page's existing completion bitmap.
+[REPLICATION.md](REPLICATION.md) defines cursor provenance,
+inventory-to-change catch-up and retry recognition.
+
+### Replica mailbox graph publication (schema 39)
+
+Schema 39 adds indexes on mailbox receipt account/observation and current
+present account/ID. Tables and role grants are unchanged. The complete-graph
+operation runs under the publisher's finite budgets and the account lock.
+It validates source/account/generation, the initialized Inbox and
+observation ordering, and commits graph changes, local history, receipts,
+receipt usage and the completed Mailbox checkpoint together.
+[REPLICATION.md](REPLICATION.md) owns deferred retirement dependencies and
+the explicit 256-folder union capacity boundary. The operation never removes
+Email memberships to force a folder deletion or claims completeness while
+retirement is pending. A schema-38 binary cannot serve schema 39; retain a
+consistent backup and use the fenced upgrade procedure.

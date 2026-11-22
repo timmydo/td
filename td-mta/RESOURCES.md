@@ -4499,7 +4499,7 @@ one separate bound. SQL statements retain their finite server timeout. Wire
 and deadline exhaustion can refuse before logical limits; success requires
 all shared passes, acknowledged rollback and the final deadline check. The
 report covers canonical field/reference, mailbox-chain and recipient-coverage
-checks only, with the exclusions in POSTGRES section 202.
+checks only, with the exclusions in POSTGRES.md, [Historical canonical metadata audit](POSTGRES.md#historical-canonical-metadata-audit).
 
 ## PostgreSQL composed account audit
 
