@@ -1,6 +1,7 @@
 //! Byte encodings td's crates each kept a copy of: lowercase hexadecimal
 //! both ways, and base64 (RFC 4648 §4, the standard alphabet with `=`
-//! padding) both ways.
+//! padding) both ways. Base64's `_into` forms write to a caller's buffer
+//! and allocate nothing, for callers whose growth goes through td-alloc.
 //!
 //! One file and `std` alone, so a crate built by a direct rustc can include
 //! it as a module by `#[path]`, as td-txt does td-regex. Decoders that
@@ -47,6 +48,26 @@ fn nibble(byte: u8) -> Option<u8> {
 /// The standard base64 encoding of `bytes`, padded.
 pub fn base64(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    encode_base64(bytes, |symbol| out.push(char::from(symbol)));
+    out
+}
+
+/// `base64(bytes)` written to the front of `out`, allocating nothing:
+/// the length written, or `None`, writing nothing, when `out` is shorter
+/// than the encoding.
+pub fn base64_into(bytes: &[u8], out: &mut [u8]) -> Option<usize> {
+    let length = bytes.len().div_ceil(3).checked_mul(4)?;
+    let mut slots = out.get_mut(..length)?.iter_mut();
+    encode_base64(bytes, |symbol| {
+        if let Some(slot) = slots.next() {
+            *slot = symbol;
+        }
+    });
+    Some(length)
+}
+
+/// Every symbol of the padded standard base64 of `bytes`, in order.
+fn encode_base64(bytes: &[u8], mut emit: impl FnMut(u8)) {
     for chunk in bytes.chunks(3) {
         let a = chunk.first().copied().unwrap_or(0);
         let b = chunk.get(1).copied().unwrap_or(0);
@@ -59,14 +80,13 @@ pub fn base64(bytes: &[u8]) -> String {
         ];
         // A chunk of n bytes carries n + 1 sextets; padding fills the rest.
         for (index, sextet) in sextets.into_iter().enumerate() {
-            out.push(if index > chunk.len() {
-                '='
+            emit(if index > chunk.len() {
+                b'='
             } else {
-                digit(BASE64, sextet)
+                symbol(BASE64, sextet)
             });
         }
     }
-    out
 }
 
 /// The bytes the standard padded base64 `text` spells, or `None` for any
@@ -75,11 +95,36 @@ pub fn base64(bytes: &[u8]) -> String {
 /// (whitespace and the URL-safe `-_` included), or bits the padding drops
 /// that are not zero, so one value has one spelling.
 pub fn from_base64(text: &str) -> Option<Vec<u8>> {
-    let (quads, rest) = text.as_bytes().as_chunks::<4>();
+    let mut out = Vec::with_capacity((text.len() / 4).saturating_mul(3));
+    decode_base64(text.as_bytes(), |bytes| {
+        out.extend_from_slice(bytes);
+        Some(())
+    })?;
+    Some(out)
+}
+
+/// `from_base64(text)` written to the front of `out`, allocating nothing:
+/// the length written, or `None` for any spelling `from_base64` refuses
+/// or an `out` too short for the bytes. After `None`, what `out` holds is
+/// unspecified.
+pub fn from_base64_into(text: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut used = 0usize;
+    decode_base64(text, |bytes| {
+        let end = used.checked_add(bytes.len())?;
+        out.get_mut(used..end)?.copy_from_slice(bytes);
+        used = end;
+        Some(())
+    })?;
+    Some(used)
+}
+
+/// Every one to three bytes padded standard base64 `text` spells, in order,
+/// or `None` at the first wrong spelling or the first `None` of `emit`.
+fn decode_base64(text: &[u8], mut emit: impl FnMut(&[u8]) -> Option<()>) -> Option<()> {
+    let (quads, rest) = text.as_chunks::<4>();
     if !rest.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(quads.len().saturating_mul(3));
     for (index, quad) in quads.iter().enumerate() {
         let pad = quad.iter().rev().take_while(|&&byte| byte == b'=').count();
         if pad > 2 || (pad > 0 && index + 1 != quads.len()) {
@@ -94,9 +139,9 @@ pub fn from_base64(text: &str) -> Option<Vec<u8>> {
         if value & ((1u32 << (8 * pad)) - 1) != 0 {
             return None;
         }
-        out.extend_from_slice(value.to_be_bytes().get(1..4 - pad)?);
+        emit(value.to_be_bytes().get(1..4 - pad)?)?;
     }
-    Some(out)
+    Some(())
 }
 
 fn sextet(byte: u8) -> Option<u8> {
@@ -113,9 +158,11 @@ fn sextet(byte: u8) -> Option<u8> {
 /// The alphabet symbol for a masked value; out of range would be a bug,
 /// answered with `?` rather than a panic.
 fn digit(alphabet: &[u8], value: u8) -> char {
-    alphabet
-        .get(usize::from(value))
-        .map_or('?', |byte| char::from(*byte))
+    char::from(symbol(alphabet, value))
+}
+
+fn symbol(alphabet: &[u8], value: u8) -> u8 {
+    alphabet.get(usize::from(value)).copied().unwrap_or(b'?')
 }
 
 #[cfg(test)]
@@ -212,6 +259,39 @@ mod tests {
             "Zg=a",
         ] {
             assert_eq!(from_base64(bad), None, "{bad:?}");
+            assert_eq!(from_base64_into(bad.as_bytes(), &mut [0; 16]), None);
         }
+    }
+
+    #[test]
+    fn slice_forms_agree_with_the_allocating_ones() {
+        for length in 0..=64 {
+            let bytes: Vec<u8> = (0..length).map(|i| (i * 13 + 5) as u8).collect();
+            let text = base64(&bytes);
+            let mut encoded = [0u8; 96];
+            assert_eq!(base64_into(&bytes, &mut encoded), Some(text.len()));
+            assert_eq!(&encoded[..text.len()], text.as_bytes());
+            let mut decoded = [0u8; 64];
+            assert_eq!(
+                from_base64_into(text.as_bytes(), &mut decoded),
+                Some(length)
+            );
+            assert_eq!(&decoded[..length], &bytes[..]);
+        }
+    }
+
+    #[test]
+    fn slice_forms_refuse_a_short_output() {
+        let mut short = [7u8; 7];
+        assert_eq!(base64_into(b"foobar", &mut short), None);
+        assert_eq!(short, [7; 7], "a refused encoding writes nothing");
+        let mut exact = [0u8; 8];
+        assert_eq!(base64_into(b"foobar", &mut exact), Some(8));
+        assert_eq!(&exact, b"Zm9vYmFy");
+        assert_eq!(from_base64_into(b"Zm9vYmFy", &mut [0; 5]), None);
+        assert_eq!(from_base64_into(b"Zm9vYg==", &mut [0; 3]), None);
+        assert_eq!(from_base64_into(b"Zm9vYg==", &mut [0; 4]), Some(4));
+        assert_eq!(from_base64_into(b"", &mut []), Some(0));
+        assert_eq!(base64_into(b"", &mut []), Some(0));
     }
 }

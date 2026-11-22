@@ -1,0 +1,31 @@
+[package]
+name = "td-postgres"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "td's synchronous, bounded PostgreSQL client: protocol 3.0, SCRAM-SHA-256, the extended query and the types a mail store needs"
+
+# Own workspace root, so cargo behaves the same from the main checkout as
+# from a worktree nested under it.
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[dependencies]
+td-alloc = { path = "../td-alloc" }
+td-encoding = { path = "../td-encoding" }
+td-fs = { path = "../td-fs" }
+td-primitives = { path = "../td-primitives" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
