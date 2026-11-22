@@ -375,6 +375,12 @@ fn a_printing_helpers_result_is_its_standard_output() {
     // The fixture's checks: an empty environment and `/`.
     let helper = printed(b"x\n", 0, false, 2, LIFETIME).unwrap();
     assert_eq!(finished(helper), Some(b"x\n".to_vec()));
+    // A successful helper that prints nothing, as `td-admin submit` does,
+    // succeeds with no bytes; a failing one is still no result.
+    let helper = printed(b"", 0, false, 511, LIFETIME).unwrap();
+    assert_eq!(finished(helper), Some(Vec::new()));
+    let helper = printed(b"", 1, false, 511, LIFETIME).unwrap();
+    assert_eq!(finished(helper), None);
     assert!(Inspection::printing(list(), READ_SIZE, LIFETIME).is_err());
 }
 

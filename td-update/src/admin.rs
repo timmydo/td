@@ -30,7 +30,7 @@ const RELEASE_EVIDENCE: &str = "/var/lib/td-admin-build/release-state.metadata";
 const UPSTREAM: &str = "https://github.com/timmydo/td.git";
 const OFFICIAL_ENDPOINT: &str = "https://releases.tdlinux.org";
 const OFFICIAL_ROOT: &str = include_str!("official.root");
-const HELP: &str = "td-admin update [--no-reboot] | update-from-source [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates download a valid signed release and reboot by default. Jobs survive disconnects.\nUse update-from-source explicitly to build trusted upstream main.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\nKey recovery: td-admin trust-publisher ROOT_FILE SHA256, then approve H; trusts future releases.\nOne image only: td-update trust-image DIRECTORY SHA256, then approve I.\n";
+const HELP: &str = "td-admin update [--no-reboot] | update-from-source [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates download a valid signed release and reboot by default. Jobs survive disconnects.\nUse update-from-source explicitly to build trusted upstream main.\nLocally, update and update-from-source queue a request; approve H on secure attention.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\nKey recovery: td-admin trust-publisher ROOT_FILE SHA256, then approve H; trusts future releases.\nOne image only: td-update trust-image DIRECTORY SHA256, then approve I.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Request {
@@ -1010,7 +1010,88 @@ fn serve() -> Result<()> {
     Err("admin listener ended".into())
 }
 
+/// The settings-intake request for the update `words` ask for, exactly
+/// the words td-authd's `consent::admin_update` admits; `None` for every
+/// other verb.
+fn consented_update(words: &[&str]) -> Option<&'static str> {
+    match parse(words).ok()? {
+        Request::Update { reboot: true } => Some("admin-update update"),
+        Request::Update { reboot: false } => Some("admin-update update --no-reboot"),
+        Request::SourceUpdate { reboot: true } => Some("admin-update update-from-source"),
+        Request::SourceUpdate { reboot: false } => {
+            Some("admin-update update-from-source --no-reboot")
+        }
+        _ => None,
+    }
+}
+
+/// Root and the dedicated SSH account reach the service's socket; any
+/// other caller's update queues on the settings intake for secure-attention
+/// consent, whose fixed root helper then submits the same words.
+fn local_update(words: &[&str]) -> Result<bool> {
+    let Some(setting) = consented_update(words) else {
+        return Ok(false);
+    };
+    let uid = io(fs::metadata("/proc/self"), "read admin identity")?.uid();
+    if uid == 0 || uid == ADMIN_UID {
+        return Ok(false);
+    }
+    crate::success(
+        fixed("/bin/td-authd").args(["request-hostname", setting]),
+        "request admin update consent",
+    )?;
+    Ok(true)
+}
+
+/// Whether `reply` is the service's answer to a fresh job of `words`:
+/// `job ID: queued OPERATION`, then the reboot choice. A running job
+/// answers with its own status instead.
+fn queued(reply: &str, words: &[&str]) -> bool {
+    let (operation, reboot) = match parse(words) {
+        Ok(Request::Update { reboot }) => ("update", reboot),
+        Ok(Request::SourceUpdate { reboot }) => ("source-update", reboot),
+        _ => return false,
+    };
+    let Some((id, rest)) = reply
+        .strip_prefix("job ")
+        .and_then(|rest| rest.split_once(": queued "))
+    else {
+        return false;
+    };
+    !id.is_empty()
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && rest
+            .strip_prefix(operation)
+            .and_then(|rest| rest.strip_prefix("\nreboot "))
+            == Some(if reboot { "true\n" } else { "false\n" })
+}
+
+/// td-authd's helper after local consent: the same submission as root.
+/// It succeeds only when the service started a fresh job of exactly the
+/// approved kind and reboot choice, and prints nothing, since a running
+/// job's whole status would not fit root's bounded helper read.
+fn submit(words: &[&str]) -> Result<()> {
+    if consented_update(words).is_none() {
+        return Err("only an update is submitted after local consent".into());
+    }
+    root()?;
+    if queued(&exchange(words)?, words) {
+        Ok(())
+    } else {
+        Err("another admin job is running; nothing new was started".into())
+    }
+}
+
 fn client(words: &[&str]) -> Result<()> {
+    let response = exchange(words)?;
+    io(
+        std::io::stdout().write_all(response.as_bytes()),
+        "show admin result",
+    )
+}
+
+/// The service's `OK` reply to `words`, without its `OK` line.
+fn exchange(words: &[&str]) -> Result<String> {
     parse(words)?;
     let mut stream = io(
         UnixStream::connect(SOCKET),
@@ -1038,10 +1119,7 @@ fn client(words: &[&str]) -> Result<()> {
         "read admin response",
     )?;
     if let Some(text) = response.strip_prefix("OK\n") {
-        io(
-            std::io::stdout().write_all(text.as_bytes()),
-            "show admin result",
-        )
+        Ok(text.into())
     } else {
         Err(response
             .strip_prefix("ERR\n")
@@ -1243,6 +1321,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     match words.as_slice() {
         ["serve"] => serve(),
         ["accept-key", blob] => accept_key(blob),
+        ["submit", words @ ..] => submit(words),
         ["enroll-key", source] => {
             let key = key_line(&read(Path::new(source), 4096)?)?;
             let blob = key.split_whitespace().nth(1).ok_or("missing public key")?;
@@ -1309,6 +1388,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 std::env::var("SSH_ORIGINAL_COMMAND").map_err(|_| "SSH command is missing")?;
             client(&original.split_whitespace().collect::<Vec<_>>())
         }
+        _ if local_update(&words)? => Ok(()),
         _ => client(&words),
     }
 }
@@ -1443,8 +1523,99 @@ mod tests {
             ],
             vec!["download-worker", "file:/repo"],
             vec!["verify-release-child"],
+            vec!["submit", "update"],
         ] {
             assert!(parse(&words).is_err());
+        }
+    }
+
+    /// Only the four update requests can queue for local consent (td-authd's
+    /// `consent::admin_update` admits exactly these words); every other
+    /// verb, valid or not, still goes to the socket, before any identity
+    /// read or helper.
+    #[test]
+    fn only_update_requests_route_to_local_consent() {
+        for words in [
+            vec!["status"],
+            vec!["status", "7"],
+            vec!["logs"],
+            vec!["cancel"],
+            vec!["reboot"],
+            vec!["rollback"],
+            vec!["rollback", "--no-reboot"],
+            vec!["update", "main"],
+            vec!["update", "--no-reboot", "--no-reboot"],
+            vec!["update-from-source", "--repo", "/tmp/repo"],
+            vec!["submit", "update"],
+            vec![],
+        ] {
+            assert_eq!(consented_update(&words), None);
+            assert_eq!(local_update(&words), Ok(false));
+            // Refused before the identity check, so as root too.
+            assert_eq!(
+                submit(&words),
+                Err("only an update is submitted after local consent".into())
+            );
+        }
+        for (words, setting) in [
+            (vec!["update"], "admin-update update"),
+            (
+                vec!["update", "--no-reboot"],
+                "admin-update update --no-reboot",
+            ),
+            (
+                vec!["update-from-source"],
+                "admin-update update-from-source",
+            ),
+            (
+                vec!["update-from-source", "--no-reboot"],
+                "admin-update update-from-source --no-reboot",
+            ),
+        ] {
+            assert_eq!(consented_update(&words), Some(setting));
+            assert_eq!(
+                setting.strip_prefix("admin-update "),
+                Some(&*words.join(" "))
+            );
+        }
+        if fs::metadata("/proc/self").unwrap().uid() != 0 {
+            assert!(submit(&["update"]).is_err());
+        }
+    }
+
+    /// Only a fresh job of the approved kind and reboot choice counts as
+    /// submitted: a running job's status, another kind or choice refuses.
+    #[test]
+    fn only_a_fresh_matching_job_counts_as_submitted() {
+        assert!(queued("job 7: queued update\nreboot true\n", &["update"]));
+        assert!(queued(
+            "job 12: queued source-update\nreboot false\n",
+            &["update-from-source", "--no-reboot"]
+        ));
+        for (reply, words) in [
+            (
+                "job 7: queued update\nreboot true\n",
+                vec!["update", "--no-reboot"],
+            ),
+            ("job 7: queued update\nreboot false\n", vec!["update"]),
+            ("job 7: queued source-update\nreboot true\n", vec!["update"]),
+            (
+                "job 7: queued update\nreboot true\n",
+                vec!["update-from-source"],
+            ),
+            ("job 7: queued rollback\nreboot true\n", vec!["update"]),
+            ("job 7: building\nabc\n", vec!["update"]),
+            (
+                "job 7: failed\nqueued update\nreboot true\n",
+                vec!["update"],
+            ),
+            ("job : queued update\nreboot true\n", vec!["update"]),
+            ("job x: queued update\nreboot true\n", vec!["update"]),
+            ("job 7: queued update\nreboot true\nmore", vec!["update"]),
+            ("job 7: queued update\nreboot true\n", vec!["rollback"]),
+            ("", vec!["update"]),
+        ] {
+            assert!(!queued(reply, &words), "{reply:?} {words:?}");
         }
     }
     #[test]

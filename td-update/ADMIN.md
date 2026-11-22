@@ -5,7 +5,9 @@ acquires a release under the machine's separately provisioned publisher
 policy; `update-from-source` builds and installs `main` from
 `https://github.com/timmydo/td.git`. Both reboot after successful installation
 unless `--no-reboot` was requested. Neither needs a further physical consent
-prompt. Download failures never select the source path automatically.
+prompt. Download failures never select the source path automatically. The
+primary account can request the same two jobs on the machine itself,
+approving each on secure attention ("Local consent").
 
 Whoever controls a trusted release key can authorize bytes for that policy's
 profile; a signed source commit is the publisher's assertion, not a proof of
@@ -75,6 +77,46 @@ No internal root or builder verb is exposed by the SSH parser. Neither
 executable is setuid. The root service is a `stop=leaf` td-svc daemon, so its
 requested stops drain its children. On an unexpected leader exit, the new
 leader drains every helper subgroup before accepting commands.
+
+## Local consent
+
+Run as any account but root or UID 986, `td-admin update [--no-reboot]`
+and `td-admin update-from-source [--no-reboot]` do not dial the control
+socket. They queue `admin-update WORDS`, exactly those command words, on
+td-authd's settings intake (`td-authd request-hostname`) and wait for its
+outcome. Ctrl+Alt+Escape, then H, presents consent tag 46: a signed
+release or trusted main, the requester, and whether it restarts. The
+distinct `admin-update` elevation-table grant, given to the primary
+account, admits it; the ordinary presented Enter, cancellation, requester
+liveness and backoff rules apply (`td-authd/DESIGN.md`, "Local admin
+updates"). Other verbs from such an account still dial the socket and
+are refused by its permissions.
+
+After commit, root runs `/bin/td-admin submit` with those words. That
+root-only internal verb admits only the four update requests, which the
+SSH parser never accepts as `submit`. Root reaches the socket, so the
+job is then the job an SSH request starts: the same fetch and ancestry
+rule, build identity, release verification, installation and reboot
+choice. `submit` succeeds only when the service answers with a
+`queued` job of exactly the approved kind and reboot choice (normally
+the one it just started; an identical job still queued answers the
+same), and prints nothing. While another job runs the service answers with that job's
+status and starts nothing, so `submit` fails: the person is never told
+an approved job started when a different one, with its own reboot
+choice, is the one running.
+
+The approval authorizes one job submission, not a commit or a release:
+like the SSH caller, the person cannot see which main or which signed
+release the job will fetch. This path needs neither an enrolled admin
+key nor td-sshd, and grants no SSH key anything.
+
+It submits only. The socket stays root:986, so the primary account can
+read neither the job's status nor its log, and cannot cancel a job; an
+approved job that restarts will restart once it installs. A failed job
+installs nothing and requests no reboot. A failed or timed-out
+submission is not proof that nothing started: the request may already
+have reached the service. Rollback has its own local consent
+(`deploy-rollback`, B).
 
 ## Release policy and download boundary
 

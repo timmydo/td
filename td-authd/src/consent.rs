@@ -20,6 +20,30 @@ pub fn admin_key(blob: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
+/// `td-admin`'s locally requested update (td-update/ADMIN.md, "Local
+/// consent"): exactly its own command words, read as whether it builds
+/// trusted main rather than installing a signed release, and whether it
+/// reboots.
+pub fn admin_update(words: &str) -> Option<(bool, bool)> {
+    match words {
+        "update" => Some((false, true)),
+        "update --no-reboot" => Some((false, false)),
+        "update-from-source" => Some((true, true)),
+        "update-from-source --no-reboot" => Some((true, false)),
+        _ => None,
+    }
+}
+
+/// The admin service command an approved tag 46 submits.
+pub fn admin_update_words(source: bool, reboot: bool) -> &'static [&'static str] {
+    match (source, reboot) {
+        (false, true) => &["update"],
+        (false, false) => &["update", "--no-reboot"],
+        (true, true) => &["update-from-source"],
+        (true, false) => &["update-from-source", "--no-reboot"],
+    }
+}
+
 const MAGIC: &[u8; 8] = b"TDCONS02";
 const MAX_BYTES: usize = 256;
 // Whole-disk installation summary bounds, in displayed (escaped) bytes.
@@ -1233,6 +1257,13 @@ pub enum Operation {
         requester: u32,
         blob: String,
     },
+    /// Tag 46: one admin update job, requested locally. `source` builds
+    /// trusted main; otherwise a signed release.
+    AdminUpdate {
+        requester: u32,
+        source: bool,
+        reboot: bool,
+    },
     /// Storage operation `01`: write the running deployment `current`'s
     /// kernel and selector to the ESP in `form`. One step.
     SelectorUpdate {
@@ -1834,6 +1865,9 @@ impl Request {
             {
                 return Err("invalid admin key enrollment".into());
             }
+            Operation::AdminUpdate { requester, .. } if *requester != owner => {
+                return Err("invalid admin update request".into());
+            }
             Operation::ManageTime { requester, setting }
                 if *requester != owner || time_setting::Change::decode(setting).is_err() =>
             {
@@ -2067,6 +2101,7 @@ impl Request {
             | Operation::ManageVolumes { .. }
             | Operation::ReplacePublisher { .. }
             | Operation::EnrollAdminKey { .. }
+            | Operation::AdminUpdate { .. }
             | Operation::SelectorUpdate { .. }
             | Operation::UpgradeCancel => true,
             Operation::Upgrade { step, .. } => *step == UpgradeStep::Review,
@@ -2653,6 +2688,15 @@ impl Request {
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 put_text(&mut bytes, blob);
             }
+            Operation::AdminUpdate {
+                requester,
+                source,
+                reboot,
+            } => {
+                bytes.push(46);
+                bytes.extend_from_slice(&requester.to_be_bytes());
+                bytes.extend_from_slice(&[u8::from(*source), u8::from(*reboot)]);
+            }
             Operation::ManageTime { requester, setting } => {
                 bytes.push(39);
                 bytes.extend_from_slice(&requester.to_be_bytes());
@@ -2918,6 +2962,11 @@ impl Request {
             40 => Operation::EnrollAdminKey {
                 requester: input.number()?,
                 blob: input.text()?,
+            },
+            46 => Operation::AdminUpdate {
+                requester: input.number()?,
+                source: input.flag()?,
+                reboot: input.flag()?,
             },
             45 => {
                 let stage = input.byte()?;
@@ -3303,6 +3352,36 @@ impl Request {
                 lines.push("CAN INSTALL CONFIGURED SIGNED RELEASES".into());
                 lines.push("OR BUILD TRUSTED MAIN, AND REBOOT".into());
                 lines.push("WITHOUT FURTHER PHYSICAL APPROVAL".into());
+                approval_lines(&mut lines);
+            }
+            Operation::AdminUpdate {
+                requester,
+                source,
+                reboot,
+            } => {
+                let [title, target, chosen] = if *source {
+                    [
+                        "BUILD AND INSTALL TRUSTED MAIN",
+                        "MAIN IS FETCHED WHEN THE JOB RUNS",
+                        "AND MUST EXTEND THE LAST ONE BUILT",
+                    ]
+                } else {
+                    [
+                        "INSTALL THE LATEST SIGNED RELEASE",
+                        "FROM THE CONFIGURED PUBLISHER",
+                        "THE VERSION IS CHOSEN WHEN IT RUNS",
+                    ]
+                };
+                let restart = if *reboot {
+                    "RESTARTS AFTER INSTALLING"
+                } else {
+                    "DOES NOT RESTART"
+                };
+                lines.push(title.into());
+                lines.push(format!("REQUESTER UID {requester}"));
+                for line in [target, chosen, restart] {
+                    lines.push(line.into());
+                }
                 approval_lines(&mut lines);
             }
             Operation::ManageTime { requester, setting } => {
@@ -9144,6 +9223,85 @@ mod admin_tests {
                 }
             )
             .is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod admin_update_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    /// Tag 46 carries the requester, then exactly two flag bytes, and its
+    /// description names the kind and whether it restarts.
+    #[test]
+    fn admin_updates_bind_their_kind_reboot_choice_and_requester() {
+        for (source, reboot, first, last) in [
+            (
+                false,
+                true,
+                "INSTALL THE LATEST SIGNED RELEASE",
+                "RESTARTS AFTER INSTALLING",
+            ),
+            (
+                false,
+                false,
+                "INSTALL THE LATEST SIGNED RELEASE",
+                "DOES NOT RESTART",
+            ),
+            (
+                true,
+                true,
+                "BUILD AND INSTALL TRUSTED MAIN",
+                "RESTARTS AFTER INSTALLING",
+            ),
+            (
+                true,
+                false,
+                "BUILD AND INSTALL TRUSTED MAIN",
+                "DOES NOT RESTART",
+            ),
+        ] {
+            let operation = Operation::AdminUpdate {
+                requester: 1000,
+                source,
+                reboot,
+            };
+            let request = Request::new([7; 32], 1000, operation).unwrap();
+            let bytes = request.encode();
+            assert_eq!(bytes.get(44), Some(&46));
+            assert_eq!(bytes.len(), 51);
+            assert_eq!(bytes[49..], [u8::from(source), u8::from(reboot)]);
+            assert_eq!(Request::decode(&bytes), Ok(request.clone()));
+            assert!(request.awaits_approval());
+            let lines = request.lines();
+            assert!(lines.iter().any(|line| line == first));
+            assert!(lines.iter().any(|line| line == "REQUESTER UID 1000"));
+            assert!(lines.iter().any(|line| line == last));
+            assert_eq!(
+                admin_update(&admin_update_words(source, reboot).join(" ")),
+                Some((source, reboot))
+            );
+            for (index, byte) in [(49, 2), (50, 2)] {
+                let mut bad = bytes.clone();
+                bad[index] = byte;
+                assert!(Request::decode(&bad).is_err());
+            }
+            assert!(Request::decode(&bytes[..50]).is_err());
+            assert!(Request::decode(&[&bytes[..], &[0]].concat()).is_err());
+        }
+        assert!(Request::new(
+            [7; 32],
+            1000,
+            Operation::AdminUpdate {
+                requester: 1001,
+                source: true,
+                reboot: true,
+            }
+        )
+        .is_err());
+        for words in ["", "update ", "rollback", "update --no-reboot x", "UPDATE"] {
+            assert_eq!(admin_update(words), None);
         }
     }
 }

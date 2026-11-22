@@ -424,7 +424,8 @@ impl Elevation {
             | Operation::ManageTime { .. }
             | Operation::ManageVolumes { .. }
             | Operation::ReplacePublisher { .. }
-            | Operation::EnrollAdminKey { .. } => Some(Self::Hostname),
+            | Operation::EnrollAdminKey { .. }
+            | Operation::AdminUpdate { .. } => Some(Self::Hostname),
             _ => None,
         }
     }
@@ -2193,6 +2194,11 @@ impl Client {
                             Operation::EnrollAdminKey { .. }
                         ) {
                             crate::attention::Notice::AdminKeySaved
+                        } else if matches!(
+                            pending.request.operation(),
+                            Operation::AdminUpdate { .. }
+                        ) {
+                            crate::attention::Notice::AdminUpdateSubmitted
                         } else if matches!(
                             pending.request.operation(),
                             Operation::ReplacePublisher { .. }

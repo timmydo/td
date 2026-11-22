@@ -688,6 +688,83 @@ fn publisher_replacement_needs_its_own_grant_and_exact_presented_approval() {
     }
 }
 
+/// Each of td-admin's four update requests binds its own kind and reboot
+/// choice under the distinct `admin-update` grant; nothing starts before
+/// a presented, unchanged approval.
+#[test]
+fn admin_updates_need_their_own_grant_and_exact_presented_approval() {
+    for (words, source, reboot) in [
+        ("update", false, true),
+        ("update --no-reboot", false, false),
+        ("update-from-source", true, true),
+        ("update-from-source --no-reboot", true, false),
+    ] {
+        let fixture = Fixture::new("td");
+        let value = format!("admin-update {words}");
+        assert_eq!(
+            Setting::parse(&value).unwrap().operation(),
+            elevation::Operation::AdminUpdate
+        );
+        let mut refused_intake = fixture.intake(refused);
+        assert_eq!(
+            fixture.submit(&mut refused_intake, &frame(&value)).1,
+            Some(4)
+        );
+        drop(refused_intake);
+        let (mut intake, _client) = queued(&fixture, &value);
+        let ready = intake.select().unwrap();
+        let mut change = intake.describe(fixture.uid(), ready).unwrap();
+        let request = change.request().clone();
+        assert_eq!(
+            request.operation(),
+            &Operation::AdminUpdate {
+                requester: fixture.uid(),
+                source,
+                reboot,
+            }
+        );
+        assert!(request.awaits_approval());
+        assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+        assert_eq!(
+            crate::consent::admin_update_words(source, reboot).join(" "),
+            words
+        );
+        assert!(change.commit(&request).is_err());
+        change.presented(&request).unwrap();
+        let changed = Request::new(
+            *request.nonce(),
+            fixture.uid(),
+            Operation::AdminUpdate {
+                requester: fixture.uid(),
+                source: !source,
+                reboot,
+            },
+        )
+        .unwrap();
+        assert!(change.commit(&changed).is_err());
+        assert!(change.helper.is_none());
+        change.cancel().unwrap();
+        assert!(change.commit(&request).is_err());
+        assert!(change.helper.is_none());
+    }
+    for bad in [
+        "admin-update ",
+        "admin-update update ",
+        "admin-update update --no-reboot --no-reboot",
+        "admin-update rollback",
+        "admin-update status",
+        "admin-update update --repo /tmp/repo",
+        "admin-update update-from-source main",
+    ] {
+        assert!(Setting::parse(bad).is_err(), "{bad}");
+    }
+    let table = Table::parse(
+        "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\treplace-publisher\n",
+    )
+    .unwrap();
+    assert!(!table.grants(1000, elevation::Operation::AdminUpdate));
+}
+
 #[test]
 fn time_settings_have_a_distinct_principal_and_refuse_malformed_values() {
     assert_eq!(

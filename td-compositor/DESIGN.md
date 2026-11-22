@@ -8253,6 +8253,17 @@ the attention screen selects takes the token slot from a notebook step
 in progress, which then fails in its window. A notebook operation never
 unlocks the login screen.
 
+### Local admin update
+
+H also selects tag 46, an admin update job the primary account requested
+with `td-admin update` or `update-from-source`. The shared description
+says whether it installs the latest signed release or builds trusted
+main, that the version is chosen when the job runs, and whether it
+restarts. It uses the ordinary fresh presented Enter approval; success
+says UPDATE JOB SUBMITTED once the admin service started that job, which
+runs on there. Another job already running is a failure.
+`td-update/ADMIN.md`, "Local consent", owns the policy.
+
 ### Update publisher recovery
 
 H also selects tag 43, an explicit replacement of update publisher trust. The

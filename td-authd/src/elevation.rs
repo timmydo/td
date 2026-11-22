@@ -28,6 +28,7 @@ pub(crate) enum Operation {
     DeployPublish,
     ManageVolumes,
     ReplacePublisher,
+    AdminUpdate,
 }
 
 impl Operation {
@@ -39,6 +40,7 @@ impl Operation {
         Self::EnrollAdminKey,
         Self::ManageVolumes,
         Self::ReplacePublisher,
+        Self::AdminUpdate,
     ];
 
     fn name(self) -> &'static str {
@@ -50,6 +52,7 @@ impl Operation {
             Self::DeployPublish => "deploy-publish",
             Self::ManageVolumes => "manage-volumes",
             Self::ReplacePublisher => "replace-publisher",
+            Self::AdminUpdate => "admin-update",
         }
     }
 

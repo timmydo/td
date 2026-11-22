@@ -36,6 +36,8 @@ pub(crate) enum Notice {
     TimeSaved,
     VolumeSaved,
     AdminKeySaved,
+    /// Root's success for tag 46: the admin service started the job.
+    AdminUpdateSubmitted,
     PublisherSaved,
     /// A committed device-bound disk installation, before its recovery key:
     /// the screen then closes by itself (secret_client).
@@ -703,6 +705,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::TimeSaved => "TIME SETTINGS SAVED",
         Notice::VolumeSaved => "VOLUME CHANGE APPLIED",
         Notice::AdminKeySaved => "REMOTE ADMIN KEY ENROLLED",
+        Notice::AdminUpdateSubmitted => "UPDATE JOB SUBMITTED",
         Notice::PublisherSaved => "UPDATE PUBLISHER TRUST REPLACED",
         Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
@@ -973,6 +976,11 @@ mod tests {
             Operation::EnrollAdminKey {
                 requester: 65533,
                 blob: "AAAAC3NzaC1lZDI1NTE5AAAAIGmTjqOMdHoPzoqbE+wEE5Q4aNmEGC0tgJbQOkxqdgUi".into(),
+            },
+            Operation::AdminUpdate {
+                requester: 65533,
+                source: true,
+                reboot: false,
             },
             Operation::DeployRollback {
                 current: "a".repeat(64),
@@ -1391,6 +1399,7 @@ mod tests {
         Notice::TimeSaved,
         Notice::VolumeSaved,
         Notice::AdminKeySaved,
+        Notice::AdminUpdateSubmitted,
         Notice::PublisherSaved,
         Notice::Returning,
         Notice::Enrolled,

@@ -9365,9 +9365,15 @@ service identity, and installs only that job's validated result.
    are immutable by construction and are the thing the operator was shown
    — a hash, not a location. Any future operation whose argument is a
    mutable object must carry a digest computed over the same descriptor
-   and re-verified at use, or it does not belong in the table. The nonce
-   is **consumed atomically before the operation starts**, so a retry is
-   unambiguously a new request.
+   and re-verified at use, or it does not belong in the table. The one
+   operation whose target is resolved after approval, `admin-update`,
+   carries no argument object at all: two typed flags choose a job of
+   the admin service, whose target is fixed by installed policy (a
+   signed release under the machine's publisher trust, or upstream
+   main that must extend the last one built), never by the requester,
+   and the prompt says so (`td-update/ADMIN.md`, "Local consent"). The
+   nonce is **consumed atomically before the operation starts**, so a
+   retry is unambiguously a new request.
 4. **Authorization is separate from consent.** The table says what may be
    elevated; it does not say who may approve it. `SO_PEERCRED`
    identifies the requesting process and protected input supplies consent;
@@ -9492,6 +9498,7 @@ confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
 | `replace-publisher` | `td-admin trust-publisher` queues a typed settings request; H selects it | the complete public-root SHA-256; future-release authority and version-history reset | `/bin/td-admin accept-publisher SHA256` |
 | `manage-time` | `td-time` queues a typed settings request; the menu's `H` selects it | exact UTC timestamp, timezone identifier, or automatic on/off | `/bin/td-time apply ACTION VALUE` |
 | `manage-volumes` | `td-disks` queues a typed settings request; the menu's `H` selects it | the volume's name, filesystem UUID and kind, and whether its programs may run | `/bin/td-disks apply add\|remove ...` |
+| `admin-update` | `td-admin update` or `update-from-source`, run locally, queues a typed settings request; the menu's `H` selects it | signed release or trusted main, and whether it restarts | `/bin/td-admin submit update\|update-from-source [--no-reboot]` |
 
 **`deploy-rollback`.** The person opens secure attention and presses
 `B`; nothing outside the compositor asks, so there is no requester to
@@ -9564,10 +9571,12 @@ queued request, to its requester, refuses with a named diagnostic
 (property 4). Its v1 row is "UID 1000 may perform every v1 operation":
 `deploy-rollback` from L3, `set-hostname` from L4 and `deploy-publish`,
 today's update installation, from L5, followed by `manage-time`,
-`enroll-admin-key`, `manage-volumes` and `replace-publisher`. Each authorizes one reviewed
-setting, never arbitrary root execution; `td-time/DESIGN.md` defines
-clock and RTC policy and `td-disks/DESIGN.md` which volumes mount. A machine with other rows builds
-them into its own image; no user's home or setting adds one.
+`enroll-admin-key`, `manage-volumes`, `replace-publisher` and
+`admin-update`. Each authorizes one reviewed setting or, for
+`admin-update`, one fixed admin service job, never arbitrary root
+execution; `td-time/DESIGN.md` defines clock and RTC policy and
+`td-disks/DESIGN.md` which volumes mount. A machine with other rows
+builds them into its own image; no user's home or setting adds one.
 
 **Live installation.** Trusted boot media uses the isolated installer's
 final review to confirm erase or preserve mode. It does not open secure

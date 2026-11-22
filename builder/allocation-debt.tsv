@@ -1129,9 +1129,9 @@ td-authd/src/backoff.rs	unchecked-growth-or-clone	1
 td-authd/src/channel.rs	allocation-macro	1
 td-authd/src/consent.rs	allocating-constructor	5
 td-authd/src/consent.rs	allocating-conversion	13
-td-authd/src/consent.rs	allocation-macro	51
+td-authd/src/consent.rs	allocation-macro	52
 td-authd/src/consent.rs	heap-owner	2
-td-authd/src/consent.rs	unchecked-growth-or-clone	228
+td-authd/src/consent.rs	unchecked-growth-or-clone	234
 td-authd/src/deployment.rs	allocating-constructor	2
 td-authd/src/deployment.rs	allocating-conversion	21
 td-authd/src/deployment.rs	allocation-macro	7

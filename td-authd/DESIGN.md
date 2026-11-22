@@ -5005,6 +5005,38 @@ remote policy, private build identity and durable job service are specified
 in `td-update/ADMIN.md`. Tag 40 does not authorize a credential-store or
 disk-protector operation.
 
+## Local admin updates
+
+The settings intake also accepts `admin-update WORDS`, where WORDS is
+exactly `update`, `update --no-reboot`, `update-from-source` or
+`update-from-source --no-reboot`, the four requests `td-admin` sends from
+an account that cannot reach its service (`td-update/ADMIN.md`, "Local
+consent"). The distinct `admin-update` elevation-table operation, granted
+to the primary account last, is required at admission and selection as
+for `manage-time`. There is no saved value to compare.
+
+Tag 46 carries a requester u32 equal to the owner, then a flag byte that
+is `1` for a trusted-main source build and `0` for a signed release, then
+a flag byte that is `1` when it restarts; any other flag value refuses.
+Tag 44, a retired website-key assignment, stays unassigned. H presents
+which update it is, the requester, that main or the release is chosen
+when the job runs, and whether it restarts after installing. The
+ordinary fresh, presented Enter confirmation, cancellation, requester
+liveness, backoff and immutable-description rules apply.
+
+Commitment is consumed first, clears the common backoff, and starts only
+`/bin/td-admin submit` with the four words' canonical form for those two
+flags, through Inspection with its cleared environment, cwd `/`, null
+stdin and bounded stdout, under a fifteen-second deadline that contains
+the client's own two-second send and ten-second answer bounds. The
+helper prints nothing and succeeds only when the admin service answers
+with a queued job of exactly that kind and reboot choice, normally the
+one it just started; the job's own outcome is the service's. A failed or
+timed-out helper never retries, and its failure does not prove the
+service started nothing. Tag 46 authorizes no
+other admin verb, no key or publisher change, and no credential-store or
+disk-protector operation.
+
 ## Root helpers' stderr
 
 Root's log is its own stderr, which the `[wayland]` unit keeps in
@@ -5028,8 +5060,8 @@ that is Rust's panic note says only that it panicked, since the message
 above it may quote what the process held. The launcher's other helpers
 keep a tail that no text quotes yet, since root reports their outcome
 as a state or their own printed result: store and login inspection,
-`td-svc status`, `suspend-system`, `td-admin accept-key`, `td-time
-apply`, `td-disks apply`. The notebook's two processes have their own
+`td-svc status`, `suspend-system`, `td-admin accept-key`, `td-admin
+submit`, `td-time apply`, `td-disks apply`. The notebook's two processes have their own
 rule ("Notebook token descriptions").
 
 Root drains a tail on every poll or wait step of its helper, `umount`'s

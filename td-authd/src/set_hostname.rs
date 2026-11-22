@@ -35,6 +35,10 @@ impl Setting {
             if !crate::consent::admin_key(blob) {
                 return Err("invalid admin public key".into());
             }
+        } else if let Some(words) = text.strip_prefix("admin-update ") {
+            if crate::consent::admin_update(words).is_none() {
+                return Err("invalid admin update request".into());
+            }
         } else if let Some(value) = text.strip_prefix("time ") {
             time_setting::Change::decode(value)?;
         } else if let Some(value) = text.strip_prefix("volume ") {
@@ -52,6 +56,8 @@ impl Setting {
             elevation::Operation::ReplacePublisher
         } else if self.0.starts_with("admin-key ") {
             elevation::Operation::EnrollAdminKey
+        } else if self.0.starts_with("admin-update ") {
+            elevation::Operation::AdminUpdate
         } else if self.0.starts_with("time ") {
             elevation::Operation::ManageTime
         } else if self.0.starts_with("volume ") {
@@ -73,6 +79,8 @@ const SAVED: &str = "/var/lib/td/hostname";
 const CONSENT: Duration = Duration::from_secs(120);
 /// How long `td-disks apply` may take to mount or unmount one volume.
 const VOLUME_APPLY: Duration = Duration::from_secs(60);
+/// How long `td-admin` may take to submit an approved update job.
+const ADMIN_SUBMIT: Duration = Duration::from_secs(15);
 
 fn error(why: impl std::fmt::Display) -> io::Error {
     io::Error::other(why.to_string())
@@ -602,11 +610,19 @@ pub(crate) fn request(name: &str) -> Result<(), String> {
         .read_exact(&mut reply)
         .map_err(|e| format!("hostname change ended without a completion receipt: {e}"))?;
     if reply == [1] {
-        writeln!(
-            io::stdout(),
-            "Settings change completed: {}. Hostname changes require a restart.",
-            name.name()
-        )
+        if name.operation() == elevation::Operation::AdminUpdate {
+            writeln!(
+                io::stdout(),
+                "Settings change completed: {}. The admin service started that job.",
+                name.name()
+            )
+        } else {
+            writeln!(
+                io::stdout(),
+                "Settings change completed: {}. Hostname changes require a restart.",
+                name.name()
+            )
+        }
         .map_err(|e| e.to_string())
     } else {
         Err("hostname change was declined, expired or failed".into())
@@ -655,6 +671,14 @@ impl Change {
                 Operation::EnrollAdminKey {
                     requester: ready.requester,
                     blob: blob.into(),
+                }
+            } else if let Some(words) = ready.name.name().strip_prefix("admin-update ") {
+                let (source, reboot) =
+                    crate::consent::admin_update(words).ok_or("invalid admin update request")?;
+                Operation::AdminUpdate {
+                    requester: ready.requester,
+                    source,
+                    reboot,
                 }
             } else if let Some(setting) = ready.name.name().strip_prefix("time ") {
                 Operation::ManageTime {
@@ -738,6 +762,20 @@ impl Change {
             let mut command = Command::new("/bin/td-admin");
             command.args(["accept-key", blob]);
             self.helper = Some(Inspection::printing(command, 511, Duration::from_secs(10))?);
+            self.result = None;
+            return Ok(());
+        }
+        if let Operation::AdminUpdate { source, reboot, .. } = self.request.operation() {
+            self.committed = true;
+            self.result = Some(false);
+            self.backoff.approved()?;
+            let mut command = Command::new("/bin/td-admin");
+            command
+                .arg("submit")
+                .args(crate::consent::admin_update_words(*source, *reboot));
+            // The client's own exchange with the service is bounded inside
+            // this: two seconds to send, ten to answer.
+            self.helper = Some(Inspection::printing(command, 511, ADMIN_SUBMIT)?);
             self.result = None;
             return Ok(());
         }
