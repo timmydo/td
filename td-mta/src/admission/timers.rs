@@ -18,6 +18,7 @@ settings! { NetworkLimits {
     response_idle_seconds: 15, 15, 240;
     keepalive_seconds: 15, 15, 240;
     event_stall_seconds: 15, 15, 240;
+    smtp_pre_mail_idle_seconds: 60, 60, 960;
     smtp_idle_seconds: 300, 300, 4800;
     smtp_data_seconds: 1800, 1800, 28800;
     command_seconds: 300, 300, 4800;

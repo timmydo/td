@@ -154,6 +154,9 @@ fn network<'a>(routes: &'a Routing<'a>, plan: &TimeoutPlan, timer: &Timer) -> Ne
     .unwrap()
 }
 
+fn feed(w: &mut Wire, bytes: &[u8]) {
+    w.input.extend(bytes);
+}
 fn turns(n: &mut Network<'_>, w: &mut Wire, t: &Timer, count: usize) {
     for _ in 0..count {
         n.advance(w, t).unwrap();
@@ -179,7 +182,7 @@ fn partial_reply_and_flush_stall_never_parse_a_command() {
             flush_pending: true,
             ..Wire::default()
         };
-        w.input.extend(b"QUIT\r\n");
+        feed(&mut w, b"QUIT\r\n");
         turns(&mut n, &mut w, timer, 100);
         assert_eq!(w.output, b"220 mx.example.test ESMTP ready\r\n");
         assert_eq!(w.reads, 0);
@@ -237,11 +240,11 @@ fn idle_total_and_regressing_time_refuse_without_renewing_work() {
         let mut n = network(routes, plan, timer);
         let mut w = Wire::default();
         turns(&mut n, &mut w, timer, 2);
-        timer.0.store(300001, Ordering::Relaxed);
+        timer.0.store(60001, Ordering::Relaxed);
         assert_eq!(n.advance(&mut w, timer), Ok(Progress::Advanced));
         turns(&mut n, &mut w, timer, 4);
         assert!(w.output.ends_with(b"421 4.3.2 Service unavailable\r\n"));
-        timer.0.store(305001, Ordering::Relaxed);
+        timer.0.store(65001, Ordering::Relaxed);
         assert_eq!(n.advance(&mut w, timer), Ok(Progress::Closed));
         assert_eq!(w.aborts, 1);
         assert_eq!(n.advance(&mut w, timer), Ok(Progress::Closed));
@@ -266,6 +269,119 @@ fn idle_total_and_regressing_time_refuse_without_renewing_work() {
         let mut n = network(routes, plan, timer);
         timer.0.store(9, Ordering::Relaxed);
         assert_eq!(n.advance(&mut w, timer), Err(Error::Invalid));
+    });
+}
+
+#[test]
+fn only_an_open_transaction_keeps_the_five_minute_idle_wait() {
+    fixture(|routes, plan, timer| {
+        let pre = plan.limits().smtp_pre_mail_idle_seconds * 1000;
+        let within = plan.limits().smtp_idle_seconds * 1000;
+        assert_eq!((pre, within), (60_000, 300_000));
+        let refused = |w: &Wire| w.output.ends_with(b"421 4.3.2 Service unavailable\r\n");
+        // A silent peer after the greeting loses its slot after the shorter wait.
+        timer.0.store(1, Ordering::Relaxed);
+        let mut n = network(routes, plan, timer);
+        let mut w = Wire::default();
+        turns(&mut n, &mut w, timer, 2);
+        timer.0.store(pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(!refused(&w));
+        timer.0.store(1 + pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(refused(&w));
+
+        // NOOP renews only the shorter wait; MAIL opens the longer one.
+        timer.0.store(1, Ordering::Relaxed);
+        let mut n = network(routes, plan, timer);
+        let mut w = Wire::default();
+        feed(&mut w, b"EHLO sender.test\r\n");
+        turns(&mut n, &mut w, timer, 20);
+        timer.0.store(30_001, Ordering::Relaxed);
+        feed(&mut w, b"NOOP\r\n");
+        turns(&mut n, &mut w, timer, 20);
+        assert!(w.output.ends_with(b"250 2.0.0 OK\r\n"));
+        timer.0.store(30_000 + pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(!refused(&w));
+        feed(&mut w, b"MAIL FROM:<>\r\n");
+        turns(&mut n, &mut w, timer, 20);
+        assert!(w.output.ends_with(b"250 2.1.0 Sender accepted\r\n"));
+        // MAIL arrived at 30_000 + pre.
+        timer.0.store(29_999 + pre + within, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(!refused(&w));
+        timer.0.store(30_000 + pre + within, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(refused(&w));
+        // A NOOP at t keeps a session without a transaction until t + pre only.
+        timer.0.store(1, Ordering::Relaxed);
+        let mut n = network(routes, plan, timer);
+        let mut w = Wire::default();
+        turns(&mut n, &mut w, timer, 2);
+        timer.0.store(50_001, Ordering::Relaxed);
+        feed(&mut w, b"NOOP\r\n");
+        turns(&mut n, &mut w, timer, 20);
+        assert!(w.output.ends_with(b"250 2.0.0 OK\r\n"));
+        timer.0.store(50_000 + pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(!refused(&w));
+        timer.0.store(50_001 + pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(refused(&w));
+
+        // A DATA chunk the worker acknowledges renews the longer wait.
+        timer.0.store(1, Ordering::Relaxed);
+        let mut n = network(routes, plan, timer);
+        let mut w = Wire::default();
+        begin(&mut n, &mut w, timer);
+        n.data_ready(Ok(()), timer).unwrap();
+        feed(&mut w, b"Subject: x\r\n\r\nbody\r\n");
+        let mut handed = false;
+        for _ in 0..100 {
+            if n.advance(&mut w, timer).unwrap() == Progress::Work {
+                handed = true;
+                break;
+            }
+        }
+        assert!(handed && matches!(n.session().pending(), Pending::Data(_)));
+        timer.0.store(100_001, Ordering::Relaxed);
+        n.data_written(Ok(()), timer).unwrap();
+        timer.0.store(100_000 + within, Ordering::Relaxed);
+        assert!(n.advance(&mut w, timer).is_ok());
+        timer.0.store(100_001 + within, Ordering::Relaxed);
+        assert_eq!(n.advance(&mut w, timer), Err(Error::Deadline));
+
+        // The final DATA reply closes the transaction.
+        timer.0.store(1, Ordering::Relaxed);
+        let mut n = network(routes, plan, timer);
+        let mut w = Wire::default();
+        pending_commit(&mut n, &mut w, timer);
+        timer.0.store(10_001, Ordering::Relaxed);
+        n.committed(Ok(Commits::new([committed_result()]).unwrap()), timer)
+            .unwrap();
+        turns(&mut n, &mut w, timer, 20);
+        assert!(w.output.windows(16).any(|b| b == b"Message accepted"));
+        timer.0.store(10_000 + pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(!refused(&w));
+        timer.0.store(10_001 + pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(refused(&w));
+
+        // RSET ends the transaction and the shorter wait applies again.
+        timer.0.store(1, Ordering::Relaxed);
+        let mut n = network(routes, plan, timer);
+        let mut w = Wire::default();
+        feed(&mut w, b"EHLO sender.test\r\nMAIL FROM:<>\r\nRSET\r\n");
+        turns(&mut n, &mut w, timer, 30);
+        assert!(w.output.ends_with(b"250 2.0.0 Reset\r\n"));
+        timer.0.store(pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(!refused(&w));
+        timer.0.store(1 + pre, Ordering::Relaxed);
+        turns(&mut n, &mut w, timer, 4);
+        assert!(refused(&w));
     });
 }
 
@@ -336,7 +452,8 @@ fn command_progress_does_not_renew_connection_lifetime() {
         let mut n = network(routes, plan, timer);
         let mut w = Wire::default();
         turns(&mut n, &mut w, timer, 2);
-        for now in (250001..3600001).step_by(250000) {
+        // NOOP inside each pre-MAIL idle window still cannot pass the lifetime.
+        for now in (50001..3600001).step_by(50000) {
             timer.0.store(now, Ordering::Relaxed);
             w.input.extend(b"NOOP\r\n");
             turns(&mut n, &mut w, timer, 4);
@@ -517,7 +634,7 @@ fn partial_command_expiry_aborts_instead_of_fabricating_a_reply() {
         let mut w = Wire::default();
         w.input.extend(b"NO");
         turns(&mut n, &mut w, timer, 4);
-        timer.0.store(300001, Ordering::Relaxed);
+        timer.0.store(60001, Ordering::Relaxed);
         assert_eq!(n.advance(&mut w, timer), Err(Error::Deadline));
         assert!(!w.output.windows(3).any(|b| b == b"421"));
     });

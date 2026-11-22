@@ -56,7 +56,8 @@ pub struct Network<'a> {
     transport_deadline: Deadline,
     idle_deadline: Deadline,
     data_deadline: Option<Deadline>,
-    idle_seconds: u64,
+    pre_mail_idle_seconds: u64,
+    transaction_idle_seconds: u64,
     data_seconds: u64,
     last: Tick,
     closing: Closing,
@@ -84,9 +85,10 @@ impl<'a> Network<'a> {
             reply_timing: None,
             session_deadline,
             transport_deadline,
-            idle_deadline: after(now, plan.limits().smtp_idle_seconds)?,
+            idle_deadline: after(now, plan.limits().smtp_pre_mail_idle_seconds)?,
             data_deadline: None,
-            idle_seconds: plan.limits().smtp_idle_seconds,
+            pre_mail_idle_seconds: plan.limits().smtp_pre_mail_idle_seconds,
+            transaction_idle_seconds: plan.limits().smtp_idle_seconds,
             data_seconds: plan.limits().smtp_data_seconds,
             last: now,
             closing: Closing::Open,
@@ -95,6 +97,17 @@ impl<'a> Network<'a> {
 
     pub fn session(&self) -> &Session<'a> {
         &self.session
+    }
+
+    /// Only an open transaction keeps RFC 5321's five-minute command wait;
+    /// the greeting and the gaps between transactions use the shorter one.
+    fn idle_after(&self, now: Tick) -> Result<Deadline, Error> {
+        let seconds = if self.session.envelope().is_some() {
+            self.transaction_idle_seconds
+        } else {
+            self.pre_mail_idle_seconds
+        };
+        after(now, seconds)
     }
 
     pub fn set_rate_limited(&mut self, limited: bool) {
@@ -213,7 +226,7 @@ impl<'a> Network<'a> {
             return Err(Error::Conflict);
         }
         let now = self.now(clock)?;
-        self.idle_deadline = after(now, self.idle_seconds)?;
+        self.idle_deadline = self.idle_after(now)?;
         self.work = None;
         Ok(now)
     }
@@ -388,7 +401,7 @@ impl<'a> Network<'a> {
                     match transport.write(input)? {
                         IoProgress::Bytes(n) if n > 0 && n <= input.len() => {
                             self.written += n;
-                            self.idle_deadline = after(now, self.idle_seconds)?;
+                            self.idle_deadline = self.idle_after(now)?;
                         }
                         IoProgress::Pending => return Ok(Progress::Pending),
                         _ => return Err(Error::Invalid),
@@ -434,7 +447,7 @@ impl<'a> Network<'a> {
                         IoProgress::Bytes(n) if n > 0 && n <= self.input.len() => {
                             self.start = 0;
                             self.end = n;
-                            self.idle_deadline = after(now, self.idle_seconds)?;
+                            self.idle_deadline = self.idle_after(now)?;
                         }
                         IoProgress::Pending => return Ok(Progress::Pending),
                         IoProgress::Closed => {

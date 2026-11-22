@@ -343,11 +343,13 @@ messages and upload bytes, not decoded attachment size alone.
 
 `handshake_seconds`, `dns_seconds`, `dial_seconds`, `header_idle_seconds`,
 `header_seconds`, `body_idle_seconds`, `response_idle_seconds`,
-`keepalive_seconds`, `event_stall_seconds`, `smtp_idle_seconds`,
-`smtp_data_seconds`, `command_seconds`, `data_init_seconds`,
-`data_block_seconds`, `final_reply_seconds`, `migration_idle_seconds`,
-`migration_minimum_seconds`, `transfer_minimum_seconds`,
-`transfer_base_seconds`, `minimum_rate`.
+`keepalive_seconds`, `event_stall_seconds`, `smtp_pre_mail_idle_seconds`,
+`smtp_idle_seconds`, `smtp_data_seconds`, `command_seconds`,
+`data_init_seconds`, `data_block_seconds`, `final_reply_seconds`,
+`migration_idle_seconds`, `migration_minimum_seconds`,
+`transfer_minimum_seconds`, `transfer_base_seconds`, `minimum_rate`.
+Inbound SMTP waits `smtp_pre_mail_idle_seconds` before MAIL and between
+transactions and `smtp_idle_seconds` within one (ADMISSION.md).
 
 Quantities ending in `_bytes` are bytes and those ending in `_seconds` are
 seconds. Counts/depths are integers; `minimum_rate` is bytes per second. No

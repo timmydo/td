@@ -707,6 +707,7 @@ mod tests {
                 "response_idle_seconds",
                 "keepalive_seconds",
                 "event_stall_seconds",
+                "smtp_pre_mail_idle_seconds",
                 "smtp_idle_seconds",
                 "smtp_data_seconds",
                 "command_seconds",

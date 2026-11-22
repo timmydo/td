@@ -60,7 +60,7 @@ milliseconds, not a five-millisecond network timeout.
 | HTTP response/download | 15 seconds idle; total derived from retained/download bytes below |
 | HTTP keepalive | 5 seconds idle, at most 32 requests per connection |
 | Event stream | One hour maximum; no input-idle timer while subscribed; 15-second output-stall timer only while an event/ping is pending |
-| Inbound SMTP | 300 seconds command/DATA idle; DATA 1800 seconds total; at most 100 transactions per connection |
+| Inbound SMTP | 60 seconds idle before MAIL and between transactions (`smtp_pre_mail_idle_seconds`); 300 seconds command/DATA idle within a transaction (`smtp_idle_seconds`); DATA 1800 seconds total; at most 100 transactions per connection |
 | Smart-host SMTP | 300 seconds greeting/ordinary-command reply, 120 seconds DATA initiation, 180 seconds per 16 KiB DATA write block, 600 seconds final-DATA reply |
 | Outbound attempt | Checked sum of bounded command/block budgets, defined below |
 | Online ACME transport lease | 60 seconds absolute; release between polls/requests as RESOURCES.md specifies |
@@ -79,6 +79,33 @@ The offline 1800-second transfer minimum is separately configurable in its
 the caller applies every enclosing lease and does not renew absolute timers.
 These helpers calculate budgets only; protocol state machines own phase
 transitions, progress/idle handling, fixed lifetimes and operation counts.
+
+Inbound SMTP is in a transaction from an accepted MAIL until its final DATA
+reply, RSET, a new greeting or closure; the longer wait starts when the first
+byte of the reply to MAIL is written. `smtp_idle_seconds` (300) governs
+every command and DATA wait within one, meeting RFC 5321 section
+4.5.3.2.7's five-minute server timeout. `smtp_pre_mail_idle_seconds` (60)
+governs the greeting and the gaps between transactions. Section 4.5.3.2.7
+is a SHOULD for every command, so this is a deliberate deviation where no
+transaction is open, made on operational grounds:
+
+- A sender writes EHLO, STARTTLS and its first MAIL as soon as each reply
+  arrives; only network loss delays them. Five successive TCP
+  retransmission timeouts from the RFC 6298 one-second floor take 31
+  seconds.
+- A sender that reuses a connection and has no next message within 60
+  seconds gets 421 and a close. A MAIL that races that close is discarded,
+  and the sender reads the 421 as its reply. No transaction was accepted,
+  so the message is only deferred to the sender's retry, and the slot is
+  freed for a sender that has mail.
+- Shortening server waits is established practice; Postfix, for example,
+  lowers its every-command `smtpd_timeout` to ten seconds under overload.
+
+The shorter wait removes only fully passive holders. A peer that keeps
+sending NOOP renews it, and one that opens a transaction can renew the
+300-second wait until the one-hour session lifetime. The per-peer limit and
+pool size bound such holders, and the lifetime bounds their duration.
+Neither key is checked against the other.
 
 Event closeafter/ping follow RFC 8620 within that lifetime; quiet subscriptions
 are not timed out as idle HTTP bodies. Inbound SMTP session lifetime is also
