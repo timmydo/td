@@ -156,6 +156,11 @@ every workload that names it:
 
 - **native**: no `/usr`; td's `/bin` and `/td/store`, as today's
   source-built applications and workspaces see;
+- **native-glibc**, for a workspace alone: native, with td's own glibc
+  and `libgcc_s.so.1` linked at `/lib` and `/lib64` in place of the
+  host's, so a program built for another glibc system runs by its
+  `/lib64/ld-linux-x86-64.so.2`; it stores and installs nothing
+  (`APPLICATIONS.md` §C);
 - **a Flathub runtime**, such as `org.freedesktop.Platform//25.08`, at
   `/usr`, with td-jail's `/bin /sbin /lib /lib64` aliases into it for
   application launches and `/lib /lib64` only for workspace launches,

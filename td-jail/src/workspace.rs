@@ -62,6 +62,18 @@ pub(crate) const PROGRAM_TREES: &[&str] = &["td", "usr"];
 /// `/lib` and `/lib64` links into it. Nothing of the host's is bound there.
 /// One list with the launchers that leave them out of a spec.
 pub(crate) const RUNTIME_TREES: &[&str] = flathub_app::WORKSPACE_RUNTIME_TREES;
+/// The system trees a `native-glibc` workspace replaces with td's glibc
+/// ABI: a `/lib` of links to its shared objects and `/lib64` a link to it.
+pub(crate) const NATIVE_ABI_TREES: &[&str] = &["lib", "lib64"];
+/// td's imported glibc's library directory and its `libgcc_s.so.1`, which
+/// the target recipe names; a host build has neither.
+const NATIVE_GLIBC_LIB: Option<&str> = option_env!("TD_JAIL_NATIVE_GLIBC_LIB");
+const NATIVE_LIBGCC: Option<&str> = option_env!("TD_JAIL_NATIVE_LIBGCC");
+/// The interpreter a foreign x86-64 glibc program names, in `/lib64`.
+const NATIVE_LOADER: &str = "ld-linux-x86-64.so.2";
+const NATIVE_LIBGCC_NAME: &str = "libgcc_s.so.1";
+/// More entries than td's glibc library directory holds.
+const MAX_NATIVE_LIB_ENTRIES: usize = 256;
 /// The human whose directories root may expose through account views.
 const TD_ACCOUNT_UID: u32 = 1000;
 /// The caller's user namespace's map of ids.
@@ -225,6 +237,8 @@ pub(crate) struct WorkspacePlan {
     pub(crate) arguments: Vec<OsString>,
     /// The spec's runtime, held; none for a native workspace.
     pub(crate) runtime: Option<WorkspaceRuntime>,
+    /// td's glibc ABI, for `runtime=native-glibc`.
+    pub(crate) native_abi: Option<NativeAbi>,
     /// Whether the channel is a connection root's intake accepted, a
     /// ledger caller's, rather than its launcher's unnamed socket pair.
     pub(crate) intake: bool,
@@ -316,12 +330,143 @@ pub(crate) fn path_directory_named(path: &Path) -> bool {
             .any(|tree| path_is_same_or_child(path, &Path::new("/").join(tree)))
 }
 
-/// Whether `path` lies in a tree a runtime replaces, where a host path
-/// would name the runtime's file inside the jail.
-pub(crate) fn in_runtime_tree(path: &Path) -> bool {
-    RUNTIME_TREES
+/// td's glibc ABI for a native workspace: where its shared objects and
+/// `libgcc_s.so.1` lie in the store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeAbi {
+    pub(crate) glibc_lib: &'static str,
+    pub(crate) libgcc: &'static str,
+}
+
+/// td's glibc ABI, which `runtime=native-glibc` selects: compiled into a
+/// target build, absent from a host build, which refuses the choice.
+pub(crate) fn native_abi() -> io::Result<NativeAbi> {
+    match (NATIVE_GLIBC_LIB, NATIVE_LIBGCC) {
+        (Some(glibc_lib), Some(libgcc)) => Ok(NativeAbi { glibc_lib, libgcc }),
+        _ => Err(crate::error(
+            io::ErrorKind::PermissionDenied,
+            format_args!(
+                "runtime={} is td's alone: this td-jail was built without td's glibc",
+                flathub_app::NATIVE_GLIBC
+            ),
+        )),
+    }
+}
+
+/// The system trees the plan replaces rather than binding the host's: a
+/// runtime's, or with td's glibc ABI (`native`) its `/lib` and `/lib64`.
+pub(crate) fn replaced_trees(runtime: bool, native: bool) -> &'static [&'static str] {
+    if runtime {
+        RUNTIME_TREES
+    } else if native {
+        NATIVE_ABI_TREES
+    } else {
+        &[]
+    }
+}
+
+/// Whether `path` lies in a tree the plan replaces, where a host path
+/// would name another file inside the jail.
+pub(crate) fn in_replaced_tree(path: &Path, runtime: bool, native: bool) -> bool {
+    replaced_trees(runtime, native)
         .iter()
         .any(|tree| path_is_same_or_child(path, &Path::new("/").join(tree)))
+}
+
+/// Whether `name` is a versioned shared object's, as `libc.so.6` or
+/// `ld-linux-x86-64.so.2` is: what a program's `DT_NEEDED` or interpreter
+/// names, not a link-time `libc.so`, an archive or an object.
+fn versioned_shared_object(name: &str) -> bool {
+    name.split_once(".so.").is_some_and(|(stem, version)| {
+        !stem.is_empty()
+            && !version.is_empty()
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+/// The links a native workspace's `/lib` holds, by name in order: each
+/// versioned shared object of td's glibc, the loader among them, and
+/// `libgcc_s.so.1`, each to its store file. The loader's default search
+/// reaches `/lib`, so a program built against another glibc finds these
+/// with no cache, and `/lib64`'s loader is the same file.
+pub(crate) fn native_lib_links(abi: &NativeAbi) -> io::Result<Vec<(String, PathBuf)>> {
+    let glibc_lib = Path::new(abi.glibc_lib);
+    let libgcc = Path::new(abi.libgcc);
+    for path in [glibc_lib, libgcc] {
+        if !path.starts_with("/td/store") || authority::validate_filesystem_target(path).is_err() {
+            return Err(crate::error(
+                io::ErrorKind::Other,
+                format_args!(
+                    "native glibc path {} is not a canonical td store path",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    native_lib_links_in(glibc_lib, libgcc)
+}
+
+/// `native_lib_links` past its store-path check.
+fn native_lib_links_in(glibc_lib: &Path, libgcc: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    let refused = |args: std::fmt::Arguments<'_>| crate::error(io::ErrorKind::Other, args);
+    let oom = |_| io::Error::from(io::ErrorKind::OutOfMemory);
+    if libgcc.file_name() != Some(OsStr::new(NATIVE_LIBGCC_NAME)) {
+        return Err(refused(format_args!(
+            "native libgcc path {} does not name {NATIVE_LIBGCC_NAME}",
+            libgcc.display()
+        )));
+    }
+    let mut links: Vec<(String, PathBuf)> = Vec::new();
+    let mut entries = 0usize;
+    for entry in fs::read_dir(glibc_lib)? {
+        entries += 1;
+        if entries > MAX_NATIVE_LIB_ENTRIES {
+            return Err(refused(format_args!(
+                "native glibc library directory {} holds more than {MAX_NATIVE_LIB_ENTRIES} entries",
+                glibc_lib.display()
+            )));
+        }
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !versioned_shared_object(name) {
+            continue;
+        }
+        if !entry.file_type()?.is_file() {
+            return Err(refused(format_args!(
+                "native glibc object {name} is not a regular file"
+            )));
+        }
+        let name = crate::allocation::string(name).map_err(oom)?;
+        let target = joined(glibc_lib, &file_name)?;
+        crate::allocation::push(&mut links, (name, target)).map_err(oom)?;
+    }
+    if !links.iter().any(|(name, _)| name == NATIVE_LOADER) {
+        return Err(refused(format_args!(
+            "native glibc library directory {} has no {NATIVE_LOADER}",
+            glibc_lib.display()
+        )));
+    }
+    if links.iter().any(|(name, _)| name == NATIVE_LIBGCC_NAME) {
+        return Err(refused(format_args!(
+            "native glibc library directory already holds {NATIVE_LIBGCC_NAME}"
+        )));
+    }
+    if !fs::symlink_metadata(libgcc)?.is_file() {
+        return Err(refused(format_args!(
+            "native {} is not a regular file",
+            libgcc.display()
+        )));
+    }
+    let libgcc_name = crate::allocation::string(NATIVE_LIBGCC_NAME).map_err(oom)?;
+    crate::allocation::push(&mut links, (libgcc_name, PathBuf::from(libgcc))).map_err(oom)?;
+    // In place: names are unique, so no stable order is needed.
+    links.sort_unstable();
+    Ok(links)
 }
 
 pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
@@ -337,6 +482,8 @@ struct Spec {
     development: bool,
     shared_network: bool,
     runtime: Option<FlathubRuntime>,
+    /// `runtime=native-glibc`: td's own trees with td's glibc ABI.
+    native_glibc: bool,
     scratch: Vec<PathBuf>,
     programs: Vec<PathBuf>,
     aliases: Vec<crate::host_path::Alias>,
@@ -424,7 +571,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             .position(|known| *known == key)
             .ok_or_else(|| invalid(format!("workspace spec has an unknown key {key:?}")))?;
         let repeated = match key {
-            "runtime" => spec.runtime.is_some(),
+            "runtime" => spec.runtime.is_some() || spec.native_glibc,
             "entry" => entry,
             "home" => home.is_some(),
             _ => false,
@@ -435,6 +582,10 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             )));
         }
         last = rank;
+        if key == "runtime" && value == flathub_app::NATIVE_GLIBC {
+            spec.native_glibc = true;
+            continue;
+        }
         if key == "runtime" {
             spec.runtime = Some(flathub_app::flathub_runtime(value).ok_or_else(|| {
                 invalid(format!(
@@ -574,6 +725,7 @@ where
         }
     }
     let runtime = spec.runtime;
+    let native_glibc = spec.native_glibc;
     // A ledger account's home is the spec's, its own; the human's is the
     // one no directory may be or contain.
     let real_home = authority::account_home(match caller {
@@ -591,6 +743,10 @@ where
     plan.intake = matches!(caller, Caller::Account(_));
     if let Some(runtime) = runtime {
         plan.runtime = Some(spec_runtime(runtime, &td_runtime_source())?);
+    }
+    if native_glibc {
+        plan.native_abi = Some(native_abi()?);
+        require_td_for_runtime(Path::new(authority::CONFIG_PATH))?;
     }
     Ok(plan)
 }
@@ -958,12 +1114,13 @@ fn admit(
     reserved: &[&str],
 ) -> io::Result<WorkspacePlan> {
     let runtime = spec.runtime.is_some();
+    let native = spec.native_glibc;
     let mut alias_names = std::collections::BTreeSet::new();
     for alias in &spec.aliases {
         if !alias_names.insert(alias.name.clone()) {
             return Err(invalid("workspace PATH alias is named twice"));
         }
-        refuse_runtime_tree("PATH alias source", &alias.source, runtime)?;
+        refuse_replaced_tree("PATH alias source", &alias.source, runtime, native)?;
         admit_alias(alias)?;
     }
     let mut programs: Vec<Program> = Vec::new();
@@ -979,7 +1136,7 @@ fn admit(
     }
     let mut path: Vec<PathBuf> = Vec::new();
     for directory in spec.path {
-        refuse_runtime_tree("path directory", &directory, runtime)?;
+        refuse_replaced_tree("path directory", &directory, runtime, native)?;
         admit_path_directory(&directory)?;
         if path.contains(&directory) {
             return Err(invalid(format!(
@@ -1241,17 +1398,25 @@ fn admit(
         shared,
         arguments,
         runtime: None,
+        native_abi: None,
         intake: false,
     })
 }
 
-/// With a `runtime`, a host path in a tree it replaces would resolve into
-/// the runtime inside the jail, so a spec may not name one there.
-pub(crate) fn refuse_runtime_tree(what: &str, path: &Path, runtime: bool) -> io::Result<()> {
-    if runtime && in_runtime_tree(path) {
+/// With a `runtime`, or `native-glibc`, a host path in a tree it replaces
+/// would resolve into the runtime or td's glibc inside the jail, so a spec
+/// may not name one there.
+pub(crate) fn refuse_replaced_tree(
+    what: &str,
+    path: &Path,
+    runtime: bool,
+    native: bool,
+) -> io::Result<()> {
+    if in_replaced_tree(path, runtime, native) {
         return Err(invalid(format!(
-            "workspace {what} {} lies in /usr, /lib or /lib64, which the spec's runtime replaces",
-            path.display()
+            "workspace {what} {} lies in {:?}, which the spec's runtime replaces",
+            path.display(),
+            replaced_trees(runtime, native)
         )));
     }
     Ok(())
@@ -3077,9 +3242,16 @@ mod tests {
             "/lib64/x",
             "/usr/lib/x86_64-linux-gnu",
         ] {
-            assert!(in_runtime_tree(Path::new(replaced)), "{replaced}");
-            assert!(refuse_runtime_tree("path directory", Path::new(replaced), true).is_err());
-            assert!(refuse_runtime_tree("path directory", Path::new(replaced), false).is_ok());
+            let path = Path::new(replaced);
+            assert!(in_replaced_tree(path, true, false), "{replaced}");
+            assert!(refuse_replaced_tree("path directory", path, true, false).is_err());
+            assert!(refuse_replaced_tree("path directory", path, false, false).is_ok());
+            // td's glibc ABI replaces /lib and /lib64 alone.
+            assert_eq!(
+                refuse_replaced_tree("path directory", path, false, true).is_err(),
+                !replaced.starts_with("/usr"),
+                "{replaced}"
+            );
         }
         for kept in [
             "/bin",
@@ -3089,13 +3261,21 @@ mod tests {
             "/usrx",
             "/sbin",
         ] {
-            assert!(!in_runtime_tree(Path::new(kept)), "{kept}");
-            assert!(refuse_runtime_tree("path directory", Path::new(kept), true).is_ok());
+            for (runtime, native) in [(true, false), (false, true), (false, false)] {
+                assert!(
+                    !in_replaced_tree(Path::new(kept), runtime, native),
+                    "{kept}"
+                );
+            }
+            assert!(refuse_replaced_tree("path directory", Path::new(kept), true, false).is_ok());
         }
         // Each replaced tree is one every instance otherwise binds.
-        for tree in RUNTIME_TREES {
+        for tree in RUNTIME_TREES.iter().chain(NATIVE_ABI_TREES) {
             assert!(SYSTEM_TREES.contains(tree), "{tree}");
         }
+        assert!(NATIVE_ABI_TREES
+            .iter()
+            .all(|tree| RUNTIME_TREES.contains(tree)));
         // Admission refuses them before it looks at anything on disk.
         let runtime = flathub_app::flathub_runtime("freedesktop-platform-25-08");
         let path = Spec {
@@ -3113,12 +3293,155 @@ mod tests {
             home: "/h".into(),
             ..Spec::default()
         };
-        for spec in [path, alias] {
+        let native = Spec {
+            native_glibc: true,
+            path: vec!["/lib64".into()],
+            home: "/h".into(),
+            ..Spec::default()
+        };
+        for spec in [path, alias, native] {
             let refused = admit(spec, Path::new("/s/spec"), 1, 1, &[], Vec::new(), RESERVED)
                 .unwrap_err()
                 .to_string();
             assert!(refused.contains("runtime replaces"), "{refused}");
         }
+    }
+
+    /// `runtime=native-glibc` is a runtime line of its own: once, in a
+    /// runtime's place, never beside one.
+    #[test]
+    fn native_glibc_is_a_runtime_line_exclusive_of_a_flathub_runtime() {
+        let spec = parse_spec("format=1\nruntime=native-glibc\nentry=/a\nhome=/h\n").unwrap();
+        assert!(spec.native_glibc);
+        assert!(spec.runtime.is_none());
+        let plain = parse_spec("format=1\nentry=/a\nhome=/h\n").unwrap();
+        assert!(!plain.native_glibc);
+        for refused in [
+            "format=1\nruntime=native-glibc\nruntime=native-glibc\nentry=/a\nhome=/h\n",
+            "format=1\nruntime=native-glibc\nruntime=freedesktop-platform-25-08\nentry=/a\nhome=/h\n",
+            "format=1\nruntime=freedesktop-platform-25-08\nruntime=native-glibc\nentry=/a\nhome=/h\n",
+            "format=1\nruntime=native\nentry=/a\nhome=/h\n",
+            "format=1\nentry=/a\nruntime=native-glibc\nhome=/h\n",
+        ] {
+            assert!(parse_spec(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    /// A host build carries no glibc paths, so it refuses `native-glibc`
+    /// rather than binding a host's `/lib` under the name.
+    #[test]
+    fn a_host_build_has_no_native_abi() {
+        if NATIVE_GLIBC_LIB.is_none() || NATIVE_LIBGCC.is_none() {
+            let refused = native_abi().unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+            assert!(refused.to_string().contains("native-glibc"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_versioned_shared_object_is_what_a_program_names() {
+        for good in [
+            "libc.so.6",
+            "ld-linux-x86-64.so.2",
+            "libpthread.so.0",
+            "libgcc_s.so.1",
+            "libfoo.so.1.2.3",
+        ] {
+            assert!(versioned_shared_object(good), "{good}");
+        }
+        for bad in [
+            "libc.so",
+            "libc.a",
+            "crt1.o",
+            "gconv",
+            ".so.6",
+            "libc.so.",
+            "libc.so.6a",
+            "libc.so.6..1",
+            "libmemusage.so",
+        ] {
+            assert!(!versioned_shared_object(bad), "{bad}");
+        }
+    }
+
+    /// `/lib`'s links: each versioned shared object of the glibc
+    /// directory, the loader required, nothing else of it, and
+    /// `libgcc_s.so.1` beside them, in order.
+    #[test]
+    fn native_lib_links_take_glibcs_shared_objects_and_libgcc() {
+        // A store-shaped tree below a scratch root stands in for /td/store,
+        // whose prefix the paths must carry, so this checks shape alone.
+        let root = td_fs::TempDir::new("native-lib-links").unwrap();
+        let glibc = root.join("glibc/lib");
+        fs::create_dir_all(&glibc).unwrap();
+        for name in [
+            "libc.so.6",
+            "ld-linux-x86-64.so.2",
+            "libm.so.6",
+            "libc.so",
+            "libc.a",
+        ] {
+            fs::write(glibc.join(name), b"").unwrap();
+        }
+        fs::create_dir(glibc.join("gconv")).unwrap();
+        let libgcc = root.join("gcc/lib/libgcc_s.so.1");
+        fs::create_dir_all(libgcc.parent().unwrap()).unwrap();
+        fs::write(&libgcc, b"").unwrap();
+        // Outside /td/store, or not canonical: refused before anything is
+        // read.
+        for (glibc_lib, libgcc) in [
+            ("/tmp/glibc/lib", "/td/store/x-gcc/lib/libgcc_s.so.1"),
+            ("/td/store/x-glibc/lib", "/tmp/libgcc_s.so.1"),
+            (
+                "/td/store/x-glibc/../lib",
+                "/td/store/x-gcc/lib/libgcc_s.so.1",
+            ),
+        ] {
+            let abi = NativeAbi { glibc_lib, libgcc };
+            assert!(
+                native_lib_links(&abi)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("td store"),
+                "{glibc_lib} {libgcc}"
+            );
+        }
+        // The shape, past the store-prefix check.
+        let links = native_lib_links_in(&glibc, &libgcc).unwrap();
+        let names: Vec<&str> = links.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "ld-linux-x86-64.so.2",
+                "libc.so.6",
+                "libgcc_s.so.1",
+                "libm.so.6"
+            ]
+        );
+        for (name, target) in &links {
+            let expected = if name == "libgcc_s.so.1" {
+                libgcc.clone()
+            } else {
+                glibc.join(name)
+            };
+            assert_eq!(target, &expected, "{name}");
+        }
+        // No loader: refused.
+        fs::remove_file(glibc.join("ld-linux-x86-64.so.2")).unwrap();
+        assert!(native_lib_links_in(&glibc, &libgcc).is_err());
+        fs::write(glibc.join("ld-linux-x86-64.so.2"), b"").unwrap();
+        // A shared object that is a link, which could lead out of the
+        // store: refused.
+        fs::remove_file(glibc.join("libm.so.6")).unwrap();
+        std::os::unix::fs::symlink("/elsewhere", glibc.join("libm.so.6")).unwrap();
+        assert!(native_lib_links_in(&glibc, &libgcc).is_err());
+        fs::remove_file(glibc.join("libm.so.6")).unwrap();
+        // A libgcc the glibc directory already holds: refused.
+        fs::write(glibc.join("libgcc_s.so.1"), b"").unwrap();
+        assert!(native_lib_links_in(&glibc, &libgcc).is_err());
+        fs::remove_file(glibc.join("libgcc_s.so.1")).unwrap();
+        // A libgcc path that names another file: refused.
+        assert!(native_lib_links_in(&glibc, &glibc.join("libc.so.6")).is_err());
     }
 
     #[test]

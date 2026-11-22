@@ -32,8 +32,11 @@ pub struct Profile {
     _lock: Option<File>,
 }
 
-/// A declared runtime's td name.
+/// `native-glibc`, or a declared runtime's td name.
 pub fn runtime(name: &str) -> io::Result<&'static str> {
+    if name == crate::flathub_app::NATIVE_GLIBC {
+        return Ok(crate::flathub_app::NATIVE_GLIBC);
+    }
     crate::flathub_app::flathub_runtime(name)
         .map(|runtime| runtime.name)
         .ok_or_else(|| crate::failure(format_args!("{name} is no declared runtime")))

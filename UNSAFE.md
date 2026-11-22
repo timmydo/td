@@ -2221,7 +2221,11 @@ the runtime's loader files in `/etc` in place of the host's, through the
 application kind's runtime-entry bind, with no new call, flag or
 operation, the descriptor sweep keeping that runtime's lock in stage 1
 as an application launch keeps its generation locks (close-on-exec, so
-stage 2 starts without it); at most four admitted program files, read-only
+stage 2 starts without it); with `native-glibc`, in place of the host's
+`/lib` and `/lib64`, a `/lib` directory of links into td's glibc and
+gcc-runtime store outputs on the root tmpfs before its read-only
+remount, and a `/lib64` link to it, through the same `mkdir` and
+`symlink` the plan already makes, with no new call, flag or operation; at most four admitted program files, read-only
 and executable, device and inode checked; and the admitted directories
 at their real paths through the same grant bind and hardening loop,
 `noexec` but for worktrees and development's private home and shared trees, which keeps

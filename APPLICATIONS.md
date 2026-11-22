@@ -3893,8 +3893,9 @@ with the kind's own departures:
 
 - **Runtime** (WORKLOADS.md, "Runtimes"). `runtime=` names a Flathub
   runtime by its td name in `flathub_app::FLATHUB_RUNTIMES`
-  (`freedesktop-platform-25-08`, `freedesktop-sdk-25-08`); any other
-  value is refused. A td-sandbox sandbox's runtime
+  (`freedesktop-platform-25-08`, `freedesktop-sdk-25-08`), or is
+  `native-glibc` (below); any other value is refused. A td-sandbox
+  sandbox's runtime
   (td-sandbox/DESIGN.md, "Runtime") is written here by root's intake,
   and a td-agent
   template's (td-agent/DESIGN.md §8, Runtime), on its workspaces'
@@ -3925,6 +3926,19 @@ with the kind's own departures:
   there, as on any system whose os-release says td and that has a `/usr`
   (td-agent/DESIGN.md §8, Runtime); `cargo` run outside td-builder is
   not refused.
+- **td's glibc** (`runtime=native-glibc`, `flathub_app::NATIVE_GLIBC`).
+  Not a Flathub runtime and never installed: the workspace keeps td's own
+  trees, and td-jail lays out td's imported glibc where a foreign x86-64
+  glibc program looks for it (the mount plan below). It is in a runtime's
+  place, so the two never meet, and is td's alone as a runtime is: a
+  host build of td-jail carries no glibc paths and refuses it, as does a
+  host without product configuration. No path directory or alias source
+  may lie in `/lib` or `/lib64`, and stage 2 refuses them again. It
+  confines no differently from `native`: a workspace already runs
+  whatever its account puts in its home, through td's store loader if
+  need be, and this only gives that loader its conventional name. Only
+  td-sandbox offers it; a td-agent template names a Flathub runtime or
+  none.
 - **Programs**, the entry first, are direct executable regular files,
   bound read-only and executable at `/opt/workspace/bin/<file name>`,
   their device and inode checked before and after the bind. The entry
@@ -4060,7 +4074,22 @@ td's `/bin` symlinks with `sh` pointing to `/usr/bin/bash` and `curl` to
 held runtime’s own `bin` directory.
 `/sbin` stays the host's. A host `/run` or `/etc` link that names or
 resolves into `/usr`, `/lib` or `/lib64` is then not recreated, since
-there it would name the runtime's file. Without persistent scratch, `/run` holds only a store-based host's
+there it would name the runtime's file. With `native-glibc` the host's
+`/lib` and `/lib64` are not bound either: `/lib` is a directory of the
+read-only root holding one link per versioned shared object of td's
+glibc library directory (`libc.so.6`, `ld-linux-x86-64.so.2` and the
+rest, never a link-time `libc.so`, archive or object), each to its store
+file, and `libgcc_s.so.1` to gcc-runtime's, and `/lib64` is a link to
+`/lib`. td-jail's target recipe compiles both store paths in, as
+td-link's are, and stage 1 refuses a glibc directory with no loader, a
+member that is not a regular file, or one already named
+`libgcc_s.so.1`. td's glibc searches `/lib` by default, so
+a program whose `PT_INTERP` is `/lib64/ld-linux-x86-64.so.2` runs with
+td's loader and finds its glibc sonames there with no cache; the host's
+loader files are left out of `/etc`, and a host `/run` or `/etc` link
+into `/lib` or `/lib64` is not recreated. td's own programs are
+unaffected: their interpreter and `RUNPATH` name the same files in the
+store. Without persistent scratch, `/run` holds only a store-based host's
 `current-system` link, to its resolved target when that lies in a bound
 tree. `/etc` is a tmpfs holding synthesized account, group, host,
 hostname and NSS files, the account the caller's identity with the
@@ -4095,7 +4124,11 @@ names of the root, of every directory between it and an admitted tree,
 and of `/run`, `/etc` and `/opt/workspace`; with a runtime, the `/lib`
 and `/lib64` links, `/usr`'s flags and a refused write to it, no mount
 below `/usr` or at `/lib` or `/lib64`, and each loader entry again
-selected from `/usr/etc` and required to be that file at `/etc`; every
+selected from `/usr/etc` and required to be that file at `/etc`; with
+`native-glibc`, `/lib` a directory with no mount at or below it holding
+exactly the links derived again inside from the compiled store paths,
+each to its planned file, `/lib64` the link to it, and no loader entry
+in `/etc`; every
 program's flags; every
 mount row below every directory; each repository's chain links, derived
 again inside from the fixed names and the read-only `worktrees/` and

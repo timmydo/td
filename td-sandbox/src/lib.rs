@@ -49,7 +49,10 @@ const HELP: &str = "td-sandbox COMMAND\n\
   share NAME PATH --read|--write  share a directory below your home\n\
   unshare NAME PATH\n\
   network NAME off|host\n\
-  runtime NAME RUNTIME|native bind a declared Flathub runtime at /usr\n\
+  runtime NAME RUNTIME|native-glibc|native\n\
+                              bind a declared Flathub runtime at /usr, or\n\
+                              td's glibc at /lib and /lib64 for programs\n\
+                              built for another glibc system\n\
   shell NAME                  start an interactive shell\n\
   run NAME -- COMMAND [ARG...] run a command in the sandbox\n\
   sessions NAME               list active CLI session IDs\n\
@@ -314,6 +317,11 @@ fn session(
 /// The compiled choices, not a claim that their payloads are installed.
 fn runtime_catalog(output: &mut impl Write) -> io::Result<()> {
     writeln!(output, "NAME\tSOURCE\nnative\ttd (no download)")?;
+    writeln!(
+        output,
+        "{}\ttd, with td's glibc at /lib and /lib64 (no download)",
+        flathub_app::NATIVE_GLIBC
+    )?;
     for runtime in flathub_app::FLATHUB_RUNTIMES {
         writeln!(output, "{}\t{}", runtime.name, runtime.exact_ref)?;
     }
@@ -527,6 +535,9 @@ mod tests {
         runtime_catalog(&mut output)?;
         let listing = String::from_utf8(output).map_err(error)?;
         assert!(listing.contains("native\ttd (no download)\n"));
+        assert!(listing.contains("\nnative-glibc\ttd, with td's glibc at /lib and /lib64"));
+        assert!(state::runtime("native-glibc").is_ok());
+        assert!(state::runtime("native").is_err());
         for runtime in flathub_app::FLATHUB_RUNTIMES {
             assert!(listing.contains(&format!("{}\t{}\n", runtime.name, runtime.exact_ref)));
         }

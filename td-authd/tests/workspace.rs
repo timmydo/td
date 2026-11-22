@@ -115,6 +115,21 @@ fn a_request_is_one_exact_bounded_line() {
         panic!("{runtime:?}");
     };
     assert_eq!(launch.words().unwrap(), ["/bin/sh", "-i"]);
+    // `native-glibc` is td's own trees, so its shell is td's as native's
+    // is, by the path /bin/sh resolves to.
+    let glibc = Request::parse(b"start tools native-glibc linux\n").unwrap();
+    assert_eq!(glibc.verb, shell(Some("native-glibc"), "linux"));
+    let Verb::Launch(launch) = &glibc.verb else {
+        panic!("{glibc:?}");
+    };
+    assert_eq!(
+        encode(&glibc.name, launch),
+        b"start tools native-glibc linux\n".to_vec()
+    );
+    if let Ok(native) = fs::canonicalize("/bin/sh") {
+        assert_eq!(launch.words().unwrap(), [native.to_str().unwrap(), "-i"]);
+    }
+    assert!(Request::parse(b"start tools native-musl linux\n").is_err());
     // A command's words are hex, so any argument is one word: an empty
     // one, one with spaces, a newline or a quote.
     let line = format!(
@@ -379,6 +394,10 @@ fn the_spec_maps_the_network_row_and_names_only_the_account() {
         spec_text(Network::Host, Some("freedesktop-platform-25-08"), entry, &home).unwrap(),
         "format=1\nprofile=development\nruntime=freedesktop-platform-25-08\nentry=/td/store/abc-td-sandbox/bin/td-sandbox\nhome=/var/lib/td/workloads/98304\n"
     );
+    assert_eq!(
+        spec_text(Network::Off, Some("native-glibc"), entry, &home).unwrap(),
+        "format=1\nprofile=development-offline\nruntime=native-glibc\nentry=/td/store/abc-td-sandbox/bin/td-sandbox\nhome=/var/lib/td/workloads/98304\n"
+    );
     assert!(spec_text(Network::Off, None, Path::new("/td/a\nwrite=/x"), &home).is_err());
     assert_eq!(
         spec_path(98304, 7).unwrap(),
@@ -576,6 +595,8 @@ fn a_named_runtime_must_be_installed_before_the_answer() {
     let temp = crate::test_temp::TempDir::new("td-workspace-runtime").unwrap();
     let store = temp.path();
     require_runtime(store, None).unwrap();
+    // td's own glibc installs nothing.
+    require_runtime(store, Some("native-glibc")).unwrap();
     let refused = require_runtime(store, Some("freedesktop-sdk-25-08")).unwrap_err();
     assert!(refused.contains("is not installed"), "{refused}");
     fs::create_dir(store.join("freedesktop-sdk-25-08")).unwrap();
@@ -1608,6 +1629,9 @@ fn a_workspace_request_names_a_slot_and_its_launch() {
         format!("workspace launch agent-1 development nosuch {tool_host}\n"),
         format!("workspace launch agent-1 development native {tool_host} tool-host\n"),
         format!("workspace launch default development native {tool_host}\n"),
+        // td's glibc at /lib is td-sandbox's runtime alone.
+        format!("workspace launch agent-1 development native-glibc {tool_host}\n"),
+        format!("workspace launch agent-1 isolated native-glibc {tool_host}\n"),
     ] {
         assert!(Request::parse(wrong.as_bytes()).is_err(), "{wrong}");
     }

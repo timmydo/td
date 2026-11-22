@@ -187,7 +187,10 @@ impl Launch {
         if let Some(command) = &self.command {
             return copied(command);
         }
-        if self.runtime.is_some() {
+        if self
+            .runtime
+            .is_some_and(|runtime| runtime != flathub_app::NATIVE_GLIBC)
+        {
             // The runtime's /bin/sh exists only after td-jail builds /bin.
             return copied(&[SHELL, "-i"]);
         }
@@ -439,6 +442,10 @@ fn workspace_request(rest: &str) -> Result<Request, String> {
             };
             let profile = Profile::parse(profile).ok_or_else(malformed)?;
             let runtime = runtime_of(runtime)?;
+            // td's glibc at /lib is a sandbox's choice; td-agent offers none.
+            if runtime == Some(flathub_app::NATIVE_GLIBC) {
+                return Err("native-glibc is a td-sandbox runtime".into());
+            }
             if runtime.is_some() && profile == Profile::Isolated {
                 return Err("a workspace runtime runs only in a development instance".into());
             }
@@ -511,10 +518,11 @@ fn words<const N: usize>(text: &str) -> Option<[&str; N]> {
     words.next().is_none().then_some(out)
 }
 
-/// `native`, or a declared runtime's td name.
+/// `native`, `native-glibc`, or a declared runtime's td name.
 fn runtime_of(word: &str) -> Result<Option<&'static str>, String> {
     match word {
         "native" => Ok(None),
+        flathub_app::NATIVE_GLIBC => Ok(Some(flathub_app::NATIVE_GLIBC)),
         named => flathub_app::flathub_runtime(named)
             .map(|runtime| Some(runtime.name))
             .ok_or_else(|| "the workspace request names no declared runtime".into()),
@@ -916,8 +924,9 @@ fn ensure_parents(base: &Path, through: &Path, owner: (u32, u32)) -> Result<(), 
 /// `current` below `store` exists. td-jail holds it at the launch and
 /// remains the authority; this only refuses, before the answer, what the
 /// human can mend, since a failure after it reaches only root's log.
+/// `native-glibc` is td's own glibc and installs nothing.
 fn require_runtime(store: &Path, runtime: Option<&str>) -> Result<(), String> {
-    let Some(runtime) = runtime else {
+    let Some(runtime) = runtime.filter(|runtime| *runtime != flathub_app::NATIVE_GLIBC) else {
         return Ok(());
     };
     let current = joined(

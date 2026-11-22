@@ -4741,7 +4741,7 @@ account, network or grant list retires the cached file host and restarts
 MCP servers on their next reconciliation. Running calls keep their
 existing jail until they end. Conversation/template deletion never deletes
 the named sandbox or its files, and no per-conversation account is acquired
-for these tool launches. A runtime-bearing sandbox remains outside the
+for these tool launches. A sandbox naming a Flathub runtime remains outside the
 td control-plane build boundary (TRUST.md, "Trust zones").
 
 The named-sandbox adapter retains specific allocation debt in the existing

@@ -112,6 +112,13 @@ pub const PRODUCT_CONFIG: &str = "/etc/td-app.conf";
 /// source there.
 pub const WORKSPACE_RUNTIME_TREES: &[&str] = &["lib", "lib64", "usr"];
 
+/// The workspace runtime that is td's own trees with td's glibc at the
+/// paths a foreign x86-64 glibc program names: no Flathub runtime, no
+/// `/usr`, and a `/lib` and `/lib64` of td's glibc in place of the host's
+/// (td-sandbox/DESIGN.md, "Runtime"). It is not a declared Flathub runtime
+/// and is never installed.
+pub const NATIVE_GLIBC: &str = "native-glibc";
+
 /// Whether absolute `path` is or lies below one of
 /// `WORKSPACE_RUNTIME_TREES`, by component.
 pub fn in_workspace_runtime_tree(path: &std::path::Path) -> bool {
@@ -1189,6 +1196,18 @@ mod tests {
         ] {
             assert!(!in_workspace_runtime_tree(path.as_ref()), "{path}");
         }
+    }
+
+    /// `native-glibc` travels where a runtime's td name does, so it keeps
+    /// that grammar, and no Flathub declaration may take it.
+    #[test]
+    fn native_glibc_is_a_runtime_word_no_flathub_runtime_declares() {
+        assert!(valid_name(NATIVE_GLIBC));
+        assert!(flathub_runtime(NATIVE_GLIBC).is_none());
+        assert!(FLATHUB_SOURCES
+            .iter()
+            .all(|source| source.name != NATIVE_GLIBC));
+        assert_ne!(NATIVE_GLIBC, "native");
     }
 
     #[test]

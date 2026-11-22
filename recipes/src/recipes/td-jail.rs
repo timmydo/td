@@ -86,6 +86,13 @@ fn declared_modules() -> Vec<&'static str> {
     modules
 }
 
+/// td glibc's library directory, as every td glibc program's `RUNPATH`
+/// names it.
+const NATIVE_GLIBC_LIB: &str = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
+
+/// The `libgcc_s.so.1` td's image ships in its runtime closure.
+pub(crate) const NATIVE_LIBGCC: &str = "{in:gcc-runtime}/lib/libgcc_s.so.1";
+
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
 
@@ -130,6 +137,11 @@ pub fn recipe() -> Recipe {
                 "{src}/main.rs",
             ],
         )
+        // td's glibc ABI, which `runtime=native-glibc` lays out at /lib
+        // and /lib64 (td-sandbox/DESIGN.md, "Runtime"): the image's own
+        // glibc and libgcc_s, compiled in as td-link's are.
+        .env("TD_JAIL_NATIVE_GLIBC_LIB", NATIVE_GLIBC_LIB)
+        .env("TD_JAIL_NATIVE_LIBGCC", NATIVE_LIBGCC)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::Require {
@@ -141,7 +153,7 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("td-jail", "0.1")
         .build_root()
-        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
+        .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64", "gcc-runtime"])
         .steps(steps)
 }
 
@@ -189,6 +201,44 @@ mod tests {
         declared.sort_unstable();
         staged.sort_unstable();
         assert_eq!(declared, staged);
+    }
+
+    /// `native-glibc`'s ABI is the image's own glibc, the directory every
+    /// td glibc program's `RUNPATH` names, and gcc-runtime's libgcc_s,
+    /// both compiled into the step that builds td-jail.
+    #[test]
+    fn recipe_compiles_in_tds_glibc_abi() {
+        assert_eq!(
+            NATIVE_GLIBC_LIB,
+            format!("{}/lib", crate::shared::BUILD_ROOT_GLIBC)
+        );
+        let recipe = recipe();
+        let inputs = recipe.native_inputs.clone().unwrap_or_default();
+        assert!(inputs.iter().any(|input| input == "glibc-x86-64"));
+        assert!(inputs.iter().any(|input| input == "gcc-runtime"));
+        let compiles = recipe
+            .steps
+            .iter()
+            .flatten()
+            .filter(|step| {
+                matches!(step, Step::Run { argv, env, .. }
+                if argv.iter().any(|arg| arg == "{out}/bin/td-jail")
+                    && env.iter().any(|(key, value)| {
+                        key == "TD_JAIL_NATIVE_GLIBC_LIB" && value == NATIVE_GLIBC_LIB
+                    })
+                    && env.iter().any(|(key, value)| {
+                        key == "TD_JAIL_NATIVE_LIBGCC" && value == NATIVE_LIBGCC
+                    }))
+            })
+            .count();
+        assert_eq!(compiles, 1);
+        let workspace = source("workspace").expect("workspace source");
+        for key in ["TD_JAIL_NATIVE_GLIBC_LIB", "TD_JAIL_NATIVE_LIBGCC"] {
+            assert!(
+                workspace.contains(&format!("option_env!(\"{key}\")")),
+                "{key}"
+            );
+        }
     }
 
     #[test]

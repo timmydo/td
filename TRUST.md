@@ -32,7 +32,8 @@ path. No Flathub byte is a zone-two tool either, so such a workspace is
 no host for the control plane: its `PATH` falls through td's `/bin` to
 the runtime's `/usr/bin` and td's glibc loads from the runtime there.
 Do not build, run or check td's control plane in a workspace that names
-a runtime (td-agent/DESIGN.md §8, Runtime). td has no `/usr`, which
+a Flathub runtime (td-agent/DESIGN.md §8, Runtime); `native-glibc`, td's
+own trees and glibc, is not one. td has no `/usr`, which
 the system recipe pins, so td-builder refuses to run on a system whose
 os-release says td and that has one (but for a few verbs that build,
 compile, link or check nothing, `affected-checks` among them, which
@@ -133,7 +134,9 @@ its `RUNPATH` resolve into the runtime there.
 
 The image asserts that a dynamic payload's `PT_INTERP` is absent from the
 image root, but this does not prove the bytes can execute only in a jail: an
-explicit store `ld.so` can load them, and static payloads have no interpreter.
+explicit store `ld.so` can load them, a `native-glibc` workspace names td's
+loader at that interpreter path inside its jail (`APPLICATIONS.md` §C), and
+static payloads have no interpreter.
 The claim is narrower and exact: no foreign application binary is a tool,
 compilation input, or execution input to a source-built output. td's supported
 run path puts applications behind td-owned namespace, seccomp, D-Bus, portal,

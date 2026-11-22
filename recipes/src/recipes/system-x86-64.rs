@@ -10970,6 +10970,15 @@ mod tests {
             "the image needs one runtime-closure step"
         );
         let (roots, dest) = closures.first().expect("one runtime closure");
+        // td-jail compiles in this libgcc_s.so.1 for a native-glibc sandbox's
+        // /lib; td's glibc arrives as every dynamic root's interpreter.
+        let libgcc = super::super::td_jail::NATIVE_LIBGCC;
+        assert!(
+            roots
+                .iter()
+                .any(|root| libgcc.starts_with(&format!("{root}/"))),
+            "td-jail's native-glibc libgcc {libgcc} must be in the image's runtime closure"
+        );
         let expected_roots = vec![
             "{in:uutils}".to_string(),
             "{in:ripgrep}".to_string(),

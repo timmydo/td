@@ -2200,8 +2200,11 @@ workspace launch SLOT development|isolated RUNTIME WORD...
 ```
 
 `NAME` is a ledger name (td-sandbox's old names that begin with a digit
-or a hyphen are not), `RUNTIME` `native` or a declared Flathub runtime's
-td name (`flathub_app::FLATHUB_RUNTIMES`), `TERM` a terminal type of
+or a hyphen are not), `RUNTIME` `native`, `native-glibc`
+(`flathub_app::NATIVE_GLIBC`, td's own trees with td's glibc at `/lib`
+and `/lib64`, which nothing installs; td-sandbox's alone, so `workspace
+launch` refuses it) or a declared Flathub runtime's td name
+(`flathub_app::FLATHUB_RUNTIMES`), `TERM` a terminal type of
 td-sandbox's relay grammar (1 to 64 ASCII letters, digits, `-`, `_`, `.`
 or `+`). A `run` word is `x` and its argument's UTF-8 bytes in lowercase
 hex, no NUL, at most 128 words, the first not empty, so any argument is
@@ -2266,7 +2269,9 @@ admitted launch root:
 
    `profile=development` where the network row is `host` and
    `development-offline` without one; `runtime` only for a declared
-   runtime; the entry `/bin/td-sandbox` resolved; the account's home. It
+   runtime or `native-glibc`, whose launch checks no store and whose
+   shell is td's as `native`'s is; the entry `/bin/td-sandbox`
+   resolved; the account's home. It
    names no directory of the human's: the account reaches those only
    through its manifest's views. A failure after the spec's creation
    removes it;

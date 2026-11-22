@@ -78,7 +78,7 @@ sandbox, so a lost record never costs a sandbox its files or grants.
   `unshare NAME PATH` revokes, taking a path that is gone, or the
   `~/PATH` form `inspect` shows.
 - `network NAME off|host` sets the network row.
-- `runtime NAME RUNTIME|native` changes the record alone.
+- `runtime NAME RUNTIME|native|native-glibc` changes the record alone.
 - `delete NAME` asks root to `delete`, then removes the record. Root
   refuses while a shell or command of the sandbox runs or its grants are
   being read or changed; the client's lock refuses while its own session
@@ -170,6 +170,20 @@ system no longer declares still inspects, clears to `native` and deletes.
 td-jail is the authority at launch: it refuses an undeclared name, and
 root refuses a runtime that is not installed before it answers.
 
+`td-sandbox runtime NAME native-glibc` instead keeps td's own trees and
+adds td's glibc where a program built for another glibc system looks
+for it: `/lib` holds a link to each of td glibc's versioned shared
+objects and to gcc-runtime's `libgcc_s.so.1`, and `/lib64` is a link to
+`/lib` (APPLICATIONS.md §C). Such a program, Claude Code's native build
+among them, then runs by name, its `/lib64/ld-linux-x86-64.so.2` being
+td's loader and its `libc.so.6` found in `/lib` by that loader's
+default search; no wrapper, explicit loader invocation or ELF rewrite
+is involved. Nothing is installed, so root checks no store for it. It
+grants nothing `native` does not: a native sandbox may already run any
+such program by naming td's store loader. What it does not supply is a
+library td does not build, `libstdc++` among them, or a `/usr`.
+`native` stays the plain choice, without these links.
+
 The jail binds the runtime store's `current` tree read-only at `/usr`,
 with `/lib` and `/lib64` links into it, and takes the runtime's
 `ld.so.cache`, `ld.so.conf` and `ld.so.conf.d` into `/etc` in place of the
@@ -196,8 +210,8 @@ the application kind's D-Bus, portal and Wayland boundaries
 (APPLICATIONS.md §C). The launch holds that generation until it ends
 (WORKLOADS.md, "Runtimes").
 
-`td-sandbox runtimes` lists `native` and the compiled Flathub runtime
-names with their exact refs, without reading a home, contacting root or
+`td-sandbox runtimes` lists `native`, `native-glibc` and the compiled
+Flathub runtime names with their exact refs, without reading a home, contacting root or
 changing state. It lists supported choices, not installed payloads, and
 points to td-software to install them.
 

@@ -212,6 +212,9 @@ const RUNTIME_ALIASES: &[(&str, &str)] = &[
 const WORKSPACE_RUNTIME_ALIASES: &[(&str, &str)] = &[("lib", "/usr/lib"), ("lib64", "/usr/lib64")];
 const WORKSPACE_RUNTIME_TOOLS: &[(&str, &str)] =
     &[("sh", "/usr/bin/bash"), ("curl", "/usr/bin/curl")];
+/// `native-glibc`'s `/lib64`: the same links as `/lib`, so a foreign
+/// program's `/lib64/ld-linux-x86-64.so.2` is td's glibc loader.
+const NATIVE_LIB64_TARGET: &str = "/lib";
 
 /// A workspace's runtime supplies the loader's files in place of the
 /// host's, and nothing else of its `/etc`.
@@ -481,6 +484,9 @@ pub struct Stage2Workspace {
     /// A runtime is bound at `/usr`, in place of the host's `/usr`, `/lib` and
     /// `/lib64`.
     runtime: bool,
+    /// `native-glibc`: td's glibc ABI at `/lib` and `/lib64`, in place of
+    /// the host's.
+    native: bool,
     programs: Vec<String>,
     aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
@@ -7083,6 +7089,8 @@ fn stage2_workspace_arguments(
         }),
         OsString::from(if plan.runtime.is_some() {
             "runtime"
+        } else if plan.native_abi.is_some() {
+            crate::flathub_app::NATIVE_GLIBC
         } else {
             "native"
         }),
@@ -7175,9 +7183,10 @@ where
         Some("ephemeral") => false,
         _ => return Err(usage_error()),
     };
-    let runtime = match args.next().as_deref().and_then(OsStr::to_str) {
-        Some("runtime") => true,
-        Some("native") => false,
+    let (runtime, native) = match args.next().as_deref().and_then(OsStr::to_str) {
+        Some("runtime") => (true, false),
+        Some("native") => (false, false),
+        Some(word) if word == crate::flathub_app::NATIVE_GLIBC => (false, true),
         _ => return Err(usage_error()),
     };
     expect(STAGE2_PROGRAMS_ARG, args)?;
@@ -7210,7 +7219,7 @@ where
             .into_string()
             .map_err(|_| usage_error())?;
         let source = tree(args.next())?;
-        workspace::refuse_runtime_tree("PATH alias source", &source, runtime)?;
+        workspace::refuse_replaced_tree("PATH alias source", &source, runtime, native)?;
         let alias = crate::host_path::Alias { name, source };
         workspace::admit_alias(&alias)?;
         if aliases.iter().any(|known| known.name == alias.name) {
@@ -7228,7 +7237,7 @@ where
         let directory = PathBuf::from(args.next().ok_or_else(usage_error)?);
         if !workspace::path_directory_named(&directory)
             || path.contains(&directory)
-            || (runtime && workspace::in_runtime_tree(&directory))
+            || workspace::in_replaced_tree(&directory, runtime, native)
         {
             return Err(usage_error());
         }
@@ -7325,6 +7334,7 @@ where
         development,
         persistent,
         runtime,
+        native,
         programs,
         aliases,
         path,
@@ -7429,16 +7439,19 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         let Ok(resolved) = fs::canonicalize(&host) else {
             continue;
         };
-        if in_system_tree(&resolved, plan.runtime.is_some()) {
+        if in_system_tree(&resolved, plan.runtime.is_some(), plan.native_abi.is_some()) {
             let target = format!("{NEW_ROOT}/run/{name}");
             refresh_workspace_run_link(Path::new(&target), &resolved)?;
         }
     }
     for name in workspace::SYSTEM_TREES {
-        if !bind_workspace_system_tree(name, plan.runtime.is_some()) {
+        if !bind_workspace_system_tree(name, plan.runtime.is_some(), plan.native_abi.is_some()) {
             continue;
         }
         bind_system_tree(name)?;
+    }
+    if let Some(abi) = &plan.native_abi {
+        install_native_abi(abi)?;
     }
     if !workspace::PROGRAM_TREES.iter().any(|name| {
         fs::symlink_metadata(format!("{NEW_ROOT}/{name}")).is_ok_and(|tree| tree.is_dir())
@@ -7480,8 +7493,77 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
     remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
 }
 
-fn bind_workspace_system_tree(name: &str, runtime: bool) -> bool {
-    !(runtime && (name == "bin" || workspace::RUNTIME_TREES.contains(&name)))
+fn bind_workspace_system_tree(name: &str, runtime: bool, native: bool) -> bool {
+    !((runtime && name == "bin") || workspace::replaced_trees(runtime, native).contains(&name))
+}
+
+/// `native-glibc`'s `/lib`, a directory of links to td's glibc shared
+/// objects and `libgcc_s.so.1`, and `/lib64`, a link to it, on the root
+/// before it becomes read-only.
+fn install_native_abi(abi: &workspace::NativeAbi) -> io::Result<()> {
+    install_native_lib(NEW_ROOT, &workspace::native_lib_links(abi)?)
+}
+
+/// `install_native_abi` below `base`, which holds no `lib` or `lib64`.
+fn install_native_lib(base: &str, links: &[(String, PathBuf)]) -> io::Result<()> {
+    let lib = crate::text(format_args!("{base}/lib"))?;
+    create_dir(&lib, 0o755)?;
+    for (name, target) in links {
+        symlink(
+            target,
+            workspace::joined(Path::new(&lib), OsStr::new(name))?,
+        )?;
+    }
+    symlink(
+        NATIVE_LIB64_TARGET,
+        crate::text(format_args!("{base}/lib64"))?,
+    )
+}
+
+/// Stage 2's check of `install_native_abi`: `/lib` is a directory of the
+/// root holding exactly the links the ABI derives, again, from td's glibc,
+/// and `/lib64` is the link to it. `require_planned_rows` refuses a mount
+/// at or below either.
+fn require_native_abi(abi: &workspace::NativeAbi) -> io::Result<()> {
+    require_native_lib("", &workspace::native_lib_links(abi)?)
+}
+
+/// `require_native_abi` of the tree below `base`, `""` for `/`.
+fn require_native_lib(base: &str, links: &[(String, PathBuf)]) -> io::Result<()> {
+    let lib = crate::text(format_args!("{base}/lib"))?;
+    let lib64 = crate::text(format_args!("{base}/lib64"))?;
+    let context =
+        |what: &str, e: io::Error| crate::error(e.kind(), format_args!("native-glibc {what}: {e}"));
+    if !fs::symlink_metadata(&lib)
+        .map_err(|e| context("/lib", e))?
+        .is_dir()
+        || fs::read_link(&lib64).map_err(|e| context("/lib64", e))?
+            != Path::new(NATIVE_LIB64_TARGET)
+    {
+        return Err(io::Error::other(
+            "native-glibc /lib or /lib64 is not the plan's",
+        ));
+    }
+    let present = read_dir_names(&lib)?;
+    if present.len() != links.len()
+        || links
+            .iter()
+            .any(|(name, _)| !present.contains(name.as_str()))
+    {
+        return Err(io::Error::other(
+            "native-glibc /lib does not hold exactly its planned links",
+        ));
+    }
+    for (name, target) in links {
+        let link = workspace::joined(Path::new(&lib), OsStr::new(name))?;
+        if fs::read_link(link).map_err(|e| context(name, e))? != *target {
+            return Err(crate::error(
+                io::ErrorKind::Other,
+                format_args!("native-glibc /lib/{name} is not its planned link"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // td's image provides a farm of links into its store. Recreate the farm
@@ -7557,34 +7639,33 @@ fn bind_system_tree(name: &str) -> io::Result<()> {
 }
 
 /// Whether `path` lies in a host system tree the plan binds: with a
-/// `runtime`, not in one the runtime replaces.
-fn in_system_tree(path: &Path, runtime: bool) -> bool {
+/// `runtime` or `native-glibc`, not in one it replaces.
+fn in_system_tree(path: &Path, runtime: bool, native: bool) -> bool {
     workspace::SYSTEM_TREES
         .iter()
         .any(|tree| path_is_same_or_child(path, &Path::new("/").join(tree)))
-        && !(runtime && workspace::in_runtime_tree(path))
+        && !workspace::in_replaced_tree(path, runtime, native)
 }
 
 /// What a host `/etc` link becomes in the jail: the host's own text when
 /// that already names a bound tree, since tools read a zone's name from
 /// `/etc/localtime`'s; else where it resolves when that is in one, since a
 /// chain through an unbound tree (NixOS's `/etc/static`) would dangle;
-/// else the host's text. With a `runtime`, none for a link that names or
-/// resolves into a tree it replaces, which would be the runtime's file.
-fn bound_link_target(host: &Path, runtime: bool) -> io::Result<Option<PathBuf>> {
+/// else the host's text. With a `runtime` or `native-glibc`, none for a
+/// link that names or resolves into a tree it replaces, which would be
+/// another file there.
+fn bound_link_target(host: &Path, runtime: bool, native: bool) -> io::Result<Option<PathBuf>> {
     let text = fs::read_link(host)?;
     let resolved = fs::canonicalize(host).ok();
-    if runtime
-        && (workspace::in_runtime_tree(&text)
-            || resolved.as_deref().is_some_and(workspace::in_runtime_tree))
-    {
+    let replaced = |path: &Path| workspace::in_replaced_tree(path, runtime, native);
+    if replaced(&text) || resolved.as_deref().is_some_and(replaced) {
         return Ok(None);
     }
-    if text.is_absolute() && in_system_tree(&text, runtime) {
+    if text.is_absolute() && in_system_tree(&text, runtime, native) {
         return Ok(Some(text));
     }
     match resolved {
-        Some(resolved) if in_system_tree(&resolved, runtime) => Ok(Some(resolved)),
+        Some(resolved) if in_system_tree(&resolved, runtime, native) => Ok(Some(resolved)),
         _ => Ok(Some(text)),
     }
 }
@@ -7616,8 +7697,11 @@ fn prepare_workspace_etc(plan: &WorkspacePlan, identity: Identity) -> io::Result
         create_file(&etc.join(name), contents.as_bytes(), 0o444)?;
     }
     for name in workspace::HOST_ETC {
-        // The runtime's loader files, below, not the host's.
-        if plan.runtime.is_some() && WORKSPACE_RUNTIME_ETC.allowlist.contains(name) {
+        // The runtime's loader files, below, not the host's; td's glibc
+        // ABI takes none, since the host's would describe the host's /lib.
+        if (plan.runtime.is_some() || plan.native_abi.is_some())
+            && WORKSPACE_RUNTIME_ETC.allowlist.contains(name)
+        {
             continue;
         }
         let host = Path::new("/etc").join(name);
@@ -7626,7 +7710,9 @@ fn prepare_workspace_etc(plan: &WorkspacePlan, identity: Identity) -> io::Result
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                if let Some(link) = bound_link_target(&host, plan.runtime.is_some())? {
+                if let Some(link) =
+                    bound_link_target(&host, plan.runtime.is_some(), plan.native_abi.is_some())?
+                {
                     symlink(link, &target)?;
                 }
             }
@@ -7763,6 +7849,15 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
     if let Some(missing) = fixed.difference(&present).next() {
         return Err(io::Error::other(format!("workspace root lacks /{missing}")));
     }
+    if plan.native
+        && !workspace::NATIVE_ABI_TREES
+            .iter()
+            .all(|tree| present.contains(*tree))
+    {
+        return Err(io::Error::other(
+            "native-glibc workspace root lacks /lib or /lib64",
+        ));
+    }
     if let Some(stray) = present
         .difference(&fixed)
         .find(|name| !workspace::SYSTEM_TREES.contains(&name.as_str()))
@@ -7775,7 +7870,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
     require_planned_rows(plan, &mountinfo)?;
     let mut programs = false;
     for name in workspace::SYSTEM_TREES {
-        if !bind_workspace_system_tree(name, plan.runtime) {
+        if !bind_workspace_system_tree(name, plan.runtime, plan.native) {
             continue;
         }
         let path = format!("/{name}");
@@ -7820,6 +7915,9 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             require_runtime_tool(Path::new(target))?;
         }
     }
+    if plan.native {
+        require_native_abi(&workspace::native_abi()?)?;
+    }
     for name in if plan.persistent {
         BTreeSet::new()
     } else {
@@ -7849,6 +7947,9 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             Path::new(RUNTIME_ROOT),
             &WORKSPACE_RUNTIME_ETC,
         )?)
+    } else if plan.native {
+        // td's glibc ABI takes no loader files, the host's included.
+        Some(Vec::new())
     } else {
         None
     };
@@ -8205,7 +8306,7 @@ fn require_planned_rows(plan: &Stage2Workspace, mountinfo: &str) -> io::Result<(
     planned.extend(
         workspace::SYSTEM_TREES
             .iter()
-            .filter(|name| bind_workspace_system_tree(name, plan.runtime))
+            .filter(|name| bind_workspace_system_tree(name, plan.runtime, plan.native))
             .map(|name| Path::new("/").join(name)),
     );
     planned.extend(plan.trees().map(Path::to_path_buf));
@@ -8365,6 +8466,7 @@ mod tests {
             development: false,
             persistent: false,
             runtime: false,
+            native: false,
             programs: vec!["a".into()],
             aliases: Vec::new(),
             path: Vec::new(),
@@ -8413,7 +8515,7 @@ mod tests {
             source_device: 1,
             source_inode: 2,
         };
-        let plan = WorkspacePlan {
+        let mut plan = WorkspacePlan {
             development: false,
             shared_network: false,
             scratch: Vec::new(),
@@ -8452,6 +8554,7 @@ mod tests {
             shared: vec![grant("/d", true), grant("/e", false)],
             arguments: vec!["tool-host".into(), "--root".into()],
             runtime: None,
+            native_abi: None,
             intake: false,
         };
         let identity = Identity {
@@ -8466,9 +8569,45 @@ mod tests {
             },
             &plan,
         );
-        let mut rest = arguments.into_iter().skip(7);
+        let mut rest = arguments.clone().into_iter().skip(7);
         let parsed = parse_stage2_workspace(&mut rest).unwrap();
         assert!(!parsed.runtime);
+        assert!(!parsed.native);
+        // `native-glibc` is the runtime word's third value, and admits no
+        // path directory in the trees it replaces.
+        let native_word = |path: &str| -> Vec<OsString> {
+            arguments
+                .iter()
+                .skip(7)
+                .map(|word| match word.to_str() {
+                    Some("native") => OsString::from("native-glibc"),
+                    Some("/gnu/store/x-profile/bin") => OsString::from(path),
+                    _ => word.clone(),
+                })
+                .collect()
+        };
+        let native =
+            parse_stage2_workspace(&mut native_word("/td/store/x/bin").into_iter()).unwrap();
+        assert!(native.native && !native.runtime);
+        assert!(parse_stage2_workspace(&mut native_word("/lib64/x").into_iter()).is_err());
+        // Stage 1 says `native-glibc` exactly when the plan carries td's ABI.
+        plan.native_abi = Some(workspace::NativeAbi {
+            glibc_lib: "/td/store/g/lib",
+            libgcc: "/td/store/c/lib/libgcc_s.so.1",
+        });
+        let emitted = stage2_workspace_arguments(
+            &[7; TOKEN_LEN],
+            LaunchIdentityMap {
+                inside: identity,
+                outside: identity,
+            },
+            &plan,
+        );
+        assert!(emitted.iter().any(|word| word == "native-glibc"));
+        assert!(!emitted.iter().any(|word| word == "native"));
+        let emitted = parse_stage2_workspace(&mut emitted.into_iter().skip(7)).unwrap();
+        assert!(emitted.native && !emitted.runtime);
+        plan.native_abi = None;
         assert_eq!(parsed.programs, ["td-agent", "td-txt"]);
         assert_eq!(parsed.path, [PathBuf::from("/gnu/store/x-profile/bin")]);
         assert_eq!(
@@ -8604,10 +8743,11 @@ mod tests {
     /// workspace's scaffold carries no application alias.
     #[test]
     fn a_workspace_runtime_is_one_mount_and_its_trees_hold_no_host_link() {
-        let plan = |runtime| Stage2Workspace {
+        let plan_of = |runtime, native| Stage2Workspace {
             development: false,
             persistent: false,
             runtime,
+            native,
             programs: vec!["a".into()],
             aliases: Vec::new(),
             path: Vec::new(),
@@ -8619,6 +8759,7 @@ mod tests {
             working_directory: "/h".into(),
             arguments: Vec::new(),
         };
+        let plan = |runtime| plan_of(runtime, false);
         let row =
             |id: u32, point: &str| format!("{id} 1 0:1 / {point} ro,nosuid - ext4 /dev/a ro\n");
         let base = [
@@ -8630,6 +8771,7 @@ mod tests {
         .concat();
         assert!(require_planned_rows(&plan(false), &base).is_ok());
         assert!(require_planned_rows(&plan(true), &base).is_ok());
+        assert!(require_planned_rows(&plan_of(false, true), &base).is_ok());
         // Below the runtime's tree, or at a replaced tree's link: the
         // host's own trees may carry mounts, a runtime's carries none.
         for stray in [
@@ -8643,6 +8785,13 @@ mod tests {
             let rows = [base.clone(), row(9, stray)].concat();
             assert!(require_planned_rows(&plan(false), &rows).is_ok(), "{stray}");
             assert!(require_planned_rows(&plan(true), &rows).is_err(), "{stray}");
+            // td's glibc ABI's /lib, a directory, and /lib64, a link, lie on
+            // the root and carry no mount; the host's other trees may.
+            assert_eq!(
+                require_planned_rows(&plan_of(false, true), &rows).is_err(),
+                stray.starts_with("/lib"),
+                "{stray}"
+            );
         }
 
         // A non-application plan's root takes no application alias.
@@ -8659,18 +8808,105 @@ mod tests {
         symlink("/usr/share/zoneinfo/UTC", &into_usr).unwrap();
         let into_td = directory.join("into-td");
         symlink("/td/store/x-tzdata/share/zoneinfo/UTC", &into_td).unwrap();
+        let into_lib = directory.join("into-lib");
+        symlink("/lib/x86_64-linux-gnu/libc.so.6", &into_lib).unwrap();
         assert_eq!(
-            bound_link_target(&into_usr, false).unwrap(),
+            bound_link_target(&into_usr, false, false).unwrap(),
             Some(PathBuf::from("/usr/share/zoneinfo/UTC"))
         );
-        assert_eq!(bound_link_target(&into_usr, true).unwrap(), None);
+        assert_eq!(bound_link_target(&into_usr, true, false).unwrap(), None);
         assert_eq!(
-            bound_link_target(&into_td, true).unwrap(),
+            bound_link_target(&into_td, true, false).unwrap(),
             Some(PathBuf::from("/td/store/x-tzdata/share/zoneinfo/UTC"))
         );
-        assert!(in_system_tree(Path::new("/usr/bin"), false));
-        assert!(!in_system_tree(Path::new("/usr/bin"), true));
-        assert!(in_system_tree(Path::new("/td/store"), true));
+        // td's glibc ABI keeps the host's /usr and replaces its /lib.
+        assert_eq!(
+            bound_link_target(&into_usr, false, true).unwrap(),
+            Some(PathBuf::from("/usr/share/zoneinfo/UTC"))
+        );
+        assert_eq!(bound_link_target(&into_lib, false, true).unwrap(), None);
+        assert!(in_system_tree(Path::new("/usr/bin"), false, false));
+        assert!(!in_system_tree(Path::new("/usr/bin"), true, false));
+        assert!(in_system_tree(Path::new("/usr/bin"), false, true));
+        assert!(!in_system_tree(Path::new("/lib64/x"), false, true));
+        assert!(in_system_tree(Path::new("/td/store"), true, false));
+        assert!(in_system_tree(Path::new("/td/store"), false, true));
+    }
+
+    /// td's glibc ABI binds neither of the host's loader trees; a runtime
+    /// also takes `/usr` and builds `/bin`; plain native binds them all.
+    #[test]
+    fn native_glibc_replaces_lib_and_lib64_alone() {
+        for name in workspace::SYSTEM_TREES {
+            let native = bind_workspace_system_tree(name, false, true);
+            assert_eq!(native, !["lib", "lib64"].contains(name), "{name}");
+            assert!(bind_workspace_system_tree(name, false, false), "{name}");
+        }
+        assert_eq!(NATIVE_LIB64_TARGET, "/lib");
+        // Its /etc takes no loader file, the host's included.
+        for name in WORKSPACE_RUNTIME_ETC.allowlist {
+            assert!(!workspace_etc_name(name, false, Some(&[])), "{name}");
+            assert!(workspace_etc_name(name, false, None), "{name}");
+        }
+    }
+
+    /// Stage 2 accepts exactly what stage 1 installs, and refuses a /lib
+    /// that gained, lost or re-pointed a link, or a /lib64 elsewhere.
+    #[test]
+    fn stage_two_accepts_the_native_lib_stage_one_installs_and_nothing_else() {
+        let temp = td_fs::TempDir::new("native-lib").unwrap();
+        let links = vec![
+            (
+                "ld-linux-x86-64.so.2".to_string(),
+                PathBuf::from("/td/store/g/lib/ld-linux-x86-64.so.2"),
+            ),
+            (
+                "libc.so.6".to_string(),
+                PathBuf::from("/td/store/g/lib/libc.so.6"),
+            ),
+        ];
+        let fresh = |name: &str| {
+            let base = temp.join(name);
+            fs::create_dir(&base).unwrap();
+            let base = base.to_str().unwrap().to_string();
+            install_native_lib(&base, &links).unwrap();
+            base
+        };
+        let base = fresh("good");
+        require_native_lib(&base, &links).unwrap();
+        assert_eq!(
+            fs::read_link(format!("{base}/lib/libc.so.6")).unwrap(),
+            Path::new("/td/store/g/lib/libc.so.6")
+        );
+        assert!(require_native_lib(&base, links.get(..1).unwrap()).is_err());
+
+        let base = fresh("extra");
+        symlink("/td/store/x", format!("{base}/lib/libx.so.1")).unwrap();
+        assert!(require_native_lib(&base, &links).is_err());
+
+        let base = fresh("repointed");
+        fs::remove_file(format!("{base}/lib/libc.so.6")).unwrap();
+        symlink("/elsewhere/libc.so.6", format!("{base}/lib/libc.so.6")).unwrap();
+        assert!(require_native_lib(&base, &links).is_err());
+
+        let base = fresh("lost");
+        fs::remove_file(format!("{base}/lib/libc.so.6")).unwrap();
+        assert!(require_native_lib(&base, &links).is_err());
+
+        // The right count, one name swapped for another.
+        let base = fresh("swapped");
+        fs::remove_file(format!("{base}/lib/libc.so.6")).unwrap();
+        symlink("/td/store/g/lib/libc.so.6", format!("{base}/lib/libc.so.7")).unwrap();
+        assert!(require_native_lib(&base, &links).is_err());
+
+        let base = fresh("lib64");
+        fs::remove_file(format!("{base}/lib64")).unwrap();
+        symlink("/usr/lib", format!("{base}/lib64")).unwrap();
+        assert!(require_native_lib(&base, &links).is_err());
+
+        let base = temp.join("empty");
+        fs::create_dir(&base).unwrap();
+        assert!(require_native_lib(base.to_str().unwrap(), &links).is_err());
     }
 
     #[test]
