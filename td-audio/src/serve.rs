@@ -97,6 +97,41 @@ pub enum Role {
     /// An application account: only its own streams. Another connection's
     /// sink inputs are absent, never merely forbidden.
     Player,
+    /// The compositor's account, for the volume keys and the bar: the
+    /// output's real level and mute, and the events that change them, and
+    /// nothing else. Another connection's streams are as absent to it as to
+    /// a player, and it plays none of its own.
+    Output,
+}
+
+impl Role {
+    /// Whether this role sees the output's real level and mute and may set
+    /// them. Exhaustive, so a new role decides rather than inherits.
+    fn controls_output(self) -> bool {
+        match self {
+            Self::Controller | Self::Output => true,
+            Self::Player => false,
+        }
+    }
+
+    /// Whether this role may create playback streams. The compositor plays
+    /// nothing, so a stream under a name it chose never reaches a
+    /// controller's list or an application's summary.
+    fn plays(self) -> bool {
+        match self {
+            Self::Controller | Self::Player => true,
+            Self::Output => false,
+        }
+    }
+
+    /// Whether a peer in this role hears another connection's event.
+    fn hears(self, event: u32) -> bool {
+        match self {
+            Self::Controller => true,
+            Self::Output => event & subscription::EVENT_FACILITY_MASK == subscription::EVENT_SINK,
+            Self::Player => false,
+        }
+    }
 }
 
 /// Who may connect.
@@ -107,6 +142,8 @@ pub struct Policy {
     /// account. Asked on each admission, so an account the ledger gains
     /// after the daemon started is admitted without a restart.
     applications: Option<crate::app_policy::Policy>,
+    /// The compositor's account, admitted in the `Output` role.
+    output_uid: Option<u32>,
 }
 
 impl Policy {
@@ -124,7 +161,14 @@ impl Policy {
         Self {
             allowed_uids,
             applications: None,
+            output_uid: None,
         }
+    }
+
+    /// Admit `uid` in the `Output` role, unless it already has another.
+    pub fn with_output_uid(mut self, uid: u32) -> Self {
+        self.output_uid = Some(uid);
+        self
     }
 
     pub fn for_deployment(own: u32) -> io::Result<Self> {
@@ -162,14 +206,14 @@ impl Policy {
             .map(|rule| rule.uid)
     }
 
-    /// Every uid admitted now: the fixed pair and the browser's account.
+    /// Every uid admitted now: the fixed pair, the browser's account and
+    /// the compositor's.
     pub fn permitted(&self) -> Vec<u32> {
         let mut uids = self.allowed_uids.clone();
-        if let Some(uid) = self
-            .browser()
-            .filter(|uid| !self.allowed_uids.contains(uid))
-        {
-            uids.push(uid);
+        for uid in [self.browser(), self.output_uid].into_iter().flatten() {
+            if !uids.contains(&uid) {
+                uids.push(uid);
+            }
         }
         uids
     }
@@ -183,9 +227,10 @@ impl Policy {
         if self.browser() == Some(peer.uid) {
             return Some(Role::Player);
         }
-        self.allowed_uids
-            .contains(&peer.uid)
-            .then_some(Role::Controller)
+        if self.allowed_uids.contains(&peer.uid) {
+            return Some(Role::Controller);
+        }
+        (self.output_uid == Some(peer.uid)).then_some(Role::Output)
     }
 
     /// Why a peer was refused, in words a log line can carry. §K.5 asks for a
@@ -646,8 +691,10 @@ impl<S: AudioSink> Server<S> {
             self.refused = self.refused.saturating_add(1);
             return;
         };
-        let mut session =
-            Session::new(self.spec, index).with_controller_role(role == Role::Controller);
+        let mut session = Session::new(self.spec, index)
+            .with_controller_role(role == Role::Controller)
+            .with_output_control(role.controls_output())
+            .with_playback(role.plays());
         if role == Role::Player {
             // The role and the name come from the same policy row: the only
             // player today is the browser's account.
@@ -687,17 +734,18 @@ impl<S: AudioSink> Server<S> {
             }
         }
         for (origin, event, index) in events {
-            self.notify_controllers(Some(origin), event, index);
+            self.notify_others(Some(origin), event, index);
         }
     }
 
-    /// The one fan-out of another connection's sink-input or sink event. Only
-    /// controllers hear it: a player learns of no stream but its own, whose
-    /// events its session already delivered locally, and of no change to the
-    /// output, which in its view never changes.
-    fn notify_controllers(&mut self, origin: Option<usize>, event: u32, index: u32) {
+    /// The one fan-out of another connection's sink-input or sink event, to
+    /// whoever `Role::hears` it: a controller hears both, the compositor the
+    /// output's alone, and a player neither. A player learns of no stream but
+    /// its own, whose events its session already delivered locally, and of
+    /// no change to the output, which in its view never changes.
+    fn notify_others(&mut self, origin: Option<usize>, event: u32, index: u32) {
         for (recipient, client) in self.clients.iter_mut().enumerate() {
-            if Some(recipient) != origin && client.role == Role::Controller {
+            if Some(recipient) != origin && client.role.hears(event) {
                 client.session.notify_global(event, index);
             }
         }
@@ -926,7 +974,7 @@ impl<S: AudioSink> Server<S> {
                 _ => continue,
             };
             for index in indexes {
-                self.notify_controllers(
+                self.notify_others(
                     None,
                     subscription::EVENT_SINK_INPUT | subscription::EVENT_CHANGE,
                     index,
@@ -1210,7 +1258,7 @@ impl<S: AudioSink> Server<S> {
             // where it set it — so the event announcing it is relayed before
             // the client goes, not discarded with it.
             for (event, sink_index) in removed.session.take_global_events() {
-                self.notify_controllers(None, event, sink_index);
+                self.notify_others(None, event, sink_index);
             }
             removed_sink_inputs.extend(removed.session.sink_input_indexes());
             self.disconnected = self.disconnected.saturating_add(1);
@@ -1221,7 +1269,7 @@ impl<S: AudioSink> Server<S> {
         // is a separate table, reconciled here against the sessions that remain.
         self.forget_orphaned_streams();
         for index in removed_sink_inputs {
-            self.notify_controllers(
+            self.notify_others(
                 None,
                 subscription::EVENT_SINK_INPUT | subscription::EVENT_REMOVE,
                 index,
@@ -2757,6 +2805,184 @@ pub(crate) mod tests {
         }
     }
 
+    /// The compositor's uid is admitted only when the unit names it, and in
+    /// the `Output` role alone: the browser's account and a controller uid
+    /// keep their own roles if named, and nobody else is admitted by it.
+    #[test]
+    fn the_compositor_is_admitted_to_the_output_alone() {
+        let peer = |uid| sys::Peer {
+            pid: 1,
+            uid,
+            gid: uid,
+        };
+        let policy = browser_policy(994).with_output_uid(993);
+        assert_eq!(policy.role(&peer(993)), Some(Role::Output));
+        assert_eq!(policy.permitted(), [994, 1000, 65536, 993]);
+        for uid in [0, 992, 995, 1001] {
+            assert_eq!(policy.role(&peer(uid)), None, "{uid}");
+        }
+        let named_browser = browser_policy(994).with_output_uid(BROWSER_UID);
+        assert_eq!(named_browser.role(&peer(BROWSER_UID)), Some(Role::Player));
+        assert_eq!(named_browser.permitted(), [994, 1000, 65536]);
+        let named_seat = browser_policy(994).with_output_uid(SEAT_UID);
+        assert_eq!(named_seat.role(&peer(SEAT_UID)), Some(Role::Controller));
+    }
+
+    /// The compositor sees and sets the output's real level and mute, and
+    /// hears the output change whoever changed it. It hears nothing of
+    /// another connection's streams, cannot list them or their clients, an
+    /// index it names that belongs to one answers as if nobody held it, and
+    /// it cannot play a stream of its own. A player hears nothing of what the
+    /// compositor sets and still sees the output at unity.
+    #[test]
+    fn the_compositor_sets_and_hears_the_output_and_nothing_else() {
+        const COMPOSITOR_UID: u32 = 993;
+        let (mut server, path) = server("compositor");
+        server.policy = browser_policy(own_uid()).with_output_uid(COMPOSITOR_UID);
+        let mut compositor = admit_as(&mut server, COMPOSITOR_UID, 8);
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut controller = UnixStream::connect(&path).unwrap();
+        for socket in [&mut compositor, &mut player, &mut controller] {
+            socket.write_all(&auth_packet()).unwrap();
+        }
+        server.pass().unwrap();
+        // Both subscribe to everything, so what each does not hear is the
+        // fan-out's choice and not a missing subscription.
+        for socket in [&mut compositor, &mut player] {
+            socket
+                .write_all(&build(command::SUBSCRIBE, 2, |writer| {
+                    writer.u32(subscription::MASK_ALL);
+                }))
+                .unwrap();
+        }
+        server.pass().unwrap();
+        for socket in [&mut compositor, &mut player, &mut controller] {
+            let _ = drain_socket(socket);
+        }
+
+        // Another connection's stream: created and changed, unheard.
+        player.write_all(&named_create_request(3, "a tab")).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let tab = created_sink_input(&drain_socket(&mut player)).unwrap();
+        controller
+            .write_all(&build(command::SET_SINK_INPUT_MUTE, 3, |writer| {
+                writer.u32(tab).boolean(true);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let _ = drain_socket(&mut controller);
+        assert_eq!(
+            subscription_events(&drain_socket(&mut compositor)),
+            Vec::new()
+        );
+
+        // The output: set by the compositor, read back, and heard when a
+        // controller changes it.
+        let half = crate::mixer::VOLUME_NORM / 2;
+        let mut writes = build(command::SET_SINK_VOLUME, 4, |writer| {
+            writer.u32(0).null_string().cvolume(&[half, half]);
+        });
+        writes.extend(build(command::GET_SINK_INFO, 5, |writer| {
+            writer.u32(0).null_string();
+        }));
+        compositor.write_all(&writes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let answers = drain_socket(&mut compositor);
+        assert_eq!(error_code(&answers, 4), None);
+        assert_eq!(
+            reported_output(&reply_packet(&answers, 5).unwrap()),
+            (vec![half, half], false)
+        );
+        let change = (subscription::EVENT_SINK | subscription::EVENT_CHANGE, 0);
+        assert_eq!(subscription_events(&answers), vec![change]);
+        assert_eq!(server.mixer.master_volume(), half);
+        player
+            .write_all(&build(command::GET_SINK_INFO, 20, |writer| {
+                writer.u32(0).null_string();
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let seen = drain_socket(&mut player);
+        assert_eq!(subscription_events(&seen), Vec::new());
+        let norm = crate::mixer::VOLUME_NORM;
+        assert_eq!(
+            reported_output(&reply_packet(&seen, 20).unwrap()),
+            (vec![norm, norm], false)
+        );
+        controller
+            .write_all(&build(command::SET_SINK_MUTE, 6, |writer| {
+                writer.u32(0).null_string().boolean(true);
+            }))
+            .unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert_eq!(
+            subscription_events(&drain_socket(&mut compositor)),
+            vec![change]
+        );
+
+        // Lists are commands it does not have; streams are nobody's.
+        let mut probes = build(command::GET_SINK_INPUT_INFO_LIST, 10, |_| {});
+        probes.extend(build(command::GET_CLIENT_INFO_LIST, 11, |_| {}));
+        probes.extend(build(command::GET_SINK_INPUT_INFO, 12, |writer| {
+            writer.u32(tab);
+        }));
+        probes.extend(build(command::SET_SINK_INPUT_MUTE, 13, |writer| {
+            writer.u32(tab).boolean(false);
+        }));
+        probes.extend(build(command::GET_CLIENT_INFO, 14, |writer| {
+            writer.u32(0);
+        }));
+        probes.extend(named_create_request(15, "a chime"));
+        compositor.write_all(&probes).unwrap();
+        server.pass().unwrap();
+        server.pass().unwrap();
+        let answers = drain_socket(&mut compositor);
+        for probe in [10, 11, 14, 15] {
+            assert_eq!(
+                error_code(&answers, probe),
+                Some(crate::proto::error::NOTIMPLEMENTED),
+                "{probe}"
+            );
+        }
+        for probe in [12, 13] {
+            assert_eq!(
+                error_code(&answers, probe),
+                Some(crate::proto::error::NOENTITY),
+                "{probe}"
+            );
+        }
+        let app = server
+            .clients
+            .iter()
+            .find(|client| client.role == Role::Player)
+            .map(|client| client.session.app_level());
+        assert_eq!(
+            app,
+            Some((crate::mixer::VOLUME_NORM, true)),
+            "the human's mute stands"
+        );
+        assert_eq!(
+            server.mixer.stream_count(),
+            1,
+            "the compositor plays nothing"
+        );
+
+        // The player's departure removes a stream the compositor never
+        // heard of, so it hears nothing of that either.
+        drop(player);
+        server.pass().unwrap();
+        server.pass().unwrap();
+        assert_eq!(
+            subscription_events(&drain_socket(&mut compositor)),
+            Vec::new()
+        );
+    }
+
     /// A controller whose one read holds a valid sink write and then a frame
     /// that breaks its schema is dropped in that pass. The level it set
     /// outlives it, so the event announcing the level must too.
@@ -3041,6 +3267,7 @@ pub(crate) mod tests {
         server.policy = Policy {
             allowed_uids: Vec::new(),
             applications: None,
+            output_uid: None,
         };
         let _late = UnixStream::connect(&path).unwrap();
         server.pass().unwrap();
@@ -3473,7 +3700,7 @@ pub(crate) mod tests {
         assert_eq!(role(1000), Some(Role::Controller), "the seat user");
         assert_eq!(role(65536), Some(Role::Player), "the browser account");
         assert_eq!(role(65537), None, "an application without audio");
-        assert_eq!(role(993), None, "the compositor is not yet admitted");
+        assert_eq!(role(993), None, "the compositor, unless the unit names it");
         for uid in [994, 1000, 65536] {
             assert!(admits(
                 &policy,
@@ -3753,6 +3980,7 @@ pub(crate) mod tests {
             Policy {
                 allowed_uids: Vec::new(),
                 applications: None,
+                output_uid: None,
             },
         )
         .unwrap();

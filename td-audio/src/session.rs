@@ -318,12 +318,21 @@ pub struct Session {
     next_channel: u64,
     client_index: u32,
     subscribed: u32,
-    /// Whether this connection is a controller (§K.5): it may set and see the
-    /// output's level and mute, and list every stream and client. Set by the
-    /// daemon from the role fixed at accept; false is the player's view, in
-    /// which the sink is always at unity and unmuted, and a sink write or a
-    /// list is a command this server does not have.
+    /// Whether this connection is a controller (§K.5): it may list every
+    /// stream and client and reach other connections' streams. Set by the
+    /// daemon from the role fixed at accept; false is the player's and the
+    /// compositor's view, in which a list is a command this server does not
+    /// have.
     controller: bool,
+    /// Whether this connection sees the output's real level and mute and may
+    /// set them: a controller's, or the compositor's, which may do no more.
+    /// False is the player's view, in which the sink is always at unity and
+    /// unmuted, and a sink write is a command this server does not have.
+    output: bool,
+    /// Whether this connection may create playback streams; false for the
+    /// compositor, to which stream creation is a command this server does
+    /// not have.
+    playback: bool,
     /// The application name controllers are shown for this connection. A
     /// player's is the daemon's, from its uid's application policy row, and
     /// fixed: the `application.name` it sends is a claim, not an identity. A
@@ -360,6 +369,8 @@ impl Session {
             client_index,
             subscribed: 0,
             controller: false,
+            output: false,
+            playback: true,
             sent_application: String::new(),
             fixed_application: None,
             app_level: (VOLUME_NORM, false),
@@ -371,10 +382,24 @@ impl Session {
         }
     }
 
-    /// A controller's session: it may set and see the output's level and
-    /// mute, and list every stream and client.
+    /// A controller's session: it may list every stream and client, and
+    /// sees its own streams the way it sees every stream.
     pub fn with_controller_role(mut self, controller: bool) -> Self {
         self.controller = controller;
+        self
+    }
+
+    /// A session that may set and see the output's real level and mute: a
+    /// controller's, or the compositor's.
+    pub fn with_output_control(mut self, output: bool) -> Self {
+        self.output = output;
+        self
+    }
+
+    /// A session that may create playback streams: every one but the
+    /// compositor's.
+    pub fn with_playback(mut self, playback: bool) -> Self {
+        self.playback = playback;
         self
     }
 
@@ -910,7 +935,9 @@ impl Session {
             command::GET_SOURCE_INFO_LIST => self.source_info_list(reader, tag),
             command::GET_SINK_INPUT_INFO => self.sink_input_info(reader, tag, version, mixer),
             command::SUBSCRIBE => self.subscribe(reader, tag),
-            command::CREATE_PLAYBACK_STREAM => self.create_stream(reader, tag, version, mixer),
+            command::CREATE_PLAYBACK_STREAM if self.playback => {
+                self.create_stream(reader, tag, version, mixer)
+            }
             command::DELETE_PLAYBACK_STREAM => self.delete_stream(reader, tag, mixer),
             command::CORK_PLAYBACK_STREAM => self.cork(reader, tag, mixer),
             command::FLUSH_PLAYBACK_STREAM => self.flush(reader, tag, mixer),
@@ -920,8 +947,8 @@ impl Session {
             command::GET_PLAYBACK_LATENCY => self.latency(reader, tag, version, mixer),
             command::SET_SINK_INPUT_VOLUME => self.set_volume(reader, tag, mixer),
             command::SET_SINK_INPUT_MUTE => self.set_mute(reader, tag, mixer),
-            command::SET_SINK_VOLUME if self.controller => self.set_sink_volume(reader, tag, mixer),
-            command::SET_SINK_MUTE if self.controller => self.set_sink_mute(reader, tag, mixer),
+            command::SET_SINK_VOLUME if self.output => self.set_sink_volume(reader, tag, mixer),
+            command::SET_SINK_MUTE if self.output => self.set_sink_mute(reader, tag, mixer),
             command::GET_SINK_INPUT_INFO_LIST if self.controller => {
                 reader.finish().map_err(Disconnect::Schema)?;
                 self.route(GlobalRequest::SinkInputList { tag, version });
@@ -1751,7 +1778,7 @@ impl Session {
         Ok(())
     }
 
-    /// `SET_SINK_VOLUME` from a controller: the selector `GET_SINK_INFO`
+    /// `SET_SINK_VOLUME` from a controller or the compositor: the selector `GET_SINK_INFO`
     /// takes, then a cvolume. One level for the output, the loudest channel's,
     /// as a stream's is.
     fn set_sink_volume(
@@ -1793,7 +1820,8 @@ impl Session {
         }
     }
 
-    /// `SET_SINK_MUTE` from a controller: the same selector, then a boolean.
+    /// `SET_SINK_MUTE` from a controller or the compositor: the same selector,
+    /// then a boolean.
     fn set_sink_mute(
         &mut self,
         mut reader: tag::Reader<'_>,
@@ -1820,10 +1848,10 @@ impl Session {
     }
 
     /// The output's level and mute as this connection may see them: as they
-    /// are for a controller, and unity and unmuted for a player, whose view
-    /// of the one sink never changes.
+    /// are for a controller or the compositor, and unity and unmuted for a
+    /// player, whose view of the one sink never changes.
     fn output_view(&self, mixer: &Mixer) -> (u32, bool) {
-        if self.controller {
+        if self.output {
             (mixer.master_volume(), mixer.master_muted())
         } else {
             (VOLUME_NORM, false)

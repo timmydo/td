@@ -2172,7 +2172,7 @@ fn build_desktop_td_svc_conf() -> String {
          # socket. A live connect is required before applications may launch.\n\
          [audio]\n\
          type=daemon\n\
-         exec=/bin/td-seatd exec-audio --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid} -- /bin/td-login exec-service-as {audio_user} -- /bin/td-audio serve --socket {audio_socket}\n\
+         exec=/bin/td-seatd exec-audio --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid} -- /bin/td-login exec-service-as {audio_user} -- /bin/td-audio serve --socket {audio_socket} --output-uid {compositor_uid}\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/td-login exec-service-as {audio_user} -- /bin/td-audio probe --socket {audio_socket}\n\
@@ -7579,7 +7579,7 @@ mod tests {
                 "/bin/td-seatd exec-audio --uid {UI_UID} --gid {UI_GID} \
                  --compositor-uid {COMPOSITOR_RESERVED_UID} --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID} -- \
                  /bin/td-login exec-service-as {AUDIO_USER} -- /bin/td-audio \
-                 serve --socket {}",
+                 serve --socket {} --output-uid {COMPOSITOR_RESERVED_UID}",
                 td_engine::permissions::TD_AUDIO_SOCKET_PATH
             ))
         );

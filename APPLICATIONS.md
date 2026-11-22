@@ -8782,8 +8782,9 @@ for a single-user machine is *nearly* fine and is exactly the kind of
 "nearly" this document refuses elsewhere. The specification: the
 **directory is traversable (0755, owned by `audio`) and the socket is
 0666**, with authorization done by the daemon on `SO_PEERCRED` — accept
-the human UID and the audio UID as controllers and the immutable assigned
-Firefox UID as a player, refuse everything else — rather than by mode
+the human UID and the audio UID as controllers, the immutable assigned
+Firefox UID as a player and the compositor's UID, which the unit names,
+in the output role, refuse everything else — rather than by mode
 bits. That puts the decision in code that can say why it refused, which
 is the same reason `td-busd` authenticates rather than relying on a 0700
 directory. And `td-seatd` **creates the directory only**; it cannot
@@ -8857,7 +8858,13 @@ uid and the seat user are controllers, one ordinary same-user Pulse
 authorization domain: a controller may enumerate any connection's sink
 input and apply the supported volume or mute controls. An application
 account, today only the browser's ledger uid, is a player, and a browser
-account that ever named a controller uid is still a player. Another
+account that ever named a controller uid is still a player. The
+compositor's account, for the volume keys and the bar, is admitted only
+because the unit's `td-audio serve` argv names it with `--output-uid`,
+in the narrower output role: it sees and sets the output's real level
+and mute and hears the output's events, while every other connection's
+streams are to it as to a player, and the lists and stream creation are
+commands it does not have, so it plays nothing under a name of its own. Another
 connection's sink input is absent to a player: inspecting it, setting its
 volume or muting it answers `NOENTITY`, as for an index nobody holds, and
 no server-wide subscription event reaches a player, a disconnect's removal
@@ -8869,7 +8876,8 @@ device latency, from gaps in the process-global sink-input and client
 numbering, and from the daemon-wide stream, queue-reservation and client
 limits it meets; none of these names a stream, its client or its content.
 Roles do not reserve capacity: players can fill the client table and the
-stream and queue budgets against a later controller, as any admitted peer
+stream and queue budgets against a later controller, or against the
+compositor, whose volume keys then show no audio, as any admitted peer
 could before roles existed. td-agent's unconfined workspace runs as the
 human (WORKLOADS.md) and is therefore a controller.
 A controller lists every connection's streams and every connection, with
@@ -8898,8 +8906,8 @@ lives only as long as the daemon: a restart, a lost device's included,
 starts every application at unity again, until persistence lands.
 A controller also sets the output's level and mute with `SET_SINK_VOLUME`
 and `SET_SINK_MUTE`, captured in both selector forms from the pinned
-runtime's libpulse 17.0, sees them in sink info, and every controller,
-the writer included, hears one sink change event for a write that changed
+runtime's libpulse 17.0, sees them in sink info, and every controller and
+the compositor, the writer included, hears one sink change event for a write that changed
 something and none for one that did not, even when the writer is dropped
 in the same pass. A setter naming the sink both ways or neither, or
 carrying a level vector that is empty, wider than stereo or holds an

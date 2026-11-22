@@ -79,7 +79,7 @@ usage: td-audio devices [--proc PATH]
                      [--proc PATH]
        td-audio verify-tone [--wav PATH] [--hz HZ] [--voices N] [--ms MS]
        td-audio serve [--socket PATH] [--card N] [--device N] [--proc PATH]
-                      [--passes N]
+                      [--passes N] [--output-uid UID]
        td-audio probe [--socket PATH]
        td-audio status [--socket PATH]
        td-audio outputs [--socket PATH]
@@ -154,7 +154,9 @@ fn parse_probe(arguments: &[OsString]) -> io::Result<PathBuf> {
 /// creates, and authorizes on `SO_PEERCRED` rather than on mode bits. The
 /// image runs it as the dedicated `audio` account; the daemon resolves that
 /// identity at run time and admits its own uid plus the seat user rather than
-/// compiling an account number into this protocol boundary.
+/// compiling an account number into this protocol boundary. The browser's
+/// account comes from the deployment's policy, and the compositor's only
+/// from `--output-uid`.
 fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
     let options = parse(arguments)?;
     let found = device::read(&options.proc_pcm)?;
@@ -162,7 +164,7 @@ fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
     let playback = device::select(&found, wanted)?;
     let sink = AlsaSink::open(playback, Request::default())?;
     let spec = sink.spec();
-    let policy = serve::Policy::for_deployment(current_uid()?)?;
+    let policy = options.admit(serve::Policy::for_deployment(current_uid()?)?);
     let mut server = serve::Server::bind(&options.socket, sink, policy)?;
     let mut stdout = io::stdout();
     writeln!(
@@ -219,6 +221,8 @@ struct Options {
     /// A bound on `serve`'s event loop, for a test or a smoke run. `None` is
     /// the real daemon, which runs until the device goes away.
     passes: Option<u32>,
+    /// The compositor's uid, admitted to the output's level and mute alone.
+    output_uid: Option<u32>,
 }
 
 impl Default for Options {
@@ -234,11 +238,21 @@ impl Default for Options {
             wav: None,
             socket: PathBuf::from(serve::SOCKET_PATH),
             passes: None,
+            output_uid: None,
         }
     }
 }
 
 impl Options {
+    /// The policy `serve` runs with: the deployment's, plus the compositor's
+    /// uid in the output role when the unit names one.
+    fn admit(&self, policy: serve::Policy) -> serve::Policy {
+        match self.output_uid {
+            Some(uid) => policy.with_output_uid(uid),
+            None => policy,
+        }
+    }
+
     fn voices(&self) -> Vec<tone::Voice> {
         tone::plan(
             Tone {
@@ -289,6 +303,7 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
                     PathBuf::from(next.ok_or_else(|| bad("--socket needs a path".into()))?)
             }
             Some("--passes") => options.passes = Some(number("--passes", next)?),
+            Some("--output-uid") => options.output_uid = Some(number("--output-uid", next)?),
             _ => {
                 return Err(bad(format!("unexpected argument {argument:?}\n{USAGE}")));
             }
@@ -688,6 +703,35 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// `--output-uid` reaches the policy `serve` runs with, and only then is
+    /// the compositor admitted; a missing or non-numeric value is refused.
+    #[test]
+    fn the_output_uid_flag_admits_the_compositor() {
+        let compositor = sys::Peer {
+            pid: 1,
+            uid: 993,
+            gid: 993,
+        };
+        let named = parse(&[OsString::from("--output-uid"), OsString::from("993")]).unwrap();
+        assert_eq!(named.output_uid, Some(993));
+        assert_eq!(
+            named.admit(serve::Policy::for_uid(994)).role(&compositor),
+            Some(serve::Role::Output)
+        );
+        let unnamed = parse(&[]).unwrap();
+        assert_eq!(
+            unnamed.admit(serve::Policy::for_uid(994)).role(&compositor),
+            None
+        );
+        for bad in [
+            vec![OsString::from("--output-uid")],
+            vec![OsString::from("--output-uid"), OsString::from("compositor")],
+            vec![OsString::from("--output-uid"), OsString::from("-1")],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn probe_accepts_only_its_fixed_socket_option() {
