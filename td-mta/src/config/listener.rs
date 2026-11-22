@@ -1076,6 +1076,7 @@ mod tests {
     fn mandatory_roles_and_global_pool_budgets_are_checked_at_finish() {
         let _lock = lock();
         let plan = Limits::default().plan().unwrap();
+        let pool = plan.limits().smtp_sessions as u64;
         for case in 0..5 {
             let mut s = Storage::new();
             let mut arena = text::Builder::new(&mut s.bytes).unwrap();
@@ -1092,11 +1093,11 @@ mod tests {
             if case != 0 {
                 let mut smtp = input(Kind::DirectSmtp, "127.0.0.1:25");
                 smtp.session_limit = Some(if case == 2 {
-                    9
+                    pool + 1
                 } else if case == 3 {
                     3
                 } else {
-                    5
+                    pool - 3
                 });
                 smtp.per_peer_limit = Some(if case == 3 { 3 } else { 1 });
                 b.listener(&mut arena, "smtp", smtp, at(2)).unwrap();
@@ -1140,12 +1141,13 @@ mod tests {
     fn inclusive_pool_bounds_fixture_accounting_and_http01_role_are_pinned() {
         let _lock = lock();
         let plan = Limits::default().plan().unwrap();
+        let pool = plan.limits().smtp_sessions as u64;
         for split in [false, true] {
             let mut s = Storage::new();
             let mut arena = text::Builder::new(&mut s.bytes).unwrap();
             let mut b = Builder::new(&arena, &mut s.slots).unwrap();
             let mut smtp = input(Kind::DirectSmtp, "127.0.0.1:25");
-            smtp.session_limit = Some(if split { 5 } else { 8 });
+            smtp.session_limit = Some(if split { pool - 3 } else { pool });
             smtp.per_peer_limit = Some(2);
             b.listener(&mut arena, "smtp", smtp, at(1)).unwrap();
             b.listener(
@@ -1167,7 +1169,7 @@ mod tests {
             let mut arena = text::Builder::new(&mut s.bytes).unwrap();
             let mut b = Builder::new(&arena, &mut s.slots).unwrap();
             let mut smtp = input(Kind::DirectSmtp, "127.0.0.1:25");
-            smtp.session_limit = Some(5);
+            smtp.session_limit = Some(pool - 3);
             b.listener(&mut arena, "smtp", smtp, at(1)).unwrap();
             b.listener(
                 &mut arena,

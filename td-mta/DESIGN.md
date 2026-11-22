@@ -916,7 +916,7 @@ The library denies `unsafe_code` with one function-scoped exception for
 Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
 `readiness_sys.rs` borrows connected sockets, listeners and wake receivers
 through each deadline-bounded wait. HTTPS and direct SMTP each wait on a
-fixed set sized for a private wake receiver, 16 listeners and 32 client slots. PostgreSQL
+fixed set sized for a private wake receiver, 16 listeners and 64 client slots. PostgreSQL
 and single-connection transport waits use one or two entries. The dedicated
 HTTP-01 responder waits on its private stop receiver, one TCP listener and
 up to eight connected TCP sockets. UNSAFE.md
@@ -1310,9 +1310,9 @@ Initial default ceilings (validated together at startup):
 
 | Resource | Default limit |
 | --- | --- |
-| Simultaneous inbound SMTP sessions | 8, at most 2 per SMTP peer key |
+| Simultaneous inbound SMTP sessions | 32, at most 2 per SMTP peer key |
 | Accepted inbound mail per peer key | Bursts of 100 messages and 256 MiB, then 120 messages/hour and about 1 GiB/day |
-| Active HTTPS connections | 8, at most 7 per IPv4 address or IPv6 /64, with a separate cap of 2 TLS handshakes |
+| Active HTTPS connections | 16, at most 15 per IPv4 address or IPv6 /64, with a separate cap of 2 TLS handshakes |
 | Event-source connections within the HTTPS pool | 2 |
 | Concurrent smart-host deliveries | 1 |
 | Concurrent body/search jobs | 3 |

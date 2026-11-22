@@ -1488,6 +1488,62 @@ mod tests {
     }
 
     #[test]
+    fn four_peer_keys_cannot_fill_the_default_session_pool() {
+        // One listener takes the whole default pool, as SCHEMA.md's example does.
+        let limits = crate::limits::Limits::default();
+        let (sessions, per_peer) = (limits.smtp_sessions, limits.smtp_per_peer);
+        let admit = |occupied: &[Option<(usize, PeerKey)>], address: IpAddr| {
+            let key = (0, PeerKey::from(address));
+            session_capacity(occupied, key, sessions, per_peer, per_peer).then_some(key)
+        };
+        let mut occupied = vec![None; sessions];
+        let mut used = 0;
+        // An IPv4 address in both spellings and three IPv6 /64s, each sending
+        // from a new address within its key on every attempt.
+        for prefix in 0..4u16 {
+            for host in 1..=u16::try_from(sessions).unwrap_or(u16::MAX) {
+                let address = match (prefix, host % 2) {
+                    (0, 0) => IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                    (0, _) => IpAddr::V6(std::net::Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()),
+                    _ => IpAddr::V6(std::net::Ipv6Addr::new(
+                        0x2001, 0xdb8, 0, prefix, 0, 0, 0, host,
+                    )),
+                };
+                let Some(key) = admit(&occupied, address) else {
+                    continue;
+                };
+                if let Some(slot) = occupied.get_mut(used) {
+                    *slot = Some(key);
+                    used += 1;
+                }
+            }
+        }
+        assert_eq!(used, 4 * per_peer);
+        assert!(used < sessions);
+        // Every other sender still finds room; filling the pool takes sixteen keys.
+        let mut keys = 4;
+        for prefix in 4..=u16::try_from(sessions).unwrap_or(u16::MAX) {
+            let address = IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, prefix, 0, 0, 0, 1,
+            ));
+            while let Some(key) = admit(&occupied, address) {
+                let Some(slot) = occupied.get_mut(used) else {
+                    break;
+                };
+                *slot = Some(key);
+                used += 1;
+            }
+            keys += 1;
+            if used == sessions {
+                break;
+            }
+        }
+        assert_eq!(used, sessions);
+        assert_eq!(keys, sessions.div_ceil(per_peer));
+        assert_eq!(keys, 16);
+    }
+
+    #[test]
     fn pending_accept_errors_retry_but_broken_listener_fails() {
         for errno in [
             12, 23, 24, 64, 71, 92, 95, 100, 101, 103, 104, 105, 112, 113,

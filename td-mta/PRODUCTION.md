@@ -54,7 +54,8 @@ Five processes use the selected MTA executable:
 - `td-mta-acme-production.service`: certificate issuance/renewal for all three MX names.
 
 On claw1 the selected frontend profile sets `event_streams = 4` in
-`[limits]`. Push can occupy four of the eight HTTPS connections. Each graphical
+`[limits]`. Push can occupy four of the frontend's `https_connections`,
+which default to sixteen. Each graphical
 td-mail process opens one stream per eligible watched account, up to two
 streams per process. Change this host setting through the versioned
 [configuration selection procedure](POSTGRES.md#configuration-selection-commands).
@@ -69,7 +70,11 @@ cause. An increase in `calls` means the frontend refused at least one
 pre-authentication attempt during the interval. That attempt could belong
 to another client. Lost observations leave the cause uncertain.
 
-The inbound SMTP listener permits eight simultaneous sessions. The SMTP session
+The inbound SMTP listener permits eight simultaneous sessions, so four peer
+keys at two sessions each can hold all of them. The listener's explicit
+`session_limit` governs: the default pool of 32 sessions (DESIGN.md section 5)
+takes effect only once a selected configuration raises `session_limit` to 32,
+and `smtp_sessions` too if the profile sets it. The SMTP session
 and DATA limits share a peer key: an IPv4 address (including IPv4-mapped
 addresses) or an IPv6 /64. DATA admission has its own fixed limits of four
 jobs overall and two per peer. Each peer key may also deliver bursts of 100

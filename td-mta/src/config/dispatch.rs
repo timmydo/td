@@ -1439,7 +1439,13 @@ certificate = "public"
         let sources = [
             SOURCE.replace("certificate = \"public\"", "certificate = \"missing\""),
             SOURCE.replace("server_name = \"mail.example.test\"", "server_name = \"other.example.test\""),
-            SOURCE.replace("session_limit = 1", "session_limit = 9"),
+            SOURCE.replace(
+                "session_limit = 1",
+                &format!(
+                    "session_limit = {}",
+                    crate::limits::Limits::default().smtp_sessions + 1
+                ),
+            ),
             SOURCE.replace("[domain \"example.test\"]", "[domain \"other.test\"]"),
             SOURCE.replace("account = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "account = \"cccccccccccccccccccccccccccccccc\""),
             SOURCE.replace("[resolver \"primary\"]\naddress = \"127.0.0.1:53\"\n", ""),

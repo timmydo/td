@@ -251,7 +251,9 @@ pub(super) fn exercise(
         reply
     };
     // Establish the TCP sessions together, before doing any TLS or API work.
-    let pending: Vec<_> = (0..7)
+    // One network peer may hold the default pool minus one slot.
+    let per_peer = td_mta::limits::Limits::default().https_connections - 1;
+    let pending: Vec<_> = (0..per_peer)
         .map(|_| TcpStream::connect(https_address).unwrap())
         .collect();
     let mut extra = TcpStream::connect(https_address).unwrap();

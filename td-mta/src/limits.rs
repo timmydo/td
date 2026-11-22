@@ -1,8 +1,9 @@
 //! Checked startup reservations, not allocation or measured RSS guarantees.
 use std::fmt;
 
-pub(crate) const MAX_SMTP_SESSIONS: usize = 32;
-pub(crate) const MAX_HTTPS_CONNECTIONS: usize = 32;
+// RESOURCES.md derives these pools from the per-slot reservations below.
+pub(crate) const MAX_SMTP_SESSIONS: usize = 64;
+pub(crate) const MAX_HTTPS_CONNECTIONS: usize = 64;
 
 pub const KIB: usize = 1024;
 pub const MIB: usize = 1024 * KIB;
@@ -152,9 +153,9 @@ macro_rules! limits {
 
 limits! {
     configurable {
-        smtp_sessions: 8, 1, MAX_SMTP_SESSIONS;
+        smtp_sessions: 32, 1, MAX_SMTP_SESSIONS;
         smtp_per_peer: 2, 1, 32;
-        https_connections: 8, 1, MAX_HTTPS_CONNECTIONS;
+        https_connections: 16, 1, MAX_HTTPS_CONNECTIONS;
         tls_handshakes: 2, 1, 8;
         event_streams: 2, 0, 8;
         body_jobs: 3, 1, 8;
@@ -501,7 +502,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 442_164_480);
+        assert_eq!(plan.total_bytes(), 481_623_296);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -519,10 +520,54 @@ mod tests {
     }
 
     #[test]
+    fn default_pools_spend_headroom_but_keep_one_message_buffer() -> Result<(), ResourceError> {
+        // RESOURCES.md sizes the pools from these per-slot entries plus a TLS session.
+        let plan = Limits::default().plan()?;
+        let slot = |name| {
+            plan.reservations()
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.bytes_each + TLS_SESSION_BYTES)
+                .ok_or(ResourceError::Inconsistent("missing slot reservation"))
+        };
+        assert_eq!(slot("smtp slots")?, 901_376);
+        assert_eq!(slot("https slots")?, 2_228_224);
+        let headroom = plan.limits().memory_budget_bytes - plan.total_bytes();
+        assert!(headroom >= MAX_MESSAGE_BYTES);
+        // The SMTP maximum fits the default budget; the HTTPS maximum needs more
+        // unless its request arena shrinks.
+        let smtp = Limits {
+            smtp_sessions: MAX_SMTP_SESSIONS,
+            ..Limits::default()
+        }
+        .plan()?;
+        assert_eq!(smtp.total_bytes(), 510_467_328);
+        let https = Limits {
+            https_connections: MAX_HTTPS_CONNECTIONS,
+            ..Limits::default()
+        };
+        assert_eq!(
+            https.plan(),
+            Err(ResourceError::MemoryBudget {
+                required: 588_578_048,
+                available: 512 * MIB,
+            })
+        );
+        let shrunk = Limits {
+            json_bytes: 256 * KIB,
+            json_tokens: 4096,
+            ..https
+        }
+        .plan()?;
+        assert_eq!(shrunk.total_bytes(), 508_886_272);
+        Ok(())
+    }
+
+    #[test]
     fn tls_budget_keeps_concurrency_and_refuses_an_underfunded_plan() -> Result<(), ResourceError> {
         let defaults = Limits::default();
-        assert_eq!(defaults.smtp_sessions, 8);
-        assert_eq!(defaults.https_connections, 8);
+        assert_eq!(defaults.smtp_sessions, 32);
+        assert_eq!(defaults.https_connections, 16);
         assert_eq!(defaults.tls_handshakes, 2);
         let required = defaults.plan()?.total_bytes();
         for available in [64 * MIB, required - 1] {
@@ -576,14 +621,14 @@ mod tests {
         for (limits, extra) in [
             (
                 Limits {
-                    smtp_sessions: 9,
+                    smtp_sessions: defaults.smtp_sessions + 1,
                     ..defaults
                 },
                 377_088 + 512 * KIB,
             ),
             (
                 Limits {
-                    https_connections: 9,
+                    https_connections: defaults.https_connections + 1,
                     ..defaults
                 },
                 1_703_936 + 512 * KIB,
@@ -633,7 +678,7 @@ mod tests {
         }
         assert_eq!(
             larger_inbound.total_bytes() - plan.total_bytes(),
-            8 * 900 * 320 - 2 * MIB
+            Limits::default().smtp_sessions * 900 * 320 - 2 * MIB
         );
         Ok(())
     }
@@ -659,7 +704,7 @@ mod tests {
         ));
         assert!(matches!(
             Limits {
-                https_connections: 33,
+                https_connections: MAX_HTTPS_CONNECTIONS + 1,
                 memory_budget_bytes: usize::MAX,
                 ..expanded
             }
@@ -723,11 +768,13 @@ mod tests {
             })
         ));
         let limits = Limits {
-            smtp_per_peer: 9,
+            smtp_sessions: 2,
+            smtp_per_peer: 3,
             ..Limits::default()
         };
         assert!(matches!(limits.plan(), Err(ResourceError::Inconsistent(_))));
         let limits = Limits {
+            https_connections: 8,
             event_streams: 8,
             ..Limits::default()
         };
@@ -849,7 +896,7 @@ mod tests {
     #[test]
     fn larger_pool_requires_capacity_rebalancing() -> Result<(), ResourceError> {
         let limits = Limits {
-            https_connections: 10,
+            https_connections: Limits::default().https_connections + 2,
             memory_budget_bytes: Limits::default().plan()?.total_bytes(),
             ..Limits::default()
         };
@@ -864,8 +911,7 @@ mod tests {
         .plan()?;
         assert!(plan.total_bytes() > Limits::default().plan()?.total_bytes());
         let maximum_pool = Limits {
-            https_connections: 32,
-            memory_budget_bytes: Limits::default().plan()?.total_bytes() + 16 * MIB,
+            https_connections: MAX_HTTPS_CONNECTIONS,
             ..Limits::default()
         };
         assert!(matches!(

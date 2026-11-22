@@ -270,8 +270,12 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 442164480 bytes (about 421.68 MiB), including the
-4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
+default plan is 481623296 bytes (about 459.31 MiB), including the
+4-MiB index cache. The default pools of 32 SMTP sessions and 16 HTTPS
+connections reserve 39458816 bytes (about 37.63 MiB) more than eight of each;
+RESOURCES.md derives them, and a tightly sized explicit budget must allow
+them. A listener's explicit `session_limit` still bounds its own sessions.
+Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.
 

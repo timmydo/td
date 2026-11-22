@@ -21,7 +21,7 @@ pub(super) const SMTP_STREAMS_MAX: u64 = 4;
 const SMALL_BYTES: usize = 2048;
 const LARGE_BYTES: usize = 256 * 1024;
 const LARGE_EVERY: u64 = 10;
-/// Readers and the metadata client within the default eight HTTPS connections.
+/// Readers and the metadata client within the default sixteen HTTPS connections.
 const JMAP_READERS_MAX: u64 = 6;
 const QUERY_PAGE: usize = 256;
 const GET_BATCH: usize = 64;

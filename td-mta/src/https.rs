@@ -2234,6 +2234,7 @@ mod tests {
             (16, 15, 16),
             (17, 16, 16),
             (32, 16, 16),
+            (crate::limits::MAX_HTTPS_CONNECTIONS, 16, 16),
         ] {
             assert_eq!(peer_limit(network, slots), network_limit);
             assert_eq!(peer_limit(PeerAddress::Local, slots), local_limit);

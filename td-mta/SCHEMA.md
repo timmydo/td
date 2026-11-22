@@ -856,7 +856,7 @@ kind = "direct_smtp"
 bind = "0.0.0.0:25"
 server_name = "mx.example.test"
 certificate = "public"
-session_limit = 8
+session_limit = 32
 per_peer_limit = 2
 
 [listener "jmap"]
@@ -868,7 +868,7 @@ certificate = "public"
 Implementation fixtures must also cover a gateway-only profile with an
 explicit upstream MX, private client trust/pins/prefixes, and both forms of
 certificate provisioning. A combined profile must divide the global SMTP
-session budget explicitly; copying the example's full eight-slot limit onto a
+session budget explicitly; copying the example's full 32-slot limit onto a
 second listener is invalid. All fixture network activity stays local as
 DESIGN.md requires. M11/M18 use an unprivileged user/network namespace with
 private loopback and namespace-local port 80/443 permission; fixture setup
