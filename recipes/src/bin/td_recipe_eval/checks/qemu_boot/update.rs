@@ -1150,6 +1150,51 @@ fn unchanged(guest: &mut Guest, current: &str, previous: &str, after: &str) -> R
     Ok(())
 }
 
+/// This boot's `boot_id`, which a reboot changes.
+fn boot_id(guest: &mut Guest) -> Result<String> {
+    guest.scalar(
+        "echo TD-BOOT-ID=$(cat /proc/sys/kernel/random/boot_id)",
+        |line| line.starts_with("TD-BOOT-ID="),
+    )
+}
+
+/// Ctrl+Alt+Delete, sent as QEMU keys through the guest's keyboard, so the
+/// kernel's keymap delivers its Ctrl-Alt-Del to td-svc's sentinel as well as
+/// the compositor its evdev chord: the attention menu shows, Escape closes
+/// it, and with the compositor's unit running td-svc reboots nothing, so the
+/// same shell answers with the same `boot_id` (td-svc/DESIGN.md §9).
+fn ctrl_alt_delete_opens_attention(guest: &mut Guest, capture: &Path) -> Result<()> {
+    let before = boot_id(guest)?;
+    guest.key(&["ctrl", "alt", "delete"])?;
+    let end = guest.exchange_deadline()?;
+    guest.qmp()?.move_absolute_until(0, 0, end)?;
+    guest.screen_until(
+        capture,
+        Duration::from_secs(20),
+        "secure-attention menu after Ctrl+Alt+Delete",
+        menu_pixels_match,
+    )?;
+    guest.key(&["esc"])?;
+    guest.screen_until(
+        capture,
+        Duration::from_secs(20),
+        "the attention screen closing after Ctrl+Alt+Delete",
+        |pixels| Ok(!menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?),
+    )?;
+    // An ordered reboot begun by the press would have stopped the session
+    // within this wait; the serial shell answering the same id says none did.
+    thread::sleep(Duration::from_secs(5));
+    let after = boot_id(guest)?;
+    if after != before {
+        return Err("Ctrl+Alt+Delete rebooted the guest: its boot_id changed".into());
+    }
+    println!(
+        "[qemu-deploy-rollback] Ctrl+Alt+Delete opened the attention menu, Escape closed it, \
+         and the guest did not reboot"
+    );
+    Ok(())
+}
+
 /// The `deploy-rollback` phase (td-authd/DESIGN.md, "Elevation
 /// operations"): on a guest whose selectors name `current` and `previous`,
 /// the prompt names exactly that pair and asks for Enter; the control
@@ -1160,6 +1205,7 @@ fn unchanged(guest: &mut Guest, current: &str, previous: &str, after: &str) -> R
 fn deploy_rollback(guest: &mut Guest, work: &Path, current: &str, previous: &str) -> Result<()> {
     let capture = work.join("rollback.ppm");
     unchanged(guest, current, previous, "the boot")?;
+    ctrl_alt_delete_opens_attention(guest, &capture)?;
     guest.rollback_prompt(&capture, current, previous)?;
     println!(
         "[qemu-deploy-rollback] prompt names current {current} and previous {previous}, \

@@ -1416,6 +1416,32 @@ needs to **die, observably**. td-svc:
    **SIGINT specifically** is the press; any other death is a bug to log and
    re-arm from.
 
+What a press then does is the image's, declared on `run`'s command line as
+`--ctrl-alt-del reboot` (the default) or `--ctrl-alt-del attention=UNIT`,
+UNIT a name in the table's own `[A-Za-z0-9_-]` syntax; a repeated option,
+a missing value, any other value and the option on any verb but `run` are
+usage errors. `reboot` begins the ordered reboot. `attention=UNIT` asks,
+at the press, whether that unit has a live process, spawned and not yet
+reaped, whatever its phase: a `failed` unit whose readiness probe timed
+out may still be drawing the attention screen that press opened. A pid
+td-svc could not wait for (`WaitFailed`, which leaves it in place) counts
+as live too, so in that degraded state a press is ignored. A live
+process means the press is logged and re-armed, through the scheduled
+path below, shutting nothing down; no process, or a unit the table does
+not declare, means the ordered reboot, so a compositor in a crash loop or
+one that never started leaves the press its restart. `run` says at
+startup when UNIT is undeclared, and supervises on. The server image's
+inittab takes the default. The
+desktop image's, which the live medium boots too, passes
+`attention=wayland`, the unit running its paired compositor, which reads
+the same keys from evdev as its secure-attention chord
+(td-compositor/DESIGN.md, "Physical secure attention"), whose restart
+asks first; a reboot behind that screen would discard the session's
+unsaved work. A compositor that hangs while its process lives is not
+covered: the press does nothing, and the attention screen's R, if the
+compositor still draws it, is the restart. The arming, and with it the
+disabled hard reset, are the same under both.
+
 Re-arming is required after each press — `cad_pid` holds a reference to the
 reaped sentinel's `struct pid`, so delivery finds no task until a new pid is
 written — and is suppressed once a shutdown is in flight, so a second press
@@ -1487,7 +1513,12 @@ deliberate rather than a gap someone forgot to close:
   holding a sentinel: every other test here starts from a *death*, and an
   `arm_cad` that quietly gave up on every path would satisfy all of them.
 - **The reaction** is proven: a sentinel death by SIGINT begins a reboot, any
-  other death does not, a death arriving once a teardown is already in flight
+  other death does not; under `attention=UNIT` a SIGINT death while that
+  unit has a live process, `starting`, `ready` or `failed`, begins none
+  and re-arms, one while it has none reboots whatever its phase, and an
+  undeclared unit is reported and reboots; `run`'s routing refuses each
+  malformed option; a death arriving once a
+  teardown is already in flight
   neither restarts the sequence nor re-arms, a *retired* sentinel's death —
   including a SIGINT — changes nothing, a refused shutdown still re-arms, and
   repeated failure schedules rather than spins.
@@ -1510,9 +1541,13 @@ deliberate rather than a gap someone forgot to close:
   exercised against our own pid, against a pid above the kernel's ceiling
   (ESRCH), and against an invalid signal number (EINVAL, the one refusal that
   does not depend on whether the suite runs as root).
-- **The kernel path joining them is not covered.** `ctrl_alt_del()` delivering
-  SIGINT to `cad_pid` is taken on the kernel's word; only a `sendkey` test
-  would close it, and none exists yet.
+- **The kernel path joining them** is covered on the desktop only by the
+  `qemu-deploy-rollback` oracle, which main's integration tier runs: it sends
+  Ctrl+Alt+Delete as QEMU keys, requires the attention menu, closes it with
+  Escape and requires the same `boot_id` afterwards. That shows a press does
+  not reboot while the compositor runs, not that the sentinel received it;
+  `ctrl_alt_del()` delivering SIGINT to `cad_pid`, and the server's reboot,
+  are taken on the kernel's word.
 - **The sentinel's identity is proven only on a booted image.** Every suite
   here runs below root, so none reaches the change of identity. A source pin
   holds the code, and boot health under the autotest token reads the process
@@ -1601,12 +1636,13 @@ knows.
 Landing 5 armed Ctrl-Alt-Del and moved signalling in-crate. The
 supervisor now issues `kill(2)` itself rather than exec'ing the uutils
 `/bin/kill` — §2 I1 records why that is the smaller surface, not the larger —
-and arms a sentinel at startup. Re-arming is for a sentinel that *broke*, and
-for a press whose shutdown was refused; a press that lands begins a teardown
-and wants no new sentinel. It is scheduled on `backoff::delay` rather than run
-inline, and keyed to the sentinel's pid — §9 records the two loops those two
-choices close. td-svc is consequently the fifth target-side unsafe exception
-UNSAFE.md lists, for exactly one syscall.
+and arms a sentinel at startup. Re-arming is for a sentinel that *broke*, for
+a press whose shutdown was refused, and for a press `attention=UNIT` ignored
+(§9); a press that lands begins a teardown and wants no new sentinel. It is
+scheduled on `backoff::delay` rather than run inline, and keyed to the
+sentinel's pid — §9 records the two loops those two choices close. td-svc
+is consequently the fifth target-side unsafe exception UNSAFE.md lists,
+for exactly one syscall.
 
 Landing 6 is the supervisor-restart eviction contract §11
 describes: td-svc records what it started under `/run` and, on startup,
@@ -1696,7 +1732,9 @@ the login tree without touching the boot path at all.
 
 The system recipe generates the table for one of two profiles. The
 desktop (`system-x86-64`) is everything above. The server
-(`server-x86-64`) runs the same supervisor, inittab and boot path. Its
+(`server-x86-64`) runs the same supervisor and boot path, and the same
+inittab but for `run`'s Ctrl-Alt-Del option, which it leaves at the
+ordered reboot (§9). Its
 accounts are the desktop's root, primary (UID 1000), profiler and
 td-sshd privilege-separation accounts, without the td-admin,
 td-admin-build, compositor, broker, portal, audio, installer or notebook

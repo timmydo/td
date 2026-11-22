@@ -1172,6 +1172,8 @@ pub struct Runtime {
     /// evidence, and the same threshold, that resets a service's restart count.
     cad_retry_at: Option<Instant>,
     cad_failures: u32,
+    /// What a press does: `run`'s `--ctrl-alt-del`, which the image declares.
+    press: crate::cad::Press,
     /// Where this supervisor records what it started, so its SUCCESSOR can
     /// evict it. A field for the same reason `marker_path` is one: the whole
     /// interesting behaviour is what happens to a machine that already has a
@@ -1246,6 +1248,7 @@ impl Runtime {
                 cad_pid_path: crate::cad::CAD_PID.to_string(),
                 cad_retry_at: None,
                 cad_failures: 0,
+                press: crate::cad::Press::Reboot,
                 started_path: crate::evict::STATE.to_string(),
                 unevicted: Vec::new(),
                 marker_path: SHUTDOWN_MARKER.to_string(),
@@ -3133,6 +3136,19 @@ impl Runtime {
         if stayed_up {
             self.cad_failures = 0;
         }
+        if signal == Some(crate::sys::SIGINT) && self.attention_unit_running() {
+            // The desktop image: that unit, its paired compositor, reads the
+            // same chord from evdev and opens secure attention, whose own
+            // restart asks first. The arming is spent all the same, so re-arm,
+            // through the scheduled path: a press inside its short delay finds
+            // nothing armed and does nothing, as this one did.
+            log(
+                "ctrl-alt-del sentinel signalled while the attention unit runs; \
+                 it opens secure attention, so nothing shuts down",
+            );
+            self.schedule_cad_rearm();
+            return;
+        }
         if signal == Some(crate::sys::SIGINT) {
             // NOT "Ctrl-Alt-Del pressed": `cad_pid` is 0600 but any root process,
             // or one holding the sentinel's uid, can send SIGINT to the sentinel,
@@ -3210,6 +3226,33 @@ impl Runtime {
             std::thread::sleep(SILENT_TABLE_COMPLAINT);
             log(&format!("{applet} failed earlier; the machine is still up"));
         }
+    }
+
+    /// Set what a Ctrl-Alt-Del press does, before `run` arms it.
+    pub fn set_press(&mut self, press: crate::cad::Press) {
+        self.press = press;
+    }
+
+    /// Whether `attention=UNIT`'s unit has a live process: spawned and not yet
+    /// reaped, whatever its phase says. A `failed` unit whose readiness probe
+    /// timed out may still be drawing the attention screen the press opened.
+    /// A unit with no process, or undeclared, answers `false`, and the press
+    /// reboots.
+    fn attention_unit_running(&self) -> bool {
+        let crate::cad::Press::Attention(unit) = &self.press else {
+            return false;
+        };
+        self.lookup(unit)
+            .is_some_and(|service| service.pid.is_some())
+    }
+
+    /// `attention=UNIT` naming no unit of the table: every press then reboots,
+    /// which `run` says once at startup rather than at the first press.
+    pub fn attention_unit_undeclared(&self) -> Option<&str> {
+        let crate::cad::Press::Attention(unit) = &self.press else {
+            return None;
+        };
+        self.lookup(unit).is_none().then_some(unit.as_str())
     }
 
     /// A sender for the event channel, so the control thread can reach the loop.
@@ -4034,12 +4077,12 @@ mod tests {
         let unit = &rt.lookup("paired").unwrap().unit;
         let (command, _) = build(unit, false, false).unwrap();
         assert_eq!(command.get_program(), "/proc/self/exe");
-        let argv: Vec<String> = command
+        let mut argv: Vec<String> = command
             .get_args()
             .map(|s| s.to_str().unwrap().to_string())
             .collect();
         assert!(
-            matches!(crate::route(&argv), crate::Route::PairRun { left, right }
+            matches!(crate::route(&mut argv), crate::Route::PairRun { left, right }
             if left == unit.argv && Some(&right) == unit.pair_argv.as_ref())
         );
     }
@@ -4183,12 +4226,12 @@ mod tests {
         let unit = &rt.lookup("sshd").unwrap().unit;
         let (command, _) = build(unit, false, false).unwrap();
         assert_eq!(command.get_program(), "/proc/self/exe");
-        let argv: Vec<String> = command
+        let mut argv: Vec<String> = command
             .get_args()
             .map(|s| s.to_str().unwrap().to_string())
             .collect();
         assert!(
-            matches!(crate::route(&argv), crate::Route::LeafExec { argv } if argv == unit.argv)
+            matches!(crate::route(&mut argv), crate::Route::LeafExec { argv } if argv == unit.argv)
         );
         let (command, _) = build(&rt.lookup("plain").unwrap().unit, false, false).unwrap();
         assert_eq!(command.get_program(), "/bin/x");
@@ -6492,6 +6535,87 @@ mod tests {
             "a press reboots"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A runtime declaring `attention=wayland`, its marker and sysctls under
+    /// `dir`, armed: the sentinel's pid.
+    fn attention_runtime(dir: &td_fs::TempDir) -> (Runtime, i32) {
+        let mut rt = runtime("[wayland]\ntype=daemon\nexec=/x\n");
+        let base = dir.path().to_str().unwrap().to_owned();
+        rt.marker_path = format!("{base}/shutdown");
+        rt.set_press(crate::cad::Press::Attention("wayland".into()));
+        let pid = arm_at(&mut rt, &base);
+        (rt, pid)
+    }
+
+    /// Under `--ctrl-alt-del attention=wayland`, a press while that unit has a
+    /// live process begins no shutdown, whatever its phase: the desktop's
+    /// compositor answers the chord with secure attention, and one whose
+    /// readiness probe timed out (`failed`) may still be drawing it. The
+    /// spent arming is re-armed, so a later press is still caught and the
+    /// kernel's hard reset stays off.
+    #[test]
+    fn a_press_while_the_attention_unit_runs_shuts_nothing_down_and_re_arms() {
+        let dir = td_fs::TempDir::new("td-svc-cad-attention").unwrap();
+        let (mut rt, mut pid) = attention_runtime(&dir);
+        assert_eq!(rt.attention_unit_undeclared(), None);
+        for phase in [Phase::Starting, Phase::Ready, Phase::Failed] {
+            let service = rt.lookup_mut("wayland").unwrap();
+            // Past pid_max: never a process, and never signalled here.
+            service.pid = Some(i32::MAX);
+            service.phase = phase;
+            rt.on_sentinel_died(pid, Some(crate::sys::SIGINT));
+            assert!(
+                rt.shutdown.is_none(),
+                "a press while the compositor runs ({phase:?}) must not begin a shutdown"
+            );
+            assert!(rt.cad.is_none(), "the spent sentinel is let go");
+            assert!(
+                rt.cad_retry_at.is_some(),
+                "the press must schedule the re-arm"
+            );
+            rt.cad_retry_at = None;
+            rt.arm_cad();
+            pid = rt.cad.as_ref().map_or(0, |armed| armed.pid);
+            assert!(pid > 0, "re-armed for the next press");
+        }
+    }
+
+    /// The same declaration with no live process for the unit, down, failed,
+    /// held or stopped, a crash loop or a start that never took, is the
+    /// ordered reboot: nothing would open secure attention for that press.
+    #[test]
+    fn a_press_while_the_attention_unit_is_not_running_reboots() {
+        for phase in [Phase::Down, Phase::Failed, Phase::Held, Phase::Stopped] {
+            let dir = td_fs::TempDir::new("td-svc-cad-no-attention").unwrap();
+            let (mut rt, pid) = attention_runtime(&dir);
+            let service = rt.lookup_mut("wayland").unwrap();
+            service.pid = None;
+            service.phase = phase;
+            rt.on_sentinel_died(pid, Some(crate::sys::SIGINT));
+            assert_eq!(
+                rt.shutdown.as_ref().map(|s| s.power),
+                Some(Power::Reboot),
+                "a press with the compositor {phase:?} and no process must reboot"
+            );
+        }
+    }
+
+    /// `attention=UNIT` naming no unit of the table is reported, so `run` can
+    /// say at startup that every press reboots, and a press does reboot.
+    #[test]
+    fn an_undeclared_attention_unit_is_reported_and_its_press_reboots() {
+        let dir = td_fs::TempDir::new("td-svc-cad-undeclared").unwrap();
+        let mut rt = runtime("[a]\ntype=oneshot\nexec=/x\n");
+        let base = dir.path().to_str().unwrap().to_owned();
+        rt.marker_path = format!("{base}/shutdown");
+        rt.set_press(crate::cad::Press::Attention("wayland".into()));
+        assert_eq!(rt.attention_unit_undeclared(), Some("wayland"));
+        let pid = arm_at(&mut rt, &base);
+        rt.on_sentinel_died(pid, Some(crate::sys::SIGINT));
+        assert_eq!(rt.shutdown.as_ref().map(|s| s.power), Some(Power::Reboot));
+        rt.set_press(crate::cad::Press::Reboot);
+        assert_eq!(rt.attention_unit_undeclared(), None);
     }
 
     #[test]

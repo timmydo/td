@@ -759,7 +759,8 @@ terminal-exec wrapper refuses a failed session-cgroup placement before
 terminal code runs, and a new process group keeps the user terminal
 independent of the authority generation. This adds no credential-switch
 mechanism or human authentication policy here. The paired compositor now
-reserves physical Ctrl+Alt+Esc for a trusted screen with exclusive input.
+reserves physical Ctrl+Alt+Esc, and Ctrl+Alt+Delete beside it, for a
+trusted screen with exclusive input.
 It selects enrollment with a second token or explicit unrecoverability,
 and primary or recovery unlock. Each immutable step must be presented
 before root token I/O; an assertion binds the exact request. Session

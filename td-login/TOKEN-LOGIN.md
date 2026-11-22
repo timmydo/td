@@ -703,7 +703,8 @@ generation, since nothing on the lock surface unlocks it; the next
 generation, at a reboot or a compositor or authority restart, starts
 unlocked, as every unenrolled one does.
 
-On the lock surface Ctrl+Alt+Esc opens a login-unlock attention lifetime
+On the lock surface Ctrl+Alt+Esc (or Ctrl+Alt+Delete, the same chord)
+opens a login-unlock attention lifetime
 directly, without the menu. The prompt presents the unlock description; the
 worker identifies the connected key, which must already be the only one
 connected (the worker does not wait for it); the next presented step

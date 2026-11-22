@@ -1458,7 +1458,7 @@ fn password_field(u: &User) -> &'static str {
     }
 }
 
-fn build_inittab() -> String {
+fn build_inittab(sys: &SystemDef) -> String {
     // td-init: `<id>::<action>:<process>`. `id` names the tty init opens for the
     // process; empty id => the system console. This inittab runs on the REAL root AFTER
     // stage-1 `switch_root`ed into it.
@@ -1485,13 +1485,28 @@ fn build_inittab() -> String {
     // There is still no `ctrlaltdel` or `shutdown` line: td-init supervises with NO
     // signals (a blocking wait4 IS its event loop), so both actions are signal contracts
     // it cannot honour. Ctrl-Alt-Del is td-svc's to own precisely because PID 1 cannot.
+    // What a press does is the profile's (td-svc/DESIGN.md §9): the desktop's paired
+    // compositor reads the chord and opens secure attention, so td-svc ignores it there
+    // while that unit runs and reboots in order otherwise; the headless server always
+    // reboots in order.
     format!(
         "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
          ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
          ::sysinit:/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup\n\
          ::sysinit:/bin/devpts\n\
-         ::respawn:/bin/td-svc run -f {TD_SVC_CONF}\n"
+         ::respawn:/bin/td-svc run -f {TD_SVC_CONF}{press}\n",
+        press = ctrl_alt_del_option(sys)
     )
+}
+
+/// `td-svc run`'s Ctrl-Alt-Del option for the profile: empty, the reboot, unless the
+/// paired compositor owns the console. The desktop's names `wayland`, the unit running
+/// that compositor, which a test holds.
+fn ctrl_alt_del_option(sys: &SystemDef) -> &'static str {
+    match sys.profile {
+        Profile::Desktop => " --ctrl-alt-del attention=wayland",
+        Profile::Server => "",
+    }
 }
 
 /// Where the unit table lives. ONE const, and every consumer derives from it: the
@@ -5152,7 +5167,7 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
             profiler_application_roots(sys),
             false,
         ),
-        ("inittab", build_inittab(), false),
+        ("inittab", build_inittab(sys), false),
         (td_svc_conf_etc_name(), build_td_svc_conf(sys), false),
         ("profile", build_profile(sys), false),
         // Executable glue (mode 0755): getty execs autologin; init respawns tty-session
@@ -5199,7 +5214,7 @@ fn server_etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
             build_application_config(),
             false,
         ),
-        ("inittab", build_inittab(), false),
+        ("inittab", build_inittab(sys), false),
         (td_svc_conf_etc_name(), build_td_svc_conf(sys), false),
         ("profile", build_profile(sys), false),
         ("shutdown", build_shutdown(sys), true),
@@ -7769,7 +7784,7 @@ mod tests {
     /// and it is the one place in this file where line order still carries meaning.
     #[test]
     fn the_inittab_keeps_only_what_pid_one_must_own() {
-        let inittab = build_inittab();
+        let inittab = build_inittab(&SYSTEM);
         let lines: Vec<&str> = inittab
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
@@ -7781,10 +7796,29 @@ mod tests {
                 "::sysinit:/bin/mount -t sysfs sysfs /sys",
                 "::sysinit:/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup",
                 "::sysinit:/bin/devpts",
-                &format!("::respawn:/bin/td-svc run -f {TD_SVC_CONF}"),
+                &format!(
+                    "::respawn:/bin/td-svc run -f {TD_SVC_CONF} --ctrl-alt-del attention=wayland"
+                ),
             ],
             "PID 1's table is the pseudo-filesystem mounts plus td-svc, and nothing else \
              — a service that reappears here is one td-svc cannot order, restart, or stop"
+        );
+        // The desktop's paired compositor owns the chord (secure attention) while its
+        // unit runs; the headless server keeps td-svc's ordered reboot (td-svc/DESIGN.md
+        // §9). The named unit is the one that runs the compositor.
+        const COMPOSITOR_UNIT: &str = "wayland";
+        assert!(ctrl_alt_del_option(&SYSTEM).ends_with(&format!(" attention={COMPOSITOR_UNIT}")));
+        assert!(
+            unit_key(COMPOSITOR_UNIT, "pair-exec")
+                .unwrap_or_default()
+                .contains("/bin/td-compositor run "),
+            "attention={COMPOSITOR_UNIT} must name the unit that runs the paired compositor"
+        );
+        assert!(
+            build_inittab(&SERVER)
+                .lines()
+                .any(|l| l == format!("::respawn:/bin/td-svc run -f {TD_SVC_CONF}")),
+            "the server's td-svc must keep the default Ctrl-Alt-Del reboot"
         );
 
         assert!(
@@ -7804,7 +7838,7 @@ mod tests {
     #[test]
     fn every_job_the_inittab_used_to_run_still_runs() {
         let table = build_td_svc_conf(&SYSTEM);
-        let inittab = build_inittab();
+        let inittab = build_inittab(&SYSTEM);
         for command in [
             "/bin/td-firstboot hostname",
             "/bin/td-firstboot provision",
@@ -13824,7 +13858,7 @@ mod tests {
     /// silently strip a guarantee; red it here.
     #[test]
     fn exit_powers_off_and_rootcheck_runs() {
-        let inittab = build_inittab();
+        let inittab = build_inittab(&SYSTEM);
         // These moved out of the inittab and into the unit table; each must still be
         // there, running the same command, or the cutover dropped a job.
         for (unit, exec) in [
@@ -17900,7 +17934,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // The inittab's -f, spelled out rather than rebuilt from the const, so this is
         // not the tautology it replaces.
         assert!(
-            build_inittab().contains("/bin/td-svc run -f /etc/td-svc.conf"),
+            build_inittab(&SYSTEM).contains("/bin/td-svc run -f /etc/td-svc.conf"),
             "PID 1's only respawn line must name the generated table literally"
         );
         // And the file really is generated at that name.

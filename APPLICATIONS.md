@@ -9395,7 +9395,8 @@ service identity, and installs only that job's validated result.
 
 #### What proves a human is present
 
-The paired stock compositor reserves **Ctrl+Alt+Esc** for an opaque,
+The paired stock compositor reserves **Ctrl+Alt+Esc**, and
+**Ctrl+Alt+Delete** beside it, for an opaque,
 compositor-owned screen. The evdev adapter enters it before client,
 launcher or help bindings; it withdraws keyboard/pointer focus and
 grabs. It shows a menu of one-letter operations and approves only what

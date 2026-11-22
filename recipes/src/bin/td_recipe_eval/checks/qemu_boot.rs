@@ -8951,6 +8951,9 @@ impl Qmp {
                         | "q"
                         // The compositor's volume key, before Firefox's tone.
                         | "volumedown"
+                        // `qemu-deploy-rollback`'s Ctrl+Alt+Delete, the
+                        // second attention chord.
+                        | "delete"
                 )
             })
         {

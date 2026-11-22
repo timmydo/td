@@ -16,7 +16,8 @@
 //! from an exit status, and the console is never skippable.
 //!
 //! `td-svc check [-f FILE]` validates a table and prints the start order it
-//! would use. `td-svc run [-f FILE]` supervises.
+//! would use. `td-svc run [-f FILE] [--ctrl-alt-del reboot|attention=UNIT]`
+//! supervises; the option says what a Ctrl-Alt-Del press does (DESIGN.md §9).
 
 mod backoff;
 mod cad;
@@ -58,7 +59,8 @@ pub(crate) fn emit_err(text: &str) {
 
 fn usage() -> String {
     format!(
-        "usage: td-svc <check|run> [-f FILE]\n       \
+        "usage: td-svc check [-f FILE]\n       \
+         td-svc run [-f FILE] [--ctrl-alt-del reboot|attention=UNIT]\n       \
          td-svc <status|start|stop|restart> [NAME]\n       \
          td-svc <reload|reboot|poweroff|halt>\n       \
          td-svc oom-watch\n  \
@@ -92,6 +94,7 @@ enum Route {
     },
     Run {
         path: String,
+        press: cad::Press,
     },
     /// The Ctrl-Alt-Del sentinel: block until our parent lets go. Not a control
     /// verb — it addresses no supervisor and reads no table.
@@ -121,7 +124,7 @@ const CTL_VERBS: &[&str] = &[
     "status", "start", "stop", "restart", "reload", "reboot", "poweroff", "halt",
 ];
 
-fn route(args: &[String]) -> Route {
+fn route(args: &mut [String]) -> Route {
     let Some(verb) = args.first() else {
         return Route::Usage("no subcommand".into());
     };
@@ -165,19 +168,46 @@ fn route(args: &[String]) -> Route {
         };
     }
     let mut path = DEFAULT_PATH.to_string();
-    let mut rest = args.iter().skip(1);
+    let mut press = None;
+    let Some((verb, tail)) = args.split_first_mut() else {
+        return Route::Usage("no subcommand".into());
+    };
+    let mut rest = tail.iter_mut();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "-f" | "--file" => match rest.next() {
                 Some(value) => path = value.clone(),
                 None => return Route::Usage(format!("{arg} needs a path")),
             },
+            // `run`'s alone: `check` validates a table and handles no press.
+            // The value is moved out of argv rather than copied.
+            cad::PRESS_OPTION if verb == "run" => {
+                if press.is_some() {
+                    return Route::Usage("--ctrl-alt-del given twice".into());
+                }
+                match rest.next().map(std::mem::take).map(cad::Press::parse) {
+                    Some(Some(chosen)) => press = Some(chosen),
+                    Some(None) => {
+                        return Route::Usage(
+                            "--ctrl-alt-del takes 'reboot' or 'attention=UNIT'".into(),
+                        )
+                    }
+                    None => {
+                        return Route::Usage(
+                            "--ctrl-alt-del needs 'reboot' or 'attention=UNIT'".into(),
+                        )
+                    }
+                }
+            }
             other => return Route::Usage(format!("unexpected argument '{other}'")),
         }
     }
     match verb.as_str() {
         "check" => Route::Check { path },
-        "run" => Route::Run { path },
+        "run" => Route::Run {
+            path,
+            press: press.unwrap_or(cad::Press::Reboot),
+        },
         other => Route::Usage(format!("unknown subcommand '{other}'")),
     }
 }
@@ -229,14 +259,14 @@ fn args_utf8() -> Result<Vec<String>, String> {
 }
 
 fn main() -> ExitCode {
-    let args = match args_utf8() {
+    let mut args = match args_utf8() {
         Ok(args) => args,
         Err(why) => {
             emit_err(&format!("td-svc: {why}\n{}\n", usage()));
             return ExitCode::from(2);
         }
     };
-    match route(&args) {
+    match route(&mut args) {
         Route::Usage(why) => {
             emit_err(&format!("td-svc: {why}\n{}\n", usage()));
             ExitCode::from(2)
@@ -304,7 +334,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Route::Run { path } => {
+        Route::Run { path, press } => {
             if let Err(error) = cgroup::delegate_session() {
                 emit_err(&format!(
                     "td-svc: application cgroup delegation failed: {error}\n"
@@ -329,6 +359,15 @@ fn main() -> ExitCode {
                 logs::share_with(gid);
             }
             let (mut runtime, complaints) = supervise::Runtime::new(units, &path);
+            runtime.set_press(press);
+            if let Some(unit) = runtime.attention_unit_undeclared() {
+                // In pieces, as `run` allocates no diagnostic of its own here.
+                emit_err("td-svc: --ctrl-alt-del attention=");
+                emit_err(unit);
+                emit_err(
+                    ": the table declares no such unit, so a Ctrl-Alt-Del press will reboot\n",
+                );
+            }
             control::spawn(runtime.events());
             if let Some(gid) = observer {
                 control::spawn_status(runtime.events(), gid);
@@ -352,29 +391,77 @@ mod tests {
     #[test]
     fn subcommands_route_with_the_default_path() {
         assert_eq!(
-            route(&argv(&["check"])),
+            route(&mut argv(&["check"])),
             Route::Check {
                 path: DEFAULT_PATH.into()
             }
         );
         assert_eq!(
-            route(&argv(&["run"])),
+            route(&mut argv(&["run"])),
             Route::Run {
-                path: DEFAULT_PATH.into()
+                path: DEFAULT_PATH.into(),
+                press: cad::Press::Reboot,
             }
         );
+    }
+
+    /// The desktop image declares `attention=wayland` on `run`; the default
+    /// is the reboot, and anything else is refused.
+    #[test]
+    fn run_takes_what_a_ctrl_alt_del_press_does() {
+        assert_eq!(
+            route(&mut argv(&[
+                "run",
+                "-f",
+                "/etc/td-svc.conf",
+                "--ctrl-alt-del",
+                "attention=wayland"
+            ])),
+            Route::Run {
+                path: "/etc/td-svc.conf".into(),
+                press: cad::Press::Attention("wayland".into()),
+            }
+        );
+        assert_eq!(
+            route(&mut argv(&["run", "--ctrl-alt-del", "reboot"])),
+            Route::Run {
+                path: DEFAULT_PATH.into(),
+                press: cad::Press::Reboot,
+            }
+        );
+        for words in [
+            &["run", "--ctrl-alt-del"][..],
+            &["run", "--ctrl-alt-del", "attention"],
+            &["run", "--ctrl-alt-del", "attention="],
+            &["run", "--ctrl-alt-del", "attention=way land"],
+            &["run", "--ctrl-alt-del", "attention=../wayland"],
+            &["run", "--ctrl-alt-del", "ignore"],
+            &[
+                "run",
+                "--ctrl-alt-del",
+                "reboot",
+                "--ctrl-alt-del",
+                "attention=wayland",
+            ],
+            &["check", "--ctrl-alt-del", "attention=wayland"],
+        ] {
+            assert!(
+                matches!(route(&mut argv(words)), Route::Usage(_)),
+                "{words:?} must be refused"
+            );
+        }
     }
 
     #[test]
     fn an_explicit_file_overrides_the_default() {
         assert_eq!(
-            route(&argv(&["check", "-f", "/tmp/t.conf"])),
+            route(&mut argv(&["check", "-f", "/tmp/t.conf"])),
             Route::Check {
                 path: "/tmp/t.conf".into()
             }
         );
         assert_eq!(
-            route(&argv(&["check", "--file", "/tmp/t.conf"])),
+            route(&mut argv(&["check", "--file", "/tmp/t.conf"])),
             Route::Check {
                 path: "/tmp/t.conf".into()
             }
@@ -385,10 +472,16 @@ mod tests {
     /// booted machine that would start services nobody asked for.
     #[test]
     fn a_malformed_argv_is_usage_not_a_default() {
-        assert!(matches!(route(&argv(&[])), Route::Usage(_)));
-        assert!(matches!(route(&argv(&["runn"])), Route::Usage(_)));
-        assert!(matches!(route(&argv(&["check", "-f"])), Route::Usage(_)));
-        assert!(matches!(route(&argv(&["check", "extra"])), Route::Usage(_)));
+        assert!(matches!(route(&mut argv(&[])), Route::Usage(_)));
+        assert!(matches!(route(&mut argv(&["runn"])), Route::Usage(_)));
+        assert!(matches!(
+            route(&mut argv(&["check", "-f"])),
+            Route::Usage(_)
+        ));
+        assert!(matches!(
+            route(&mut argv(&["check", "extra"])),
+            Route::Usage(_)
+        ));
     }
 
     /// The four control verbs address the RUNNING supervisor, not a file, and
@@ -407,9 +500,9 @@ mod tests {
             (vec!["poweroff"], "poweroff"),
             (vec!["halt"], "halt"),
         ] {
-            let args: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+            let mut args: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
             assert_eq!(
-                route(&args),
+                route(&mut args),
                 Route::Ctl {
                     request: expect.to_string()
                 },
@@ -421,9 +514,9 @@ mod tests {
         // `td-svc reboot`; if that stopped reaching the socket the greeter
         // could no longer end a boot.
         for verb in CTL_VERBS {
-            let args = vec![verb.to_string()];
+            let mut args = vec![verb.to_string()];
             assert_eq!(
-                route(&args),
+                route(&mut args),
                 Route::Ctl {
                     request: verb.to_string()
                 },
@@ -445,7 +538,7 @@ mod tests {
     #[test]
     fn the_sentinel_verb_routes_to_the_sentinel() {
         assert_eq!(
-            route(&argv(&[cad::SENTINEL_VERB])),
+            route(&mut argv(&[cad::SENTINEL_VERB])),
             Route::CadSentinel,
             "the argv arm_cad spawns does not reach the sentinel"
         );
@@ -461,9 +554,9 @@ mod tests {
     /// and nothing after the verb is taken silently.
     #[test]
     fn the_oom_watch_verb_routes_to_the_watcher_and_takes_nothing() {
-        assert_eq!(route(&argv(&[oom::VERB])), Route::OomWatch);
+        assert_eq!(route(&mut argv(&[oom::VERB])), Route::OomWatch);
         assert!(matches!(
-            route(&argv(&[oom::VERB, "-f"])),
+            route(&mut argv(&[oom::VERB, "-f"])),
             Route::Usage(why) if why.contains("takes no argument")
         ));
         assert!(!CTL_VERBS.contains(&oom::VERB));
@@ -474,12 +567,12 @@ mod tests {
     /// addressed a different supervisor when it addressed the only one there is.
     #[test]
     fn a_control_verb_refuses_a_table_option_rather_than_ignoring_it() {
-        let args: Vec<String> = ["stop", "-f", "/etc/other.conf"]
+        let mut args: Vec<String> = ["stop", "-f", "/etc/other.conf"]
             .iter()
             .map(|a| (*a).to_string())
             .collect();
         assert!(
-            matches!(route(&args), Route::Usage(why) if why.contains("unexpected option")),
+            matches!(route(&mut args), Route::Usage(why) if why.contains("unexpected option")),
             "a control verb accepted -f"
         );
     }
@@ -487,19 +580,20 @@ mod tests {
     /// ...while `check` and `run` still take one, and still default it.
     #[test]
     fn check_and_run_still_take_a_table_path() {
-        let args: Vec<String> = vec!["run".to_string()];
+        let mut args: Vec<String> = vec!["run".to_string()];
         assert_eq!(
-            route(&args),
+            route(&mut args),
             Route::Run {
-                path: DEFAULT_PATH.to_string()
+                path: DEFAULT_PATH.to_string(),
+                press: cad::Press::Reboot,
             }
         );
-        let args: Vec<String> = ["check", "-f", "/tmp/x.conf"]
+        let mut args: Vec<String> = ["check", "-f", "/tmp/x.conf"]
             .iter()
             .map(|a| (*a).to_string())
             .collect();
         assert_eq!(
-            route(&args),
+            route(&mut args),
             Route::Check {
                 path: "/tmp/x.conf".to_string()
             }

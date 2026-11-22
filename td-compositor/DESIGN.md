@@ -6192,9 +6192,16 @@ does not prove that a usable keyboard remains or that the attention chord is
 reachable; removing the last keyboard denies that input path until another
 is attached. Startup input counts are not an authentication-readiness claim.
 
-Only the root-paired stock compositor profile reserves Ctrl+Alt+Esc. The
-Escape press opens an opaque, built-in screen with no pending authorization
-request. The evdev adapter alone can construct the private origin witness
+Only the root-paired stock compositor profile reserves Ctrl+Alt+Esc and
+Ctrl+Alt+Delete, with either Delete key (the main one or the keypad's),
+the attention chord either way; what is said of the Escape press that
+opens it holds for a Delete press, while Escape alone cancels an open
+screen. The press opens an opaque, built-in screen with no pending
+authorization request. The kernel also maps both Ctrl+Alt+Delete chords
+to Ctrl-Alt-Del, and the desktop image's td-svc ignores them while this
+compositor's unit runs (td-svc/DESIGN.md §9), so the same press restarts
+nothing; restarting is the screen's own `R`, which asks first. The evdev
+adapter alone can construct the private origin witness
 required by Runtime's transition method. Control, Wayland and portal clients
 have no transition request, and ordinary key/pointer APIs suppress input
 while the screen is active. Direct development mode leaves the chord alone.
@@ -7696,7 +7703,8 @@ but a session process can choose which window has focus once the
 session unlocks, and read window titles and the arrangement behind the
 lock.
 
-On the lock surface Ctrl+Alt+Esc is the selection: it opens attention
+On the lock surface the chord, Ctrl+Alt+Esc or Ctrl+Alt+Delete, is the
+selection: it opens attention
 straight into a login unlock, the lifetime's one operation, and the
 private client sends `1b 07`, while the last `1a` answer is enrolled.
 Unavailable, the chord's attention screen shows the cause's two rows,
@@ -7707,8 +7715,8 @@ polling, after which the chord's unlock returns. A session whose state
 turns unenrolled while locked so stays locked for its generation. The
 attention screen opened there shows `PREPARING REQUEST`, never the
 menu, and the menu's and key-management screen's keys select nothing.
-The chord is read under the selection's rules: its Escape a fresh
-press, and Control and Alt held, each on a device secure attention
+The chord is read under the selection's rules: its Escape or Delete a
+fresh press, and Control and Alt held, each on a device secure attention
 reads, so a security key's own keyboard's chord leaves the lock
 surface as it was; its Escape still cancels an unlock another keyboard
 opened. One attention lifetime carries the

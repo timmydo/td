@@ -253,12 +253,12 @@ mod tests {
         let left = args(&["/first", "", "two words", "--"]);
         let right = args(&["/second", "1", ""]);
         let command = command(&left, &right).unwrap();
-        let wire: Vec<String> = command
+        let mut wire: Vec<String> = command
             .get_args()
             .map(|s| s.to_str().unwrap().to_string())
             .collect();
         assert!(
-            matches!(crate::route(&wire), crate::Route::PairRun { left: a, right: b } if a == left && b == right)
+            matches!(crate::route(&mut wire), crate::Route::PairRun { left: a, right: b } if a == left && b == right)
         );
     }
 

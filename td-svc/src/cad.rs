@@ -41,6 +41,43 @@ pub const CAD_PID: &str = "/proc/sys/kernel/cad_pid";
 /// dispatcher cannot disagree about what a sentinel is.
 pub const SENTINEL_VERB: &str = "cad-sentinel";
 
+/// The `run` option that says what a press does.
+pub const PRESS_OPTION: &str = "--ctrl-alt-del";
+
+/// What a press does, which the image declares on `run`'s command line
+/// (DESIGN.md §9). Either way the hard reset stays disabled and the
+/// sentinel armed: only the answer to its SIGINT death differs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Press {
+    /// The ordered reboot. The default, and the server image's.
+    Reboot,
+    /// `attention=UNIT`: while the named unit is running, logged and re-armed
+    /// with nothing stopped, since that unit, the desktop's paired compositor,
+    /// reads the same chord from evdev and opens secure attention; otherwise
+    /// the ordered reboot.
+    Attention(String),
+}
+
+impl Press {
+    /// `reboot`, or `attention=` and a unit name in the table's own syntax.
+    /// Takes the argument whole so the name is kept in place, not copied.
+    pub fn parse(mut value: String) -> Option<Press> {
+        const ATTENTION: &str = "attention=";
+        if value == "reboot" {
+            return Some(Press::Reboot);
+        }
+        if !value.starts_with(ATTENTION) {
+            return None;
+        }
+        value.drain(..ATTENTION.len());
+        let named = !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        named.then_some(Press::Attention(value))
+    }
+}
+
 /// An armed sentinel: the kernel points at `pid`, and this process holds the
 /// pipe that keeps it blocked.
 pub struct Armed {

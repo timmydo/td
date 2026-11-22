@@ -112,7 +112,8 @@ compositor workspace chords, the help overlay and `Super+q`'s polite
 close of the focused window, a request no stronger than typing into that
 window. Launcher opening and process-launch chords report unavailable;
 they never start a process.
-Ctrl+Alt+Esc is ordinary untrusted input here, never secure attention.
+Ctrl+Alt+Esc and Ctrl+Alt+Delete are ordinary untrusted input here, never
+secure attention.
 
 The seat belongs to the headless process generation, not an individual
 one-request control connection. Held keys and buttons persist across them.

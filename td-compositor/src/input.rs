@@ -114,6 +114,13 @@ const KEY_UP: u16 = 103;
 const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
 const KEY_DOWN: u16 = 108;
+/// With Control and Alt, the second attention chord: the one the kernel's
+/// own keymap also maps to Ctrl-Alt-Del, which td-svc ignores while the
+/// compositor runs. The keypad's Delete, `KEY_KPDOT`, is the same chord, as
+/// the kernel's `control alt keycode 83 = Boot` makes it.
+const KEY_DELETE: u16 = 111;
+/// The chord's last key: Escape, or either Delete.
+const ATTENTION_KEYS: &[u16] = &[KEY_ESC, KEY_DELETE, KEY_KPDOT];
 /// Print on keyboards and Fn layers that send it apart from SysRq.
 const KEY_PRINT: u16 = 210;
 const KEY_LEFTMETA: u16 = 125;
@@ -410,8 +417,8 @@ struct KeyDecision {
     /// while its field is open and was on glass before the press.
     field: Option<(crate::secret_client::FieldKey, u128)>,
     /// This chord may open the lock surface's unlock, which is its
-    /// selection: a fresh Escape and held Control and Alt, each from a
-    /// device secure attention reads.
+    /// selection: a fresh Escape or Delete and held Control and Alt, each
+    /// from a device secure attention reads.
     unlock: bool,
     /// Lock the session: `Super+l`, or the attention menu's `L`, while
     /// root's last `1a` answer is enrolled or unavailable.
@@ -577,7 +584,7 @@ impl KeyBindings {
             _ => None,
         };
         if self.attention_enabled
-            && (event.code == KEY_ESC || website.is_some())
+            && (ATTENTION_KEYS.contains(&event.code) || website.is_some())
             && event.value == KEY_PRESS
             && (self.pressed(KEY_LEFTCTRL) || self.pressed(KEY_RIGHTCTRL))
             && (self.pressed(KEY_LEFTALT) || self.pressed(KEY_RIGHTALT))
@@ -9143,6 +9150,87 @@ mod tests {
         assert!(!bindings.screenshot_open);
     }
 
+    /// Ctrl+Alt+Delete, with either Delete, opens secure attention as
+    /// Ctrl+Alt+Esc does, in the paired profile alone: the press is consumed,
+    /// so no client sees it. Direct development mode leaves the chord to the
+    /// client.
+    #[test]
+    fn ctrl_alt_delete_opens_attention_in_the_paired_profile_alone() {
+        for delete in [KEY_DELETE, KEY_KPDOT] {
+            let mut paired = KeyBindings {
+                attention_enabled: true,
+                ..KeyBindings::default()
+            };
+            press(&mut paired, KEY_LEFTCTRL);
+            press(&mut paired, KEY_LEFTALT);
+            let decision = paired.feed(key(delete, KEY_PRESS));
+            assert_eq!(decision.attention, Some(true), "{delete}");
+            assert!(decision.unlock, "{delete}");
+            assert!(decision.forward.is_none(), "{delete}");
+            assert!(paired.attention == AttentionState::Open, "{delete}");
+
+            let mut direct = KeyBindings::default();
+            press(&mut direct, KEY_LEFTCTRL);
+            press(&mut direct, KEY_LEFTALT);
+            let decision = direct.feed(key(delete, KEY_PRESS));
+            assert_eq!(decision.attention, None, "{delete}");
+            assert!(direct.attention == AttentionState::Closed, "{delete}");
+            assert_eq!(
+                decision.forward.map(|input| input.key),
+                Some(u32::from(delete))
+            );
+        }
+    }
+
+    /// On an open screen the chord is not Escape: a fresh Ctrl+Alt+Delete
+    /// neither drains the screen nor selects an operation, and nothing
+    /// reopens it.
+    #[test]
+    fn ctrl_alt_delete_on_an_open_screen_neither_drains_nor_selects() {
+        for delete in [KEY_DELETE, KEY_KPDOT] {
+            let mut bindings = KeyBindings {
+                attention_enabled: true,
+                ..KeyBindings::default()
+            };
+            press(&mut bindings, KEY_LEFTCTRL);
+            press(&mut bindings, KEY_LEFTALT);
+            assert_eq!(bindings.feed(key(KEY_ESC, KEY_PRESS)).attention, Some(true));
+            for code in [KEY_ESC, KEY_LEFTALT, KEY_LEFTCTRL] {
+                bindings.feed(key(code, KEY_RELEASE));
+            }
+            press(&mut bindings, KEY_LEFTCTRL);
+            press(&mut bindings, KEY_LEFTALT);
+            let decision = bindings.feed(key(delete, KEY_PRESS));
+            assert!(!decision.draining, "{delete}");
+            assert!(decision.secret.is_none(), "{delete}");
+            assert!(decision.notice.is_none(), "{delete}");
+            assert_eq!(decision.attention, None, "{delete}");
+            assert!(bindings.attention == AttentionState::Open, "{delete}");
+        }
+    }
+
+    /// A security key's own keyboard's Ctrl+Alt+Delete is read as its
+    /// Ctrl+Alt+Esc is ("A security key's own keyboard"): it may open the
+    /// screen, so a lone such keyboard can leave it again, but it is never
+    /// the lock surface's selection and selects nothing.
+    #[test]
+    fn a_security_keys_keyboard_delete_chord_is_never_a_selection() {
+        const KEY: usize = 1;
+        for delete in [KEY_DELETE, KEY_KPDOT] {
+            let mut bindings = KeyBindings {
+                attention_enabled: true,
+                attention_excluded: BTreeSet::from([KEY]),
+                ..KeyBindings::default()
+            };
+            bindings.feed_device(KEY, key(KEY_LEFTCTRL, KEY_PRESS));
+            bindings.feed_device(KEY, key(KEY_LEFTALT, KEY_PRESS));
+            let decision = bindings.feed_device(KEY, key(delete, KEY_PRESS));
+            assert!(!decision.unlock, "{delete}");
+            assert!(decision.secret.is_none(), "{delete}");
+            assert!(decision.forward.is_none(), "{delete}");
+        }
+    }
+
     /// A card whose closing paint failed is still down: the adapter settles
     /// its capture before the error, so the next key reaches the client
     /// rather than a card nobody can see.
@@ -12406,11 +12494,16 @@ mod tests {
 
     /// Ctrl+Alt+Esc, each change its own report, opening attention.
     fn chord_reports(from: u32) -> Vec<Event> {
+        chord_reports_with(KEY_ESC, from)
+    }
+
+    /// Ctrl+Alt and `last`, each change its own report.
+    fn chord_reports_with(last: u16, from: u32) -> Vec<Event> {
         [
             (KEY_LEFTCTRL, KEY_PRESS),
             (KEY_LEFTALT, KEY_PRESS),
-            (KEY_ESC, KEY_PRESS),
-            (KEY_ESC, KEY_RELEASE),
+            (last, KEY_PRESS),
+            (last, KEY_RELEASE),
             (KEY_LEFTCTRL, KEY_RELEASE),
             (KEY_LEFTALT, KEY_RELEASE),
         ]
@@ -14705,6 +14798,10 @@ mod tests {
             self.read(0, from, chord_reports(from + 1));
         }
 
+        fn chord_with(&self, last: u16, from: u32) {
+            self.read(0, from, chord_reports_with(last, from + 1));
+        }
+
         fn press(&self, codes: &[u16], from: u32) {
             self.read(0, from, presses(codes, from + 1));
         }
@@ -14914,6 +15011,23 @@ mod tests {
             .filter(|call| call.first() == Some(&0x1c))
             .collect();
         assert_eq!(pins, [&pin]);
+    }
+
+    /// Ctrl+Alt+Delete is the lock surface's selection too: the same login
+    /// unlock as Ctrl+Alt+Esc, in one lifetime.
+    #[test]
+    fn ctrl_alt_delete_on_the_lock_surface_selects_the_unlock() {
+        use crate::secret_client::{LoginSelection, Selection};
+        for delete in [KEY_DELETE, KEY_KPDOT] {
+            let seat = LockedSeat::new(&[]);
+            seat.chord_with(delete, 10);
+            assert!(seat.attention_open());
+            let attempt = seat.queued.attempt().unwrap();
+            assert_eq!(
+                attempt.selection(),
+                &Selection::Login(LoginSelection::Unlock)
+            );
+        }
     }
 
     /// A failure leaves the session locked with its text on the trusted
@@ -15364,16 +15478,19 @@ mod tests {
         assert!(seat.locked() && seat.attention_open());
     }
 
-    /// A security key's own keyboard opens no unlock on the paired seat:
-    /// nothing reaches the worker and the lock surface stays.
+    /// A security key's own keyboard opens no unlock on the paired seat,
+    /// with Escape or either Delete: nothing reaches the worker and the lock
+    /// surface stays.
     #[test]
     fn a_security_keys_chord_reaches_no_worker() {
         const KEY: usize = 1;
-        let seat = LockedSeat::new(&[KEY]);
-        seat.read(KEY, 10, chord_reports(11));
-        assert!(seat.queued.attempt().is_none());
-        assert!(!seat.attention_open() && seat.locked());
-        assert!(seat.glass() == seat.lock_surface());
+        for last in [KEY_ESC, KEY_DELETE, KEY_KPDOT] {
+            let seat = LockedSeat::new(&[KEY]);
+            seat.read(KEY, 10, chord_reports_with(last, 11));
+            assert!(seat.queued.attempt().is_none(), "{last}");
+            assert!(!seat.attention_open() && seat.locked(), "{last}");
+            assert!(seat.glass() == seat.lock_surface(), "{last}");
+        }
     }
 
     /// Root's `9a` for `state`, with the names `login_answer` gives.
