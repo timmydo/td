@@ -729,6 +729,8 @@ pub(super) struct Switch {
     stopped: bool,
     dropin: Option<Setting>,
     backup: Option<Setting>,
+    /// The Debian tree's window the source's verified switch recorded.
+    window: Option<u64>,
 }
 
 impl Switch {
@@ -739,6 +741,7 @@ impl Switch {
             stopped: false,
             dropin: None,
             backup: None,
+            window: None,
         }
     }
 
@@ -809,8 +812,9 @@ impl Deployment {
             self.probes.probe("jmap")?;
             // A host switched before the time was recorded starts its
             // Debian tree's window now.
-            super::retire::record_switch(
+            super::retire::start_window(
                 Path::new(super::retire::SWITCHED),
+                Path::new(crate::common::DEBIAN_POSTGRES),
                 super::retire::now_secs()?,
                 false,
             )?;
@@ -941,11 +945,10 @@ impl Deployment {
         // a leftover backup drop-in this run adopted included.
         switch.dropin = Some(setting);
         switch.backup = Some(backup);
-        // An unverified td server never inherits a window: only the
-        // verified end of this switch records one.
-        if matches!(switch.source, Source::Debian) {
-            super::retire::clear_switch(Path::new(super::retire::SWITCHED))?;
-        }
+        // An unverified server never inherits a window: only the verified
+        // end of this switch records one. A rollback to a td source puts
+        // back the time its own verified switch recorded.
+        switch.window = super::retire::take_switch(Path::new(super::retire::SWITCHED))?;
         switch.stopped = true;
         self.host
             .run(self.host.cmd("systemctl").args(["stop", PG]))?;
@@ -1000,12 +1003,12 @@ impl Deployment {
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
         require(self.active_timers()? == self.timers, "timer set changed")?;
-        // Leaving the Debian server starts its tree's window; another td
-        // closure keeps the window it has.
-        super::retire::record_switch(
+        // This verified closure starts the Debian tree's window.
+        super::retire::start_window(
             Path::new(super::retire::SWITCHED),
+            Path::new(crate::common::DEBIAN_POSTGRES),
             super::retire::now_secs()?,
-            matches!(switch.source, Source::Debian),
+            true,
         )?;
         self.event("verified td-built PostgreSQL")?;
         Ok(())
@@ -1099,8 +1102,9 @@ impl Deployment {
             !Path::new(BINARIES_DROPIN).try_exists()? && !Path::new(BACKUP_DROPIN).try_exists()?,
             "PostgreSQL binaries drop-in remains",
         )?;
-        // Only a later verified switch starts the tree's window again.
-        super::retire::clear_switch(Path::new(super::retire::SWITCHED))?;
+        // Only a later verified switch starts the tree's window again; a
+        // rollback to td puts this one back.
+        switch.window = super::retire::take_switch(Path::new(super::retire::SWITCHED))?;
         self.host.select_tools(None);
         self.host
             .run(self.host.cmd("systemctl").arg("daemon-reload"))?;
@@ -1573,7 +1577,21 @@ impl Deployment {
                 "source PostgreSQL restored: {}",
                 switch.source.name()
             ))?),
-        )
+        )?;
+        // The restored td closure was verified when its switch recorded
+        // this. Absence is the safe state, which a verified rerun rewrites.
+        let note = match super::retire::put_back(
+            Path::new(super::retire::SWITCHED),
+            Path::new(crate::common::DEBIAN_POSTGRES),
+            matches!(switch.source, Source::Td { .. }),
+            switch.window,
+        ) {
+            Ok(true) => owned("Debian tree window restored")?,
+            Ok(false) => owned("no Debian tree window to restore")?,
+            Err(e) => fmt(format_args!("Debian tree window not restored: {e}"))?,
+        };
+        self.event(&note)?;
+        Ok(())
     }
 }
 

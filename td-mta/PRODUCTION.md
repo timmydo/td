@@ -779,20 +779,26 @@ each physical recovery copy under `/data/td-mta-physical-recovery` (base
 backup, WAL and `bootstrap.tar`; copies taken before the socket cutover
 hold the old TLS directory and its CA key). While td's server is
 selected, the retained Debian tree `/opt/td-mta/postgresql` is material
-too, from the time a verified switch left the Debian server, which the
-switch records in
-`/var/lib/td-mta-operator/debian-postgresql-retained-since`. A switch
-from the Debian server clears that record before it stops the server and
-writes it only once verified; a switch between td closures keeps it; a
-verified rerun on td's server writes it when none is, or none readable;
-`--to-debian` clears it once the drop-ins are gone, and its rerun on the
-Debian server too. Retirement never writes it: without a record, or
-unless the running server is the selected td one mapping only its
-closure and the backup job runs its tools, the tree stays, the rest
-still goes, and the receipt's `debian_tree_kept` names what to run. Once
-the tree is gone the record goes too, `--to-debian` refuses, and the
-server moves only between td closures. Removing material cannot be
-undone, so the command names that:
+too, from the time the switch to the running td closure verified, which
+the switch records in
+`/var/lib/td-mta-operator/debian-postgresql-retained-since`. Every
+switch to a td closure, between td closures included, clears that record
+before it stops the server and writes it, with that time, only once
+verified; `--to-debian` clears it once the drop-ins are gone, and its
+rerun on the Debian server too. Either one's rollback before writer
+admission to a td closure puts back the time that closure's own switch
+recorded (the receipt says whether), so a switch that fails after
+writers returned leaves no window, and nor does a rollback whose source
+had none or whose put-back failed: a verified rerun on td's server
+(`--postgres-binaries` naming the running closure) writes it when none
+is, or none readable. Nothing is written once the tree is gone.
+Retirement never writes it: without a record, or unless the running
+server is the selected td one mapping only its closure and the backup
+job runs its tools, the tree stays, the rest still goes, and the
+receipt's `debian_tree_kept` names what to run. Once the tree is gone
+the record goes too, `--to-debian` refuses, and the server moves only
+between td closures. Removing material cannot be undone, so the command
+names that:
 
 ```text
 ./td-mta/deploy --retire-rollback --irreversible

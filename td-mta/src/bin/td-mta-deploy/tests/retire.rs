@@ -134,7 +134,8 @@ fn the_debian_tree_counts_from_the_switch_that_left_it() {
     assert_eq!(switched_at(&record), None);
     record_switch(&record, 100, false).unwrap();
     assert_eq!(switched_at(&record), Some(100));
-    // Another td closure keeps the window; leaving Debian restarts it.
+    // A verified rerun keeps a recorded window; a verified switch or a
+    // rollback's put-back writes its own.
     record_switch(&record, 200, false).unwrap();
     assert_eq!(switched_at(&record), Some(100));
     record_switch(&record, 300, true).unwrap();
@@ -190,4 +191,41 @@ fn the_debian_tree_counts_from_the_switch_that_left_it() {
     assert_eq!(dead, Some(root.join(".retired-postgresql")));
     let (found, dead) = debian_material(&tree, &record, true).unwrap();
     assert!(found.is_some() && dead.is_some());
+}
+
+#[test]
+fn a_switch_takes_the_window_and_only_verification_or_rollback_writes_it() {
+    let dir = td_fs::TempDir::new("retire-window").unwrap();
+    let root = dir.path();
+    let record = root.join("since");
+    let tree = root.join("postgresql");
+    fs::create_dir(&tree).unwrap();
+    record_switch(&record, 100, true).unwrap();
+    // Before the stop: the time so far, and nothing left meanwhile.
+    assert_eq!(take_switch(&record).unwrap(), Some(100));
+    assert!(!record.exists());
+    assert_eq!(take_switch(&record).unwrap(), None);
+    fs::write(&record, "garbage").unwrap();
+    assert_eq!(take_switch(&record).unwrap(), None);
+    assert!(!record.exists());
+    // A rollback to a td source puts back that closure's own time.
+    assert!(put_back(&record, &tree, true, Some(100)).unwrap());
+    assert_eq!(switched_at(&record), Some(100));
+    clear_switch(&record).unwrap();
+    assert!(!put_back(&record, &tree, false, Some(100)).unwrap());
+    assert!(!put_back(&record, &tree, true, None).unwrap());
+    assert!(!record.exists());
+    // A verified rerun after a taken window starts it now.
+    start_window(&record, &tree, 500, false).unwrap();
+    assert_eq!(switched_at(&record), Some(500));
+    start_window(&record, &tree, 600, false).unwrap();
+    assert_eq!(switched_at(&record), Some(500));
+    start_window(&record, &tree, 700, true).unwrap();
+    assert_eq!(switched_at(&record), Some(700));
+    // Once the tree is gone nothing is written.
+    clear_switch(&record).unwrap();
+    fs::remove_dir(&tree).unwrap();
+    start_window(&record, &tree, 800, true).unwrap();
+    assert!(!put_back(&record, &tree, true, Some(100)).unwrap());
+    assert!(!record.exists());
 }

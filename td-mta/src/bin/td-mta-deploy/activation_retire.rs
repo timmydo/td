@@ -22,8 +22,8 @@ pub(super) fn now_secs() -> R<u64> {
 }
 
 /// The time `SWITCHED` holds; none if absent or unreadable in any way,
-/// which only a verified switch or a verified rerun on td's server
-/// rewrites. Until then the tree stays.
+/// which only a verified switch, a verified rerun on td's server or a
+/// rollback to a verified td closure rewrites. Until then the tree stays.
 pub(super) fn switched_at(path: &Path) -> Option<u64> {
     td_fs::read_bounded(path, 64)
         .ok()
@@ -31,9 +31,10 @@ pub(super) fn switched_at(path: &Path) -> Option<u64> {
         .and_then(|text| text.trim().parse().ok())
 }
 
-/// Records `now` in `path` atomically: after a verified switch from the
-/// Debian server always, otherwise only where nothing valid is recorded.
-/// Its staged name is fixed: the activation lock admits one writer.
+/// Records `now` in `path` atomically: always with `restart` (a verified
+/// switch, a rollback's put-back), else only where nothing valid is
+/// recorded (a verified rerun). Its staged name is fixed: the activation
+/// lock admits one writer.
 pub(super) fn record_switch(path: &Path, now: u64, restart: bool) -> R<()> {
     if !restart && switched_at(path).is_some() {
         return Ok(());
@@ -57,6 +58,35 @@ pub(super) fn record_switch(path: &Path, now: u64, restart: bool) -> R<()> {
         let _ = remove_file(&staged);
     }
     result
+}
+
+/// Before a switch stops the server: the time recorded so far, and none
+/// left while the switch is unverified.
+pub(super) fn take_switch(path: &Path) -> R<Option<u64>> {
+    let window = switched_at(path);
+    clear_switch(path)?;
+    Ok(window)
+}
+
+/// A verified td closure starts the window at `now` (`restart`), or a
+/// verified rerun where none is recorded; nothing once the tree is gone.
+pub(super) fn start_window(path: &Path, tree: &Path, now: u64, restart: bool) -> R<()> {
+    if !tree.try_exists()? {
+        return Ok(());
+    }
+    record_switch(path, now, restart)
+}
+
+/// After a rollback to a td source: the time that closure's own verified
+/// switch recorded, if any and while the tree exists. Whether it did.
+pub(super) fn put_back(path: &Path, tree: &Path, td_source: bool, window: Option<u64>) -> R<bool> {
+    match window {
+        Some(window) if td_source && tree.try_exists()? => {
+            record_switch(path, window, true)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// After the return to the Debian server: nothing left it.
@@ -253,7 +283,7 @@ impl Deployment {
             debian_material(Path::new(DEBIAN_POSTGRES), Path::new(SWITCHED), td_selected)?;
         if td_selected && tree.is_none() {
             kept = Some(owned(
-                "no verified switch recorded when it left the Debian server: run td-mta/deploy --postgres-binaries",
+                "no verified switch to the running td PostgreSQL recorded: run td-mta/deploy --postgres-binaries",
             )?);
         }
         if let (true, Some(reason)) = (present, kept) {
