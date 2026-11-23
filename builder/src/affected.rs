@@ -3617,7 +3617,9 @@ fn cargo_group_key(cmd: &str) -> Option<String> {
 /// list, and each cargo run left most of the machine idle: a crate's suite
 /// builds one crate and runs a few hundred tests, and there are nineteen of
 /// them after the workspace's. The groups are independent, each with its own
-/// target directory, so they run beside each other; within a group the order
+/// target directory except the crypto-cargo groups, which share one: Cargo's
+/// build lock serializes their builds, and crypto_build.rs keeps what they
+/// build identical. So they run beside each other; within a group the order
 /// holds and the first failure ends it, since clippy after a failed test is
 /// noise, while every group runs to its end so one red crate does not hide
 /// another. The exit code is the first non-zero one in table order.

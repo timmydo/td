@@ -132,6 +132,8 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         .map_err(|e| format!("crypto vendor path: {e}"))?;
     let vendor = vendor.to_str().ok_or("crypto vendor path must be UTF-8")?;
     let quoted = td_engine::json::Json::Str(vendor.into()).to_json_string();
+    // Concurrent legs share this directory: every build into it uses the mail
+    // vendor directory, and a build from another vendor takes a subdirectory.
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .unwrap_or_else(|| root.join(".td-build-cache/crypto-target").into_os_string());
     let command = |verb: &str, manifest: &str| {
@@ -268,6 +270,17 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             .ok_or("fetch fixture vendor path must be UTF-8")?;
         let quoted = td_engine::json::Json::Str(net_vendor.into()).to_json_string();
         let mut fetch = command("test", "net/Cargo.toml");
+        // Its vendor directory differs from the crypto graph's, so in the
+        // shared target directory the crates both graphs name, and rustls
+        // above them, would be rebuilt in place under another leg reading
+        // them.
+        let fetch_target = target
+            .to_str()
+            .ok_or("crypto fixture target must be UTF-8")?;
+        let fetch_target =
+            td_engine::allocation::format(format_args!("{fetch_target}/net-fixture"))
+                .map_err(|_| String::new())?;
+        fetch.env("CARGO_TARGET_DIR", fetch_target);
         if inbox_perf {
             fetch.arg("--release");
         }

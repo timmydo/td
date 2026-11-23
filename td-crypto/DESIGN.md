@@ -122,6 +122,11 @@ provisioned `cc` (td-link on a td host) as its linker driver only: no
 admitted crate compiles C, and the wrapper sets no C compiler or archiver
 for build scripts. Host invocations
 share `.td-build-cache/crypto-target` unless CARGO_TARGET_DIR is supplied.
+Every build into it uses td-mta's locked vendor directory: the same registry
+crate from another vendor directory has the same artifact name and would be
+rebuilt in place under a concurrent leg reading it, so td-mta's td-net fetch
+fixture, built from td-net's vendor directory, builds in its `net-fixture`
+subdirectory.
 Verified archive extraction and tree hashing repeat for each invocation; a
 persisted digest alone cannot authenticate changed source bytes. Its build is
 not the portable artifact: M03b2 separately pins all portable inputs and
