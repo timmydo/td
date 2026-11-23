@@ -18,19 +18,28 @@ use td_json::Json;
 
 #[path = "launcher_closure.rs"]
 mod closure;
+#[path = "launcher_files.rs"]
+mod files;
 
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [OPTIONS]
        td-mta/deploy --postgres-binaries --postgres-minor-reviewed 17.N [OPTIONS]
+       td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
+         --identity KEY --jmap-account ACCOUNT --jmap-url URL [--config FILE] [--replace]
+       td-mta/deploy --provision-host --build-account ACCOUNT --build-home DIR
+         --public-name NAME [--config FILE] [--replace]
 Options: [--window-seconds 1..3600] [--jmap-account ACCOUNT] [--config FILE]
 Select a verified origin/main revision and deploy it to the configured host,
 move the live release's database from loopback TLS to its private socket, or
 switch it from the Debian PostgreSQL to td's source-built one. 17.N is the
 live Debian release whose notes up to td's release the operator read. The
 target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
-~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md).";
+~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
+writes that file; --provision-host then prepares the host's build account
+and installs its /var/lib/td-mta-operator/host.json. Either refuses to
+change an existing file that says something else unless --replace.";
 struct Options<'a> {
     skip: bool,
     budget: u64,
@@ -282,16 +291,28 @@ impl Local {
         Ok((owned(live)?, None))
     }
     fn save(&self, path: &str, value: &Json) -> R<()> {
+        self.save_bytes(path, fmt(format_args!("{value}"))?.as_bytes())
+    }
+    /// Replace `path` on the host with a root-owned mode-0600 file.
+    fn save_bytes(&self, path: &str, bytes: &[u8]) -> R<()> {
         let tmp = fmt(format_args!("{path}.pending"))?;
         self.host.exec(
             &mut self.ssh(&["sudo", "-n", "install", "-m", "0600", "/dev/stdin", &tmp])?,
-            fmt(format_args!("{value}"))?.as_bytes(),
+            bytes,
             Duration::from_secs(30),
             true,
         )?;
         self.sudo(&["mv", "-T", &tmp, path])?;
         self.sudo(&["sync", "-f", path])?;
         Ok(())
+    }
+    /// The exit status of `args` on the host, run as the login account.
+    fn remote_status(&self, args: &[&str]) -> R<Option<i32>> {
+        Ok(self
+            .host
+            .exec(&mut self.ssh(args)?, &[], Duration::from_secs(40), false)?
+            .status
+            .code())
     }
     fn upload(&self, file: &Path, dst: &str, mode: &str) -> R<()> {
         let mut c = self.ssh(&["sudo", "-n", "install", "-m", mode, "/dev/stdin", dst])?;
@@ -500,28 +521,94 @@ impl Local {
         now()
     }
 }
+/// The operator's home (absolute), the target configuration `config` or
+/// the default path names, and a session to the host it names.
+fn session(config: Option<&str>) -> R<(Local, Target, PathBuf)> {
+    let host = Host::default();
+    let root = PathBuf::from(host.out(Command::new("git").args(["rev-parse", "--show-toplevel"]))?);
+    let home = operator_home()?;
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let target = Target::load(config.map(Path::new), &home, xdg.as_deref())?;
+    let local = Local {
+        host,
+        root,
+        destination: owned(&target.destination)?,
+        key: PathBuf::from(owned(
+            target
+                .identity
+                .to_str()
+                .ok_or("deploy target: invalid identity")?,
+        )?),
+    };
+    Ok((local, target, home))
+}
+fn operator_home() -> R<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("operator home")?);
+    require(home.is_absolute(), "operator home must be absolute")?;
+    Ok(home)
+}
+/// The command that follows: its arguments, and the options whose values
+/// the operator supplies.
+struct Next<'a> {
+    argv: &'a [&'a str],
+    needs: &'a [&'a str],
+}
+struct Outcome<'a> {
+    result: &'a str,
+    error: Option<&'a str>,
+    next: Option<Next<'a>>,
+}
+fn strings(list: &[&str]) -> R<Json> {
+    let mut out = Vec::new();
+    for item in list {
+        td_alloc::push(&mut out, Json::Str(owned(item)?))?;
+    }
+    Ok(Json::Arr(out))
+}
+/// `td-mta-deploy-outcome` and a JSON object: what happened, the refusal
+/// if any, and the command that follows, if any.
+fn outcome_line(outcome: &Outcome<'_>) -> R<String> {
+    let mut line = Json::Obj(Vec::new());
+    set(&mut line, "result", Json::Str(owned(outcome.result)?))?;
+    if let Some(error) = outcome.error {
+        set(&mut line, "error", Json::Str(owned(error)?))?;
+    }
+    let next = match &outcome.next {
+        Some(next) => {
+            let mut object = Json::Obj(Vec::new());
+            set(&mut object, "argv", strings(next.argv)?)?;
+            set(&mut object, "needs", strings(next.needs)?)?;
+            object
+        }
+        None => Json::Null,
+    };
+    set(&mut line, "next", next)?;
+    fmt(format_args!("td-mta-deploy-outcome {line}\n"))
+}
+/// The command's final stdout line, for whoever runs it next.
+fn outcome(outcome: &Outcome<'_>) -> R<()> {
+    let mut out = std::io::stdout().lock();
+    std::io::Write::write_all(&mut out, outcome_line(outcome)?.as_bytes())?;
+    std::io::Write::flush(&mut out)?;
+    Ok(())
+}
 pub(super) fn run(args: &[String]) -> R<()> {
     if matches!(args,[s] if s=="--help"||s=="-h") {
         println!("{HELP}");
         return Ok(());
     }
+    match args.split_first() {
+        Some((first, rest)) if first == "--write-target" => return files::write_target(rest),
+        Some((first, rest)) if first == "--provision-host" => return files::provision_host(rest),
+        _ => (),
+    }
     let opts = parse(args)?;
-    let host = Host::default();
-    let root = PathBuf::from(host.out(Command::new("git").args(["rev-parse", "--show-toplevel"]))?);
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or("operator home")?);
-    require(home.is_absolute(), "operator home must be absolute")?;
-    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-    let target = Target::load(opts.config.map(Path::new), &home, xdg.as_deref())?;
+    let (local, target, home) = session(opts.config)?;
     let account = opts.account.unwrap_or(&target.jmap_account);
-    let local = Local {
-        host,
-        root,
-        destination: target.destination,
-        key: target.identity,
-    };
+    local.login()?;
     // The host's own description names its build mirror and identity.
     let site = local.sudo(&["cat", "--", HOST_CONFIG]).map_err(|_| {
-        "cannot read /var/lib/td-mta-operator/host.json over SSH and sudo; see td-mta/PRODUCTION.md, \"Deploy target configuration\""
+        "cannot read /var/lib/td-mta-operator/host.json over SSH and sudo: provision it with td-mta/deploy --provision-host (td-mta/PRODUCTION.md, \"Deploy target configuration\")"
     })?;
     let site = HostConfig::parse(site.as_bytes())?;
     require(

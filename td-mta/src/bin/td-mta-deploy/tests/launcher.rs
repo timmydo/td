@@ -427,3 +427,228 @@ fn every_library_the_postgresql_output_loads_resolves_inside_the_closure() {
         .collect();
     refused(none, "loads nothing");
 }
+
+fn strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+const TARGET_ARGS: &[&str] = &[
+    "--host",
+    "192.0.2.10",
+    "--host-name",
+    "mx1",
+    "--account",
+    "alice",
+    "--identity",
+    "~/.ssh/deploy",
+    "--jmap-account",
+    "alice",
+    "--jmap-url",
+    "https://mx.example.org/.well-known/jmap",
+];
+
+#[test]
+fn the_file_commands_take_each_field_once_by_flag() {
+    let args = strings(TARGET_ARGS);
+    let v = files::values(&args, crate::target::TARGET_FLAGS, "all").unwrap();
+    assert_eq!((v.config, v.replace), (None, false));
+    assert_eq!(v.fields.len(), 6);
+    assert!(v.fields.contains(&("identity", "~/.ssh/deploy")));
+    let mut more = args.clone();
+    more.extend(strings(&["--replace", "--config", "/tmp/t.json"]));
+    let v = files::values(&more, crate::target::TARGET_FLAGS, "all").unwrap();
+    assert_eq!((v.config, v.replace), (Some("/tmp/t.json"), true));
+    for refused in [
+        strings(&TARGET_ARGS[2..]),
+        strings(&[TARGET_ARGS, &["--host", "192.0.2.11"]].concat()),
+        strings(&[TARGET_ARGS, &["--replace", "--replace"]].concat()),
+        strings(&[TARGET_ARGS, &["--config"]].concat()),
+        strings(&[TARGET_ARGS, &["--port", "22"]].concat()),
+        strings(&TARGET_ARGS[..TARGET_ARGS.len() - 1]),
+        // An option is never taken for the value before it.
+        strings(&[&TARGET_ARGS[..TARGET_ARGS.len() - 1], &["--replace"]].concat()),
+        strings(&[TARGET_ARGS, &["--config", "--replace"]].concat()),
+    ] {
+        assert!(
+            files::values(&refused, crate::target::TARGET_FLAGS, "all").is_err(),
+            "{refused:?}"
+        );
+    }
+    let host = strings(&[
+        "--build-account",
+        "alice",
+        "--build-home",
+        "/home/alice",
+        "--public-name",
+        "mx.example.org",
+    ]);
+    let v = files::values(&host, crate::target::HOST_FLAGS, "all").unwrap();
+    assert_eq!(v.fields.len(), 3);
+    // host_name comes from target.json, never from a flag.
+    let named = [&host[..], &strings(&["--host-name", "mx1"])].concat();
+    assert!(files::values(&named, crate::target::HOST_FLAGS, "all").is_err());
+}
+
+#[test]
+fn write_target_creates_keeps_and_replaces_only_on_request() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let scratch = TempDir::new("deploy-write-target").unwrap();
+    let home = scratch.path().join("home");
+    let args = strings(TARGET_ARGS);
+    let v = files::values(&args, crate::target::TARGET_FLAGS, "all").unwrap();
+    let (text, target) = Target::render(&v.fields, &home).unwrap();
+    let path = crate::target::target_path(None, &home, None).unwrap();
+    assert_eq!(path, home.join(".config/td-mta-deploy/target.json"));
+    // The default directory is created private; an explicit file's is not.
+    let explicit = scratch.path().join("absent/target.json");
+    assert!(files::store_target(&explicit, &text, &target, &home, false, false).is_err());
+    assert_eq!(
+        files::store_target(&path, &text, &target, &home, false, true).unwrap(),
+        "target-written"
+    );
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+    assert_eq!(
+        fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o7777,
+        0o700
+    );
+    assert_eq!(Target::load(None, &home, None).unwrap(), target);
+    assert_eq!(
+        files::store_target(&path, &text, &target, &home, false, true).unwrap(),
+        "target-unchanged"
+    );
+    let other = args
+        .iter()
+        .map(|a| a.replace("192.0.2.10", "192.0.2.20"))
+        .collect::<Vec<_>>();
+    let w = files::values(&other, crate::target::TARGET_FLAGS, "all").unwrap();
+    let (new_text, new_target) = Target::render(&w.fields, &home).unwrap();
+    let refused = files::store_target(&path, &new_text, &new_target, &home, false, true);
+    assert!(refused.unwrap_err().to_string().contains("--replace"));
+    assert_eq!(Target::load(None, &home, None).unwrap(), target);
+    assert_eq!(
+        files::store_target(&path, &new_text, &new_target, &home, true, true).unwrap(),
+        "target-replaced"
+    );
+    assert_eq!(Target::load(None, &home, None).unwrap(), new_target);
+    // No staging file is left beside it.
+    let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["target.json"]);
+    // The same values in a file others can read are rewritten private.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        files::store_target(&path, &new_text, &new_target, &home, false, true).unwrap(),
+        "target-repaired"
+    );
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+    // An unreadable or invalid file is replaced only on request too.
+    fs::write(&path, "{}").unwrap();
+    let refused = files::store_target(&path, &text, &target, &home, false, true);
+    assert_eq!(refused.unwrap_err().to_string(), files::DIFFERS);
+    assert_eq!(fs::read(&path).unwrap(), b"{}");
+    // A bare relative --config names a file in the working directory.
+    assert_eq!(
+        crate::target::target_path(Some(Path::new("t.json")), &home, None).unwrap(),
+        Path::new("t.json")
+    );
+    // The key must be a private regular file.
+    let key = scratch.path().join("key");
+    assert!(files::private_key(&key).is_err());
+    fs::write(&key, "k").unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(files::private_key(&key).is_err());
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    files::private_key(&key).unwrap();
+    assert!(files::private_key(scratch.path()).is_err());
+}
+
+#[test]
+fn host_json_is_written_only_where_absent_wrong_or_replaced_on_request() {
+    use files::{host_decision, Existing};
+    let state = |same, private| Existing { same, private };
+    assert_eq!(host_decision(None, false).unwrap(), "host-provisioned");
+    assert_eq!(
+        host_decision(Some(&state(true, true)), false).unwrap(),
+        "host-unchanged"
+    );
+    assert_eq!(
+        host_decision(Some(&state(true, true)), true).unwrap(),
+        "host-unchanged"
+    );
+    assert_eq!(
+        host_decision(Some(&state(true, false)), false).unwrap(),
+        "host-repaired"
+    );
+    for private in [true, false] {
+        let differs = host_decision(Some(&state(false, private)), false);
+        assert_eq!(differs.unwrap_err().to_string(), files::DIFFERS);
+        assert_eq!(
+            host_decision(Some(&state(false, private)), true).unwrap(),
+            "host-replaced"
+        );
+    }
+}
+
+#[test]
+fn the_outcome_line_is_one_json_object_after_a_fixed_prefix() {
+    let line = outcome_line(&Outcome {
+        result: "target-written",
+        error: None,
+        next: Some(Next {
+            argv: &["td-mta/deploy", "--provision-host", "--config", "t.json"],
+            needs: &["--build-account"],
+        }),
+    })
+    .unwrap();
+    let json = line
+        .strip_prefix("td-mta-deploy-outcome ")
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .unwrap();
+    assert!(!json.contains('\n'));
+    let json = td_json::parse(json).unwrap();
+    assert_eq!(
+        json.get("result").and_then(Json::as_str),
+        Some("target-written")
+    );
+    assert!(json.get("error").is_none());
+    let next = json.get("next").unwrap();
+    assert_eq!(next.get("argv").and_then(Json::as_arr).unwrap().len(), 4);
+    let refused = outcome_line(&Outcome {
+        result: "refused-differs",
+        error: Some(files::DIFFERS),
+        next: None,
+    })
+    .unwrap();
+    let json = td_json::parse(
+        refused
+            .trim()
+            .strip_prefix("td-mta-deploy-outcome ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        json.get("error").and_then(Json::as_str),
+        Some(files::DIFFERS)
+    );
+    assert!(json.get("next").unwrap().is_null());
+}
+
+#[test]
+fn the_build_account_is_unprivileged_and_owns_the_build_home() {
+    let entry = "alice:x:1000:1000:Alice:/home/alice:/bin/bash";
+    files::passwd_home(entry, "/home/alice").unwrap();
+    for (entry, home) in [
+        (entry, "/home/bob"),
+        ("root:x:0:0:root:/home/alice:/bin/sh", "/home/alice"),
+        ("alice:x:1000:1000:Alice:/home/alice", "/home/alice"),
+        (
+            "alice:x:1000:1000:Alice:/home/alice:/bin/sh:x",
+            "/home/alice",
+        ),
+        ("alice:x:u:1000:Alice:/home/alice:/bin/sh", "/home/alice"),
+    ] {
+        assert!(files::passwd_home(entry, home).is_err(), "{entry}");
+    }
+}

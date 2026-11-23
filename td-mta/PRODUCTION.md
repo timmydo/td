@@ -982,80 +982,129 @@ window.
 ### Deploy target configuration
 
 The tool takes its host, accounts, key and public names only from two
-small JSON files the operator provisions outside the repository. Each is
-one object holding exactly the fields below, as strings. A missing,
-unknown, duplicate, mistyped or invalid field refuses with a fixed
-message that never includes a value. Nothing falls back to an
-environment variable or a built-in value.
+small JSON files outside the repository, which two of its own commands
+write from explicit flags. Each file is one object holding exactly the
+fields below, as strings. A missing, unknown, duplicate, mistyped or
+invalid value refuses with a fixed message that never includes a value,
+whether it comes from a flag or a file; no option takes a value starting
+with `--`. Nothing falls back to an environment variable or a built-in
+value. Neither command changes a file that already says something else
+unless given `--replace`, and one that already says the same in a
+private file is left as it is. Both are recognized only as the first
+argument, and both end with an outcome line ([Command
+outcomes](#command-outcomes)).
 
-On the development machine, `target.json` says how to reach the host. The
-launcher reads the file `--config FILE` names, else
-`$XDG_CONFIG_HOME/td-mta-deploy/target.json` when that variable is an
-absolute path, else `~/.config/td-mta-deploy/target.json`. For example:
+These come from the operator and the host's administration, not from
+the tool. The two commands check each but the last before writing; a
+deployment checks the last:
 
-```json
-{
-  "host": "192.0.2.10",
-  "host_name": "mx1",
-  "account": "alice",
-  "identity": "~/.ssh/td-mta-deploy",
-  "jmap_account": "alice",
-  "jmap_url": "https://mx.example.org/.well-known/jmap"
-}
+- the values themselves;
+- the host's SSH key in `~/.ssh/known_hosts` on the development machine
+  (StrictHostKeyChecking): enrolling it is a trust decision, made from a
+  fingerprint obtained over a channel other than SSH;
+- the key authorized for `ADMIN` on the host, and passwordless `sudo -n`
+  for `ADMIN`;
+- Cargo in `.cargo/bin` under the build home;
+- the td-mail account named below, configured with
+  `jmap_url`.
+
+On the development machine, `target.json` says how to reach the host:
+
+```text
+./td-mta/deploy --write-target --host HOST --host-name NAME --account ADMIN \
+  --identity KEY --jmap-account ACCOUNT --jmap-url URL [--config FILE] [--replace]
 ```
 
-- `host`: the SSH host, a DNS name or IPv4 address. There is no port
-  field: for another port, name a `Host` alias from `~/.ssh/config`.
-- `host_name`: the host name the host's own `host.json` must state; the
-  launcher refuses before building when they differ.
-- `account`: the administrator account (`ADMIN`), which logs in, runs
-  `sudo` and pushes into the build mirror. Lowercase letters, digits, `_`,
-  `.` and `-`, starting with a letter or `_`.
-- `identity`: the private key file (`KEY`), an absolute path or one
-  starting with `~/` for the invoking user's home, without `%` or `$`.
-  SSH uses only this key and requires the host's key to be known already.
-- `jmap_account`: the td-mail account of the public JMAP checks;
-  `--jmap-account` overrides it.
-- `jmap_url`: the `https://` discovery URL that account must use.
+It writes the file `--config FILE` names, else
+`$XDG_CONFIG_HOME/td-mta-deploy/target.json` when that variable is an
+absolute path, else `~/.config/td-mta-deploy/target.json`, mode 0600,
+creating the default directory mode 0700. Every launcher mode reads the
+same file. Its result is `target-written`, `target-unchanged`,
+`target-repaired` (the same values in a file others could read, now
+private) or `target-replaced`; its `next` is `--provision-host` with the
+same `--config`.
+
+- `--host` (`host`): the SSH host, a DNS name or IPv4 address, reached
+  on SSH's port.
+- `--host-name` (`host_name`): the host name the host's own `host.json`
+  must state; the launcher refuses before building when they differ.
+- `--account` (`account`): the administrator account (`ADMIN`), which
+  logs in, runs `sudo -n` and pushes into the build mirror. Lowercase
+  letters, digits, `_`, `.` and `-`, starting with a letter or `_`.
+- `--identity` (`identity`): the private key file (`KEY`), an absolute
+  path or one starting with `~/` for the invoking user's home, without
+  `%` or `$`. It must exist as a regular file only its owner can read.
+  SSH uses only this key.
+- `--jmap-account` (`jmap_account`): the td-mail account of the public
+  JMAP checks; a deployment's `--jmap-account` overrides it.
+- `--jmap-url` (`jmap_url`): the `https://` discovery URL that account
+  must use.
 
 On the host, the root-owned `/var/lib/td-mta-operator/host.json`, mode
 0600, describes the host to the supervisor, which refuses every mode
-without it:
+without it. The launcher provisions it over the target's SSH login:
 
-```json
-{
-  "host_name": "mx1",
-  "build_account": "alice",
-  "build_home": "/home/alice",
-  "public_name": "mx.example.org"
-}
+```text
+./td-mta/deploy --provision-host --build-account ADMIN --build-home DIR \
+  --public-name NAME [--config FILE] [--replace]
 ```
+
+`host_name` is target.json's. Before changing anything the command
+requires the SSH login and `sudo -n` to work, the host's kernel host
+name to be `host_name`, the build account to be target.json's `account`,
+unprivileged, with `--build-home` as its home directory, Cargo under it,
+no symbolic link in the candidate directory's path, the mirror to be
+absent or the top of its own Git work tree, `/var/lib/td-mta-operator`
+to be absent or a root-owned directory, and an existing `host.json` to
+say the same unless `--replace`. Then, as the build account, it creates
+the candidate directory and, if absent, an empty Git repository for the
+mirror; creates `/var/lib/td-mta-operator` root-owned 0700 if absent;
+and places `host.json` root-owned 0600 through `sudo -n`, staged under a
+fresh name and moved into place (where none existed, without replacing
+one that appeared meanwhile), reading it back. Its result is
+`host-provisioned`, `host-unchanged`, `host-repaired` (the same values
+in a file of another owner or mode) or `host-replaced`; its `next` is
+`null`: provisioning starts no deployment.
 
 - `host_name`: the kernel host name the supervisor requires before it
   acts.
-- `build_account`: the unprivileged account that builds each candidate;
-  root is refused.
-- `build_home`: that account's home directory, which the account must
-  own. Its source mirror is `src/td` there, candidates build under
-  `.local/state/td-mta-candidates`, which must exist with no symbolic
-  link anywhere in its path, and Cargo comes from `.cargo/bin`. The
-  launcher pushes into that mirror as `account`, and Git refuses a push
-  into another account's repository unless that repository is listed in
-  `safe.directory`, so use the same account for both.
-- `public_name`: the DNS name, not an address, that the public SMTP and
-  HTTPS listeners' certificate presents. The listener probes send it as
-  SNI and HTTP `Host`. An activation probes both listeners before it
-  builds, so a deployment, even one with nothing newer to deploy,
-  checks the name before anything changes. A shared-services rollback
-  does not require the listeners to answer before it starts, so check a
-  changed `public_name` with a deployment first.
+- `--build-account` (`build_account`): the unprivileged account that
+  builds each candidate; root is refused. The launcher pushes into its
+  mirror as `account`, and Git refuses a push into another account's
+  repository, so the two are the same account.
+- `--build-home` (`build_home`): that account's home directory, which it
+  must own; the supervisor checks the ownership before each build. Its
+  source mirror is `src/td` there, candidates build under
+  `.local/state/td-mta-candidates`, and Cargo comes from `.cargo/bin`.
+- `--public-name` (`public_name`): the DNS name, not an address, that
+  the public SMTP and HTTPS listeners' certificate presents. The listener
+  probes send it as SNI and HTTP `Host`. An activation probes both
+  listeners before it builds, so a deployment, even one with nothing
+  newer to deploy, checks the name before anything changes. A
+  shared-services rollback does not require the listeners to answer
+  before it starts, so check a changed `public_name` with a deployment
+  first.
 
-Install it with `sudo install -o root -g root -m 0600 host.json
-/var/lib/td-mta-operator/host.json`. The launcher reads it with `sudo
-cat` over SSH before building, to compare host names, find the mirror and
-print the host name; when that read fails it says so without telling an
-absent file from a refused login. A current controller run in an older
-job directory (see the next section) needs the file too.
+Every launcher mode first requires the SSH login, then reads `host.json`
+with `sudo cat` before building, to compare host names, find the mirror
+and print the host name. A current controller run in an older job
+directory (see "Isolating production service accounts") needs the file
+too.
+
+### Command outcomes
+
+`--write-target` and `--provision-host` end their standard output with
+one line, `td-mta-deploy-outcome` followed by a JSON object, whether they
+changed something, found nothing to do or refused:
+
+- `result`: what happened, one of the results named with each command,
+  `refused-differs` when only `--replace` would proceed (a decision for
+  whoever supplied the values), or `refused` for any other refusal;
+- `error`: on a refusal, the fixed message, which the command also
+  prints on standard error before exiting nonzero;
+- `next`: the command that follows, as `{"argv": [...], "needs":
+  [...]}` with the options whose values the operator supplies, or
+  `null`.
 
 ### Isolating production service accounts
 

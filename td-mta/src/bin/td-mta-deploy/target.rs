@@ -2,7 +2,7 @@
 //! what the supervisor on that host requires of itself. Neither is compiled
 //! in; td-mta/PRODUCTION.md, "Deploy target configuration", owns the format.
 use crate::{
-    common::{child, owned, require},
+    common::{child, fmt, owned, require},
     R,
 };
 use std::{
@@ -27,6 +27,21 @@ const LAUNCHER_KEYS: &[&str] = &[
     "jmap_url",
 ];
 const HOST_KEYS: &[&str] = &["host_name", "build_account", "build_home", "public_name"];
+/// The flags `--write-target` takes, one per `target.json` field.
+pub const TARGET_FLAGS: &[(&str, &str)] = &[
+    ("--host", "host"),
+    ("--host-name", "host_name"),
+    ("--account", "account"),
+    ("--identity", "identity"),
+    ("--jmap-account", "jmap_account"),
+    ("--jmap-url", "jmap_url"),
+];
+/// The flags `--provision-host` takes; `host_name` comes from target.json.
+pub const HOST_FLAGS: &[(&str, &str)] = &[
+    ("--build-account", "build_account"),
+    ("--build-home", "build_home"),
+    ("--public-name", "public_name"),
+];
 
 /// The development machine's `target.json`.
 #[derive(Debug, PartialEq)]
@@ -143,24 +158,55 @@ fn url(value: &str) -> bool {
             .is_some_and(dns_name)
 }
 
-impl Target {
-    /// Read `path`, or `target.json` under `$XDG_CONFIG_HOME/td-mta-deploy`
-    /// (else `~/.config/td-mta-deploy`). `~/` in `identity` names `home`.
-    pub fn load(path: Option<&Path>, home: &Path, xdg: Option<&Path>) -> R<Self> {
-        let default;
-        let path = match path {
-            Some(path) => path,
-            None => {
-                let base = match xdg {
-                    Some(base) if base.is_absolute() => owned_path(base)?,
-                    _ => child(home, ".config")?,
-                };
-                default = child(&base, "td-mta-deploy/target.json")?;
-                &default
-            }
+/// One JSON object with `values` under `keys`, in that order: the text the
+/// two commands that create these files write.
+fn render(keys: &[&str], values: &[(&str, &str)]) -> R<String> {
+    let mut object = Vec::new();
+    for key in keys {
+        let mut found = values.iter().filter(|(k, _)| k == key);
+        let (Some((_, value)), None) = (found.next(), found.next()) else {
+            return Err("every configuration field needs exactly one value".into());
         };
-        let bytes = td_fs::read_bounded(path, LIMIT).map_err(|_| {
-            "cannot read the deploy target configuration; see td-mta/PRODUCTION.md, \"Deploy target configuration\""
+        td_alloc::push(&mut object, (owned(key)?, Json::Str(owned(value)?)))?;
+    }
+    require(values.len() == keys.len(), "unexpected configuration field")?;
+    fmt(format_args!("{}\n", Json::Obj(object)))
+}
+
+/// The file `Target::load` reads: `path`, else `target.json` under
+/// `$XDG_CONFIG_HOME/td-mta-deploy` when that is absolute, else under
+/// `~/.config/td-mta-deploy`.
+pub fn target_path(path: Option<&Path>, home: &Path, xdg: Option<&Path>) -> R<PathBuf> {
+    match path {
+        Some(path) => owned_path(path),
+        None => {
+            let base = match xdg {
+                Some(base) if base.is_absolute() => owned_path(base)?,
+                _ => child(home, ".config")?,
+            };
+            child(&base, "td-mta-deploy/target.json")
+        }
+    }
+}
+
+impl Target {
+    /// `target.json`'s text for `values`, keyed by field, and what it says.
+    pub fn render(values: &[(&str, &str)], home: &Path) -> R<(String, Self)> {
+        let text = render(LAUNCHER_KEYS, values)?;
+        let target = Self::parse(text.as_bytes(), home)?;
+        Ok((text, target))
+    }
+
+    /// The administrator account, the login part of `destination`.
+    pub fn account(&self) -> Option<&str> {
+        self.destination.split_once('@').map(|(account, _)| account)
+    }
+
+    /// Read the file `target_path` names. `~/` in `identity` names `home`.
+    pub fn load(path: Option<&Path>, home: &Path, xdg: Option<&Path>) -> R<Self> {
+        let path = target_path(path, home, xdg)?;
+        let bytes = td_fs::read_bounded(&path, LIMIT).map_err(|_| {
+            "cannot read the deploy target configuration: write it with td-mta/deploy --write-target (td-mta/PRODUCTION.md, \"Deploy target configuration\")"
         })?;
         Self::parse(&bytes, home)
     }
@@ -215,13 +261,20 @@ impl Target {
 }
 
 impl HostConfig {
+    /// `host.json`'s text for `values`, keyed by field, and what it says.
+    pub fn render(values: &[(&str, &str)]) -> R<(String, Self)> {
+        let text = render(HOST_KEYS, values)?;
+        let config = Self::parse(text.as_bytes())?;
+        Ok((text, config))
+    }
+
     /// The supervisor's own read: a root-owned, mode-0600 regular file.
     pub fn load() -> R<Self> {
         Self::load_file(Path::new(HOST_CONFIG), 0)
     }
 
     fn load_file(path: &Path, owner: u32) -> R<Self> {
-        let unreadable = "cannot read /var/lib/td-mta-operator/host.json";
+        let unreadable = "cannot read /var/lib/td-mta-operator/host.json: provision it with td-mta/deploy --provision-host";
         let (file, meta) =
             td_fs::open_real_file(path, "host configuration").map_err(|_| unreadable)?;
         require(

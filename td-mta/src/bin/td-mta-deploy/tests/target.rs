@@ -169,6 +169,43 @@ fn the_host_configuration_names_every_value_and_nothing_else() {
 }
 
 #[test]
+fn rendered_files_read_back_as_the_parsers_read_them() {
+    let target = [
+        ("host", "192.0.2.10"),
+        ("host_name", "mx1"),
+        ("account", "alice"),
+        ("identity", "~/.ssh/deploy"),
+        ("jmap_account", "alice"),
+        ("jmap_url", "https://mx.example.org/.well-known/jmap"),
+    ];
+    let (text, parsed) = Target::render(&target, home()).unwrap();
+    assert_eq!(text, format!("{LAUNCHER}\n"));
+    assert_eq!(parsed, Target::parse(LAUNCHER.as_bytes(), home()).unwrap());
+    let host = [
+        ("public_name", "mx.example.org"),
+        ("build_home", "/home/alice"),
+        ("host_name", "mx1"),
+        ("build_account", "alice"),
+    ];
+    let (text, parsed) = HostConfig::render(&host).unwrap();
+    // The file's order, whatever order the values came in.
+    assert_eq!(text, format!("{HOST}\n"));
+    assert_eq!(parsed, HostConfig::parse(HOST.as_bytes()).unwrap());
+    let quoted = [("host_name", "m\"x"), ("build_account", "alice")];
+    assert!(HostConfig::render(&quoted).is_err());
+    let mut extra = host.to_vec();
+    extra.push(("port", "22"));
+    assert!(HostConfig::render(&extra).is_err());
+    let mut twice = host.to_vec();
+    twice.push(("host_name", "mx2"));
+    assert!(HostConfig::render(&twice).is_err());
+    assert!(HostConfig::render(&host[1..]).is_err());
+    let mut bad = target;
+    bad[0].1 = "-oProxyCommand=x";
+    assert!(Target::render(&bad, home()).is_err());
+}
+
+#[test]
 fn the_host_configuration_file_must_be_its_owners_private_regular_file() {
     let scratch = TempDir::new("deploy-host-config").unwrap();
     let path = scratch.path().join("host.json");
