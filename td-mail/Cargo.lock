@@ -7,6 +7,21 @@ name = "td-alloc"
 version = "0.1.0"
 
 [[package]]
+name = "td-av1"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
+
+[[package]]
+name = "td-avif"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-av1",
+]
+
+[[package]]
 name = "td-charset"
 version = "0.1.0"
 dependencies = [
@@ -46,7 +61,21 @@ name = "td-fs"
 version = "0.1.0"
 
 [[package]]
+name = "td-gif"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
+
+[[package]]
 name = "td-html"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]
+
+[[package]]
+name = "td-jpeg"
 version = "0.1.0"
 dependencies = [
  "td-alloc",
@@ -86,6 +115,8 @@ dependencies = [
  "td-json",
  "td-kv",
  "td-page",
+ "td-picture",
+ "td-png",
  "td-regex",
  "td-test-compositor",
  "td-toml",
@@ -104,6 +135,27 @@ dependencies = [
  "td-layout",
  "td-ui",
  "td-url",
+]
+
+[[package]]
+name = "td-picture"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-avif",
+ "td-gif",
+ "td-jpeg",
+ "td-page",
+ "td-png",
+ "td-ui",
+ "td-webp",
+]
+
+[[package]]
+name = "td-png"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
 ]
 
 [[package]]
@@ -128,3 +180,10 @@ dependencies = [
 [[package]]
 name = "td-url"
 version = "0.1.0"
+
+[[package]]
+name = "td-webp"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+]

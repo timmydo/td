@@ -4,6 +4,7 @@ use crate::jmap::types::{Email, Mailbox};
 use crate::rules;
 use crate::ui::input::Key;
 use crate::ui::page::{Held, Paged};
+use crate::ui::pictures::{self, Pictures};
 use crate::ui::views::{
     strip_newlines, text_scroll, wrap_text, Body, Row, Scene, Scroll, View, ViewAction,
 };
@@ -173,6 +174,9 @@ pub struct EmailView {
     /// The message as its pages, while the body is one: let go before
     /// any text of it is rendered (README.md, "Memory").
     page: Held,
+    /// The pictures the message's HTML names among its own parts, asked
+    /// for once a message, and those come.
+    pictures: Option<Pictures>,
     browser: Option<String>,
     urls: Vec<String>,
     url_picking: bool,
@@ -227,6 +231,7 @@ impl EmailView {
             head_end: 0,
             html_at: None,
             page: Held::default(),
+            pictures: None,
             browser,
             urls: Vec::new(),
             url_picking: false,
@@ -513,6 +518,52 @@ impl EmailView {
             } else {
                 email.keywords.remove("$seen");
             }
+        }
+    }
+
+    /// Asks the account's server for the pictures the shown message's HTML
+    /// (as far as it is laid) names by `cid:` URL among its parts, once a
+    /// message, one at a time: another message's are let go.
+    fn ask_pictures(&mut self) {
+        let Some(email) = self.email.as_ref() else {
+            return;
+        };
+        if self
+            .pictures
+            .as_ref()
+            .is_some_and(|pictures| pictures.of_email(&email.id))
+        {
+            return;
+        }
+        let html = self.html_at.and_then(|at| Self::html_in(email, at));
+        let html = html.map(|html| crate::compose::HTML_LIMITS.read(html));
+        self.pictures = html.and_then(|html| Pictures::of(email, html));
+        self.ask_next_picture();
+    }
+
+    /// Asks for the next of the message's pictures, if one is left.
+    /// The pictures' own message names the request: the view may have
+    /// moved on to another whose body has not come.
+    fn ask_next_picture(&mut self) {
+        let Some(pictures) = self.pictures.as_mut() else {
+            return;
+        };
+        let Ok(email_id) = td_alloc::string(pictures.email()) else {
+            return;
+        };
+        let Some(part) = pictures.next_ask() else {
+            return;
+        };
+        let ask = (|| {
+            Some(BackendCommand::FetchPicture {
+                email_id,
+                blob_id: td_alloc::string(&part.blob_id).ok()?,
+                content_type: td_alloc::string(&part.content_type).ok()?,
+                limit: pictures::MAX_BODY,
+            })
+        })();
+        if let Some(ask) = ask {
+            let _ = self.cmd_tx.send(ask);
         }
     }
 
@@ -1203,6 +1254,8 @@ impl View for EmailView {
                 };
                 self.status_message = Some(shown.to_string());
                 self.rerender_text();
+                // A message's HTML first shown here asks for its pictures.
+                self.ask_pictures();
                 ViewAction::Continue
             }
             Key::Char('b') => {
@@ -1246,7 +1299,8 @@ impl View for EmailView {
             (Some(rect), Some(html)) => {
                 let key = self.text_key();
                 let head = self.text.get(..self.head_end).unwrap_or_default();
-                self.page.show(&key, head, html, rect, scale, faces);
+                self.page
+                    .show(&key, head, html, rect, scale, faces, self.pictures.as_ref());
             }
             _ => self.page.clear(),
         }
@@ -1281,6 +1335,7 @@ impl View for EmailView {
                         }
                         self.email = Some(email.clone());
                         self.rerender_text();
+                        self.ask_pictures();
                         self.error = None;
                         self.pending_write_ops.clear();
                     }
@@ -1289,6 +1344,26 @@ impl View for EmailView {
                     }
                 }
                 true
+            }
+            // Taken for the pictures' own message, though the view has
+            // moved on: dropped, the rest of its pictures would never be
+            // asked for when the view comes back to it.
+            BackendResponse::PictureFetched {
+                email_id,
+                blob_id,
+                result,
+            } => {
+                let body = result.as_ref().ok().map(Vec::as_slice);
+                let Some(kept) = self
+                    .pictures
+                    .as_mut()
+                    .filter(|pictures| pictures.of_email(email_id))
+                    .and_then(|pictures| pictures.answered(blob_id, body))
+                else {
+                    return false;
+                };
+                self.ask_next_picture();
+                kept && *email_id == self.email_id
             }
             BackendResponse::EmailForReply { id, result } if *id == self.email_id => {
                 let reply_all = self.pending_reply_all.take();
@@ -1490,6 +1565,7 @@ mod tests {
             r#type: Some(kind.to_string()),
             name: None,
             size: None,
+            cid: None,
         };
         let value = |text: &str| crate::jmap::types::BodyValue {
             value: text.to_string(),
@@ -1513,6 +1589,196 @@ mod tests {
             result: Box::new(Ok(email)),
         });
         view
+    }
+
+    /// A view on message `e1`, and its commands, whose body holds a
+    /// plain part when `plain` and an HTML part naming `logo@e.example`
+    /// and `mark@e.example` by `cid:`, which its attachments carry with
+    /// one more no URL names.
+    fn cid_view(plain: bool) -> (EmailView, mpsc::Receiver<BackendCommand>, Email) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let view = EmailView::new(
+            cmd_tx,
+            "me@example.com".to_string(),
+            "e1".to_string(),
+            Vec::new(),
+            0,
+            false,
+            Vec::new(),
+            "Archive".to_string(),
+            "Trash".to_string(),
+            Some("true".to_string()),
+        );
+        let part = |id: &str, kind: &str, cid: Option<&str>| BodyPart {
+            part_id: id.to_string(),
+            blob_id: Some(format!("blob-{id}")),
+            r#type: Some(kind.to_string()),
+            name: None,
+            size: Some(100),
+            cid: cid.map(str::to_string),
+        };
+        let value = |text: &str| crate::jmap::types::BodyValue {
+            value: text.to_string(),
+            is_encoding_problem: false,
+            is_truncated: false,
+        };
+        let mut email = make_email("e1", "Hello", "preview");
+        email.html_body = Some(vec![part("1", "text/html", None)]);
+        email.body_values.insert(
+            "1".into(),
+            value("<p>see <img src='cid:logo%40e.example'><img src=cid:mark@e.example>"),
+        );
+        if plain {
+            email.text_body = Some(vec![part("0", "text/plain", None)]);
+            email.body_values.insert("0".into(), value("see the logo"));
+        } else {
+            email.text_body = Some(vec![part("1", "text/html", None)]);
+        }
+        email.attachments = Some(vec![
+            part("2", "image/png", Some("logo@e.example")),
+            part("3", "image/png", Some("unnamed@e.example")),
+            part("4", "image/png", Some("mark@e.example")),
+        ]);
+        (view, cmd_rx, email)
+    }
+
+    /// The pictures a view's commands ask for: each message, blob and
+    /// byte limit.
+    fn asked_pictures(commands: &mpsc::Receiver<BackendCommand>) -> Vec<(String, String, u64)> {
+        commands
+            .try_iter()
+            .filter_map(|command| match command {
+                BackendCommand::FetchPicture {
+                    email_id,
+                    blob_id,
+                    limit,
+                    ..
+                } => Some((email_id, blob_id, limit)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn asked(blob: &str) -> Vec<(String, String, u64)> {
+        vec![("e1".to_string(), blob.to_string(), pictures::MAX_BODY)]
+    }
+
+    /// A message whose HTML names its own image parts by `cid:` asks the
+    /// account for them one at a time, each within `MAX_BODY`, though its
+    /// body comes twice (the cache's, then the server's): the next on the
+    /// answer for the one awaited, a picture or not. The picture come is
+    /// kept and redraws; an answer for another message, or one that does
+    /// not decode, changes nothing. Another message's are let go.
+    #[test]
+    fn a_messages_cid_pictures_are_asked_for_one_at_a_time_and_kept() {
+        let (mut view, cmd_rx, email) = cid_view(false);
+        for _ in 0..2 {
+            view.on_response(&BackendResponse::EmailBody {
+                id: "e1".to_string(),
+                result: Box::new(Ok(email.clone())),
+            });
+        }
+        assert_eq!(asked_pictures(&cmd_rx), asked("blob-2"));
+        let came = |view: &mut EmailView, email: &str, blob: &str, body: &[u8]| {
+            view.on_response(&BackendResponse::PictureFetched {
+                email_id: email.to_string(),
+                blob_id: blob.to_string(),
+                result: Ok(body.to_vec()),
+            })
+        };
+        let png = crate::ui::pictures::tests::png(4, 4);
+        assert!(!came(&mut view, "e2", "blob-2", &png));
+        assert!(asked_pictures(&cmd_rx).is_empty());
+        assert!(!came(&mut view, "e1", "blob-2", b"not a picture"));
+        assert_eq!(asked_pictures(&cmd_rx), asked("blob-4"));
+        assert!(came(&mut view, "e1", "blob-4", &png));
+        assert!(asked_pictures(&cmd_rx).is_empty());
+        assert_eq!(view.pictures.as_ref().map(Pictures::count), Some(1));
+        let mut other = make_email("e1b", "Other", "preview");
+        other.html_body = email.html_body.clone();
+        other.body_values = email.body_values.clone();
+        view.email_id = "e1b".to_string();
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1b".to_string(),
+            result: Box::new(Ok(other)),
+        });
+        assert!(view.pictures.is_none());
+    }
+
+    /// An answer that comes while the view has moved on to another message,
+    /// whose body has not come, is still taken for the pictures' own
+    /// message, without a redraw, and the next is asked in its name; back
+    /// on it, the rest come.
+    #[test]
+    fn a_messages_pictures_keep_coming_across_a_move_away_and_back() {
+        let (mut view, cmd_rx, email) = cid_view(false);
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1".to_string(),
+            result: Box::new(Ok(email.clone())),
+        });
+        assert_eq!(asked_pictures(&cmd_rx), asked("blob-2"));
+        view.email_id = "e2".to_string();
+        let png = crate::ui::pictures::tests::png(4, 4);
+        let came = |view: &mut EmailView, blob: &str| {
+            view.on_response(&BackendResponse::PictureFetched {
+                email_id: "e1".to_string(),
+                blob_id: blob.to_string(),
+                result: Ok(png.clone()),
+            })
+        };
+        assert!(!came(&mut view, "blob-2"));
+        assert_eq!(asked_pictures(&cmd_rx), asked("blob-4"));
+        view.email_id = "e1".to_string();
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1".to_string(),
+            result: Box::new(Ok(email)),
+        });
+        assert!(asked_pictures(&cmd_rx).is_empty());
+        assert!(came(&mut view, "blob-4"));
+        assert_eq!(view.pictures.as_ref().map(Pictures::count), Some(2));
+    }
+
+    /// Only the HTML the page lays is read for `cid:` URLs: a picture
+    /// named past td-mail's input limit, where the page is cut, is not
+    /// asked for.
+    #[test]
+    fn a_picture_named_past_the_cut_is_not_asked_for() {
+        let (mut view, cmd_rx, mut email) = cid_view(false);
+        let input = crate::compose::HTML_LIMITS.input;
+        let value = email.body_values.get_mut("1").unwrap();
+        value.value = format!("{}<img src=cid:logo@e.example>", "x".repeat(input));
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1".to_string(),
+            result: Box::new(Ok(email)),
+        });
+        assert!(asked_pictures(&cmd_rx).is_empty());
+        assert!(view.pictures.is_none());
+    }
+
+    /// A message with a plain part and an HTML part shows the plain one
+    /// and asks for nothing; its HTML shown with h asks for its pictures,
+    /// once; and a failed answer asks for the next.
+    #[test]
+    fn an_alternative_messages_pictures_are_asked_for_when_its_html_is_shown() {
+        let (mut view, cmd_rx, email) = cid_view(true);
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1".to_string(),
+            result: Box::new(Ok(email)),
+        });
+        assert!(view.page_html().is_none());
+        assert!(asked_pictures(&cmd_rx).is_empty());
+        view.handle_key(Key::Char('h'), 10);
+        assert!(view.page_html().is_some());
+        assert_eq!(asked_pictures(&cmd_rx), asked("blob-2"));
+        view.handle_key(Key::Char('h'), 10);
+        view.handle_key(Key::Char('h'), 10);
+        assert!(asked_pictures(&cmd_rx).is_empty());
+        view.on_response(&BackendResponse::PictureFetched {
+            email_id: "e1".to_string(),
+            blob_id: "blob-2".to_string(),
+            result: Err("offline".to_string()),
+        });
+        assert_eq!(asked_pictures(&cmd_rx), asked("blob-4"));
     }
 
     /// The HTML a scene shows as a page and the head above it, or none.
@@ -1743,6 +2009,7 @@ mod tests {
                     name: Some(format!("attachment-{n}.pdf")),
                     r#type: Some("application/pdf".to_string()),
                     size: Some(2048),
+                    cid: None,
                 })
                 .collect(),
         );
@@ -1953,6 +2220,7 @@ mod tests {
             r#type: Some("text/plain".to_string()),
             name: None,
             size: None,
+            cid: None,
         }]);
         email.body_values.insert(
             "1".to_string(),

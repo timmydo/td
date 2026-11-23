@@ -1061,6 +1061,10 @@ mod tests {
     /// an atlas page with its key map and shelves for each of the three
     /// faces at the raster's size, bounded as td-ui bounds its other
     /// pages, and `prose::ATLAS` for every other size.
+    /// A message's pictures (`ui::pictures`) are held beside its page:
+    /// their decoded term, which each decoding's peak is charged to
+    /// first, the term their fitted copies are charged to, and one body
+    /// fetched at a time.
     /// `BASELINE` is td-mail's own resident memory at 2880x1800 with
     /// td-ui's three window buffers and the faces' bytes, and
     /// `MEMORY_HIGH` the jail's in recipes/src/recipes/mail.rs, both
@@ -1075,7 +1079,10 @@ mod tests {
         let at_size = 3 * (PAGE_WIDTH * PAGE_HEIGHT + (MAX_KEYS / 4 + 2) * 768 + PAGE_HEIGHT * 48);
         let glyphs = at_size + td_ui::prose::ATLAS;
         let page = crate::ui::page::BUDGET;
-        let total = BASELINE + glyphs + kept + rendering.max(page);
+        let pictures = crate::ui::pictures::TERM
+            + crate::ui::pictures::FITTED
+            + crate::ui::pictures::MAX_BODY as usize;
+        let total = BASELINE + glyphs + kept + rendering.max(page) + pictures;
         assert!(total < MEMORY_HIGH, "{total}");
         // What a page's layout holds beyond its budget, uncharged, has the
         // rest of the rendering's term: measured, not modelled.
@@ -1536,6 +1543,7 @@ mod tests {
             r#type: Some("text/plain".to_string()),
             name: None,
             size: None,
+            cid: None,
         }]);
         hostile.body_values.insert(
             "1".to_string(),

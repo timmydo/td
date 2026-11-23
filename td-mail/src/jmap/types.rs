@@ -809,6 +809,9 @@ pub struct BodyPart {
     pub r#type: Option<String>,
     pub name: Option<String>,
     pub size: Option<u64>,
+    /// The part's Content-ID, its angle brackets gone (RFC 8621 §4.1.4):
+    /// what an HTML body's `cid:` URL names it by.
+    pub cid: Option<String>,
 }
 
 impl BodyPart {
@@ -820,6 +823,7 @@ impl BodyPart {
             r#type: opt_str(obj, "type")?,
             name: opt_str(obj, "name")?,
             size: opt_u64(obj, "size")?,
+            cid: opt_str(obj, "cid")?,
         })
     }
 }
@@ -832,6 +836,7 @@ impl ToJson for BodyPart {
             .set("type", &self.r#type)
             .set("name", &self.name)
             .set("size", self.size)
+            .set("cid", &self.cid)
             .build()
     }
 }
@@ -932,6 +937,23 @@ impl ThreadGetResponse {
 mod tests {
     use super::*;
     use td_json::json;
+
+    /// A part's Content-ID is read as the server sends it and written
+    /// back for the cache, so a cached message's `cid:` pictures are
+    /// still found; a part without one has none.
+    #[test]
+    fn a_parts_content_id_survives_the_cache() {
+        let part = BodyPart::from_json(&json!({
+            "partId": "2", "blobId": "b2", "type": "image/png", "cid": "logo@e.example"
+        }))
+        .unwrap();
+        assert_eq!(part.cid.as_deref(), Some("logo@e.example"));
+        let again = BodyPart::from_json(&part.to_json()).unwrap();
+        assert_eq!(again.cid.as_deref(), Some("logo@e.example"));
+        let bare = BodyPart::from_json(&json!({"partId": "1"})).unwrap();
+        assert_eq!(bare.cid, None);
+        assert_eq!(BodyPart::from_json(&bare.to_json()).unwrap().cid, None);
+    }
 
     #[test]
     fn get_object_limit_is_optional_but_positive_when_supplied() {

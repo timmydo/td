@@ -11,6 +11,7 @@
 pub mod frame;
 pub mod input;
 pub mod page;
+pub mod pictures;
 pub mod sidebar;
 pub mod views;
 
@@ -4196,6 +4197,7 @@ mod frame_tests {
             r#type: Some("text/html".to_string()),
             name: None,
             size: None,
+            cid: None,
         };
         let mut values = std::collections::HashMap::new();
         values.insert(

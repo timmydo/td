@@ -2,9 +2,10 @@
 
 The bounded picture path td's page readers share: td-web's navigated
 and inline pictures (td-web/DESIGN.md §10), and the pictures a message
-carries for td-mail. It holds no state, starts no thread and fetches
-nothing: a caller brings a body and its own `Limits`, and gets a td-ui
-picture or a refusal.
+carries for its `cid:` URLs in td-mail (td-mail/README.md, "HTML
+mail"), at td-mail's limits: a 2 MiB body, 24 MiB of decoding. It holds
+no state, starts no thread and fetches nothing: a caller brings a body
+and its own `Limits`, and gets a td-ui picture or a refusal.
 
 ## The path
 

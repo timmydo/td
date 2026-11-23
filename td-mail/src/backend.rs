@@ -101,6 +101,15 @@ pub enum BackendCommand {
         name: String,
         content_type: String,
     },
+    /// The bytes of a picture message `email_id` carries in its part
+    /// `blob_id`, for its HTML's `cid:` URL: at most `limit` bytes, held
+    /// in memory and answered, never written.
+    FetchPicture {
+        email_id: String,
+        blob_id: String,
+        content_type: String,
+        limit: u64,
+    },
     /// Submit the retained draft at `path` through the account's server
     /// (JMAP `EmailSubmission`); the file itself is not changed.
     SendDraft {
@@ -242,6 +251,11 @@ pub enum BackendResponse {
     AttachmentDownloaded {
         name: String,
         result: Result<std::path::PathBuf, String>,
+    },
+    PictureFetched {
+        email_id: String,
+        blob_id: String,
+        result: Result<Vec<u8>, String>,
     },
     DraftSent {
         path: PathBuf,
@@ -1041,6 +1055,28 @@ fn queue_offline(
         .map_err(|e| offline_error(&e, reason))
 }
 
+/// Part `blob_id`'s bytes, a picture of `content_type`, from the account's
+/// own download URL, the fetch service asked to refuse a body past
+/// `limit`; kept in memory, never written.
+fn fetch_picture(
+    client: &JmapClient,
+    blob_id: &str,
+    content_type: &str,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    client
+        .download_blob(blob_id, "picture", content_type, Some(limit))
+        .map_err(|e| td_alloc::format(format_args!("{e}")).unwrap_or_default())
+        .and_then(|bytes| {
+            if bytes.len() as u64 > limit {
+                Err(td_alloc::format(format_args!("picture past {limit} bytes"))
+                    .unwrap_or_default())
+            } else {
+                Ok(bytes)
+            }
+        })
+}
+
 /// Handle a command in offline mode. Returns true to continue, false to
 /// break (shutdown). `reason` is why the connection failed, when one was
 /// tried; none for a session that asked to be offline.
@@ -1364,6 +1400,15 @@ fn handle_offline_command(
         BackendCommand::DownloadAttachment { name, .. } => {
             let _ = resp_tx.send(BackendResponse::AttachmentDownloaded {
                 name: name.clone(),
+                result: Err(offline_error("not available", reason)),
+            });
+        }
+        BackendCommand::FetchPicture {
+            email_id, blob_id, ..
+        } => {
+            let _ = resp_tx.send(BackendResponse::PictureFetched {
+                email_id: td_alloc::string(email_id).unwrap_or_default(),
+                blob_id: td_alloc::string(blob_id).unwrap_or_default(),
                 result: Err(offline_error("not available", reason)),
             });
         }
@@ -2835,7 +2880,7 @@ fn backend_loop(
             } => {
                 let result = (|| {
                     let bytes = client
-                        .download_blob(&blob_id, &name, &content_type)
+                        .download_blob(&blob_id, &name, &content_type, None)
                         .map_err(|e| e.to_string())?;
 
                     let dir = std::env::var("XDG_DOWNLOAD_DIR")
@@ -2874,6 +2919,19 @@ fn backend_loop(
                 })();
 
                 let _ = resp_tx.send(BackendResponse::AttachmentDownloaded { name, result });
+            }
+            BackendCommand::FetchPicture {
+                email_id,
+                blob_id,
+                content_type,
+                limit,
+            } => {
+                let result = fetch_picture(client, &blob_id, &content_type, limit);
+                let _ = resp_tx.send(BackendResponse::PictureFetched {
+                    email_id,
+                    blob_id,
+                    result,
+                });
             }
             BackendCommand::PreviewRetentionExpiry { policies } => {
                 let result = collect_retention_candidates(client, &cached_mailboxes, &policies)
@@ -4632,6 +4690,104 @@ mod tests {
                 assert_eq!(result.unwrap().body_values["1"].value, "available offline")
             }
             _ => panic!("offline body response"),
+        }
+    }
+
+    /// Online, a picture is fetched from the account's download URL with
+    /// its part's blob, the fetch service asked to refuse a body past the
+    /// picture's limit; one within it comes, one past it does not.
+    #[test]
+    fn a_picture_is_fetched_within_its_limit() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+        let _env = crate::testing::env_lock();
+        let dir = td_fs::TempDir::new("mail-picture-fetch").unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        std::fs::create_dir(dir.join("td-fetch")).unwrap();
+        let listener = UnixListener::bind(dir.join("td-fetch/socket")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Answers one request with `body`, and says what it was asked.
+        let serve = |listener: &UnixListener, body: Vec<u8>| {
+            let listener = listener.try_clone().unwrap();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline);
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                // The request's head ends at its body's length; a GET's is 0.
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    head.push_str(&line);
+                    if line.starts_with("body ") {
+                        break;
+                    }
+                }
+                let _ = write!(socket, "td-fetch 1\nstatus 200\nbody {}\n\n", body.len());
+                let _ = socket.write_all(&body);
+                head
+            })
+        };
+        let client = JmapClient::downloading_for_tests(
+            "https://mail.invalid/download/{accountId}/{blobId}/{name}?type={type}",
+        );
+        let server = serve(&listener, b"\x89PNG within".to_vec());
+        let fetched = fetch_picture(&client, "blob 2", "image/png", 64);
+        let head = server.join().unwrap();
+        assert_eq!(fetched.as_deref(), Ok(&b"\x89PNG within"[..]));
+        assert!(head.contains("limit 64\n"), "{head}");
+        assert!(
+            head.contains(
+                "url https://mail.invalid/download/account/blob%202/picture?type=image%2Fpng\n"
+            ),
+            "{head}"
+        );
+        let server = serve(&listener, vec![0; 65]);
+        assert!(fetch_picture(&client, "blob-2", "image/png", 64).is_err());
+        assert!(server.join().unwrap().contains("limit 64\n"));
+    }
+
+    /// Offline, a picture asked for is answered at once as not
+    /// available, so the page lays the `img` without it.
+    #[test]
+    fn an_offline_picture_is_answered_not_available() {
+        let (tx, rx) = mpsc::channel();
+        handle_offline_command(
+            &BackendCommand::FetchPicture {
+                email_id: "e1".into(),
+                blob_id: "b2".into(),
+                content_type: "image/png".into(),
+                limit: 1 << 20,
+            },
+            &tx,
+            &None,
+            &mut Vec::new(),
+            1,
+            Some("offline"),
+        );
+        match rx.recv().unwrap() {
+            BackendResponse::PictureFetched {
+                email_id,
+                blob_id,
+                result,
+            } => {
+                assert_eq!((email_id.as_str(), blob_id.as_str()), ("e1", "b2"));
+                assert!(result.unwrap_err().contains("not available"));
+            }
+            _ => panic!("offline picture response"),
         }
     }
 

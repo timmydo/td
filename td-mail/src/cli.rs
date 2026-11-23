@@ -1980,6 +1980,7 @@ mod tests {
                 r#type: Some("text/plain".to_string()),
                 name: None,
                 size: None,
+                cid: None,
             }]),
             html_body: None,
             body_values: HashMap::from([(

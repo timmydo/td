@@ -65,11 +65,13 @@ staged beside each program that builds it; it has no recipe of its own.
 ## 4. Callers
 
 td-web, and td-mail's message view (td-mail/README.md, "HTML mail"
-and "Memory"): a page made from a message's HTML part alone, styles
-on, pictures and every sheet it names off, on td-mail's window thread
-within a budget of its own measured against td-mail's jail, with
-td-mail's head as a text page above it, its links taken in the pane
-and opened outside it. `cid:` pictures from the message's own parts
-remain planned (td-web/DESIGN.md §11). Each is its own amendment, and
+and "Memory"): a page made from a message's HTML part, styles on,
+every sheet and every picture it names elsewhere off, on td-mail's
+window thread within a budget of its own measured against td-mail's
+jail, with td-mail's head as a text page above it, its links taken in
+the pane and opened outside it. The pictures its `cid:` URLs name
+among the message's own parts are decoded through td-picture at
+td-mail's limits and laid by `pipeline::again` with an `inline::Set`,
+as td-web lays a page's. Each further use is its own amendment, and
 the one that makes a rule here caller-neutral moves that rule from
 td-web/DESIGN.md to this file.

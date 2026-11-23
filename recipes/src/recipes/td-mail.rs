@@ -6,9 +6,10 @@ use crate::types::Recipe;
 /// `td-mail/` tree with the toolkit, whose editor core is the document
 /// pane a message is read in, td-page, which makes, lays out and paints
 /// a message's HTML as a page, and td-charset, td-css, td-dom, td-layout
-/// and td-url, which it does that with, td's other shared crates it
-/// names, and the compositor's shared font and wire sources staged beside
-/// it, the
+/// and td-url, which it does that with, td-picture and its decoders for a
+/// message's own pictures (with engine, td-inflate and td-util, whose
+/// sources td-png names), td's other shared crates it names, and the
+/// compositor's shared font and wire sources staged beside it, the
 /// `td-mail-source` seed pinned by the compiled seed-digest table, and the
 /// crate's committed lock naming itself and those crates.
 pub fn recipe() -> Recipe {
@@ -27,6 +28,16 @@ pub fn recipe() -> Recipe {
             "td-kv",
             "td-layout",
             "td-page",
+            "td-picture",
+            "td-av1",
+            "td-avif",
+            "td-gif",
+            "td-jpeg",
+            "td-png",
+            "td-webp",
+            "engine",
+            "td-inflate",
+            "td-util",
             "td-regex",
             "td-toml",
             "td-alloc",
@@ -68,6 +79,16 @@ mod tests {
                 "td-kv".into(),
                 "td-layout".into(),
                 "td-page".into(),
+                "td-picture".into(),
+                "td-av1".into(),
+                "td-avif".into(),
+                "td-gif".into(),
+                "td-jpeg".into(),
+                "td-png".into(),
+                "td-webp".into(),
+                "engine".into(),
+                "td-inflate".into(),
+                "td-util".into(),
                 "td-regex".into(),
                 "td-toml".into(),
                 "td-alloc".into(),
@@ -101,6 +122,8 @@ mod tests {
             names,
             [
                 "td-alloc",
+                "td-av1",
+                "td-avif",
                 "td-charset",
                 "td-civil",
                 "td-css",
@@ -108,17 +131,22 @@ mod tests {
                 "td-encoding",
                 "td-fetch-client",
                 "td-fs",
+                "td-gif",
                 "td-html",
+                "td-jpeg",
                 "td-json",
                 "td-kv",
                 "td-layout",
                 "td-mail",
                 "td-page",
+                "td-picture",
+                "td-png",
                 "td-regex",
                 "td-test-compositor",
                 "td-toml",
                 "td-ui",
                 "td-url",
+                "td-webp",
             ]
         );
         assert!(!lock.contains("source = "));
@@ -132,6 +160,8 @@ mod tests {
             "td-json",
             "td-kv",
             "td-page",
+            "td-picture",
+            "td-png",
             "td-regex",
             "td-test-compositor",
             "td-toml",

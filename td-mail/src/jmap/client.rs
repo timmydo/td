@@ -317,13 +317,14 @@ fn get_with_auth(
     url: &str,
     auth: Option<&str>,
     trust: &AccountTrust,
+    limit: Option<u64>,
 ) -> Result<Fetched, JmapError> {
     if !td_fetch_client::available() {
         return Err(no_fetch_service());
     }
     let headers: Vec<(&str, &str)> = auth.map(|a| ("authorization", a)).into_iter().collect();
     let response = read_backoff(
-        || trust.request("GET", url, &headers, &[], RESPONSE_LIMIT),
+        || trust.request("GET", url, &headers, &[], limit),
         std::thread::sleep,
     )
     .map_err(|e| JmapError::Http(e.to_string()))?;
@@ -388,6 +389,13 @@ impl JmapClient {
         let mut client = Self::unreachable_for_tests();
         client.read_only = true;
         client.submission = true;
+        client
+    }
+    /// A client whose blobs download from `template`, through the fetch
+    /// service a test stands in for.
+    pub(crate) fn downloading_for_tests(template: &str) -> Self {
+        let mut client = Self::unreachable_for_tests();
+        client.download_url = td_alloc::string(template).ok();
         client
     }
     /// A client for a server that is not there, for the paths that need
@@ -459,10 +467,11 @@ impl JmapClient {
             log_debug!("[JMAP] Request {} to: {}", i + 1, current_url);
 
             let fetched =
-                get_with_auth(&current_url, carries.then_some(auth), trust).map_err(|e| {
-                    log_error!("[JMAP] Connection error: {}", e);
-                    e
-                })?;
+                get_with_auth(&current_url, carries.then_some(auth), trust, RESPONSE_LIMIT)
+                    .map_err(|e| {
+                        log_error!("[JMAP] Connection error: {}", e);
+                        e
+                    })?;
             let status = fetched.status;
             log_debug!("[JMAP] Got {} response", status);
 
@@ -2164,11 +2173,14 @@ impl JmapClient {
         text
     }
 
+    /// The blob `blob_id`, read whole, of at most `limit` bytes when one
+    /// is given, else the fetch service's own ceiling.
     pub fn download_blob(
         &self,
         blob_id: &str,
         name: &str,
         content_type: &str,
+        limit: Option<u64>,
     ) -> Result<Vec<u8>, JmapError> {
         let download_url = match &self.download_url {
             Some(url) => url,
@@ -2190,8 +2202,12 @@ impl JmapClient {
         let mut current_url = url.clone();
         let mut carries = true;
         for _ in 0..5 {
-            let fetched =
-                get_with_auth(&current_url, carries.then_some(auth.as_str()), &self.trust)?;
+            let fetched = get_with_auth(
+                &current_url,
+                carries.then_some(auth.as_str()),
+                &self.trust,
+                limit,
+            )?;
             let status = fetched.status;
             if (300..400).contains(&status) {
                 match fetched.location {

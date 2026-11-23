@@ -13,7 +13,7 @@
 
 - Connects to one or more JMAP accounts.
 - Lists mailboxes and emails, opens message view, and shows threads.
-- Shows HTML mail as a styled page, fetching nothing it names.
+- Shows HTML mail as a styled page, with the pictures it carries in its own parts, fetching nothing else it names.
 - Supports read/unread, flag/unflag, move, archive, delete, and mailbox-wide mark-read.
 - Supports compose/reply/reply-all/forward draft generation, and sends a draft through the account's JMAP server.
 - Supports optional mail rules and retention policies.
@@ -55,10 +55,23 @@ Number keys do not open attachments.
 The message view shows HTML as a styled page, laid out by td-page,
 td-web's page engine, when the body it shows is HTML: a message whose
 only body is HTML, or one whose plain part is shown and whose HTML is
-asked for with h (or HTML in the bar). The page is the HTML part alone,
-with its `style` elements and `style` attributes: no sheet, picture or
-font it names elsewhere is fetched, and none from the message's other
-parts is shown yet, so opening a message reaches no server.
+asked for with h (or HTML in the bar). The page is the HTML part, with
+its `style` elements and `style` attributes, and the pictures it names
+among the message's own parts: an `img` whose `src` is a `cid:` URL
+naming a part's Content-ID shows that part, fetched from your account's
+own server when the HTML is first shown, one at a time. Only the HTML
+the page lays (to td-mail's input limit) is read for those URLs. At
+most 16 are asked for, each an image part of a type td-picture decodes
+(PNG, JPEG, GIF, WebP or AVIF) of at most 2 MiB. The message's pictures
+share one 24 MiB term, which each decoding's reckoned peak
+(td-picture/DESIGN.md) must fit beside those already kept: a large
+picture, or one past what the others left, is not shown. One that does
+not come, as when offline, or does not decode, leaves its place as the
+page lays an `img` without one; it is not asked for again while the
+message is open. A picture that comes lays the page out again where it
+is read, its focused link kept. No sheet, picture or font the HTML
+names elsewhere is fetched, so opening a message reaches no server but
+your account's.
 
 Above the page, under a rule td-mail draws, is td-mail's own text of
 the headers and attachments, a document of its own: the message's
@@ -844,7 +857,15 @@ rendering. A 100 KiB newsletter of nested tables and inline styles uses
 1.5 MiB of the budget and is laid out in 19 ms. The ladder's steps take
 up to 2 s on this host for hostile shapes (a table, empty paragraphs),
 on the window's thread, and the jail's CPU share of half a core may
-double that: a known cost until pages are made off it.
+double that: a known cost until pages are made off it. A message's
+pictures are held beside its page: 24 MiB for those decoded, each
+decoding's peak charged there before it begins, 16 MiB for the copies
+fitted to their boxes, and one 2 MiB body, the one fetch asked at a
+time, which the same rule counts (`compose` test
+`the_html_limits_fit_the_jail`). They are decoded on the window's
+thread too, and each that comes makes the page again there, its
+markup parsed and laid, then laid with its pictures: a page with
+pictures costs about twice one without, once for each picture.
 
 A message is fetched whole, its body values included, to the fetch
 service's 64 MiB ceiling; these limits bound what rendering it costs,
