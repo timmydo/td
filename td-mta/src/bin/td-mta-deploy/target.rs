@@ -202,6 +202,11 @@ impl Target {
         self.destination.split_once('@').map(|(account, _)| account)
     }
 
+    /// The SSH host of `destination`.
+    pub fn host(&self) -> Option<&str> {
+        self.destination.split_once('@').map(|(_, host)| host)
+    }
+
     /// Read the file `target_path` names. `~/` in `identity` names `home`.
     pub fn load(path: Option<&Path>, home: &Path, xdg: Option<&Path>) -> R<Self> {
         let path = target_path(path, home, xdg)?;

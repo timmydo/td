@@ -25,6 +25,7 @@ pub(super) struct Values<'a> {
     pub(super) fields: Vec<(&'static str, &'a str)>,
     pub(super) config: Option<&'a str>,
     pub(super) replace: bool,
+    pub(super) host_key: Option<&'a str>,
 }
 
 /// Exactly one `FLAG VALUE` for each of `flags`, an optional `--config
@@ -38,6 +39,7 @@ pub(super) fn values<'a>(
         fields: Vec::new(),
         config: None,
         replace: false,
+        host_key: None,
     };
     let mut it = args.iter();
     let value = |it: &mut std::slice::Iter<'a, String>| -> R<&'a str> {
@@ -52,6 +54,9 @@ pub(super) fn values<'a>(
         } else if arg == "--config" {
             require(out.config.is_none(), "--config is repeated")?;
             out.config = Some(value(&mut it)?);
+        } else if arg == "--host-key-sha256" {
+            require(out.host_key.is_none(), "--host-key-sha256 is repeated")?;
+            out.host_key = Some(host_key::fingerprint(value(&mut it)?)?);
         } else {
             let (_, key) = flags
                 .iter()
@@ -74,17 +79,19 @@ pub(super) fn reported(command: impl FnOnce() -> R<&'static str>) -> R<()> {
     match command() {
         Ok(result) => outcome(&Outcome {
             result,
+            host_key: None,
             error: None,
             next: None,
         }),
         Err(error) => {
             let message = fmt(format_args!("{error}"))?;
             outcome(&Outcome {
-                result: if message == DIFFERS {
+                result: if message == DIFFERS || message == host_key::KEY_DIFFERS {
                     "refused-differs"
                 } else {
                     "refused"
                 },
+                host_key: None,
                 error: Some(&message),
                 next: None,
             })?;
@@ -96,6 +103,7 @@ pub(super) fn reported(command: impl FnOnce() -> R<&'static str>) -> R<()> {
 /// `--write-target`: target.json from its six values.
 pub(super) fn write_target(args: &[String]) -> R<()> {
     let mut config = None;
+    let mut enrolled = None;
     let result = (|| -> R<&'static str> {
         let v = values(
             args,
@@ -108,7 +116,22 @@ pub(super) fn write_target(args: &[String]) -> R<()> {
         let path = target_path(v.config.map(Path::new), &home, xdg.as_deref())?;
         let (text, target) = Target::render(&v.fields, &home)?;
         private_key(&target.identity)?;
-        store_target(&path, &text, &target, &home, v.replace, v.config.is_none())
+        // Decided before anything is written, applied after target.json.
+        let plan = match v.host_key {
+            Some(expected) => Some(host_key::Enrollment::plan(
+                target.host().ok_or("deploy target: no host")?,
+                expected,
+                &path,
+                v.replace,
+            )?),
+            None => None,
+        };
+        let stored = store_target(&path, &text, &target, &home, v.replace, v.config.is_none())?;
+        if let Some(plan) = plan {
+            plan.apply()?;
+            enrolled = Some(plan.result);
+        }
+        Ok(stored)
     })();
     let mut argv = Vec::new();
     td_alloc::extend_from_slice(&mut argv, &["td-mta/deploy", "--provision-host"])?;
@@ -122,6 +145,7 @@ pub(super) fn write_target(args: &[String]) -> R<()> {
     match result {
         Ok(result) => outcome(&Outcome {
             result,
+            host_key: enrolled,
             error: None,
             next: Some(next),
         }),
@@ -187,7 +211,7 @@ pub(super) fn store_target(
     Ok(result)
 }
 
-fn parent(path: &Path) -> R<&Path> {
+pub(super) fn parent(path: &Path) -> R<&Path> {
     match path.parent() {
         Some(p) if p.as_os_str().is_empty() => Ok(Path::new(".")),
         Some(p) => Ok(p),
@@ -197,7 +221,7 @@ fn parent(path: &Path) -> R<&Path> {
 
 /// A private file under a fresh name, synced, then moved to `path`: over
 /// what is there if `replace`, else only where nothing is.
-fn publish(directory: &Path, path: &Path, text: &str, replace: bool) -> R<()> {
+pub(super) fn publish(directory: &Path, path: &Path, text: &str, replace: bool) -> R<()> {
     let staged = child(directory, &fmt(format_args!(".target-{}", random_hex(8)?))?)?;
     let result = (|| -> R<()> {
         let mut file = fs::OpenOptions::new()
@@ -229,6 +253,10 @@ pub(super) fn provision_host(args: &[String]) -> R<()> {
             args,
             HOST_FLAGS,
             "--provision-host needs --build-account, --build-home and --public-name",
+        )?;
+        require(
+            v.host_key.is_none(),
+            "--host-key-sha256 belongs to --write-target",
         )?;
         let (local, target, _) = session(v.config)?;
         let mut fields = v.fields;
@@ -403,7 +431,7 @@ impl Local {
     pub(super) fn login(&self) -> R<()> {
         require(
             self.remote_status(&["true"])? == Some(0),
-            "cannot log in over SSH as target.json's account with its key: the host must be reachable, its key in ~/.ssh/known_hosts and the key authorized",
+            "cannot log in over SSH as target.json's account with its key: the host must be reachable, its key enrolled (--write-target --host-key-sha256) and the identity key authorized",
         )
     }
 

@@ -78,6 +78,7 @@ fn selected_release_requires_passing_first_parent_and_live_ancestry_even_with_ov
         root: root.into(),
         destination: "alice@192.0.2.10".into(),
         key: PathBuf::new(),
+        ssh_options: Vec::new(),
     };
     fs::write(verdicts.join(&side), "pass 0 1 2\n").unwrap();
     fs::write(verdicts.join(&tip), "pass 0 incomplete\n").unwrap();
@@ -124,6 +125,7 @@ fn fetches_only_advertised_main_and_requires_an_already_submitted_controller() {
         root: client.clone(),
         destination: "alice@192.0.2.10".into(),
         key: PathBuf::new(),
+        ssh_options: Vec::new(),
     };
     assert_eq!(local.origin_revisions().unwrap(), (tip.clone(), live));
     // A fetch by object ID leaves the local origin/main tracking ref unchanged.
@@ -580,6 +582,7 @@ fn host_json_is_written_only_where_absent_wrong_or_replaced_on_request() {
 fn the_outcome_line_is_one_json_object_after_a_fixed_prefix() {
     let line = outcome_line(&Outcome {
         result: "target-written",
+        host_key: Some("host-key-enrolled"),
         error: None,
         next: Some(Next {
             argv: &["td-mta/deploy", "--provision-host", "--config", "t.json"],
@@ -602,6 +605,7 @@ fn the_outcome_line_is_one_json_object_after_a_fixed_prefix() {
     assert_eq!(next.get("argv").and_then(Json::as_arr).unwrap().len(), 4);
     let refused = outcome_line(&Outcome {
         result: "refused-differs",
+        host_key: None,
         error: Some(files::DIFFERS),
         next: None,
     })
@@ -636,4 +640,142 @@ fn the_build_account_is_unprivileged_and_owns_the_build_home() {
     ] {
         assert!(files::passwd_home(entry, home).is_err(), "{entry}");
     }
+}
+
+#[test]
+fn a_host_key_is_enrolled_only_with_the_given_fingerprint() {
+    use host_key::{decision, fingerprint, line, scanned, Key, KEY_DIFFERS};
+    let good = "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU";
+    assert_eq!(fingerprint(good).unwrap(), good);
+    for refused in [
+        "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU",
+        "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuF",
+        "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "MD5:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU",
+    ] {
+        assert!(fingerprint(refused).is_err(), "{refused}");
+    }
+    let scan =
+        "# mx1:22 SSH-2.0-OpenSSH_9.6\nmx1 ssh-ed25519 AAAAC3k\nmx1 ecdsa-sha2-nistp256 AAAAE2v\n";
+    let keys = scanned(scan, "mx1").unwrap();
+    assert_eq!(
+        keys.first(),
+        Some(&Key {
+            kind: "ssh-ed25519",
+            blob: "AAAAC3k"
+        })
+    );
+    assert_eq!(keys.len(), 2);
+    assert!(scanned("other ssh-ed25519 AAAA\n", "mx1").is_err());
+    let wanted = line("mx1", &keys[0]).unwrap();
+    assert_eq!(wanted, "mx1 ssh-ed25519 AAAAC3k\n");
+    assert_eq!(decision(None, &wanted, false).unwrap(), "host-key-enrolled");
+    assert_eq!(
+        decision(Some(&wanted), &wanted, false).unwrap(),
+        "host-key-unchanged"
+    );
+    let other = "mx1 ssh-rsa AAAAB3\n";
+    let refused = decision(Some(other), &wanted, false)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(refused, KEY_DIFFERS);
+    assert_eq!(
+        decision(Some(other), &wanted, true).unwrap(),
+        "host-key-replaced"
+    );
+    let args = strings(&["--host-key-sha256", good, "--host-key-sha256", good]);
+    assert!(files::values(&args, &[], "x").is_err());
+    let args = strings(&["--host-key-sha256", "--replace"]);
+    assert!(files::values(&args, &[], "x").is_err());
+}
+
+#[test]
+fn the_enrolled_key_lives_beside_the_target_and_pins_ssh() {
+    let dir = TempDir::new("known-hosts").unwrap();
+    let target = dir.path().join("target.json");
+    let file = host_key::known_hosts(&target).unwrap();
+    assert_eq!(file, dir.path().join("target.json.known_hosts"));
+    // Nothing enrolled: ssh's own known_hosts, as before.
+    assert!(host_key::ssh_options(&target).unwrap().is_empty());
+    let enroll = |result| host_key::Enrollment {
+        line: "mx1 ssh-ed25519 AAAAC3k\n".into(),
+        file: file.clone(),
+        result,
+    };
+    enroll("host-key-enrolled").apply().unwrap();
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "mx1 ssh-ed25519 AAAAC3k\n"
+    );
+    let mode = fs::metadata(&file).unwrap().permissions();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+        0o600
+    );
+    let options = host_key::ssh_options(&target).unwrap();
+    assert_eq!(
+        options,
+        [
+            format!("-oUserKnownHostsFile={}", file.display()),
+            "-oGlobalKnownHostsFile=/dev/null".into(),
+            "-oUpdateHostKeys=no".into(),
+            "-oCheckHostIP=no".into(),
+            "-oVerifyHostKeyDNS=no".into(),
+        ]
+    );
+    // Enrolling where a key is already enrolled needs the replace path.
+    assert!(enroll("host-key-enrolled").apply().is_err());
+    let replaced = host_key::Enrollment {
+        line: "mx1 ssh-rsa AAAAB3\n".into(),
+        file: file.clone(),
+        result: "host-key-replaced",
+    };
+    replaced.apply().unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), "mx1 ssh-rsa AAAAB3\n");
+    enroll("host-key-unchanged").apply().unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), "mx1 ssh-rsa AAAAB3\n");
+    // The right key in a file others can read is rewritten privately.
+    let open = std::os::unix::fs::PermissionsExt::from_mode(0o644);
+    fs::set_permissions(&file, open).unwrap();
+    enroll("host-key-repaired").apply().unwrap();
+    let mode = fs::metadata(&file).unwrap().permissions();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn only_a_private_key_file_at_a_literal_path_pins_ssh() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("known-hosts-checks").unwrap();
+    let target = dir.path().join("t.json");
+    let file = host_key::known_hosts(&target).unwrap();
+    fs::write(&file, "mx1 ssh-ed25519 AAAAC3k\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    // A file the tool did not write, readable by others, is refused.
+    assert!(host_key::ssh_options(&target).is_err());
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(host_key::ssh_options(&target).unwrap().len(), 5);
+    // A link to a private file is not the file the tool wrote.
+    let other = dir.path().join("other");
+    fs::rename(&file, &other).unwrap();
+    std::os::unix::fs::symlink(&other, &file).unwrap();
+    assert!(host_key::ssh_options(&target).is_err());
+    for bad in [
+        "a b/t.json",
+        "%h/t.json",
+        "$X/t.json",
+        "~root/t.json",
+        "q\"/t.json",
+        "a\\\\b/t.json",
+    ] {
+        assert!(
+            host_key::known_hosts(&dir.path().join(bad)).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(host_key::known_hosts(Path::new("relative.json"))
+        .unwrap()
+        .is_absolute());
 }

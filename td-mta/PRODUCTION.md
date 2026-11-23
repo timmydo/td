@@ -999,9 +999,10 @@ the tool. The two commands check each but the last before writing; a
 deployment checks the last:
 
 - the values themselves;
-- the host's SSH key in `~/.ssh/known_hosts` on the development machine
-  (StrictHostKeyChecking): enrolling it is a trust decision, made from a
-  fingerprint obtained over a channel other than SSH;
+- the SHA-256 fingerprint of the host's SSH key, obtained over a channel
+  other than SSH (the cloud console or the host's serial log): trusting
+  it is the operator's decision, and `--host-key-sha256` enrolls the key
+  that has it;
 - the key authorized for `ADMIN` on the host, and passwordless `sudo -n`
   for `ADMIN`;
 - Cargo in `.cargo/bin` under the build home;
@@ -1012,7 +1013,8 @@ On the development machine, `target.json` says how to reach the host:
 
 ```text
 ./td-mta/deploy --write-target --host HOST --host-name NAME --account ADMIN \
-  --identity KEY --jmap-account ACCOUNT --jmap-url URL [--config FILE] [--replace]
+  --identity KEY --jmap-account ACCOUNT --jmap-url URL \
+  [--host-key-sha256 SHA256:FINGERPRINT] [--config FILE] [--replace]
 ```
 
 It writes the file `--config FILE` names, else
@@ -1023,6 +1025,29 @@ same file. Its result is `target-written`, `target-unchanged`,
 `target-repaired` (the same values in a file others could read, now
 private) or `target-replaced`; its `next` is `--provision-host` with the
 same `--config`.
+
+With `--host-key-sha256` (a lowercase `--host`, and a target path
+without white space, quotes, backslashes, `%`, `$` or `~`), before
+writing anything it fetches the keys the host offers with `ssh-keyscan`
+on SSH's port and picks the one whose fingerprint (`ssh-keygen -l -E
+sha256`) is the given one, refusing if the host offers none or none has
+it. The key goes, alone, into the tool's own known_hosts file beside
+target.json (its name and `.known_hosts`, mode 0600), written after
+target.json; a file that holds anything else refuses with
+`refused-differs` unless `--replace`, and anything but a regular file
+there refuses. The outcome's `host_key` is `host-key-enrolled`,
+`host-key-unchanged`, `host-key-replaced`, or `host-key-repaired` when
+the file held the key but others could read it. While that file exists,
+every SSH connection of the launcher, the build mirror push included,
+requires it to be a regular file, not a link, only its owner can read
+and uses it as the only known_hosts file: the global file is empty, ssh
+learns no further keys and records no address (`UpdateHostKeys=no`,
+`CheckHostIP=no`), DNS fingerprints are off, and StrictHostKeyChecking
+refuses any other key. A `KnownHostsCommand` in the operator's own ssh
+configuration is not overridden. Without the file, ssh's own
+`~/.ssh/known_hosts` decides, as before; deleting it returns there.
+Changing `--host` with `--replace` keeps the old host's key in force, so
+logins fail until the new one is enrolled.
 
 - `--host` (`host`): the SSH host, a DNS name or IPv4 address, reached
   on SSH's port.
@@ -1104,7 +1129,9 @@ changed something, found nothing to do or refused:
   prints on standard error before exiting nonzero;
 - `next`: the command that follows, as `{"argv": [...], "needs":
   [...]}` with the options whose values the operator supplies, or
-  `null`.
+  `null`;
+- `host_key`: with `--write-target --host-key-sha256`, what happened to
+  the enrolled key.
 
 ### Isolating production service accounts
 

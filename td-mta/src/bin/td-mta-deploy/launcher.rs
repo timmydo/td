@@ -20,6 +20,8 @@ use td_json::Json;
 mod closure;
 #[path = "launcher_files.rs"]
 mod files;
+#[path = "launcher_host_key.rs"]
+mod host_key;
 
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
@@ -27,7 +29,8 @@ const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [OPTIONS]
        td-mta/deploy --postgres-binaries [OPTIONS]
        td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
-         --identity KEY --jmap-account ACCOUNT --jmap-url URL [--config FILE] [--replace]
+         --identity KEY --jmap-account ACCOUNT --jmap-url URL
+         [--host-key-sha256 SHA256:FP] [--config FILE] [--replace]
        td-mta/deploy --provision-host --build-account ACCOUNT --build-home DIR
          --public-name NAME [--config FILE] [--replace]
 Options: [--window-seconds 1..3600] [--jmap-account ACCOUNT] [--config FILE]
@@ -39,7 +42,10 @@ The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
 and installs its /var/lib/td-mta-operator/host.json. Either refuses to
-change an existing file that says something else unless --replace.";
+change an existing file that says something else unless --replace.
+--host-key-sha256 enrolls the host key with that fingerprint, obtained
+over another channel, in FILE.known_hosts, which every SSH connection
+then trusts alone.";
 struct Options<'a> {
     skip: bool,
     budget: u64,
@@ -154,6 +160,8 @@ struct Local {
     root: PathBuf,
     destination: String,
     key: PathBuf,
+    /// Trust exactly the enrolled host key, when there is one.
+    ssh_options: Vec<String>,
 }
 impl Local {
     fn git(&self) -> Command {
@@ -169,8 +177,9 @@ impl Local {
             "-oBatchMode=yes",
             "-oStrictHostKeyChecking=yes",
             "-oIdentitiesOnly=yes",
-            "-i",
         ])
+        .args(&self.ssh_options)
+        .arg("-i")
         .arg(&self.key)
         .arg(&self.destination)
         .arg(words(args)?);
@@ -518,7 +527,10 @@ fn session(config: Option<&str>) -> R<(Local, Target, PathBuf)> {
     let home = operator_home()?;
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let target = Target::load(config.map(Path::new), &home, xdg.as_deref())?;
+    let path = crate::target::target_path(config.map(Path::new), &home, xdg.as_deref())?;
+    let ssh_options = host_key::ssh_options(&path)?;
     let local = Local {
+        ssh_options,
         host,
         root,
         destination: owned(&target.destination)?,
@@ -544,6 +556,8 @@ struct Next<'a> {
 }
 struct Outcome<'a> {
     result: &'a str,
+    /// `--write-target --host-key-sha256`: what happened to known_hosts.
+    host_key: Option<&'a str>,
     error: Option<&'a str>,
     next: Option<Next<'a>>,
 }
@@ -559,6 +573,9 @@ fn strings(list: &[&str]) -> R<Json> {
 fn outcome_line(outcome: &Outcome<'_>) -> R<String> {
     let mut line = Json::Obj(Vec::new());
     set(&mut line, "result", Json::Str(owned(outcome.result)?))?;
+    if let Some(host_key) = outcome.host_key {
+        set(&mut line, "host_key", Json::Str(owned(host_key)?))?;
+    }
     if let Some(error) = outcome.error {
         set(&mut line, "error", Json::Str(owned(error)?))?;
     }
@@ -656,16 +673,23 @@ pub(super) fn run(args: &[String]) -> R<()> {
             local.destination,
             mirror.to_str().ok_or("invalid source mirror")?
         ))?;
-        let ssh = words(&[
-            "ssh",
-            "-T",
-            "-oConnectTimeout=10",
-            "-oBatchMode=yes",
-            "-oStrictHostKeyChecking=yes",
-            "-oIdentitiesOnly=yes",
-            "-i",
-            key,
-        ])?;
+        let mut parts = Vec::new();
+        td_alloc::extend_from_slice(
+            &mut parts,
+            &[
+                "ssh",
+                "-T",
+                "-oConnectTimeout=10",
+                "-oBatchMode=yes",
+                "-oStrictHostKeyChecking=yes",
+                "-oIdentitiesOnly=yes",
+            ],
+        )?;
+        for option in &local.ssh_options {
+            td_alloc::push(&mut parts, option.as_str())?;
+        }
+        td_alloc::extend_from_slice(&mut parts, &["-i", key])?;
+        let ssh = words(&parts)?;
         local.host.exec(
             local.git().env("GIT_SSH_COMMAND", ssh).args([
                 "push",
