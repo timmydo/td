@@ -82,7 +82,16 @@ it, Control held or not; a press on another names it, and the next
 opens it. l and L focus the next and previous link, scrolling it into
 view, and until the pointer moves the row names the focused link, not
 the one under a pointer at rest; Return opens the named link, once
-however long it is held, and Escape lets the focus go. An `http` or
+however long it is held, and Escape lets the focus go. With Shift held,
+a press and Return open the link in the other browser instead:
+`other_browser` under `[ui]`, else `$OTHER_BROWSER`, which td's mail
+package sets to `td-open --with web`, so a link opens in Firefox by
+default and in td-web with Shift. To make td-web the default there, set
+`browser = "td-open --with web"` and `other_browser = "td-open"`. With
+no other browser, or `other_browser = ""`, Shift opens nothing and the
+status row says so. The portal hands a link only to a browser already
+running, so with no td-web window open, Shift's link goes nowhere; the
+status row says only that the opener started. An `http` or
 `https` link opens, its fragment kept when it is printable ASCII
 without a backslash; a relative link, `//host` included, opens only
 against the message's own absolute `<base href>`, since a message has

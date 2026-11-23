@@ -71,6 +71,13 @@ const SEND_CHORD: &str = "C-Return";
 /// being edited, Ctrl-Shift-A, which the pane does not bind either.
 const ATTACH_CHORD: &str = "C-S-a";
 
+/// The chord that opens a page's named link in the other browser,
+/// Shift-Return, as a Shift-held press does.
+const OTHER_OPEN_CHORD: &str = "S-Return";
+
+/// What opening in the other browser says when none is set.
+const NO_OTHER_BROWSER: &str = "no other browser: set other_browser under [ui], or $OTHER_BROWSER";
+
 /// How soon a second press on the finder's row must follow the first to
 /// choose it, as Return does.
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
@@ -97,6 +104,8 @@ struct Setup {
     account_names: Vec<String>,
     page_size: u32,
     browser: Option<String>,
+    /// Shift's browser for a page's link, else none set.
+    other_browser: Option<String>,
     /// Every account's policies and rules; each account's backend and
     /// views get those that apply to it.
     retention_policies: Vec<RetentionPolicyConfig>,
@@ -1715,6 +1724,21 @@ impl Session {
             }
             return;
         }
+        // Shift+Return over a page laid out, the views having the keys,
+        // opens the named link in the other browser, as Return does in
+        // the default one.
+        if chord == OTHER_OPEN_CHORD
+            && !self.tree_focused()
+            && self
+                .shape()
+                .is_some_and(|shape| shape.layout.page.is_some())
+        {
+            self.last_user_activity = Instant::now();
+            if let Some(said) = self.open_in_other(None) {
+                self.note(said);
+            }
+            return;
+        }
         // Tab moves the keys between the views and the account tree.
         if chord == "Tab" && self.setup.accounts.len() > 1 {
             self.last_user_activity = Instant::now();
@@ -2004,12 +2028,16 @@ impl Session {
         // the status row names it: the page takes no other press.
         if phase == PointerPhase::Press && shape.layout.page.is_some_and(|page| page.contains(x, y))
         {
-            let browser = self.setup.browser.as_deref();
-            let said = self
-                .stack
-                .top_mut()
-                .and_then(|slot| slot.view.page_mut())
-                .and_then(|page| page.press(x, y, browser));
+            // Shift held, the other browser's.
+            let said = if extend {
+                self.open_in_other(Some((x, y)))
+            } else {
+                let browser = self.setup.browser.as_deref();
+                self.stack
+                    .top_mut()
+                    .and_then(|slot| slot.view.page_mut())
+                    .and_then(|page| page.press(x, y, browser))
+            };
             if let Some(said) = said {
                 self.note(said);
                 return;
@@ -2238,6 +2266,35 @@ impl Session {
             .lay_out_page(layout.page, surface.scale, self.prose.as_ref());
     }
 
+    /// Opens a page's link in the other browser: the named one for
+    /// Shift+Return (`at` none), or as a Shift-press at `at`, which names
+    /// a link first as a plain press does. Where a link would open and no
+    /// other browser is set, says so: never the default browser in its
+    /// place. None where nothing would open.
+    fn open_in_other(&mut self, at: Option<(i64, i64)>) -> Option<String> {
+        let other = self
+            .setup
+            .other_browser
+            .as_deref()
+            .filter(|command| !command.trim().is_empty());
+        let page = self.stack.top_mut().and_then(|slot| slot.view.page_mut())?;
+        let opens = match at {
+            Some((x, y)) => page.shown_link() == Some(page.link_at(x, y)?),
+            None => page.shown_link().is_some(),
+        };
+        if !opens {
+            return at.and_then(|(x, y)| page.press(x, y, None));
+        }
+        let Some(other) = other else {
+            return td_alloc::format(format_args!("{NO_OTHER_BROWSER}")).ok();
+        };
+        let said = match at {
+            Some((x, y)) => page.press(x, y, Some(other)),
+            None => page.open_shown(Some(other)),
+        }?;
+        td_alloc::format(format_args!("other browser: {said}")).ok()
+    }
+
     /// The top view's pages, while its body is one.
     fn shown_page(&self) -> Option<&Paged> {
         self.stack
@@ -2366,7 +2423,9 @@ impl Handler for Session {
                     // A held C-x is one; a held Return over a page opens
                     // its link once, not a browser a repeat.
                     let held = repeat
-                        && (chord == "C-x" || (chord == "Return" && self.shown_page().is_some()));
+                        && (chord == "C-x"
+                            || ((chord == "Return" || chord == OTHER_OPEN_CHORD)
+                                && self.shown_page().is_some()));
                     if !held {
                         self.chord(chord);
                     }
@@ -2611,6 +2670,7 @@ pub fn run(
     current_account_idx: usize,
     page_size: u32,
     browser: Option<String>,
+    other_browser: Option<String>,
     mouse: bool,
     sync_interval_secs: Option<u64>,
     rules_mailbox_regex: UserRegex,
@@ -2636,6 +2696,7 @@ pub fn run(
         accounts,
         page_size,
         browser,
+        other_browser,
         retention_policies,
         sync_interval_secs,
         rules,
@@ -2755,6 +2816,7 @@ mod frame_tests {
             account_names: vec!["test".to_string()],
             page_size: 50,
             browser: None,
+            other_browser: None,
             retention_policies: Vec::new(),
             sync_interval_secs: None,
             rules: Vec::new(),
@@ -4289,6 +4351,113 @@ mod frame_tests {
         // The view's own browser, `show_html`'s `true`.
         assert!(
             shown.contains("opened https://e.example/there with true"),
+            "{shown}"
+        );
+    }
+
+    /// Shift held, Return and a press open the named link in the other
+    /// browser; with none set they say so and open nothing, never in the
+    /// default browser instead.
+    #[test]
+    fn shift_opens_a_pages_link_in_the_other_browser() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        session.setup.browser = Some("/nonexistent/td-mail-browser".to_string());
+        show_html(
+            &mut session,
+            &resp_tx,
+            "<p>see <a href='https://e.example/there'>the place</a>",
+        );
+        session.prepare_frame();
+        let at = page_point(&session, 0).expect("a point over the link");
+        // Nothing named, Shift+Return says nothing, as Return does.
+        key(&mut session, "S-Return");
+        assert!(!session.shown().contains("no other browser"));
+        session.motion(Some(at));
+        let shifted = |session: &mut Session| {
+            for phase in [PointerPhase::Press, PointerPhase::Release] {
+                let input = Input::Pointer {
+                    phase,
+                    x: at.0,
+                    y: at.1,
+                    extend: true,
+                    follow: false,
+                };
+                session.input(input, &mut NoClipboard);
+            }
+        };
+        // Off every link a Shift-press says nothing, as a press does.
+        let rect = session.shape().unwrap().layout.page.unwrap();
+        let at_head = (rect.x + 2, rect.y + 2);
+        for phase in [PointerPhase::Press, PointerPhase::Release] {
+            let input = Input::Pointer {
+                phase,
+                x: at_head.0,
+                y: at_head.1,
+                extend: true,
+                follow: false,
+            };
+            session.input(input, &mut NoClipboard);
+        }
+        assert!(!session.shown().contains("no other browser"));
+        // A blank setting is none, not a way to the default browser.
+        for other in [None, Some(" ".to_string())] {
+            session.setup.other_browser = other;
+            key(&mut session, "S-Return");
+            let shown = session.shown();
+            assert!(shown.contains("no other browser"), "{shown}");
+            assert!(!shown.contains("opened"), "{shown}");
+        }
+        session.setup.other_browser = None;
+        session.note("cleared".to_string());
+        shifted(&mut session);
+        let shown = session.shown();
+        assert!(shown.contains("no other browser"), "{shown}");
+        assert!(!shown.contains("opened"), "{shown}");
+        session.setup.other_browser = Some("true".to_string());
+        // A held Shift+Return opens nothing a repeat.
+        let repeat = Input::Key {
+            chord: "S-Return",
+            repeat: true,
+        };
+        session.input(repeat, &mut NoClipboard);
+        assert!(!session.shown().contains("opened"));
+        key(&mut session, "S-Return");
+        let shown = session.shown();
+        assert!(
+            shown.contains("other browser: opened https://e.example/there with true"),
+            "{shown}"
+        );
+        session.setup.other_browser = Some("/nonexistent/td-mail-other".to_string());
+        shifted(&mut session);
+        let shown = session.shown();
+        assert!(
+            shown.contains("link not opened: /nonexistent/td-mail-other"),
+            "{shown}"
+        );
+    }
+
+    /// While the account tree has the keys, Shift+Return is not the
+    /// page's, though the page is drawn beside it; given back, it is.
+    #[test]
+    fn shift_return_is_the_trees_while_it_has_the_keys() {
+        let (mut session, _state, _test_cmds, _work_cmds, answers) = two_accounts_answering();
+        show_html(
+            &mut session,
+            &answers[0],
+            "<p>see <a href='https://e.example/there'>the place</a>",
+        );
+        session.prepare_frame();
+        session.setup.other_browser = Some("true".to_string());
+        key(&mut session, "l");
+        key(&mut session, "Tab");
+        assert!(session.tree_focused());
+        key(&mut session, "S-Return");
+        assert!(!session.shown().contains("other browser"));
+        key(&mut session, "Tab");
+        key(&mut session, "S-Return");
+        let shown = session.shown();
+        assert!(
+            shown.contains("other browser: opened https://e.example/there with true"),
             "{shown}"
         );
     }

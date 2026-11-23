@@ -25,12 +25,16 @@ const PROGRAM_RECIPE: &str = "td-mail";
 /// (APPLICATIONS.md §W.6).
 const OPENER: &str = "td-open";
 const OPENER_ENTRY: &str = "/app/bin/td-open";
+/// The other browser td-mail opens a page's link in with Shift held: the
+/// same opener, asking the portal for td-web (APPLICATIONS.md §W.6).
+const OTHER_BROWSER: &str = "/app/bin/td-open --with web";
 
 pub fn recipe() -> Recipe {
     let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY)
         .and_then(|declaration| declaration.with_environment("BROWSER", OPENER_ENTRY))
         // Saved attachments open through the same helper, by descriptor.
         .and_then(|declaration| declaration.with_environment("OPENER", OPENER_ENTRY))
+        .and_then(|declaration| declaration.with_environment("OTHER_BROWSER", OTHER_BROWSER))
     else {
         return invalid_recipe("declaration");
     };
@@ -209,10 +213,15 @@ mod tests {
             td_engine::target_profile::output_assembly_exceptions(PROGRAM_RECIPE)
         );
         // The opener ships beside the program, with its companion, and the
-        // manifest names it as the browser.
+        // manifest names it as the browser, and, asking for td-web, as
+        // Shift's other one.
         assert_eq!(
             declaration.environment().collect::<Vec<_>>(),
-            [("BROWSER", OPENER_ENTRY), ("OPENER", OPENER_ENTRY)]
+            [
+                ("BROWSER", OPENER_ENTRY),
+                ("OPENER", OPENER_ENTRY),
+                ("OTHER_BROWSER", "/app/bin/td-open --with web"),
+            ]
         );
         for (file, dest) in [
             (format!("{{in:{OPENER}}}/bin/{OPENER}"), "{out}/files/bin"),

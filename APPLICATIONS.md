@@ -11068,7 +11068,11 @@ authenticates to the session bus as the application's UID, calls
 Request's `Response`, and exits 0 only for response 0. `td-open --with
 firefox|web LINK` also sets the request's `td.handler` option, so a
 caller may ask for td-web link by link (§E row 4); `--with web` with a
-file is refused before any request, since td-web opens no file. The applications
+file is refused before any request, since td-web opens no file. The mail
+manifest also sets `OTHER_BROWSER=/app/bin/td-open --with web`, the
+browser td-mail opens a page's link in with Shift held, so Return opens
+it in Firefox and Shift+Return in td-web unless td-mail's `browser` and
+`other_browser` say otherwise. The applications
 carry no D-Bus code, and neither needs a bus name: a portal call is the
 default grant. td-ui's opener discards the helper's stderr and reports
 only that it started, so a link that does not open is diagnosed from

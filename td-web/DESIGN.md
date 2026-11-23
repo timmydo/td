@@ -2472,10 +2472,10 @@ order; each is its own design amendment when it starts:
   draw one as the window does.
 - **HTML mail.** td-mail shows a message's HTML through td-page
   (td-page/DESIGN.md §4), styled, fetching nothing, its links opened in
-  the configured browser with their real target shown first. To come:
-  a choice per link between td-web and Firefox (Return or a press for
-  the default, with Shift for the other), through the portal's handler
-  option (§7); `cid:` pictures from the message's own parts;
+  the configured browser with their real target shown first, or with
+  Shift held in the other one, which td's mail package makes td-web
+  through the portal's handler option (§7). To come: `cid:` pictures
+  from the message's own parts;
   remote content only when asked for; and its pages made off the
   window's thread.
 - **Primary selection**: the page's selection offered as the primary

@@ -274,6 +274,29 @@ mod password_file_tests {
 }
 
 #[cfg(test)]
+mod other_browser_tests {
+    use super::other_browser;
+
+    /// The configuration's command over the environment's; a blank
+    /// configured one is none, and a blank environment one is passed over.
+    #[test]
+    fn the_configured_other_browser_comes_first_and_blank_is_none() {
+        let some = |command: &str| Some(command.to_string());
+        assert_eq!(
+            other_browser(some("mine"), some("td-open --with web")),
+            some("mine")
+        );
+        assert_eq!(
+            other_browser(None, some("td-open --with web")),
+            some("td-open --with web")
+        );
+        assert_eq!(other_browser(some(" "), some("td-open --with web")), None);
+        assert_eq!(other_browser(None, some("  ")), None);
+        assert_eq!(other_browser(None, None), None);
+    }
+}
+
+#[cfg(test)]
 mod portal_tests {
     use super::read_portal_credential_from;
     use std::os::unix::fs::PermissionsExt;
@@ -527,6 +550,7 @@ Here is the format:
 [ui]
 editor = "nvim"          # accepted and ignored: drafts are edited in the window
 browser = "firefox"      # optional: browser for opening URLs ($BROWSER fallback, then xdg-open)
+other_browser = "td-open --with web" # optional: browser a page's link opens in with Shift held ($OTHER_BROWSER fallback; "" for none)
 page_size = 100           # optional: emails per page (default 500)
 mouse = true              # optional: enable mouse support (default true)
 sync_interval_secs = 60   # optional: background sync interval (default 60, 0 = off)
@@ -711,6 +735,18 @@ Please ask me what kinds of emails I receive and how I want them organized, then
     out.flush()
 }
 
+/// Shift's browser for a page's link: the configuration's, else
+/// `$OTHER_BROWSER` (`environment`), which td's mail package sets to
+/// td-open asking for td-web; else none, and Shift opens nothing. A
+/// blank `other_browser` is none, turning the package's off.
+fn other_browser(configured: Option<String>, environment: Option<String>) -> Option<String> {
+    let blank = |command: &String| command.trim().is_empty();
+    match configured {
+        Some(command) => (!blank(&command)).then_some(command),
+        None => environment.filter(|command| !blank(command)),
+    }
+}
+
 fn print_help_config() -> io::Result<()> {
     let mut out = io::stdout().lock();
     let config_path = default_config_path();
@@ -724,6 +760,7 @@ fn print_help_config() -> io::Result<()> {
         "  editor = \"nvim\"              # Accepted and ignored: drafts are edited in the window"
     )?;
     writeln!(out, "  browser = \"firefox\"           # Browser for opening URLs (fallback: $BROWSER, xdg-open)")?;
+    writeln!(out, "  other_browser = \"td-open --with web\" # Browser a page's link opens in with Shift held (fallback: $OTHER_BROWSER; \"\" for none)")?;
     writeln!(
         out,
         "  page_size = 500              # Emails per page (default: 500)"
@@ -1055,6 +1092,7 @@ fn run() -> io::Result<()> {
         0,
         config.ui.page_size,
         config.ui.browser,
+        other_browser(config.ui.other_browser, std::env::var("OTHER_BROWSER").ok()),
         config.ui.mouse,
         config.ui.sync_interval_secs,
         config.mail.rules_mailbox_regex,

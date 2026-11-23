@@ -181,9 +181,19 @@ pub const EMAIL_VIEW: Table = Table {
             "open_page_link",
             "Open the page's link the status row names, else name it",
         ),
+        (
+            "S-click",
+            "open_page_link_other",
+            "As click, in the other browser (other_browser)",
+        ),
         ("l", "next_link", "Focus the page's next link"),
         ("L", "previous_link", "Focus the page's previous link"),
         ("Return", "open_link", "Open the link the status row names"),
+        (
+            "S-Return",
+            "open_link_other",
+            "Open the link the status row names in the other browser",
+        ),
         ("Escape", "unfocus_link", "Let the focused link go"),
         (
             "h",

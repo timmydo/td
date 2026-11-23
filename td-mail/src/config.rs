@@ -209,6 +209,8 @@ pub struct SpamConfig {
 #[derive(Debug)]
 pub struct UiConfig {
     pub browser: Option<String>,
+    /// The browser a page's link opens in with Shift held.
+    pub other_browser: Option<String>,
     pub page_size: u32,
     pub mouse: bool,
     pub sync_interval_secs: Option<u64>,
@@ -405,6 +407,7 @@ impl Default for RawSpamConfig {
 #[derive(Debug)]
 struct RawUiConfig {
     browser: Option<String>,
+    other_browser: Option<String>,
     page_size: u32,
     mouse: bool,
     sync_interval_secs: u64,
@@ -413,6 +416,7 @@ struct RawUiConfig {
 const UI_KEYS: &[&str] = &[
     "editor",
     "browser",
+    "other_browser",
     "page_size",
     "scrolloff",
     "mouse",
@@ -429,6 +433,7 @@ impl RawUiConfig {
         let _ = table.optional_usize("scrolloff")?;
         Ok(RawUiConfig {
             browser: table.optional_str("browser")?.map(str::to_string),
+            other_browser: table.optional_str("other_browser")?.map(str::to_string),
             page_size: table
                 .optional_u32("page_size")?
                 .unwrap_or_else(default_page_size),
@@ -444,6 +449,7 @@ impl Default for RawUiConfig {
     fn default() -> Self {
         Self {
             browser: None,
+            other_browser: None,
             page_size: default_page_size(),
             mouse: default_mouse(),
             sync_interval_secs: default_sync_interval_secs(),
@@ -812,6 +818,7 @@ impl Config {
             accounts,
             ui: UiConfig {
                 browser: raw.ui.browser,
+                other_browser: raw.ui.other_browser,
                 page_size: raw.ui.page_size,
                 mouse: raw.ui.mouse,
                 sync_interval_secs: if raw.ui.sync_interval_secs == 0 {
@@ -1350,6 +1357,21 @@ password_command = "pass show email/work.com"
         let config = Config::parse(&jmap_config("[ui]\nsync_interval_secs = 0")).unwrap();
         assert_eq!(config.ui.page_size, 500);
         assert_eq!(config.ui.sync_interval_secs, None);
+        assert_eq!(config.ui.other_browser, None);
+    }
+
+    /// Shift's browser is a `[ui]` command beside the default one.
+    #[test]
+    fn the_other_browser_is_read_beside_the_browser() {
+        let text =
+            jmap_config("[ui]\nbrowser = \"firefox\"\nother_browser = \"td-open --with web\"");
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.ui.browser.as_deref(), Some("firefox"));
+        assert_eq!(
+            config.ui.other_browser.as_deref(),
+            Some("td-open --with web")
+        );
+        assert!(Config::parse(&jmap_config("[ui]\nother_browser = 1")).is_err());
     }
 
     #[test]
