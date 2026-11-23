@@ -13750,7 +13750,7 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
         postgres_smtp_receiving::Receiving,
         postgres_smtp_storage::Backend,
         smtp_session::{Pending as Action, Session, Settings},
-        smtp_storage::{Begin, Failure, Job, Storage},
+        smtp_storage::{Begin, Failure, Job, Recipient, Storage},
     };
     let loaded = receiving_input(fixture, binding.profile());
     let clock = Arc::new(RuntimeClock::new());
@@ -13808,6 +13808,22 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
             "RCPT TO:<alice@example.test>\r\n",
         ] {
             assert_eq!(session.feed(line.as_bytes()).unwrap(), line.len());
+            // The account's first RCPT waits for the storage worker's quota
+            // and Inbox check before its reply.
+            if let Action::Recipient {
+                account,
+                declared_bytes,
+            } = session.pending()
+            {
+                assert_eq!(account, binding.account());
+                let check = storage
+                    .recipient(account, declared_bytes, until(10_000))
+                    .unwrap();
+                assert_eq!(check, Recipient::Accepted);
+                session.recipient_checked(Ok(check)).unwrap();
+            } else {
+                assert!(!line.starts_with("RCPT"), "RCPT replied unchecked");
+            }
             assert!(
                 matches!(session.pending(), Action::Reply { bytes, .. } if bytes.starts_with(b"250"))
             );
