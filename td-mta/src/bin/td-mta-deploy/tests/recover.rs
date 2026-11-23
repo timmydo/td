@@ -314,6 +314,15 @@ fn a_rollback_reactivates_what_the_live_release_replaced() {
     )
     .unwrap();
     job(&op, "deploy-socket00", "receipt.json", &socket);
+    // Nor does a configuration convergence under the live release.
+    let mut converged = activation(3.5, &[VERIFIED], 40, 40);
+    set(
+        &mut converged,
+        "mode",
+        Json::Str("converge-config".to_string()),
+    )
+    .unwrap();
+    job(&op, "deploy-converge", "receipt.json", &converged);
     let rolled = rollback_job(parse(spec_text.clone()), &op, &me, &releases).unwrap();
     assert_eq!(field(&rolled, "revision").unwrap(), old);
     assert_eq!(field(&rolled, "tree").unwrap(), tree);

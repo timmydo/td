@@ -49,6 +49,10 @@ pub fn child(parent: &Path, name: &str) -> R<PathBuf> {
     td_alloc::extend_from_slice(&mut bytes, name.as_bytes())?;
     Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
+/// A copy of `value` through its text, so growth stays fallible.
+pub fn copy_json(value: &Json) -> R<Json> {
+    Ok(td_json::parse(&fmt(format_args!("{value}"))?)?)
+}
 pub fn set(obj: &mut Json, key: &str, value: Json) -> R<()> {
     let Json::Obj(fields) = obj else {
         return Err("expected JSON object".into());

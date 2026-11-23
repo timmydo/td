@@ -81,8 +81,8 @@ fn load_job(work: &Path, mode: &str, owner: u32) -> R<td_json::Json> {
     Ok(record)
 }
 // Only the PostgreSQL socket and binary switches', the rollback
-// retirement's, recovery's and rollback's jobs name their operation; an
-// activation job does not.
+// retirement's, recovery's, rollback's and configuration convergence's
+// jobs name their operation; an activation job does not.
 fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     let declared = match job.get("mode") {
         None => None,
@@ -92,7 +92,7 @@ fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
         declared
             == match mode {
                 "postgres-socket" | "postgres-binaries" | "postgres-to-debian"
-                | "retire-rollback" | "recover" | "rollback" => Some(mode),
+                | "retire-rollback" | "recover" | "rollback" | "converge-config" => Some(mode),
                 _ => None,
             },
         "job operation does not match the requested mode",
@@ -145,6 +145,7 @@ fn run() -> R<()> {
         [s] if s == "--retire-rollback" => supervise("retire-rollback"),
         [s] if s == "--recover" => supervise("recover"),
         [s] if s == "--rollback" => supervise("rollback"),
+        [s] if s == "--converge-config" => supervise("converge-config"),
         [s] if s == "--restore-shared-services" => supervise("restore-shared-services"),
         [s] if s == "--refresh-notifications" => supervise("refresh-notifications"),
         [s, rest @ ..]
@@ -229,6 +230,16 @@ mod tests {
         assert!(check_mode(&back, "postgres-binaries").is_err());
         assert!(check_mode(&binaries, "postgres-to-debian").is_err());
         assert!(check_mode(&plain, "postgres-to-debian").is_err());
+        let converge = td_json::parse(r#"{"revision":"r","mode":"converge-config"}"#)?;
+        check_mode(&converge, "converge-config")?;
+        assert!(check_mode(&converge, "activate").is_err());
+        assert!(check_mode(&plain, "converge-config").is_err());
+        assert!(check_mode(&binaries, "converge-config").is_err());
+        for other in ["recover", "rollback"] {
+            let job = td_json::parse(&format!(r#"{{"revision":"r","mode":"{other}"}}"#))?;
+            assert!(check_mode(&job, "converge-config").is_err());
+            assert!(check_mode(&converge, other).is_err());
+        }
         Ok(())
     }
 }

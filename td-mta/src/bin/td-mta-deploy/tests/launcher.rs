@@ -650,6 +650,7 @@ fn the_outcome_line_is_one_json_object_after_a_fixed_prefix() {
         result: "target-written",
         host_key: Some("host-key-enrolled"),
         error: None,
+        details: None,
         next: Some(Next {
             argv: &["td-mta/deploy", "--provision-host", "--config", "t.json"],
             needs: &["--build-account"],
@@ -673,6 +674,7 @@ fn the_outcome_line_is_one_json_object_after_a_fixed_prefix() {
         result: "refused-differs",
         host_key: None,
         error: Some(files::DIFFERS),
+        details: None,
         next: None,
     })
     .unwrap();

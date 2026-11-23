@@ -22,6 +22,8 @@ use td_json::Json;
 
 #[path = "activation_binaries.rs"]
 pub(crate) mod binaries;
+#[path = "activation_config.rs"]
+mod config;
 #[path = "activation_database.rs"]
 mod database;
 #[path = "activation_fence.rs"]
@@ -36,6 +38,7 @@ mod retire;
 mod transport;
 
 pub(crate) use binaries::{discard_nars, selected_store, BACKUP_DROPIN, BINARIES_DROPIN};
+pub(crate) use config::RESULTS as CONVERGE_RESULTS;
 
 const OP: &str = "/var/lib/td-mta-operator";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases";
@@ -225,6 +228,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
             | "retire-rollback"
             | "recover"
             | "rollback"
+            | "converge-config"
     ) {
         // Reserve the first activation receipt under the host lock. A repeated
         // invocation must leave the original event and recovery evidence intact.
@@ -238,6 +242,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "postgres-to-debian" => deployment.postgres_to_debian(),
         "retire-rollback" => deployment.retire_rollback(),
         "recover" => deployment.recover(),
+        "converge-config" => deployment.converge_config(),
         _ => Err("unknown deployment operation".into()),
     };
     if let Err(ref err) = result {

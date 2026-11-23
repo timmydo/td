@@ -58,7 +58,7 @@ impl Deployment {
             .success())
     }
 
-    fn native_command(
+    pub(super) fn native_command(
         &self,
         bin: &Path,
         op: &str,
@@ -216,6 +216,18 @@ impl Deployment {
                 .contains(&fmt(format_args!("pid={pid},"))?))
     }
 
+    /// The account a profile serves as and its runtime directory.
+    pub(super) fn profile_runtime(&self, role: &str) -> R<(&'static str, String)> {
+        Ok(if self.isolated {
+            (
+                isolation::role_user(role)?,
+                owned(isolation::runtime(role)?)?,
+            )
+        } else {
+            ("td-mta", fmt(format_args!("{MAIL}/{role}/runtime"))?)
+        })
+    }
+
     pub(super) fn healthy(&self, bin: &Path) -> R<()> {
         for unit in std::iter::once(PG).chain(UNITS.iter().copied()) {
             self.host.run(
@@ -235,14 +247,7 @@ impl Deployment {
             isolation::verify(&self.host, true, self.tls)?;
         }
         for &role in PROFILES {
-            let (uid, runtime) = if self.isolated {
-                (
-                    isolation::role_user(role)?,
-                    owned(isolation::runtime(role)?)?,
-                )
-            } else {
-                ("td-mta", fmt(format_args!("{MAIL}/{role}/runtime"))?)
-            };
+            let (uid, runtime) = self.profile_runtime(role)?;
             self.wait(120, "profile readiness", || {
                 Ok(self
                     .host

@@ -19,6 +19,8 @@ use td_json::Json;
 
 #[path = "launcher_closure.rs"]
 mod closure;
+#[path = "launcher_converge.rs"]
+mod converge;
 #[path = "launcher_files.rs"]
 mod files;
 #[path = "launcher_host_key.rs"]
@@ -32,6 +34,7 @@ const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --retire-rollback --irreversible [OPTIONS]
        td-mta/deploy --recover [OPTIONS]
        td-mta/deploy --rollback [OPTIONS]
+       td-mta/deploy --converge-config [--plan | --expect-digest HEX] [OPTIONS]
        td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
          --identity KEY --jmap-account ACCOUNT --jmap-url URL
          [--host-key-sha256 SHA256:FP] [--config FILE] [--replace]
@@ -51,6 +54,9 @@ whose controller stopped inside its writer fence, as that controller
 would have, keeping the live release otherwise. --rollback reactivates
 the release replaced by the activation that installed the live one,
 when that activation migrated nothing.
+--converge-config converges the selected configuration to the live release's
+defaults plus its td-mta/production-overrides.conf; --plan only reports, and
+--expect-digest applies only the configuration a plan reported.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
@@ -72,6 +78,9 @@ struct Options<'a> {
     recover: bool,
     rollback: bool,
     irreversible: bool,
+    converge: bool,
+    plan: bool,
+    expect: Option<&'a str>,
 }
 fn parse(args: &[String]) -> R<Options<'_>> {
     let mut out = Options {
@@ -87,6 +96,9 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         recover: false,
         rollback: false,
         irreversible: false,
+        converge: false,
+        plan: false,
+        expect: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -109,6 +121,19 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--recover" => out.recover = true,
             "--rollback" => out.rollback = true,
             "--irreversible" => out.irreversible = true,
+            "--converge-config" => out.converge = true,
+            "--plan" => out.plan = true,
+            "--expect-digest" => {
+                let digest = it.next().ok_or("missing expected digest")?;
+                require(
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+                    "invalid expected digest",
+                )?;
+                out.expect = Some(digest);
+            }
             _ => return Err(HELP.into()),
         }
     }
@@ -155,6 +180,26 @@ fn parse(args: &[String]) -> R<Options<'_>> {
     require(
         !(out.irreversible && (out.socket || out.binaries)),
         "--irreversible applies to a deployment or --retire-rollback",
+    )?;
+    require(
+        !(out.converge
+            && (out.skip
+                || out.socket
+                || out.binaries
+                || out.retire
+                || out.recover
+                || out.rollback
+                || out.irreversible
+                || out.window)),
+        "configuration convergence keeps the live release, is its own job and has no writer window",
+    )?;
+    require(
+        out.converge || !(out.plan || out.expect.is_some()),
+        "--plan and --expect-digest apply to --converge-config",
+    )?;
+    require(
+        !(out.plan && out.expect.is_some()),
+        "--expect-digest binds an apply to a plan",
     )?;
     Ok(out)
 }
@@ -662,6 +707,9 @@ struct Outcome<'a> {
     /// `--write-target --host-key-sha256`: what happened to known_hosts.
     host_key: Option<&'a str>,
     error: Option<&'a str>,
+    /// Further members, in order, from a JSON object; none may be named
+    /// `result`, `host_key`, `error` or `next`.
+    details: Option<&'a Json>,
     next: Option<Next<'a>>,
 }
 fn strings(list: &[&str]) -> R<Json> {
@@ -682,6 +730,18 @@ fn outcome_line(outcome: &Outcome<'_>) -> R<String> {
     if let Some(error) = outcome.error {
         set(&mut line, "error", Json::Str(owned(error)?))?;
     }
+    if let Some(details) = outcome.details {
+        let Json::Obj(members) = details else {
+            return Err("outcome details must be a JSON object".into());
+        };
+        for (key, value) in members {
+            require(
+                !["result", "host_key", "error", "next"].contains(&key.as_str()),
+                "outcome details reuse a member name",
+            )?;
+            set(&mut line, key, crate::common::copy_json(value)?)?;
+        }
+    }
     let next = match &outcome.next {
         Some(next) => {
             let mut object = Json::Obj(Vec::new());
@@ -696,12 +756,34 @@ fn outcome_line(outcome: &Outcome<'_>) -> R<String> {
 }
 /// The command's final stdout line, for whoever runs it next.
 fn outcome(outcome: &Outcome<'_>) -> R<()> {
-    let mut out = std::io::stdout().lock();
-    std::io::Write::write_all(&mut out, outcome_line(outcome)?.as_bytes())?;
-    std::io::Write::flush(&mut out)?;
+    write_outcome(&mut std::io::stdout().lock(), outcome)
+}
+fn write_outcome(out: &mut impl std::io::Write, outcome: &Outcome<'_>) -> R<()> {
+    out.write_all(outcome_line(outcome)?.as_bytes())?;
+    out.flush()?;
     Ok(())
 }
 pub(super) fn run(args: &[String]) -> R<()> {
+    let mut session = converge::Session::default();
+    let result = deploy(args, &mut session);
+    if let Err(error) = &result {
+        // The file commands report their own outcome.
+        let file_command = matches!(
+            args.first().map(String::as_str),
+            Some("--write-target" | "--provision-host")
+        );
+        if !file_command && args.iter().any(|arg| arg == "--converge-config") {
+            converge::unreported(
+                &mut std::io::stdout().lock(),
+                &mut session,
+                &fmt(format_args!("{error}"))?,
+                &converge::carried(args)?,
+            )?;
+        }
+    }
+    result
+}
+fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
     if matches!(args,[s] if s=="--help"||s=="-h") {
         println!("{HELP}");
         return Ok(());
@@ -731,16 +813,21 @@ pub(super) fn run(args: &[String]) -> R<()> {
         Some(p) => PathBuf::from(p),
         None => child(&home, ".local/state/td/main-integration")?,
     };
-    let (selected, verdict) =
-        if opts.socket || opts.binaries || opts.retire || opts.recover || opts.rollback {
-            require(
-                local.is_ancestor(live, &tip)?,
-                "live release is not an ancestor of advertised main",
-            )?;
-            (owned(live)?, None)
-        } else {
-            local.select(&tip, live, opts.skip, &child(&base, "verdicts")?)?
-        };
+    let (selected, verdict) = if opts.socket
+        || opts.binaries
+        || opts.retire
+        || opts.recover
+        || opts.rollback
+        || opts.converge
+    {
+        require(
+            local.is_ancestor(live, &tip)?,
+            "live release is not an ancestor of advertised main",
+        )?;
+        (owned(live)?, None)
+    } else {
+        local.select(&tip, live, opts.skip, &child(&base, "verdicts")?)?
+    };
     let tree = local.host.out(
         local
             .git()
@@ -767,6 +854,11 @@ pub(super) fn run(args: &[String]) -> R<()> {
             ))
             .map_or(e, Into::into)
         })?)
+    } else {
+        None
+    };
+    let policy = if opts.converge {
+        Some(converge::policy(&local, live)?)
     } else {
         None
     };
@@ -846,6 +938,23 @@ pub(super) fn run(args: &[String]) -> R<()> {
             local.send_nar(built, &job)?;
         }
     }
+    let policy_sha256 = match &policy {
+        Some(policy) => {
+            let hash = crate::common::digest_reader(&mut policy.as_slice())?;
+            let destination = fmt(format_args!("{job}/overrides.conf"))?;
+            local.save_bytes(&destination, policy)?;
+            require(
+                local
+                    .sudo(&["sha256sum", "--", &destination])?
+                    .split_whitespace()
+                    .next()
+                    == Some(&hash),
+                "uploaded configuration policy mismatch",
+            )?;
+            Some(hash)
+        }
+        None => None,
+    };
     let mut spec = Json::Obj(Vec::new());
     for (k, v) in [
         ("previous", live),
@@ -892,6 +1001,16 @@ pub(super) fn run(args: &[String]) -> R<()> {
             Json::Str(fmt(format_args!("17.{minor}"))?),
         )?;
     }
+    if let Some(hash) = policy_sha256 {
+        set(&mut spec, "mode", Json::Str(owned("converge-config")?))?;
+        set(&mut spec, "policy_sha256", Json::Str(hash))?;
+        set(&mut spec, "plan_only", Json::Bool(opts.plan))?;
+        let expect = match opts.expect {
+            Some(digest) => Json::Str(owned(digest)?),
+            None => Json::Null,
+        };
+        set(&mut spec, "expect_digest", expect)?;
+    }
     if let Some(built) = &closure {
         set(&mut spec, "mode", Json::Str(owned("postgres-binaries")?))?;
         let mut entries = Vec::new();
@@ -921,6 +1040,12 @@ pub(super) fn run(args: &[String]) -> R<()> {
     set(&mut probe, "before", before.map_or(Json::Null, Json::from))?;
     local.save(&probe_path, &probe)?;
     let unit = fmt(format_args!("--unit=td-mta-deploy-{token}"))?;
+    if opts.converge {
+        state.launched = Some(converge::Launch {
+            receipt: owned(&receipt)?,
+            unit: fmt(format_args!("td-mta-deploy-{token}"))?,
+        });
+    }
     let working = fmt(format_args!("--property=WorkingDirectory={job}"))?;
     let status = local
         .ssh(&[
@@ -948,6 +1073,8 @@ pub(super) fn run(args: &[String]) -> R<()> {
                 "--recover"
             } else if opts.rollback {
                 "--rollback"
+            } else if opts.converge {
+                "--converge-config"
             } else {
                 "--activate"
             },
@@ -973,7 +1100,43 @@ pub(super) fn run(args: &[String]) -> R<()> {
         Json::Str(owned(if post.is_ok() { "passed" } else { "failed" })?),
     )?;
     local.save(&probe_path, &probe)?;
-    println!("{}", local.sudo(&["cat", &receipt])?);
+    if opts.converge {
+        let printed = local.sudo(&["cat", &receipt]);
+        if let Ok(printed) = &printed {
+            println!("{printed}");
+        }
+        // Absent, as opposed to unreadable, when `test -e` says so.
+        let missing = printed.is_err()
+            && local
+                .ssh(&["sudo", "-n", "test", "-e", &receipt])?
+                .stdin(Stdio::null())
+                .status()?
+                .code()
+                == Some(1);
+        let receipt = match &printed {
+            Ok(text) => converge::Receipt::Text(text),
+            Err(_) if missing => converge::Receipt::Missing,
+            Err(_) => converge::Receipt::Unreadable,
+        };
+        // A signal or a lost connection: the detached job may still run.
+        let job = if matches!(status.code(), Some(255) | None) {
+            converge::Job::Lost
+        } else if status.success() {
+            converge::Job::Succeeded
+        } else {
+            converge::Job::Failed
+        };
+        return converge::finish(
+            &mut std::io::stdout().lock(),
+            state,
+            receipt,
+            job,
+            post,
+            &converge::carried(args)?,
+        );
+    }
+    let printed = local.sudo(&["cat", &receipt])?;
+    println!("{printed}");
     require(
         status.success(),
         "remote job failed or disconnected; inspect the job receipt",

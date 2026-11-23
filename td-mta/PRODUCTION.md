@@ -64,16 +64,16 @@ Five processes use the selected MTA executable:
 - `td-mta-migadu.service`: production outbound relay profile.
 - `td-mta-acme-production.service`: certificate issuance/renewal for all three MX names.
 
-On this host the selected frontend profile sets `event_streams = 4` in
-`[limits]`: four stream slots of their own, beside the frontend's
-`https_connections` for ordinary requests, which default to sixteen. The
-default is eight streams; selecting a configuration without the setting
-adopts it. Each graphical
-td-mail process opens one stream per eligible watched account, up to two
-streams per process. Change this host setting through the versioned
-[configuration selection procedure](POSTGRES.md#configuration-selection-commands).
-To roll back, select the retained previous version against the current
-generation and verify each profile is ready.
+The selected configuration is to be td-mta's defaults plus the reviewed
+`td-mta/production-overrides.conf`, which states no difference; it changes
+only through [`--converge-config`](#converge-the-configuration). A
+configuration selected before convergence first ran can still set pool
+sizes explicitly; `./td-mta/deploy --converge-config --plan` lists every
+such setting, and the latest receipt's `config_profiles` the pools in
+force. Once converged, the frontend serves the default eight event
+streams in slots of their own, beside its sixteen `https_connections` for
+ordinary requests. Each graphical td-mail process opens one stream per
+eligible watched account, up to two streams per process.
 
 If this frontend returns HTTP 429 for a valid EventSource URL and
 credentials, compare its `http_auth_refused` counters in
@@ -87,13 +87,14 @@ target, means all `https_connections` ordinary admissions were held; its
 log record is a capacity `AdmissionRefused`. Event streams never hold
 ordinary admissions.
 
-The inbound SMTP listener permits eight simultaneous sessions, so four peer
-keys at two sessions each can hold all of them. The listener's explicit
-`session_limit` governs: the default pool of 32 sessions (DESIGN.md section 5)
-takes effect only once a selected configuration raises `session_limit` to 32,
-and `smtp_sessions` too if the profile sets it. The SMTP session
-and DATA limits share a peer key: an IPv4 address (including IPv4-mapped
-addresses) or an IPv6 /64. DATA admission has its own fixed limits of four
+Once converged, the inbound SMTP listener takes the default pool of 32
+sessions (DESIGN.md section 5), at two per peer key, so filling it takes
+sixteen peer keys: convergence sets the listener's required
+`session_limit` and `per_peer_limit` to the profile's `smtp_sessions` and
+`smtp_per_peer`.
+The SMTP session and DATA limits share a peer key: an IPv4 address
+(including IPv4-mapped addresses) or an IPv6 /64. DATA admission has
+its own fixed limits of four
 jobs overall and two per peer. Each peer key may also deliver bursts of 100
 messages and 256 MiB, then 120 messages an hour and about 1 GiB a day; beyond
 that its MAIL commands receive `421 4.7.0` until the balance refills, and the
@@ -298,7 +299,9 @@ it, and the controller preflights, stages, activates and verifies it,
 rolling back on its own before writer admission. `--rollback`
 ([Rolling back an activation](#rolling-back-an-activation)) returns to
 the release it replaced, and `--recover` finishes any job interrupted
-inside its fence. There is no manual build or activation path.
+inside its fence. There is no manual build or activation path; a
+rollback keeps the selected configuration, which
+[`--converge-config`](#converge-the-configuration) sets.
 
 ## Shorten a schema maintenance window
 
@@ -565,12 +568,18 @@ first: it records `live_unhealthy` and the launcher's first JMAP check
 may fail. It refuses if the release rolled back to would itself
 migrate the database, or its runtime check refuses the current grants:
 a release older than upload lease reclamation refuses the runtime
-DELETE on `td_mta.leases` every later one needs. Retirement removes job
+DELETE on `td_mta.leases` every later one needs, or its `config-check`
+refuses the selected configuration, which a convergence under the live
+release may have written (select that job's `config_previous_version`
+first). Retirement removes job
 directories after seven days, and with them what a rollback reads. A
 second `--rollback` returns to the release the first one replaced, and
 a plain `./td-mta/deploy` selects the newest verified main again, so
 land the fix first. Rolling back the executable never restores a
-database backup: that would discard mail accepted since.
+database backup: that would discard mail accepted since. A rollback does
+not change the selected configuration; `--converge-config --plan`
+afterwards shows what the rolled-back release's defaults and policy
+would change, and refuses a release older than its policy file.
 
 ### Recovering an interrupted job
 
@@ -693,7 +702,11 @@ Retiring a job directory also removes what host commands run from it:
 the identity change's job directory is where `--restore-shared-services`
 returns to the shared identities, so that return ends with it, and
 `--refresh-notifications` runs from an activation job directory, which
-a fresh `./td-mta/deploy` creates when none is left.
+a fresh `./td-mta/deploy` creates when none is left. A configuration
+convergence job's receipt is the only copy of its
+`config_previous_version` and, after `uncertain`, of the retained
+selection request: resolve an uncertain request before its job
+directory is seven days old.
 
 
 ### The finished socket cutover
@@ -705,6 +718,117 @@ Production moved PostgreSQL from loopback TLS to its private socket with
 included (`postgres-socket/retired/`), until the operator accepts the
 cutover. The mode remains for a host still on loopback TLS, where the
 controller refuses every other mode and names it.
+
+### Converge the configuration
+
+Production's td-mta configuration is the defaults of the release it runs
+plus the reviewed `td-mta/production-overrides.conf`. Every deliberate
+difference lives in that file, with its reason, so changing production's
+configuration is a code review, never an edit on the host. Operator
+identity stays out of it: host names, addresses, accounts and keys stay in
+the selected configuration and in `target.json` and `host.json`.
+
+```text
+./td-mta/deploy --converge-config --plan [--config FILE] [--jmap-account A]
+./td-mta/deploy --converge-config --expect-digest HEX [--config FILE] [--jmap-account A]
+```
+
+The command takes the policy from the live release's revision with
+`git cat-file blob`, so the defaults it differs from and the file were
+reviewed together: a change to the file takes effect after the release
+that carries it is deployed, and a release older than the file refuses.
+The job runs the live release's `postgres config-converge` (POSTGRES.md,
+"Configuration convergence command") over the selected version. That
+refuses a policy naming a profile production lacks, a profile with
+several SMTP listeners, and any plan that exceeds its memory budget or
+leaves less than one 32-MiB message buffer unassigned (RESOURCES.md,
+"Connection pool sizing"), and validates the complete candidate. The job
+first refuses an unfinished deployment or PostgreSQL socket fence, which
+`--recover` resolves, then runs an activation's configuration and health
+checks and the public SMTP and JMAP probes, and changes nothing
+(`refused`) if any fails.
+
+- `--plan` derives the configuration, records the changes and its digest,
+  publishes nothing and ends `planned`. Its `next` is the apply command,
+  bound to that digest.
+- `--expect-digest HEX` applies only that configuration: if what the job
+  derives now differs, because the selection, release or materials
+  changed, it ends `failed` before publishing and the operator plans
+  again. Without it the
+  job applies whatever it derives.
+- Nothing differs: the job waits for every profile to serve the selected
+  generation and ends `unchanged`. Running it again is always safe.
+- Otherwise it retains a new version ID in the receipt, publishes the
+  converged version under it (settling an uncertain publication under the
+  same ID), checks it with `config-check`, retains a selection request for
+  the observed generation in the receipt and selects it. A select that
+  fails without a definite refusal is inspected once. Each serving profile
+  reloads within its 30-second poll, with a brief listener gap. The job
+  waits up to 150 seconds for each to serve the new generation, repeats
+  the configuration, health and public probe checks, and ends
+  `converged`.
+- If that verification fails, the job records `config_verify_error`,
+  selects the previous version back at the new generation with a second
+  retained request, verifies it the same way, ends `restored` and reports
+  the original failure.
+
+The receipt records `config_changes` (profile, section, listener label,
+key, `before` and `after`, where null is the release default),
+`config_profiles` (pool sizes, planned, budget and unassigned bytes),
+`config_digest`, `config_generation`, `config_selected` (the version the
+job last knows selected, null while a selection is in flight or its
+outcome is unknown), `config_reload_seconds` (the 150-second bound on
+each profile's reload), `config_restarted_units`, the new and previous
+versions and both requests. The launcher prints it and then ends stdout
+with the outcome line of "Command outcomes"; a failure also prints
+`td-mta-deploy: ERROR` on stderr. Its object holds:
+
+- `result`, one of:
+  - `planned`, `unchanged`, `converged`: as above;
+  - `restored`: the previous version is selected and verified again;
+  - `failed`: the job stopped; `selected_version` is what is selected,
+    which is the version it started with unless a restore could not
+    select (the new one) or could not verify (the previous one, with
+    both failures in `error`);
+  - `uncertain`: a selection's outcome is unknown and `request` is its
+    retained request;
+  - `refused`: the launcher, or the host job's preflight, refused
+    before changing anything;
+  - `unknown`: the job settled no result the launcher could read: the
+    connection was lost, the receipt could not be read, or the job died
+    or still runs. Read `receipt` on the host and the journal of `unit`;
+    a receipt whose `config_selected` is null had a selection in flight.
+- `error`, when the job, or the launcher's public JMAP check after it,
+  failed. `converged` with an `error` means the new version stays
+  selected though that check failed.
+- `selected_version`, `changes`, `config_version`,
+  `previous_config_version`, `reload_seconds`, `restarted_units`,
+  `request`, `receipt` and `unit`, when known.
+- `next`: after a successful plan, the apply command bound to its digest
+  with the plan's `--config` and `--jmap-account`, needing nothing; else
+  null.
+
+To return to the previous configuration by hand, select the receipt's
+`config_previous_version` against the current generation with
+`config-selection-prepare` and `config-select` (POSTGRES.md,
+"Configuration selection commands"). The next convergence reapplies the
+policy, so a lasting difference belongs in the reviewed file. After
+`uncertain`, resolve the retained request with `config-selection-inspect`
+before running the command again, and never prepare a replacement for it
+by hand. `--recover` does not settle an `uncertain` or `unknown`
+convergence: a convergence holds no fence, so recovery ends with nothing
+to recover without reading the request. A serving profile that cannot
+load a selected version exits. Once
+a converged selection has failed verification, the restore resets and
+starts every failed serving unit (`td-mta-frontend`, `-receive`,
+`-relay`, `-migadu` and the ACME unit) before verifying the previous
+version, and again before it ends `failed` or `uncertain`, and lists them
+in `restarted_units`; an `error` naming the restart means a unit would
+not start. The job waits up to `reload_seconds`, 150, for each profile in
+turn to serve a new generation: its 30-second poll plus the drain; a
+slower reload fails verification and is restored. Preflight restarts
+nothing: a serving unit that had already failed refuses the job until
+`systemctl reset-failed` and `systemctl start` bring it back.
 
 ### Deploy target configuration
 
@@ -845,9 +969,11 @@ too.
 
 ### Command outcomes
 
-`--write-target` and `--provision-host` end their standard output with
-one line, `td-mta-deploy-outcome` followed by a JSON object, whether they
-changed something, found nothing to do or refused:
+`--write-target`, `--provision-host` and `--converge-config` end their
+standard output with one line, `td-mta-deploy-outcome` followed by a JSON
+object, whether they changed something, found nothing to do or refused.
+All hold the following; `--converge-config` adds the members listed under
+"Converge the configuration":
 
 - `result`: what happened, one of the results named with each command,
   `refused-differs` when only `--replace` would proceed (a decision for

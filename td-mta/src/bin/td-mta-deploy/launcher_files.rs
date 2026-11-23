@@ -81,6 +81,7 @@ pub(super) fn reported(command: impl FnOnce() -> R<&'static str>) -> R<()> {
             result,
             host_key: None,
             error: None,
+            details: None,
             next: None,
         }),
         Err(error) => {
@@ -93,6 +94,7 @@ pub(super) fn reported(command: impl FnOnce() -> R<&'static str>) -> R<()> {
                 },
                 host_key: None,
                 error: Some(&message),
+                details: None,
                 next: None,
             })?;
             Err(error)
@@ -147,6 +149,7 @@ pub(super) fn write_target(args: &[String]) -> R<()> {
             result,
             host_key: enrolled,
             error: None,
+            details: None,
             next: Some(next),
         }),
         Err(_) => reported(|| result),
