@@ -61,7 +61,12 @@ enforced by td-mta's stream-level filter before the driver reads.
 
 - `connect_unix(path, config, limits, deadline)` and
   `connect_tls(address, connector, config, limits, deadline)` open a
-  session; `startup(stream, ...)` starts one over any `Stream`.
+  session; `connect_unix_through(path, wrap, ...)` runs the Unix one
+  over the `Stream` that `wrap` makes of the connected `Socket`, so
+  a caller's own filter sees the startup and login too;
+  `start_tls(socket, connector, ...)` is `connect_tls` over a TCP stream
+  the caller connected, so it can tell a failed connect from a failed
+  negotiation; `startup(stream, ...)` starts one over any `Stream`.
 - `Client::batch(sql, deadline)`: the simple query, several statements,
   rows discarded.
 - `Client::query`, `query_one`, `query_opt`, `execute`: the extended query,
@@ -96,15 +101,20 @@ how `wait` polls. `Socket` implements it for Unix sockets with
 `SO_RCVTIMEO`/`SO_SNDTIMEO` and a nonblocking poll; no `poll(2)` and no
 `unsafe`.
 
-`connect_tls` sends the 8-byte SSLRequest and reads exactly one byte of
-answer: `S` hands the bare `TcpStream` to the caller's `TlsConnect`,
+`connect_tls` (or `start_tls` on a stream the caller connected) sends
+the 8-byte SSLRequest and reads exactly one byte of
+answer: `S` hands the bare, blocking `TcpStream` to the caller's
+`TlsConnect`,
 which must verify chain and name; `N` is `TlsRefused`, with no plaintext
 fallback; anything else is `Protocol`. Reading one byte, not a buffer,
 means nothing the server sends before its handshake can be taken for
 protected data. The crate carries no TLS: td-crypto may not be a
 dependency of a crate outside the crypto admission, and td-mta's TLS
 stream lives in td-mta, so td-mta supplies the connector. Direct TLS
-(PostgreSQL 17's `sslnegotiation=direct`) is not offered.
+(PostgreSQL 17's `sslnegotiation=direct`) is not offered. `start_tls`
+first makes the caller's stream blocking, and consumes it: on any
+failure, a refused configuration or a past deadline included, the
+stream is closed.
 
 ## Startup and SCRAM
 
@@ -195,7 +205,11 @@ or PANIC breaks it.
 An operation may thus read up to `messages` times `message_bytes`, most
 of it discarded. A total byte budget per connection or per turn, such
 as td-mta's stream filter keeps, stays a wrapper of the caller's around
-its `Stream`.
+its `Stream`: `connect_unix_through` puts it around the Unix socket,
+and a TLS connector returns it around its own TLS stream. The
+SSLRequest's eight bytes and its one-byte answer pass on the bare
+socket, before the connector's stream exists, and outside such a
+budget.
 
 Every server length, count and terminator is checked against the bytes
 present, every message must be consumed exactly, negative counts and
@@ -274,7 +288,9 @@ format in the extended query, and every type not listed above.
 
 ## Tests
 
-Unit tests run against byte fixtures and a scripted in-memory stream:
+Unit tests run against byte fixtures and a scripted in-memory stream,
+and the connect forms against a Unix listener in a `td_fs::TempDir` or
+a loopback TCP listener:
 
 - framing of every backend message at every fragmentation, lengths
   below four or above the limit refused from the header, and every
@@ -286,7 +302,11 @@ Unit tests run against byte fixtures and a scripted in-memory stream:
   `hashlib` and `hmac`), and each hostile server-first and server-final
   refused;
 - startup: trust, cleartext, MD5, GSS, a PLUS-only offer, a missing or
-  forged proof, AuthenticationOk out of turn, a non-UTF8 encoding;
+  forged proof, AuthenticationOk out of turn, a non-UTF8 encoding, a
+  Unix login carried, or cut short, by a caller's wrapper, and
+  `start_tls` on a loopback stream: exactly the SSLRequest out, each
+  answer byte, a nonblocking stream handed on blocking, and nothing
+  sent past a deadline;
 - queries: rows read and typed, errors that keep or end the session,
   every protocol-order violation, each limit, a stalled server's
   deadline;
@@ -300,8 +320,9 @@ Unit tests run against byte fixtures and a scripted in-memory stream:
 on a disposable cluster in a `td_fs::TempDir`, found as td-mta's native
 fixtures find theirs: the first `initdb` on `PATH`, with `postgres` and
 `pg_ctl` beside it, each tool run with only `PATH` and `LC_ALL=C`. It
-covers SCRAM login over the Unix socket, a wrong password, cleartext and
-trust refused by the client, an SSLRequest the server answers `N`, every
+covers SCRAM login over the Unix socket, directly and through a
+counting wrapper, a wrong password, cleartext and trust refused by the
+client, an SSLRequest the server answers `N`, every
 type both ways (arrays with NULLs, `name`, the extremes of each integer,
 all 256 byte values), the extended and simple queries, commit and
 rollback, a failed transaction's COMMIT, a deferred constraint failing

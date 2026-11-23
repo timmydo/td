@@ -14,7 +14,9 @@ mod stream;
 mod types;
 mod wire;
 
-pub use client::{connect_tls, connect_unix, startup, Client, Notification};
+pub use client::{
+    connect_tls, connect_unix, connect_unix_through, start_tls, startup, Client, Notification,
+};
 pub use rows::{Row, RowRef, Rows};
 pub use stream::{Socket, Stream, StreamError, TlsConnect};
 pub use types::{oid, Array, Decode, DecodeError, Element, Encode, Typed};

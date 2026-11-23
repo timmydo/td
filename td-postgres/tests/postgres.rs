@@ -13,13 +13,13 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use td_postgres::{
-    connect_tls, connect_unix, Array, Client, CommitError, Config, Error, Limits, Severity, Socket,
-    SqlState, StreamError, TlsConnect, TransactionStatus,
+    connect_tls, connect_unix, connect_unix_through, Array, Client, CommitError, Config, Error,
+    Limits, Severity, Socket, SqlState, Stream, StreamError, TlsConnect, TransactionStatus,
 };
 
 const PASSWORD: &str = "td-postgres-fixture-0123456789abcdef";
@@ -233,6 +233,7 @@ fn real_postgres() {
     let server = Server::start();
     authentication(&server);
     tls_request(&server);
+    wrapped(&server);
     types(&server);
     statements(&server);
     transactions(&server);
@@ -345,6 +346,50 @@ fn tls_request(server: &Server) {
     );
     assert_eq!(result.err(), Some(Error::TlsRefused));
     assert!(!asked.load(Ordering::SeqCst));
+}
+
+/// A caller's stream around the socket, counting both directions.
+struct Counting {
+    inner: Socket,
+    counts: Arc<(AtomicUsize, AtomicUsize)>,
+}
+
+impl Stream for Counting {
+    fn read(&mut self, buffer: &mut [u8], deadline: Instant) -> Result<usize, StreamError> {
+        let count = self.inner.read(buffer, deadline)?;
+        self.counts.0.fetch_add(count, Ordering::SeqCst);
+        Ok(count)
+    }
+
+    fn write_all(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), StreamError> {
+        self.counts.1.fetch_add(bytes.len(), Ordering::SeqCst);
+        self.inner.write_all(bytes, deadline)
+    }
+}
+
+fn wrapped(server: &Server) {
+    let counts = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let mut client = connect_unix_through(
+        &server.socket(),
+        |inner| Counting {
+            inner,
+            counts: Arc::clone(&counts),
+        },
+        &config("td"),
+        limits(),
+        soon(),
+    )
+    .unwrap();
+    let login = (
+        counts.0.load(Ordering::SeqCst),
+        counts.1.load(Ordering::SeqCst),
+    );
+    // SCRAM's messages out; its challenge and the parameters in.
+    assert!(login.0 > 200 && login.1 > 100, "{login:?}");
+    let row = client.query_one("SELECT 7::int8", &[], soon()).unwrap();
+    assert_eq!(row.get::<i64>(0), Ok(7));
+    assert!(counts.0.load(Ordering::SeqCst) > login.0);
+    assert!(counts.1.load(Ordering::SeqCst) > login.1);
 }
 
 fn types(server: &Server) {
