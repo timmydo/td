@@ -31,6 +31,7 @@ const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-binaries [--to-debian] [OPTIONS]
        td-mta/deploy --retire-rollback --irreversible [OPTIONS]
        td-mta/deploy --recover [OPTIONS]
+       td-mta/deploy --rollback [OPTIONS]
        td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
          --identity KEY --jmap-account ACCOUNT --jmap-url URL
          [--host-key-sha256 SHA256:FP] [--config FILE] [--replace]
@@ -47,7 +48,9 @@ release in between needs; --to-debian returns it to the retained Debian one.
 job directories, physical recovery copies, and the Debian PostgreSQL tree
 once a verified switch left it. --recover finishes or rolls back a job
 whose controller stopped inside its writer fence, as that controller
-would have, keeping the live release otherwise.
+would have, keeping the live release otherwise. --rollback reactivates
+the release replaced by the activation that installed the live one,
+when that activation migrated nothing.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
@@ -67,6 +70,7 @@ struct Options<'a> {
     to_debian: bool,
     retire: bool,
     recover: bool,
+    rollback: bool,
     irreversible: bool,
 }
 fn parse(args: &[String]) -> R<Options<'_>> {
@@ -81,6 +85,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         to_debian: false,
         retire: false,
         recover: false,
+        rollback: false,
         irreversible: false,
     };
     let mut it = args.iter();
@@ -102,6 +107,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--to-debian" => out.to_debian = true,
             "--retire-rollback" => out.retire = true,
             "--recover" => out.recover = true,
+            "--rollback" => out.rollback = true,
             "--irreversible" => out.irreversible = true,
             _ => return Err(HELP.into()),
         }
@@ -131,6 +137,16 @@ fn parse(args: &[String]) -> R<Options<'_>> {
                 || out.retire
                 || out.irreversible)),
         "recovery is its own job: it takes no other operation",
+    )?;
+    require(
+        !(out.rollback
+            && (out.socket
+                || out.binaries
+                || out.skip
+                || out.retire
+                || out.recover
+                || out.irreversible)),
+        "a rollback is its own binary-only activation",
     )?;
     require(
         out.irreversible || !out.retire,
@@ -715,22 +731,30 @@ pub(super) fn run(args: &[String]) -> R<()> {
         Some(p) => PathBuf::from(p),
         None => child(&home, ".local/state/td/main-integration")?,
     };
-    let (selected, verdict) = if opts.socket || opts.binaries || opts.retire || opts.recover {
-        require(
-            local.is_ancestor(live, &tip)?,
-            "live release is not an ancestor of advertised main",
-        )?;
-        (owned(live)?, None)
-    } else {
-        local.select(&tip, live, opts.skip, &child(&base, "verdicts")?)?
-    };
+    let (selected, verdict) =
+        if opts.socket || opts.binaries || opts.retire || opts.recover || opts.rollback {
+            require(
+                local.is_ancestor(live, &tip)?,
+                "live release is not an ancestor of advertised main",
+            )?;
+            (owned(live)?, None)
+        } else {
+            local.select(&tip, live, opts.skip, &child(&base, "verdicts")?)?
+        };
     let tree = local.host.out(
         local
             .git()
             .args(["rev-parse", &fmt(format_args!("{selected}^{{tree}}"))?]),
     )?;
     revision(&tree)?;
-    println!("{} current {live}, selected {selected}", site.host_name);
+    if opts.rollback {
+        println!(
+            "{} current {live}: the controller rolls back to the release it replaced",
+            site.host_name
+        );
+    } else {
+        println!("{} current {live}, selected {selected}", site.host_name);
+    }
     let live_server = if opts.binaries {
         Some(local.live_release()?)
     } else {
@@ -762,9 +786,12 @@ pub(super) fn run(args: &[String]) -> R<()> {
         }
         _ => None,
     };
-    // A held fence keeps the services, and so public JMAP, down.
+    // A held fence keeps the services, and so public JMAP, down; a
+    // rollback may be leaving a failing release.
     let before = if opts.recover {
         None
+    } else if opts.rollback {
+        local.qualify_jmap(account, &target.jmap_url).ok()
     } else {
         Some(local.qualify_jmap(account, &target.jmap_url)?)
     };
@@ -839,6 +866,9 @@ pub(super) fn run(args: &[String]) -> R<()> {
     }
     if opts.recover {
         set(&mut spec, "mode", Json::Str(owned("recover")?))?;
+    }
+    if opts.rollback {
+        set(&mut spec, "mode", Json::Str(owned("rollback")?))?;
     }
     set(&mut spec, "irreversible", Json::Bool(opts.irreversible))?;
     if let Some((source, live_minor)) = &live_server {
@@ -916,6 +946,8 @@ pub(super) fn run(args: &[String]) -> R<()> {
                 "--retire-rollback"
             } else if opts.recover {
                 "--recover"
+            } else if opts.rollback {
+                "--rollback"
             } else {
                 "--activate"
             },

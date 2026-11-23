@@ -194,6 +194,11 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "PostgreSQL still uses loopback TLS: run td-mta/deploy --postgres-socket",
     )?;
     host.select_tools(binaries::selected()?);
+    let job = if mode == "rollback" {
+        recover::rollback_job(job, Path::new(OP), &work, Path::new(RELEASES))?
+    } else {
+        job
+    };
     let mut deployment = Deployment::new(host, work, job, tls, &config, mode == "recover")?;
     if mode == "refresh-notifications" {
         require(
@@ -219,6 +224,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
             | "postgres-to-debian"
             | "retire-rollback"
             | "recover"
+            | "rollback"
     ) {
         // Reserve the first activation receipt under the host lock. A repeated
         // invocation must leave the original event and recovery evidence intact.
@@ -226,7 +232,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
     }
     let result = match mode {
         "restore-shared-services" => deployment.restore_shared_services(),
-        "activate" => deployment.execute(),
+        "activate" | "rollback" => deployment.execute(),
         "postgres-socket" => deployment.postgres_socket(),
         "postgres-binaries" => deployment.postgres_binaries(),
         "postgres-to-debian" => deployment.postgres_to_debian(),
@@ -343,6 +349,10 @@ impl Deployment {
         Err(fmt(format_args!("{reason} timeout"))?.into())
     }
 
+    fn rolling_back(&self) -> bool {
+        field(&self.record, "mode").ok() == Some("rollback")
+    }
+
     fn journal_identity(&mut self) -> R<()> {
         let old = self.native(&self.previous, "schema-inspect", &[], &[], Login::Owner)?;
         self.epoch = owned(field(&old, "store_epoch")?)?;
@@ -365,10 +375,20 @@ impl Deployment {
         crate::readiness::prepare(&self.host, false)?;
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
-        self.healthy(&self.previous)?;
-        // Before the build: host.json's public_name must verify now.
-        self.probes.probe("smtp")?;
-        self.probes.probe("jmap")?;
+        // Before the build: host.json's public_name must verify now. A
+        // rollback leaves a release that may be failing: it records that.
+        let live = self
+            .healthy(&self.previous)
+            .and_then(|()| self.probes.probe("smtp"))
+            .and_then(|()| self.probes.probe("jmap"));
+        match live {
+            Err(e) if self.rolling_back() => set(
+                &mut self.record,
+                "live_unhealthy",
+                Json::Str(fmt(format_args!("{e}"))?),
+            )?,
+            other => other?,
+        }
         if self.previous == self.candidate {
             self.event("already deployed and healthy")?;
             return Ok(());
@@ -417,6 +437,10 @@ impl Deployment {
         // A migration (schema, service identities or grants) is undone only
         // by restoring the recovery copy it takes first, losing later mail:
         // the job must say so. The receipt names the schema change.
+        require(
+            !migrate || !self.rolling_back(),
+            "the release rolled back to would migrate the database: deploy a forward fix",
+        )?;
         require(
             !migrate || self.record.get("irreversible").and_then(Json::as_bool) == Some(true),
             "this release migrates the database, which cannot be rolled back: run td-mta/deploy --irreversible",
@@ -570,7 +594,8 @@ impl Deployment {
         } else {
             self.config(&self.candidate, &[], self.isolated)?;
         }
-        self.prepare_fence(true, migration)?;
+        // A rollback may start from listeners that are down.
+        self.prepare_fence(!self.rolling_back(), migration)?;
         self.fence(false, migration)?;
         if let Some(copy) = recovery.as_mut() {
             self.migrate(copy)?;

@@ -185,6 +185,24 @@ fn recovery_runs_alone() {
 }
 
 #[test]
+fn a_rollback_is_its_own_binary_only_activation() {
+    let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let alone = args(&["--rollback", "--window-seconds", "120"]);
+    let opts = parse(&alone).unwrap();
+    assert!(opts.rollback && opts.budget == 120 && !opts.irreversible);
+    for other in [
+        "--skip-tests",
+        "--postgres-socket",
+        "--postgres-binaries",
+        "--retire-rollback",
+        "--recover",
+        "--irreversible",
+    ] {
+        assert!(parse(&args(&["--rollback", other])).is_err(), "{other}");
+    }
+}
+
+#[test]
 fn the_binary_switch_takes_no_attestation() {
     let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let only = args(&["--postgres-binaries"]);

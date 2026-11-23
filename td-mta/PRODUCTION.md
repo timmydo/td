@@ -164,8 +164,8 @@ needed for data correctness or schema admission.
 MTA software does **not** update automatically from Git. A merge, fetch or pull
 does not change the running executable. `./install-td-mta` builds and installs
 for the chosen prefix; it changes that prefix's executable link but does not
-restart services. The procedure below deliberately builds into a candidate
-prefix before touching the live installation.
+restart services. A deployment builds into its own release directory
+before touching the live installation.
 
 Public certificates renew through `td-mta-acme-production.service`, without
 certbot. Leave public TCP 80 reachable for HTTP-01 renewal, as well as SMTP 25
@@ -288,49 +288,17 @@ systemctl status td-mta-maint-backup-status.service
 
 Recovery archives are retained data, not disposable cache.
 
-## Choose and build an update
+## Update and roll back
 
-Use a reviewed revision whose required checks passed. Normal updates select a
-landed commit from `main`; testing an unlanded rolling revision requires its
-own exact source and gate receipt. Do not deploy a moving branch name.
-
-The host checkout's `origin` currently names `/srv/git/td.git`, the development
-machine's local handoff path. Do not assume that remote is usable on Azure.
-Fetch the public backup explicitly (its `main` must contain the chosen commit):
-
-```text
-cd /home/ADMIN/src/td
-git fetch https://github.com/timmydo/td.git main
-git log -1 FETCH_HEAD
-```
-
-In Bash, set `revision` to the full reviewed commit hash. The following
-commands prepare an isolated checkout and candidate installation. Keep this
-shell's variables for the later steps, and stop on any failed command.
-
-```bash
-revision=REPLACE_WITH_REVIEWED_FULL_COMMIT_HASH
-git cat-file -e "$revision^{commit}"
-git merge-base --is-ancestor "$revision" FETCH_HEAD
-checkout="$HOME/src/td-deploy-$revision"
-candidate="$HOME/.local/state/td-mta-candidates/$revision"
-git worktree add --detach "$checkout" "$revision"
-cd "$checkout"
-./install-td-mta --prefix "$candidate"
-candidate_release=$(readlink -f "$candidate/bin/td-mta")
-"$candidate_release" --version
-sha256sum "$candidate_release"
-```
-
-Run the build as `ADMIN`, with the host Rust/C toolchain on PATH. No custom
-compiler store paths or secret build environment are needed. Retain the host
-libraries used by this native build. Do not use `sudo` for compilation. The
-candidate release includes the build input receipt and dependency notices.
-
-During incident work, exact source archives and small deployment drivers were
-retained under `/var/lib/td-mta/operator/*/deployment-*`. Those are historical
-receipts, not scripts to rerun: they pin old commits, configuration versions
-and staging locations. This runbook does not depend on them to build or update.
+Updates and their rollback run from the development machine through
+`./td-mta/deploy`
+([Deploy from the development machine](#deploy-from-the-development-machine)):
+it selects a reviewed revision of main, the host's build account builds
+it, and the controller preflights, stages, activates and verifies it,
+rolling back on its own before writer admission. `--rollback`
+([Rolling back an activation](#rolling-back-an-activation)) returns to
+the release it replaced, and `--recover` finishes any job interrupted
+inside its fence. There is no manual build or activation path.
 
 ## Shorten a schema maintenance window
 
@@ -377,200 +345,6 @@ mail services as soon as these checks pass.
 Record elapsed times for backup, restore, comparison, migration and restart
 in the activation receipt. Verify ACME, timers and aggregate health as usual
 and record their completion separately from listener recovery.
-
-## Preflight and stage the binary
-
-This procedure is for a **binary-only** update with a compatible database and
-configuration. If the change requires a schema upgrade, stop here and follow
-the migration contract in [POSTGRES.md](POSTGRES.md): fence application
-and maintenance sessions, verify the pre-migration recovery point and
-apply the documented migration. Do not run
-`schema-upgrade` as a speculative fix. Binary rollback does not undo a schema
-or configuration change.
-
-Read the current schema epoch and locate the selected configuration version
-in the retained configuration-selection/deployment receipt. Validate that
-same version with the candidate. The version is an operator input, not the
-output of `config-version` (which generates a new identifier).
-
-```text
-sudo -u td-mta /opt/td-mta/bin/td-mta postgres schema-inspect --connection-file /var/lib/td-mta/mail/owner-connection
-```
-
-Copy the whole candidate release, including notices, to a new root-owned
-release directory. Do not overwrite a retained release:
-
-```bash
-release="/opt/td-mta/lib/td-mta/releases/git-$revision"
-test ! -e "$release"
-sudo cp -a "$(dirname "$candidate_release")" "$release"
-sudo chown -R root:root "$release"
-sudo chmod -R a+rX,go-w "$release"
-sudo sha256sum "$release/td-mta"
-sudo -u td-mta "$release/td-mta" postgres config-check \
-  --connection-file /var/lib/td-mta/mail/owner-connection \
-  --epoch CURRENT_EPOCH --version SELECTED_CONFIG_VERSION
-```
-
-The copied binary hash must equal the candidate hash. Require successful
-`config-check`. Confirm disk space and recent backup status before activation:
-
-```text
-df -h /var/lib/td-mta
-sudo systemctl start td-mta-maint-backup-status.service
-sudo systemctl start td-mta-health.service
-```
-
-Keep a private deployment record containing the commit, source tree hash,
-candidate binary hash, gate receipt, selected configuration version and
-previous executable path. Save `performance-status` before restarting if
-comparing performance: process-local counters reset on restart.
-
-## Activate and verify
-
-The commands in this section use the shared production service identity.
-After the identity migration, use the role-specific UIDs and runtime paths in
-[Isolating production service accounts](#isolating-production-service-accounts).
-
-Updates briefly interrupt listeners. PostgreSQL and stored mail remain in
-place. Pause the aggregate health timer for this window, stop all five MTA
-processes, then switch the link. Do not continue if any service fails to stop.
-Use a unique temporary link and an atomic rename within the same directory.
-Pause both search timers and stop their service jobs before switching binaries;
-resume the timers after verifying the new release, or after a verified rollback.
-Preserve their durable progress. Schema upgrades additionally fence every
-other database user, including backup, scrub and status jobs.
-
-The activation block runs in a subshell: any failed command ends activation
-and resumes the health timer. It preserves the previous executable path in a
-private receipt before stopping services. A failure after stopping requires
-operator rollback; it is not an automatic rollback implementation.
-
-```bash
-mail_units=(td-mta-frontend td-mta-receive td-mta-relay td-mta-migadu td-mta-acme-production)
-previous=$(readlink -f /opt/td-mta/bin/td-mta)
-record="/var/lib/td-mta-operator/manual-$revision"
-(
-  set -euo pipefail
-  sudo mkdir -m 700 "$record"
-  printf '%s\n' "$previous" | sudo tee "$record/previous-release" >/dev/null
-  trap 'sudo systemctl start td-mta-health.timer' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  sudo systemctl stop td-mta-health.timer
-  sudo systemctl stop "${mail_units[@]}"
-  for unit in "${mail_units[@]}"; do
-    state=$(systemctl show "$unit" -p ActiveState --value)
-    case "$state" in
-      inactive|failed) ;;
-      *) echo "$unit has not stopped" >&2; exit 1 ;;
-    esac
-  done
-  sudo ln -s "$release/td-mta" "/opt/td-mta/bin/.update-$revision"
-  sudo mv -T "/opt/td-mta/bin/.update-$revision" /opt/td-mta/bin/td-mta
-  sudo systemctl start "${mail_units[@]}"
-  wait_ready() {
-    local end=$((SECONDS + 120))
-    until "$@"; do
-      if (( SECONDS >= end )); then return 1; fi
-      sleep 2
-    done
-  }
-  for profile in frontend receive relay migadu; do
-    wait_ready sudo -u td-mta /opt/td-mta/bin/td-mta status --json --require-ready \
-      --runtime "/var/lib/td-mta/mail/$profile/runtime"
-  done
-  # A previous ACME owner's lease can outlive its process by 180 seconds.
-  # The HTTP-01 listener is opened only after the new owner acquires it.
-  acme_end=$((SECONDS + 240))
-  while :; do
-    acme_pid=$(systemctl show td-mta-acme-production -p MainPID --value)
-    if [[ "$acme_pid" =~ ^[1-9][0-9]*$ ]] &&
-       sudo ss -H -ltnp 'sport = :80' | grep -Fq "pid=$acme_pid,"; then
-      break
-    fi
-    if (( SECONDS >= acme_end )); then exit 1; fi
-    sleep 2
-  done
-  wait_ready sudo -u td-mta /opt/td-mta/bin/td-mta acme-status \
-    --connection-file /var/lib/td-mta/mail/runtime-connection \
-    --certificate-profile production --require-ready --minimum-validity-seconds 2592000
-  test "$(systemctl show td-mta-acme-production -p MainPID --value)" = "$acme_pid"
-  sudo systemctl start td-mta-health.service
-)
-```
-
-ACME process startup has a four-minute retry window because the previous
-owner's 180-second database lease survives shutdown. During that interval,
-systemd can retry with `runtime-claim` errors; do not clear the lease by hand.
-`acme-status` reports persisted certificate health, so it cannot alone prove
-that the new renewal worker is running. Require its HTTP-01 listener first,
-then the same PID after the certificate check. The process hash checks below
-remain required.
-
-Each persisted or runtime readiness check has a two-minute retry window; the command's own bounded
-execution time may extend the final attempt. A service being `active` alone is
-not success. If startup or readiness fails, inspect the journal and use the
-rollback procedure below. Confirm that the health timer resumed even after a
-failed attempt.
-
-Check every running process, not merely the selected link. For each of the
-five units, read its nonzero `MainPID` and compare `/proc/PID/exe` with the
-candidate SHA-256:
-
-```text
-systemctl show td-mta-frontend -p MainPID -p NRestarts -p ActiveState
-sudo sha256sum /proc/REPLACE_WITH_MAINPID/exe
-```
-
-Repeat for receive, relay, migadu and acme-production. Record the hashes and
-readiness results with the deployment receipt. Check public TLS/JMAP access
-from td-mail and the changed behavior with an appropriate acceptance test.
-Readiness does not prove a remote recipient accepted an outbound message.
-
-## Roll back a binary-only update
-
-To return across the Linux and database identity cutover, use the recorded
-job's shared-service rollback procedure in
-[Isolating production service accounts](#isolating-production-service-accounts).
-
-Use the **recorded** previous executable, not whichever release happens
-to be second in a directory listing. Returning to a release older than
-upload lease reclamation also needs `REVOKE DELETE ON td_mta.leases FROM
-td_mta_runtime;` with the services stopped, before the old executable
-starts. Preserve the failed candidate and its logs.
-Stop all five services and verify their stopped states as above, then:
-
-If reconnecting after a failed update, recover `previous` from the private
-`manual-COMMIT/previous-release` receipt and set `revision` and `mail_units`
-again. The following block refuses to switch while any worker remains active:
-
-```bash
-(
-  set -euo pipefail
-  test -x "$previous"
-  trap 'sudo systemctl start td-mta-health.timer' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  sudo systemctl stop td-mta-health.timer
-  sudo systemctl stop "${mail_units[@]}"
-  for unit in "${mail_units[@]}"; do
-    state=$(systemctl show "$unit" -p ActiveState --value)
-    case "$state" in
-      inactive|failed) ;;
-      *) echo "$unit has not stopped" >&2; exit 1 ;;
-    esac
-  done
-  sudo ln -s "$previous" "/opt/td-mta/bin/.rollback-$revision"
-  sudo mv -T "/opt/td-mta/bin/.rollback-$revision" /opt/td-mta/bin/td-mta
-  sudo systemctl start "${mail_units[@]}"
-)
-```
-
-Repeat all readiness, certificate, process-hash and aggregate health checks;
-resume `td-mta-health.timer`. A rollback is complete only after those checks
-pass. Do not restore a database backup to roll back an executable: that would
-discard mail accepted since the backup.
 
 ## Diagnose and retain evidence
 
@@ -766,6 +540,37 @@ ACME may need its separate four-minute lease budget after SMTP and JMAP
 return. The original data stays in the job directory and the recovery
 inputs in `/data/td-mta-physical-recovery` through the rollback window
 ([Retiring rollback material](#retiring-rollback-material)).
+
+### Rolling back an activation
+
+```text
+./td-mta/deploy --rollback
+```
+
+The controller, not the launcher, picks the release: the latest
+activation or rollback in `/var/lib/td-mta-operator` that installed the
+live release and left it selected (verified, or kept because it failed
+after writers returned) names, as `previous`, the job's `revision`, with
+the tree its retained release's `deployment-inputs.json` names;
+`rollback_of` names that job. It refuses when that activation changed
+the service identities (run `--restore-shared-services`, see
+[Isolating production service accounts](#isolating-production-service-accounts))
+or migrated anything (`recovery`, or `schema_before` other than
+`schema_after`): a binary rollback cannot undo a migration, and a
+forward fix is the path. The job is otherwise an ordinary activation of
+a retained release whose provenance the controller checks: the same
+fence, budget, verification and automatic rollback, with no
+main-integration verdict: that release was the one live before. Unlike an update it does not require the live release healthy
+first: it records `live_unhealthy` and the launcher's first JMAP check
+may fail. It refuses if the release rolled back to would itself
+migrate the database, or its runtime check refuses the current grants:
+a release older than upload lease reclamation refuses the runtime
+DELETE on `td_mta.leases` every later one needs. Retirement removes job
+directories after seven days, and with them what a rollback reads. A
+second `--rollback` returns to the release the first one replaced, and
+a plain `./td-mta/deploy` selects the newest verified main again, so
+land the fix first. Rolling back the executable never restores a
+database backup: that would discard mail accepted since.
 
 ### Recovering an interrupted job
 
@@ -1125,7 +930,8 @@ next monitor and digest invocation use the new settings.
    profile run its named readiness job, then start
    `td-mta-maint-backup-status.service` and `td-mta-health.service`.
    Run `acme-status` as `td-mta-acme` with its own connection file and
-   the certificate profile and minimum validity used above.
+   `--certificate-profile production --require-ready
+   --minimum-validity-seconds 2592000`.
 4. After writer admission, keep the selected primary and subsequent mail.
    To return to the recorded shared deployment, run the following from
    the root-owned directory of the **identity cutover** job while its

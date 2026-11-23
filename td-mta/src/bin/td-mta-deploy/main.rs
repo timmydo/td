@@ -80,8 +80,9 @@ fn load_job(work: &Path, mode: &str, owner: u32) -> R<td_json::Json> {
     }
     Ok(record)
 }
-// Only the PostgreSQL socket and binary switches' and the rollback
-// retirement's jobs name their operation; an activation job does not.
+// Only the PostgreSQL socket and binary switches', the rollback
+// retirement's, recovery's and rollback's jobs name their operation; an
+// activation job does not.
 fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     let declared = match job.get("mode") {
         None => None,
@@ -91,7 +92,7 @@ fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
         declared
             == match mode {
                 "postgres-socket" | "postgres-binaries" | "postgres-to-debian"
-                | "retire-rollback" | "recover" => Some(mode),
+                | "retire-rollback" | "recover" | "rollback" => Some(mode),
                 _ => None,
             },
         "job operation does not match the requested mode",
@@ -143,6 +144,7 @@ fn run() -> R<()> {
         [s] if s == "--postgres-to-debian" => supervise("postgres-to-debian"),
         [s] if s == "--retire-rollback" => supervise("retire-rollback"),
         [s] if s == "--recover" => supervise("recover"),
+        [s] if s == "--rollback" => supervise("rollback"),
         [s] if s == "--restore-shared-services" => supervise("restore-shared-services"),
         [s] if s == "--refresh-notifications" => supervise("refresh-notifications"),
         [s, rest @ ..]

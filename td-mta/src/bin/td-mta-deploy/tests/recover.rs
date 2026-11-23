@@ -266,3 +266,151 @@ fn recorded_timers_are_required() {
         ["td-mta-health.timer", "td-mta-maint-backup.timer"]
     );
 }
+
+#[test]
+fn a_rollback_reactivates_what_the_live_release_replaced() {
+    let dir = td_fs::TempDir::new("recover-rollback").unwrap();
+    let op = dir.path().join("op");
+    let releases = dir.path().join("releases");
+    fs::create_dir_all(&op).unwrap();
+    let me = op.join("deploy-rollback");
+    let (old, live, tree) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let release = releases.join(format!("git-{old}"));
+    fs::create_dir_all(&release).unwrap();
+    let mut stamp = Json::Obj(Vec::new());
+    set(&mut stamp, "revision", Json::Str(old.clone())).unwrap();
+    set(&mut stamp, "tree", Json::Str(tree.clone())).unwrap();
+    durable(&release.join("deployment-inputs.json"), &stamp).unwrap();
+    let mut job_spec = Json::Obj(Vec::new());
+    set(&mut job_spec, "previous", Json::Str(live.clone())).unwrap();
+    set(&mut job_spec, "revision", Json::Str(live.clone())).unwrap();
+    set(&mut job_spec, "mode", Json::Str("rollback".to_string())).unwrap();
+    let activation = |started: f64, events: &[&str], before: u64, after: u64| {
+        let mut record = receipt(started, events);
+        set(&mut record, "revision", Json::Str(live.clone())).unwrap();
+        set(&mut record, "previous", Json::Str(old.clone())).unwrap();
+        set(&mut record, "schema_before", Json::from(before)).unwrap();
+        set(&mut record, "schema_after", Json::from(after)).unwrap();
+        record
+    };
+    let parse = |text: String| td_json::parse(&text).unwrap();
+    let spec_text = format!("{job_spec}");
+    let refused = || rollback_job(parse(spec_text.clone()), &op, &me, &releases).is_err();
+    assert!(refused());
+    let verified = activation(1.0, &["fencing", OPENING, VERIFIED], 40, 40);
+    let done = job(&op, "deploy-verified", "receipt.json", &verified);
+    // A later failed or socket job does not count.
+    job(
+        &op,
+        "deploy-failed00",
+        "receipt.json",
+        &activation(2.0, &[FAILED], 40, 40),
+    );
+    let mut socket = activation(3.0, &[VERIFIED], 40, 40);
+    set(
+        &mut socket,
+        "mode",
+        Json::Str("postgres-socket".to_string()),
+    )
+    .unwrap();
+    job(&op, "deploy-socket00", "receipt.json", &socket);
+    let rolled = rollback_job(parse(spec_text.clone()), &op, &me, &releases).unwrap();
+    assert_eq!(field(&rolled, "revision").unwrap(), old);
+    assert_eq!(field(&rolled, "tree").unwrap(), tree);
+    assert_eq!(field(&rolled, "previous").unwrap(), live);
+    assert_eq!(
+        field(&rolled, "rollback_of").unwrap(),
+        done.to_str().unwrap()
+    );
+    // The live release must be the one it installed.
+    let mut elsewhere = parse(spec_text.clone());
+    set(&mut elsewhere, "previous", Json::Str("d".repeat(40))).unwrap();
+    assert!(rollback_job(elsewhere, &op, &me, &releases).is_err());
+    // Nothing migrated, no identity change.
+    let mut migrated = activation(4.0, &[VERIFIED], 40, 41);
+    job(&op, "deploy-migrate0", "receipt.json", &migrated);
+    assert!(refused());
+    set(&mut migrated, "schema_after", Json::from(40u64)).unwrap();
+    set(&mut migrated, "recovery", Json::Str("/data/x".to_string())).unwrap();
+    durable(&op.join("deploy-migrate0/receipt.json"), &migrated).unwrap();
+    assert!(refused());
+    let mut isolating = activation(5.0, &[VERIFIED], 40, 40);
+    set(&mut isolating, "isolation_change", Json::Bool(true)).unwrap();
+    job(&op, "deploy-isolate0", "receipt.json", &isolating);
+    assert!(refused());
+    // A verified rollback counts as an activation.
+    let mut plain = activation(6.0, &[VERIFIED], 40, 40);
+    set(&mut plain, "mode", Json::Str("rollback".to_string())).unwrap();
+    job(&op, "deploy-plain000", "receipt.json", &plain);
+    assert!(!refused());
+    // A retained release whose stamp names another revision.
+    set(&mut stamp, "revision", Json::Str("e".repeat(40))).unwrap();
+    durable(&release.join("deployment-inputs.json"), &stamp).unwrap();
+    assert!(refused());
+}
+
+#[test]
+fn a_rollback_follows_a_release_kept_after_admission_and_sees_past_restores() {
+    let dir = td_fs::TempDir::new("recover-kept").unwrap();
+    let op = dir.path().join("op");
+    let releases = dir.path().join("releases");
+    fs::create_dir_all(&op).unwrap();
+    let me = op.join("deploy-rollback");
+    let (old, live) = ("a".repeat(40), "b".repeat(40));
+    let release = releases.join(format!("git-{old}"));
+    fs::create_dir_all(&release).unwrap();
+    let mut stamp = Json::Obj(Vec::new());
+    set(&mut stamp, "revision", Json::Str(old.clone())).unwrap();
+    set(&mut stamp, "tree", Json::Str("c".repeat(40))).unwrap();
+    durable(&release.join("deployment-inputs.json"), &stamp).unwrap();
+    let spec = format!(r#"{{"previous":"{live}","revision":"{live}","mode":"rollback"}}"#);
+    let attempt = || rollback_job(td_json::parse(&spec).unwrap(), &op, &me, &releases);
+    let activation = |started: f64, events: &[&str]| {
+        let mut record = receipt(started, events);
+        set(&mut record, "revision", Json::Str(live.clone())).unwrap();
+        set(&mut record, "previous", Json::Str(old.clone())).unwrap();
+        set(&mut record, "schema_before", Json::from(40u64)).unwrap();
+        set(&mut record, "schema_after", Json::from(40u64)).unwrap();
+        record
+    };
+    // Failed and rolled back: the live release is not its.
+    let mut rolled = activation(1.0, &["fencing", OPENING, FAILED]);
+    set(&mut rolled, "rollback", Json::from("verified")).unwrap();
+    job(&op, "deploy-rolled00", "receipt.json", &rolled);
+    assert!(attempt().is_err());
+    // Failed after writers returned: kept, so it installed the live one.
+    let kept = job(
+        &op,
+        "deploy-kept0000",
+        "receipt.json",
+        &activation(2.0, &["fencing", OPENING, FAILED]),
+    );
+    let rolled = attempt().unwrap();
+    assert_eq!(field(&rolled, "revision").unwrap(), old);
+    assert_eq!(
+        field(&rolled, "rollback_of").unwrap(),
+        kept.to_str().unwrap()
+    );
+    // A shared-service restore's record does not hide the isolating
+    // activation from the refusal that names it.
+    let mut isolating = activation(3.0, &["fencing", OPENING, VERIFIED]);
+    set(&mut isolating, "isolation_change", Json::Bool(true)).unwrap();
+    let restored = job(&op, "deploy-isolate0", "receipt.json", &isolating);
+    durable(&restored.join(SHARED), &receipt(4.0, &["fencing", FAILED])).unwrap();
+    let refusal = attempt().unwrap_err().to_string();
+    assert!(refusal.contains("--restore-shared-services"), "{refusal}");
+    // An unretained release is named as such.
+    fs::remove_file(op.join("deploy-isolate0/receipt.json")).unwrap();
+    fs::remove_dir_all(&release).unwrap();
+    let missing = attempt().unwrap_err().to_string();
+    assert!(missing.contains("no longer retained"), "{missing}");
+}
+
+#[test]
+fn a_fenced_rollback_recovers_as_an_activation() {
+    let events = ["fencing", "fenced", SEALED];
+    assert_eq!(
+        classify("rollback", &events, true, true, false).unwrap(),
+        Interrupted::Activation { stopped: true }
+    );
+}

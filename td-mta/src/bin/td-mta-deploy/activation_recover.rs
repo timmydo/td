@@ -13,6 +13,7 @@ pub(super) const OPENING: &str = "opening writers";
 const SEALED: &str = "exact recovery point verified";
 const FAILED: &str = "deployment failed";
 const FENCING: &str = "fencing";
+const VERIFIED: &str = "verified deployment";
 /// The record of a shared-service restore, in its deployment's directory.
 const SHARED: &str = "shared-rollback.json";
 const RECEIPT_BOUND: u64 = 1024 * 1024;
@@ -76,7 +77,7 @@ pub(super) fn classify(
     }
     Ok(match mode {
         "restore-shared-services" => Interrupted::Shared,
-        "activate" => Interrupted::Activation {
+        "activate" | "rollback" => Interrupted::Activation {
             stopped: events.contains(&SEALED),
         },
         "postgres-binaries" | "postgres-to-debian" => Interrupted::Switch,
@@ -139,6 +140,84 @@ fn latest(
         }
     }
     Ok(found.map(|(dir, record, shared, _)| (dir, record, shared)))
+}
+
+/// `--rollback`: `job` (live release in `previous`) becomes the activation
+/// of the release replaced by the latest activation or rollback in `op`
+/// that installed the live one, verified or kept once writers returned,
+/// which must have migrated nothing.
+pub(super) fn rollback_job(mut job: Json, op: &Path, work: &Path, releases: &Path) -> R<Json> {
+    let live = owned(field(&job, "previous")?)?;
+    let (dir, last) = installed(op, work, &live)?
+        .ok_or("no retained activation installed the live release: nothing to roll back")?;
+    require(
+        last.get("isolation_change").and_then(Json::as_bool) != Some(true),
+        "the latest activation isolated the service identities: run td-mta/deploy --restore-shared-services",
+    )?;
+    require(
+        last.get("recovery").is_none() && uint(&last, "schema_before")? == uint(&last, "schema_after")?,
+        "the latest activation migrated the database, which a binary rollback cannot undo: deploy a forward fix",
+    )?;
+    let target = owned(field(&last, "previous")?)?;
+    require(lower_hex(&target, 40), "invalid recorded previous release")?;
+    let stamp = child(
+        releases,
+        &fmt(format_args!("git-{target}/deployment-inputs.json"))?,
+    )?;
+    require(
+        stamp.try_exists()?,
+        "the release rolled back to is no longer retained",
+    )?;
+    let stamp = read_json(&stamp, RECEIPT_BOUND)?;
+    require(
+        field(&stamp, "revision")? == target,
+        "retained release provenance",
+    )?;
+    let tree = owned(field(&stamp, "tree")?)?;
+    set(&mut job, "revision", Json::Str(target))?;
+    set(&mut job, "tree", Json::Str(tree))?;
+    set(
+        &mut job,
+        "rollback_of",
+        Json::Str(owned(dir.to_str().ok_or("job path")?)?),
+    )?;
+    Ok(job)
+}
+
+/// The latest activation or rollback whose `revision` is `live` and that
+/// left it selected: verified, or kept once its writers returned. Its
+/// deployment's own receipt, not a later shared-service restore's record.
+fn installed(op: &Path, exclude: &Path, live: &str) -> R<Option<(PathBuf, Json)>> {
+    let mut found: Option<(PathBuf, Json, f64)> = None;
+    for entry in fs::read_dir(op)? {
+        let dir = entry?.path();
+        if dir == exclude || !name(&dir).is_ok_and(|n| numbered_name(n, "deploy-")) {
+            continue;
+        }
+        let path = child(&dir, "receipt.json")?;
+        // Unreadable or legacy records install nothing this can verify.
+        let Ok(record) = read_json(&path, RECEIPT_BOUND) else {
+            continue;
+        };
+        let Some(started) = record.get("started").and_then(Json::as_f64) else {
+            continue;
+        };
+        let Ok(events) = messages(&record) else {
+            continue;
+        };
+        let kept = events.contains(&VERIFIED)
+            || (events.contains(&OPENING) && record.get("rollback").is_none());
+        if matches!(
+            record.get("mode").and_then(Json::as_str),
+            None | Some("rollback")
+        ) && record.get("revision").and_then(Json::as_str) == Some(live)
+            && kept
+            && found.as_ref().is_none_or(|f| started > f.2)
+        {
+            found = Some((dir, record, started));
+        }
+    }
+    Ok(found.map(|(dir, record, _)| (dir, record)))
 }
 
 /// Whether a record could still hold the deployment fence: it recorded
@@ -249,7 +328,8 @@ impl Deployment {
         };
         let events = messages(&receipt)?;
         // Every migration and switch closes the socket; nothing else does.
-        let socket_fence = !shared && (mode != "activate" || receipt.get("recovery").is_some());
+        let socket_fence = !shared
+            && (!matches!(mode, "activate" | "rollback") || receipt.get("recovery").is_some());
         let pg_fence = Path::new(PG_FENCE).try_exists()?;
         let decided = child(&job, DECIDED)?;
         let state = classify(mode, &events, socket_fence, pg_fence, decided.try_exists()?)?;
