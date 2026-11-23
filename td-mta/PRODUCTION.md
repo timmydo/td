@@ -725,6 +725,15 @@ a holder: a transient unit whose mount namespace shows the trial's socket
 directory at `/var/lib/td-mta-postgres`, so the production connection
 files and libpq services reach the trial and nothing else changes.
 
+A migration (a schema change, the service identity change or a grant
+change) cannot be rolled back once writers return except by restoring
+the recovery copy the deployment took and replayed first, losing the
+mail accepted since. A deployment that migrates therefore refuses after
+building the candidate, before that backup and before any fence, unless
+it runs as `./td-mta/deploy --irreversible`; the refused receipt names
+`schema_before` and `schema_after`. The flag is recorded in job.json and
+applies to that run only.
+
 The default forward activation budget is 60 seconds. On expiry the job
 restores service and records the observed outage. Recovery and clean
 PostgreSQL shutdown can extend the interruption beyond the budget. Use
@@ -755,8 +764,45 @@ its event record, unit states, selected executable, both PGDATA directories
 and the recovery receipt before reopening writers. Never restore a retained
 cluster after writers may have reopened without reconciling subsequent mail.
 ACME may need its separate four-minute lease budget after SMTP and JMAP
-return. Keep recovery inputs and the original data through the rollback
-window.
+return. The original data stays in the job directory and the recovery
+inputs in `/data/td-mta-physical-recovery` through the rollback window
+([Retiring rollback material](#retiring-rollback-material)).
+
+### Retiring rollback material
+
+Rollback material stays for seven days after its last write: each
+earlier job directory under `/var/lib/td-mta-operator` (its receipt, the
+original data directory a migration left, uploaded closures, and the
+loopback TLS material and CA key the socket cutover moved there), and
+each physical recovery copy under `/data/td-mta-physical-recovery`
+(base backup, WAL and `bootstrap.tar`; copies taken before the socket
+cutover hold the old TLS directory and its CA key). The retained Debian
+tree `/opt/td-mta/postgresql` stays: changing td's PostgreSQL closure
+still goes through it, until the binary switch can go from one td
+closure to another. Removing material cannot be undone, so the command
+names that:
+
+```text
+./td-mta/deploy --retire-rollback --irreversible
+```
+
+It keeps the live release, takes the activation lock, refuses while a
+deployment or PostgreSQL fence is held, and first checks the live system
+as the binary switch does (source, journal identity, configuration,
+health). It then checks every piece past its seven days (a root-owned
+directory with nothing mounted inside) before removing any, renames
+each to `.retired-NAME` and removes it; a rerun finishes such a name
+whatever its age. Each removal is a receipt event first, and the
+receipt lists what went (`rollback_retired`) and, while any remains,
+`rollback_retire_not_before`, the Unix time the next piece may go. When
+everything is inside its window it refuses and records that time. A
+piece it may not remove refuses the run with its path.
+
+Retiring a job directory also removes what host commands run from it:
+the identity change's job directory is where `--restore-shared-services`
+returns to the shared identities, so that return ends with it, and
+`--refresh-notifications` runs from an activation job directory, which
+a fresh `./td-mta/deploy` creates when none is left.
 
 
 ### The finished socket cutover
@@ -957,8 +1003,9 @@ The controller stages the notification monitor and digest configuration from
 the existing private configuration. Its sudoers entry permits only the
 eight fixed readiness and performance commands as the four service UIDs.
 After changing notification recipients or checks in the managed `config.json`,
-run `sudo ./td-mta-deploy --refresh-notifications` from
-the root-owned isolated deployment job directory. It validates those eight
+run `sudo ./td-mta-deploy --refresh-notifications` from a root-owned
+isolated deployment job directory (after rollback material is retired,
+the one a fresh `./td-mta/deploy` leaves). It validates those eight
 commands and atomically refreshes the derived private configuration. The
 next monitor and digest invocation use the new settings.
 

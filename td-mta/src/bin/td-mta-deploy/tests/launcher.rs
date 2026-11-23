@@ -143,6 +143,24 @@ fn fetches_only_advertised_main_and_requires_an_already_submitted_controller() {
 }
 
 #[test]
+fn retiring_rollback_material_needs_irreversible_and_runs_alone() {
+    let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let retire = args(&["--retire-rollback", "--irreversible"]);
+    let opts = parse(&retire).unwrap();
+    assert!(opts.retire && opts.irreversible && !opts.socket && !opts.binaries);
+    let deploy = args(&["--irreversible"]);
+    assert!(parse(&deploy).unwrap().irreversible);
+    for refused in [
+        args(&["--retire-rollback"]),
+        args(&["--retire-rollback", "--irreversible", "--skip-tests"]),
+        args(&["--retire-rollback", "--irreversible", "--postgres-binaries"]),
+        args(&["--postgres-binaries", "--irreversible"]),
+    ] {
+        assert!(parse(&refused).is_err(), "{refused:?}");
+    }
+}
+
+#[test]
 fn the_binary_switch_takes_no_attestation() {
     let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let only = args(&["--postgres-binaries"]);

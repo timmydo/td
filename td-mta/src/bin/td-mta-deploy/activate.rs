@@ -28,6 +28,8 @@ mod database;
 mod fence;
 #[path = "activation_release.rs"]
 mod release;
+#[path = "activation_retire.rs"]
+mod retire;
 #[path = "activation_transport.rs"]
 mod transport;
 
@@ -205,7 +207,10 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
             "shared service identities are already selected",
         )?;
     }
-    if matches!(mode, "activate" | "postgres-socket" | "postgres-binaries") {
+    if matches!(
+        mode,
+        "activate" | "postgres-socket" | "postgres-binaries" | "retire-rollback"
+    ) {
         // Reserve the first activation receipt under the host lock. A repeated
         // invocation must leave the original event and recovery evidence intact.
         start_receipt(&deployment.receipt, &deployment.record)?;
@@ -215,6 +220,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "activate" => deployment.execute(),
         "postgres-socket" => deployment.postgres_socket(),
         "postgres-binaries" => deployment.postgres_binaries(),
+        "retire-rollback" => deployment.retire_rollback(),
         _ => Err("unknown deployment operation".into()),
     };
     if let Err(ref err) = result {
@@ -386,6 +392,13 @@ impl Deployment {
         ] {
             set(&mut self.record, key, val)?;
         }
+        // A migration (schema, service identities or grants) is undone only
+        // by restoring the recovery copy it takes first, losing later mail:
+        // the job must say so. The receipt names the schema change.
+        require(
+            !migrate || self.record.get("irreversible").and_then(Json::as_bool) == Some(true),
+            "this release migrates the database, which cannot be rolled back: run td-mta/deploy --irreversible",
+        )?;
         let mut recovery = None;
         let result = self.cutover(migrate, &mut recovery);
         let result = if result.is_err() {

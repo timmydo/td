@@ -28,16 +28,20 @@ const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [OPTIONS]
        td-mta/deploy --postgres-binaries [OPTIONS]
+       td-mta/deploy --retire-rollback --irreversible [OPTIONS]
        td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
          --identity KEY --jmap-account ACCOUNT --jmap-url URL
          [--host-key-sha256 SHA256:FP] [--config FILE] [--replace]
        td-mta/deploy --provision-host --build-account ACCOUNT --build-home DIR
          --public-name NAME [--config FILE] [--replace]
 Options: [--window-seconds 1..3600] [--jmap-account ACCOUNT] [--config FILE]
+  [--irreversible] (required by a deployment that migrates the database)
 Select a verified origin/main revision and deploy it to the configured host,
 move the live release's database from loopback TLS to its private socket, or
 switch it from the Debian PostgreSQL to td's source-built one, applying
 what the reviewed minor-release table says each release in between needs.
+--retire-rollback deletes rollback material older than seven days: earlier
+job directories and physical recovery copies.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
@@ -53,6 +57,8 @@ struct Options<'a> {
     config: Option<&'a str>,
     socket: bool,
     binaries: bool,
+    retire: bool,
+    irreversible: bool,
 }
 fn parse(args: &[String]) -> R<Options<'_>> {
     let mut out = Options {
@@ -62,6 +68,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         config: None,
         socket: false,
         binaries: false,
+        retire: false,
+        irreversible: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -78,6 +86,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--config" => out.config = Some(it.next().ok_or("missing target configuration")?),
             "--postgres-socket" => out.socket = true,
             "--postgres-binaries" => out.binaries = true,
+            "--retire-rollback" => out.retire = true,
+            "--irreversible" => out.irreversible = true,
             _ => return Err(HELP.into()),
         }
     }
@@ -88,6 +98,18 @@ fn parse(args: &[String]) -> R<Options<'_>> {
     require(
         !(out.socket && out.binaries),
         "one PostgreSQL operation per job",
+    )?;
+    require(
+        !(out.retire && (out.socket || out.binaries || out.skip)),
+        "retiring rollback material is its own job",
+    )?;
+    require(
+        out.irreversible || !out.retire,
+        "retiring rollback material cannot be undone: pass --irreversible",
+    )?;
+    require(
+        !(out.irreversible && (out.socket || out.binaries)),
+        "--irreversible applies to a deployment or --retire-rollback",
     )?;
     Ok(out)
 }
@@ -628,7 +650,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
         Some(p) => PathBuf::from(p),
         None => child(&home, ".local/state/td/main-integration")?,
     };
-    let (selected, verdict) = if opts.socket || opts.binaries {
+    let (selected, verdict) = if opts.socket || opts.binaries || opts.retire {
         require(
             local.is_ancestor(live, &tip)?,
             "live release is not an ancestor of advertised main",
@@ -731,6 +753,10 @@ pub(super) fn run(args: &[String]) -> R<()> {
     if opts.socket {
         set(&mut spec, "mode", Json::Str(owned("postgres-socket")?))?;
     }
+    if opts.retire {
+        set(&mut spec, "mode", Json::Str(owned("retire-rollback")?))?;
+    }
+    set(&mut spec, "irreversible", Json::Bool(opts.irreversible))?;
     if let Some((built, live_minor)) = &closure {
         set(&mut spec, "mode", Json::Str(owned("postgres-binaries")?))?;
         let mut entries = Vec::new();
@@ -785,6 +811,8 @@ pub(super) fn run(args: &[String]) -> R<()> {
                 "--postgres-socket"
             } else if opts.binaries {
                 "--postgres-binaries"
+            } else if opts.retire {
+                "--retire-rollback"
             } else {
                 "--activate"
             },

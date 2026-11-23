@@ -80,8 +80,8 @@ fn load_job(work: &Path, mode: &str, owner: u32) -> R<td_json::Json> {
     }
     Ok(record)
 }
-// Only the PostgreSQL socket and binary switches' jobs name their operation;
-// an activation job, and every earlier job, does not.
+// Only the PostgreSQL socket and binary switches' and the rollback
+// retirement's jobs name their operation; an activation job does not.
 fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     let declared = match job.get("mode") {
         None => None,
@@ -90,7 +90,7 @@ fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     require(
         declared
             == match mode {
-                "postgres-socket" | "postgres-binaries" => Some(mode),
+                "postgres-socket" | "postgres-binaries" | "retire-rollback" => Some(mode),
                 _ => None,
             },
         "job operation does not match the requested mode",
@@ -139,6 +139,7 @@ fn run() -> R<()> {
         [s] if s == "--activate" => supervise("activate"),
         [s] if s == "--postgres-socket" => supervise("postgres-socket"),
         [s] if s == "--postgres-binaries" => supervise("postgres-binaries"),
+        [s] if s == "--retire-rollback" => supervise("retire-rollback"),
         [s] if s == "--restore-shared-services" => supervise("restore-shared-services"),
         [s] if s == "--refresh-notifications" => supervise("refresh-notifications"),
         [s, rest @ ..]
@@ -213,6 +214,11 @@ mod tests {
         assert!(check_mode(&plain, "postgres-binaries").is_err());
         assert!(check_mode(&binaries, "activate").is_err());
         assert!(check_mode(&td_json::parse(r#"{"mode":1}"#)?, "postgres-socket").is_err());
+        let retire = td_json::parse(r#"{"revision":"r","mode":"retire-rollback"}"#)?;
+        check_mode(&retire, "retire-rollback")?;
+        assert!(check_mode(&plain, "retire-rollback").is_err());
+        assert!(check_mode(&retire, "activate").is_err());
+        assert!(check_mode(&retire, "postgres-binaries").is_err());
         Ok(())
     }
 }

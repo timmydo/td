@@ -24,7 +24,7 @@ pub(super) const SYSTEM: &str = "7698635942461075926";
 pub(super) const SOCKET_DIR: &str = "/var/lib/td-mta-postgres";
 pub(super) const PG_DROPIN: &str =
     "/etc/systemd/system/td-mta-postgres.service.d/90-td-mta-socket.conf";
-const VOLUME: &str = "/data/td-mta-physical-recovery";
+pub(super) const VOLUME: &str = "/data/td-mta-physical-recovery";
 pub(super) const GIB: u64 = 1024 * 1024 * 1024;
 
 const SETTINGS: &str = "SELECT current_setting('wal_level') IN ('replica','logical'),
