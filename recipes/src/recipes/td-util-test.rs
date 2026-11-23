@@ -175,7 +175,9 @@ pub fn recipe() -> Recipe {
                      out=$('{bin}' less '{{root}}/less-in' </dev/null) || {{ echo 'less failed on a file' >&2; exit 1; }}; \
                      [ \"$(printf '%s\\n' \"$out\" | wc -l)\" -eq 100 ] || {{ echo 'less must copy through UNPAGED when stdout is not a terminal — otherwise its prompts land in the data of every pipeline' >&2; exit 1; }}; \
                      printf '%s\\n' \"$out\" | grep -q -x -F 100 || {{ echo 'less dropped the last line of a non-terminal copy' >&2; exit 1; }}; \
-                     printf '%s\\n' \"$out\" | grep -q -- '--More--' && {{ echo 'less emitted a pager prompt into a pipe' >&2; exit 1; }}; \
+                     '{bin}' less '{{root}}/less-in' </dev/null > '{{root}}/less-out' && '{bin}' cmp '{{root}}/less-in' '{{root}}/less-out' || {{ echo 'less must copy a pipe byte for byte: a prompt, a redraw or a colour reset in the data of a pipeline' >&2; exit 1; }}; \
+                     '{bin}' less -FRX '{{root}}/less-in' </dev/null > '{{root}}/less-out' && '{bin}' cmp '{{root}}/less-in' '{{root}}/less-out' || {{ echo 'less must accept -FRX, which git asks of every pager it starts' >&2; exit 1; }}; \
+                     LESS='-N -x4' '{bin}' less '{{root}}/less-in' </dev/null > '{{root}}/less-out' || {{ echo 'an option in LESS this less lacks must not stop it starting: LESS is the reader standing preference, written for a fuller less' >&2; exit 1; }}; \
                      '{bin}' less -N '{{root}}/less-in' >/dev/null 2>&1; \
                      [ $? -eq 2 ] || {{ echo 'less must refuse an option it cannot honour rather than silently ignoring it, and exit 2 for a usage error as the rest of this multicall does' >&2; exit 1; }}; \
                      '{bin}' printf 'a\\nb\\n' > '{{root}}/-N'; \

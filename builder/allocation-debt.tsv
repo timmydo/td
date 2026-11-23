@@ -4256,11 +4256,7 @@ td-util/src/hwcheck.rs	allocating-conversion	14
 td-util/src/hwcheck.rs	allocation-macro	21
 td-util/src/hwcheck.rs	heap-owner	1
 td-util/src/hwcheck.rs	unchecked-growth-or-clone	18
-td-util/src/less.rs	allocating-constructor	2
-td-util/src/less.rs	allocating-conversion	7
-td-util/src/less.rs	allocation-macro	8
-td-util/src/less.rs	heap-owner	2
-td-util/src/less.rs	unchecked-growth-or-clone	4
+td-util/src/less.rs	allocating-constructor	1
 td-util/src/main.rs	allocating-conversion	6
 td-util/src/main.rs	allocation-macro	6
 td-util/src/od.rs	allocating-constructor	3
