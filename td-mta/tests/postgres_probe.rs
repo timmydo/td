@@ -1649,7 +1649,77 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "62");
+    // Every table of the current schema by name, so a migration that adds
+    // or drops one says which.
+    const TABLES: &[&str] = &[
+        "account_bootstraps",
+        "account_usage",
+        "accounts",
+        "acme_profiles",
+        "application_log_state",
+        "application_logs",
+        "attempt_acceptance_receipts",
+        "attempt_command_receipts",
+        "attempt_final_reservations",
+        "attempt_phase_receipts",
+        "attempt_rcpt_receipts",
+        "attempt_recovery_receipts",
+        "attempt_refusal_receipts",
+        "blob_chunks",
+        "blob_ids",
+        "blob_interpretations",
+        "blob_search",
+        "blob_summaries",
+        "blobs",
+        "changes",
+        "config_material_chunks",
+        "config_materials",
+        "config_selection",
+        "config_selection_receipts",
+        "config_version_chunks",
+        "config_versions",
+        "devices",
+        "draft_receipts",
+        "email_authentication",
+        "email_dkim_signatures",
+        "emails",
+        "flag_receipts",
+        "imports",
+        "keywords",
+        "leases",
+        "mailbox_create_receipts",
+        "mailboxes",
+        "memberships",
+        "queue_expiry_progress",
+        "recipients",
+        "replica_accounts",
+        "replica_blob_identities",
+        "replica_email_receipts",
+        "replica_mailbox_receipts",
+        "replica_pending",
+        "replica_progress",
+        "replica_source",
+        "route_health",
+        "route_health_receipts",
+        "route_owner_receipts",
+        "route_owners",
+        "runtime_barrier",
+        "schema_migrations",
+        "smtp_receipt_recipients",
+        "submission_attempts",
+        "submission_cancel_receipts",
+        "submission_expiry_receipts",
+        "submission_receipts",
+        "submission_routes",
+        "submissions",
+        "thread_anchors",
+        "threads",
+        "upload_receipts",
+    ];
+    assert_eq!(
+        sql(&fixture, "SELECT string_agg(c.relname,',' ORDER BY c.relname COLLATE \"C\") FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"),
+        TABLES.join(",")
+    );
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1738,7 +1808,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     sql(&fixture, &format!("INSERT INTO td_mta.route_health VALUES({a},'primary',{digest},{high},1,4,0,300000,{high}); INSERT INTO td_mta.route_health_receipts VALUES({a},{a},{digest},'primary',{digest},1,{zero},{high},1,4,0,300000,{high})"));
     for assignment in [
         "failure_count=4294967296",
-        "next_at=299999",
+        "next_at=999",
         "next_at=3600001",
         "reason=2",
         "reason=3",
@@ -1757,6 +1827,8 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
         "UPDATE td_mta.route_health_receipts SET new_revision=old_revision".to_owned(),
         "23514",
     );
+    // The lowest minimum retry interval a serving process may choose.
+    sql(&fixture, "UPDATE td_mta.route_health SET next_at=1000; UPDATE td_mta.route_health_receipts SET next_at=1000; UPDATE td_mta.route_health_receipts SET next_at=300000");
     sql(&fixture, "UPDATE td_mta.route_health SET repair_generation=NULL; UPDATE td_mta.route_health SET failure_count=0,reason=0,failed_at=NULL,next_at=NULL");
     assert_eq!(sql(&fixture, "SELECT failure_count,reason,failed_at IS NULL,next_at IS NULL,repair_generation IS NULL FROM td_mta.route_health"), "0|0|t|t|t");
     assert_eq!(
