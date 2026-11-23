@@ -18,7 +18,8 @@ Linux devtmpfs + sysfs + fbdev + evdev
 
 `td-seatd` is a root oneshot for one permanently configured local seat, and
 in its `watch` mode the root daemon `[seat-watch]`, which gives each evdev
-node that appears later the same assignment. It creates the private human
+node that appears later the same assignment, and each playback node the
+audio account's (`APPLICATIONS.md` §K.5). It creates the private human
 runtime `/run/user/1000` and the compositor's `/run/td-compositor/1000`
 below root-owned parents. It selects one DRM card: the lowest-numbered
 `/dev/dri/cardN` with a connector reporting `connected`, else the
@@ -6497,10 +6498,11 @@ Token presence is inferred neither from keyboard events nor from a
 device's arrival or departure: the compositor's sysfs reads can only
 exclude a device from secure attention, and token workers find tokens
 through their own root-only hidraw path (`td-secret/DESIGN.md`, "USB
-token transport"). Only `/dev/input/event*` nodes are assigned late.
-hidraw nodes stay root-only, framebuffer, card, backlight and VM-port
-assignment stay boot snapshots, playback nodes keep their own
-reassignment at each audio start (`APPLICATIONS.md` §K.5), and no node
+token transport"). Of the compositor's nodes, only `/dev/input/event*`
+are assigned late. hidraw nodes stay root-only, framebuffer, card,
+backlight and VM-port assignment stay boot snapshots, playback nodes are
+assigned late to the audio account by the same watcher with the same
+rules ("Playback nodes" below; `APPLICATIONS.md` §K.5), and no node
 moves between accounts: section 1's absent live seat reassignment stays
 absent.
 
@@ -6549,6 +6551,22 @@ the loop. Boot evidence keeps its snapshot meaning: `probe` and
 `probe-access` check the nodes present when they run, `probe` with the
 same major check, and a node mid-assignment is refused to the human
 either way.
+
+**Playback nodes.** Each tick, after `/dev/input`, the watcher gives
+`/dev/snd` the same treatment for the audio account, with its own
+reported sets and listing state: each `pcmC<card>D<device>p` entry that
+is not already a character device of ALSA's major 116 owned by `audio`
+with mode 0600 receives the boot playback assignment, one function
+shared with `assign` and `exec-audio`, whose major check is new for
+both. It handles at most 1024 entries (ALSA allots 256 minors) and the
+boot scan's limit of 64 playback nodes; where the boot scan refuses a
+larger directory, the watcher handles the first 64 in read order,
+reporting either cap once per transition. As for input, a cut listing
+prunes nothing, so while it stays cut a reused inode can go unreported.
+Capture, control, timer and sequencer nodes are never touched. A missing
+`/dev/snd` is a complete, empty listing, not a failure: devtmpfs creates
+it with the first sound card and removes it with the last. The check/use
+window argument above holds for root-owned `/dev/snd` unchanged.
 
 Polling is chosen over the alternatives, as td-disks' media watcher
 chose it. A `NETLINK_KOBJECT_UEVENT` listener (td-profiler's

@@ -8895,7 +8895,12 @@ account, or a general `User=` directive in td-svc. The unit requires seat
 setup. On every start, `td-seatd exec-audio` repeats the bounded playback
 scan and assignment before literally executing the service credential
 transition and `td-audio serve`; this covers sound nodes that enumerate
-after the seat oneshot without giving the daemon root. Its readiness probe
+after the seat oneshot without giving the daemon root. A playback node
+that appears while the daemon runs, such as a USB DAC plugged in later,
+is given the same assignment within about one 250 ms poll by the `[seat-watch]`
+root daemon (`td-compositor/DESIGN.md`, "Playback nodes"); the daemon
+still reads its outputs once at start, so such a card becomes an output
+at its next start. Its readiness probe
 connects to that running instance's socket under the same service identity.
 With no non-loopback playback PCM, device selection fails and the service
 remains in supervised restart rather than exposing a silent fake sink;
@@ -9136,7 +9141,7 @@ middle.
 | component | uid | why |
 |---|---|---|
 | `td-svc` | root | the supervisor |
-| `td-seatd` | root, oneshot, and the `[seat-watch]` daemon (`td-seatd watch`) | assigns `/dev/fb0`, the DRM card it selects when present, and `/dev/input/event*`, at boot and, through `watch`, each event node that appears later; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
+| `td-seatd` | root, oneshot, and the `[seat-watch]` daemon (`td-seatd watch`) | assigns `/dev/fb0`, the DRM card it selects when present, and `/dev/input/event*`, at boot and, through `watch`, each event node that appears later; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio`, at boot, at each audio start and, through `watch`, each that appears later |
 | `td-compositor` | 993 (`tdc1000`) | owns display/input devices and the private root authority endpoint |
 | `td-busd` | 992 (`tdb1000`) | protected runtime and explicit kernel-UID admission |
 | `td-portal` | 991 (`tdp1000`) | owns the credential store and reads a fixed read-only Downloads view |

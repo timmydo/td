@@ -2175,8 +2175,9 @@ fn build_desktop_td_svc_conf() -> String {
          after=rootcheck\n\
          timeout={seat}\n\
          \n\
-         # Each evdev node that appears later gets the same assignment\n\
-         # (td-compositor/DESIGN.md, \"Input hotplug\").\n\
+         # Each evdev node, and each playback node for audio, that appears\n\
+         # later gets the same assignment (td-compositor/DESIGN.md, \"Input\n\
+         # hotplug\" and \"Playback nodes\").\n\
          [seat-watch]\n\
          type=daemon\n\
          exec=/bin/td-seatd watch --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\

@@ -30,12 +30,56 @@ const READY_MARKER: &str = "TD-SEAT-READY";
 const PRIVATE_DEVICES_MARKER: &str = "TD-COMPOSITOR-DEVICES-PRIVATE";
 /// The input core's character-device major (`INPUT_MAJOR`).
 const INPUT_MAJOR: u64 = 13;
-/// How often `watch` reads `/dev/input` (td-compositor/DESIGN.md, "Input
-/// hotplug").
+/// ALSA's character-device major (`CONFIG_SND_MAJOR`).
+const SOUND_MAJOR: u64 = 116;
+/// How often `watch` reads `/dev/input` and `/dev/snd`
+/// (td-compositor/DESIGN.md, "Input hotplug"; APPLICATIONS.md §K.5).
 const WATCH_PERIOD: Duration = Duration::from_millis(250);
 /// `/dev/input` entries a watch tick handles, in read order: the input
 /// core allots at most 1024 character devices.
 const INPUT_DIRECTORY_ENTRIES: usize = 2048;
+/// `/dev/snd` entries a watch tick handles, in read order: ALSA allots
+/// 256 minors.
+const SOUND_DIRECTORY_ENTRIES: usize = 1024;
+
+/// A kind of node root assigns: its names, its character major, and how
+/// much of its directory one watch tick handles.
+#[derive(Clone, Copy)]
+struct NodeClass {
+    name: fn(&str) -> bool,
+    major: u64,
+    /// What a node of another major is not, for its refusal.
+    device: &'static str,
+    /// Its nodes, for the cap's report.
+    nodes: &'static str,
+    entries: usize,
+    most: usize,
+    /// Whether a missing directory is an empty one: devtmpfs creates
+    /// `/dev/snd` with the first sound card and removes it with the last.
+    may_be_absent: bool,
+}
+
+/// `/dev/input/eventN`, the compositor's.
+const INPUT_NODES: NodeClass = NodeClass {
+    name: event_name,
+    major: INPUT_MAJOR,
+    device: "an input device",
+    nodes: "event nodes",
+    entries: INPUT_DIRECTORY_ENTRIES,
+    most: INPUT_DIRECTORY_ENTRIES,
+    may_be_absent: false,
+};
+
+/// `/dev/snd/pcmC<card>D<device>p`, the audio account's.
+const PLAYBACK_NODES: NodeClass = NodeClass {
+    name: playback_name,
+    major: SOUND_MAJOR,
+    device: "a sound device",
+    nodes: "playback devices",
+    entries: SOUND_DIRECTORY_ENTRIES,
+    most: MAX_PLAYBACK_DEVICES,
+    may_be_absent: true,
+};
 
 fn usage() -> String {
     "usage: td-seatd assign --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID | \
@@ -417,35 +461,46 @@ fn device_minor(device: u64) -> u64 {
     (device & 0xff) | ((device >> 12) & 0xffff_ff00)
 }
 
-/// Refuses a symlink or anything but an input core character device, and
-/// changes nothing. `require_char: false` is the scratch-tree tests'
-/// regular-file seam, and the only path that skips the major check.
-fn input_node(path: &Path, require_char: bool) -> Result<Metadata, String> {
+/// Refuses a symlink or anything but a character device of the class's
+/// major, and changes nothing. `require_char: false` is the scratch-tree
+/// tests' regular-file seam, and the only path that skips the major check.
+fn class_node(path: &Path, class: NodeClass, require_char: bool) -> Result<Metadata, String> {
     let metadata = checked_metadata(path, require_char)?;
     let major = device_major(metadata.rdev());
-    if require_char && major != INPUT_MAJOR {
+    if require_char && major != class.major {
         return Err(format!(
-            "{} is character major {major}, not an input device",
-            path.display()
+            "{} is character major {major}, not {}",
+            path.display(),
+            class.device
         ));
     }
     Ok(metadata)
 }
 
-/// The boot node assignment, shared by `assign` and `watch`: `input_node`,
-/// then `lchown` to the compositor, `chmod` 0600 and verify. Answers the
-/// metadata the check passed.
-fn assign_input(path: &Path, account: Account, require_char: bool) -> Result<Metadata, String> {
-    let node = input_node(path, require_char)?;
+/// The boot node assignment, shared by `assign`, `exec-audio` and
+/// `watch`: `class_node`, then `lchown` to the account, `chmod` 0600 and
+/// verify. Answers the metadata the check passed.
+fn assign_node(
+    path: &Path,
+    class: NodeClass,
+    account: Account,
+    require_char: bool,
+) -> Result<Metadata, String> {
+    let node = class_node(path, class, require_char)?;
     assign_path(path, account, require_char)?;
     Ok(node)
 }
 
-/// Whether an input node already has the boot assignment.
-fn assigned_input(metadata: &Metadata, account: Account, require_char: bool) -> bool {
+/// Whether a node of the class already has the boot assignment.
+fn assigned_node(
+    metadata: &Metadata,
+    class: NodeClass,
+    account: Account,
+    require_char: bool,
+) -> bool {
     let kind = metadata.file_type();
     let node = if require_char {
-        kind.is_char_device() && device_major(metadata.rdev()) == INPUT_MAJOR
+        kind.is_char_device() && device_major(metadata.rdev()) == class.major
     } else {
         kind.is_file()
     };
@@ -454,7 +509,7 @@ fn assigned_input(metadata: &Metadata, account: Account, require_char: bool) -> 
         && metadata.permissions().mode() & 0o7777 == 0o600
 }
 
-/// What the watch last found of `/dev/input` itself.
+/// What the watch last found of a class's directory itself.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 enum Listing {
     #[default]
@@ -463,33 +518,40 @@ enum Listing {
     Overflowing,
 }
 
-/// `td-seatd watch`'s state: the inodes whose assignment and whose failure
-/// it has said, pruned each tick to those still present, and the listing
-/// it last found, said on each change to a failure.
+/// One class's `td-seatd watch` state: the inodes whose assignment and
+/// whose failure it has said, pruned each tick to those still present, and
+/// the listing it last found, said on each change to a failure.
 #[derive(Default)]
-struct Watch {
+struct NodeWatch {
     assigned: BTreeSet<u64>,
     reported: BTreeSet<u64>,
     listing: Listing,
 }
 
-impl Watch {
-    /// One tick: gives each `eventN` node in `input_dir` that is not
-    /// already the compositor's the boot assignment. Answers what it
-    /// assigned and what failed, each said once per inode.
+impl NodeWatch {
+    /// One tick: gives each node of the class in `dir` that is not already
+    /// the account's the boot assignment. Answers what it assigned and what
+    /// failed, each said once per inode.
     fn tick(
         &mut self,
-        input_dir: &Path,
+        dir: &Path,
+        class: NodeClass,
         account: Account,
         require_char: bool,
     ) -> (Vec<String>, Vec<String>) {
         let mut assigned = Vec::new();
         let mut said = Vec::new();
-        let entries = match fs::read_dir(input_dir) {
+        let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
+            Err(error) if class.may_be_absent && error.kind() == std::io::ErrorKind::NotFound => {
+                self.listing = Listing::Read;
+                self.assigned.clear();
+                self.reported.clear();
+                return (assigned, said);
+            }
             Err(error) => {
                 self.found(Listing::Unreadable, &mut said, || {
-                    format!("read {}: {error}", input_dir.display())
+                    format!("read {}: {error}", dir.display())
                 });
                 return (assigned, said);
             }
@@ -497,13 +559,12 @@ impl Watch {
         let mut present = BTreeSet::new();
         let mut listing = Listing::Read;
         let mut failure = String::new();
+        // The cap a cut listing met, said only on a transition.
+        let mut cap = (class.entries, "entries");
+        let mut nodes = 0;
         for (index, entry) in entries.enumerate() {
-            if index >= INPUT_DIRECTORY_ENTRIES {
+            if index >= class.entries {
                 listing = Listing::Overflowing;
-                failure = format!(
-                    "{} has more than {INPUT_DIRECTORY_ENTRIES} entries; handling the first",
-                    input_dir.display()
-                );
                 break;
             }
             // std ends the listing after an error, so the rest waits.
@@ -511,22 +572,30 @@ impl Watch {
                 Ok(entry) => entry,
                 Err(error) => {
                     listing = Listing::Unreadable;
-                    failure = format!("read {}: {error}", input_dir.display());
+                    failure = format!("read {}: {error}", dir.display());
                     break;
                 }
             };
-            if !entry.file_name().to_str().is_some_and(event_name) {
+            if !entry.file_name().to_str().is_some_and(class.name) {
                 continue;
             }
+            if nodes >= class.most {
+                listing = Listing::Overflowing;
+                cap = (class.most, class.nodes);
+                break;
+            }
+            nodes += 1;
             let path = entry.path();
             let inode = entry.ino();
             present.insert(inode);
             match fs::symlink_metadata(&path) {
-                Ok(metadata) if assigned_input(&metadata, account, require_char) => continue,
+                Ok(metadata) if assigned_node(&metadata, class, account, require_char) => {
+                    continue;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 _ => {}
             }
-            match assign_input(&path, account, require_char) {
+            match assign_node(&path, class, account, require_char) {
                 Ok(node) => {
                     if self.assigned.insert(inode) {
                         assigned.push(format!(
@@ -539,7 +608,7 @@ impl Watch {
                     }
                 }
                 // Removed meanwhile, or assigned after all: nothing to say.
-                Err(_) if settled(&path, account, require_char) => {}
+                Err(_) if settled(&path, class, account, require_char) => {}
                 Err(error) => {
                     if self.reported.insert(inode) {
                         said.push(error);
@@ -547,7 +616,15 @@ impl Watch {
                 }
             }
         }
-        self.found(listing, &mut said, || failure);
+        self.found(listing, &mut said, || match listing {
+            Listing::Overflowing => format!(
+                "{} has more than {} {}; handling the first",
+                dir.display(),
+                cap.0,
+                cap.1
+            ),
+            _ => failure,
+        });
         // A cut listing is no evidence of what is gone.
         if listing == Listing::Read {
             self.assigned.retain(|inode| present.contains(inode));
@@ -567,21 +644,30 @@ impl Watch {
 }
 
 /// Whether a node whose assignment failed is gone or assigned after all.
-fn settled(path: &Path, account: Account, require_char: bool) -> bool {
+fn settled(path: &Path, class: NodeClass, account: Account, require_char: bool) -> bool {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => assigned_input(&metadata, account, require_char),
+        Ok(metadata) => assigned_node(&metadata, class, account, require_char),
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
-/// `td-seatd watch` (td-compositor/DESIGN.md, "Input hotplug"): every
-/// 250 ms, the boot node assignment for each event node that appears
-/// after the `[seat]` oneshot. Nothing it meets ends it.
+/// `td-seatd watch` (td-compositor/DESIGN.md, "Input hotplug";
+/// APPLICATIONS.md §K.5): every 250 ms, the boot node assignment for each
+/// event node and each playback node that appears after the `[seat]`
+/// oneshot. Nothing it meets ends it.
 fn watch(assignment: Assignment) -> Result<(), String> {
-    let mut state = Watch::default();
+    let mut input = NodeWatch::default();
+    let mut playback = NodeWatch::default();
     loop {
-        let (assigned, said) = state.tick(Path::new(INPUT_DIR), assignment.compositor, true);
-        for line in assigned.into_iter().chain(said) {
+        let (assigned, said) = input.tick(
+            Path::new(INPUT_DIR),
+            INPUT_NODES,
+            assignment.compositor,
+            true,
+        );
+        let (late, failed) =
+            playback.tick(Path::new(SOUND_DIR), PLAYBACK_NODES, assignment.audio, true);
+        for line in assigned.into_iter().chain(said).chain(late).chain(failed) {
             let _ = writeln!(std::io::stderr().lock(), "td-seatd: watch: {line}");
         }
         std::thread::sleep(WATCH_PERIOD);
@@ -847,7 +933,7 @@ fn assign(
     };
     let inputs = input_paths(input_dir)?;
     for path in &inputs {
-        assign_input(path, assignment.compositor, require_char)?;
+        assign_node(path, INPUT_NODES, assignment.compositor, require_char)?;
     }
     let playback = assign_playback(sound_dir, assignment.audio, require_char)?;
     Ok(Counts {
@@ -864,7 +950,7 @@ fn assign_playback(
 ) -> Result<Vec<PathBuf>, String> {
     let playback = playback_paths(sound_dir)?;
     for path in &playback {
-        assign_path(path, account, require_char)?;
+        assign_node(path, PLAYBACK_NODES, account, require_char)?;
     }
     Ok(playback)
 }
@@ -912,12 +998,12 @@ fn probe(
     };
     let inputs = input_paths(input_dir)?;
     for path in &inputs {
-        input_node(path, require_char)?;
+        class_node(path, INPUT_NODES, require_char)?;
         verify_owner_mode(path, assignment.compositor, 0o600)?;
     }
     let playback = playback_paths(sound_dir)?;
     for path in &playback {
-        checked_metadata(path, require_char)?;
+        class_node(path, PLAYBACK_NODES, require_char)?;
         verify_owner_mode(path, assignment.audio, 0o600)?;
     }
     Ok(Counts {
@@ -1359,19 +1445,19 @@ mod tests {
         let input = root.path().join("input");
         fs::create_dir(&input).unwrap();
         let account = own_account(root.path());
-        let mut watch = Watch::default();
+        let mut watch = NodeWatch::default();
         let none = (Vec::new(), Vec::new());
         // A node present at boot, already assigned, is left alone.
         fs::write(input.join("event0"), b"").unwrap();
-        assign_input(&input.join("event0"), account, false).unwrap();
-        assert_eq!(watch.tick(&input, account, false), none);
+        assign_node(&input.join("event0"), INPUT_NODES, account, false).unwrap();
+        assert_eq!(watch.tick(&input, INPUT_NODES, account, false), none);
         // A late node, root's mode 0600 being the kernel's, is assigned
         // and said once; `mouse0` and other names are never touched.
         fs::write(input.join("event5"), b"").unwrap();
         fs::set_permissions(input.join("event5"), Permissions::from_mode(0o644)).unwrap();
         fs::write(input.join("mouse0"), b"").unwrap();
         fs::set_permissions(input.join("mouse0"), Permissions::from_mode(0o644)).unwrap();
-        let (assigned, said) = watch.tick(&input, account, false);
+        let (assigned, said) = watch.tick(&input, INPUT_NODES, account, false);
         assert!(said.is_empty(), "{said:?}");
         assert_eq!(assigned.len(), 1);
         assert!(assigned[0].starts_with(&format!(
@@ -1379,20 +1465,20 @@ mod tests {
             input.join("event5").display()
         )));
         verify_owner_mode(&input.join("event5"), account, 0o600).unwrap();
-        assert_eq!(watch.tick(&input, account, false), none);
+        assert_eq!(watch.tick(&input, INPUT_NODES, account, false), none);
         assert_eq!(
             fs::metadata(input.join("mouse0")).unwrap().mode() & 0o777,
             0o644
         );
         // Loosened again by its owner, it is put back without a second line.
         fs::set_permissions(input.join("event5"), Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(watch.tick(&input, account, false), none);
+        assert_eq!(watch.tick(&input, INPUT_NODES, account, false), none);
         verify_owner_mode(&input.join("event5"), account, 0o600).unwrap();
         // Recreated under the same name, it is a new node, assigned again.
         fs::remove_file(input.join("event5")).unwrap();
         fs::write(input.join("event5"), b"").unwrap();
         fs::set_permissions(input.join("event5"), Permissions::from_mode(0o640)).unwrap();
-        let (assigned, said) = watch.tick(&input, account, false);
+        let (assigned, said) = watch.tick(&input, INPUT_NODES, account, false);
         assert_eq!((assigned.len(), said.len()), (1, 0));
         verify_owner_mode(&input.join("event5"), account, 0o600).unwrap();
     }
@@ -1403,7 +1489,7 @@ mod tests {
         let input = root.path().join("input");
         fs::create_dir(&input).unwrap();
         let account = own_account(root.path());
-        let mut watch = Watch::default();
+        let mut watch = NodeWatch::default();
         let none = (Vec::new(), Vec::new());
         // A symlink is refused, never followed.
         fs::write(root.path().join("target"), b"").unwrap();
@@ -1411,7 +1497,7 @@ mod tests {
         unix_fs::symlink(root.path().join("target"), input.join("event3")).unwrap();
         fs::write(input.join("event4"), b"").unwrap();
         fs::set_permissions(input.join("event4"), Permissions::from_mode(0o644)).unwrap();
-        let (assigned, said) = watch.tick(&input, account, false);
+        let (assigned, said) = watch.tick(&input, INPUT_NODES, account, false);
         assert_eq!(assigned.len(), 1);
         assert_eq!(said.len(), 1);
         assert!(said[0].contains("refusing symlink"), "{said:?}");
@@ -1420,36 +1506,149 @@ mod tests {
             0o644
         );
         // Retried each tick, said once.
-        assert_eq!(watch.tick(&input, account, false), none);
+        assert_eq!(watch.tick(&input, INPUT_NODES, account, false), none);
         // Once the node is gone the record is pruned, so a new failure at
         // the same name is said again.
         fs::remove_file(input.join("event3")).unwrap();
-        assert_eq!(watch.tick(&input, account, false), none);
+        assert_eq!(watch.tick(&input, INPUT_NODES, account, false), none);
         assert!(watch.reported.is_empty());
         fs::create_dir(input.join("event3")).unwrap();
-        assert_eq!(watch.tick(&input, account, false).1.len(), 1);
+        assert_eq!(watch.tick(&input, INPUT_NODES, account, false).1.len(), 1);
         // A failed directory read is said once per transition.
         let missing = root.path().join("missing");
-        assert_eq!(watch.tick(&missing, account, false).1.len(), 1);
-        assert!(watch.tick(&missing, account, false).1.is_empty());
-        watch.tick(&input, account, false);
-        assert_eq!(watch.tick(&missing, account, false).1.len(), 1);
+        assert_eq!(watch.tick(&missing, INPUT_NODES, account, false).1.len(), 1);
+        assert!(watch
+            .tick(&missing, INPUT_NODES, account, false)
+            .1
+            .is_empty());
+        watch.tick(&input, INPUT_NODES, account, false);
+        assert_eq!(watch.tick(&missing, INPUT_NODES, account, false).1.len(), 1);
         // An overflow is its own transition, before and after a failed read.
         let crowded = root.path().join("crowded");
         fs::create_dir(&crowded).unwrap();
         for index in 0..=INPUT_DIRECTORY_ENTRIES {
             fs::write(crowded.join(format!("other{index}")), b"").unwrap();
         }
-        let said = watch.tick(&crowded, account, false).1;
+        let said = watch.tick(&crowded, INPUT_NODES, account, false).1;
         assert!(said[0].contains("more than 2048 entries"), "{said:?}");
-        assert!(watch.tick(&crowded, account, false).1.is_empty());
-        assert_eq!(watch.tick(&missing, account, false).1.len(), 1);
-        assert_eq!(watch.tick(&crowded, account, false).1.len(), 1);
+        assert!(watch
+            .tick(&crowded, INPUT_NODES, account, false)
+            .1
+            .is_empty());
+        assert_eq!(watch.tick(&missing, INPUT_NODES, account, false).1.len(), 1);
+        assert_eq!(watch.tick(&crowded, INPUT_NODES, account, false).1.len(), 1);
         // A node that is gone, or assigned after all, by the time its
         // assignment fails is not a failure.
-        assert!(settled(&input.join("event9"), account, false));
-        assert!(settled(&input.join("event4"), account, false));
-        assert!(!settled(&input.join("event3"), account, false));
+        assert!(settled(&input.join("event9"), INPUT_NODES, account, false));
+        assert!(settled(&input.join("event4"), INPUT_NODES, account, false));
+        assert!(!settled(&input.join("event3"), INPUT_NODES, account, false));
+    }
+
+    #[test]
+    fn watch_assigns_late_playback_nodes_to_audio_and_nothing_else() {
+        let root = td_fs::TempDir::new("td-seat-watch-snd").unwrap();
+        let snd = root.path().join("snd");
+        let account = own_account(root.path());
+        let mut watch = NodeWatch::default();
+        let none = (Vec::new(), Vec::new());
+        let loose = |path: &Path| {
+            fs::write(path, b"").unwrap();
+            fs::set_permissions(path, Permissions::from_mode(0o644)).unwrap();
+        };
+        // No sound card yet, so no `/dev/snd`: nothing to say.
+        assert_eq!(watch.tick(&snd, PLAYBACK_NODES, account, false), none);
+        // A card plugged in: its playback node is assigned and said once;
+        // capture, control and timer nodes stay as the kernel made them.
+        fs::create_dir(&snd).unwrap();
+        for name in ["pcmC1D0p", "pcmC1D0c", "controlC1", "timer"] {
+            loose(&snd.join(name));
+        }
+        let (assigned, said) = watch.tick(&snd, PLAYBACK_NODES, account, false);
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(assigned.len(), 1, "{assigned:?}");
+        assert!(assigned[0].starts_with(&format!(
+            "assigned {}, device 0:0, inode ",
+            snd.join("pcmC1D0p").display()
+        )));
+        verify_owner_mode(&snd.join("pcmC1D0p"), account, 0o600).unwrap();
+        for name in ["pcmC1D0c", "controlC1", "timer"] {
+            let mode = fs::metadata(snd.join(name)).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o644, "{name}");
+        }
+        assert_eq!(watch.tick(&snd, PLAYBACK_NODES, account, false), none);
+        // A refused node is said once, as for input.
+        let refused = |snd: &Path| {
+            unix_fs::symlink(root.path().join("target"), snd.join("pcmC3D0p")).unwrap();
+        };
+        refused(&snd);
+        let said = watch.tick(&snd, PLAYBACK_NODES, account, false).1;
+        assert!(
+            said.len() == 1 && said[0].contains("refusing symlink"),
+            "{said:?}"
+        );
+        assert_eq!(watch.tick(&snd, PLAYBACK_NODES, account, false), none);
+        // Over the 1024-entry cap, the cut listing is said once.
+        let crowded = root.path().join("crowded");
+        fs::create_dir(&crowded).unwrap();
+        for index in 0..=SOUND_DIRECTORY_ENTRIES {
+            fs::write(crowded.join(format!("other{index}")), b"").unwrap();
+        }
+        let said = watch.tick(&crowded, PLAYBACK_NODES, account, false).1;
+        assert!(
+            said.len() == 1 && said[0].contains("more than 1024 entries"),
+            "{said:?}"
+        );
+        assert!(watch
+            .tick(&crowded, PLAYBACK_NODES, account, false)
+            .1
+            .is_empty());
+        // Unplugging the last card takes `/dev/snd` with it, a complete
+        // listing of nothing that forgets every record and the cut; plugged
+        // in again, its nodes are new and the refusal and cut are said again.
+        fs::remove_dir_all(&snd).unwrap();
+        assert_eq!(watch.tick(&snd, PLAYBACK_NODES, account, false), none);
+        assert!(watch.assigned.is_empty() && watch.reported.is_empty());
+        assert_eq!(watch.listing, Listing::Read);
+        assert_eq!(
+            watch.tick(&crowded, PLAYBACK_NODES, account, false).1.len(),
+            1
+        );
+        fs::create_dir(&snd).unwrap();
+        loose(&snd.join("pcmC1D0p"));
+        refused(&snd);
+        let (assigned, said) = watch.tick(&snd, PLAYBACK_NODES, account, false);
+        assert_eq!((assigned.len(), said.len()), (1, 1), "{said:?}");
+        fs::remove_file(snd.join("pcmC3D0p")).unwrap();
+        // Past the boot scan's 64 playback nodes, the first 64 in read
+        // order are handled and the cap is said once. Every one starts
+        // loose, so which one is left does not depend on read order.
+        fs::set_permissions(snd.join("pcmC1D0p"), Permissions::from_mode(0o644)).unwrap();
+        for device in 1..=MAX_PLAYBACK_DEVICES {
+            loose(&snd.join(format!("pcmC2D{device}p")));
+        }
+        let said = watch.tick(&snd, PLAYBACK_NODES, account, false).1;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("more than 64 playback devices"),
+            "{said:?}"
+        );
+        let assigned = fs::read_dir(&snd)
+            .unwrap()
+            .filter(|entry| {
+                let mode = entry.as_ref().unwrap().metadata().unwrap().mode();
+                mode & 0o777 == 0o600
+            })
+            .count();
+        assert_eq!(assigned, MAX_PLAYBACK_DEVICES);
+        let loose_left = fs::read_dir(&snd)
+            .unwrap()
+            .filter(|entry| {
+                let mode = entry.as_ref().unwrap().metadata().unwrap().mode();
+                mode & 0o777 == 0o644
+            })
+            .count();
+        assert_eq!(loose_left, 1);
+        assert_eq!(watch.tick(&snd, PLAYBACK_NODES, account, false), none);
     }
 
     #[test]
@@ -1457,16 +1656,22 @@ mod tests {
         // A character device of another major, `/dev/null`'s 1, is refused
         // by the check that precedes any change.
         let null = Path::new("/dev/null");
-        let refused = input_node(null, true).unwrap_err();
+        let refused = class_node(null, INPUT_NODES, true).unwrap_err();
         assert!(
             refused.contains("major 1, not an input device"),
             "{refused}"
         );
-        assert!(!assigned_input(
+        assert!(!assigned_node(
             &fs::symlink_metadata(null).unwrap(),
+            INPUT_NODES,
             own_account(Path::new("/")),
             true
         ));
+        // A playback node is held to ALSA's major, at boot as in the watch.
+        let refused = class_node(null, PLAYBACK_NODES, true).unwrap_err();
+        assert!(refused.contains("major 1, not a sound device"), "{refused}");
+        // The kernel's numbers: `INPUT_MAJOR` and `CONFIG_SND_MAJOR`.
+        assert_eq!((INPUT_NODES.major, PLAYBACK_NODES.major), (13, 116));
         assert_eq!(device_major(0x0d40), 13);
         assert_eq!(device_minor(0x0d40), 64);
         assert_eq!(
@@ -1479,22 +1684,34 @@ mod tests {
         );
         let source = include_str!("main.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(production.matches("assign_input(").count(), 3);
+        assert_eq!(production.matches("assign_node(").count(), 4);
+        assert!(production.contains(
+            "        assign_node(path, INPUT_NODES, assignment.compositor, require_char)?;\n"
+        ));
         assert!(production
-            .contains("        assign_input(path, assignment.compositor, require_char)?;\n"));
-        assert!(
-            production.contains("state.tick(Path::new(INPUT_DIR), assignment.compositor, true)")
-        );
-        assert!(
-            production.contains("            match assign_input(&path, account, require_char) {\n")
-        );
+            .contains("        assign_node(path, PLAYBACK_NODES, account, require_char)?;\n"));
+        assert!(production
+            .contains("            match assign_node(&path, class, account, require_char) {\n"));
+        assert!(production.contains(
+            "            Path::new(INPUT_DIR),\n            INPUT_NODES,\n            assignment.compositor,\n"
+        ));
+        assert!(production.contains(
+            "playback.tick(Path::new(SOUND_DIR), PLAYBACK_NODES, assignment.audio, true);\n"
+        ));
+        assert!(production.contains(
+            "        for line in assigned.into_iter().chain(said).chain(late).chain(failed) {\n"
+        ));
         // The check comes first in every assignment and in the probe.
         assert!(production.contains(
-            "    let node = input_node(path, require_char)?;\n    assign_path(path, account, require_char)?;\n"
+            "    let node = class_node(path, class, require_char)?;\n    assign_path(path, account, require_char)?;\n"
         ));
-        assert!(production.contains("Err(_) if settled(&path, account, require_char) => {}"));
-        assert!(production
-            .contains("    for path in &inputs {\n        input_node(path, require_char)?;\n"));
+        assert!(production.contains("Err(_) if settled(&path, class, account, require_char) => {}"));
+        assert!(production.contains(
+            "    for path in &inputs {\n        class_node(path, INPUT_NODES, require_char)?;\n"
+        ));
+        assert!(production.contains(
+            "    for path in &playback {\n        class_node(path, PLAYBACK_NODES, require_char)?;\n"
+        ));
     }
 
     #[test]
