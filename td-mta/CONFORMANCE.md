@@ -423,7 +423,10 @@ which the services inherit. Each scenario prints one `td-mta-perf
   one-MiB acceptance goal. Generated headers and complete 76-character lines
   may exceed the target slightly. Combined message size/count settings must
   fit the fixture's 4-GiB body quota, including a conservative 4-KiB overhead
-  per message; otherwise the harness refuses before starting its workload.
+  per message, and the accepted-mail burst of the one peer every stream
+  shares (100 messages and 4,096 64-KiB blocks, DESIGN.md section 9);
+  otherwise the harness refuses before starting its workload. Past that
+  burst the server would admit one message per 30 seconds.
   Distributions include p50, p90, p95 and p99. It reports throughput, milliseconds
   from the final dot to 250 for small and large messages apart (a large
   message's tail may still be in transit when the dot is sent), time to

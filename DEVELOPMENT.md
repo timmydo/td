@@ -1322,9 +1322,10 @@ and runs the one ignored `real_postgres_performance_harness` case in
 release, with the release build's profile, under the private trusted
 root, through the same bounded output and passing-summary check.
 `TD_MTA_PERF_IDLE_SECONDS` (default 30), `TD_MTA_PERF_SMTP_STREAMS` (4,
-at most 4), `TD_MTA_PERF_SMTP_MESSAGES` (50 per stream, at most 1000)
-and `TD_MTA_PERF_JMAP_READERS` (2, at most 6) size it; the defaults take
-about six minutes. Its `td-mta-perf` lines are the report;
+at most 4), `TD_MTA_PERF_SMTP_MESSAGES` (25 per stream; all streams
+together at most 100, the burst one SMTP peer may deliver) and
+`TD_MTA_PERF_JMAP_READERS` (2, at most 6) size it; the defaults take
+about five minutes. Its `td-mta-perf` lines are the report;
 td-mta/CONFORMANCE.md says what each measures.
 
 ## TLS session contention harness

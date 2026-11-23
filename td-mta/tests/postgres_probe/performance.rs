@@ -21,6 +21,8 @@ pub(super) const SMTP_STREAMS_MAX: u64 = 4;
 const SMALL_BYTES: usize = 2048;
 const LARGE_BYTES: usize = 256 * 1024;
 const LARGE_EVERY: u64 = 10;
+/// Default messages per stream: four streams fill one peer's burst.
+const SMTP_MESSAGES_DEFAULT: u64 = 25;
 /// Readers and the metadata client within the default sixteen HTTPS connections.
 const JMAP_READERS_MAX: u64 = 6;
 const QUERY_PAGE: usize = 256;
@@ -64,7 +66,11 @@ impl Knobs {
                 SMTP_STREAMS_MAX,
                 SMTP_STREAMS_MAX,
             ),
-            messages: knob("TD_MTA_PERF_SMTP_MESSAGES", 50, 1000),
+            messages: knob(
+                "TD_MTA_PERF_SMTP_MESSAGES",
+                SMTP_MESSAGES_DEFAULT,
+                td_mta::limits::SMTP_RATE_MESSAGE_BURST,
+            ),
             readers: knob("TD_MTA_PERF_JMAP_READERS", 2, JMAP_READERS_MAX),
             large_bytes: {
                 let value = usize::try_from(knob(
@@ -84,13 +90,22 @@ impl Knobs {
             knobs.fits_body_quota(td_mta::admission::DiskLimits::default().body_bytes),
             "performance workload exceeds fixture body quota; reduce message size or count"
         );
+        assert!(
+            knobs.fits_peer_burst(),
+            "performance workload exceeds one SMTP peer's accepted-mail burst; streams times messages must be at most {}",
+            td_mta::limits::SMTP_RATE_MESSAGE_BURST
+        );
         knobs
+    }
+    /// One stream's small and large message counts.
+    fn mix(&self) -> (u64, u64) {
+        let large = self.messages / LARGE_EVERY;
+        (self.messages - large, large)
     }
     fn fits_body_quota(&self, quota: u64) -> bool {
         // Full-line rounding and the trusted receiver's trace fit within 4 KiB.
         let bound = (|| {
-            let large = self.messages / LARGE_EVERY;
-            let small = self.messages.checked_sub(large)?;
+            let (small, large) = self.mix();
             let payload = large
                 .checked_mul(u64::try_from(self.large_bytes).ok()?)?
                 .checked_add(small.checked_mul(SMALL_BYTES as u64)?)?;
@@ -99,6 +114,33 @@ impl Knobs {
                 .checked_mul(self.streams)
         })();
         bound.is_some_and(|bytes| bytes <= quota)
+    }
+    /// Every stream shares the harness's one loopback peer, whose accepted
+    /// mail the server limits to a burst of messages and of 64 KiB blocks
+    /// (DESIGN.md section 9); past it a message waits about 30 seconds.
+    /// Within the knobs' ceilings only the message count can bind; the
+    /// block bound guards the limits' constants.
+    fn fits_peer_burst(&self) -> bool {
+        use td_mta::limits::{SMTP_RATE_BLOCK, SMTP_RATE_BLOCK_BURST, SMTP_RATE_MESSAGE_BURST};
+        let blocks = |bytes: usize| {
+            u64::try_from(bytes)
+                .ok()?
+                .checked_add(4096)
+                .map(|bytes| bytes.div_ceil(SMTP_RATE_BLOCK as u64))
+        };
+        let bound = (|| {
+            let (small, large) = self.mix();
+            let per_stream = small
+                .checked_mul(blocks(SMALL_BYTES)?)?
+                .checked_add(large.checked_mul(blocks(self.large_bytes)?)?)?;
+            Some((
+                self.messages.checked_mul(self.streams)?,
+                per_stream.checked_mul(self.streams)?,
+            ))
+        })();
+        bound.is_some_and(|(messages, blocks)| {
+            messages <= SMTP_RATE_MESSAGE_BURST && blocks <= SMTP_RATE_BLOCK_BURST
+        })
     }
 }
 
@@ -120,6 +162,34 @@ fn performance_workload_refuses_permanent_quota_exhaustion() {
     assert!(knobs.fits_body_quota(quota));
     knobs.messages = u64::MAX;
     assert!(!knobs.fits_body_quota(quota));
+}
+
+#[test]
+fn performance_workload_fits_one_peers_accepted_mail_burst() {
+    let mut knobs = Knobs {
+        idle_seconds: 30,
+        streams: SMTP_STREAMS_MAX,
+        messages: SMTP_MESSAGES_DEFAULT,
+        readers: 2,
+        large_bytes: LARGE_BYTES,
+    };
+    // The defaults: 100 messages, 92 of one block and 8 of five.
+    assert!(knobs.fits_peer_burst());
+    knobs.messages = 26;
+    assert!(!knobs.fits_peer_burst());
+    knobs.streams = 1;
+    knobs.messages = 100;
+    assert!(knobs.fits_peer_burst());
+    // 90 + 10 * 257 blocks of 16 MiB messages fit 4096; at 32 they do not.
+    knobs.large_bytes = 16 * 1024 * 1024;
+    assert!(knobs.fits_peer_burst());
+    knobs.streams = 4;
+    knobs.messages = 25;
+    assert!(knobs.fits_peer_burst());
+    knobs.large_bytes = 32 * 1024 * 1024;
+    assert!(!knobs.fits_peer_burst());
+    knobs.messages = u64::MAX;
+    assert!(!knobs.fits_peer_burst());
 }
 
 /// `VmRSS` and `VmHWM` in KiB; HWM is the kernel's peak since exec.
