@@ -146,9 +146,46 @@ impl Command {
     }
 }
 
-pub fn run(cache: &Cache) -> Result<(), String> {
+// JSON formats a reply in small fragments. Coalesce them in bounded stack
+// storage, and flush each complete line before reading the next command.
+struct ReplyWriter {
+    file: std::fs::File,
+    buffer: [u8; 8192],
+    used: usize,
+}
+
+impl Write for ReplyWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.used == self.buffer.len() {
+            self.flush()?;
+        }
+        let room = self
+            .buffer
+            .get_mut(self.used..)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let n = (&mut *room).write(bytes)?;
+        self.used += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let pending = self
+            .buffer
+            .get(..self.used)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        self.file.write_all(pending)?;
+        self.used = 0;
+        Ok(())
+    }
+}
+
+pub fn run(cache: &Cache, file: std::fs::File) -> Result<(), String> {
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
+    let mut stdout = ReplyWriter {
+        file,
+        buffer: [0; 8192],
+        used: 0,
+    };
 
     for line_res in stdin.lock().lines() {
         let line = match line_res {

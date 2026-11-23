@@ -5,7 +5,8 @@
 
 mod window;
 
-use std::io::Write;
+use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -36,10 +37,18 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("td-dua: {message}");
+            let _ = writeln!(io::stderr().lock(), "td-dua: {message}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn output(write: impl FnOnce(&mut std::fs::File) -> io::Result<()>) -> Result<(), String> {
+    io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|fd| write(&mut std::fs::File::from(fd)))
+        .map_err(|error| error.to_string())
 }
 
 /// The directory to scan, absolute and with links resolved.
@@ -73,8 +82,7 @@ fn report(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Stri
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--help" | "-h") => {
-                let _ = writeln!(std::io::stdout().lock(), "{USAGE}");
-                return Ok(());
+                return output(|out| writeln!(out, "{USAGE}"));
             }
             Some("--json") => json = true,
             Some("--apparent") => options.measure = td_dua::tree::Measure::Apparent,
@@ -114,10 +122,7 @@ fn report(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Stri
     } else {
         report.to_text()
     };
-    std::io::stdout()
-        .lock()
-        .write_all(text.as_bytes())
-        .map_err(|error| error.to_string())
+    output(|out| out.write_all(text.as_bytes()))
 }
 
 fn run() -> Result<(), String> {
@@ -125,24 +130,18 @@ fn run() -> Result<(), String> {
     let first = args.next();
     match first.as_ref().and_then(|arg| arg.to_str()) {
         Some("--help" | "-h") => {
-            let _ = writeln!(
-                std::io::stdout().lock(),
-                "{USAGE}\n\nKeys: {}",
-                td_dua::app::hint()
-            );
-            Ok(())
+            output(|out| writeln!(out, "{USAGE}\n\nKeys: {}", td_dua::app::hint()))
         }
-        Some("--font-license") => {
-            let _ = write!(
-                std::io::stdout().lock(),
+        Some("--font-license") => output(|out| {
+            write!(
+                out,
                 "{}\n{}\n{}\n{}",
                 td_ui::notices::FONT_PROVENANCE,
                 td_ui::notices::FONT_COPYING,
                 td_ui::notices::FONT_LICENSE,
                 td_ui::notices::OUTLINE_FACE
-            );
-            Ok(())
-        }
+            )
+        }),
         Some("report") => report(args),
         Some("--preview") => {
             let size = args
@@ -159,10 +158,7 @@ fn run() -> Result<(), String> {
                 return Err(USAGE.to_owned());
             }
             let ppm = window::preview(root, width, height, select)?;
-            std::io::stdout()
-                .lock()
-                .write_all(&ppm)
-                .map_err(|error| error.to_string())
+            output(|out| out.write_all(&ppm))
         }
         Some(arg) if arg.starts_with('-') => Err(USAGE.to_owned()),
         _ => {

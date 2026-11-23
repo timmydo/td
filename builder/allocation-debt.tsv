@@ -1659,7 +1659,7 @@ td-dua/src/delete.rs	allocating-constructor	1
 td-dua/src/delete.rs	allocating-conversion	2
 td-dua/src/delete.rs	allocation-macro	8
 td-dua/src/delete.rs	unchecked-growth-or-clone	5
-td-dua/src/main.rs	allocating-conversion	8
+td-dua/src/main.rs	allocating-conversion	7
 td-dua/src/main.rs	allocation-macro	6
 td-dua/src/main.rs	unchecked-growth-or-clone	1
 td-dua/src/report.rs	allocating-constructor	1

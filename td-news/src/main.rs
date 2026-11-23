@@ -30,81 +30,72 @@ mod ui;
 #[allow(dead_code)]
 mod xml;
 
+use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 
-fn main() {
+fn output(stream: impl AsFd) -> io::Result<std::fs::File> {
+    Ok(std::fs::File::from(stream.as_fd().try_clone_to_owned()?))
+}
+
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(io::stderr().lock(), "td-news: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opts = match CliOptions::parse(&args) {
         Ok(opts) => opts,
         Err(e) => {
-            eprintln!("{}", e);
-            eprintln!("Use --help for usage.");
+            let _ = writeln!(io::stderr().lock(), "{}", e);
+            let _ = writeln!(io::stderr().lock(), "Use --help for usage.");
             std::process::exit(2);
         }
     };
 
-    if opts.help {
-        eprintln!("Usage: td-news [OPTIONS]");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  --help          Show this help message");
-        eprintln!("  --help-config   Show configuration file documentation");
-        eprintln!("  --help-cli      Show CLI mode command documentation");
-        eprintln!("  --cli           Run newline-delimited JSON CLI mode");
-        eprintln!("  --log           View debug log file");
-        eprintln!("  --news-log      View news log file");
-        eprintln!("  --clear-cache   Delete all cache files");
-        eprintln!("  --offline       Browse cached articles only");
-        eprintln!("  --fetch-and-quit  Fetch all configured feeds into cache, then exit");
-        eprintln!("  --config=PATH   Use a custom config file");
-        eprintln!("  --cache=PATH    Use a custom cache DB path");
-        return;
-    }
-
-    if opts.help_config {
-        print_help_config();
-        return;
-    }
-
-    if opts.help_cli {
-        eprintln!("{}", cli::help_text());
-        return;
-    }
-
-    if opts.log {
-        let Some(path) = log::debug_log_path() else {
-            eprintln!("No log: {}", td_ui::xdg::Base::Cache.missing());
-            return;
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                print!("{}", contents);
-            }
-            Err(e) => {
-                eprintln!("No log at {} ({})", path.display(), e);
-            }
+    if opts.help || opts.help_config || opts.help_cli {
+        let mut out = output(io::stderr())?;
+        if opts.help {
+            return writeln!(out, "{USAGE}");
         }
-        return;
+        if opts.help_config {
+            return print_help_config(&mut out);
+        }
+        return writeln!(out, "{}", cli::help_text());
     }
 
-    if opts.news_log {
-        let Some(path) = log::news_log_path() else {
-            eprintln!("No log: {}", td_ui::xdg::Base::Cache.missing());
-            return;
+    if opts.log || opts.news_log {
+        let path = if opts.log {
+            log::debug_log_path()
+        } else {
+            log::news_log_path()
         };
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                print!("{}", contents);
-            }
-            Err(e) => {
-                eprintln!("No log at {} ({})", path.display(), e);
-            }
-        }
-        return;
+        let Some(path) = path else {
+            return writeln!(
+                output(io::stderr())?,
+                "No log: {}",
+                td_ui::xdg::Base::Cache.missing()
+            );
+        };
+        return match std::fs::read_to_string(&path) {
+            Ok(contents) => output(io::stdout())?.write_all(contents.as_bytes()),
+            Err(e) => writeln!(
+                output(io::stderr())?,
+                "No log at {} ({})",
+                path.display(),
+                e
+            ),
+        };
     }
 
     if let Err(e) = log::init() {
-        eprintln!("Failed to initialize logging: {}", e);
+        let _ = writeln!(io::stderr().lock(), "Failed to initialize logging: {}", e);
     } else {
         log::info("td-news starting");
         log::news("td-news session started");
@@ -114,12 +105,11 @@ fn main() {
         if let Some(path) = opts.cache_path.clone() {
             cache::Cache::clear_at(path);
         } else if let Err(e) = cache::Cache::clear() {
-            eprintln!("td-news: {e}");
+            let _ = writeln!(io::stderr().lock(), "td-news: {e}");
             std::process::exit(1);
         }
         log::info("cache cleared");
-        eprintln!("Cache cleared.");
-        return;
+        return writeln!(output(io::stderr())?, "Cache cleared.");
     }
 
     let cache = if let Some(path) = opts.cache_path.clone() {
@@ -127,7 +117,7 @@ fn main() {
             Ok(c) => c,
             Err(e) => {
                 log::error(format!("failed to open cache: {}", e));
-                eprintln!("Failed to open cache: {}", e);
+                let _ = writeln!(io::stderr().lock(), "Failed to open cache: {}", e);
                 std::process::exit(1);
             }
         }
@@ -136,37 +126,38 @@ fn main() {
             Ok(c) => c,
             Err(e) => {
                 log::error(format!("failed to open cache: {}", e));
-                eprintln!("Failed to open cache: {}", e);
+                let _ = writeln!(io::stderr().lock(), "Failed to open cache: {}", e);
                 std::process::exit(1);
             }
         }
     };
 
     if opts.cli {
-        if let Err(e) = cli::run(&cache) {
+        if let Err(e) = cli::run(&cache, output(io::stdout())?) {
             log::error(format!("cli error: {}", e));
-            eprintln!("CLI error: {}", e);
+            let _ = writeln!(io::stderr().lock(), "CLI error: {}", e);
             std::process::exit(1);
         }
         log::info("td-news cli shutdown");
         log::news("td-news cli session ended");
-        return;
+        return Ok(());
     }
 
     let config = match config::Config::load(opts.config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             log::error(format!("config load failed: {}", e));
-            eprintln!("Error loading config: {}", e);
+            let _ = writeln!(io::stderr().lock(), "Error loading config: {}", e);
             std::process::exit(1);
         }
     };
 
     if opts.fetch_and_quit {
+        let mut report_output = output(io::stderr())?;
         let (cmd_tx, resp_rx) = backend::spawn(&config, cache.clone());
         if let Err(e) = cmd_tx.send(backend::BackendCommand::FetchAllFeeds) {
             log::error(format!("failed to request fetch-all: {}", e));
-            eprintln!("Failed to start fetch: {}", e);
+            let _ = writeln!(io::stderr().lock(), "Failed to start fetch: {}", e);
             std::process::exit(1);
         }
 
@@ -177,16 +168,23 @@ fn main() {
                     for report in reports {
                         if let Some(error) = report.error {
                             had_errors = true;
-                            eprintln!("Fetch error {}: {}", report.feed_url, error);
+                            let _ = writeln!(
+                                io::stderr().lock(),
+                                "Fetch error {}: {}",
+                                report.feed_url,
+                                error
+                            );
                         } else {
-                            eprintln!(
+                            had_errors |= writeln!(
+                                report_output,
                                 "Fetched {} ({}) new={} total={} unread={}",
                                 report.feed_name,
                                 report.feed_url,
                                 report.new_articles,
                                 report.total,
                                 report.unread
-                            );
+                            )
+                            .is_err();
                         }
                     }
                     break;
@@ -194,7 +192,7 @@ fn main() {
                 Ok(_) => {}
                 Err(e) => {
                     log::error(format!("fetch-and-quit response channel error: {}", e));
-                    eprintln!("Fetch failed: {}", e);
+                    let _ = writeln!(io::stderr().lock(), "Fetch failed: {}", e);
                     let _ = cmd_tx.send(backend::BackendCommand::Shutdown);
                     std::process::exit(1);
                 }
@@ -205,7 +203,7 @@ fn main() {
         if had_errors {
             std::process::exit(1);
         }
-        return;
+        return Ok(());
     }
 
     let offline = opts.offline;
@@ -214,7 +212,7 @@ fn main() {
         Ok(()) => false,
         Err(e) => {
             log::error(format!("window error: {}", e));
-            eprintln!("Window error: {}", e);
+            let _ = writeln!(io::stderr().lock(), "Window error: {}", e);
             true
         }
     };
@@ -227,6 +225,7 @@ fn main() {
     if window_failed {
         std::process::exit(1);
     }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -292,27 +291,40 @@ impl CliOptions {
     }
 }
 
-fn print_help_config() {
+fn print_help_config(out: &mut impl Write) -> io::Result<()> {
     match config::default_path() {
-        Ok(path) => eprintln!("Configuration file: {}", path.display()),
-        Err(why) => eprintln!("Configuration file: none ({why})"),
+        Ok(path) => writeln!(out, "Configuration file: {}", path.display())?,
+        Err(why) => writeln!(out, "Configuration file: none ({why})")?,
     }
-    eprintln!();
-    eprintln!("[ui]");
-    eprintln!("  mouse = true                 # enable mouse support (default: true)");
-    eprintln!("  sync_interval_secs = 300     # auto-refresh interval in seconds (default: 300; at least 30; 0 turns it off)");
-    eprintln!(
-        "  browser = \"command {{url}}\"     # browser command; {{url}} is replaced with the URL"
-    );
-    eprintln!("                               # if no {{url}}, URL is appended as argument");
-    eprintln!(
-        "                               # run directly, no shell; falls back to $BROWSER, xdg-open"
-    );
-    eprintln!("  scrolloff = 0                # rows kept shown past the selection on each side (default: 0)");
-    eprintln!("  # page_size and a [theme] table are the terminal reader's:");
-    eprintln!("  # read as unknown keys and ignored");
-    eprintln!();
-    eprintln!("[[feed]]");
-    eprintln!("  name = \"Feed Name\"            # display name for the feed");
-    eprintln!("  url = \"https://example/rss\"   # RSS or Atom feed URL");
+    writeln!(out, "{CONFIG_HELP}")
 }
+
+const USAGE: &str = r#"Usage: td-news [OPTIONS]
+
+Options:
+  --help          Show this help message
+  --help-config   Show configuration file documentation
+  --help-cli      Show CLI mode command documentation
+  --cli           Run newline-delimited JSON CLI mode
+  --log           View debug log file
+  --news-log      View news log file
+  --clear-cache   Delete all cache files
+  --offline       Browse cached articles only
+  --fetch-and-quit  Fetch all configured feeds into cache, then exit
+  --config=PATH   Use a custom config file
+  --cache=PATH    Use a custom cache DB path"#;
+
+const CONFIG_HELP: &str = r#"
+[ui]
+  mouse = true                 # enable mouse support (default: true)
+  sync_interval_secs = 300     # auto-refresh interval in seconds (default: 300; at least 30; 0 turns it off)
+  browser = "command {url}"     # browser command; {url} is replaced with the URL
+                               # if no {url}, URL is appended as argument
+                               # run directly, no shell; falls back to $BROWSER, xdg-open
+  scrolloff = 0                # rows kept shown past the selection on each side (default: 0)
+  # page_size and a [theme] table are the terminal reader's:
+  # read as unknown keys and ignored
+
+[[feed]]
+  name = "Feed Name"            # display name for the feed
+  url = "https://example/rss"   # RSS or Atom feed URL"#;

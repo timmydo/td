@@ -418,3 +418,18 @@ fn the_command_line_is_strict_and_writes_one_document() {
         assert!(out.stdout.is_empty(), "{bad:?}");
     }
 }
+
+#[test]
+fn required_output_fails_cleanly_on_a_full_device() {
+    use std::process::Command;
+    for args in [&["report", "--help"][..], &["--help"], &["--font-license"]] {
+        let full = fs::File::options().write(true).open("/dev/full").unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_td-dua"))
+            .args(args)
+            .stdout(full)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("os error 28"));
+    }
+}

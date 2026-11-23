@@ -160,3 +160,36 @@ fn article(
         "read": read,
     })
 }
+
+#[test]
+fn required_help_and_optional_usage_diagnostics_handle_full_stderr() {
+    for (arg, code) in [
+        ("--help", 1),
+        ("--help-config", 1),
+        ("--help-cli", 1),
+        ("--unknown", 2),
+    ] {
+        let full = std::fs::File::options()
+            .write(true)
+            .open("/dev/full")
+            .expect("full device");
+        let status = Command::new(env!("CARGO_BIN_EXE_td-news"))
+            .arg(arg)
+            .stderr(full)
+            .status()
+            .expect("run td-news");
+        assert_eq!(status.code(), Some(code), "{arg}");
+    }
+}
+
+#[test]
+fn a_missing_log_notice_requires_writable_stderr() {
+    let status = Command::new(env!("CARGO_BIN_EXE_td-news"))
+        .arg("--news-log")
+        .env_remove("HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .stderr(std::fs::File::open("/dev/null").expect("read-only stderr"))
+        .status()
+        .expect("run td-news");
+    assert_eq!(status.code(), Some(1));
+}
