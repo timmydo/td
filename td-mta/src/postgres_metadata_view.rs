@@ -9,11 +9,8 @@ use crate::{
     ports::{ChangeCursor, ChangeStep, Error, ReadView, Record, ViewIdentity},
     postgres_probe::{self, Worker},
 };
+use postgres_probe::{Encode, FromColumn, OneRow, Row as SqlRow, Rows};
 use std::sync::Mutex;
-use tokio_postgres::{
-    types::{FromSql, ToSql},
-    Row as SqlRow,
-};
 
 pub(super) struct View<'a> {
     pub identity: ViewIdentity,
@@ -23,25 +20,25 @@ pub(super) struct View<'a> {
     pub failure: Option<postgres_probe::Error>,
 }
 
-fn field<'a, T: FromSql<'a>>(row: &'a SqlRow, name: &str) -> Result<T, Error> {
+fn field<'a, T: FromColumn<'a>>(row: &SqlRow<'a>, name: &str) -> Result<T, Error> {
     row.try_get(name).map_err(|_| Error::Corrupt)
 }
-fn fixed<const N: usize>(row: &SqlRow, name: &str) -> Result<[u8; N], Error> {
+fn fixed<const N: usize>(row: &SqlRow<'_>, name: &str) -> Result<[u8; N], Error> {
     field::<&[u8]>(row, name)?
         .try_into()
         .map_err(|_| Error::Corrupt)
 }
-fn optional_id(row: &SqlRow, name: &str) -> Result<Option<[u8; 16]>, Error> {
+fn optional_id(row: &SqlRow<'_>, name: &str) -> Result<Option<[u8; 16]>, Error> {
     field::<Option<&[u8]>>(row, name)?
         .map(|b| b.try_into().map_err(|_| Error::Corrupt))
         .transpose()
 }
-fn number<T: TryFrom<i64>>(row: &SqlRow, name: &str) -> Result<T, Error> {
+fn number<T: TryFrom<i64>>(row: &SqlRow<'_>, name: &str) -> Result<T, Error> {
     field::<i64>(row, name)?
         .try_into()
         .map_err(|_| Error::Corrupt)
 }
-fn boolean(row: &SqlRow, name: &str) -> Result<bool, Error> {
+fn boolean(row: &SqlRow<'_>, name: &str) -> Result<bool, Error> {
     match field::<i64>(row, name)? {
         0 => Ok(false),
         1 => Ok(true),
@@ -73,7 +70,7 @@ fn table(table: Table) -> (&'static str, &'static str) {
         ),
     }
 }
-type Parameter = Box<dyn ToSql + Sync + Send>;
+type Parameter = Box<dyn Encode + Send>;
 fn parameters(key: Key<'_>) -> Vec<Parameter> {
     match key {
         Key::Blob(id) | Key::Lease(id) => vec![Box::new(id.as_bytes().to_vec())],
@@ -106,7 +103,7 @@ fn parameters(key: Key<'_>) -> Vec<Parameter> {
         ],
     }
 }
-fn key(row: &SqlRow, table: Table) -> Result<Key<'_>, Error> {
+fn key<'a>(row: &SqlRow<'a>, table: Table) -> Result<Key<'a>, Error> {
     Ok(match table {
         Table::Blobs => Key::Blob(BlobId::from_bytes(fixed(row, "id")?)),
         Table::Mailboxes => Key::Mailbox(MailboxId::from_bytes(fixed(row, "id")?)),
@@ -145,7 +142,7 @@ impl View<'_> {
         selected: Table,
         cursor: Option<Key<'_>>,
         exact: bool,
-    ) -> Result<Option<(SqlRow, Vec<SqlRow>)>, Error> {
+    ) -> Result<Option<(OneRow, Option<Rows>)>, Error> {
         let (name, columns) = table(selected);
         let account = self.identity.account.as_bytes().to_vec();
         let mut values: Vec<Parameter> = vec![Box::new(account)];
@@ -168,16 +165,15 @@ impl View<'_> {
         }
         statement.push_str(&format!(" ORDER BY {columns} LIMIT 1"));
         let account = self.identity.account;
-        let result = self.worker.get_mut().map_err(|_|Error::Corrupt)?.run(move |client| Box::pin(async move {
-            let params:Vec<&(dyn ToSql+Sync)>=values.iter().map(|p|p.as_ref() as &(dyn ToSql+Sync)).collect();
-            let rows=client.query(&statement,&params).await.map_err(|_|Error::Corrupt)?;
-            let Some(row)=rows.into_iter().next() else {return Ok(None)};
+        let result = self.worker.get_mut().map_err(|_|Error::Corrupt)?.run(move |client| {
+            let params:Vec<&dyn Encode>=values.iter().map(|p|p.as_ref() as &dyn Encode).collect();
+            let Some(row)=client.query_opt(&statement,&params).map_err(|_|Error::Corrupt)? else {return Ok(None)};
             let receipts=if selected==Table::Emails {
-                let id:Vec<u8>=field(&row,"id")?;
-                client.query("SELECT ordinal,address FROM td_mta.smtp_receipt_recipients WHERE account=$1 AND email_id=$2 ORDER BY ordinal LIMIT 1001",&[&account.as_bytes().as_slice(),&id]).await.map_err(|_|Error::Corrupt)?
-            } else {Vec::new()};
+                let id:&[u8]=field(&row.row(),"id")?;
+                Some(client.query("SELECT ordinal,address FROM td_mta.smtp_receipt_recipients WHERE account=$1 AND email_id=$2 ORDER BY ordinal LIMIT 1001",&[&account.as_bytes().as_slice(),&id]).map_err(|_|Error::Corrupt)?)
+            } else {None};
             Ok(Some((row,receipts)))
-        }));
+        });
         match result {
             Ok(result) => result,
             Err(error) => {
@@ -188,8 +184,8 @@ impl View<'_> {
     }
     fn decode<'a>(
         &self,
-        sql: &SqlRow,
-        receipts: &[SqlRow],
+        sql: &SqlRow<'_>,
+        receipts: Option<&Rows>,
         selected: Table,
         output: &'a mut [u8],
     ) -> Result<(Row<'a>, Sequence), Error> {
@@ -214,15 +210,17 @@ impl View<'_> {
             Table::Emails => {
                 let origin = match field::<i64>(sql, "origin")? {
                     1 => {
-                        if number::<usize>(sql, "receipt_count")? != receipts.len() {
+                        if number::<usize>(sql, "receipt_count")? != receipts.map_or(0, Rows::len) {
                             return Err(Error::Corrupt);
                         }
-                        let mut addresses = Vec::with_capacity(receipts.len());
-                        for (ordinal, recipient) in receipts.iter().enumerate() {
-                            if number::<usize>(recipient, "ordinal")? != ordinal {
+                        let mut addresses = Vec::with_capacity(receipts.map_or(0, Rows::len));
+                        for (ordinal, recipient) in
+                            receipts.into_iter().flat_map(Rows::iter).enumerate()
+                        {
+                            if number::<usize>(&recipient, "ordinal")? != ordinal {
                                 return Err(Error::Corrupt);
                             }
-                            addresses.push(field::<&str>(recipient, "address")?);
+                            addresses.push(field::<&str>(&recipient, "address")?);
                         }
                         let peer = match field::<i64>(sql, "peer_family")? {
                             4 => std::net::IpAddr::from(fixed::<4>(sql, "peer_octets")?),
@@ -245,7 +243,7 @@ impl View<'_> {
                     4 => EmailOrigin::FailureNotice,
                     _ => return Err(Error::Corrupt),
                 };
-                if !matches!(origin, EmailOrigin::Smtp(_)) && !receipts.is_empty() {
+                if !matches!(origin, EmailOrigin::Smtp(_)) && !receipts.is_none_or(Rows::is_empty) {
                     return Err(Error::Corrupt);
                 }
                 Row::Email(EmailRow {
@@ -333,10 +331,11 @@ impl ReadView for View<'_> {
         let Some((sql, receipts)) = self.query(requested.table(), Some(requested), true)? else {
             return Ok(None);
         };
+        let sql = sql.row();
         if key(&sql, requested.table())?.compare(requested) != std::cmp::Ordering::Equal {
             return Err(Error::Corrupt);
         }
-        self.decode(&sql, &receipts, requested.table(), value)
+        self.decode(&sql, receipts.as_ref(), requested.table(), value)
             .map(Some)
     }
     fn next<'a>(
@@ -352,6 +351,7 @@ impl ReadView for View<'_> {
         let Some((sql, receipts)) = self.query(selected, cursor, false)? else {
             return Ok(None);
         };
+        let sql = sql.row();
         let decoded = key(&sql, selected)?;
         if cursor.is_some_and(|cursor| !decoded.compare(cursor).is_gt()) {
             return Err(Error::Corrupt);
@@ -359,7 +359,7 @@ impl ReadView for View<'_> {
         let length = decoded.encode(output_key).map_err(|_| Error::Capacity)?;
         let key = Key::decode(selected, output_key.get(..length).ok_or(Error::Capacity)?)
             .map_err(|_| Error::Corrupt)?;
-        let (row, last_change) = self.decode(&sql, &receipts, selected, value)?;
+        let (row, last_change) = self.decode(&sql, receipts.as_ref(), selected, value)?;
         Ok(Some(Record {
             key,
             row,

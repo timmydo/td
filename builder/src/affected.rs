@@ -5027,8 +5027,6 @@ fn manifest_path_dependencies(
         };
         if !is_dev
             && ((name == "td-crypto" && crate::crypto_policy::DEPENDENCIES.contains(&line))
-                || (name == "td-mta"
-                    && crate::crypto_policy::POSTGRES_DEPENDENCIES.contains(&line))
                 || (name == "td-tls-provider"
                     && crate::crypto_policy::TLS_PROVIDER_DEPENDENCIES.contains(&line)))
         {
@@ -5998,10 +5996,10 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// `workspace_exemption_requires_no_distribution_recipe` holds, and a crate
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
-/// whole list without the list changing. td-mta reads td-alloc, td-civil, td-crypto, td-header,
-/// td-html, td-json, td-mime and td-nfc directly, td-fs for fixtures,
-/// and td-mail through its native
-/// read fixture. td-agent left the
+/// whole list without the list changing. td-mta reads td-alloc, td-civil,
+/// td-crypto, td-header, td-html, td-json, td-mime, td-nfc and td-postgres
+/// directly, td-fs for fixtures, and td-mail through its native read
+/// fixture. td-agent left the
 /// list with its packaging (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
     "td-mta",
@@ -6016,6 +6014,7 @@ const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
         "td-mail",
         "td-mime",
         "td-nfc",
+        "td-postgres",
     ],
 )];
 
@@ -11700,6 +11699,7 @@ mod tests {
             "td-mail",
             "td-mime",
             "td-nfc",
+            "td-postgres",
             "td-authd",
         ] {
             let base = root.join(name);
@@ -13377,29 +13377,23 @@ mod tests {
         );
     }
 
+    /// td-mta's PostgreSQL client is td-postgres, a sibling: it declares
+    /// no external dependency, and none of td-crypto's is admitted to it.
     #[test]
-    fn postgres_dependencies_are_private_production_pins() {
+    fn mail_declares_only_sibling_dependencies() {
         let admitted = include_str!("../../td-mta/Cargo.toml");
         let (paths, dev_paths) = manifest_path_dependencies("td-mta", admitted).unwrap();
         assert!(paths.iter().all(|name| name.starts_with("td-")));
         assert!(dev_paths.is_empty());
-        assert!(paths.iter().any(|name| name == "td-fs"));
-        for line in crate::crypto_policy::POSTGRES_DEPENDENCIES {
-            assert!(admitted.lines().any(|candidate| candidate == *line));
-            let manifest = format!("[dependencies]\n{line}\n");
-            for name in ["td-aa", "td-crypto"] {
-                assert!(manifest_path_dependencies(name, &manifest).is_err());
-            }
-            let dev = format!(
-                "{}\n[dev-dependencies]\n{line}\n",
-                admitted.replace(line, "")
-            );
-            assert!(manifest_path_dependencies("td-mta", &dev).is_err());
-            let changed = admitted.replace(
-                line,
-                &line.replace("default-features = false", "default-features = true"),
-            );
-            assert!(manifest_path_dependencies("td-mta", &changed).is_err());
+        assert!(paths.iter().any(|name| name == "td-postgres"));
+        for line in [
+            "tokio-postgres = { version = \"=0.7.18\", default-features = false }",
+            crate::crypto_policy::DEPENDENCIES[0],
+        ] {
+            let manifest =
+                admitted.replace("[dependencies]\n", &format!("[dependencies]\n{line}\n"));
+            assert_ne!(manifest, admitted);
+            assert!(manifest_path_dependencies("td-mta", &manifest).is_err());
         }
     }
 

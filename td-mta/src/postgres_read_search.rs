@@ -1,7 +1,7 @@
 //! Passive search descriptors share the metadata window and its snapshot.
 use super::{Error, Snapshot};
+use crate::postgres_probe::Client;
 use crate::{ids::BlobId, postgres_body, postgres_search};
-use tokio_postgres::{types::Type, Client};
 
 #[derive(Clone, Copy)]
 pub(super) struct Descriptor {
@@ -13,7 +13,7 @@ pub(super) struct Descriptor {
 
 pub(super) struct Window(Vec<(BlobId, Option<Descriptor>)>);
 impl Window {
-    async fn read(
+    fn read(
         client: &Client,
         account: crate::ids::AccountId,
         blobs: &[BlobId],
@@ -35,9 +35,9 @@ impl Window {
             ids.push(blob.as_bytes().as_slice());
             entries.push((*blob, None));
         }
-        let rows = client.query_typed("SELECT blob_id,body_length,body_digest,octet_length(fields),fields_digest FROM td_mta.blob_search WHERE account=$1 AND blob_id=ANY($2) AND version=$3 ORDER BY blob_id LIMIT 16", &[(&account.as_bytes().as_slice(),Type::BYTEA),(&ids,Type::BYTEA_ARRAY),(&postgres_search::VERSION,Type::INT4)]).await.map_err(|_| Error::Database)?;
+        let rows = client.query("SELECT blob_id,body_length,body_digest,octet_length(fields),fields_digest FROM td_mta.blob_search WHERE account=$1 AND blob_id=ANY($2) AND version=$3 ORDER BY blob_id LIMIT 16", &[&account.as_bytes().as_slice(), &ids, &postgres_search::VERSION]).map_err(|_| Error::Database)?;
         let mut previous = None;
-        for row in rows {
+        for row in &rows {
             let bytes: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
             let blob = BlobId::from_bytes(bytes.try_into().map_err(|_| Error::Integrity)?);
             if previous.is_some_and(|old| old >= blob) {
@@ -113,7 +113,7 @@ impl Snapshot<'_> {
         let account = self.identity.account;
         let result = self
             .worker
-            .run(|client| Box::pin(async move { Window::read(client, account, &blobs).await }))
+            .run(|client| Window::read(client, account, &blobs))
             .map_err(Error::Connection)
             .and_then(|result| result);
         self.retain(result)

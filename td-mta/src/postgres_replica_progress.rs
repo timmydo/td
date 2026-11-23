@@ -1,4 +1,5 @@
 //! Historical copy progress; returned values grant no publication authority.
+use crate::postgres_probe::{Client, Row};
 use crate::{
     format::Sequence,
     ids::{AccountId, EmailId, StoreEpoch},
@@ -14,7 +15,6 @@ use crate::{
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
-use tokio_postgres::{types::Type, Client, Row};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -48,18 +48,18 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub(crate) async fn select_local_work(&mut self, client: &Client) -> Result<(), Error> {
+    pub(crate) fn select_local_work(&mut self, client: &Client) -> Result<(), Error> {
         if self.pending.as_ref().is_none_or(Pending::complete) {
             return Ok(());
         }
-        let rows = client.query_typed(
+        let rows = client.query(
             "SELECT e.id FROM td_mta.replica_pending p
                 CROSS JOIN LATERAL generate_series(0,octet_length(p.ids)/16-1) AS n
                 JOIN td_mta.emails e ON e.account=p.account AND e.id=substring(p.ids FROM 16*n+1 FOR 16)
              WHERE p.account=$1 AND get_bit(p.done,n)=0 ORDER BY e.id LIMIT $2",
-            &[(&self.account.as_bytes().as_slice(),Type::BYTEA),(&(crate::replica_copy::MAX_STEP_EMAILS as i64),Type::INT8)],
-        ).await.map_err(|_| Error::Database)?;
-        for (slot, row) in self.local_work.iter_mut().zip(rows) {
+            &[&self.account.as_bytes().as_slice(), &(crate::replica_copy::MAX_STEP_EMAILS as i64)],
+        ).map_err(|_| Error::Database)?;
+        for (slot, row) in self.local_work.iter_mut().zip(&rows) {
             let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
             *slot = Some(EmailId::from_bytes(
                 id.try_into().map_err(|_| Error::Integrity)?,
@@ -80,59 +80,57 @@ pub fn inspect(
         return Err(Error::Owner);
     }
     let result = postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+            let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
             if receipt.store_epoch != epoch {
                 return Err(Error::Epoch);
             }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            postgres_maintenance::owner(client).await.map_err(|_| Error::Owner)?;
-            let source = postgres_replica_source::read(client).await.map_err(|_|Error::Source)?.ok_or(Error::Source)?;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            postgres_maintenance::owner(client).map_err(|_| Error::Owner)?;
+            let source = postgres_replica_source::read(client).map_err(|_|Error::Source)?.ok_or(Error::Source)?;
             if source.epoch() == epoch { return Err(Error::Integrity); }
-            let progress=read_snapshot(client,source,account).await?;
-            client.batch_execute("ROLLBACK").await.map_err(|_|Error::Database)?;
+            let progress=read_snapshot(client,source,account)?;
+            client.rollback().map_err(|_|Error::Database)?;
             Ok(progress)
-        })
-    }).map_err(Error::Connection)?;
+        }).map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
     result
 }
 /// Caller owns one consistent snapshot or the account publication lock.
-pub(crate) async fn read_snapshot(
+pub(crate) fn read_snapshot(
     client: &Client,
     source: Source,
     account: AccountId,
 ) -> Result<Progress, Error> {
-    let row = client.query_typed_opt("SELECT a.seed_digest,a.body_limit,a.blob_limit,a.email_limit,a.receipt_limit,p.generation,p.email_cursor,p.mailbox_checkpoint,p.inventory_base,p.inventory_cursor,p.inventory_complete,p.email_count,p.receipt_count FROM td_mta.replica_accounts a JOIN td_mta.replica_progress p USING(account) WHERE a.account=$1", &[(&account.as_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?.ok_or(Error::Missing)?;
+    let row = client.query_opt("SELECT a.seed_digest,a.body_limit,a.blob_limit,a.email_limit,a.receipt_limit,p.generation,p.email_cursor,p.mailbox_checkpoint,p.inventory_base,p.inventory_cursor,p.inventory_complete,p.email_count,p.receipt_count FROM td_mta.replica_accounts a JOIN td_mta.replica_progress p USING(account) WHERE a.account=$1", &[&account.as_bytes().as_slice()]).map_err(|_|Error::Database)?.ok_or(Error::Missing)?;
     let state = |index, kind| -> Result<DataState, Error> {
         Ok(DataState {
             epoch: source.epoch(),
             account,
             kind,
-            sequence: Sequence::from_u64(sequence(&row, index)?),
+            sequence: Sequence::from_u64(sequence(&row.row(), index)?),
         })
     };
-    let seed_digest = bytes(&row, 0)?;
+    let seed_digest = bytes(&row.row(), 0)?;
     let limits = Limits {
-        body_bytes: count(&row, 1)?,
-        blobs: count(&row, 2)?,
-        emails: count(&row, 3)?,
-        receipts: count(&row, 4)?,
+        body_bytes: count(&row.row(), 1)?,
+        blobs: count(&row.row(), 2)?,
+        emails: count(&row.row(), 3)?,
+        receipts: count(&row.row(), 4)?,
     };
     limits.validate().map_err(|_| Error::Integrity)?;
-    let generation = sequence(&row, 5)?;
+    let generation = sequence(&row.row(), 5)?;
     if generation == 0 {
         return Err(Error::Integrity);
     }
     let email_cursor = state(6, DataType::Email)?;
     let mailbox_checkpoint = state(7, DataType::Mailbox)?;
     let inventory_base = state(8, DataType::Email)?;
-    let inventory_cursor = cursor(&row, 9)?;
+    let inventory_cursor = cursor(&row.row(), 9)?;
     let inventory_complete = row.try_get(10).map_err(|_| Error::Integrity)?;
-    let email_count = count(&row, 11)?;
-    let receipt_count = count(&row, 12)?;
+    let email_count = count(&row.row(), 11)?;
+    let receipt_count = count(&row.row(), 12)?;
     if email_count > limits.emails
         || receipt_count > limits.receipts
         || email_cursor.sequence < inventory_base.sequence
@@ -140,12 +138,12 @@ pub(crate) async fn read_snapshot(
     {
         return Err(Error::Integrity);
     }
-    let pending = client.query_typed_opt("SELECT generation,page,kind,observed,ids,done,next_cursor,next_state,more FROM td_mta.replica_pending WHERE account=$1", &[(&account.as_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?;
+    let pending = client.query_opt("SELECT generation,page,kind,observed,ids,done,next_cursor,next_state,more FROM td_mta.replica_pending WHERE account=$1", &[&account.as_bytes().as_slice()]).map_err(|_|Error::Database)?;
     let pending = pending
         .as_ref()
         .map(|row| {
             load_pending(
-                row,
+                &row.row(),
                 generation,
                 email_cursor,
                 inventory_base,

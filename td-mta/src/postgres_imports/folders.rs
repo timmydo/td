@@ -5,7 +5,7 @@ pub struct FolderFence {
     pub source: Vec<u8>,
     pub local: [u8; 16],
 }
-pub(super) async fn check(
+pub(super) fn check(
     client: &Client,
     authority: &Authority,
     key: &Key,
@@ -53,14 +53,14 @@ pub(super) async fn check(
     }
     let sources: Vec<_> = sources.into_iter().collect();
     let account = authority.account.as_bytes().as_slice();
-    let rows=client.query("SELECT i.source_object,i.local_object,i.source_digest,i.changed,m.name,m.parent_id,m.role,m.sort_order,m.subscribed,m.changed,p.source_object,NOT EXISTS(SELECT 1 FROM td_mta.imports a WHERE a.account=i.account AND a.source_instance=i.source_instance AND a.source_kind=1 AND a.source_account=i.source_account AND a.local_object=i.local_object AND a.source_object<>i.source_object) FROM unnest($4::bytea[]) requested(id) LEFT JOIN td_mta.imports i ON i.account=$1 AND i.source_instance=$2 AND i.source_kind=1 AND i.source_account=$3 AND i.source_object=requested.id LEFT JOIN td_mta.mailboxes m ON m.account=i.account AND m.id=i.local_object LEFT JOIN td_mta.imports p ON p.account=m.account AND p.local_object=m.parent_id AND p.source_instance=$2 AND p.source_kind=1 AND p.source_account=$3 ORDER BY i.source_object LIMIT 257",&[&account,&key.instance.as_bytes().as_slice(),&key.account.as_slice(),&sources]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT i.source_object,i.local_object,i.source_digest,i.changed,m.name,m.parent_id,m.role,m.sort_order,m.subscribed,m.changed,p.source_object,NOT EXISTS(SELECT 1 FROM td_mta.imports a WHERE a.account=i.account AND a.source_instance=i.source_instance AND a.source_kind=1 AND a.source_account=i.source_account AND a.local_object=i.local_object AND a.source_object<>i.source_object) FROM unnest($4::bytea[]) requested(id) LEFT JOIN td_mta.imports i ON i.account=$1 AND i.source_instance=$2 AND i.source_kind=1 AND i.source_account=$3 AND i.source_object=requested.id LEFT JOIN td_mta.mailboxes m ON m.account=i.account AND m.id=i.local_object LEFT JOIN td_mta.imports p ON p.account=m.account AND p.local_object=m.parent_id AND p.source_instance=$2 AND p.source_kind=1 AND p.source_account=$3 ORDER BY i.source_object LIMIT 257",&[&account,&key.instance.as_bytes().as_slice(),&key.account.as_slice(),&sources]).map_err(|_|Error::Database)?;
     if rows.len() != sources.len() {
         return Err(Error::Conflict);
     }
     let mut fences = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut locals = std::collections::BTreeSet::new();
-    for row in rows {
+    for row in &rows {
         let source: Option<&[u8]> = row.try_get(0).map_err(|_| Error::Integrity)?;
         let source = source.ok_or(Error::MissingMailbox)?;
         if !seen.insert(source.to_vec()) {

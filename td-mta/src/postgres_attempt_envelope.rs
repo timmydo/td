@@ -78,15 +78,10 @@ fn read(
     let observed = observation.is_some();
     let value = value.clone();
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            if !owners::begin(client, &value.claim, true, false)
-                .await
-                .map_err(Error::Owner)?
-            {
-                return Err(Error::Policy);
-            }
-            check_locked(client, deadline, &value, observation.as_ref()).await
-        })
+        if !owners::begin(client, &value.claim, true, false).map_err(Error::Owner)? {
+            return Err(Error::Policy);
+        }
+        check_locked(client, deadline, &value, observation.as_ref())
     })
     .map_err(Error::Connection)??;
     if observed && Instant::now() >= result.1 {
@@ -95,8 +90,8 @@ fn read(
     Ok(result)
 }
 
-async fn check_locked(
-    client: &tokio_postgres::Client,
+fn check_locked(
+    client: &crate::postgres_probe::Client,
     deadline: Instant,
     value: &Dispatch,
     observation: Option<&Observation>,
@@ -107,19 +102,17 @@ async fn check_locked(
         }
         None => Ok(()),
     };
-    let timestamp =
-        owners::check_locked_observed(client, &value.claim, value.generation, &check).await?;
+    let timestamp = owners::check_locked_observed(client, &value.claim, value.generation, check)?;
     if observation.is_some() {
         crate::postgres_route_health::admit_locked(client, &value.claim, timestamp)
-            .await
             .map_err(Error::RouteHealth)?;
     }
-    let outcome = super::active_receipt(client, value).await?;
+    let outcome = super::active_receipt(client, value)?;
     let binding = value.claim.binding();
     let account = binding.account();
     let account = account.as_bytes().as_slice();
     let submission = value.submission.as_bytes().as_slice();
-    let rows=client.query("SELECT s.reverse_path,s.recipient_count,s.send_at,s.expires_at,s.completed_at,s.changed,a.sequence,a.floor FROM td_mta.submissions s JOIN td_mta.accounts a ON a.id=s.account JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND s.id=$2 AND r.route_name=$3 AND r.destination=$4", &[&account,&submission,&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT s.reverse_path,s.recipient_count,s.send_at,s.expires_at,s.completed_at,s.changed,a.sequence,a.floor FROM td_mta.submissions s JOIN td_mta.accounts a ON a.id=s.account JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND s.id=$2 AND r.route_name=$3 AND r.destination=$4", &[&account,&submission,&binding.route().name(),&binding.route().destination().as_slice()]).map_err(|_|Error::Database)?;
     let row = rows.first().ok_or(Error::Missing)?;
     let reverse: &str = row.try_get(0).map_err(|_| Error::Integrity)?;
     let total: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -149,7 +142,7 @@ async fn check_locked(
     for ordinal in &outcome.ordinals {
         selected.push(i64::from(*ordinal));
     }
-    let rows=client.query("SELECT ordinal,address,state,attempt_id,phase,attempt_count,last_attempt_at,next_attempt_at,changed,reason,diagnostic,uncertain FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal=ANY($3) ORDER BY ordinal LIMIT 101", &[&account,&submission,&selected]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT ordinal,address,state,attempt_id,phase,attempt_count,last_attempt_at,next_attempt_at,changed,reason,diagnostic,uncertain FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal=ANY($3) ORDER BY ordinal LIMIT 101", &[&account,&submission,&selected]).map_err(|_|Error::Database)?;
     if rows.len() != outcome.ordinals.len() {
         return Err(Error::Integrity);
     }
@@ -191,8 +184,7 @@ async fn check_locked(
     }
     let started = Instant::now();
     let (finished, owner_expiry) =
-        owners::check_locked_expiry_observed(client, &value.claim, value.generation, &check)
-            .await?;
+        owners::check_locked_expiry_observed(client, &value.claim, value.generation, check)?;
     if finished >= expires {
         return Err(Error::NotDue);
     }

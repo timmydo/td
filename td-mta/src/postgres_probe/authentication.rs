@@ -44,18 +44,12 @@ impl AuthenticationSession {
                 binding.epoch,
                 ReadIsolation::RepeatableReadOnly,
                 deadline,
-                move |client| {
-                    Box::pin(async move {
-                        match postgres_snapshot::observe_events(
-                            client, binding, principal, credential,
-                        )
-                        .await
-                        {
-                            Ok(observation) => Ok(Some(observation)),
-                            Err(postgres_snapshot::Error::Unauthenticated) => Ok(None),
-                            Err(_) => Err(ports::Error::Invalid),
-                        }
-                    })
+                move |client| match postgres_snapshot::observe_events(
+                    client, binding, principal, credential,
+                ) {
+                    Ok(observation) => Ok(Some(observation)),
+                    Err(postgres_snapshot::Error::Unauthenticated) => Ok(None),
+                    Err(_) => Err(ports::Error::Invalid),
                 },
             )
             .map_err(connection)??
@@ -74,17 +68,13 @@ impl AuthenticationSession {
                 binding.epoch,
                 ReadIsolation::RepeatableReadOnly,
                 deadline,
-                move |client| {
-                    Box::pin(async move {
-                        match postgres_snapshot::observe(client, binding, presented).await {
-                            Ok(_) => Ok(Some(Principal {
-                                account: binding.account,
-                                device,
-                            })),
-                            Err(postgres_snapshot::Error::Unauthenticated) => Ok(None),
-                            Err(_) => Err(ports::Error::Invalid),
-                        }
-                    })
+                move |client| match postgres_snapshot::observe(client, binding, presented) {
+                    Ok(_) => Ok(Some(Principal {
+                        account: binding.account,
+                        device,
+                    })),
+                    Err(postgres_snapshot::Error::Unauthenticated) => Ok(None),
+                    Err(_) => Err(ports::Error::Invalid),
                 },
             )
             .map_err(connection)??

@@ -1,4 +1,5 @@
 //! Local Inbox notices, serialized with the submission's durable marker.
+use crate::postgres_probe::{Client, Row};
 use crate::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -17,7 +18,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::{Client, Row};
 
 const MAX_TEXT: usize = 10 * 1024 * 1024;
 const RECIPIENT_PAGE: &str = "SELECT ordinal,address,state,uncertain,next_attempt_at,rcpt_reply,data_reply,reason,diagnostic,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal >= $3 ORDER BY ordinal LIMIT 100";
@@ -46,8 +46,8 @@ pub enum Error {
     Crypto,
     Indeterminate,
 }
-fn field<'a, T: tokio_postgres::types::FromSql<'a>>(
-    row: &'a Row,
+fn field<'a, T: crate::postgres_probe::FromColumn<'a>>(
+    row: Row<'a>,
     column: usize,
 ) -> Result<T, Error> {
     row.try_get(column).map_err(|_| Error::Integrity)
@@ -98,19 +98,19 @@ fn detail(text: &mut String, label: &str, value: &str, maximum: usize) -> Result
     append(text, "\n")
 }
 fn recipient(text: &mut String, row: &Row, ordinal: usize) -> Result<(), Error> {
-    if field::<i64>(row, 0)? != ordinal as i64 || field::<Option<i64>>(row, 4)?.is_some() {
+    if field::<i64>(*row, 0)? != ordinal as i64 || field::<Option<i64>>(*row, 4)?.is_some() {
         return Err(Error::Integrity);
     }
     render_recipient(
         text,
         Recipient {
-            address: field(row, 1)?,
-            state: field(row, 2)?,
-            uncertain: field(row, 3)?,
-            rcpt: field(row, 5)?,
-            data: field(row, 6)?,
-            reason: field(row, 7)?,
-            diagnostic: field(row, 8)?,
+            address: field(*row, 1)?,
+            state: field(*row, 2)?,
+            uncertain: field(*row, 3)?,
+            rcpt: field(*row, 5)?,
+            data: field(*row, 6)?,
+            reason: field(*row, 7)?,
+            diagnostic: field(*row, 8)?,
         },
     )
 }
@@ -195,214 +195,192 @@ pub fn publish_next(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_notice_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            if !owners::begin(client, &claim, true, true)
-                .await
-                .map_err(Error::Owner)?
-            {
-                return Err(Error::Policy);
-            }
-            let now = owners::check_locked(client, &claim, generation)
-                .await
-                .map_err(Error::Owner)?;
-            let binding = claim.binding();
-            let account_id = binding.account();
-            let account = account_id.as_bytes().as_slice();
-            // Random order: one notice that keeps failing never blocks the rest.
-            let rows = client.query("SELECT id,email_id,recipient_count,completed_at FROM td_mta.submissions WHERE account=$1 AND notification=1 AND completed_at IS NOT NULL ORDER BY random() LIMIT 1", &[&account]).await.map_err(|_| Error::Database)?;
-            let Some(row) = rows.first() else {
-                return Ok(false);
-            };
-            let submission = SubmissionId::from_bytes(
-                field::<&[u8]>(row, 0)?
-                    .try_into()
-                    .map_err(|_| Error::Integrity)?,
-            );
-            let original = EmailId::from_bytes(
-                field::<&[u8]>(row, 1)?
-                    .try_into()
-                    .map_err(|_| Error::Integrity)?,
-            );
-            let count: i64 = field(row, 2)?;
-            if !(1..=1000).contains(&count) {
-                return Err(Error::Integrity);
-            }
-            let completed_at: i64 = field(row, 3)?;
-            let state = client
-                .query_one(
-                    "SELECT sequence FROM td_mta.accounts WHERE id=$1",
-                    &[&account],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            let old = number(field(&state, 0)?)?;
-            let next = crate::postgres_sequence::next(client, account, old)
-                .await
-                .map_err(|error| match error {
-                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
-                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
-                    crate::postgres_sequence::Error::Database => Error::Database,
-                })?;
-            let mailbox = inbox(client, account, old).await?;
-            let heading = format!("Local delivery report\nSubmission: {submission}\nOriginal Email: {original}\n\nNo further attempts are scheduled for this submission.\nAn unknown outcome is not proof of failure; resending may deliver a duplicate.\n");
-            // A recent notice reports every recipient in full; an older one, or
-            // one its size or the account's quota refuses, is stored compact.
-            let mut text = String::new();
-            let mut full = now.saturating_sub(completed_at) <= FULL_WINDOW_MS;
-            if full {
-                append(&mut text, &heading)?;
-                let built = async {
-                    for start in (0..count).step_by(100) {
-                        let rows = client
-                            .query(
-                                RECIPIENT_PAGE,
-                                &[&account, &submission.as_bytes().as_slice(), &start],
-                            )
-                            .await
-                            .map_err(|_| Error::Database)?;
-                        if rows.len() != (count - start).min(100) as usize {
+        if !owners::begin(client, &claim, true, true).map_err(Error::Owner)? {
+            return Err(Error::Policy);
+        }
+        let now = owners::check_locked(client, &claim, generation).map_err(Error::Owner)?;
+        let binding = claim.binding();
+        let account_id = binding.account();
+        let account = account_id.as_bytes().as_slice();
+        // Random order: one notice that keeps failing never blocks the rest.
+        let rows = client.query("SELECT id,email_id,recipient_count,completed_at FROM td_mta.submissions WHERE account=$1 AND notification=1 AND completed_at IS NOT NULL ORDER BY random() LIMIT 1", &[&account]).map_err(|_| Error::Database)?;
+        let Some(row) = rows.first() else {
+            return Ok(false);
+        };
+        let submission = SubmissionId::from_bytes(
+            field::<&[u8]>(row, 0)?
+                .try_into()
+                .map_err(|_| Error::Integrity)?,
+        );
+        let original = EmailId::from_bytes(
+            field::<&[u8]>(row, 1)?
+                .try_into()
+                .map_err(|_| Error::Integrity)?,
+        );
+        let count: i64 = field(row, 2)?;
+        if !(1..=1000).contains(&count) {
+            return Err(Error::Integrity);
+        }
+        let completed_at: i64 = field(row, 3)?;
+        let state = client
+            .query_one(
+                "SELECT sequence FROM td_mta.accounts WHERE id=$1",
+                &[&account],
+            )
+            .map_err(|_| Error::Database)?;
+        let old = number(field(state.row(), 0)?)?;
+        let next =
+            crate::postgres_sequence::next(client, account, old).map_err(|error| match error {
+                crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                crate::postgres_sequence::Error::Database => Error::Database,
+            })?;
+        let mailbox = inbox(client, account, old)?;
+        let heading = format!("Local delivery report\nSubmission: {submission}\nOriginal Email: {original}\n\nNo further attempts are scheduled for this submission.\nAn unknown outcome is not proof of failure; resending may deliver a duplicate.\n");
+        // A recent notice reports every recipient in full; an older one, or
+        // one its size or the account's quota refuses, is stored compact.
+        let mut text = String::new();
+        let mut full = now.saturating_sub(completed_at) <= FULL_WINDOW_MS;
+        if full {
+            append(&mut text, &heading)?;
+            let built = (|| {
+                for start in (0..count).step_by(100) {
+                    let rows = client
+                        .query(
+                            RECIPIENT_PAGE,
+                            &[&account, &submission.as_bytes().as_slice(), &start],
+                        )
+                        .map_err(|_| Error::Database)?;
+                    if rows.len() != (count - start).min(100) as usize {
+                        return Err(Error::Integrity);
+                    }
+                    for (offset, row) in rows.iter().enumerate() {
+                        if Instant::now() >= deadline {
+                            return Err(Error::Work(ports::Error::Deadline));
+                        }
+                        if number(field(row, 9)?)? > old {
                             return Err(Error::Integrity);
                         }
-                        for (offset, row) in rows.iter().enumerate() {
-                            if Instant::now() >= deadline {
-                                return Err(Error::Work(ports::Error::Deadline));
-                            }
-                            if number(field(row, 9)?)? > old {
-                                return Err(Error::Integrity);
-                            }
-                            meter
-                                .charge(
-                                    clock.sample().map_err(Error::Work)?.monotonic,
-                                    Charge {
-                                        io_bytes: 10 * 1024,
-                                        output_bytes: 10 * 1024,
-                                        records: 1,
-                                        ..Charge::default()
-                                    },
-                                )
-                                .map_err(|stop| {
-                                    Error::Work(if stop == crate::admission::work::Stop::Deadline {
-                                        ports::Error::Deadline
-                                    } else {
-                                        ports::Error::Capacity
-                                    })
-                                })?;
-                            recipient(&mut text, row, start as usize + offset)?;
-                        }
+                        meter
+                            .charge(
+                                clock.sample().map_err(Error::Work)?.monotonic,
+                                Charge {
+                                    io_bytes: 10 * 1024,
+                                    output_bytes: 10 * 1024,
+                                    records: 1,
+                                    ..Charge::default()
+                                },
+                            )
+                            .map_err(|stop| {
+                                Error::Work(if stop == crate::admission::work::Stop::Deadline {
+                                    ports::Error::Deadline
+                                } else {
+                                    ports::Error::Capacity
+                                })
+                            })?;
+                        recipient(&mut text, &row, start as usize + offset)?;
                     }
-                    Ok::<(), Error>(())
                 }
-                .await;
-                match built {
-                    Ok(()) => {}
-                    Err(error) if fallback(error) => full = false,
-                    Err(error) => return Err(error),
-                }
+                Ok::<(), Error>(())
+            })();
+            match built {
+                Ok(()) => {}
+                Err(error) if fallback(error) => full = false,
+                Err(error) => return Err(error),
             }
-            let extra: bool = field(&client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal >= $3) OR EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND submission_id=$2 AND active)", &[&account,&submission.as_bytes().as_slice(),&count]).await.map_err(|_| Error::Database)?,0)?;
-            if extra {
-                return Err(Error::Integrity);
-            }
-            let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
-            let mut id = || {
-                let mut bytes = [0; 16];
-                entropy.fill(&mut bytes).map_err(|_| Error::Crypto)?;
-                Ok::<_, Error>(bytes)
-            };
-            let email = EmailId::from_bytes(id()?);
-            let blob = BlobId::from_bytes(id()?);
-            let thread = ThreadId::from_bytes(id()?);
-            let message_id = format!("notice-{email}@localhost.invalid");
-            let mut prepared = None;
-            if full {
-                match render(&text, &message_id, now, MAX_MESSAGE, &clock, &mut meter) {
-                    // Charge first: a full account must not pay for hashing and
-                    // MIME evidence of a report it will not store.
-                    Ok(bytes) => match publication::charge(
-                        client,
-                        account_id,
-                        binding.quotas(),
-                        [bytes.len() as u64, 1, 0, 0, 0],
-                    )
-                    .await
-                    {
-                        Ok(usage) => {
-                            let (digest, interpretation) = seal(&bytes, deadline)?;
-                            prepared = Some((bytes, digest, interpretation, usage));
-                        }
-                        Err(publication::Error::Quota) => {}
-                        Err(error) => return Err(publication_error(error)),
-                    },
-                    Err(error) if fallback(error) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            let (bytes, digest, interpretation, usage) = match prepared {
-                Some(prepared) => prepared,
-                None => {
-                    let compact =
-                        compact_text(client, account, submission, &heading, count, old).await?;
-                    let bytes = render(
-                        &compact,
-                        &message_id,
-                        now,
-                        COMPACT_MESSAGE,
-                        &clock,
-                        &mut meter,
-                    )?;
-                    let (digest, interpretation) = seal(&bytes, deadline)?;
-                    let usage = publication::charge(
-                        client,
-                        account_id,
-                        compact_caps(binding.quotas()),
-                        [bytes.len() as u64, 1, 0, 0, 0],
-                    )
-                    .await
-                    .map_err(publication_error)?;
-                    (bytes, digest, interpretation, usage)
-                }
-            };
-            write_notice(
-                client,
-                Notice {
-                    account: account_id,
-                    mailbox: &mailbox,
-                    email,
-                    blob,
-                    thread,
-                    message_id: &message_id,
-                    bytes: &bytes,
-                    digest: &digest,
-                    interpretation: interpretation.as_ref(),
-                    now,
-                    next,
+        }
+        let extra: bool = field((client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal >= $3) OR EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND submission_id=$2 AND active)", &[&account,&submission.as_bytes().as_slice(),&count]).map_err(|_| Error::Database)?).row(),0)?;
+        if extra {
+            return Err(Error::Integrity);
+        }
+        let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
+        let mut id = || {
+            let mut bytes = [0; 16];
+            entropy.fill(&mut bytes).map_err(|_| Error::Crypto)?;
+            Ok::<_, Error>(bytes)
+        };
+        let email = EmailId::from_bytes(id()?);
+        let blob = BlobId::from_bytes(id()?);
+        let thread = ThreadId::from_bytes(id()?);
+        let message_id = format!("notice-{email}@localhost.invalid");
+        let mut prepared = None;
+        if full {
+            match render(&text, &message_id, now, MAX_MESSAGE, &clock, &mut meter) {
+                // Charge first: a full account must not pay for hashing and
+                // MIME evidence of a report it will not store.
+                Ok(bytes) => match publication::charge(
+                    client,
+                    account_id,
+                    binding.quotas(),
+                    [bytes.len() as u64, 1, 0, 0, 0],
+                ) {
+                    Ok(usage) => {
+                        let (digest, interpretation) = seal(&bytes, deadline)?;
+                        prepared = Some((bytes, digest, interpretation, usage));
+                    }
+                    Err(publication::Error::Quota) => {}
+                    Err(error) => return Err(publication_error(error)),
                 },
-                usage,
-                deadline,
-            )
-            .await?;
-            let changed = next.to_be_bytes();
-            let changed = changed.as_slice();
-            let email = email.as_bytes().as_slice();
-            let submission = submission.as_bytes().as_slice();
-            execute(client,"UPDATE td_mta.submissions SET notification=2,notification_email_id=$3,changed=$4 WHERE account=$1 AND id=$2 AND notification=1 AND completed_at IS NOT NULL", &[&account,&submission,&email,&changed],1).await?;
-            execute(
-                client,
-                "INSERT INTO td_mta.changes VALUES($1,$2,3,5,2,$3)",
-                &[&account, &changed, &submission],
-                1,
-            )
-            .await?;
-            owners::check_locked(client, &claim, generation)
-                .await
-                .map_err(Error::Owner)?;
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(true)
-        })
+                Err(error) if fallback(error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let (bytes, digest, interpretation, usage) = match prepared {
+            Some(prepared) => prepared,
+            None => {
+                let compact = compact_text(client, account, submission, &heading, count, old)?;
+                let bytes = render(
+                    &compact,
+                    &message_id,
+                    now,
+                    COMPACT_MESSAGE,
+                    &clock,
+                    &mut meter,
+                )?;
+                let (digest, interpretation) = seal(&bytes, deadline)?;
+                let usage = publication::charge(
+                    client,
+                    account_id,
+                    compact_caps(binding.quotas()),
+                    [bytes.len() as u64, 1, 0, 0, 0],
+                )
+                .map_err(publication_error)?;
+                (bytes, digest, interpretation, usage)
+            }
+        };
+        write_notice(
+            client,
+            Notice {
+                account: account_id,
+                mailbox: &mailbox,
+                email,
+                blob,
+                thread,
+                message_id: &message_id,
+                bytes: &bytes,
+                digest: &digest,
+                interpretation: interpretation.as_ref(),
+                now,
+                next,
+            },
+            usage,
+            deadline,
+        )?;
+        let changed = next.to_be_bytes();
+        let changed = changed.as_slice();
+        let email = email.as_bytes().as_slice();
+        let submission = submission.as_bytes().as_slice();
+        execute(client,"UPDATE td_mta.submissions SET notification=2,notification_email_id=$3,changed=$4 WHERE account=$1 AND id=$2 AND notification=1 AND completed_at IS NOT NULL", &[&account,&submission,&email,&changed],1)?;
+        execute(
+            client,
+            "INSERT INTO td_mta.changes VALUES($1,$2,3,5,2,$3)",
+            &[&account, &changed, &submission],
+            1,
+        )?;
+        owners::check_locked(client, &claim, generation).map_err(Error::Owner)?;
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(true)
     });
     match result {
         Ok(value) => value,
@@ -410,8 +388,8 @@ pub fn publish_next(
         Err(error) => Err(Error::Connection(error)),
     }
 }
-async fn inbox(client: &Client, account: &[u8], old: u64) -> Result<[u8; 16], Error> {
-    let boxes = client.query("SELECT id,changed FROM td_mta.mailboxes WHERE account=$1 AND role='inbox' ORDER BY id LIMIT 2", &[&account]).await.map_err(|_| Error::Database)?;
+fn inbox(client: &Client, account: &[u8], old: u64) -> Result<[u8; 16], Error> {
+    let boxes = client.query("SELECT id,changed FROM td_mta.mailboxes WHERE account=$1 AND role='inbox' ORDER BY id LIMIT 2", &[&account]).map_err(|_| Error::Database)?;
     if boxes.len() != 1 {
         return Err(Error::Integrity);
     }
@@ -439,14 +417,14 @@ struct Notice<'a> {
 
 /// One unread Inbox Email with its blob, fresh thread, anchor, history and
 /// quota charge, in the caller's transaction holding the account row lock.
-async fn write_notice(
+fn write_notice(
     client: &Client,
     notice: Notice<'_>,
     usage: publication::Usage,
     deadline: Instant,
 ) -> Result<(), Error> {
     let account = notice.account.as_bytes().as_slice();
-    let used: bool = field(&client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$3) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND ((kind=3 AND object=$2) OR (kind=2 AND object=$3)))", &[&account,&notice.email.as_bytes().as_slice(),&notice.thread.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?,0)?;
+    let used: bool = field((client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$3) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND ((kind=3 AND object=$2) OR (kind=2 AND object=$3)))", &[&account,&notice.email.as_bytes().as_slice(),&notice.thread.as_bytes().as_slice()]).map_err(|_| Error::Database)?).row(),0)?;
     if used {
         return Err(Error::Integrity);
     }
@@ -463,7 +441,6 @@ async fn write_notice(
         },
         deadline,
     )
-    .await
     .map_err(publication_error)?;
     let changed = notice.next.to_be_bytes();
     let changed = changed.as_slice();
@@ -475,40 +452,34 @@ async fn write_notice(
         "INSERT INTO td_mta.threads VALUES($1,$2,$3)",
         &[&account, &thread, &changed],
         1,
-    )
-    .await?;
-    execute(client,"INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES($1,$2,$3,$4,$5,4,$6)", &[&account,&email,&notice.blob.as_bytes().as_slice(),&thread,&notice.now,&changed],1).await?;
+    )?;
+    execute(client,"INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES($1,$2,$3,$4,$5,4,$6)", &[&account,&email,&notice.blob.as_bytes().as_slice(),&thread,&notice.now,&changed],1)?;
     execute(
         client,
         "INSERT INTO td_mta.memberships VALUES($1,$2,$3,$4)",
         &[&account, &email, &mailbox, &changed],
         1,
-    )
-    .await?;
+    )?;
     execute(
         client,
         "INSERT INTO td_mta.thread_anchors VALUES($1,$2,$3,$4)",
         &[&account, &notice.message_id, &email, &changed],
         1,
-    )
-    .await?;
+    )?;
     execute(
         client,
         "UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=$2",
         &[&account, &mailbox, &changed],
         1,
-    )
-    .await?;
+    )?;
     execute(
         client,
         "INSERT INTO td_mta.changes VALUES($1,$2,0,3,1,$3),($1,$2,1,2,1,$4),($1,$2,2,1,2,$5)",
         &[&account, &changed, &email, &thread, &mailbox],
         3,
-    )
-    .await?;
+    )?;
     usage
         .publish(client, notice.account)
-        .await
         .map_err(publication_error)?;
     execute(
         client,
@@ -516,7 +487,6 @@ async fn write_notice(
         &[&account, &changed],
         1,
     )
-    .await
 }
 
 /// Facts of an incoming message an account's quota refused at DATA.
@@ -568,7 +538,7 @@ fn refused_text(reverse_path: &str, recipients: &[String], length: u64) -> Resul
 /// The caller holds the selection and this account's row lock, and commits.
 /// The notice may pass the caps by one compact message; past that this
 /// refuses with Quota.
-pub(crate) async fn store_refused(
+pub(crate) fn store_refused(
     client: &Client,
     refused: Refused<'_>,
     deadline: Instant,
@@ -576,24 +546,25 @@ pub(crate) async fn store_refused(
     let text = refused_text(refused.reverse_path, refused.recipients, refused.length)?;
     let account_id = refused.binding.account();
     let account = account_id.as_bytes().as_slice();
-    let next = crate::postgres_sequence::next(client, account, refused.old)
-        .await
-        .map_err(|error| match error {
-            crate::postgres_sequence::Error::Capacity => Error::Capacity,
-            crate::postgres_sequence::Error::Integrity => Error::Integrity,
-            crate::postgres_sequence::Error::Database => Error::Database,
-        })?;
+    let next =
+        crate::postgres_sequence::next(client, account, refused.old).map_err(
+            |error| match error {
+                crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                crate::postgres_sequence::Error::Database => Error::Database,
+            },
+        )?;
     let now: i64 = field(
-        &client
+        (client
             .query_one(
                 "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
                 &[],
             )
-            .await
-            .map_err(|_| Error::Database)?,
+            .map_err(|_| Error::Database)?)
+        .row(),
         0,
     )?;
-    let mailbox = inbox(client, account, refused.old).await?;
+    let mailbox = inbox(client, account, refused.old)?;
     let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
     let mut ids = [[0; 16]; 3];
     for id in &mut ids {
@@ -633,7 +604,6 @@ pub(crate) async fn store_refused(
         incoming_caps(refused.binding.quotas()),
         [bytes.len() as u64, 1, 0, 0, 0],
     )
-    .await
     .map_err(publication_error)?;
     let (digest, interpretation) = seal(&bytes, deadline)?;
     write_notice(
@@ -653,8 +623,7 @@ pub(crate) async fn store_refused(
         },
         usage,
         deadline,
-    )
-    .await?;
+    )?;
     Ok((email, next))
 }
 
@@ -788,7 +757,7 @@ fn count_line(text: &mut String, state: i64, uncertain: i64, number: i64) -> Res
 
 /// Counts by outcome and the first Failed or unknown recipients: never more
 /// than `COMPACT_TEXT`, however many recipients or how long their replies.
-async fn compact_text(
+fn compact_text(
     client: &Client,
     account: &[u8],
     submission: SubmissionId,
@@ -799,14 +768,14 @@ async fn compact_text(
     let submission = submission.as_bytes().as_slice();
     // The checks the full report's pages make on every recipient.
     let old = old.to_be_bytes();
-    let faulty: i64 = field(&client.query_one("SELECT count(*) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND (next_attempt_at IS NOT NULL OR reason NOT BETWEEN 0 AND 10 OR changed > $3)", &[&account, &submission, &old.as_slice()]).await.map_err(|_| Error::Database)?, 0)?;
+    let faulty: i64 = field((client.query_one("SELECT count(*) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND (next_attempt_at IS NOT NULL OR reason NOT BETWEEN 0 AND 10 OR changed > $3)", &[&account, &submission, &old.as_slice()]).map_err(|_| Error::Database)?).row(), 0)?;
     if faulty != 0 {
         return Err(Error::Integrity);
     }
     let mut text = String::new();
     append(&mut text, heading)?;
     append(&mut text, COMPACT_INTRO)?;
-    let groups = client.query("SELECT state,uncertain,count(*) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 GROUP BY state,uncertain ORDER BY state,uncertain", &[&account, &submission]).await.map_err(|_| Error::Database)?;
+    let groups = client.query("SELECT state,uncertain,count(*) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 GROUP BY state,uncertain ORDER BY state,uncertain", &[&account, &submission]).map_err(|_| Error::Database)?;
     let mut total = 0i64;
     for row in &groups {
         let number: i64 = field(row, 2)?;
@@ -816,7 +785,7 @@ async fn compact_text(
     if total != count {
         return Err(Error::Integrity);
     }
-    let listed = client.query("SELECT address,state,uncertain,reason FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND state IN (5,7) ORDER BY ordinal LIMIT $3", &[&account, &submission, &COMPACT_ADDRESSES]).await.map_err(|_| Error::Database)?;
+    let listed = client.query("SELECT address,state,uncertain,reason FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND state IN (5,7) ORDER BY ordinal LIMIT $3", &[&account, &submission, &COMPACT_ADDRESSES]).map_err(|_| Error::Database)?;
     if !listed.is_empty() {
         append(&mut text, "\n")?;
     }
@@ -831,15 +800,14 @@ async fn compact_text(
     Ok(text)
 }
 
-async fn execute(
+fn execute(
     client: &Client,
     sql: &str,
-    parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    parameters: &[&dyn crate::postgres_probe::Encode],
     count: u64,
 ) -> Result<(), Error> {
     if client
         .execute(sql, parameters)
-        .await
         .map_err(|_| Error::Database)?
         != count
     {

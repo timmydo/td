@@ -1,7 +1,7 @@
 //! Primary service logins. The grant plan and the cold catalog check use the
 //! same inventory, including individual columns needed only for row locks.
 use super::{Error, TABLES};
-use tokio_postgres::Client;
+use crate::postgres_probe::Client;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceRole {
@@ -189,16 +189,13 @@ fn entries(grants: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
     })
 }
 
-pub(super) async fn qualify(client: &Client, role: ServiceRole) -> Result<(), Error> {
-    let rows = client
-        .query_typed(PRIVILEGES, &[])
-        .await
-        .map_err(|_| Error::Database)?;
+pub(super) fn qualify(client: &Client, role: ServiceRole) -> Result<(), Error> {
+    let rows = client.query(PRIVILEGES, &[]).map_err(|_| Error::Database)?;
     if rows.len() > 1024 {
         return Err(Error::Privileges);
     }
     let mut counts = [0usize; TABLES.len()];
-    for row in rows {
+    for row in &rows {
         let name: &str = row.try_get(0).map_err(|_| Error::Database)?;
         let i = TABLES
             .iter()
@@ -226,7 +223,7 @@ pub(super) async fn qualify(client: &Client, role: ServiceRole) -> Result<(), Er
             return Err(Error::Privileges);
         }
     }
-    crate::postgres_service_materials::qualify_views(client, role).await
+    crate::postgres_service_materials::qualify_views(client, role)
 }
 
 #[cfg(test)]

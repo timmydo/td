@@ -1,4 +1,5 @@
 //! Owner-side device preparation. Observations grant no serving authority.
+use crate::postgres_probe::Client;
 use crate::{
     device_credentials::{
         self, Credential, DevicePassword, Presented, DEVICE_CAPACITY, DEVICE_RECORDS,
@@ -15,7 +16,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::{types::Type, Client};
 
 #[path = "postgres_device_list.rs"]
 mod listing;
@@ -251,35 +251,29 @@ fn mutate(
     let marker = attempted.clone();
     // Retirement and the record counts outgrow the ordinary 128-frame budget.
     let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            begin(client, epoch).await?;
-            // Every device writer takes the account fence before device rows.
-            let rows = client
-                .query(
-                    "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-                    &[&account.as_bytes().as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            if rows.len() != 1 {
-                return Err(Error::Missing);
+        begin(client, epoch)?;
+        // Every device writer takes the account fence before device rows.
+        let rows = client
+            .query(
+                "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                &[&account.as_bytes().as_slice()],
+            )
+            .map_err(|_| Error::Database)?;
+        if rows.len() != 1 {
+            return Err(Error::Missing);
+        }
+        let change = match action {
+            Action::Create(row) => create(client, account, row)?,
+            Action::Revoke(revocation) => revoke(client, revocation)?,
+        };
+        match change {
+            Change::Known(outcome) => Ok(outcome),
+            Change::Write(outcome) => {
+                marker.store(true, Ordering::Relaxed);
+                client.commit().map_err(|_| Error::Indeterminate)?;
+                Ok(outcome)
             }
-            let change = match action {
-                Action::Create(row) => create(client, account, row).await?,
-                Action::Revoke(revocation) => revoke(client, revocation).await?,
-            };
-            match change {
-                Change::Known(outcome) => Ok(outcome),
-                Change::Write(outcome) => {
-                    marker.store(true, Ordering::Relaxed);
-                    client
-                        .batch_execute("COMMIT")
-                        .await
-                        .map_err(|_| Error::Indeterminate)?;
-                    Ok(outcome)
-                }
-            }
-        })
+        }
     });
     match result {
         Ok(result) => result,
@@ -288,18 +282,17 @@ fn mutate(
     }
 }
 
-async fn begin(client: &postgres_probe::ScopedClient, epoch: StoreEpoch) -> Result<(), Error> {
-    let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
+fn begin(client: &postgres_probe::Client, epoch: StoreEpoch) -> Result<(), Error> {
+    let receipt = client.inspect_schema().map_err(Error::Schema)?;
     if receipt.store_epoch != epoch {
         return Err(Error::Epoch);
     }
     client
-        .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000")
-        .await
+        .batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000")
         .map_err(|_| Error::Database)
 }
 
-async fn create(client: &Client, account: AccountId, row: CreationRow) -> Result<Change, Error> {
+fn create(client: &Client, account: AccountId, row: CreationRow) -> Result<Change, Error> {
     let rows = client
         .query(
             "SELECT creation_digest FROM td_mta.devices WHERE account=$1 AND id=$2 LIMIT 2",
@@ -308,7 +301,6 @@ async fn create(client: &Client, account: AccountId, row: CreationRow) -> Result
                 &row.id.as_bytes().as_slice(),
             ],
         )
-        .await
         .map_err(|_| Error::Database)?;
     if let Some(existing) = rows.first() {
         let stored: &[u8] = existing.try_get(0).map_err(|_| Error::Invalid)?;
@@ -326,7 +318,6 @@ async fn create(client: &Client, account: AccountId, row: CreationRow) -> Result
             "DELETE FROM td_mta.devices WHERE account=$1 AND revoked_at<(extract(epoch FROM clock_timestamp())*1000)::bigint-$2::bigint",
             &[&account.as_bytes().as_slice(), &REVOKED_RETENTION_MS],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let limit = i64::try_from(DEVICE_RECORDS.checked_add(1).ok_or(Error::Capacity)?)
         .map_err(|_| Error::Capacity)?;
@@ -336,7 +327,6 @@ async fn create(client: &Client, account: AccountId, row: CreationRow) -> Result
             "SELECT count(*) FILTER (WHERE revoked_at IS NULL),count(*) FROM (SELECT revoked_at FROM td_mta.devices WHERE account=$1 LIMIT $2) bounded",
             &[&account.as_bytes().as_slice(), &limit],
         )
-        .await
         .map_err(|_| Error::Database)?;
     for (column, cap) in [(0, DEVICE_CAPACITY), (1, DEVICE_RECORDS)] {
         let count: i64 = counts.try_get(column).map_err(|_| Error::Invalid)?;
@@ -346,18 +336,16 @@ async fn create(client: &Client, account: AccountId, row: CreationRow) -> Result
     }
     let written = client.execute("INSERT INTO td_mta.devices (account,id,salt,verifier,label,created_at,creation_digest) VALUES ($1,$2,$3,$4,$5,$6,$7)",
         &[&account.as_bytes().as_slice(), &row.id.as_bytes().as_slice(), &row.salt.as_slice(),
-        &row.verifier.as_slice(), &row.label, &row.created, &row.digest.as_slice()])
-        .await.map_err(|_| Error::Database)?;
+        &row.verifier.as_slice(), &row.label, &row.created, &row.digest.as_slice()]).map_err(|_| Error::Database)?;
     if written != 1 {
         return Err(Error::Invalid);
     }
     Ok(Change::Write(RevocationOutcome::Recorded))
 }
 
-async fn revoke(client: &Client, operation: Revocation) -> Result<Change, Error> {
+fn revoke(client: &Client, operation: Revocation) -> Result<Change, Error> {
     let rows = client.query("SELECT id,revocation_digest FROM td_mta.devices WHERE account=$1 AND revocation_id=$2 LIMIT 2",
-        &[&operation.account.as_bytes().as_slice(), &operation.id.as_bytes().as_slice()])
-        .await.map_err(|_| Error::Database)?;
+        &[&operation.account.as_bytes().as_slice(), &operation.id.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
     if let Some(row) = rows.first() {
         let id: &[u8] = row.try_get(0).map_err(|_| Error::Invalid)?;
         let digest: &[u8] = row.try_get(1).map_err(|_| Error::Invalid)?;
@@ -374,7 +362,6 @@ async fn revoke(client: &Client, operation: Revocation) -> Result<Change, Error>
                 &operation.device.as_bytes().as_slice(),
             ],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let row = rows.first().ok_or(Error::Missing)?;
     if rows.len() != 1 {
@@ -388,8 +375,7 @@ async fn revoke(client: &Client, operation: Revocation) -> Result<Change, Error>
     // counts from it.
     let written = client.execute("UPDATE td_mta.devices SET revoked_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,revocation_id=$3,revocation_digest=$4 WHERE account=$1 AND id=$2 AND revoked_at IS NULL",
         &[&operation.account.as_bytes().as_slice(), &operation.device.as_bytes().as_slice(),
-        &operation.id.as_bytes().as_slice(), &operation.digest.as_slice()])
-        .await.map_err(|_| Error::Database)?;
+        &operation.id.as_bytes().as_slice(), &operation.digest.as_slice()]).map_err(|_| Error::Database)?;
     if written != 1 {
         return Err(Error::Invalid);
     }
@@ -410,13 +396,11 @@ pub fn check(
         return Ok(None);
     };
     let result = postgres_probe::with_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            authenticate(client, account, presented).await
-        })
-    }).map_err(Error::Connection)?;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            authenticate(client, account, presented)
+        }).map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
@@ -424,13 +408,13 @@ pub fn check(
 }
 
 // Caller owns an admitted primary transaction; never reuse the result outside it.
-pub(crate) async fn authenticate(
+pub(crate) fn authenticate(
     client: &Client,
     account: AccountId,
     presented: Presented,
 ) -> Result<Option<DeviceId>, Error> {
     let device = presented.id();
-    let (salt, expected, active) = credential_row(client, account, device).await?;
+    let (salt, expected, active) = credential_row(client, account, device)?;
     let matched = presented
         .matches(account, &salt, &expected)
         .map_err(|_| Error::Crypto)?;
@@ -439,14 +423,13 @@ pub(crate) async fn authenticate(
 
 /// Compare an admitted stream with the current row without keeping a password
 /// or a database verifier in its connection slot.
-pub(crate) async fn event_stamp(
+pub(crate) fn event_stamp(
     client: &Client,
     principal: crate::http_auth::Principal,
     credential: crate::http_auth::EventCredential<Presented>,
 ) -> Result<Option<[u8; 32]>, Error> {
     use crate::http_auth::EventCredential;
-    let (salt, verifier, active) =
-        credential_row(client, principal.account, principal.device).await?;
+    let (salt, verifier, active) = credential_row(client, principal.account, principal.device)?;
     let stamp = hash(&[
         b"td-mta event credential v1",
         principal.account.as_bytes(),
@@ -465,14 +448,13 @@ pub(crate) async fn event_stamp(
     };
     Ok((active && matched).then_some(stamp))
 }
-async fn credential_row(
+fn credential_row(
     client: &Client,
     account: AccountId,
     device: DeviceId,
 ) -> Result<([u8; 32], [u8; 32], bool), Error> {
-    let rows = client.query_typed("SELECT salt,verifier,revoked_at FROM td_mta.devices WHERE account=$1 AND id=$2 LIMIT 2",
-                &[(&account.as_bytes().as_slice(), Type::BYTEA), (&device.as_bytes().as_slice(), Type::BYTEA)])
-                .await.map_err(|_| Error::Database)?;
+    let rows = client.query("SELECT salt,verifier,revoked_at FROM td_mta.devices WHERE account=$1 AND id=$2 LIMIT 2",
+                &[&account.as_bytes().as_slice(), &device.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
     if rows.len() > 1 {
         return Err(Error::Invalid);
     }

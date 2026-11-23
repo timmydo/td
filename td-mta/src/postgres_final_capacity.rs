@@ -1,5 +1,5 @@
 //! Durable logical final-result capacity under the caller's account row lock.
-use tokio_postgres::Client;
+use crate::postgres_probe::Client;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
@@ -15,10 +15,10 @@ pub(crate) enum Receipt {
     Expiry,
 }
 /// Every caller holds the account row lock before inspecting or changing claims.
-pub(crate) async fn reserved(client: &Client, account: &[u8]) -> Result<u64, Error> {
+pub(crate) fn reserved(client: &Client, account: &[u8]) -> Result<u64, Error> {
     let count: i64 = client.query_one(
         "SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_final_reservations WHERE account=$1 LIMIT 1025) claims", &[&account]
-    ).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
+    ).map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
     if !(0..=1024).contains(&count) {
         return Err(Error::Integrity);
     }
@@ -33,11 +33,7 @@ fn available(used: i64, claims: u64) -> Result<(), Error> {
     }
     Ok(())
 }
-pub(crate) async fn admit_receipt(
-    client: &Client,
-    account: &[u8],
-    kind: Receipt,
-) -> Result<(), Error> {
+pub(crate) fn admit_receipt(client: &Client, account: &[u8], kind: Receipt) -> Result<(), Error> {
     // Expiry receipts expire by age; the others go with their attempts.
     if matches!(kind, Receipt::Expiry) {
         client
@@ -45,7 +41,6 @@ pub(crate) async fn admit_receipt(
                 "DELETE FROM td_mta.submission_expiry_receipts WHERE account=$1 AND published_at<(extract(epoch FROM clock_timestamp())*1000)::bigint-$2",
                 &[&account, &crate::postgres_queue_expiry::RECEIPT_RETENTION_MS],
             )
-            .await
             .map_err(|_| Error::Database)?;
     }
     let query = match kind {
@@ -56,11 +51,10 @@ pub(crate) async fn admit_receipt(
     };
     let used = client
         .query_one(query, &[&account])
-        .await
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Integrity)?;
-    available(used, reserved(client, account).await?)
+    available(used, reserved(client, account)?)
 }
 fn encode(ordinals: &[i64]) -> Result<Vec<u8>, Error> {
     if ordinals.is_empty() || ordinals.len() > 100 {
@@ -84,7 +78,7 @@ fn encode(ordinals: &[i64]) -> Result<Vec<u8>, Error> {
     }
     Ok(bytes)
 }
-pub(crate) async fn reserve(
+pub(crate) fn reserve(
     client: &Client,
     account: &[u8],
     attempt: &[u8],
@@ -97,14 +91,13 @@ pub(crate) async fn reserve(
         Receipt::Recovery,
         Receipt::Expiry,
     ] {
-        admit_receipt(client, account, kind).await?;
+        admit_receipt(client, account, kind)?;
     }
     if client
         .execute(
             "INSERT INTO td_mta.attempt_final_reservations VALUES($1,$2,$3)",
             &[&account, &attempt, &bytes],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {
@@ -113,13 +106,13 @@ pub(crate) async fn reserve(
     Ok(())
 }
 /// Check a retained claim without consuming it; the caller pins the account.
-pub(crate) async fn check(
+pub(crate) fn check(
     client: &Client,
     account: &[u8],
     attempt: &[u8],
     ordinals: &[i64],
 ) -> Result<(), Error> {
-    let rows=client.query("SELECT ordinals FROM td_mta.attempt_final_reservations WHERE account=$1 AND attempt_id=$2", &[&account,&attempt]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT ordinals FROM td_mta.attempt_final_reservations WHERE account=$1 AND attempt_id=$2", &[&account,&attempt]).map_err(|_|Error::Database)?;
     let row = rows.first().ok_or(Error::Integrity)?;
     let stored: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
     if stored != encode(ordinals)? {
@@ -129,13 +122,13 @@ pub(crate) async fn check(
 }
 /// Consume only the entire still-AcceptancePossible subset in the same final
 /// transaction. Empty means this attempt had no possible remote acceptance.
-pub(crate) async fn consume(
+pub(crate) fn consume(
     client: &Client,
     account: &[u8],
     attempt: &[u8],
     ordinals: &[i64],
 ) -> Result<(), Error> {
-    let rows = client.query("SELECT ordinals FROM td_mta.attempt_final_reservations WHERE account=$1 AND attempt_id=$2 FOR UPDATE", &[&account,&attempt]).await.map_err(|_| Error::Database)?;
+    let rows = client.query("SELECT ordinals FROM td_mta.attempt_final_reservations WHERE account=$1 AND attempt_id=$2 FOR UPDATE", &[&account,&attempt]).map_err(|_| Error::Database)?;
     let Some(row) = rows.first() else {
         return if ordinals.is_empty() {
             Ok(())
@@ -152,7 +145,6 @@ pub(crate) async fn consume(
             "DELETE FROM td_mta.attempt_final_reservations WHERE account=$1 AND attempt_id=$2",
             &[&account, &attempt],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {
@@ -165,12 +157,12 @@ pub(crate) struct Subset {
     pub ordinals: Vec<i64>,
 }
 /// Expiry must finish one reserved subset in a single bounded publication.
-pub(crate) async fn expiry_subset(
+pub(crate) fn expiry_subset(
     client: &Client,
     account: &[u8],
     submission: &[u8],
 ) -> Result<Option<Subset>, Error> {
-    let rows = client.query("SELECT c.attempt_id,c.ordinals,a.active FROM td_mta.attempt_final_reservations c JOIN td_mta.submission_attempts a USING(account,attempt_id) WHERE c.account=$1 AND a.submission_id=$2 ORDER BY c.attempt_id LIMIT 1 FOR UPDATE OF c,a", &[&account,&submission]).await.map_err(|_| Error::Database)?;
+    let rows = client.query("SELECT c.attempt_id,c.ordinals,a.active FROM td_mta.attempt_final_reservations c JOIN td_mta.submission_attempts a USING(account,attempt_id) WHERE c.account=$1 AND a.submission_id=$2 ORDER BY c.attempt_id LIMIT 1 FOR UPDATE OF c,a", &[&account,&submission]).map_err(|_| Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };

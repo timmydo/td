@@ -90,17 +90,15 @@ impl TcpTransport {
 
     /// A scheduler slice may expire without retiring a healthy connection.
     pub(crate) fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, Error> {
-        use crate::readiness_sys::{self, Connected, Interest, Ready};
+        use crate::readiness_sys::{self, Connected, Interest};
         readiness_sys::wait(
             Connected::Tcp(self.connected()?),
             Interest {
                 read: true,
                 write: false,
             },
-            None,
             until,
         )
-        .map(|ready| !matches!(ready, Ready::Timeout))
         .map_err(|error| self.fail(error.into()))
     }
 

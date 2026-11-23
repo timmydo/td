@@ -58,39 +58,27 @@ pub fn idle_observation(
 ) -> Result<Option<i64>, Error> {
     let claim = claim.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let current_policy = owners::begin(client, &claim, true, false)
-                .await
-                .map_err(Error::Owner)?;
-            if !current_policy {
-                return Err(Error::Policy);
-            }
-            idle_query(client, &claim, generation).await
-        })
+        let current_policy = owners::begin(client, &claim, true, false).map_err(Error::Owner)?;
+        if !current_policy {
+            return Err(Error::Policy);
+        }
+        idle_query(client, &claim, generation)
     })
     .map_err(Error::Connection)?
 }
-async fn idle_query(
-    client: &tokio_postgres::Client,
+fn idle_query(
+    client: &crate::postgres_probe::Client,
     claim: &Claim,
     generation: u64,
 ) -> Result<Option<i64>, Error> {
-    owners::check_locked(client, claim, generation)
-        .await
-        .map_err(Error::Owner)?;
+    owners::check_locked(client, claim, generation).map_err(Error::Owner)?;
     let binding = claim.binding();
     let account = binding.account();
-    let work: bool = client.query_typed_one(
+    let work: bool = client.query_one(
                 "SELECT EXISTS(SELECT 1 FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL) OR EXISTS(SELECT 1 FROM td_mta.submissions WHERE account=$1 AND completed_at IS NOT NULL AND notification=1) OR EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND destination=$3 AND active)",
-                &[
-                    (&account.as_bytes().as_slice(), tokio_postgres::types::Type::BYTEA),
-                    (&binding.route().name(), tokio_postgres::types::Type::TEXT),
-                    (&binding.route().destination().as_slice(), tokio_postgres::types::Type::BYTEA),
-                ],
-            ).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
-    let observed_at = owners::check_locked(client, claim, generation)
-        .await
-        .map_err(Error::Owner)?;
+                &[&account.as_bytes().as_slice(), &binding.route().name(), &binding.route().destination().as_slice()],
+            ).map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
+    let observed_at = owners::check_locked(client, claim, generation).map_err(Error::Owner)?;
     Ok((!work).then_some(observed_at))
 }
 
@@ -221,15 +209,12 @@ impl<'a, 'r> IdleReader<'a, 'r> {
                 postgres_probe::ReadIsolation::ReadCommitted,
                 deadline,
                 move |client| {
-                    Box::pin(async move {
-                        if !owners::lock_account_policy(client, &claim, true, false)
-                            .await
-                            .map_err(Error::Owner)?
-                        {
-                            return Err(Error::Policy);
-                        }
-                        idle_query(client, &claim, generation).await
-                    })
+                    if !owners::lock_account_policy(client, &claim, true, false)
+                        .map_err(Error::Owner)?
+                    {
+                        return Err(Error::Policy);
+                    }
+                    idle_query(client, &claim, generation)
                 },
             )
             .map_err(Error::Connection)
@@ -285,28 +270,27 @@ pub fn scan(
     }
     let claim = claim.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            if !owners::begin(client, &claim, true, false).await.map_err(Error::Owner)? {
+            if !owners::begin(client, &claim, true, false).map_err(Error::Owner)? {
                 return Err(Error::Policy);
             }
-            let observed_at = owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
+            let observed_at = owners::check_locked(client, &claim, generation).map_err(Error::Owner)?;
             if kind != Kind::Expiry {
-                postgres_route_health::admit_locked(client, &claim, observed_at).await.map_err(Error::RouteHealth)?;
+                postgres_route_health::admit_locked(client, &claim, observed_at).map_err(Error::RouteHealth)?;
             }
             let binding = claim.binding();
             let account = binding.account();
             let account = account.as_bytes().as_slice();
             if kind != Kind::Expiry {
-                let busy:bool = client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND active)", &[&account,&binding.route().name()]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
+                let busy:bool = client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND active)", &[&account,&binding.route().name()]).map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
                 if busy { return Err(Error::Busy); }
             }
             let states: &[i64] = match kind { Kind::Fresh => &[1], Kind::Retry => &[3,7], Kind::Expiry => &[] };
             let after_id = after.as_ref().map(|cursor| cursor.last.submission.as_bytes().as_slice());
             let after_due = after.map_or(0, |cursor| cursor.last.due_at);
             let rows = if kind == Kind::Expiry {
-                client.query("SELECT s.id,s.expires_at FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL AND s.expires_at<=$4 AND EXISTS(SELECT 1 FROM td_mta.recipients p WHERE p.account=s.account AND p.submission_id=s.id AND (p.state IN (1,2,3) OR (p.state=7 AND p.next_attempt_at IS NOT NULL))) AND ($5::bytea IS NULL OR (s.expires_at,s.id)>($6,$5)) ORDER BY s.expires_at,s.id LIMIT 65", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&observed_at,&after_id,&after_due]).await.map_err(|_|Error::Database)?
+                client.query("SELECT s.id,s.expires_at FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL AND s.expires_at<=$4 AND EXISTS(SELECT 1 FROM td_mta.recipients p WHERE p.account=s.account AND p.submission_id=s.id AND (p.state IN (1,2,3) OR (p.state=7 AND p.next_attempt_at IS NOT NULL))) AND ($5::bytea IS NULL OR (s.expires_at,s.id)>($6,$5)) ORDER BY s.expires_at,s.id LIMIT 65", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&observed_at,&after_id,&after_due]).map_err(|_|Error::Database)?
             } else {
-                client.query("SELECT id,due FROM (SELECT s.id,min(p.next_attempt_at) AS due FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id JOIN td_mta.recipients p ON p.account=s.account AND p.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL AND s.send_at<=$4 AND s.expires_at>$4 AND p.state=ANY($7) AND p.next_attempt_at<=$4 GROUP BY s.id) candidates WHERE ($5::bytea IS NULL OR (due,id)>($6,$5)) ORDER BY due,id LIMIT 65", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&observed_at,&after_id,&after_due,&states]).await.map_err(|_|Error::Database)?
+                client.query("SELECT id,due FROM (SELECT s.id,min(p.next_attempt_at) AS due FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id JOIN td_mta.recipients p ON p.account=s.account AND p.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL AND s.send_at<=$4 AND s.expires_at>$4 AND p.state=ANY($7) AND p.next_attempt_at<=$4 GROUP BY s.id) candidates WHERE ($5::bytea IS NULL OR (due,id)>($6,$5)) ORDER BY due,id LIMIT 65", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&observed_at,&after_id,&after_due,&states]).map_err(|_|Error::Database)?
             };
             if rows.len() > PAGE_SIZE+1 { return Err(Error::Integrity); }
             let mut candidates = Vec::new();
@@ -327,8 +311,7 @@ pub fn scan(
                 Some(Cursor { operation:claim.operation(), generation, kind,
                     last:*candidates.last().ok_or(Error::Integrity)? })
             } else { None };
-            owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
+            owners::check_locked(client, &claim, generation).map_err(Error::Owner)?;
             Ok(Page {observed_at,candidates,next})
-        })
-    }).map_err(Error::Connection)?
+        }).map_err(Error::Connection)?
 }

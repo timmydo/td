@@ -88,42 +88,35 @@ pub fn publish(
         trust,
         deadline,
         move |client| {
-            Box::pin(async move {
-                let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
-                if receipt.store_epoch != epoch {
-                    return Err(Error::Epoch);
+            let receipt = client.inspect_schema().map_err(Error::Schema)?;
+            if receipt.store_epoch != epoch {
+                return Err(Error::Epoch);
+            }
+            client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit = on; SET LOCAL idle_in_transaction_session_timeout = 10000").map_err(|_| Error::Database)?;
+            let inserted = client.execute("INSERT INTO td_mta.config_versions (id,length,checksum,chunk_count) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING", &[&version.as_bytes().as_slice(), &length, &digest.as_slice(), &count]).map_err(|_| Error::Database)?;
+            if inserted == 0 {
+                let row = client.query_one("SELECT length,checksum,chunk_count FROM td_mta.config_versions WHERE id=$1", &[&version.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
+                let stored_length: i32 = row.try_get(0).map_err(|_| Error::Integrity)?;
+                let stored_digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+                let stored_count: i16 = row.try_get(2).map_err(|_| Error::Integrity)?;
+                if stored_length != length || stored_digest != digest || stored_count != count {
+                    return Err(Error::Conflict);
                 }
-                client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit = on; SET LOCAL idle_in_transaction_session_timeout = 10000")
-                .await.map_err(|_| Error::Database)?;
-                let inserted = client.execute("INSERT INTO td_mta.config_versions (id,length,checksum,chunk_count) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING", &[&version.as_bytes().as_slice(), &length, &digest.as_slice(), &count])
-                .await.map_err(|_| Error::Database)?;
-                if inserted == 0 {
-                    let row = client.query_one("SELECT length,checksum,chunk_count FROM td_mta.config_versions WHERE id=$1", &[&version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-                    let stored_length: i32 = row.try_get(0).map_err(|_| Error::Integrity)?;
-                    let stored_digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-                    let stored_count: i16 = row.try_get(2).map_err(|_| Error::Integrity)?;
-                    if stored_length != length || stored_digest != digest || stored_count != count {
-                        return Err(Error::Conflict);
-                    }
-                    return Ok(());
-                }
-                if inserted != 1 {
+                return Ok(());
+            }
+            if inserted != 1 {
+                return Err(Error::Integrity);
+            }
+            for (ordinal, chunk) in bytes.chunks(CHUNK).enumerate() {
+                let ordinal = i16::try_from(ordinal).map_err(|_| Error::Capacity)?;
+                let changed = client.execute("INSERT INTO td_mta.config_version_chunks (version_id,ordinal,bytes) VALUES ($1,$2,$3)", &[&version.as_bytes().as_slice(), &ordinal, &chunk]).map_err(|_| Error::Database)?;
+                if changed != 1 {
                     return Err(Error::Integrity);
                 }
-                for (ordinal, chunk) in bytes.chunks(CHUNK).enumerate() {
-                    let ordinal = i16::try_from(ordinal).map_err(|_| Error::Capacity)?;
-                    let changed = client.execute("INSERT INTO td_mta.config_version_chunks (version_id,ordinal,bytes) VALUES ($1,$2,$3)", &[&version.as_bytes().as_slice(), &ordinal, &chunk]).await.map_err(|_| Error::Database)?;
-                    if changed != 1 {
-                        return Err(Error::Integrity);
-                    }
-                }
-                marker.store(true, Ordering::Relaxed);
-                client
-                    .batch_execute("COMMIT")
-                    .await
-                    .map_err(|_| Error::Indeterminate)?;
-                Ok(())
-            })
+            }
+            marker.store(true, Ordering::Relaxed);
+            client.commit().map_err(|_| Error::Indeterminate)?;
+            Ok(())
         },
     );
     match result {
@@ -170,12 +163,10 @@ pub fn read_sources(
     version: Version,
 ) -> Result<Sources, Error> {
     let bytes = postgres_probe::with_configuration_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout = 10000")
-                .await.map_err(|_| Error::Database)?;
-            let rows = client.query("SELECT length,checksum,chunk_count FROM td_mta.config_versions WHERE id=$1 LIMIT 2", &[&version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout = 10000").map_err(|_| Error::Database)?;
+            let rows = client.query("SELECT length,checksum,chunk_count FROM td_mta.config_versions WHERE id=$1 LIMIT 2", &[&version.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
             if rows.is_empty() { return Err(Error::Missing); }
             if rows.len() != 1 { return Err(Error::Integrity); }
             let row = rows.first().ok_or(Error::Integrity)?;
@@ -186,7 +177,7 @@ pub fn read_sources(
             if length == 0 || length > MAX_WIRE || digest.len() != 32 || usize::try_from(count).ok() != Some(length.div_ceil(CHUNK)) {
                 return Err(Error::Integrity);
             }
-            let chunks = client.query("SELECT ordinal,bytes FROM td_mta.config_version_chunks WHERE version_id=$1 ORDER BY ordinal LIMIT 34", &[&version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+            let chunks = client.query("SELECT ordinal,bytes FROM td_mta.config_version_chunks WHERE version_id=$1 ORDER BY ordinal LIMIT 34", &[&version.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
             if chunks.len() != length.div_ceil(CHUNK) { return Err(Error::Integrity); }
             let mut bytes = Vec::new();
             bytes.try_reserve_exact(length).map_err(|_| Error::Capacity)?;
@@ -202,8 +193,7 @@ pub fn read_sources(
             hash.update(&bytes).map_err(|_| Error::Crypto)?;
             if hash.finish().map_err(|_| Error::Crypto)?.as_slice() != digest { return Err(Error::Integrity); }
             Ok(bytes)
-        })
-    }).map_err(Error::Connection)??;
+        }).map_err(Error::Connection)??;
     decode(&bytes, epoch)?;
     Ok(Sources { epoch, bytes })
 }

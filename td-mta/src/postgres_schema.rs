@@ -1,5 +1,6 @@
 //! Explicit operator schema-ledger preparation; no serving path selects it.
 use crate::postgres_probe::with_migration_client;
+use crate::postgres_probe::Client;
 use crate::{
     ids::StoreEpoch,
     postgres_probe::{self, Request},
@@ -12,7 +13,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::Client;
 
 const MIGRATIONS: &[&str] = &[
     include_str!("postgres_schema.sql"),
@@ -136,86 +136,70 @@ fn write_schema(
         MAX_UPGRADE_DURATION
     };
     let result = with_migration_client(request, trust, deadline, maximum, move |client| {
-        Box::pin(async move {
-            version(client).await?;
-            client
-                .batch_execute("BEGIN; SET LOCAL synchronous_commit = on")
-                .await
-                .map_err(|_| Error::Database)?;
-            let locked: bool = client
-                .query_one(
-                    "SELECT pg_catalog.pg_try_advisory_xact_lock($1)",
-                    &[&MIGRATION_KEY],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                .try_get(0)
-                .map_err(|_| Error::Invalid)?;
-            if !locked {
-                return Err(Error::Busy);
+        version(client)?;
+        client
+            .batch("BEGIN; SET LOCAL synchronous_commit = on")
+            .map_err(|_| Error::Database)?;
+        let locked: bool = client
+            .query_one(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock($1)",
+                &[&MIGRATION_KEY],
+            )
+            .map_err(|_| Error::Database)?
+            .try_get(0)
+            .map_err(|_| Error::Invalid)?;
+        if !locked {
+            return Err(Error::Busy);
+        }
+        let (start, epoch, grants) = if let Some(epoch) = fresh_epoch {
+            let exists: bool = client.query_one("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'td_mta')", &[]).map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Invalid)?;
+            if exists {
+                return Err(Error::Exists);
             }
-            let (start, epoch, grants) = if let Some(epoch) = fresh_epoch {
-                let exists: bool = client.query_one("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'td_mta')", &[])
-                    .await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Invalid)?;
-                if exists {
-                    return Err(Error::Exists);
-                }
-                (0, epoch, Vec::new())
-            } else {
-                let receipt = ledger(client, false).await?;
-                acl::owner(client).await?;
-                if receipt.version == VERSION {
-                    client
-                        .batch_execute("ROLLBACK")
-                        .await
-                        .map_err(|_| Error::Database)?;
-                    return Ok(receipt);
-                }
-                (
-                    usize::try_from(receipt.version).map_err(|_| Error::Version)?,
-                    receipt.store_epoch,
-                    acl::read(client).await?,
-                )
-            };
-            if fresh_epoch.is_none() {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
-                let milliseconds =
-                    i64::try_from(remaining.as_millis().max(1)).map_err(|_| Error::Invalid)?;
-                client
+            (0, epoch, Vec::new())
+        } else {
+            let receipt = ledger(client, false)?;
+            acl::owner(client)?;
+            if receipt.version == VERSION {
+                client.rollback().map_err(|_| Error::Database)?;
+                return Ok(receipt);
+            }
+            (
+                usize::try_from(receipt.version).map_err(|_| Error::Version)?,
+                receipt.store_epoch,
+                acl::read(client)?,
+            )
+        };
+        if fresh_epoch.is_none() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
+            let milliseconds =
+                i64::try_from(remaining.as_millis().max(1)).map_err(|_| Error::Invalid)?;
+            client
                     .query_one(
                         "SELECT set_config('statement_timeout', ($1::bigint)::text, true), set_config('transaction_timeout', ($1::bigint)::text, true)",
                         &[&milliseconds],
                     )
-                    .await
                     .map_err(|_| Error::Database)?;
-            }
-            for (index, ddl) in MIGRATIONS.iter().enumerate().skip(start) {
-                let version = i32::try_from(index + 1).map_err(|_| Error::Version)?;
-                let checksum = checksum(ddl)?;
-                client
-                    .batch_execute(ddl)
-                    .await
-                    .map_err(|_| Error::Database)?;
-                let rows = client.execute("INSERT INTO td_mta.schema_migrations (version, checksum, store_epoch) VALUES ($1, $2, $3)", &[&version, &checksum.as_slice(), &epoch.as_bytes().as_slice()])
-                    .await.map_err(|_| Error::Database)?;
-                if rows != 1 {
-                    return Err(Error::Invalid);
-                }
-            }
-            if !acl::preserves(&grants, &acl::read(client).await?) {
+        }
+        for (index, ddl) in MIGRATIONS.iter().enumerate().skip(start) {
+            let version = i32::try_from(index + 1).map_err(|_| Error::Version)?;
+            let checksum = checksum(ddl)?;
+            client.batch(ddl).map_err(|_| Error::Database)?;
+            let rows = client.execute("INSERT INTO td_mta.schema_migrations (version, checksum, store_epoch) VALUES ($1, $2, $3)", &[&version, &checksum.as_slice(), &epoch.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
+            if rows != 1 {
                 return Err(Error::Invalid);
             }
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Receipt {
-                version: VERSION,
-                store_epoch: epoch,
-            })
+        }
+        if !acl::preserves(&grants, &acl::read(client)?) {
+            return Err(Error::Invalid);
+        }
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Receipt {
+            version: VERSION,
+            store_epoch: epoch,
         })
     });
     match result {
@@ -235,10 +219,9 @@ pub fn inspect(
     trust: &TrustStore,
     deadline: Instant,
 ) -> Result<Receipt, Error> {
-    let result = postgres_probe::with_client(request, trust, deadline, |client| {
-        Box::pin(client.inspect_schema())
-    })
-    .map_err(Error::Connection)?;
+    let result =
+        postgres_probe::with_client(request, trust, deadline, |client| client.inspect_schema())
+            .map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
@@ -252,7 +235,7 @@ pub fn plan(
     deadline: Instant,
 ) -> Result<Receipt, Error> {
     let result = postgres_probe::with_client(request, trust, deadline, |client| {
-        Box::pin(inspect_prefix(client, false))
+        inspect_prefix(client, false)
     })
     .map_err(Error::Connection)?;
     if Instant::now() >= deadline {
@@ -262,26 +245,25 @@ pub fn plan(
 }
 
 /// The caller must retain this same session through all application SQL.
-pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> {
-    inspect_prefix(client, true).await
+pub(crate) fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> {
+    inspect_prefix(client, true)
 }
 
-async fn inspect_prefix(client: &Client, require_current: bool) -> Result<Receipt, Error> {
+fn inspect_prefix(client: &Client, require_current: bool) -> Result<Receipt, Error> {
     let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbSchema);
-    version(client).await?;
+    version(client)?;
     let locked: bool = client
-        .query_typed_one(
+        .query_one(
             "SELECT pg_catalog.pg_try_advisory_lock_shared($1)",
-            &[(&MIGRATION_KEY, tokio_postgres::types::Type::INT8)],
+            &[&MIGRATION_KEY],
         )
-        .await
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Invalid)?;
     if !locked {
         return Err(Error::Busy);
     }
-    let result = ledger(client, require_current).await;
+    let result = ledger(client, require_current);
     if result.is_ok() {
         timing.succeeded();
     }
@@ -290,49 +272,45 @@ async fn inspect_prefix(client: &Client, require_current: bool) -> Result<Receip
 
 // Caller has begun a transaction; its acknowledged rollback releases this
 // lock together with every row lock before the next transport turn.
-pub(crate) async fn lock_transaction_and_inspect(client: &Client) -> Result<Receipt, Error> {
-    lock_transaction(client, false).await
+pub(crate) fn lock_transaction_and_inspect(client: &Client) -> Result<Receipt, Error> {
+    lock_transaction(client, false)
 }
 
 // Owner maintenance calls this before any ledger or barrier observation.
-pub(crate) async fn lock_exclusive_transaction_and_inspect(
-    client: &Client,
-) -> Result<Receipt, Error> {
-    lock_transaction(client, true).await
+pub(crate) fn lock_exclusive_transaction_and_inspect(client: &Client) -> Result<Receipt, Error> {
+    lock_transaction(client, true)
 }
 
-async fn lock_transaction(client: &Client, exclusive: bool) -> Result<Receipt, Error> {
+fn lock_transaction(client: &Client, exclusive: bool) -> Result<Receipt, Error> {
     let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbSchema);
-    version(client).await?;
+    version(client)?;
     let locked: bool = client
-        .query_typed_one(
+        .query_one(
             if exclusive {
                 "SELECT pg_catalog.pg_try_advisory_xact_lock($1)"
             } else {
                 "SELECT pg_catalog.pg_try_advisory_xact_lock_shared($1)"
             },
-            &[(&MIGRATION_KEY, tokio_postgres::types::Type::INT8)],
+            &[&MIGRATION_KEY],
         )
-        .await
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Invalid)?;
     if !locked {
         return Err(Error::Busy);
     }
-    let result = ledger(client, true).await;
+    let result = ledger(client, true);
     if result.is_ok() {
         timing.succeeded();
     }
     result
 }
 
-async fn ledger(client: &Client, require_current: bool) -> Result<Receipt, Error> {
+fn ledger(client: &Client, require_current: bool) -> Result<Receipt, Error> {
     let limit = MIGRATIONS.len().checked_add(1).ok_or(Error::Version)?;
     let limit = i64::try_from(limit).map_err(|_| Error::Version)?;
-    let rows = client.query_typed(
-        "SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version LIMIT $1", &[(&limit, tokio_postgres::types::Type::INT8)])
-        .await.map_err(|_| Error::Database)?;
+    let rows = client.query(
+        "SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version LIMIT $1", &[&limit]).map_err(|_| Error::Database)?;
     if rows.is_empty()
         || rows.len() > MIGRATIONS.len()
         || (require_current && rows.len() != MIGRATIONS.len())
@@ -360,16 +338,13 @@ async fn ledger(client: &Client, require_current: bool) -> Result<Receipt, Error
     })
 }
 
-async fn version(client: &Client) -> Result<(), Error> {
-    let status = postgres_probe::qualify(client)
-        .await
-        .map_err(Error::Connection)?;
+fn version(client: &Client) -> Result<(), Error> {
+    let status = postgres_probe::qualify(client).map_err(Error::Connection)?;
     if status.server_version / 10_000 != 17 {
         return Err(Error::Version);
     }
     let encoding: String = client
-        .query_typed_one("SELECT pg_catalog.current_setting('server_encoding')", &[])
-        .await
+        .query_one("SELECT pg_catalog.current_setting('server_encoding')", &[])
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Invalid)?;

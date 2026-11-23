@@ -1,10 +1,10 @@
 //! Shared body and quota writes inside an already fenced account transaction.
+use crate::postgres_probe::Client;
 use crate::{
     ids::{AccountId, BlobId},
     postgres_configuration::SharedQuotas,
 };
 use std::time::Instant;
-use tokio_postgres::{types::Type, Client};
 
 pub(crate) const CHUNK: usize = 65536;
 
@@ -22,13 +22,13 @@ pub(crate) struct Usage([i64; 5]);
 
 /// The caller holds the account row FOR UPDATE until commit or rollback,
 /// except for an advisory check that never publishes the returned Usage.
-pub(crate) async fn charge(
+pub(crate) fn charge(
     client: &Client,
     account: AccountId,
     caps: SharedQuotas,
     charges: [u64; 5],
 ) -> Result<Usage, Error> {
-    let usage = client.query_typed_one("SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage WHERE account=$1", &[(&account.as_bytes().as_slice(), Type::BYTEA)]).await.map_err(|_| Error::Database)?;
+    let usage = client.query_one("SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage WHERE account=$1", &[&account.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
     let limits = [
         caps.body_bytes,
         caps.blob_count,
@@ -62,9 +62,9 @@ fn admit(used: u64, charge: u64, limit: u64) -> Result<u64, Error> {
 
 impl Usage {
     /// Publish only in the same account transaction that computed the charge.
-    pub(crate) async fn publish(self, client: &Client, account: AccountId) -> Result<(), Error> {
+    pub(crate) fn publish(self, client: &Client, account: AccountId) -> Result<(), Error> {
         let [body, blobs, uploads, queue, submissions] = self.0;
-        if client.execute_typed("UPDATE td_mta.account_usage SET body_bytes=$2,blob_count=$3,upload_bytes=$4,queue_bytes=$5,queue_submissions=$6 WHERE account=$1", &[(&account.as_bytes().as_slice(), Type::BYTEA),(&body, Type::INT8),(&blobs, Type::INT8),(&uploads, Type::INT8),(&queue, Type::INT8),(&submissions, Type::INT8)]).await.map_err(|_|Error::Database)?!=1 { return Err(Error::Integrity); }
+        if client.execute("UPDATE td_mta.account_usage SET body_bytes=$2,blob_count=$3,upload_bytes=$4,queue_bytes=$5,queue_submissions=$6 WHERE account=$1", &[&account.as_bytes().as_slice(), &body, &blobs, &uploads, &queue, &submissions]).map_err(|_|Error::Database)?!=1 { return Err(Error::Integrity); }
         Ok(())
     }
 }
@@ -72,12 +72,12 @@ impl Usage {
 /// Delete those of `blobs` that no Email, lease or submission still reaches,
 /// under the caller's account lock. Chunks cascade; `blob_ids` rows stay, so
 /// no ID is reused. Returns the deleted bodies' total length and count.
-pub(crate) async fn retire_blobs(
+pub(crate) fn retire_blobs(
     client: &Client,
     account: &[u8],
     blobs: &[&[u8]],
 ) -> Result<(i64, i64), Error> {
-    let released = client.query_one("WITH retired AS (DELETE FROM td_mta.blobs b WHERE b.account=$1 AND b.id=ANY($2::bytea[]) AND NOT EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) RETURNING length) SELECT coalesce(sum(length),0)::bigint,count(*) FROM retired", &[&account, &blobs]).await.map_err(|_| Error::Database)?;
+    let released = client.query_one("WITH retired AS (DELETE FROM td_mta.blobs b WHERE b.account=$1 AND b.id=ANY($2::bytea[]) AND NOT EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) RETURNING length) SELECT coalesce(sum(length),0)::bigint,count(*) FROM retired", &[&account, &blobs]).map_err(|_| Error::Database)?;
     let bytes: i64 = released.try_get(0).map_err(|_| Error::Integrity)?;
     let count: i64 = released.try_get(1).map_err(|_| Error::Integrity)?;
     if bytes < 0 || count < 0 || !usize::try_from(count).is_ok_and(|n| n <= blobs.len()) {
@@ -89,16 +89,12 @@ pub(crate) async fn retire_blobs(
 /// Subtract released body bytes, blobs, upload bytes, queue bytes and queue
 /// submissions in the caller's account transaction. Refuses with Integrity
 /// rather than underflow or leave upload or queue bytes above body bytes.
-pub(crate) async fn release(
-    client: &Client,
-    account: &[u8],
-    released: [i64; 5],
-) -> Result<(), Error> {
+pub(crate) fn release(client: &Client, account: &[u8], released: [i64; 5]) -> Result<(), Error> {
     if released.iter().any(|value| *value < 0) {
         return Err(Error::Integrity);
     }
     let [body, blobs, uploads, queue, submissions] = released;
-    if client.execute("UPDATE td_mta.account_usage SET body_bytes=body_bytes-$2,blob_count=blob_count-$3,upload_bytes=upload_bytes-$4,queue_bytes=queue_bytes-$5,queue_submissions=queue_submissions-$6 WHERE account=$1 AND body_bytes>=$2 AND blob_count>=$3 AND upload_bytes>=$4 AND queue_bytes>=$5 AND queue_submissions>=$6 AND body_bytes-$2>=upload_bytes-$4 AND body_bytes-$2>=queue_bytes-$5", &[&account, &body, &blobs, &uploads, &queue, &submissions]).await.map_err(|_| Error::Database)? != 1 {
+    if client.execute("UPDATE td_mta.account_usage SET body_bytes=body_bytes-$2,blob_count=blob_count-$3,upload_bytes=upload_bytes-$4,queue_bytes=queue_bytes-$5,queue_submissions=queue_submissions-$6 WHERE account=$1 AND body_bytes>=$2 AND blob_count>=$3 AND upload_bytes>=$4 AND queue_bytes>=$5 AND queue_submissions>=$6 AND body_bytes-$2>=upload_bytes-$4 AND body_bytes-$2>=queue_bytes-$5", &[&account, &body, &blobs, &uploads, &queue, &submissions]).map_err(|_| Error::Database)? != 1 {
         return Err(Error::Integrity);
     }
     Ok(())
@@ -116,33 +112,28 @@ pub(crate) struct Blob<'a> {
     pub changed: u64,
 }
 
-pub(crate) async fn write_blob(
-    client: &Client,
-    value: Blob<'_>,
-    deadline: Instant,
-) -> Result<(), Error> {
+pub(crate) fn write_blob(client: &Client, value: Blob<'_>, deadline: Instant) -> Result<(), Error> {
     if value.bytes.len() as u64 > crate::postgres_body::MAX_BODY_BYTES {
         return Err(Error::Capacity);
     }
     let account = value.account.as_bytes().as_slice();
     let blob = value.id.as_bytes().as_slice();
     if client
-        .execute_typed(
+        .execute(
             "INSERT INTO td_mta.blob_ids VALUES($1,$2) ON CONFLICT DO NOTHING",
-            &[(&account, Type::BYTEA), (&blob, Type::BYTEA)],
+            &[&account, &blob],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {
         return Err(Error::Conflict);
     }
-    write_reserved_blob(client, value, deadline).await
+    write_reserved_blob(client, value, deadline)
 }
 
 /// The replica caller proves a retained same-ID length/digest receipt under
 /// its account lock. Ordinary fresh publication reserves the ID above.
-pub(crate) async fn write_reserved_blob(
+pub(crate) fn write_reserved_blob(
     client: &Client,
     value: Blob<'_>,
     deadline: Instant,
@@ -155,19 +146,18 @@ pub(crate) async fn write_reserved_blob(
     let length = i64::try_from(value.bytes.len()).map_err(|_| Error::Capacity)?;
     let chunks = i64::try_from(value.bytes.len().div_ceil(CHUNK)).map_err(|_| Error::Capacity)?;
     if client
-        .execute_typed(
+        .execute(
             "INSERT INTO td_mta.blobs VALUES($1,$2,$3,$4,$5,$6,$7)",
             &[
-                (&account, Type::BYTEA),
-                (&blob, Type::BYTEA),
-                (&length, Type::INT8),
-                (&value.digest.as_slice(), Type::BYTEA),
-                (&value.created_at, Type::INT8),
-                (&value.changed.to_be_bytes().as_slice(), Type::BYTEA),
-                (&chunks, Type::INT8),
+                &account,
+                &blob,
+                &length,
+                &value.digest.as_slice(),
+                &value.created_at,
+                &value.changed.to_be_bytes().as_slice(),
+                &chunks,
             ],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {
@@ -182,15 +172,15 @@ pub(crate) async fn write_reserved_blob(
         batch.clear();
         batch.extend(bytes.chunks(CHUNK));
         let ordinal = i64::try_from(index * 8).map_err(|_| Error::Capacity)?;
-        if client.execute_typed("INSERT INTO td_mta.blob_chunks SELECT $1,$2,$3+ordinality-1,bytes FROM unnest($4::bytea[]) WITH ORDINALITY chunks(bytes,ordinality)", &[(&account, Type::BYTEA),(&blob, Type::BYTEA),(&ordinal, Type::INT8),(&batch, Type::BYTEA_ARRAY)]).await.map_err(|_|Error::Database)?!=batch.len() as u64 { return Err(Error::Integrity); }
+        if client.execute("INSERT INTO td_mta.blob_chunks SELECT $1,$2,$3+ordinality-1,bytes FROM unnest($4::bytea[]) WITH ORDINALITY chunks(bytes,ordinality)", &[&account, &blob, &ordinal, &batch]).map_err(|_|Error::Database)?!=batch.len() as u64 { return Err(Error::Integrity); }
     }
     if let Some(fields) = crate::postgres_summaries::derive(value.bytes, true, deadline) {
-        if client.execute_typed("INSERT INTO td_mta.blob_summaries(account,blob_id,version,body_length,body_digest,fields) VALUES($1,$2,$3,$4,$5,$6)", &[(&account, Type::BYTEA), (&blob, Type::BYTEA), (&crate::postgres_summaries::VERSION, Type::INT4), (&length, Type::INT8), (&value.digest.as_slice(), Type::BYTEA), (&fields, Type::BYTEA_ARRAY)]).await.map_err(|_| Error::Database)? != 1 {
+        if client.execute("INSERT INTO td_mta.blob_summaries(account,blob_id,version,body_length,body_digest,fields) VALUES($1,$2,$3,$4,$5,$6)", &[&account, &blob, &crate::postgres_summaries::VERSION, &length, &value.digest.as_slice(), &fields]).map_err(|_| Error::Database)? != 1 {
             return Err(Error::Integrity);
         }
     }
     if let Some(prepared) = value.interpretation {
-        if client.execute_typed("INSERT INTO td_mta.blob_interpretations(account,blob_id,version,body_length,body_digest,header_bytes,part_table,chunk_hashes,manifest_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", &[(&account, Type::BYTEA), (&blob, Type::BYTEA), (&crate::postgres_mime_evidence::VERSION, Type::INT4), (&length, Type::INT8), (&value.digest.as_slice(), Type::BYTEA), (&(prepared.header_bytes as i64), Type::INT8), (&prepared.table, Type::BYTEA), (&prepared.chunks, Type::BYTEA), (&prepared.digest.as_slice(), Type::BYTEA)]).await.map_err(|_| Error::Database)? != 1 {
+        if client.execute("INSERT INTO td_mta.blob_interpretations(account,blob_id,version,body_length,body_digest,header_bytes,part_table,chunk_hashes,manifest_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", &[&account, &blob, &crate::postgres_mime_evidence::VERSION, &length, &value.digest.as_slice(), &(prepared.header_bytes as i64), &prepared.table, &prepared.chunks, &prepared.digest.as_slice()]).map_err(|_| Error::Database)? != 1 {
             return Err(Error::Integrity);
         }
     }
@@ -200,7 +190,7 @@ pub(crate) async fn write_reserved_blob(
     Ok(())
 }
 
-pub(crate) async fn select_thread(
+pub(crate) fn select_thread(
     client: &Client,
     account: AccountId,
     requested: &[String],
@@ -212,7 +202,7 @@ pub(crate) async fn select_thread(
         .try_reserve_exact(requested.len())
         .map_err(|_| Error::Capacity)?;
     anchors.extend(requested.iter().map(String::as_str));
-    let rows=client.query_typed("SELECT a.email_id,e.thread_id,a.changed,e.changed,t.changed FROM unnest($2::text[]) WITH ORDINALITY requested(message_id,position) JOIN LATERAL (SELECT email_id,changed FROM td_mta.thread_anchors WHERE account=$1 AND message_id=requested.message_id ORDER BY email_id LIMIT 1) a ON true LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=a.email_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id ORDER BY requested.position LIMIT 1", &[(&account.as_bytes().as_slice(), Type::BYTEA),(&anchors, Type::TEXT_ARRAY)]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT a.email_id,e.thread_id,a.changed,e.changed,t.changed FROM unnest($2::text[]) WITH ORDINALITY requested(message_id,position) JOIN LATERAL (SELECT email_id,changed FROM td_mta.thread_anchors WHERE account=$1 AND message_id=requested.message_id ORDER BY email_id LIMIT 1) a ON true LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=a.email_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id ORDER BY requested.position LIMIT 1", &[&account.as_bytes().as_slice(), &anchors]).map_err(|_|Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok((fresh, true));
     };

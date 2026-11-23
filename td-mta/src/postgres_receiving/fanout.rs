@@ -180,11 +180,9 @@ pub fn publish_fanout(
         deadline,
         fanout.count(),
         move |client| {
-            Box::pin(async move {
-                let binding = &fanout.deliveries.first().ok_or(Error::Integrity)?.binding;
-                begin(client, binding).await?;
-                publish_body(client, &fanout, deadline, &marker).await
-            })
+            let binding = &fanout.deliveries.first().ok_or(Error::Integrity)?.binding;
+            begin(client, binding)?;
+            publish_body(client, &fanout, deadline, &marker)
         },
     );
     match result {
@@ -194,14 +192,14 @@ pub fn publish_fanout(
     }
 }
 
-pub(crate) async fn publish_body(
+pub(crate) fn publish_body(
     client: &Client,
     fanout: &Fanout,
     deadline: Instant,
     marker: &AtomicBool,
 ) -> Result<FanoutOutcome, Error> {
     let binding = &fanout.deliveries.first().ok_or(Error::Integrity)?.binding;
-    let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
+    let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_| Error::Database)?;
     let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
     let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
     let mut states = Vec::new();
@@ -217,7 +215,6 @@ pub(crate) async fn publish_body(
                     "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
                     &[&delivery.binding.account().as_bytes().as_slice()],
                 )
-                .await
                 .map_err(|_| Error::Database)?,
         );
     }
@@ -234,7 +231,7 @@ pub(crate) async fn publish_body(
         td_alloc::with_capacity(fanout.deliveries.len()).map_err(|_| Error::Capacity)?;
     for (delivery, state) in fanout.deliveries.iter().zip(&states) {
         // The quota charge precedes every write, so a refused account is untouched.
-        match write_delivery(client, delivery, state, deadline).await {
+        match write_delivery(client, delivery, &state.row(), deadline) {
             Ok(outcome) => accounts.push((delivery.binding.account(), outcome)),
             Err(Error::Quota) => {
                 td_alloc::push(&mut refused, (delivery, state)).map_err(|_| Error::Capacity)?
@@ -264,7 +261,6 @@ pub(crate) async fn publish_body(
             },
             deadline,
         )
-        .await
         .map_err(notice_error)?;
         td_alloc::push(
             &mut notices,
@@ -282,10 +278,7 @@ pub(crate) async fn publish_body(
     let mut timing =
         crate::performance::Timer::start(crate::performance::Phase::SmtpDatabaseCommit);
     marker.store(true, Ordering::Relaxed);
-    client
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|_| Error::Indeterminate)?;
+    client.commit().map_err(|_| Error::Indeterminate)?;
     timing.succeeded();
     Ok(FanoutOutcome { accounts, notices })
 }
@@ -331,7 +324,7 @@ impl RecipientScope {
 /// account locks so it never waits for another delivery's commit, then the
 /// session rolls back. Its statements may each see a later commit;
 /// publication rechecks the selection, Inbox and quota under its locks.
-pub(crate) async fn recipient_body(
+pub(crate) fn recipient_body(
     client: &Client,
     scope: RecipientScope,
     declared_bytes: Option<u64>,
@@ -341,7 +334,6 @@ pub(crate) async fn recipient_body(
             "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true",
             &[],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
     let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
@@ -358,7 +350,6 @@ pub(crate) async fn recipient_body(
             "SELECT count(*) FROM td_mta.mailboxes WHERE account=$1 AND role='inbox'",
             &[&account.as_bytes().as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Integrity)?;
@@ -368,7 +359,7 @@ pub(crate) async fn recipient_body(
     let caps = scope.quotas;
     // A message without SIZE still needs room for one byte and one blob.
     let bytes = declared_bytes.unwrap_or(1).max(1);
-    match publication::charge(client, account, caps, [bytes, 1, 0, 0, 0]).await {
+    match publication::charge(client, account, caps, [bytes, 1, 0, 0, 0]) {
         Ok(_) => Ok(Recipient::Accepted),
         Err(publication::Error::Quota)
             if declared_bytes.is_some_and(|declared| declared > caps.body_bytes) =>
@@ -391,10 +382,8 @@ pub fn ready_many(
     let values = ready_bindings(bindings)?;
     let result =
         postgres_probe::with_fanout_client(request, trust, deadline, values.len(), move |client| {
-            Box::pin(async move {
-                begin(client, values.first().ok_or(Error::Integrity)?).await?;
-                ready_body(client, &values).await
-            })
+            begin(client, values.first().ok_or(Error::Integrity)?)?;
+            ready_body(client, &values)
         })
         .map_err(Error::Connection)?;
     if Instant::now() >= deadline {
@@ -429,9 +418,9 @@ pub(crate) fn ready_bindings(bindings: &[&Binding]) -> Result<Vec<Binding>, Erro
     values.sort_unstable_by_key(Binding::account);
     Ok(values)
 }
-pub(crate) async fn ready_body(client: &Client, values: &[Binding]) -> Result<(), Error> {
+pub(crate) fn ready_body(client: &Client, values: &[Binding]) -> Result<(), Error> {
     let first = values.first().ok_or(Error::Integrity)?;
-    let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
+    let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_| Error::Database)?;
     let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
     let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
     if generation != first.selection().generation
@@ -445,13 +434,12 @@ pub(crate) async fn ready_body(client: &Client, values: &[Binding]) -> Result<()
                 "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR SHARE",
                 &[&binding.account().as_bytes().as_slice()],
             )
-            .await
             .map_err(|_| Error::Database)?;
         let sequence = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
         if super::sequence(state.try_get(1).map_err(|_| Error::Integrity)?)? > sequence {
             return Err(Error::Integrity);
         }
-        inbox(client, binding.account(), sequence).await?;
+        inbox(client, binding.account(), sequence)?;
     }
     Ok(())
 }

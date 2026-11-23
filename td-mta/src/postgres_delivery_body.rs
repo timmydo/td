@@ -53,19 +53,16 @@ pub fn with_submission<T>(
     }
     let binding = binding.clone();
     postgres_probe::with_body_worker(request, trust, deadline, |worker| {
-        let metadata = worker.run(|client| Box::pin(async move {
-            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+        let metadata = worker.run(|client| {
+            let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != binding.epoch() { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000")
-                .await.map_err(|_| Error::Database)?;
-            let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true", &[])
-                .await.map_err(|_| Error::Database)?;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true", &[]).map_err(|_| Error::Database)?;
             let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
             if number(selected.try_get(0).map_err(|_| Error::Integrity)?)? != binding.selection().generation
                 || version != Some(binding.selection().version.as_bytes().as_slice()) { return Err(Error::Policy); }
             let rows = client.query("SELECT a.sequence,a.floor,s.transmitted_blob_id,s.changed,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id) FROM td_mta.accounts a JOIN td_mta.submissions s ON s.account=a.id JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id LEFT JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE a.id=$1 AND s.id=$2 AND r.route_name=$3 AND r.destination=$4 LIMIT 2",
-                &[&binding.account().as_bytes().as_slice(), &submission.as_bytes().as_slice(), &binding.route().name(), &binding.route().destination().as_slice()])
-                .await.map_err(|_| Error::Database)?;
+                &[&binding.account().as_bytes().as_slice(), &submission.as_bytes().as_slice(), &binding.route().name(), &binding.route().destination().as_slice()]).map_err(|_| Error::Database)?;
             if rows.is_empty() { return Err(Error::Missing); }
             if rows.len() != 1 { return Err(Error::Integrity); }
             let row = rows.first().ok_or(Error::Integrity)?;
@@ -87,7 +84,7 @@ pub fn with_submission<T>(
                 blob: BlobId::from_bytes(blob.try_into().map_err(|_| Error::Integrity)?),
                 body: BlobRow { length, digest: digest.try_into().map_err(|_| Error::Integrity)?, created_at: row.try_get(6).map_err(|_| Error::Integrity)? },
             })
-        })).map_err(Error::Connection)??;
+        }).map_err(Error::Connection)??;
         postgres_body::with_verified_body(worker, metadata, deadline, |body| read(metadata, body)).map_err(Error::Body)
     }).map_err(Error::Connection)?
 }

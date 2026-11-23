@@ -57,7 +57,7 @@ builder/src/crypto_musl.rs	allocation-macro	20
 builder/src/crypto_musl.rs	unchecked-growth-or-clone	1
 builder/src/crypto_policy.rs	allocating-conversion	11
 builder/src/crypto_policy.rs	allocation-macro	18
-builder/src/crypto_policy.rs	unchecked-growth-or-clone	5
+builder/src/crypto_policy.rs	unchecked-growth-or-clone	4
 builder/src/crypto_portable.rs	allocating-conversion	22
 builder/src/crypto_portable.rs	allocation-macro	42
 builder/src/crypto_portable.rs	unchecked-growth-or-clone	1
@@ -2864,15 +2864,15 @@ td-mta/src/postgres_mime_evidence.rs	unchecked-growth-or-clone	12
 td-mta/src/postgres_phase_current.rs	unchecked-growth-or-clone	5
 td-mta/src/postgres_prepared_failure.rs	heap-owner	3
 td-mta/src/postgres_prepared_failure.rs	unchecked-growth-or-clone	5
-td-mta/src/postgres_probe.rs	heap-owner	8
+td-mta/src/postgres_probe.rs	heap-owner	5
 td-mta/src/postgres_probe.rs	unchecked-growth-or-clone	1
-td-mta/src/postgres_probe/driver.rs	heap-owner	2
 td-mta/src/postgres_probe/framing.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_probe/mutation.rs	heap-owner	2
 td-mta/src/postgres_probe/mutation.rs	unchecked-growth-or-clone	3
 td-mta/src/postgres_probe/replica.rs	heap-owner	2
 td-mta/src/postgres_probe/replica.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_probe/windows.rs	heap-owner	1
+td-mta/src/postgres_probe/wire.rs	heap-owner	3
 td-mta/src/postgres_profile_materials.rs	allocating-conversion	1
 td-mta/src/postgres_profile_materials.rs	unchecked-growth-or-clone	4
 td-mta/src/postgres_publication.rs	direct-reservation	2

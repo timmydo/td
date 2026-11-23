@@ -69,10 +69,8 @@ pub fn inspect(
                 .map_err(Error::Metadata)?;
         let duplicate_roles = worker
             .run(move |client| {
-                Box::pin(async move {
-                    client.query_one("SELECT EXISTS (SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND role IS NOT NULL GROUP BY role COLLATE \"C\" HAVING count(*)>1)", &[&account.as_bytes().as_slice()]).await
+                    client.query_one("SELECT EXISTS (SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND role IS NOT NULL GROUP BY role COLLATE \"C\" HAVING count(*)>1)", &[&account.as_bytes().as_slice()])
                 })
-            })
             .map_err(Error::Connection)?
             .map_err(|_| Error::Database)?
             .try_get::<_, bool>(0)
@@ -81,9 +79,7 @@ pub fn inspect(
             return Err(Error::Integrity);
         }
         let usage = worker
-            .run(move |client| {
-                Box::pin(async move { postgres_usage_audit::audit(client, account).await })
-            })
+            .run(move |client| { postgres_usage_audit::audit(client, account) })
             .map_err(Error::Connection)?
             .map_err(Error::Usage)?;
         let (blobs, bytes) = bodies(worker, metadata, deadline, limits)?;
@@ -94,7 +90,7 @@ pub fn inspect(
             return Err(Error::Integrity);
         }
         worker
-            .run(|client| Box::pin(async move { client.batch_execute("ROLLBACK").await }))
+            .run(|client| { client.rollback() })
             .map_err(Error::Connection)?
             .map_err(|_| Error::Database)?;
         Ok(Report {
@@ -122,17 +118,17 @@ fn bodies(
     let mut blobs = 0u64;
     let mut bytes = 0u64;
     loop {
-        let body=worker.run(move |client|Box::pin(async move {
+        let body=worker.run(move |client|{
             let after_bytes=after.map(|id|id.as_bytes().to_vec());
-            let rows=client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),b.id FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id WHERE a.id=$1 AND ($2::bytea IS NULL OR b.id>$2) ORDER BY b.id LIMIT 1",&[&identity.account.as_bytes().as_slice(),&after_bytes]).await.map_err(|_|Error::Database)?;
+            let rows=client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),b.id FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id WHERE a.id=$1 AND ($2::bytea IS NULL OR b.id>$2) ORDER BY b.id LIMIT 1",&[&identity.account.as_bytes().as_slice(),&after_bytes]).map_err(|_|Error::Database)?;
             let Some(row)=rows.first() else {return Ok(None)};
             let id:&[u8]=row.try_get(8).map_err(|_|Error::Integrity)?;
             let id=BlobId::from_bytes(id.try_into().map_err(|_|Error::Integrity)?);
             if after.is_some_and(|prior|prior>=id) {return Err(Error::Integrity);}
-            let body=postgres_body::blob_metadata(row,identity.account,identity.epoch,id,postgres_body::MAX_BODY_BYTES).map_err(Error::Body)?;
+            let body=postgres_body::blob_metadata(&row,identity.account,identity.epoch,id,postgres_body::MAX_BODY_BYTES).map_err(Error::Body)?;
             if body.identity!=identity {return Err(Error::Integrity);}
             Ok(Some(body))
-        })).map_err(Error::Connection)??;
+        }).map_err(Error::Connection)??;
         let Some(body) = body else {
             return Ok((blobs, bytes));
         };

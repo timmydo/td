@@ -1,4 +1,5 @@
 use super::{number, Error};
+use crate::postgres_probe::Row as PgRow;
 use crate::{
     format::{
         self,
@@ -10,7 +11,6 @@ use crate::{
     ids::{AttemptId, BlobId, EmailId, IdentityId, ThreadId},
     recipient_sweep::QueueGroup,
 };
-use tokio_postgres::Row as PgRow;
 
 fn id(row: &PgRow, column: usize) -> Result<[u8; 16], Error> {
     let bytes: &[u8] = row.try_get(column).map_err(|_| Error::Integrity)?;
@@ -26,7 +26,7 @@ fn tag(row: &PgRow, column: usize) -> Result<u8, Error> {
     let value: i64 = row.try_get(column).map_err(|_| Error::Integrity)?;
     value.try_into().map_err(|_| Error::Integrity)
 }
-pub(super) fn submission(row: &PgRow) -> Result<SubmissionRow<'_>, Error> {
+pub(super) fn submission<'a>(row: &PgRow<'a>) -> Result<SubmissionRow<'a>, Error> {
     let count: i64 = row.try_get(7).map_err(|_| Error::Integrity)?;
     let result = SubmissionRow {
         email: EmailId::from_bytes(id(row, 0)?),
@@ -46,7 +46,7 @@ pub(super) fn submission(row: &PgRow) -> Result<SubmissionRow<'_>, Error> {
         .map_err(|_| Error::Integrity)?;
     Ok(result)
 }
-fn recipient(row: &PgRow) -> Result<RecipientRow<'_>, Error> {
+fn recipient<'a>(row: &PgRow<'a>) -> Result<RecipientRow<'a>, Error> {
     let count: i64 = row.try_get(5).map_err(|_| Error::Integrity)?;
     let uncertain = match tag(row, 3)? {
         0 => false,
@@ -95,7 +95,7 @@ pub(super) struct Plan {
 }
 pub(super) fn reserve(
     before: SubmissionRow<'_>,
-    rows: &[PgRow],
+    rows: &crate::postgres_probe::Rows,
     sequence: u64,
     now: i64,
     budget: usize,
@@ -118,7 +118,7 @@ pub(super) fn reserve(
         {
             return Err(Error::Integrity);
         }
-        let mut value = recipient(row)?;
+        let mut value = recipient(&row)?;
         group.recipient(value).map_err(|_| Error::Integrity)?;
         if value.state == RecipientState::Accepted
             || value.uncertain

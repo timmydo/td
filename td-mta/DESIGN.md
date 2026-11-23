@@ -101,15 +101,14 @@ PRODUCTION.md describes. There is no separate runtime package or td-net
 helper executable.
 
 The direct dependencies are the local `td-alloc`, `td-civil`, `td-crypto`,
-`td-header`, `td-html`, `td-json`, `td-mime`, `td-nfc` and `td-fs` crates,
-plus the approved private PostgreSQL closure: tokio-postgres 0.7.18 with
-default features disabled, and tokio 1.54.1 with only `io-util` for the
-private stream adapter (td-crypto/DEPENDENCIES.md). Std-only `td-fs` owns
+`td-header`, `td-html`, `td-json`, `td-mime`, `td-nfc`, `td-postgres` and
+`td-fs` crates; td-mta has no direct external dependency. `td-postgres` is
+the synchronous PostgreSQL client (td-postgres/DESIGN.md). Std-only `td-fs` owns
 bounded private Unix socket dialing and checks, real-file opening, bounded
 reads, file replacement and disposable fixture directories. POSTGRES.md, [8. Connection, bootstrap and serving startup](POSTGRES.md#8-connection-bootstrap-and-serving-startup), owns the verified-TLS or explicit private Unix transport, SCRAM
-connection probe and PostgreSQL serving contract. The driver's private
-SCRAM cryptography and Unicode preparation do not replace td-crypto or
-td-mime. Application protocols, configuration and scheduling use std plus
+connection probe and PostgreSQL serving contract. The client's SCRAM uses
+td-primitives and accepts only ASCII passwords, so it needs no Unicode
+preparation; it does not replace td-crypto or td-mime. Application protocols, configuration and scheduling use std plus
 the local libraries; the private PostgreSQL adapters own SQL.
 
 Reusable protocol-independent components belong in shared std-only td
@@ -878,11 +877,10 @@ td-mta (`builder/src/crypto_policy.rs`), stay in the test roster. The user
 approved Rustls as the TLS engine; td-crypto/DEPENDENCIES.md records exact
 transitive pins, features, licenses, roots and rationale, and
 td-crypto/PORTABLE.md the portable inputs and the static musl linking and
-bounded TLS qualification. The separate, user-approved private PostgreSQL
-storage closure is pinned in td-crypto/DEPENDENCIES.md and POSTGRES.md. No
-external async runtime (the tokio pin admits only `io-util`, as
-td-crypto/DEPENDENCIES.md records), web framework, mail parser, serialization
-or ACME framework rides along. Exact versions belong in the locks and their
+bounded TLS qualification. The PostgreSQL client is the local
+`td-postgres` crate and brings no external closure. No external async
+runtime, database driver, web framework, mail parser, serialization or
+ACME framework rides along. Exact versions belong in the locks and their
 review.
 
 The portable musl artifact has a separate, host-only build manifest: pin
@@ -918,8 +916,9 @@ The library denies `unsafe_code` with one function-scoped exception for
 Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
 `readiness_sys.rs` borrows connected sockets, listeners and wake receivers
 through each deadline-bounded wait. HTTPS and direct SMTP each wait on a
-fixed set sized for a private wake receiver, 16 listeners and 96 client slots. PostgreSQL
-and single-connection transport waits use one or two entries. The dedicated
+fixed set sized for a private wake receiver, 16 listeners and 96 client slots.
+Single-connection transport waits, the transitional PostgreSQL TLS stream's
+included, use one entry. The dedicated
 HTTP-01 responder waits on its private stop receiver, one TCP listener and
 up to eight connected TCP sockets. UNSAFE.md
 section 22 pins the syscall ABI.

@@ -12,7 +12,6 @@ use crate::{
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
-use tokio_postgres::types::Type;
 
 #[path = "postgres_read_search.rs"]
 mod search_reads;
@@ -152,7 +151,7 @@ pub struct Snapshot<'a> {
     failed: Option<Error>,
     metadata: Option<Metadata>,
     metadata_window: MetadataWindow,
-    summary_window: Option<Vec<tokio_postgres::Row>>,
+    summary_window: Option<crate::postgres_probe::Rows>,
     search_window: Option<search_reads::Window>,
     value_window: value_reads::Window,
     authentication_window: AuthenticationWindow,
@@ -244,11 +243,11 @@ const AUTHENTICATION: &str = "SELECT a.spf_result,a.spf_domain,a.dkim_complete,a
 /// Groups AUTHENTICATION rows by requested Email; every requested ID must
 /// appear once, in byte order, and nothing else.
 fn authentication_window(
-    rows: &[tokio_postgres::Row],
+    rows: &crate::postgres_probe::Rows,
     ids: &[EmailId],
 ) -> Result<AuthenticationWindow, Error> {
     let mut window = td_alloc::with_capacity(ids.len()).map_err(|_| Error::Capacity)?;
-    let id = |row: &tokio_postgres::Row| {
+    let id = |row: &crate::postgres_probe::Row| {
         row.try_get::<_, &[u8]>(17)
             .ok()
             .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
@@ -257,15 +256,15 @@ fn authentication_window(
     };
     let mut start = 0;
     while let Some(first) = rows.get(start) {
-        let email = id(first)?;
+        let email = id(&first)?;
         let mut end = start + 1;
         while let Some(row) = rows.get(end) {
-            if id(row)? != email {
+            if id(&row)? != email {
                 break;
             }
             end += 1;
         }
-        let group = rows.get(start..end).ok_or(Error::Integrity)?;
+        let group = rows.range(start, end).ok_or(Error::Integrity)?;
         if ids.get(window.len()) != Some(&email) {
             return Err(Error::Integrity);
         }
@@ -289,7 +288,7 @@ fn authentication_window(
     Ok(window)
 }
 
-fn stored_text(row: &tokio_postgres::Row, index: usize) -> Result<Option<String>, Error> {
+fn stored_text(row: &crate::postgres_probe::Row, index: usize) -> Result<Option<String>, Error> {
     row.try_get::<_, Option<&str>>(index)
         .map_err(|_| Error::Integrity)?
         .map(td_alloc::string)
@@ -298,7 +297,7 @@ fn stored_text(row: &tokio_postgres::Row, index: usize) -> Result<Option<String>
 }
 
 fn stored_word<T>(
-    row: &tokio_postgres::Row,
+    row: &crate::postgres_probe::Row,
     index: usize,
     parse: fn(&str) -> Option<T>,
 ) -> Result<Option<T>, Error> {
@@ -311,10 +310,10 @@ fn stored_word<T>(
 /// Rows from AUTHENTICATION; any value the schema should have refused is
 /// an integrity failure rather than a partial result.
 fn authentication(
-    rows: &[tokio_postgres::Row],
+    rows: crate::postgres_probe::RowIter<'_>,
 ) -> Result<Option<crate::sender_authentication::Results>, Error> {
     use crate::{dkim, dmarc, sender_authentication::stored};
-    let Some(first) = rows.first() else {
+    let Some(first) = rows.peek() else {
         return Ok(None);
     };
     if rows.len() > dkim::MAX_SIGNATURES {
@@ -339,10 +338,10 @@ fn authentication(
         td_alloc::push(
             &mut signatures,
             dkim::SignatureResult {
-                outcome: stored_word(row, 11, stored::dkim)?.ok_or(Error::Integrity)?,
-                algorithm: stored_word(row, 12, stored::algorithm)?,
-                domain: stored_text(row, 13)?,
-                selector: stored_text(row, 14)?,
+                outcome: stored_word(&row, 11, stored::dkim)?.ok_or(Error::Integrity)?,
+                algorithm: stored_word(&row, 12, stored::algorithm)?,
+                domain: stored_text(&row, 13)?,
+                selector: stored_text(&row, 14)?,
                 key_bits: bits,
             },
         )
@@ -353,7 +352,7 @@ fn authentication(
             .try_get::<_, Option<bool>>(index)
             .map_err(|_| Error::Integrity)
     };
-    let disposition = stored_word(first, 6, stored::disposition)?;
+    let disposition = stored_word(&first, 6, stored::disposition)?;
     let policy = match (disposition, flag(7)?, flag(8)?) {
         (Some(disposition), Some(strict_spf), Some(strict_dkim)) => Some(dmarc::Requested {
             disposition,
@@ -364,19 +363,19 @@ fn authentication(
         _ => return Err(Error::Integrity),
     };
     let results = crate::sender_authentication::Results {
-        spf: stored_word(first, 0, stored::spf)?.ok_or(Error::Integrity)?,
-        spf_domain: stored_text(first, 1)?,
+        spf: stored_word(&first, 0, stored::spf)?.ok_or(Error::Integrity)?,
+        spf_domain: stored_text(&first, 1)?,
         spf_helo: first.try_get::<_, bool>(16).map_err(|_| Error::Integrity)?,
         dkim: dkim::Report {
             signatures,
             incomplete: !first.try_get::<_, bool>(2).map_err(|_| Error::Integrity)?,
         },
         dmarc: dmarc::Report {
-            outcome: stored_word(first, 3, stored::dmarc)?.ok_or(Error::Integrity)?,
-            author: stored_text(first, 4)?,
-            policy_domain: stored_text(first, 5)?,
+            outcome: stored_word(&first, 3, stored::dmarc)?.ok_or(Error::Integrity)?,
+            author: stored_text(&first, 4)?,
+            policy_domain: stored_text(&first, 5)?,
             policy,
-            aligned: stored_word(first, 9, stored::identifier)?,
+            aligned: stored_word(&first, 9, stored::identifier)?,
         },
     };
     if !results.readable() {
@@ -547,13 +546,7 @@ fn connect_authenticated(
     let mut worker =
         postgres_probe::body_worker(request, trust, deadline).map_err(Error::Connection)?;
     let identity = worker
-        .run(|client| {
-            Box::pin(async move {
-                postgres_snapshot::begin(client, &binding, presented)
-                    .await
-                    .map_err(snapshot_error)
-            })
-        })
+        .run(|client| postgres_snapshot::begin(client, &binding, presented).map_err(snapshot_error))
         .map_err(Error::Connection)??;
     Ok((worker, identity))
 }
@@ -728,7 +721,7 @@ impl Snapshot<'_> {
         let deadline = self.deadline;
         let result = self
             .worker
-            .run(|client| Box::pin(postgres_mailboxes::read(client, identity, deadline)))
+            .run(|client| postgres_mailboxes::read(client, identity, deadline))
             .map_err(Error::Connection)
             .and_then(|result| result.map_err(Error::Mailboxes));
         self.retain(result)
@@ -753,16 +746,13 @@ impl Snapshot<'_> {
             let rows = self
                 .worker
                 .run(|client| {
-                    Box::pin(async move {
-                        postgres_body::email_metadata_batch(
-                            client,
-                            identity.epoch,
-                            identity.account,
-                            postgres_body::MAX_BODY_BYTES,
-                            &ids,
-                        )
-                        .await
-                    })
+                    postgres_body::email_metadata_batch(
+                        client,
+                        identity.epoch,
+                        identity.account,
+                        postgres_body::MAX_BODY_BYTES,
+                        &ids,
+                    )
                 })
                 .map_err(Error::Connection)?
                 .map_err(Error::Body)?;
@@ -811,16 +801,20 @@ impl Snapshot<'_> {
                 blobs.push(metadata.blob);
             }
             let account = self.identity.account;
-            let result = self.worker.run(|client| Box::pin(async move {
+            let result = self.worker.run(|client| {
                 let mut ids = Vec::new();
                 ids.try_reserve_exact(blobs.len()).map_err(|_| Error::Capacity)?;
                 ids.extend(blobs.iter().map(|blob| blob.as_bytes().as_slice()));
-                client.query_typed("SELECT blob_id,body_length,body_digest,fields FROM td_mta.blob_summaries WHERE account=$1 AND blob_id=ANY($2) AND version=$3 ORDER BY blob_id LIMIT 16", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&ids, Type::BYTEA_ARRAY), (&crate::postgres_summaries::VERSION, Type::INT4)]).await.map_err(|_| Error::Database)
-            })).map_err(Error::Connection).and_then(|rows| rows);
+                client.query("SELECT blob_id,body_length,body_digest,fields FROM td_mta.blob_summaries WHERE account=$1 AND blob_id=ANY($2) AND version=$3 ORDER BY blob_id LIMIT 16", &[&account.as_bytes().as_slice(), &ids, &crate::postgres_summaries::VERSION]).map_err(|_| Error::Database)
+            }).map_err(Error::Connection).and_then(|rows| rows);
             self.summary_window = Some(self.retain(result)?);
         }
         let result = (|| {
-            for row in self.summary_window.as_deref().unwrap_or_default() {
+            for row in self
+                .summary_window
+                .iter()
+                .flat_map(crate::postgres_probe::Rows::iter)
+            {
                 let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
                 if id != metadata.blob.as_bytes() {
                     continue;
@@ -883,9 +877,9 @@ impl Snapshot<'_> {
             }
             _ => Error::Capacity,
         })?;
-        let result = self.worker.run(|client| Box::pin(async move {
-            client.query_typed("SELECT n,substring(s.fields FROM n*65536+1 FOR 65536) FROM td_mta.blob_search s CROSS JOIN generate_series(0,$3-1) n WHERE s.account=$1 AND s.blob_id=$2 ORDER BY n LIMIT 132", &[(&account.as_bytes().as_slice(),Type::BYTEA),(&blob.as_bytes().as_slice(),Type::BYTEA),(&count,Type::INT4)]).await.map_err(|_| Error::Database)
-        })).map_err(Error::Connection).and_then(|rows| rows);
+        let result = self.worker.run(|client| {
+            client.query("SELECT n,substring(s.fields FROM n*65536+1 FOR 65536) FROM td_mta.blob_search s CROSS JOIN generate_series(0,$3-1) n WHERE s.account=$1 AND s.blob_id=$2 ORDER BY n LIMIT 132", &[&account.as_bytes().as_slice(), &blob.as_bytes().as_slice(), &count]).map_err(|_| Error::Database)
+        }).map_err(Error::Connection).and_then(|rows| rows);
         let rows = self.retain(result)?;
         if rows.len() != count as usize {
             return Ok(None);
@@ -961,9 +955,9 @@ impl Snapshot<'_> {
         }
         let account = self.identity.account;
         let blob = metadata.blob;
-        let result = self.worker.run(|client| Box::pin(async move {
-            client.query_typed_opt("SELECT body_length,body_digest,header_bytes,part_table,chunk_hashes,manifest_digest FROM td_mta.blob_interpretations WHERE account=$1 AND blob_id=$2 AND version=$3", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&mime::VERSION, Type::INT4)]).await.map_err(|_| Error::Database)
-        })).map_err(Error::Connection).and_then(|row| row);
+        let result = self.worker.run(|client| {
+            client.query_opt("SELECT body_length,body_digest,header_bytes,part_table,chunk_hashes,manifest_digest FROM td_mta.blob_interpretations WHERE account=$1 AND blob_id=$2 AND version=$3", &[&account.as_bytes().as_slice(), &blob.as_bytes().as_slice(), &mime::VERSION]).map_err(|_| Error::Database)
+        }).map_err(Error::Connection).and_then(|row| row);
         let Some(row) = self.retain(result)? else {
             return Ok(None);
         };
@@ -1010,11 +1004,7 @@ impl Snapshot<'_> {
         let identity = self.identity;
         let result = self
             .worker
-            .run(|client| {
-                Box::pin(async move {
-                    value_reads::Window::read(client, identity, &ids, mailboxes, keywords).await
-                })
-            })
+            .run(|client| value_reads::Window::read(client, identity, &ids, mailboxes, keywords))
             .map_err(Error::Connection)
             .and_then(|result| result);
         self.value_window = self.retain(result)?;
@@ -1045,16 +1035,14 @@ impl Snapshot<'_> {
         };
         let result = self
             .worker
-            .run(|client| {
-                Box::pin(async move {
-                    match postgres_body::email_metadata(client, selected).await {
-                        Ok(metadata) if metadata.identity == identity => Ok(Some(metadata)),
-                        Ok(_) => Err(Error::Integrity),
-                        Err(postgres_body::Error::Missing) => Ok(None),
-                        Err(error) => Err(Error::Body(error)),
-                    }
-                })
-            })
+            .run(
+                |client| match postgres_body::email_metadata(client, selected) {
+                    Ok(metadata) if metadata.identity == identity => Ok(Some(metadata)),
+                    Ok(_) => Err(Error::Integrity),
+                    Err(postgres_body::Error::Missing) => Ok(None),
+                    Err(error) => Err(Error::Body(error)),
+                },
+            )
             .map_err(Error::Connection)
             .and_then(|result| result);
         let metadata = self.retain(result)?;
@@ -1152,13 +1140,13 @@ impl Snapshot<'_> {
         }
         let identity = self.identity;
         let after = after.map(|value| *value.as_bytes());
-        let result=self.worker.run(|client|Box::pin(async move {
-            let rows=client.query_typed("SELECT m.mailbox_id,m.changed,b.changed FROM td_mta.memberships m LEFT JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=$2 AND ($3::bytea IS NULL OR m.mailbox_id>$3) ORDER BY m.mailbox_id LIMIT $4", &[(&identity.account.as_bytes().as_slice(),Type::BYTEA),(&email.as_bytes().as_slice(),Type::BYTEA),(&after.as_ref().map(|bytes|bytes.as_slice()),Type::BYTEA),(&limit,Type::INT8)]).await.map_err(|_|Error::Database)?;
+        let result=self.worker.run(|client|{
+            let rows=client.query("SELECT m.mailbox_id,m.changed,b.changed FROM td_mta.memberships m LEFT JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=$2 AND ($3::bytea IS NULL OR m.mailbox_id>$3) ORDER BY m.mailbox_id LIMIT $4", &[&identity.account.as_bytes().as_slice(), &email.as_bytes().as_slice(), &after.as_ref().map(|bytes|bytes.as_slice()), &limit]).map_err(|_|Error::Database)?;
             let mut values=Vec::new();
             values.try_reserve_exact(maximum).map_err(|_|Error::Capacity)?;
             let has_more=rows.len()>maximum;
             let mut previous=after;
-            for row in rows {
+            for row in &rows {
                 for column in [1,2] { check_changed(row.try_get(column).map_err(|_|Error::Integrity)?,identity)?; }
                 let id:&[u8]=row.try_get(0).map_err(|_|Error::Integrity)?;
                 let id:[u8;16]=id.try_into().map_err(|_|Error::Integrity)?;
@@ -1167,7 +1155,7 @@ impl Snapshot<'_> {
                 if values.len()<maximum { values.push(MailboxId::from_bytes(id)); }
             }
             Ok(Values { identity,email,values,has_more })
-        })).map_err(Error::Connection).and_then(|result|result);
+        }).map_err(Error::Connection).and_then(|result|result);
         self.retain(result)
     }
     pub fn keywords(
@@ -1194,8 +1182,8 @@ impl Snapshot<'_> {
         let after = after.map(copy_text).transpose();
         let after = self.retain(after)?;
         let identity = self.identity;
-        let result=self.worker.run(|client|Box::pin(async move {
-            let rows=client.query_typed("SELECT keyword,changed FROM td_mta.keywords WHERE account=$1 AND email_id=$2 AND ($3::text IS NULL OR keyword>$3 COLLATE \"C\") ORDER BY keyword LIMIT $4", &[(&identity.account.as_bytes().as_slice(),Type::BYTEA),(&email.as_bytes().as_slice(),Type::BYTEA),(&after,Type::TEXT),(&limit,Type::INT8)]).await.map_err(|_|Error::Database)?;
+        let result=self.worker.run(|client|{
+            let rows=client.query("SELECT keyword,changed FROM td_mta.keywords WHERE account=$1 AND email_id=$2 AND ($3::text IS NULL OR keyword>$3 COLLATE \"C\") ORDER BY keyword LIMIT $4", &[&identity.account.as_bytes().as_slice(), &email.as_bytes().as_slice(), &after, &limit]).map_err(|_|Error::Database)?;
             let mut values=Vec::new();
             values.try_reserve_exact(maximum).map_err(|_|Error::Capacity)?;
             let has_more=rows.len()>maximum;
@@ -1209,7 +1197,7 @@ impl Snapshot<'_> {
                 previous=Some(text);
             }
             Ok(Values { identity,email,values,has_more })
-        })).map_err(Error::Connection).and_then(|result|result);
+        }).map_err(Error::Connection).and_then(|result|result);
         self.retain(result)
     }
     /// The receiver's own direct-MX results for one Email of this account,
@@ -1261,31 +1249,23 @@ impl Snapshot<'_> {
         let result = self
             .worker
             .run(|client| {
-                Box::pin(async move {
-                    let mut keys =
-                        td_alloc::with_capacity(ids.len()).map_err(|_| Error::Capacity)?;
-                    for id in &ids {
-                        td_alloc::push(&mut keys, id.as_bytes().as_slice())
-                            .map_err(|_| Error::Capacity)?;
-                    }
-                    let limit = i64::try_from(ids.len())
-                        .ok()
-                        .and_then(|n| n.checked_mul(4))
-                        .and_then(|n| n.checked_add(1))
-                        .ok_or(Error::Capacity)?;
-                    let rows = client
-                        .query_typed(
-                            AUTHENTICATION,
-                            &[
-                                (&identity.account.as_bytes().as_slice(), Type::BYTEA),
-                                (&keys, Type::BYTEA_ARRAY),
-                                (&limit, Type::INT8),
-                            ],
-                        )
-                        .await
-                        .map_err(|_| Error::Database)?;
-                    authentication_window(&rows, &ids)
-                })
+                let mut keys = td_alloc::with_capacity(ids.len()).map_err(|_| Error::Capacity)?;
+                for id in &ids {
+                    td_alloc::push(&mut keys, id.as_bytes().as_slice())
+                        .map_err(|_| Error::Capacity)?;
+                }
+                let limit = i64::try_from(ids.len())
+                    .ok()
+                    .and_then(|n| n.checked_mul(4))
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(Error::Capacity)?;
+                let rows = client
+                    .query(
+                        AUTHENTICATION,
+                        &[&identity.account.as_bytes().as_slice(), &keys, &limit],
+                    )
+                    .map_err(|_| Error::Database)?;
+                authentication_window(&rows, &ids)
             })
             .map_err(Error::Connection)
             .and_then(|result| result);
@@ -1330,7 +1310,7 @@ impl Snapshot<'_> {
             return self.retain(Err(Error::Capacity));
         }
         let identity = self.identity;
-        let result = self.worker.run(|client| Box::pin(async move {
+        let result = self.worker.run(|client| {
             let mailbox = match query.scope {
                 EmailScope::Mailbox(id) => Some(*id.as_bytes()),
                 _ => None,
@@ -1346,7 +1326,7 @@ impl Snapshot<'_> {
             let account = identity.account.as_bytes().as_slice();
             let mailbox = mailbox.as_ref().map(|id|id.as_slice());
             if query.calculate_total {
-                let row=client.query_typed_one("SELECT count(*) FROM td_mta.emails e WHERE e.account=$1 AND ($2::bytea IS NULL OR EXISTS (SELECT 1 FROM td_mta.memberships m WHERE m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2)) AND ($3::bigint IS NULL OR e.received_at >= $3) AND ($4::bigint IS NULL OR e.received_at < $4)", &[(&account,Type::BYTEA),(&mailbox,Type::BYTEA),(&query.after,Type::INT8),(&query.before,Type::INT8)]).await.map_err(|_|Error::Database)?;
+                let row=client.query_one("SELECT count(*) FROM td_mta.emails e WHERE e.account=$1 AND ($2::bytea IS NULL OR EXISTS (SELECT 1 FROM td_mta.memberships m WHERE m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2)) AND ($3::bigint IS NULL OR e.received_at >= $3) AND ($4::bigint IS NULL OR e.received_at < $4)", &[&account, &mailbox, &query.after, &query.before]).map_err(|_|Error::Database)?;
                 let total:i64=row.try_get(0).map_err(|_|Error::Integrity)?;
                 page.total=Some(u64::try_from(total).map_err(|_|Error::Integrity)?);
             }
@@ -1358,16 +1338,15 @@ impl Snapshot<'_> {
                 (true, true) => include_str!("postgres_search_candidates_asc.sql"),
                 (true, false) => include_str!("postgres_search_candidates_desc.sql"),
             };
-            let parameters: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 8] = [
-                (&account,Type::BYTEA),(&mailbox,Type::BYTEA),(&limit,Type::INT8),
-                (&position,Type::INT8),(&query.after,Type::INT8),(&query.before,Type::INT8),
-                (&pattern,Type::TEXT),(&crate::postgres_search::VERSION,Type::INT4)];
+            let parameters: [&dyn crate::postgres_probe::Encode; 8] = [
+                &account, &mailbox, &limit, &position, &query.after, &query.before,
+                &pattern, &crate::postgres_search::VERSION];
             let parameters = parameters.get(..if pattern.is_some() { 8 } else { 6 }).ok_or(Error::Invalid)?;
-            let rows=client.query_typed(sql,parameters).await.map_err(|_|Error::Database)?;
+            let rows=client.query(sql,parameters).map_err(|_|Error::Database)?;
             page.ids.try_reserve_exact(query.limit).map_err(|_|Error::Capacity)?;
             page.has_more=rows.len()>query.limit;
             let mut previous:Option<(i64,[u8;16])>=None;
-            for row in rows {
+            for row in &rows {
                 let id:&[u8]=row.try_get(0).map_err(|_|Error::Integrity)?;
                 let id:[u8;16]=id.try_into().map_err(|_|Error::Integrity)?;
                 let date:i64=row.try_get(1).map_err(|_|Error::Integrity)?;
@@ -1387,7 +1366,7 @@ impl Snapshot<'_> {
                 if page.ids.len()<query.limit { page.ids.push(EmailId::from_bytes(id)); }
             }
             Ok(page)
-        })).map_err(Error::Connection).and_then(|result|result);
+        }).map_err(Error::Connection).and_then(|result|result);
         self.retain(result)
     }
     /// Ascending received-date/ID windows on this view's immutable thread
@@ -1408,21 +1387,21 @@ impl Snapshot<'_> {
         };
         let limit = self.retain(result)?;
         let identity = self.identity;
-        let result=self.worker.run(|client|Box::pin(async move {
+        let result=self.worker.run(|client|{
             let account=identity.account.as_bytes().as_slice();
             let thread_bytes=thread.as_bytes().as_slice();
-            let row=client.query_typed_opt("SELECT changed FROM td_mta.threads WHERE account=$1 AND id=$2", &[(&account,Type::BYTEA),(&thread_bytes,Type::BYTEA)]).await.map_err(|_|Error::Database)?;
+            let row=client.query_opt("SELECT changed FROM td_mta.threads WHERE account=$1 AND id=$2", &[&account, &thread_bytes]).map_err(|_|Error::Database)?;
             let Some(row)=row else { return Ok(None); };
             check_changed(row.try_get(0).map_err(|_|Error::Integrity)?,identity)?;
             let date=after.map(|entry|entry.received_at);
             let id=after.map(|entry|*entry.email.as_bytes());
             let id=id.as_ref().map(|id|id.as_slice());
-            let rows=client.query_typed("SELECT id,received_at,changed FROM td_mta.emails WHERE account=$1 AND thread_id=$2 AND ($3::bigint IS NULL OR (received_at,id)>($3,$4::bytea)) ORDER BY received_at ASC,id ASC LIMIT $5", &[(&account,Type::BYTEA),(&thread_bytes,Type::BYTEA),(&date,Type::INT8),(&id,Type::BYTEA),(&limit,Type::INT8)]).await.map_err(|_|Error::Database)?;
+            let rows=client.query("SELECT id,received_at,changed FROM td_mta.emails WHERE account=$1 AND thread_id=$2 AND ($3::bigint IS NULL OR (received_at,id)>($3,$4::bytea)) ORDER BY received_at ASC,id ASC LIMIT $5", &[&account, &thread_bytes, &date, &id, &limit]).map_err(|_|Error::Database)?;
             let has_more=rows.len()>maximum;
             let mut emails=Vec::new();
             emails.try_reserve_exact(maximum).map_err(|_|Error::Capacity)?;
             let mut previous=after;
-            for row in rows {
+            for row in &rows {
                 let id:&[u8]=row.try_get(0).map_err(|_|Error::Integrity)?;
                 let entry=ports::ThreadEmail {
                     email:EmailId::from_bytes(id.try_into().map_err(|_|Error::Integrity)?),
@@ -1434,7 +1413,7 @@ impl Snapshot<'_> {
                 if emails.len()<maximum { emails.push(entry); }
             }
             Ok(Some(ports::ThreadEmails {identity,thread,emails,has_more}))
-        })).map_err(Error::Connection).and_then(|result|result);
+        }).map_err(Error::Connection).and_then(|result|result);
         self.retain(result)
     }
     fn value_limit(&self, maximum: usize) -> Result<i64, Error> {

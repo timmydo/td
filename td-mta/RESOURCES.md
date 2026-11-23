@@ -27,9 +27,8 @@ the read end, up to 16 listeners and 96 connections. Polling borrows the origina
 worker-owned connections stay outside the wait. The array uses 904 bytes on
 the supported 64-bit targets.
 
-Each live PostgreSQL driver uses three descriptors: its connected TCP or
-Unix socket and both ends of its private worker-wake socket pair. This
-applies to each admitted fresh connection and each retained connection,
+Each live PostgreSQL connection uses one descriptor, its connected TCP or
+Unix socket. This applies to each admitted fresh connection and each retained connection,
 including while idle. POSTGRES.md describes readiness and retirement.
 
 ## Default reservation

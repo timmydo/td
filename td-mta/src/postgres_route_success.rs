@@ -1,4 +1,5 @@
 //! Shared route recovery after durably accepted final DATA.
+use crate::postgres_probe::Client;
 use crate::{
     ids::AttemptId,
     postgres_probe::{self, Request},
@@ -13,7 +14,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Provider, TrustStore};
-use tokio_postgres::Client;
 #[derive(Clone)]
 pub struct Change {
     claim: Claim,
@@ -50,9 +50,9 @@ pub fn prepare(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Cha
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
 }
-async fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
+fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
     let binding = value.claim.binding();
-    let rows=client.query("SELECT request_digest,route_name,destination,action,old_revision,new_revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health_receipts WHERE account=$1 AND operation=$2", &[&binding.account().as_bytes().as_slice(),&value.attempt.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT request_digest,route_name,destination,action,old_revision,new_revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health_receipts WHERE account=$1 AND operation=$2", &[&binding.account().as_bytes().as_slice(),&value.attempt.as_bytes().as_slice()]).map_err(|_|Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -65,7 +65,7 @@ async fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Err
     let action: i64 = row.try_get(3).map_err(|_| Error::Integrity)?;
     let old = health::number(row.try_get(4).map_err(|_| Error::Integrity)?)?;
     let new = health::number(row.try_get(5).map_err(|_| Error::Integrity)?)?;
-    let state = health::state(row, 6, new)?;
+    let state = health::state(&row, 6, new)?;
     if route != binding.route().name()
         || destination != binding.route().destination()
         || action != 3
@@ -87,12 +87,8 @@ pub fn inspect(
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            owners::begin(client, &value.claim, false, false)
-                .await
-                .map_err(Error::Owner)?;
-            receipt(client, &value).await
-        })
+        owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
+        receipt(client, &value)
     })
     .map_err(Error::Connection)?
 }
@@ -111,93 +107,84 @@ pub fn publish(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let policy = owners::begin(client, &value.claim, true, true)
-                .await
-                .map_err(Error::Owner)?;
-            if let Some(outcome) = receipt(client, &value).await? {
-                return Ok(outcome);
+        let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
+        if let Some(outcome) = receipt(client, &value)? {
+            return Ok(outcome);
+        }
+        if !policy {
+            return Err(Error::Policy);
+        }
+        let timestamp =
+            owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?;
+        if timestamp < 0 {
+            return Err(Error::Clock);
+        }
+        let binding = value.claim.binding();
+        let account = binding.account();
+        let account = account.as_bytes().as_slice();
+        let rows=client.query("SELECT generation,owner_boot,owner_operation,prepared_at,active,EXISTS(SELECT 1 FROM td_mta.attempt_acceptance_receipts r WHERE r.account=submission_attempts.account AND r.attempt_id=submission_attempts.attempt_id AND r.phase=4) FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4", &[&account,&value.attempt.as_bytes().as_slice(),&binding.route().name(),&binding.route().destination().as_slice()]).map_err(|_|Error::Database)?;
+        let row = rows.first().ok_or(Error::Missing)?;
+        let generation = health::number(row.try_get(0).map_err(|_| Error::Integrity)?)?;
+        let boot: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+        let operation: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
+        let prepared: i64 = row.try_get(3).map_err(|_| Error::Integrity)?;
+        let active: bool = row.try_get(4).map_err(|_| Error::Integrity)?;
+        let accepted: bool = row.try_get(5).map_err(|_| Error::Integrity)?;
+        if active || !accepted {
+            return Err(Error::Conflict);
+        }
+        if generation != value.generation
+            || boot != value.claim.boot().as_bytes()
+            || operation != value.claim.operation().as_bytes()
+        {
+            return Err(Error::Conflict);
+        }
+        if prepared < 0 || prepared > timestamp {
+            return Err(Error::Clock);
+        }
+        let prior = health::current(client, &value.claim)?;
+        if let Some(prior) = prior {
+            if prior.repair_generation.is_some() {
+                return Err(Error::RepairRequired);
             }
-            if !policy {
-                return Err(Error::Policy);
-            }
-            let timestamp = owners::check_locked(client, &value.claim, value.generation)
-                .await
-                .map_err(Error::Owner)?;
-            if timestamp < 0 {
-                return Err(Error::Clock);
-            }
-            let binding = value.claim.binding();
-            let account = binding.account();
-            let account = account.as_bytes().as_slice();
-            let rows=client.query("SELECT generation,owner_boot,owner_operation,prepared_at,active,EXISTS(SELECT 1 FROM td_mta.attempt_acceptance_receipts r WHERE r.account=submission_attempts.account AND r.attempt_id=submission_attempts.attempt_id AND r.phase=4) FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4", &[&account,&value.attempt.as_bytes().as_slice(),&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
-            let row = rows.first().ok_or(Error::Missing)?;
-            let generation = health::number(row.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let boot: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-            let operation: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
-            let prepared: i64 = row.try_get(3).map_err(|_| Error::Integrity)?;
-            let active: bool = row.try_get(4).map_err(|_| Error::Integrity)?;
-            let accepted: bool = row.try_get(5).map_err(|_| Error::Integrity)?;
-            if active || !accepted {
-                return Err(Error::Conflict);
-            }
-            if generation != value.generation
-                || boot != value.claim.boot().as_bytes()
-                || operation != value.claim.operation().as_bytes()
+            if prior
+                .failed_at
+                .is_some_and(|last| prepared < last || timestamp < last)
             {
                 return Err(Error::Conflict);
             }
-            if prepared < 0 || prepared > timestamp {
-                return Err(Error::Clock);
-            }
-            let prior = health::current(client, &value.claim).await?;
-            if let Some(prior) = prior {
-                if prior.repair_generation.is_some() {
-                    return Err(Error::RepairRequired);
-                }
-                if prior
-                    .failed_at
-                    .is_some_and(|last| prepared < last || timestamp < last)
-                {
-                    return Err(Error::Conflict);
-                }
-            }
-            health::expire_receipts(client, &value.claim, timestamp).await?;
-            let limits=client.query_one("SELECT (SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health WHERE account=$1 LIMIT 1024) h),(SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health_receipts WHERE account=$1 LIMIT 1024) r)", &[&account]).await.map_err(|_|Error::Database)?;
-            let health_count: i64 = limits.try_get(0).map_err(|_| Error::Integrity)?;
-            let receipts: i64 = limits.try_get(1).map_err(|_| Error::Integrity)?;
-            if (prior.is_none() && health_count >= 1024) || receipts >= 1024 {
-                return Err(Error::Capacity);
-            }
-            let old = prior.map_or(0, |state| state.revision);
-            let revision = old.checked_add(1).ok_or(Error::Capacity)?;
-            let state = State {
-                revision,
-                failure_count: 0,
-                reason: 0,
-                failed_at: None,
-                next_at: None,
-                repair_generation: None,
-            };
-            let revision_bytes = revision.to_be_bytes();
-            let revision_sql = revision_bytes.as_slice();
-            if client.execute("INSERT INTO td_mta.route_health VALUES($1,$2,$3,$4,0,0,NULL,NULL,NULL) ON CONFLICT(account,route_name,destination) DO UPDATE SET revision=EXCLUDED.revision,failure_count=0,reason=0,failed_at=NULL,next_at=NULL,repair_generation=NULL", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&revision_sql]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
-            client.execute("INSERT INTO td_mta.route_health_receipts VALUES($1,$2,$3,$4,$5,3,$6,$7,0,0,NULL,NULL,NULL)", &[&account,&value.attempt.as_bytes().as_slice(),&value.digest.as_slice(),&binding.route().name(),&binding.route().destination().as_slice(),&old.to_be_bytes().as_slice(),&revision_sql]).await.map_err(|_|Error::Database)?;
-            let final_time = owners::check_locked(client, &value.claim, value.generation)
-                .await
-                .map_err(Error::Owner)?;
-            if final_time < timestamp {
-                return Err(Error::Clock);
-            }
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Outcome {
-                old_revision: old,
-                state,
-            })
+        }
+        health::expire_receipts(client, &value.claim, timestamp)?;
+        let limits=client.query_one("SELECT (SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health WHERE account=$1 LIMIT 1024) h),(SELECT count(*) FROM (SELECT 1 FROM td_mta.route_health_receipts WHERE account=$1 LIMIT 1024) r)", &[&account]).map_err(|_|Error::Database)?;
+        let health_count: i64 = limits.try_get(0).map_err(|_| Error::Integrity)?;
+        let receipts: i64 = limits.try_get(1).map_err(|_| Error::Integrity)?;
+        if (prior.is_none() && health_count >= 1024) || receipts >= 1024 {
+            return Err(Error::Capacity);
+        }
+        let old = prior.map_or(0, |state| state.revision);
+        let revision = old.checked_add(1).ok_or(Error::Capacity)?;
+        let state = State {
+            revision,
+            failure_count: 0,
+            reason: 0,
+            failed_at: None,
+            next_at: None,
+            repair_generation: None,
+        };
+        let revision_bytes = revision.to_be_bytes();
+        let revision_sql = revision_bytes.as_slice();
+        if client.execute("INSERT INTO td_mta.route_health VALUES($1,$2,$3,$4,0,0,NULL,NULL,NULL) ON CONFLICT(account,route_name,destination) DO UPDATE SET revision=EXCLUDED.revision,failure_count=0,reason=0,failed_at=NULL,next_at=NULL,repair_generation=NULL", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&revision_sql]).map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
+        client.execute("INSERT INTO td_mta.route_health_receipts VALUES($1,$2,$3,$4,$5,3,$6,$7,0,0,NULL,NULL,NULL)", &[&account,&value.attempt.as_bytes().as_slice(),&value.digest.as_slice(),&binding.route().name(),&binding.route().destination().as_slice(),&old.to_be_bytes().as_slice(),&revision_sql]).map_err(|_|Error::Database)?;
+        let final_time =
+            owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?;
+        if final_time < timestamp {
+            return Err(Error::Clock);
+        }
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Outcome {
+            old_revision: old,
+            state,
         })
     });
     match result {

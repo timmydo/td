@@ -40,7 +40,7 @@ pub fn inspect(
     let result = postgres_probe::with_audit_worker(request, trust, deadline, budget, |worker| {
         let report = audit(worker, epoch, account, utc_ms, limits)?;
         worker
-            .run(|client| Box::pin(async move { client.batch_execute("ROLLBACK").await }))
+            .run(|client| client.rollback())
             .map_err(Error::Connection)?
             .map_err(|_| Error::Database)?;
         Ok(report)
@@ -60,11 +60,11 @@ pub(crate) fn audit(
     utc_ms: i64,
     limits: Limits,
 ) -> Result<CompleteMetadata, Error> {
-    let identity=worker.run(move |client| Box::pin(async move {
-        let schema=postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+    let identity=worker.run(move |client| {
+        let schema=postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
         if schema.store_epoch!=epoch {return Err(Error::Epoch);}
-        client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
-        let rows=client.query("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 LIMIT 2",&[&account.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+        client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_|Error::Database)?;
+        let rows=client.query("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 LIMIT 2",&[&account.as_bytes().as_slice()]).map_err(|_|Error::Database)?;
         if rows.is_empty() {return Err(Error::Missing);}
         if rows.len()!=1 {return Err(Error::Integrity);}
         let row=rows.first().ok_or(Error::Integrity)?;
@@ -73,7 +73,7 @@ pub(crate) fn audit(
         let history_floor=sequence(1)?;
         if history_floor>committed_sequence {return Err(Error::Integrity);}
         Ok(ViewIdentity{account,epoch,committed_sequence,history_floor})
-    })).map_err(Error::Connection)??;
+    }).map_err(Error::Connection)??;
     let mut sweep = metadata_sweep::Sweep::new(identity, utc_ms, limits);
     let mut key = [0; MAX_KEY_BYTES];
     let mut value = vec![0; MAX_VALUE_BYTES];

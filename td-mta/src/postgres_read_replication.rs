@@ -2,7 +2,7 @@
 #[path = "replica_cursor.rs"]
 mod cursor_wire;
 
-use super::{check_changed, EmailId, Error, Snapshot, Type};
+use super::{check_changed, EmailId, Error, Snapshot};
 use crate::sync::{DataState, DataType};
 
 pub const MAX_REPLICA_INVENTORY_PAGE: usize = 256;
@@ -47,17 +47,15 @@ impl Snapshot<'_> {
         let result = self
             .worker
             .run(|client| {
-                Box::pin(async move {
                     let account = identity.account.as_bytes().as_slice();
                     let (base, upper, after) = match cursor {
                         Some(cursor) => (cursor.base, Some(cursor.upper), Some(cursor.after)),
                         None => {
                             let row = client
-                                .query_typed_opt(
+                                .query_opt(
                                     "SELECT id FROM td_mta.emails WHERE account=$1 ORDER BY id DESC LIMIT 1",
-                                    &[(&account, Type::BYTEA)],
+                                    &[&account],
                                 )
-                                .await
                                 .map_err(|_| Error::Database)?;
                             let upper = row
                                 .map(|row| -> Result<EmailId, Error> {
@@ -86,11 +84,10 @@ impl Snapshot<'_> {
                     // destroyed before catch-up. Never inventory them. Keep
                     // future/corrupt revisions visible to check_changed below.
                     let rows = client
-                        .query_typed(
+                        .query(
                             "SELECT id,changed FROM td_mta.emails WHERE account=$1 AND id<=$2 AND ($3::bytea IS NULL OR id>$3) AND (changed<=$5 OR changed>$6) ORDER BY id LIMIT $4",
-                            &[(&account, Type::BYTEA), (&upper_bytes, Type::BYTEA), (&after_bytes, Type::BYTEA), (&limit, Type::INT8), (&base_sequence.as_slice(), Type::BYTEA), (&current_sequence.as_slice(), Type::BYTEA)],
+                            &[&account, &upper_bytes, &after_bytes, &limit, &base_sequence.as_slice(), &current_sequence.as_slice()],
                         )
-                        .await
                         .map_err(|_| Error::Database)?;
                     if rows.len() > maximum + 1 {
                         return Err(Error::Integrity);
@@ -98,7 +95,7 @@ impl Snapshot<'_> {
                     page.ids.try_reserve_exact(maximum).map_err(|_| Error::Capacity)?;
                     let more = rows.len() > maximum;
                     let mut previous = after;
-                    for row in rows {
+                    for row in &rows {
                         let bytes: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
                         let id = EmailId::from_bytes(bytes.try_into().map_err(|_| Error::Integrity)?);
                         check_changed(row.try_get(1).map_err(|_| Error::Integrity)?, identity)?;
@@ -121,7 +118,6 @@ impl Snapshot<'_> {
                     }
                     Ok(page)
                 })
-            })
             .map_err(Error::Connection)
             .and_then(|result| result);
         self.retain(result)

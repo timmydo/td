@@ -1,9 +1,9 @@
 //! Canonical PostgreSQL change-row decoding shared by reads and audits.
+use crate::postgres_probe::Row;
 use crate::{
     format::{ObjectType, Sequence},
     ports::{Change, ChangeAction, ChangeCursor, ChangeRecord, Error},
 };
-use tokio_postgres::Row;
 
 pub(crate) fn read(row: &Row) -> Result<ChangeRecord, Error> {
     decode(

@@ -72,7 +72,7 @@ pub fn publish(
     publish_record(request, trust, deadline, &filing.0, password)
 }
 
-pub(super) async fn apply(
+pub(super) fn apply(
     client: &Client,
     change: &Change,
     patch: Patch,
@@ -87,7 +87,7 @@ pub(super) async fn apply(
     let email = update.email.as_bytes().as_slice();
     let mut results = Vec::new();
     results.try_reserve_exact(1).map_err(|_| Error::Capacity)?;
-    let row = client.query_opt("SELECT e.changed,k.changed,s.changed FROM td_mta.emails e LEFT JOIN td_mta.keywords k ON k.account=e.account AND k.email_id=e.id AND k.keyword='$draft' LEFT JOIN td_mta.keywords s ON s.account=e.account AND s.email_id=e.id AND s.keyword='$seen' WHERE e.account=$1 AND e.id=$2", &[&account,&email]).await.map_err(|_| Error::Database)?;
+    let row = client.query_opt("SELECT e.changed,k.changed,s.changed FROM td_mta.emails e LEFT JOIN td_mta.keywords k ON k.account=e.account AND k.email_id=e.id AND k.keyword='$draft' LEFT JOIN td_mta.keywords s ON s.account=e.account AND s.email_id=e.id AND s.keyword='$seen' WHERE e.account=$1 AND e.id=$2", &[&account,&email]).map_err(|_| Error::Database)?;
     let Some(row) = row else {
         results.push(UpdateResult::NotFound);
         return Ok((old, results));
@@ -115,7 +115,7 @@ pub(super) async fn apply(
     let mut source_present = false;
     let mut destination_present = false;
     if patch.movement.is_some() || unread_changes {
-        let rows = client.query("SELECT m.mailbox_id,m.changed,b.changed FROM td_mta.memberships m JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=$2 ORDER BY m.mailbox_id LIMIT 257", &[&account,&email]).await.map_err(|_| Error::Database)?;
+        let rows = client.query("SELECT m.mailbox_id,m.changed,b.changed FROM td_mta.memberships m JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=$2 ORDER BY m.mailbox_id LIMIT 257", &[&account,&email]).map_err(|_| Error::Database)?;
         if rows.len() > crate::postgres_mailboxes::MAX_MAILBOXES {
             return Err(Error::Capacity);
         }
@@ -143,7 +143,6 @@ pub(super) async fn apply(
                 "SELECT changed FROM td_mta.mailboxes WHERE account=$1 AND id=$2",
                 &[&account, &destination.as_bytes().as_slice()],
             )
-            .await
             .map_err(|_| Error::Database)?;
         let Some(target) = target.filter(|_| source_present) else {
             results.push(UpdateResult::InvalidMailbox);
@@ -167,9 +166,8 @@ pub(super) async fn apply(
     if draft.is_none() && mailboxes.is_empty() {
         return Ok((old, results));
     }
-    let next = crate::postgres_sequence::next(client, account, old)
-        .await
-        .map_err(|error| match error {
+    let next =
+        crate::postgres_sequence::next(client, account, old).map_err(|error| match error {
             crate::postgres_sequence::Error::Capacity => Error::Capacity,
             crate::postgres_sequence::Error::Integrity => Error::Integrity,
             crate::postgres_sequence::Error::Database => Error::Database,
@@ -181,13 +179,12 @@ pub(super) async fn apply(
                 "DELETE FROM td_mta.memberships WHERE account=$1 AND email_id=$2 AND mailbox_id=$3",
                 &[&account, &email, &source.as_bytes().as_slice()],
             )
-            .await
             .map_err(|_| Error::Database)?
             != 1
         {
             return Err(Error::Integrity);
         }
-        if insert_destination && client.execute("INSERT INTO td_mta.memberships(account,email_id,mailbox_id,changed) VALUES($1,$2,$3,$4)", &[&account,&email,&destination.as_bytes().as_slice(),&changed.as_slice()]).await.map_err(|_| Error::Database)? != 1 {
+        if insert_destination && client.execute("INSERT INTO td_mta.memberships(account,email_id,mailbox_id,changed) VALUES($1,$2,$3,$4)", &[&account,&email,&destination.as_bytes().as_slice(),&changed.as_slice()]).map_err(|_| Error::Database)? != 1 {
             return Err(Error::Integrity);
         }
     }
@@ -197,7 +194,6 @@ pub(super) async fn apply(
                 "DELETE FROM td_mta.keywords WHERE account=$1 AND email_id=$2 AND keyword='$draft'",
                 &[&account, &email],
             )
-            .await
             .map_err(|_| Error::Database)?
             != 1
     {
@@ -208,13 +204,12 @@ pub(super) async fn apply(
             "UPDATE td_mta.emails SET changed=$3 WHERE account=$1 AND id=$2",
             &[&account, &email, &changed.as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {
         return Err(Error::Integrity);
     }
-    client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) VALUES($1,$2,0,3,2,$3)", &[&account,&changed.as_slice(),&email]).await.map_err(|_| Error::Database)?;
+    client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) VALUES($1,$2,0,3,2,$3)", &[&account,&changed.as_slice(),&email]).map_err(|_| Error::Database)?;
     if !mailboxes.is_empty() {
         let mut ids = Vec::new();
         ids.try_reserve_exact(mailboxes.len())
@@ -222,7 +217,7 @@ pub(super) async fn apply(
         for mailbox in &mailboxes {
             ids.push(mailbox.as_bytes().as_slice());
         }
-        if client.execute("WITH changed AS (UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=ANY($2::bytea[]) RETURNING id) INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,row_number() OVER (ORDER BY id),1,2,id FROM changed", &[&account,&ids,&changed.as_slice()]).await.map_err(|_| Error::Database)? != mailboxes.len() as u64 {
+        if client.execute("WITH changed AS (UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=ANY($2::bytea[]) RETURNING id) INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,row_number() OVER (ORDER BY id),1,2,id FROM changed", &[&account,&ids,&changed.as_slice()]).map_err(|_| Error::Database)? != mailboxes.len() as u64 {
             return Err(Error::Integrity);
         }
     }
@@ -231,7 +226,6 @@ pub(super) async fn apply(
             "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
             &[&account, &changed.as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {

@@ -51,17 +51,17 @@ pub fn publish(
     publish_record(request, trust, deadline, &deletion.0, password)
 }
 
-pub(super) async fn apply(
+pub(super) fn apply(
     client: &Client,
     change: &Change,
     old: u64,
 ) -> Result<(u64, Vec<UpdateResult>), Error> {
     let emails: Vec<_> = change.updates.iter().map(|update| update.email).collect();
-    apply_ids(client, change.binding.account(), &emails, old).await
+    apply_ids(client, change.binding.account(), &emails, old)
 }
 
 // Caller holds the account publication lock and owns authorization/settlement.
-pub(crate) async fn apply_ids(
+pub(crate) fn apply_ids(
     client: &Client,
     account: crate::ids::AccountId,
     emails: &[EmailId],
@@ -83,7 +83,7 @@ pub(crate) async fn apply_ids(
         }
         requested.push(id);
     }
-    let rows = client.query("SELECT q.ordinality,e.id,e.changed,e.blob_id,b.changed,e.thread_id,t.changed,k.n,k.valid,a.n,a.valid FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality) LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=q.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id CROSS JOIN LATERAL (SELECT count(*) n,coalesce(bool_and(changed<=$3),true) valid FROM (SELECT changed FROM td_mta.keywords WHERE account=e.account AND email_id=e.id LIMIT 257) v) k CROSS JOIN LATERAL (SELECT count(*) n,coalesce(bool_and(changed<=$3),true) valid FROM (SELECT changed FROM td_mta.thread_anchors WHERE account=e.account AND email_id=e.id LIMIT 2) v) a ORDER BY q.ordinality", &[&account,&requested,&before.as_slice()]).await.map_err(|_| Error::Database)?;
+    let rows = client.query("SELECT q.ordinality,e.id,e.changed,e.blob_id,b.changed,e.thread_id,t.changed,k.n,k.valid,a.n,a.valid FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality) LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=q.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id CROSS JOIN LATERAL (SELECT count(*) n,coalesce(bool_and(changed<=$3),true) valid FROM (SELECT changed FROM td_mta.keywords WHERE account=e.account AND email_id=e.id LIMIT 257) v) k CROSS JOIN LATERAL (SELECT count(*) n,coalesce(bool_and(changed<=$3),true) valid FROM (SELECT changed FROM td_mta.thread_anchors WHERE account=e.account AND email_id=e.id LIMIT 2) v) a ORDER BY q.ordinality", &[&account,&requested,&before.as_slice()]).map_err(|_| Error::Database)?;
     if rows.len() != requested.len() {
         return Err(Error::Integrity);
     }
@@ -145,15 +145,14 @@ pub(crate) async fn apply_ids(
     if deleted.is_empty() {
         return Ok((old, results));
     }
-    let next = crate::postgres_sequence::next(client, account, old)
-        .await
-        .map_err(|error| match error {
+    let next =
+        crate::postgres_sequence::next(client, account, old).map_err(|error| match error {
             crate::postgres_sequence::Error::Capacity => Error::Capacity,
             crate::postgres_sequence::Error::Integrity => Error::Integrity,
             crate::postgres_sequence::Error::Database => Error::Database,
         })?;
     let changed = next.to_be_bytes();
-    let mailbox_rows = client.query("SELECT m.mailbox_id,b.changed,bool_and(m.changed<=$3) FROM td_mta.memberships m LEFT JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=ANY($2::bytea[]) GROUP BY m.mailbox_id,b.changed ORDER BY m.mailbox_id LIMIT 257", &[&account,&deleted,&before.as_slice()]).await.map_err(|_| Error::Database)?;
+    let mailbox_rows = client.query("SELECT m.mailbox_id,b.changed,bool_and(m.changed<=$3) FROM td_mta.memberships m LEFT JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=ANY($2::bytea[]) GROUP BY m.mailbox_id,b.changed ORDER BY m.mailbox_id LIMIT 257", &[&account,&deleted,&before.as_slice()]).map_err(|_| Error::Database)?;
     if mailbox_rows.len() > crate::postgres_mailboxes::MAX_MAILBOXES {
         return Err(Error::Capacity);
     }
@@ -172,7 +171,7 @@ pub(crate) async fn apply_ids(
         }
         mailboxes.push(id);
     }
-    let thread_rows = client.query("SELECT q.id,t.changed,v.survives,v.valid FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality) LEFT JOIN td_mta.threads t ON t.account=$1 AND t.id=q.id CROSS JOIN LATERAL (SELECT coalesce(bool_or(NOT(id=ANY($3::bytea[]))),false) survives,coalesce(bool_and(changed<=$4),true) valid FROM (SELECT id,changed FROM td_mta.emails WHERE account=$1 AND thread_id=q.id LIMIT 257) owners) v ORDER BY q.ordinality", &[&account,&threads,&deleted,&before.as_slice()]).await.map_err(|_| Error::Database)?;
+    let thread_rows = client.query("SELECT q.id,t.changed,v.survives,v.valid FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality) LEFT JOIN td_mta.threads t ON t.account=$1 AND t.id=q.id CROSS JOIN LATERAL (SELECT coalesce(bool_or(NOT(id=ANY($3::bytea[]))),false) survives,coalesce(bool_and(changed<=$4),true) valid FROM (SELECT id,changed FROM td_mta.emails WHERE account=$1 AND thread_id=q.id LIMIT 257) owners) v ORDER BY q.ordinality", &[&account,&threads,&deleted,&before.as_slice()]).map_err(|_| Error::Database)?;
     if thread_rows.len() != threads.len() {
         return Err(Error::Integrity);
     }
@@ -189,12 +188,12 @@ pub(crate) async fn apply_ids(
         }
         survives.push(row.try_get::<_, bool>(2).map_err(|_| Error::Integrity)?);
     }
-    let valid: bool = client.query_one("SELECT NOT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND blob_id=ANY($2::bytea[]) AND changed>$3)", &[&account,&blobs,&before.as_slice()]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
+    let valid: bool = client.query_one("SELECT NOT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND blob_id=ANY($2::bytea[]) AND changed>$3)", &[&account,&blobs,&before.as_slice()]).map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
     if !valid {
         return Err(Error::Integrity);
     }
     // One round trip keeps the maximum batch inside the connection frame cap.
-    let written = client.execute("WITH removed_memberships AS (DELETE FROM td_mta.memberships WHERE account=$1 AND email_id=ANY($2::bytea[])), removed_keywords AS (DELETE FROM td_mta.keywords WHERE account=$1 AND email_id=ANY($2::bytea[])), removed_anchors AS (DELETE FROM td_mta.thread_anchors WHERE account=$1 AND email_id=ANY($2::bytea[])) DELETE FROM td_mta.emails WHERE account=$1 AND id=ANY($2::bytea[])", &[&account, &deleted]).await.map_err(|_| Error::Database)?;
+    let written = client.execute("WITH removed_memberships AS (DELETE FROM td_mta.memberships WHERE account=$1 AND email_id=ANY($2::bytea[])), removed_keywords AS (DELETE FROM td_mta.keywords WHERE account=$1 AND email_id=ANY($2::bytea[])), removed_anchors AS (DELETE FROM td_mta.thread_anchors WHERE account=$1 AND email_id=ANY($2::bytea[])) DELETE FROM td_mta.emails WHERE account=$1 AND id=ANY($2::bytea[])", &[&account, &deleted]).map_err(|_| Error::Database)?;
     if written != deleted.len() as u64 {
         return Err(Error::Integrity);
     }
@@ -202,26 +201,22 @@ pub(crate) async fn apply_ids(
         publication::Error::Database => Error::Database,
         _ => Error::Integrity,
     };
-    let (bytes, count) = publication::retire_blobs(client, account, &blobs)
-        .await
-        .map_err(refused)?;
-    publication::release(client, account, [bytes, count, 0, 0, 0])
-        .await
-        .map_err(refused)?;
+    let (bytes, count) = publication::retire_blobs(client, account, &blobs).map_err(refused)?;
+    publication::release(client, account, [bytes, count, 0, 0, 0]).map_err(refused)?;
     let kept = survives.iter().filter(|value| **value).count() as u64;
-    if client.execute("UPDATE td_mta.threads t SET changed=$4 FROM unnest($2::bytea[],$3::bool[]) q(id,survives) WHERE t.account=$1 AND t.id=q.id AND q.survives", &[&account,&threads,&survives,&changed.as_slice()]).await.map_err(|_| Error::Database)? != kept { return Err(Error::Integrity); }
-    if client.execute("DELETE FROM td_mta.threads t USING unnest($2::bytea[],$3::bool[]) q(id,survives) WHERE t.account=$1 AND t.id=q.id AND NOT q.survives", &[&account,&threads,&survives]).await.map_err(|_| Error::Database)? != threads.len() as u64-kept { return Err(Error::Integrity); }
-    let written = client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,ordinality-1,3,3,id FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality)", &[&account,&deleted,&changed.as_slice()]).await.map_err(|_| Error::Database)?;
+    if client.execute("UPDATE td_mta.threads t SET changed=$4 FROM unnest($2::bytea[],$3::bool[]) q(id,survives) WHERE t.account=$1 AND t.id=q.id AND q.survives", &[&account,&threads,&survives,&changed.as_slice()]).map_err(|_| Error::Database)? != kept { return Err(Error::Integrity); }
+    if client.execute("DELETE FROM td_mta.threads t USING unnest($2::bytea[],$3::bool[]) q(id,survives) WHERE t.account=$1 AND t.id=q.id AND NOT q.survives", &[&account,&threads,&survives]).map_err(|_| Error::Database)? != threads.len() as u64-kept { return Err(Error::Integrity); }
+    let written = client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,ordinality-1,3,3,id FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality)", &[&account,&deleted,&changed.as_slice()]).map_err(|_| Error::Database)?;
     if written != deleted.len() as u64 {
         return Err(Error::Integrity);
     }
     let offset = i64::try_from(deleted.len()).map_err(|_| Error::Capacity)?;
-    let written = client.execute("WITH changed AS (UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=ANY($2::bytea[]) RETURNING id) INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,row_number() OVER (ORDER BY id)+$4-1,1,2,id FROM changed", &[&account,&mailboxes,&changed.as_slice(),&offset]).await.map_err(|_| Error::Database)?;
+    let written = client.execute("WITH changed AS (UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=ANY($2::bytea[]) RETURNING id) INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,row_number() OVER (ORDER BY id)+$4-1,1,2,id FROM changed", &[&account,&mailboxes,&changed.as_slice(),&offset]).map_err(|_| Error::Database)?;
     if written != mailboxes.len() as u64 {
         return Err(Error::Integrity);
     }
     let offset = i64::try_from(deleted.len() + mailboxes.len()).map_err(|_| Error::Capacity)?;
-    let written = client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$4,ordinality+$5-1,2,CASE WHEN survives THEN 2 ELSE 3 END,id FROM unnest($2::bytea[],$3::bool[]) WITH ORDINALITY q(id,survives,ordinality)", &[&account,&threads,&survives,&changed.as_slice(),&offset]).await.map_err(|_| Error::Database)?;
+    let written = client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$4,ordinality+$5-1,2,CASE WHEN survives THEN 2 ELSE 3 END,id FROM unnest($2::bytea[],$3::bool[]) WITH ORDINALITY q(id,survives,ordinality)", &[&account,&threads,&survives,&changed.as_slice(),&offset]).map_err(|_| Error::Database)?;
     if written != threads.len() as u64 {
         return Err(Error::Integrity);
     }
@@ -230,7 +225,6 @@ pub(crate) async fn apply_ids(
             "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
             &[&account, &changed.as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {

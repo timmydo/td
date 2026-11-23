@@ -40,10 +40,9 @@ fn profile(name: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-async fn check(client: &postgres_probe::ScopedClient, epoch: StoreEpoch) -> Result<(), Error> {
+fn check(client: &postgres_probe::Client, epoch: StoreEpoch) -> Result<(), Error> {
     if client
         .inspect_schema()
-        .await
         .map_err(|_| Error::Database)?
         .store_epoch
         != epoch
@@ -79,17 +78,17 @@ pub fn claim(
         return Err(Error::Capacity);
     }
     let name = name.to_owned();
-    postgres_probe::with_material_client(request,trust,deadline,move|client| Box::pin(async move {
-        check(client,epoch).await?;
-        client.batch_execute("BEGIN; SET LOCAL synchronous_commit=on; SET LOCAL lock_timeout=1000; SET LOCAL statement_timeout=5000; SELECT pg_advisory_xact_lock(882015,30)").await.map_err(|_|Error::Database)?;
-        client.execute("INSERT INTO td_mta.acme_profiles(slot,profile,settings_hash,revision,owner,lease_until,state) SELECT s,$1,$2,1,$3,clock_timestamp()+interval '180 seconds',$4 FROM generate_series(0,15) s WHERE NOT EXISTS(SELECT 1 FROM td_mta.acme_profiles WHERE slot=s) ORDER BY s LIMIT 1 ON CONFLICT(profile) DO NOTHING", &[&name,&settings.as_slice(),&owner.as_slice(),&initial]).await.map_err(|_|Error::Database)?;
-        let row=client.query_opt("UPDATE td_mta.acme_profiles SET owner=$2,lease_until=clock_timestamp()+interval '180 seconds',revision=revision+1 WHERE profile=$1 AND settings_hash=$3 AND (owner=$2 OR lease_until<clock_timestamp()) RETURNING revision,state",&[&name,&owner.as_slice(),&settings.as_slice()]).await.map_err(|_|Error::Database)?.ok_or(Error::Conflict)?;
+    postgres_probe::with_material_client(request,trust,deadline,move|client| {
+        check(client,epoch)?;
+        client.batch("BEGIN; SET LOCAL synchronous_commit=on; SET LOCAL lock_timeout=1000; SET LOCAL statement_timeout=5000; SELECT pg_advisory_xact_lock(882015,30)").map_err(|_|Error::Database)?;
+        client.execute("INSERT INTO td_mta.acme_profiles(slot,profile,settings_hash,revision,owner,lease_until,state) SELECT s,$1,$2,1,$3,clock_timestamp()+interval '180 seconds',$4 FROM generate_series(0,15) s WHERE NOT EXISTS(SELECT 1 FROM td_mta.acme_profiles WHERE slot=s) ORDER BY s LIMIT 1 ON CONFLICT(profile) DO NOTHING", &[&name,&settings.as_slice(),&owner.as_slice(),&initial]).map_err(|_|Error::Database)?;
+        let row=client.query_opt("UPDATE td_mta.acme_profiles SET owner=$2,lease_until=clock_timestamp()+interval '180 seconds',revision=revision+1 WHERE profile=$1 AND settings_hash=$3 AND (owner=$2 OR lease_until<clock_timestamp()) RETURNING revision,state",&[&name,&owner.as_slice(),&settings.as_slice()]).map_err(|_|Error::Database)?.ok_or(Error::Conflict)?;
         let revision:i64=row.try_get(0).map_err(|_|Error::Database)?;
         let bytes:&[u8]=row.try_get(1).map_err(|_|Error::Database)?;
         let state=State::decode(bytes)?;
-        client.batch_execute("COMMIT").await.map_err(|_|Error::Database)?;
+        client.commit().map_err(|_|Error::Database)?;
         Ok(Lease {profile:name,owner,revision,state})
-    })).map_err(|_|Error::Database)?
+    }).map_err(|_|Error::Database)?
 }
 /// The active chain and key are returned from one row in one statement.
 pub fn active(
@@ -107,33 +106,30 @@ pub fn active(
         "SELECT active_generation,chain,key,settings_hash FROM td_mta.acme_profiles WHERE profile=$1 AND active_generation>0"
     };
     postgres_probe::with_material_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            check(client, epoch).await?;
-            let row = client
-                .query_opt(query, &[&name])
-                .await
+        check(client, epoch)?;
+        let row = client
+            .query_opt(query, &[&name])
+            .map_err(|_| Error::Database)?
+            .ok_or(Error::Conflict)?;
+        let active = Active {
+            generation: row.try_get(0).map_err(|_| Error::Database)?,
+            settings: row
+                .try_get::<_, &[u8]>(3)
                 .map_err(|_| Error::Database)?
-                .ok_or(Error::Conflict)?;
-            let active = Active {
-                generation: row.try_get(0).map_err(|_| Error::Database)?,
-                settings: row
-                    .try_get::<_, &[u8]>(3)
-                    .map_err(|_| Error::Database)?
-                    .try_into()
-                    .map_err(|_| Error::Invalid)?,
-                chain: row.try_get(1).map_err(|_| Error::Database)?,
-                key: row.try_get(2).map_err(|_| Error::Database)?,
-            };
-            if active.generation <= 0
-                || active.chain.is_empty()
-                || active.chain.len() > 65536
-                || active.key.is_empty()
-                || active.key.len() > 1024
-            {
-                return Err(Error::Invalid);
-            }
-            Ok(active)
-        })
+                .try_into()
+                .map_err(|_| Error::Invalid)?,
+            chain: row.try_get(1).map_err(|_| Error::Database)?,
+            key: row.try_get(2).map_err(|_| Error::Database)?,
+        };
+        if active.generation <= 0
+            || active.chain.is_empty()
+            || active.chain.len() > 65536
+            || active.key.is_empty()
+            || active.key.len() > 1024
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(active)
     })
     .map_err(|_| Error::Database)?
 }
@@ -183,14 +179,14 @@ impl Persistence for Writer<'_, '_> {
         let owner = self.owner;
         let revision = self.revision;
         let epoch = self.epoch;
-        let result=postgres_probe::with_material_client(self.request,self.trust,Instant::now()+std::time::Duration::from_secs(10),move|client|Box::pin(async move {
-            check(client,epoch).await?;
-            client.batch_execute("SET synchronous_commit=on; SET lock_timeout=1000; SET statement_timeout=5000").await.map_err(|_|Error::Database)?;
+        let result=postgres_probe::with_material_client(self.request,self.trust,Instant::now()+std::time::Duration::from_secs(10),move|client|{
+            check(client,epoch)?;
+            client.batch("SET synchronous_commit=on; SET lock_timeout=1000; SET statement_timeout=5000").map_err(|_|Error::Database)?;
             let (chain,mut key)=pair.unwrap_or_default();let publish=!chain.is_empty();
-            let result=client.execute("UPDATE td_mta.acme_profiles SET state=$4,revision=revision+1,active_generation=active_generation+CASE WHEN $5 THEN 1 ELSE 0 END,chain=CASE WHEN $5 THEN $6 ELSE chain END,key=CASE WHEN $5 THEN $7 ELSE key END WHERE profile=$1 AND owner=$2 AND revision=$3 AND lease_until>clock_timestamp()",&[&profile,&owner.as_slice(),&revision,&bytes,&publish,&chain,&key]).await.map_err(|_|Error::Database);
+            let result=client.execute("UPDATE td_mta.acme_profiles SET state=$4,revision=revision+1,active_generation=active_generation+CASE WHEN $5 THEN 1 ELSE 0 END,chain=CASE WHEN $5 THEN $6 ELSE chain END,key=CASE WHEN $5 THEN $7 ELSE key END WHERE profile=$1 AND owner=$2 AND revision=$3 AND lease_until>clock_timestamp()",&[&profile,&owner.as_slice(),&revision,&bytes,&publish,&chain,&key]).map_err(|_|Error::Database);
             key.fill(0);std::hint::black_box(&mut key);
             if result?!=1{return Err(Error::Conflict);} Ok(())
-        })).map_err(|_|Error::Database)?;
+        }).map_err(|_|Error::Database)?;
         result?;
         self.revision = self.revision.checked_add(1).ok_or(Error::Capacity)?;
         if let Some(expires_utc_ms) = expires {
@@ -235,24 +231,19 @@ pub fn generations(
         "SELECT profile,active_generation FROM td_mta.acme_profiles ORDER BY profile LIMIT 17"
     };
     postgres_probe::with_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            check(client, epoch).await?;
-            let rows = client
-                .query(query, &[])
-                .await
-                .map_err(|_| Error::Database)?;
-            if rows.len() > 16 {
-                return Err(Error::Capacity);
-            }
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push((
-                    row.try_get(0).map_err(|_| Error::Database)?,
-                    row.try_get(1).map_err(|_| Error::Database)?,
-                ));
-            }
-            Ok(result)
-        })
+        check(client, epoch)?;
+        let rows = client.query(query, &[]).map_err(|_| Error::Database)?;
+        if rows.len() > 16 {
+            return Err(Error::Capacity);
+        }
+        let mut result = Vec::with_capacity(rows.len());
+        for row in &rows {
+            result.push((
+                row.try_get(0).map_err(|_| Error::Database)?,
+                row.try_get(1).map_err(|_| Error::Database)?,
+            ));
+        }
+        Ok(result)
     })
     .map_err(|_| Error::Database)?
 }
@@ -273,10 +264,10 @@ pub fn status(
 ) -> Result<Status, Error> {
     profile(name)?;
     let name = name.to_owned();
-    postgres_probe::with_material_client(request,trust,deadline,move|client|Box::pin(async move {
-        check(client,epoch).await?;
-        let row=client.query_opt("SELECT active_generation,state,lease_until>clock_timestamp() FROM td_mta.acme_profiles WHERE profile=$1",&[&name]).await.map_err(|_|Error::Database)?.ok_or(Error::Conflict)?;
+    postgres_probe::with_material_client(request,trust,deadline,move|client|{
+        check(client,epoch)?;
+        let row=client.query_opt("SELECT active_generation,state,lease_until>clock_timestamp() FROM td_mta.acme_profiles WHERE profile=$1",&[&name]).map_err(|_|Error::Database)?.ok_or(Error::Conflict)?;
         let state=State::decode(row.try_get(1).map_err(|_|Error::Database)?)?;
         Ok(Status {generation:row.try_get(0).map_err(|_|Error::Database)?,next_ms:state.next_ms,expires_ms:state.expires_ms,failures:state.failures,leased:row.try_get(2).map_err(|_|Error::Database)?})
-    })).map_err(|_|Error::Database)?
+    }).map_err(|_|Error::Database)?
 }

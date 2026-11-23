@@ -14,8 +14,6 @@ clippy-all-targets = true
 
 [dependencies]
 td-alloc = { path = "../td-alloc" }
-tokio = { version = "=1.54.1", default-features = false, features = ["io-util"] }
-tokio-postgres = { version = "=0.7.18", default-features = false }
 td-civil = { path = "../td-civil" }
 td-crypto = { path = "../td-crypto" }
 td-header = { path = "../td-header" }
@@ -23,6 +21,7 @@ td-html = { path = "../td-html" }
 td-json = { path = "../td-json" }
 td-mime = { path = "../td-mime" }
 td-nfc = { path = "../td-nfc" }
+td-postgres = { path = "../td-postgres" }
 td-fs = { path = "../td-fs" }
 
 [[test]]

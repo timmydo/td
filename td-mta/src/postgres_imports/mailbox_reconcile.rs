@@ -33,13 +33,13 @@ struct Receipt {
     digest: [u8; 32],
     changed: u64,
 }
-async fn receipt(
+fn receipt(
     client: &Client,
     authority: &Authority,
     key: &Key,
     old: u64,
 ) -> Result<Option<Receipt>, Error> {
-    let row=client.query_opt("SELECT local_object,historical_blob,source_digest,changed FROM td_mta.imports WHERE account=$1 AND source_instance=$2 AND source_kind=1 AND source_account=$3 AND source_object=$4",&[&authority.account.as_bytes().as_slice(),&key.instance.as_bytes().as_slice(),&key.account.as_slice(),&key.object.as_slice()]).await.map_err(|_|Error::Database)?;
+    let row=client.query_opt("SELECT local_object,historical_blob,source_digest,changed FROM td_mta.imports WHERE account=$1 AND source_instance=$2 AND source_kind=1 AND source_account=$3 AND source_object=$4",&[&authority.account.as_bytes().as_slice(),&key.instance.as_bytes().as_slice(),&key.account.as_slice(),&key.object.as_slice()]).map_err(|_|Error::Database)?;
     let Some(row) = row else { return Ok(None) };
     let blob: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
     let changed = sequence(row.try_get(3).map_err(|_| Error::Integrity)?)?;
@@ -52,14 +52,14 @@ async fn receipt(
         changed,
     }))
 }
-async fn local(
+fn local(
     client: &Client,
     authority: &Authority,
     key: &Key,
     receipt: &Receipt,
     old: u64,
 ) -> Result<Option<Mailbox>, Error> {
-    let rows=client.query("SELECT m.name,m.parent_id,m.role,m.sort_order,m.subscribed,m.changed,p.source_object,p.changed,NOT EXISTS(SELECT 1 FROM td_mta.imports a WHERE a.account=m.account AND a.source_kind=1 AND a.local_object=m.id AND (a.source_instance<>$3 OR a.source_account<>$4 OR a.source_object<>$5)) FROM td_mta.mailboxes m LEFT JOIN td_mta.imports p ON p.account=m.account AND p.local_object=m.parent_id AND p.source_kind=1 AND p.source_instance=$3 AND p.source_account=$4 WHERE m.account=$1 AND m.id=$2 LIMIT 2",&[&authority.account.as_bytes().as_slice(),&receipt.local.as_slice(),&key.instance.as_bytes().as_slice(),&key.account.as_slice(),&key.object.as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT m.name,m.parent_id,m.role,m.sort_order,m.subscribed,m.changed,p.source_object,p.changed,NOT EXISTS(SELECT 1 FROM td_mta.imports a WHERE a.account=m.account AND a.source_kind=1 AND a.local_object=m.id AND (a.source_instance<>$3 OR a.source_account<>$4 OR a.source_object<>$5)) FROM td_mta.mailboxes m LEFT JOIN td_mta.imports p ON p.account=m.account AND p.local_object=m.parent_id AND p.source_kind=1 AND p.source_instance=$3 AND p.source_account=$4 WHERE m.account=$1 AND m.id=$2 LIMIT 2",&[&authority.account.as_bytes().as_slice(),&receipt.local.as_slice(),&key.instance.as_bytes().as_slice(),&key.account.as_slice(),&key.object.as_slice()]).map_err(|_|Error::Database)?;
     if rows.len() > 1 {
         return Err(Error::Conflict);
     }
@@ -101,7 +101,7 @@ async fn local(
     .map(Some)
     .map_err(|_| Error::Conflict)
 }
-async fn destination(
+fn destination(
     client: &Client,
     authority: &Authority,
     value: &Mailbox,
@@ -118,8 +118,7 @@ async fn destination(
         definitions,
         expected,
         old,
-    )
-    .await?;
+    )?;
     if expected.is_some_and(|e| e.len() != fences.len()) {
         return Err(Error::Conflict);
     }
@@ -138,7 +137,7 @@ fn parent(value: &Mailbox, fences: &[FolderFence]) -> Result<Option<[u8; 16]>, E
         })
         .transpose()
 }
-async fn candidate(
+fn candidate(
     client: &Client,
     authority: &Authority,
     value: &Mailbox,
@@ -150,7 +149,7 @@ async fn candidate(
         key::Key as FormatKey,
         row::{MailboxRow, Row},
     };
-    let rows=client.query("SELECT id,name,parent_id,role,sort_order,subscribed,changed FROM td_mta.mailboxes WHERE account=$1 ORDER BY id LIMIT 257",&[&authority.account.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT id,name,parent_id,role,sort_order,subscribed,changed FROM td_mta.mailboxes WHERE account=$1 ORDER BY id LIMIT 257",&[&authority.account.as_bytes().as_slice()]).map_err(|_|Error::Database)?;
     if rows.len() > crate::postgres_mailboxes::MAX_MAILBOXES {
         return Err(Error::Capacity);
     }
@@ -221,57 +220,52 @@ pub fn plan(
     let value = value.clone();
     let definitions = definitions.to_vec();
     postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let old = begin(client, &authority).await?;
-            let Some(receipt) = receipt(client, &authority, &value.key, old).await? else {
-                return Ok(Plan::New);
-            };
-            let current = match local(client, &authority, &value.key, &receipt, old).await {
-                Ok(Some(current)) => current,
-                Ok(None) => return Ok(Plan::Absent),
-                Err(Error::Conflict) => return Ok(Plan::LocalChanged),
-                Err(e) => return Err(e),
-            };
-            if current.digest != receipt.digest {
-                return Ok(Plan::LocalChanged);
-            }
-            if current.role != value.role {
-                return Ok(Plan::RoleChanged);
-            }
-            let fences =
-                match destination(client, &authority, &value, &definitions, None, old).await {
-                    Ok(fences) => fences,
-                    Err(Error::Conflict | Error::MissingMailbox) => return Ok(Plan::FolderChanged),
-                    Err(e) => return Err(e),
-                };
-            match candidate(
-                client,
-                &authority,
-                &value,
-                receipt.local,
-                parent(&value, &fences)?,
-                old,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(Error::Conflict) => return Ok(Plan::FolderChanged),
-                Err(e) => return Err(e),
-            }
-            if receipt.digest == value.digest {
-                return Ok(Plan::Current);
-            }
-            Ok(Plan::Update(Box::new(Baseline {
-                epoch: authority.epoch,
-                account: authority.account,
-                key: value.key.clone(),
-                local: receipt.local,
-                digest: receipt.digest,
-                changed: receipt.changed,
-                desired: value.digest,
-                folders: fences,
-            })))
-        })
+        let old = begin(client, &authority)?;
+        let Some(receipt) = receipt(client, &authority, &value.key, old)? else {
+            return Ok(Plan::New);
+        };
+        let current = match local(client, &authority, &value.key, &receipt, old) {
+            Ok(Some(current)) => current,
+            Ok(None) => return Ok(Plan::Absent),
+            Err(Error::Conflict) => return Ok(Plan::LocalChanged),
+            Err(e) => return Err(e),
+        };
+        if current.digest != receipt.digest {
+            return Ok(Plan::LocalChanged);
+        }
+        if current.role != value.role {
+            return Ok(Plan::RoleChanged);
+        }
+        let fences = match destination(client, &authority, &value, &definitions, None, old) {
+            Ok(fences) => fences,
+            Err(Error::Conflict | Error::MissingMailbox) => return Ok(Plan::FolderChanged),
+            Err(e) => return Err(e),
+        };
+        match candidate(
+            client,
+            &authority,
+            &value,
+            receipt.local,
+            parent(&value, &fences)?,
+            old,
+        ) {
+            Ok(()) => {}
+            Err(Error::Conflict) => return Ok(Plan::FolderChanged),
+            Err(e) => return Err(e),
+        }
+        if receipt.digest == value.digest {
+            return Ok(Plan::Current);
+        }
+        Ok(Plan::Update(Box::new(Baseline {
+            epoch: authority.epoch,
+            account: authority.account,
+            key: value.key.clone(),
+            local: receipt.local,
+            digest: receipt.digest,
+            changed: receipt.changed,
+            desired: value.digest,
+            folders: fences,
+        })))
     })
     .map_err(Error::Connection)?
 }
@@ -312,75 +306,67 @@ pub fn apply(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let old = begin(client, &authority).await?;
-            let receipt = receipt(client, &authority, &value.key, old)
-                .await?
-                .ok_or(Error::Conflict)?;
-            if receipt.local != expected.local {
-                return Err(Error::Conflict);
-            }
-            let present: bool = client
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND id=$2)",
-                    &[
-                        &authority.account.as_bytes().as_slice(),
-                        &receipt.local.as_slice(),
-                    ],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                .try_get(0)
-                .map_err(|_| Error::Integrity)?;
-            if !present {
-                return Ok(Applied::Absent);
-            }
-            if receipt.digest == value.digest {
-                return Ok(Applied::CurrentReceipt);
-            }
-            if receipt.digest != expected.digest || receipt.changed != expected.changed {
-                return Err(Error::Conflict);
-            }
-            let current = local(client, &authority, &value.key, &receipt, old)
-                .await?
-                .ok_or(Error::Conflict)?;
-            if current.digest != receipt.digest {
-                return Err(Error::Conflict);
-            }
-            if current.role != value.role {
-                return Err(Error::SourceChanged);
-            }
-            let fences = destination(
-                client,
-                &authority,
-                &value,
-                &definitions,
-                Some(&expected.folders),
-                old,
+        let old = begin(client, &authority)?;
+        let receipt = receipt(client, &authority, &value.key, old)?.ok_or(Error::Conflict)?;
+        if receipt.local != expected.local {
+            return Err(Error::Conflict);
+        }
+        let present: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND id=$2)",
+                &[
+                    &authority.account.as_bytes().as_slice(),
+                    &receipt.local.as_slice(),
+                ],
             )
-            .await?;
-            let parent = parent(&value, &fences)?;
-            candidate(client, &authority, &value, receipt.local, parent, old).await?;
-            let next = next(client, &authority, old).await?;
-            let changed = next.to_be_bytes();
-            let account = authority.account.as_bytes().as_slice();
-            if client.execute("UPDATE td_mta.mailboxes SET name=$3,parent_id=$4,sort_order=$5,subscribed=$6,changed=$7 WHERE account=$1 AND id=$2",&[&account,&receipt.local.as_slice(),&value.name,&parent.as_ref().map(|p|p.as_slice()),&i64::from(value.sort_order),&i64::from(value.subscribed),&changed.as_slice()]).await.map_err(|_|Error::Database)?!=1{return Err(Error::Integrity)}
-            history(client, authority.account, next, 0, 1, 2, &receipt.local).await?;
-            if client.execute("UPDATE td_mta.imports SET source_digest=$5,changed=$6 WHERE account=$1 AND source_instance=$2 AND source_kind=1 AND source_account=$3 AND source_object=$4",&[&account,&value.key.instance.as_bytes().as_slice(),&value.key.account.as_slice(),&value.key.object.as_slice(),&value.digest.as_slice(),&changed.as_slice()]).await.map_err(|_|Error::Database)?!=1{return Err(Error::Integrity)}
-            if client
-                .execute(
-                    "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
-                    &[&account, &changed.as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            commit(client, &marker).await?;
-            Ok(Applied::Updated)
-        })
+            .map_err(|_| Error::Database)?
+            .try_get(0)
+            .map_err(|_| Error::Integrity)?;
+        if !present {
+            return Ok(Applied::Absent);
+        }
+        if receipt.digest == value.digest {
+            return Ok(Applied::CurrentReceipt);
+        }
+        if receipt.digest != expected.digest || receipt.changed != expected.changed {
+            return Err(Error::Conflict);
+        }
+        let current =
+            local(client, &authority, &value.key, &receipt, old)?.ok_or(Error::Conflict)?;
+        if current.digest != receipt.digest {
+            return Err(Error::Conflict);
+        }
+        if current.role != value.role {
+            return Err(Error::SourceChanged);
+        }
+        let fences = destination(
+            client,
+            &authority,
+            &value,
+            &definitions,
+            Some(&expected.folders),
+            old,
+        )?;
+        let parent = parent(&value, &fences)?;
+        candidate(client, &authority, &value, receipt.local, parent, old)?;
+        let next = next(client, &authority, old)?;
+        let changed = next.to_be_bytes();
+        let account = authority.account.as_bytes().as_slice();
+        if client.execute("UPDATE td_mta.mailboxes SET name=$3,parent_id=$4,sort_order=$5,subscribed=$6,changed=$7 WHERE account=$1 AND id=$2",&[&account,&receipt.local.as_slice(),&value.name,&parent.as_ref().map(|p|p.as_slice()),&i64::from(value.sort_order),&i64::from(value.subscribed),&changed.as_slice()]).map_err(|_|Error::Database)?!=1{return Err(Error::Integrity)}
+        history(client, authority.account, next, 0, 1, 2, &receipt.local)?;
+        if client.execute("UPDATE td_mta.imports SET source_digest=$5,changed=$6 WHERE account=$1 AND source_instance=$2 AND source_kind=1 AND source_account=$3 AND source_object=$4",&[&account,&value.key.instance.as_bytes().as_slice(),&value.key.account.as_slice(),&value.key.object.as_slice(),&value.digest.as_slice(),&changed.as_slice()]).map_err(|_|Error::Database)?!=1{return Err(Error::Integrity)}
+        if client
+            .execute(
+                "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
+                &[&account, &changed.as_slice()],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        commit(client, &marker)?;
+        Ok(Applied::Updated)
     });
     settled(result, &attempted)
 }

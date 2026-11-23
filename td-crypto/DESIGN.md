@@ -38,7 +38,7 @@ td-mta (library and packaging executable)
   -> td-json (bounded JSON framing and td-alloc owned parser backing)
   -> td-mime (std-only MIME/header/charset/Unicode implementation)
   -> td-nfc (std-only bounded canonical composition)
-  -> tokio-postgres (private PostgreSQL backend, runtime disabled)
+  -> td-postgres (std-only synchronous PostgreSQL client)
   -> td-crypto (td-owned API and private backend)
        -> rustls (no built-in backend) + reviewed root data
        -> td-tls-provider (rustls CryptoProvider over td-primitives)
@@ -50,18 +50,15 @@ admission, td-mta is this crate's only permitted roster consumer. The common
 gate must reject other direct or transitive consumers; the engine workspace
 and other std-only roster crates cannot inherit its external closure.
 
-The mail lock admits the user-approved tokio-postgres 0.7.18 closure
-with default features disabled. SCRAM authentication uses private hmac/sha2,
-stringprep and rand; md-5 compiles in the upstream protocol crate, but mail's
-connection policy refuses legacy database authentication. These implementations
-stay inside the private mail driver and do not widen this crate's API or TLS
-provider. Tokio supplies I/O traits and synchronization only; its runtime,
-net and time features are absent. No other roster consumer is admitted.
+td-mta's PostgreSQL client is the local `td-postgres`, whose SCRAM uses
+td-primitives and which carries no TLS: td-mta hands it a connector over
+this crate's session. It does not widen this crate's API or TLS provider.
+No other roster consumer is admitted.
 
-The common offline vendor uses the mail lock's union of crypto and PostgreSQL
-sources, checking every archive checksum. Crypto's selected graph is eight
-registry packages, td-tls-provider's seven and webpki-roots; mail adds the 56
-selected PostgreSQL-side packages listed in DEPENDENCIES.md. Exact manifests, locks and active features are pinned in the
+The common offline vendor uses the mail lock, checking every archive
+checksum. Crypto's selected graph is eight registry packages,
+td-tls-provider's seven and webpki-roots; mail selects the same eight and
+local crates only. Exact manifests, locks and active features are pinned in the
 shared policy. Mail's POSTGRES.md owns SQL and database resource semantics;
 STORAGE.md owns local runtime and response scratch. Native mail qualification
 requires independently installed PostgreSQL binaries; these host test tools

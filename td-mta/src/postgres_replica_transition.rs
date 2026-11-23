@@ -1,4 +1,5 @@
 //! Commit the old page's cursor and exact next work atomically.
+use crate::postgres_probe::Client;
 use crate::{
     postgres_probe,
     postgres_replica_apply::Error,
@@ -11,9 +12,8 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
-use tokio_postgres::{types::Type, Client};
 
-pub(crate) async fn advance(
+pub(crate) fn advance(
     client: &Client,
     transition: &Transition,
     deadline: Instant,
@@ -21,11 +21,10 @@ pub(crate) async fn advance(
 ) -> Result<Ticket, Error> {
     let account = transition.account.as_bytes().as_slice();
     if client
-        .query_typed_opt(
+        .query_opt(
             "SELECT id FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-            &[(&account, Type::BYTEA)],
+            &[&account],
         )
-        .await
         .map_err(|_| Error::Database)?
         .is_none()
     {
@@ -34,7 +33,6 @@ pub(crate) async fn advance(
     let source = Source::new(transition.source.origin(), transition.source.epoch())
         .map_err(|_| Error::Source)?;
     let progress = postgres_replica_progress::read_snapshot(client, source, transition.account)
-        .await
         .map_err(|_| Error::Integrity)?;
     let current = progress.pending.as_ref().ok_or(Error::Stale)?;
     let pending = &transition.pending;
@@ -76,11 +74,11 @@ pub(crate) async fn advance(
             .map(|c| c.encode(&mut encoded))
             .transpose()
             .map_err(|_| Error::Integrity)?;
-        if client.execute_typed("UPDATE td_mta.replica_progress SET inventory_cursor=$2,inventory_complete=$3,email_cursor=$4 WHERE account=$1",&[(&account,Type::BYTEA),(&cursor,Type::TEXT),(&complete,Type::BOOL),(&email_cursor.sequence.number().to_be_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
-        client.execute_typed(
+        if client.execute("UPDATE td_mta.replica_progress SET inventory_cursor=$2,inventory_complete=$3,email_cursor=$4 WHERE account=$1",&[&account, &cursor, &complete, &email_cursor.sequence.number().to_be_bytes().as_slice()]).map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
+        client.execute(
             "DELETE FROM td_mta.replica_email_receipts WHERE account=$1 AND id IN (SELECT id FROM td_mta.replica_email_receipts WHERE account=$1 AND NOT present AND observed<$2 ORDER BY observed,id LIMIT $3)",
-            &[(&account,Type::BYTEA),(&email_cursor.sequence.number().to_be_bytes().as_slice(),Type::BYTEA),(&(crate::replica_pending::MAX_IDS as i64),Type::INT8)],
-        ).await.map_err(|_|Error::Database)?;
+            &[&account, &email_cursor.sequence.number().to_be_bytes().as_slice(), &(crate::replica_pending::MAX_IDS as i64)],
+        ).map_err(|_|Error::Database)?;
         let mut ids = Vec::new();
         ids.try_reserve_exact(pending.ids().len().checked_mul(16).ok_or(Error::Capacity)?)
             .map_err(|_| Error::Capacity)?;
@@ -102,16 +100,13 @@ pub(crate) async fn advance(
             .transpose()
             .map_err(|_| Error::Integrity)?;
         let next_state = next_state.as_ref().map(|n| n.as_slice());
-        if client.execute_typed("UPDATE td_mta.replica_pending SET generation=$2,page=$3,kind=$4,observed=$5,ids=$6,done=$7,next_cursor=$8,next_state=$9,more=$10 WHERE account=$1",&[(&account,Type::BYTEA),(&pending.ticket().generation.to_be_bytes().as_slice(),Type::BYTEA),(&pending.ticket().page.to_be_bytes().as_slice(),Type::BYTEA),(&kind,Type::INT4),(&pending.observed().sequence.number().to_be_bytes().as_slice(),Type::BYTEA),(&ids.as_slice(),Type::BYTEA),(&pending.done().as_slice(),Type::BYTEA),(&next_cursor,Type::TEXT),(&next_state,Type::BYTEA),(&more,Type::BOOL)]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
+        if client.execute("UPDATE td_mta.replica_pending SET generation=$2,page=$3,kind=$4,observed=$5,ids=$6,done=$7,next_cursor=$8,next_state=$9,more=$10 WHERE account=$1",&[&account, &pending.ticket().generation.to_be_bytes().as_slice(), &pending.ticket().page.to_be_bytes().as_slice(), &kind, &pending.observed().sequence.number().to_be_bytes().as_slice(), &ids.as_slice(), &pending.done().as_slice(), &next_cursor, &next_state, &more]).map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
     }
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
     marker.store(true, Ordering::Relaxed);
-    client
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|_| Error::Indeterminate)?;
+    client.commit().map_err(|_| Error::Indeterminate)?;
     Ok(pending.ticket())
 }
 fn same_page(a: &Pending, b: &Pending) -> bool {

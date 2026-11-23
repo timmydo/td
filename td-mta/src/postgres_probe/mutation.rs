@@ -75,13 +75,10 @@ impl MutationSession {
         )?;
         worker.deadline = deadline;
         let schema = worker.run(|client| {
-            Box::pin(async move {
-                let receipt = postgres_schema::lock_and_inspect(client)
-                    .await
-                    .map_err(|_| Error::RuntimeSchema)?;
-                super::qualify_runtime(client).await?;
-                Ok(receipt)
-            })
+            let receipt =
+                postgres_schema::lock_and_inspect(client).map_err(|_| Error::RuntimeSchema)?;
+            super::qualify_runtime(client)?;
+            Ok(receipt)
         })??;
         Ok(Self {
             worker,
@@ -145,27 +142,21 @@ impl MutationSession {
                 .map_err(|_| Error::Database)?,
             None => self.worker.begin_validation_turn()?,
         }
-        self.worker.run(move |client| Box::pin(async move {
-            client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            let row = client.query_typed_one("SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true", &[]).await.map_err(|_| Error::Database)?;
+        self.worker.run(move |client| {
+            client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            let row = client.query_one("SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true", &[]).map_err(|_| Error::Database)?;
             let observed: &[u8] = row.try_get(0).map_err(|_| Error::RuntimeSchema)?;
             let blocked: bool = row.try_get(1).map_err(|_| Error::RuntimeMaintenance)?;
             if observed != epoch.as_bytes().as_slice() { return Err(Error::RuntimeSchema); }
             if blocked { return Err(Error::RuntimeMaintenance); }
             Ok(())
-        }))??;
+        })??;
         Ok(())
     }
     fn finish(&mut self, rollback: bool) -> Result<(), Error> {
         if rollback {
-            self.worker.run(|client| {
-                Box::pin(async move {
-                    client
-                        .batch_execute("ROLLBACK")
-                        .await
-                        .map_err(|_| Error::Database)
-                })
-            })??;
+            self.worker
+                .run(|client| client.rollback().map_err(|_| Error::Database))??;
         }
         self.worker.check_deadline()?;
         self.worker.check()?;
@@ -183,9 +174,7 @@ impl MutationSession {
             self.begin(epoch, Some(bindings.len()), deadline)
                 .map_err(receiving::Error::Connection)?;
             self.worker
-                .run(move |client| {
-                    Box::pin(async move { fanout::ready_body(client, &bindings).await })
-                })
+                .run(move |client| fanout::ready_body(client, &bindings))
                 .map_err(receiving::Error::Connection)??;
             self.finish(true).map_err(receiving::Error::Connection)
         })();
@@ -205,11 +194,7 @@ impl MutationSession {
                 .map_err(receiving::Error::Connection)?;
             let check = self
                 .worker
-                .run(move |client| {
-                    Box::pin(
-                        async move { fanout::recipient_body(client, scope, declared_bytes).await },
-                    )
-                })
+                .run(move |client| fanout::recipient_body(client, scope, declared_bytes))
                 .map_err(receiving::Error::Connection)??;
             self.finish(true).map_err(receiving::Error::Connection)?;
             Ok(check)
@@ -230,11 +215,10 @@ impl MutationSession {
             self.begin(fanout.epoch()?, Some(fanout.count()), deadline)
                 .map_err(receiving::Error::Connection)?;
             let fanout = fanout.clone();
-            match self.worker.run(move |client| {
-                Box::pin(
-                    async move { fanout::publish_body(client, &fanout, deadline, &marker).await },
-                )
-            }) {
+            match self
+                .worker
+                .run(move |client| fanout::publish_body(client, &fanout, deadline, &marker))
+            {
                 Ok(result) => result,
                 Err(_) if attempted.load(Ordering::Relaxed) => Err(receiving::Error::Indeterminate),
                 Err(error) => Err(receiving::Error::Connection(error)),
@@ -270,11 +254,10 @@ impl MutationSession {
                 .epoch();
             self.begin(epoch, None, deadline)
                 .map_err(owners::Error::Connection)?;
-            match self.worker.run(move |client| {
-                Box::pin(
-                    async move { owners::update_many_body(client, &values, false, &marker).await },
-                )
-            }) {
+            match self
+                .worker
+                .run(move |client| owners::update_many_body(client, &values, false, &marker))
+            {
                 Ok(result) => result,
                 Err(_) if attempted.load(Ordering::Relaxed) => Err(owners::Error::Indeterminate),
                 Err(error) => Err(owners::Error::Connection(error)),

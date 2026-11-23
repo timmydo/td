@@ -1001,8 +1001,9 @@ exception is `td-crypto`'s private Rustls closure: exact manifests, locks,
 root Cargo configuration and active features are pinned in
 `builder/src/crypto_policy.rs`. `td-mta` depends directly on local
 `td-crypto` and std-only `td-civil`, `td-header` plus `td-html`,
-`td-json`, `td-mime`, `td-nfc` and `td-fs`, and the approved private
-`tokio-postgres` 0.7.18 closure with its runtime feature disabled.
+`td-json`, `td-mime`, `td-nfc`, `td-fs` and `td-postgres`, its
+synchronous PostgreSQL client (std-only, over `td-alloc`, `td-encoding`,
+`td-fs` and `td-primitives`); it has no external dependency of its own.
 PostgreSQL is the sole mail backend described in `td-mta/POSTGRES.md`. Its
 exact manifest, lock and active features are pinned in the same policy.
 The std-only `td-fs` owns bounded private socket dialing and test scratch.
@@ -1011,16 +1012,16 @@ on rustls 0.23.46 with no built-in backend and on local `td-primitives`;
 its exact manifest, lock and active features are pinned in the same
 policy. `td-crypto` depends on rustls with no built-in backend and on
 local `td-tls-provider` and `td-primitives`, which supply all its
-cryptography. All twelve local manifests and locks are pinned,
+cryptography. All fifteen local manifests and locks are pinned,
 `td-primitives` among them, and `td-source-scan`, which the portable
-builds stage only so Cargo can compile td-primitives' tests. No roster
+builds stage only so Cargo can compile td-primitives' tests, is one of
+them. No roster
 crate outside the admission may depend on `td-crypto`, `td-mta` or
 `td-tls-provider`, directly or transitively; `td-header`, `td-civil`,
-`td-html`, `td-json`, `td-mime`, `td-nfc` and `td-primitives` remain
-ordinary std-only shared crates. `td-crypto/DESIGN.md` owns offline
+`td-html`, `td-json`, `td-mime`, `td-nfc`, `td-postgres`, `td-encoding` and
+`td-primitives` remain ordinary std-only shared crates. `td-crypto/DESIGN.md` owns offline
 preparation and crypto confinement; `td-mta/STORAGE.md` owns local scratch
-and the storage boundary. No other roster crate may consume the PostgreSQL
-closure, directly or transitively. Any new external dependency needs
+and the storage boundary. Any new external dependency needs
 principle-2 sign-off (`AGENTS.md`).
 
 A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`

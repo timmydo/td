@@ -1,4 +1,5 @@
 //! Bounded source graph publication with deferred local removal dependencies.
+use crate::postgres_probe::{Client, Row};
 use crate::{
     format::{
         key::Key,
@@ -14,7 +15,6 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
-use tokio_postgres::{types::Type, Client, Row};
 const MAX: usize = crate::postgres_mailboxes::MAX_MAILBOXES;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Outcome {
@@ -38,7 +38,7 @@ fn bytes<const N: usize>(row: &Row, index: usize) -> Result<[u8; N], Error> {
     let bytes: &[u8] = row.try_get(index).map_err(|_| Error::Integrity)?;
     bytes.try_into().map_err(|_| Error::Integrity)
 }
-fn decode(row: &Row, sequence: u64) -> Result<Stored<'_>, Error> {
+fn decode<'a>(row: &Row<'a>, sequence: u64) -> Result<Stored<'a>, Error> {
     let id = MailboxId::from_bytes(bytes(row, 0)?);
     let parent: Option<&[u8]> = row.try_get(2).map_err(|_| Error::Integrity)?;
     let parent = parent
@@ -84,7 +84,7 @@ fn reserve<T>(n: usize) -> Result<Vec<T>, Error> {
     Ok(values)
 }
 
-pub(crate) async fn publish(
+pub(crate) fn publish(
     client: &Client,
     graph: &Graph,
     deadline: Instant,
@@ -92,21 +92,19 @@ pub(crate) async fn publish(
 ) -> Result<Outcome, Error> {
     let account = graph.account.as_bytes().as_slice();
     let row = client
-        .query_typed_opt(
+        .query_opt(
             "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-            &[(&account, Type::BYTEA)],
+            &[&account],
         )
-        .await
         .map_err(|_| Error::Database)?
         .ok_or(Error::Missing)?;
-    let old = u64::from_be_bytes(bytes(&row, 0)?);
-    if u64::from_be_bytes(bytes(&row, 1)?) > old {
+    let old = u64::from_be_bytes(bytes(&row.row(), 0)?);
+    if u64::from_be_bytes(bytes(&row.row(), 1)?) > old {
         return Err(Error::Integrity);
     }
     let source =
         Source::new(graph.source.origin(), graph.source.epoch()).map_err(|_| Error::Source)?;
     let progress = postgres_replica_progress::read_snapshot(client, source, graph.account)
-        .await
         .map_err(|_| Error::Integrity)?;
     let observed = graph.observed.sequence.number();
     if progress.generation != graph.generation
@@ -115,30 +113,29 @@ pub(crate) async fn publish(
         return Err(Error::Stale);
     }
     let row = client
-        .query_typed_one(
+        .query_one(
             "SELECT inbox FROM td_mta.account_bootstraps WHERE account=$1",
-            &[(&account, Type::BYTEA)],
+            &[&account],
         )
-        .await
         .map_err(|_| Error::Database)?;
-    if bytes::<16>(&row, 0)? != *graph.inbox.as_bytes() {
+    if bytes::<16>(&row.row(), 0)? != *graph.inbox.as_bytes() {
         return Err(Error::Integrity);
     }
-    let row=client.query_typed_opt("SELECT observed FROM td_mta.replica_mailbox_receipts WHERE account=$1 ORDER BY observed DESC LIMIT 1",&[(&account,Type::BYTEA)]).await.map_err(|_|Error::Database)?.ok_or(Error::Integrity)?;
-    let latest = u64::from_be_bytes(bytes(&row, 0)?);
+    let row=client.query_opt("SELECT observed FROM td_mta.replica_mailbox_receipts WHERE account=$1 ORDER BY observed DESC LIMIT 1",&[&account]).map_err(|_|Error::Database)?.ok_or(Error::Integrity)?;
+    let latest = u64::from_be_bytes(bytes(&row.row(), 0)?);
     if latest > observed {
         return Err(Error::Stale);
     }
     if latest < progress.mailbox_checkpoint.sequence.number() {
         return Err(Error::Integrity);
     }
-    let rows=client.query_typed("SELECT m.id,m.name,m.parent_id,m.role,m.sort_order,m.subscribed,m.changed,r.observed,r.present,EXISTS(SELECT 1 FROM td_mta.memberships x WHERE x.account=m.account AND x.mailbox_id=m.id) FROM td_mta.mailboxes m LEFT JOIN td_mta.replica_mailbox_receipts r ON r.account=m.account AND r.id=m.id WHERE m.account=$1 ORDER BY m.id LIMIT 257",&[(&account,Type::BYTEA)]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT m.id,m.name,m.parent_id,m.role,m.sort_order,m.subscribed,m.changed,r.observed,r.present,EXISTS(SELECT 1 FROM td_mta.memberships x WHERE x.account=m.account AND x.mailbox_id=m.id) FROM td_mta.mailboxes m LEFT JOIN td_mta.replica_mailbox_receipts r ON r.account=m.account AND r.id=m.id WHERE m.account=$1 ORDER BY m.id LIMIT 257",&[&account]).map_err(|_|Error::Database)?;
     if rows.len() > MAX {
         return Err(Error::Capacity);
     }
     let mut stored = reserve(rows.len())?;
     for row in &rows {
-        let value = decode(row, old)?;
+        let value = decode(&row, old)?;
         if value.observed > latest {
             return Err(Error::Integrity);
         }
@@ -156,12 +153,12 @@ pub(crate) async fn publish(
     };
     let mut ids = reserve(view.list.len())?;
     ids.extend(view.list.iter().map(|m| m.id.as_bytes().as_slice()));
-    let present=client.query_typed("SELECT id FROM td_mta.replica_mailbox_receipts WHERE account=$1 AND present ORDER BY id LIMIT 257",&[(&account,Type::BYTEA)]).await.map_err(|_|Error::Database)?;
+    let present=client.query("SELECT id FROM td_mta.replica_mailbox_receipts WHERE account=$1 AND present ORDER BY id LIMIT 257",&[&account]).map_err(|_|Error::Database)?;
     if present.len() > MAX || present.len() != stored.iter().filter(|m| m.present).count() {
         return Err(Error::Integrity);
     }
     for row in &present {
-        let id = MailboxId::from_bytes(bytes(row, 0)?);
+        let id = MailboxId::from_bytes(bytes(&row, 0)?);
         if !stored.iter().any(|m| m.id == id && m.present) {
             return Err(Error::Integrity);
         }
@@ -252,27 +249,23 @@ pub(crate) async fn publish(
     } else {
         old.checked_add(1).ok_or(Error::Capacity)?
     };
-    write_changes(client, account, &changes, next).await?;
-    client.execute_typed("UPDATE td_mta.replica_mailbox_receipts SET observed=$3,present=false WHERE account=$1 AND present AND NOT(id=ANY($2::bytea[]))",&[(&account,Type::BYTEA),(&ids,Type::BYTEA_ARRAY),(&observed.to_be_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?;
-    if client.execute_typed("INSERT INTO td_mta.replica_mailbox_receipts(account,id,observed,present) SELECT $1,id,$3,true FROM unnest($2::bytea[]) q(id) ON CONFLICT(account,id) DO UPDATE SET observed=EXCLUDED.observed,present=true",&[(&account,Type::BYTEA),(&ids,Type::BYTEA_ARRAY),(&observed.to_be_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?!=ids.len() as u64 {return Err(Error::Integrity);}
-    client.execute_typed(
+    write_changes(client, account, &changes, next)?;
+    client.execute("UPDATE td_mta.replica_mailbox_receipts SET observed=$3,present=false WHERE account=$1 AND present AND NOT(id=ANY($2::bytea[]))",&[&account, &ids, &observed.to_be_bytes().as_slice()]).map_err(|_|Error::Database)?;
+    if client.execute("INSERT INTO td_mta.replica_mailbox_receipts(account,id,observed,present) SELECT $1,id,$3,true FROM unnest($2::bytea[]) q(id) ON CONFLICT(account,id) DO UPDATE SET observed=EXCLUDED.observed,present=true",&[&account, &ids, &observed.to_be_bytes().as_slice()]).map_err(|_|Error::Database)?!=ids.len() as u64 {return Err(Error::Integrity);}
+    client.execute(
         "DELETE FROM td_mta.replica_mailbox_receipts r WHERE account=$1 AND NOT present AND NOT EXISTS (SELECT FROM td_mta.mailboxes m WHERE (m.account,m.id)=(r.account,r.id))",
-        &[(&account, Type::BYTEA)],
-    ).await.map_err(|_| Error::Database)?;
+        &[&account],
+    ).map_err(|_| Error::Database)?;
     let checkpoint = if retained.is_empty() {
         observed
     } else {
         progress.mailbox_checkpoint.sequence.number()
     };
     if client
-        .execute_typed(
+        .execute(
             "UPDATE td_mta.replica_progress SET mailbox_checkpoint=$2 WHERE account=$1",
-            &[
-                (&account, Type::BYTEA),
-                (&checkpoint.to_be_bytes().as_slice(), Type::BYTEA),
-            ],
+            &[&account, &checkpoint.to_be_bytes().as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {
@@ -280,14 +273,10 @@ pub(crate) async fn publish(
     }
     if next != old
         && client
-            .execute_typed(
+            .execute(
                 "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
-                &[
-                    (&account, Type::BYTEA),
-                    (&next.to_be_bytes().as_slice(), Type::BYTEA),
-                ],
+                &[&account, &next.to_be_bytes().as_slice()],
             )
-            .await
             .map_err(|_| Error::Database)?
             != 1
     {
@@ -297,17 +286,14 @@ pub(crate) async fn publish(
         return Err(Error::Connection(crate::postgres_probe::Error::Deadline));
     }
     marker.store(true, Ordering::Relaxed);
-    client
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|_| Error::Indeterminate)?;
+    client.commit().map_err(|_| Error::Indeterminate)?;
     Ok(Outcome {
         changed: next != old,
         pending_removals: retained.len(),
         local_sequence: next,
     })
 }
-async fn write_changes(
+fn write_changes(
     client: &Client,
     account: &[u8],
     changes: &[Change<'_>],
@@ -341,19 +327,18 @@ async fn write_changes(
     }
     let mut parent_values = reserve(parents.len())?;
     parent_values.extend(parents.iter().map(|id| id.as_ref().map(|id| id.as_slice())));
-    if !written.is_empty() && client.execute_typed("INSERT INTO td_mta.mailboxes(account,id,name,parent_id,role,sort_order,subscribed,changed) SELECT $1,id,name,parent_id,role,sort_order,subscribed,$2 FROM unnest($3::bytea[],$4::text[],$5::bytea[],$6::text[],$7::bigint[],$8::bigint[]) q(id,name,parent_id,role,sort_order,subscribed) ON CONFLICT(account,id) DO UPDATE SET name=EXCLUDED.name,parent_id=EXCLUDED.parent_id,role=EXCLUDED.role,sort_order=EXCLUDED.sort_order,subscribed=EXCLUDED.subscribed,changed=EXCLUDED.changed",&[(&account,Type::BYTEA),(&next.to_be_bytes().as_slice(),Type::BYTEA),(&written,Type::BYTEA_ARRAY),(&names,Type::TEXT_ARRAY),(&parent_values,Type::BYTEA_ARRAY),(&roles,Type::TEXT_ARRAY),(&sorts,Type::INT8_ARRAY),(&subscriptions,Type::INT8_ARRAY)]).await.map_err(|_|Error::Database)?!=written.len() as u64 {return Err(Error::Integrity);}
+    if !written.is_empty() && client.execute("INSERT INTO td_mta.mailboxes(account,id,name,parent_id,role,sort_order,subscribed,changed) SELECT $1,id,name,parent_id,role,sort_order,subscribed,$2 FROM unnest($3::bytea[],$4::text[],$5::bytea[],$6::text[],$7::bigint[],$8::bigint[]) q(id,name,parent_id,role,sort_order,subscribed) ON CONFLICT(account,id) DO UPDATE SET name=EXCLUDED.name,parent_id=EXCLUDED.parent_id,role=EXCLUDED.role,sort_order=EXCLUDED.sort_order,subscribed=EXCLUDED.subscribed,changed=EXCLUDED.changed",&[&account, &next.to_be_bytes().as_slice(), &written, &names, &parent_values, &roles, &sorts, &subscriptions]).map_err(|_|Error::Database)?!=written.len() as u64 {return Err(Error::Integrity);}
     if !deleted.is_empty()
         && client
-            .execute_typed(
+            .execute(
                 "DELETE FROM td_mta.mailboxes WHERE account=$1 AND id=ANY($2::bytea[])",
-                &[(&account, Type::BYTEA), (&deleted, Type::BYTEA_ARRAY)],
+                &[&account, &deleted],
             )
-            .await
             .map_err(|_| Error::Database)?
             != deleted.len() as u64
     {
         return Err(Error::Integrity);
     }
-    if client.execute_typed("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$2,ordinality,1,action,id FROM unnest($3::bytea[],$4::bigint[]) WITH ORDINALITY q(id,action,ordinality)",&[(&account,Type::BYTEA),(&next.to_be_bytes().as_slice(),Type::BYTEA),(&ids,Type::BYTEA_ARRAY),(&actions,Type::INT8_ARRAY)]).await.map_err(|_|Error::Database)?!=ids.len() as u64 {return Err(Error::Integrity);}
+    if client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$2,ordinality,1,action,id FROM unnest($3::bytea[],$4::bigint[]) WITH ORDINALITY q(id,action,ordinality)",&[&account, &next.to_be_bytes().as_slice(), &ids, &actions]).map_err(|_|Error::Database)?!=ids.len() as u64 {return Err(Error::Integrity);}
     Ok(())
 }

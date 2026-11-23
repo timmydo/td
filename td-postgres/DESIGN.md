@@ -2,41 +2,45 @@
 
 td-postgres is td's own PostgreSQL client: frontend/backend protocol 3.0
 over a blocking stream, SCRAM-SHA-256 login, the simple and extended
-queries, and the handful of types td-mta stores. It exists so td-mta,
-whose workers are threads, can drop tokio-postgres, tokio and their
-private closure (`builder/src/crypto_policy.rs`) for a std-only client
-whose every bound is the caller's.
+queries, and the handful of types td-mta stores. td-mta, whose workers
+are threads, uses it in place of the async driver and external closure
+it first admitted: a std-only client whose every bound is the caller's.
 
 The crate depends on std and on td-alloc, td-encoding, td-fs and
 td-primitives. It forbids `unsafe`. Its cryptography is td-primitives'
 SHA-256, HMAC, PBKDF2, entropy and constant-time comparison; TLS is a
 connector the caller supplies.
 
-## What td-mta uses of its driver
+## What td-mta uses
 
 The client covers exactly this surface, read from td-mta's sources
 (`td-mta/src/postgres_*.rs`, `postgres_probe.rs` and its modules), and
-nothing past it.
+nothing past it. td-mta reaches it through `postgres_probe::Client`, a
+per-worker adapter that holds the worker's deadline, makes a deadline or
+broken session sticky for the worker, and copies owned results through
+td-alloc.
 
 | Concern | What td-mta does |
 | --- | --- |
-| Endpoint | TCP to a caller-resolved address, or a private or group-shared Unix-domain socket whose ownership td-mta checks first (`td_fs::check_server_socket`) |
-| TLS | TCP always: `SslMode::Require` with `SslNegotiation::Postgres`, the SSLRequest handshake, then td-mta's own `TlsIo` over a td-crypto `TlsSession` verifying chain and name. Unix sockets: none. No direct TLS, no fallback, no channel binding (`ChannelBinding::Disable`) |
+| Endpoint | A private or group-shared Unix-domain socket whose ownership td-mta checks first (`td_fs::check_server_socket`), through `connect_unix_through` with td-mta's stream filter; transitionally, TCP to a caller-resolved address |
+| TLS | TCP always: the SSLRequest handshake (`start_tls`, after td-mta's own TCP connect), then td-mta's connector, its own `TlsIo` over a td-crypto `TlsSession` verifying chain and name. Unix sockets: none. No direct TLS, no fallback, no channel binding |
 | Login | SCRAM-SHA-256 only. td-mta's input filter (`postgres_probe/framing.rs`) refuses any other authentication request, AuthenticationOk without the SASL exchange, and any ReadyForQuery before authentication. Passwords are generated hex tokens, at most 4096 bytes |
 | Startup parameters | user, dbname, password, `application_name = td-mta-postgres`, and `options = -c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog` |
-| Simple query | `batch_execute`, 123 sites: BEGIN with isolation and `SET LOCAL` lines, COMMIT (40), ROLLBACK (22), LISTEN and NOTIFY, a few SET and DML statements; rows, as from `SELECT pg_advisory_xact_lock(...)`, are discarded. `simple_query`, once: the connection probe's five text settings |
-| Extended query | `query` 114, `query_one` 108, `query_opt` 11, `execute` 173, and the `_typed` forms (`query_typed` 32, `query_typed_one` 23, `query_typed_opt` 19, `execute_typed` 50). No explicit `prepare`, no `Statement` reuse, no portals or row streaming, no pipelining |
-| Transactions | Only through SQL text: `BEGIN ISOLATION LEVEL ...` then COMMIT or ROLLBACK. tokio-postgres's `Transaction` and savepoints are unused. Every COMMIT error is mapped to an indeterminate outcome, resolved later through durable receipts (POSTGRES.md section 3) |
+| Simple query | `batch`: BEGIN with isolation and `SET LOCAL` lines, LISTEN and NOTIFY, a few SET and DML statements; rows, as from `SELECT pg_advisory_xact_lock(...)`, are discarded. The connection probe reads its five text settings with `query` |
+| Extended query | `query`, `query_one`, `query_opt` and `execute`. No explicit `prepare`, no statement reuse, no portals or row streaming, no pipelining |
+| Transactions | `BEGIN ISOLATION LEVEL ...` through `batch`, then `commit` or `rollback`; no savepoints. Every COMMIT error where an outcome matters, `RolledBack` included, is taken as indeterminate and resolved later through durable receipts (POSTGRES.md section 3) |
 | Advisory locks | SQL functions only: `pg_try_advisory_lock_shared`, `pg_try_advisory_xact_lock[_shared]` (results `bool`), `pg_advisory_xact_lock` (in a batch) |
 | Notifications | `LISTEN td_mta_relay` on a retained read session; a NotificationResponse on that channel with an empty payload wakes the relay; an idle session is drained without a query to find a server-ended connection |
-| Not used | COPY, cancellation (`cancel_token`), function calls, replication, large objects, `Statement` metadata, `is_closed` |
+| Not used | COPY, cancellation, function calls, replication, large objects, statement metadata |
 
 Parameter types, each with its Rust form: `int2` (`i16`), `int4`
 (`i32`), `int8` (`i64`), `bool`, `bytea` (`&[u8]`, `Vec<u8>`), `text`
 (`&str`, `String`), any of those as `Option` for NULL, and the arrays
 `bytea[]` (`Vec<&[u8]>`, `Vec<Vec<u8>>`, `Vec<Option<&[u8]>>`), `int8[]`
 (`Vec<i64>`, `Vec<Option<i64>>`), `text[]` (`Vec<String>`, `Vec<&str>`)
-and `bool[]` (`Vec<bool>`).
+and `bool[]` (`Vec<bool>`). There is no `int4[]`: td-mta sends small
+integer arrays as `int8[]` and lets the column's assignment cast narrow
+them.
 
 Result types: `int2`, `int4`, `int8`, `bool`, `bytea`, `text` and
 `name` (as `&str` or `String`), each optionally NULL, and the arrays
@@ -45,17 +49,17 @@ by name (about 110). `timestamptz`, `interval` and `oid` appear only
 inside SQL (`lease_until > clock_timestamp()`, `oid::bigint`) and never
 cross the wire; `uuid`, `jsonb` and every other type are absent.
 
-Errors: td-mta maps every driver error to its own opaque kinds and reads
+Errors: td-mta maps every client error to its own opaque kinds and reads
 one field, the SQLSTATE, once: `55P03` (`lock_not_available`) in
-`postgres_route_owners.rs`. Messages are redacted by policy.
+`postgres_route_owners.rs`. Messages are never kept.
 
 Deadlines: connection at most ten seconds (`MAX_DURATION`), whole
 operations ten, thirty for stored bodies, up to an hour for owner audits,
-each an `Instant` the worker checks at every poll; server-side statement,
+each an `Instant` passed to every call; server-side statement,
 lock and idle-in-transaction timeouts from the startup options and
 `SET LOCAL`. Bounds: every backend message at most 128 KiB, and
 per-connection and per-turn input bytes, message counts and output bytes
-enforced by td-mta's stream-level filter before the driver reads.
+enforced by td-mta's stream-level filter before the client reads.
 
 ## Surface
 
@@ -82,16 +86,12 @@ enforced by td-mta's stream-level filter before the driver reads.
   above; `Array<'a>` reads `bytea[]`, `text[]`, `int8[]` and `bool[]` in
   place; `oid` names the type OIDs.
 
-A td-mta call site moves by dropping `.await`, passing a deadline,
-taking `&mut Client<S>` where it took `&Client`, replacing
-`&[(&value, Type::X)]` with `&[&value]`, and `try_get` with `get` or
-`get_named`. Every parameter names its own type, so an untyped call
-whose `&str` the server inferred as another type (`name`, `varchar`)
-now sends `text` and may need a cast. Owned results are read borrowed:
-`&str` or `&[u8]`, then a td-alloc copy, and arrays as `Array`
-iterations. The connection probe's one `simple_query`, which reads rows,
-becomes a `query`, since `batch` discards rows. A caller holding both
-Unix and TLS sessions names one `Stream` type over both.
+Every parameter names its own type, so a value the server would
+otherwise infer as another type (`name`, `varchar`) is sent as `text`
+and the SQL casts where it must. Owned results are read borrowed, `&str`
+or `&[u8]`, then copied through td-alloc, and arrays as `Array`
+iterations. td-mta names one `Stream` type over its Unix and TLS
+sessions.
 
 ## Stream and TLS
 

@@ -1,26 +1,17 @@
 //! PostgreSQL connection qualification and bounded worker-owned I/O.
 use crate::{
     clock::{RuntimeClock, TlsClockSource},
-    ports::{Clock, Deadline, FlushProgress, IoProgress, Transport},
-    tls_io::{TlsIo, TLS_WIRE_BYTES},
-    transport::TcpTransport,
-    unix_transport::UnixTransport,
+    ports::{Clock, Deadline},
 };
 use std::{
-    future::{poll_fn, Future},
-    io,
     net::{SocketAddr, TcpStream},
-    pin::{pin, Pin},
-    sync::Arc,
-    task::{Context, Poll, Waker},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use td_crypto::{ClientConfig, ClockHandle, TlsProtocol, TlsSession, TrustStore};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_postgres::{
-    config::{ChannelBinding, SslMode, SslNegotiation},
-    tls, Config, SimpleQueryMessage,
-};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Endpoint {
@@ -94,25 +85,25 @@ pub const MAX_AUDIT_DURATION: Duration = Duration::from_secs(3600);
 const BODY_CHECK_TURNS: usize = 8;
 
 /// Connect, authenticate, inspect primary/durability settings, and close.
-/// One bounded worker owns every future; no Tokio runtime or background task.
+/// One bounded worker owns the connection; no background thread or task.
 /// This proves neither schema compatibility nor replication durability.
 pub fn probe(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
 ) -> Result<Status, Error> {
-    let status = with_client(request, trust, deadline, |client| Box::pin(qualify(client)))??;
+    let status = with_client(request, trust, deadline, qualify)??;
     remaining(deadline)?;
     Ok(status)
 }
 
-// Only closed, bounded operations in this crate may use the driver. A known
-// mutation outcome must survive a deadline crossed while completing its poll.
+// Only closed, bounded operations in this crate may use the client. A known
+// mutation outcome survives a deadline crossed after its last call returned.
 pub(crate) fn with_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(request, trust, deadline, 64 * 1024, Input::new(), operation)
 }
@@ -123,7 +114,7 @@ pub(crate) fn with_capacity_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -140,7 +131,7 @@ pub(crate) fn with_material_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -157,7 +148,7 @@ pub(crate) fn with_mailbox_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -169,36 +160,12 @@ pub(crate) fn with_mailbox_client<T>(
     )
 }
 
-/// A worker-owned connection and the schema receipt protected by its session lock.
-/// Preparation connects without a receipt and inspects at the operation boundary.
-pub(crate) struct ScopedClient {
-    client: tokio_postgres::Client,
-    runtime_schema: Option<crate::postgres_schema::Receipt>,
-}
-impl std::ops::Deref for ScopedClient {
-    type Target = tokio_postgres::Client;
-
-    fn deref(&self) -> &Self::Target {
-        &self.client
-    }
-}
-impl ScopedClient {
-    pub(crate) async fn inspect_schema(
-        &self,
-    ) -> Result<crate::postgres_schema::Receipt, crate::postgres_schema::Error> {
-        match self.runtime_schema {
-            Some(receipt) => Ok(receipt),
-            None => crate::postgres_schema::lock_and_inspect(&self.client).await,
-        }
-    }
-}
-
 // At most 256 Email rows and 257 distinct mailbox rows, with protocol overhead.
 pub(crate) fn with_mutation_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -215,7 +182,7 @@ pub(crate) fn with_cancellation_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -232,7 +199,7 @@ pub(crate) fn with_batch_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -249,7 +216,7 @@ pub(crate) fn with_upload_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -268,7 +235,7 @@ pub(crate) fn with_import_client<T>(
     deadline: Instant,
     body_length: u64,
     guarded: bool,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     let mut worker = connect_worker_bounded(
         request,
@@ -287,7 +254,7 @@ pub(crate) fn with_import_mailbox_client<T>(
     trust: &TrustStore,
     deadline: Instant,
     guarded: bool,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -308,7 +275,7 @@ pub(crate) fn with_reconcile_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -326,7 +293,7 @@ pub(crate) fn with_fanout_client<T>(
     trust: &TrustStore,
     deadline: Instant,
     accounts: usize,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     if !(1..=crate::config::identities::MAX_ACCOUNTS).contains(&accounts) {
         return Err(Error::Invalid);
@@ -346,7 +313,7 @@ pub(crate) fn with_notice_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -363,7 +330,7 @@ pub(crate) fn with_schema_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_migration_client(request, trust, deadline, MAX_DURATION, operation)
 }
@@ -373,9 +340,8 @@ pub(crate) fn with_migration_client<T>(
     trust: &TrustStore,
     deadline: Instant,
     maximum: Duration,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    // Prepared names grow with the driver's process-wide statement counter.
     let mut worker = connect_worker_bounded(
         request,
         trust,
@@ -392,7 +358,7 @@ pub(crate) fn with_configuration_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
@@ -410,7 +376,7 @@ fn with_output_limit<T>(
     deadline: Instant,
     output_limit: usize,
     input: Input,
-    operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     let mut worker = connect_worker(request, trust, deadline, output_limit, input)?;
     worker.run(operation)
@@ -526,13 +492,10 @@ fn connect_worker_bounded(
     let mode = request.mode;
     if mode != Mode::Preparation {
         let schema = worker.run(|client| {
-            Box::pin(async move {
-                let receipt = crate::postgres_schema::lock_and_inspect(client)
-                    .await
-                    .map_err(|_| Error::RuntimeSchema)?;
-                qualify_runtime_mode(client, mode, Some(receipt.store_epoch)).await?;
-                Ok(receipt)
-            })
+            let receipt = crate::postgres_schema::lock_and_inspect(client)
+                .map_err(|_| Error::RuntimeSchema)?;
+            qualify_runtime_mode(client, mode, Some(receipt.store_epoch))?;
+            Ok(receipt)
         })??;
         worker
             .client
@@ -543,25 +506,22 @@ fn connect_worker_bounded(
     Ok(worker)
 }
 
-pub(crate) async fn qualify_runtime(client: &tokio_postgres::Client) -> Result<(), Error> {
-    qualify_runtime_mode(client, Mode::Runtime, None).await
+pub(crate) fn qualify_runtime(client: &Client) -> Result<(), Error> {
+    qualify_runtime_mode(client, Mode::Runtime, None)
 }
 
-pub(crate) async fn qualify_runtime_mode(
-    client: &tokio_postgres::Client,
+pub(crate) fn qualify_runtime_mode(
+    client: &Client,
     mode: Mode,
     epoch: Option<crate::ids::StoreEpoch>,
 ) -> Result<(), Error> {
     let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbRuntime);
     let result = match mode {
-        Mode::Runtime => crate::postgres_runtime_access::qualify(client).await,
-        Mode::ReplicaRead => {
-            crate::postgres_runtime_access::qualify_replica_reader(
-                client,
-                epoch.ok_or(Error::Invalid)?,
-            )
-            .await
-        }
+        Mode::Runtime => crate::postgres_runtime_access::qualify(client),
+        Mode::ReplicaRead => crate::postgres_runtime_access::qualify_replica_reader(
+            client,
+            epoch.ok_or(Error::Invalid)?,
+        ),
         Mode::Preparation => return Err(Error::Invalid),
     }
     .map_err(|error| match error {
@@ -605,6 +565,34 @@ fn connect_authenticated_bounded(
     )
 }
 
+/// The session settings every connection starts with.
+const OPTIONS: &str = "-c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog";
+/// The largest backend message, the frame filter's 128 KiB less the
+/// length word td-postgres does not count.
+const MESSAGE_BYTES: usize = 128 * 1024 - 4;
+/// The largest request td-postgres accepts at all.
+const REQUEST_BYTES: usize = 1 << 30;
+/// Notifications held between two reads of them; they are hints.
+const NOTIFICATIONS: usize = 64;
+/// The PBKDF2 work a server may ask of a login.
+const SCRAM_ITERATIONS: u32 = 100_000;
+
+/// td-postgres's per-operation bounds. The input filter's connection
+/// totals stay the binding ones, so each limit here is no tighter.
+fn limits(output_limit: usize, input: &Input) -> td_postgres::Limits {
+    td_postgres::Limits {
+        message_bytes: MESSAGE_BYTES,
+        request_bytes: output_limit.clamp(64, REQUEST_BYTES),
+        messages: input.frames().max(1),
+        rows: input.frames(),
+        columns: 1664,
+        // Each value costs at least four wire bytes and eight here.
+        result_bytes: input.bytes().saturating_mul(2).min(u32::MAX as usize),
+        notifications: NOTIFICATIONS,
+        scram_iterations: SCRAM_ITERATIONS,
+    }
+}
+
 fn connect_authenticated_until(
     request: &Request<'_>,
     trust: &TrustStore,
@@ -630,143 +618,141 @@ fn connect_authenticated_until(
         || request.database.contains('\0')
         || request.password.is_empty()
         || request.password.len() > 4096
+        || !request.password.is_ascii()
+        || request.password.contains(&0)
     {
         return Err(Error::Invalid);
     }
-    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
-    let now = clock.sample().map_err(|_| Error::Deadline)?.monotonic;
-    let milliseconds = transport_milliseconds(allowance)?;
-    let cap = Deadline::after(now, milliseconds).map_err(|_| Error::Invalid)?;
-    let handshake_cap = Deadline::after(now, transport_milliseconds(remaining(connect_deadline)?)?)
-        .map_err(|_| Error::Invalid)?
-        .min(cap);
-    let (transport, session): (Box<dyn DriverTransport>, Option<TlsSession>) = match request.address
-    {
-        Endpoint::Tcp(address) => {
-            let tls_clock = Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone())));
-            let policy = Arc::new(
-                ClientConfig::new(trust, tls_clock, TlsProtocol::Postgres)
-                    .map_err(|_| Error::Tls)?,
-            );
-            let session =
-                TlsSession::client(policy, request.server_name).map_err(|_| Error::Tls)?;
-            let mut tcp_timing = crate::performance::Timer::start(crate::performance::Phase::DbTcp);
-            let socket = TcpStream::connect_timeout(&address, remaining(connect_deadline)?)
-                .map_err(|_| Error::Transport)?;
-            tcp_timing.succeeded();
-            (
-                Box::new(TcpTransport::from_stream(socket).map_err(|_| Error::Transport)?),
-                Some(session),
-            )
-        }
-        Endpoint::Unix(path) => {
-            td_fs::check_server_socket(path.as_path()).map_err(|_| Error::Transport)?;
-            let socket =
-                td_fs::unix_connect_until(path.as_path(), connect_deadline).map_err(|error| {
-                    if error.kind() == io::ErrorKind::TimedOut {
-                        Error::Deadline
-                    } else {
-                        Error::Transport
-                    }
-                })?;
-            (
-                Box::new(UnixTransport::from_stream(socket).map_err(|_| Error::Transport)?),
-                None,
-            )
-        }
-    };
-    let driver = Driver::new(transport, connect_deadline)?;
-    let transport = Network(Arc::clone(&driver));
-    let mut config = Config::new();
-    config
-        .host(request.server_name)
-        .user(request.user)
-        .dbname(request.database)
-        .password(request.password)
-        .application_name("td-mta-postgres")
-        .options("-c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog")
-        .ssl_mode(if session.is_some() {
-            SslMode::Require
-        } else {
-            SslMode::Disable
-        })
-        .ssl_negotiation(SslNegotiation::Postgres)
-        .channel_binding(ChannelBinding::Disable);
     let input = if request.mode != Mode::Preparation {
         input.runtime()
     } else {
         input
     };
     let validation_window = input.window();
-    let (raw, connector) = match session {
-        Some(session) => (
-            Io::new(transport, false),
-            Encryption::Tls(Box::new(Connector {
-                session,
-                clock,
-                cap,
-                handshake_cap,
+    let limits = limits(output_limit, &input);
+    let config = td_postgres::Config {
+        user: request.user,
+        database: request.database,
+        password: request.password,
+        application_name: "td-mta-postgres",
+        parameters: &[("options", OPTIONS)],
+    };
+    let abort = Arc::new(AtomicBool::new(false));
+    // A dial that fails before any byte moves is a transport refusal,
+    // which lets the caller try another address.
+    let dialed = AtomicBool::new(false);
+    let session = match request.address {
+        Endpoint::Tcp(address) => {
+            let connector = tls_connector(
+                trust,
+                request.server_name,
+                deadline,
+                connect_deadline,
                 output_limit,
                 input,
-            })),
-        ),
-        None => {
-            // Local plaintext still enforces SCRAM-only startup, framing and
-            // the exact same per-operation input/output windows as TCP TLS.
-            let mut raw = Io::new(transport, true);
-            raw.input = Some(input);
-            raw.output_left = output_limit;
-            (raw, Encryption::Local)
+                Arc::clone(&abort),
+            )?;
+            // Transitional, with the TCP endpoint: td-mta connects, so a
+            // failed connect stays a transport refusal.
+            let mut tcp = crate::performance::Timer::start(crate::performance::Phase::DbTcp);
+            let socket = TcpStream::connect_timeout(&address, remaining(connect_deadline)?)
+                .map_err(|_| Error::Transport)?;
+            tcp.succeeded();
+            dialed.store(true, Ordering::Relaxed);
+            let mut handshake =
+                crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
+            let session =
+                td_postgres::start_tls(socket, connector, &config, limits, connect_deadline);
+            if session.is_ok() {
+                handshake.succeeded();
+            }
+            session
         }
-    };
-    let waker = driver.waker();
-    let mut context = Context::from_waker(&waker);
-    let mut handshake_timing =
-        crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
-    let mut connect = pin!(config.connect_raw(raw, connector));
-    let (client, connection) = loop {
-        remaining(connect_deadline)?;
-        driver.begin_poll(connect_deadline)?;
-        if let Poll::Ready(result) = connect.as_mut().poll(&mut context) {
-            break result.map_err(|_| Error::Database)?;
+        Endpoint::Unix(path) => {
+            // Socket admission precedes and stays apart from the dial.
+            td_fs::check_server_socket(path.as_path()).map_err(|_| Error::Transport)?;
+            let mut handshake =
+                crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
+            let session = td_postgres::connect_unix_through(
+                path.as_path(),
+                |socket| {
+                    dialed.store(true, Ordering::Relaxed);
+                    Wire::plain(socket, input, output_limit, Arc::clone(&abort))
+                },
+                &config,
+                limits,
+                connect_deadline,
+            );
+            if session.is_ok() {
+                handshake.succeeded();
+            }
+            session
         }
-        driver.wait_until(connect_deadline)?;
-    };
-    handshake_timing.succeeded();
-    drop(handshake_timing);
+    }
+    .map_err(|error| match error {
+        DbError::Deadline => Error::Deadline,
+        DbError::Io | DbError::Closed if !dialed.load(Ordering::Relaxed) => Error::Transport,
+        DbError::Invalid => Error::Invalid,
+        _ => Error::Database,
+    })?;
     timing.succeeded();
     Ok(Worker {
-        client: Some(ScopedClient {
-            client,
-            runtime_schema: None,
-        }),
-        connection: Box::pin(connection),
+        client: Some(Box::new(Client::new(session, deadline))),
         deadline,
-        waker,
         failed: None,
-        driver,
+        abort,
         validation_window,
         audit_windows: false,
         relay_wake: false,
     })
 }
 
-pub(crate) struct Worker {
-    client: Option<ScopedClient>,
-    connection: Pin<Box<tokio_postgres::Connection<Io<Network>, Io<Secure>>>>,
+/// td-crypto's verified session for `server_name`, as td-postgres's TLS
+/// connector. Transitional, with the TCP endpoint.
+fn tls_connector(
+    trust: &TrustStore,
+    server_name: &str,
     deadline: Instant,
-    waker: Waker,
+    connect_deadline: Instant,
+    output_limit: usize,
+    input: Input,
+    abort: Arc<AtomicBool>,
+) -> Result<wire::Connector, Error> {
+    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+    let now = clock.sample().map_err(|_| Error::Deadline)?.monotonic;
+    let cap = Deadline::after(now, transport_milliseconds(remaining(deadline)?)?)
+        .map_err(|_| Error::Invalid)?;
+    let handshake_cap = Deadline::after(now, transport_milliseconds(remaining(connect_deadline)?)?)
+        .map_err(|_| Error::Invalid)?
+        .min(cap);
+    let tls_clock = Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone())));
+    let policy = Arc::new(
+        ClientConfig::new(trust, tls_clock, TlsProtocol::Postgres).map_err(|_| Error::Tls)?,
+    );
+    let session = TlsSession::client(policy, server_name).map_err(|_| Error::Tls)?;
+    Ok(wire::Connector {
+        session,
+        clock,
+        cap,
+        handshake_cap,
+        output: output_limit,
+        input,
+        abort,
+    })
+}
+
+pub(crate) struct Worker {
+    // Boxed: a worker sits inline in per-attempt state of bounded size.
+    client: Option<Box<Client>>,
+    deadline: Instant,
     failed: Option<Error>,
-    driver: Arc<Driver>,
+    /// Shared with the stream: set, nothing more is written or read.
+    abort: Arc<AtomicBool>,
     validation_window: Option<windows::Windows>,
     audit_windows: bool,
     relay_wake: bool,
 }
 
-fn relay_notification(message: &tokio_postgres::AsyncMessage) -> bool {
-    matches!(message, tokio_postgres::AsyncMessage::Notification(value)
-        if value.channel() == "td_mta_relay" && value.payload().is_empty())
-}
 impl Worker {
     pub(crate) fn begin_validation_turn(&mut self) -> Result<(), Error> {
         self.validation_window
@@ -784,52 +770,60 @@ impl Worker {
         self.deadline = self.deadline.min(deadline);
         self.check()
     }
+    fn fail(&mut self, error: Error) -> Error {
+        let error = *self.failed.get_or_insert(error);
+        self.abort.store(true, Ordering::Release);
+        error
+    }
     pub(crate) fn check_deadline(&mut self) -> Result<(), Error> {
         if let Some(error) = self.failed {
             return Err(error);
         }
         if let Err(error) = remaining(self.deadline) {
-            self.failed = Some(error);
-            return Err(error);
+            return Err(self.fail(error));
         }
         Ok(())
     }
-    // No query or round trip: drain available asynchronous messages so an idle
-    // cached read cannot hide a terminal connection error behind a notice.
+    // No query or round trip: read what the idle connection already holds,
+    // so a cached session cannot hide a server-ended connection behind a
+    // notice.
     pub(crate) fn check(&mut self) -> Result<(), Error> {
+        self.check_deadline()?;
+        let client = self.client.as_ref().ok_or(Error::Database)?;
+        let drained = client.drain(Instant::now());
+        self.relay_wake |= client.take_relay();
+        match (drained, client.fault()) {
+            (_, Some(error)) => Err(self.fail(error)),
+            (Err(_), None) => Err(self.fail(Error::Database)),
+            (Ok(()), None) => Ok(()),
+        }
+    }
+    /// Wait until `until` for a notification on the idle connection;
+    /// true once the relay's hint has arrived.
+    pub(crate) fn wait_relay(&mut self, until: Instant) -> Result<bool, Error> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let mut context = Context::from_waker(&self.waker);
-        loop {
-            if let Err(error) = remaining(self.deadline) {
-                self.failed = Some(error);
-                return Err(error);
-            }
-            self.driver.begin_poll(self.deadline)?;
-            match self.connection.as_mut().poll_message(&mut context) {
-                Poll::Pending if !self.driver.active() => return Ok(()),
-                Poll::Pending => {}
-                Poll::Ready(Some(Ok(message))) => {
-                    self.relay_wake |= relay_notification(&message);
-                }
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                    self.failed = Some(Error::Database);
-                    return Err(Error::Database);
-                }
-            }
+        if Instant::now() >= until.min(self.deadline) {
+            return Ok(std::mem::take(&mut self.relay_wake));
+        }
+        let client = self.client.as_ref().ok_or(Error::Database)?;
+        let waited = client.wait(until.min(self.deadline));
+        self.relay_wake |= client.take_relay();
+        match (waited, client.fault()) {
+            (_, Some(error)) => Err(self.fail(error)),
+            (Err(_), None) => Err(self.fail(Error::Database)),
+            (Ok(()), None) => Ok(std::mem::take(&mut self.relay_wake)),
         }
     }
 
-    pub(crate) fn run<T>(
-        &mut self,
-        operation: impl for<'a> FnOnce(&'a ScopedClient) -> Pin<Box<dyn Future<Output = T> + 'a>>,
-    ) -> Result<T, Error> {
+    /// Run one operation's SQL under the worker's deadline. A failure that
+    /// ends the connection or crosses the deadline is the worker's error,
+    /// whatever the operation made of it; a statement's own error is the
+    /// operation's result.
+    pub(crate) fn run<T>(&mut self, operation: impl FnOnce(&Client) -> T) -> Result<T, Error> {
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbWork);
-        if let Some(error) = self.failed {
-            return Err(error);
-        }
-        let mut context = Context::from_waker(&self.waker);
+        self.check_deadline()?;
         let audit_window = self
             .validation_window
             .as_ref()
@@ -838,95 +832,55 @@ impl Worker {
             window.begin().map_err(|_| Error::Database)?;
         }
         let client = self.client.as_ref().ok_or(Error::Database)?;
-        let mut operation = operation(client);
-        loop {
-            if let Err(error) = remaining(self.deadline) {
-                self.failed = Some(error);
-                return Err(error);
-            }
-            self.driver.begin_poll(self.deadline)?;
-            if let Poll::Ready(result) = operation.as_mut().poll(&mut context) {
-                if let Some(window) = audit_window {
-                    window.finish().map_err(|_| Error::Database)?;
-                }
-                timing.succeeded();
-                return Ok(result);
-            }
-            match self.connection.as_mut().poll_message(&mut context) {
-                Poll::Ready(Some(Ok(message))) => {
-                    self.relay_wake |= relay_notification(&message);
-                    continue;
-                }
-                Poll::Pending => {}
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                    self.failed = Some(Error::Database);
-                    return Err(Error::Database);
-                }
-            }
-            if let Err(error) = self.driver.wait_until(self.deadline) {
-                self.failed = Some(error);
-                return Err(error);
-            }
+        client.set_deadline(self.deadline);
+        let result = operation(client);
+        self.relay_wake |= client.take_relay();
+        if let Some(error) = client.fault() {
+            return Err(self.fail(error));
         }
+        if let Some(window) = audit_window {
+            window.finish().map_err(|_| Error::Database)?;
+        }
+        timing.succeeded();
+        Ok(result)
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
         let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbClose);
-        // Releasing the last sender lets the driver drain responses and send
-        // Terminate. Cleanup must neither renew a job nor alter its outcome.
-        drop(self.client.take());
-        if self.failed.is_some() {
+        // Cleanup must neither renew a job nor alter its outcome: a failed
+        // or expired connection is abandoned, a healthy one gets Terminate
+        // within the original deadline and at most 100 ms.
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        if self.failed.is_some() || client.fault().is_some() || Instant::now() >= self.deadline {
+            self.abort.store(true, Ordering::Release);
             return;
         }
         let until = self
             .deadline
             .min(Instant::now() + Duration::from_millis(100));
-        let mut context = Context::from_waker(&self.waker);
-        while Instant::now() < until {
-            if self.driver.begin_poll(until).is_err() {
-                return;
-            }
-            match self.connection.as_mut().poll_message(&mut context) {
-                Poll::Ready(None) => {
-                    timing.succeeded();
-                    return;
-                }
-                Poll::Ready(Some(Err(_))) => return,
-                Poll::Ready(Some(Ok(_))) => (),
-                Poll::Pending if !self.driver.active() => {
-                    if self.driver.wait_until(until).is_err() {
-                        return;
-                    }
-                }
-                Poll::Pending => (),
-            }
+        if client.close(until) {
+            timing.succeeded();
         }
     }
 }
 
-pub(crate) async fn qualify(client: &tokio_postgres::Client) -> Result<Status, Error> {
-    let messages = client
-        .simple_query(QUERY)
-        .await
-        .map_err(|_| Error::Database)?;
-    let mut status = None;
-    for message in messages {
-        if let SimpleQueryMessage::Row(row) = message {
-            if status.is_some() || row.len() != 5 {
-                return Err(Error::Settings);
-            }
-            let value = |index| row.try_get(index).ok().flatten().ok_or(Error::Settings);
-            let server_version = value(0)?.parse().map_err(|_| Error::Settings)?;
-            if value(1)? != "false" || value(2)? != "off" || value(3)? != "on" || value(4)? != "on"
-            {
-                return Err(Error::Settings);
-            }
-            status = Some(Status { server_version });
-        }
+/// The settings check: one row of five text values.
+pub(crate) fn qualify(client: &Client) -> Result<Status, Error> {
+    let rows = client.query(QUERY, &[]).map_err(|_| Error::Database)?;
+    let row = match (rows.len(), rows.first()) {
+        (1, Some(row)) if row.len() == 5 => row,
+        _ => return Err(Error::Settings),
+    };
+    let value = |index: usize| row.try_get::<_, &str>(index).map_err(|_| Error::Settings);
+    let server_version = value(0)?.parse().map_err(|_| Error::Settings)?;
+    if value(1)? != "false" || value(2)? != "off" || value(3)? != "on" || value(4)? != "on" {
+        return Err(Error::Settings);
     }
-    status.ok_or(Error::Settings)
+    Ok(Status { server_version })
 }
 
 // TLS uses whole ticks; the worker's exact Instant remains authoritative.
@@ -943,197 +897,13 @@ fn remaining(deadline: Instant) -> Result<Duration, Error> {
         .ok_or(Error::Deadline)
 }
 
-mod driver;
-use driver::{Driver, DriverTransport, Network};
+mod client;
+pub(crate) use client::{
+    Client, DbError, Encode, FromColumn, OneRow, Row, RowIter, Rows, SqlState,
+};
 
-type Secure = TlsIo<Network, Box<[u8; TLS_WIRE_BYTES]>>;
-struct Connector {
-    session: TlsSession,
-    clock: Arc<dyn Clock>,
-    cap: Deadline,
-    handshake_cap: Deadline,
-    output_limit: usize,
-    input: Input,
-}
-
-enum Encryption {
-    Tls(Box<Connector>),
-    Local,
-}
-impl tls::TlsConnect<Io<Network>> for Encryption {
-    type Stream = Io<Secure>;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send>>;
-    fn connect(self, raw: Io<Network>) -> Self::Future {
-        match self {
-            Self::Tls(connector) => (*connector).connect(raw),
-            Self::Local => Box::pin(async { Err(refused()) }),
-        }
-    }
-}
-
-impl tls::TlsConnect<Io<Network>> for Connector {
-    type Stream = Io<Secure>;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send>>;
-
-    fn connect(self, raw: Io<Network>) -> Self::Future {
-        Box::pin(async move {
-            let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbTls);
-            let mut secure = TlsIo::new(
-                raw.transport,
-                self.session,
-                self.clock,
-                self.cap,
-                self.handshake_cap,
-                Box::new([0; TLS_WIRE_BYTES]),
-                Box::new([0; TLS_WIRE_BYTES]),
-            )
-            .map_err(|_| refused())?;
-            poll_fn(|cx| match secure.drive(cx, |wire| wire.handshake()) {
-                Ok(Some(_)) => Poll::Ready(Ok(())),
-                Ok(None) => Poll::Pending,
-                Err(_) => Poll::Ready(Err(refused())),
-            })
-            .await?;
-            timing.succeeded();
-            let mut io = Io::new(secure, true);
-            io.output_left = self.output_limit;
-            io.input = Some(self.input);
-            Ok(io)
-        })
-    }
-}
-
-impl tls::TlsStream for Io<Secure> {
-    fn channel_binding(&self) -> tls::ChannelBinding {
-        tls::ChannelBinding::none()
-    }
-}
-
-// Network records actual wire progress and blocked directions. TLS may also
-// consume a buffered record or queue ciphertext without touching the socket.
-trait DriverIo: Transport {
-    fn drive<R>(&mut self, _cx: &Context<'_>, op: impl FnOnce(&mut Self) -> R) -> R {
-        op(self)
-    }
-}
-impl DriverIo for Network {}
-impl DriverIo for Secure {
-    fn drive<R>(&mut self, cx: &Context<'_>, op: impl FnOnce(&mut Self) -> R) -> R {
-        let before = self.buffered_state();
-        let result = op(self);
-        if self.buffered_state() != before {
-            cx.waker().wake_by_ref();
-        }
-        result
-    }
-}
-
-struct Io<T> {
-    transport: T,
-    input: Option<Input>,
-    output_left: usize,
-}
-impl<T> Io<T> {
-    fn new(transport: T, secured: bool) -> Self {
-        Self {
-            transport,
-            input: secured.then(Input::new),
-            output_left: 64 * 1024,
-        }
-    }
-}
-fn refused() -> io::Error {
-    io::ErrorKind::InvalidData.into()
-}
-impl<T: DriverIo + Unpin> AsyncRead for Io<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        output: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if output.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        let this = self.get_mut();
-        let length = output.remaining().min(16 * 1024);
-        let Some(bytes) = output.initialize_unfilled().get_mut(..length) else {
-            return Poll::Ready(Err(refused()));
-        };
-        match this.transport.drive(cx, |wire| wire.read(bytes)) {
-            Ok(IoProgress::Bytes(count)) => {
-                let Some(received) = bytes.get(..count) else {
-                    return Poll::Ready(Err(refused()));
-                };
-                if let Some(input) = &mut this.input {
-                    if input.accept(received).is_err() {
-                        this.transport.abort();
-                        return Poll::Ready(Err(refused()));
-                    }
-                }
-                output.advance(count);
-                Poll::Ready(Ok(()))
-            }
-            Ok(IoProgress::Pending) => Poll::Pending,
-            Ok(IoProgress::Closed) => Poll::Ready(Ok(())),
-            Err(_) => Poll::Ready(Err(refused())),
-        }
-    }
-}
-impl<T: DriverIo + Unpin> AsyncWrite for Io<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if bytes.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        if bytes.len() > this.output_left
-            || this
-                .input
-                .as_ref()
-                .is_some_and(|input| input.admit_output(bytes.len()).is_err())
-        {
-            if let Some(input) = &mut this.input {
-                input.fail();
-            }
-            this.transport.abort();
-            return Poll::Ready(Err(refused()));
-        }
-        match this.transport.drive(cx, |wire| wire.write(bytes)) {
-            Ok(IoProgress::Bytes(count)) if count <= bytes.len() => {
-                this.output_left -= count;
-                if this
-                    .input
-                    .as_ref()
-                    .is_some_and(|input| input.output(count).is_err())
-                {
-                    this.transport.abort();
-                    return Poll::Ready(Err(refused()));
-                }
-                Poll::Ready(Ok(count))
-            }
-            Ok(IoProgress::Pending) => Poll::Pending,
-            _ => Poll::Ready(Err(refused())),
-        }
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        progress(self.get_mut().transport.drive(cx, Transport::flush))
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        progress(self.get_mut().transport.drive(cx, Transport::close))
-    }
-}
-fn progress(result: Result<FlushProgress, crate::ports::Error>) -> Poll<io::Result<()>> {
-    match result {
-        Ok(FlushProgress::Complete) => Poll::Ready(Ok(())),
-        Ok(FlushProgress::Pending) => Poll::Pending,
-        Err(_) => Poll::Ready(Err(refused())),
-    }
-}
+mod wire;
+use wire::Wire;
 
 mod audit_budget;
 pub(crate) use audit_budget::AuditBudget;
@@ -1155,7 +925,7 @@ use framing::Input;
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, thread};
+    use std::{io, net::TcpListener, thread};
 
     #[test]
     fn transport_tick_never_expires_before_exact_worker_allowance() {
@@ -1189,155 +959,6 @@ mod tests {
             assert!(allowance >= previous && allowance <= MAX_BODY_DURATION);
             previous = allowance;
         }
-    }
-    #[test]
-    fn socket_activity_distinguishes_progress_from_idle_polling() {
-        use std::io::{Read, Write};
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut peer, _) = listener.accept().unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let driver = Driver::new(
-            Box::new(TcpTransport::from_stream(socket).unwrap()),
-            deadline,
-        )
-        .unwrap();
-        let mut network = Network(Arc::clone(&driver));
-        let mut byte = [0];
-        assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
-        assert_eq!(network.flush(), Ok(FlushProgress::Complete));
-        assert!(!driver.active());
-        peer.write_all(b"x").unwrap();
-        let stop = Instant::now() + Duration::from_secs(1);
-        while network.read(&mut byte).unwrap() == IoProgress::Pending {
-            assert!(!driver.active());
-            assert!(Instant::now() < stop);
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(byte, *b"x");
-        assert!(driver.active());
-        driver.begin_poll(deadline).unwrap();
-        assert_eq!(network.write(b"y"), Ok(IoProgress::Bytes(1)));
-        assert!(driver.active());
-        peer.read_exact(&mut byte).unwrap();
-        assert_eq!(byte, *b"y");
-        driver.begin_poll(deadline).unwrap();
-        assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
-        assert!(!driver.active());
-    }
-
-    #[test]
-    fn pending_output_leaves_the_same_driver_free_to_read() {
-        use std::{io::Write, os::unix::net::UnixStream};
-        let (mut raw, mut peer) = UnixStream::pair().unwrap();
-        raw.set_nonblocking(true).unwrap();
-        let chunk = [1; crate::transport::SOCKET_CHUNK];
-        let mut queued = 0;
-        loop {
-            match raw.write(&chunk) {
-                Ok(0) => panic!("closed fixture"),
-                Ok(n) => queued += n as u64,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                other => panic!("fill socket: {other:?}"),
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let driver =
-            Driver::new(Box::new(UnixTransport::from_stream(raw).unwrap()), deadline).unwrap();
-        let mut network = Network(Arc::clone(&driver));
-        let mut byte = [0];
-        assert_eq!(network.write(&chunk), Ok(IoProgress::Pending));
-        assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
-        peer.write_all(b"x").unwrap();
-        assert!(driver.wait(deadline).unwrap());
-        assert_eq!(network.read(&mut byte), Ok(IoProgress::Bytes(1)));
-        assert_eq!(byte, *b"x");
-
-        driver.begin_poll(deadline).unwrap();
-        assert_eq!(network.write(&chunk), Ok(IoProgress::Pending));
-        assert!(!driver
-            .wait(Instant::now() + Duration::from_millis(10))
-            .unwrap());
-        let drained =
-            io::copy(&mut std::io::Read::take(&mut peer, queued), &mut io::sink()).unwrap();
-        assert_eq!(drained, queued);
-        assert!(driver.wait(deadline).unwrap());
-        assert_eq!(network.write(&chunk), Ok(IoProgress::Bytes(chunk.len())));
-    }
-
-    struct WindowTransport {
-        pending: bool,
-        calls: usize,
-        aborted: bool,
-    }
-    impl DriverIo for WindowTransport {}
-    impl Transport for WindowTransport {
-        fn read(&mut self, _: &mut [u8]) -> Result<IoProgress, crate::ports::Error> {
-            Ok(IoProgress::Pending)
-        }
-        fn write(&mut self, bytes: &[u8]) -> Result<IoProgress, crate::ports::Error> {
-            self.calls += 1;
-            if self.pending {
-                self.pending = false;
-                Ok(IoProgress::Pending)
-            } else {
-                Ok(IoProgress::Bytes(bytes.len().min(1)))
-            }
-        }
-        fn flush(&mut self) -> Result<FlushProgress, crate::ports::Error> {
-            Ok(FlushProgress::Complete)
-        }
-        fn close(&mut self) -> Result<FlushProgress, crate::ports::Error> {
-            Ok(FlushProgress::Complete)
-        }
-        fn abort(&mut self) {
-            self.aborted = true;
-        }
-    }
-
-    #[test]
-    fn retained_output_charges_actual_progress_and_refuses_before_transport() {
-        let mut io = Io::new(
-            WindowTransport {
-                pending: true,
-                calls: 0,
-                aborted: false,
-            },
-            true,
-        );
-        io.input = Some(Input::validation_checks(
-            ValidationBudget::test_turns(BODY_CHECK_TURNS as u64).unwrap(),
-        ));
-        io.output_left = BODY_CHECK_TURNS * 64 * 1024;
-        let window = io.input.as_ref().unwrap().window().unwrap();
-        window.begin().unwrap();
-        window.output(64 * 1024 - 2).unwrap();
-        let mut context = Context::from_waker(Waker::noop());
-        assert!(Pin::new(&mut io)
-            .poll_write(&mut context, b"ab")
-            .is_pending());
-        assert_eq!(io.output_left, BODY_CHECK_TURNS * 64 * 1024);
-        assert!(matches!(
-            Pin::new(&mut io).poll_write(&mut context, b"ab"),
-            Poll::Ready(Ok(1))
-        ));
-        assert!(matches!(
-            Pin::new(&mut io).poll_write(&mut context, b"b"),
-            Poll::Ready(Ok(1))
-        ));
-        assert_eq!(io.output_left, BODY_CHECK_TURNS * 64 * 1024 - 2);
-        window.finish().unwrap();
-        window.begin().unwrap();
-        window.output(64 * 1024 - 1).unwrap();
-        assert!(matches!(
-            Pin::new(&mut io).poll_write(&mut context, b"ab"),
-            Poll::Ready(Err(_))
-        ));
-        assert_eq!(io.transport.calls, 3);
-        assert!(io.transport.aborted);
-        assert!(window.finish().is_err());
-        assert!(window.begin().is_err());
     }
 
     #[test]
@@ -1398,5 +1019,31 @@ mod tests {
             Err(Error::Deadline)
         );
         peer.join().unwrap();
+    }
+
+    /// td-postgres does no SASLprep: a password it cannot log in with is
+    /// refused before anything is dialed.
+    #[test]
+    fn a_non_ascii_or_nul_password_is_refused_before_dialing() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let trust = TrustStore::public_roots().unwrap();
+        for password in [&b"p\xc3\xa9"[..], b"\x80", b"pass\0word"] {
+            let request = Request {
+                address: Endpoint::Tcp(listener.local_addr().unwrap()),
+                server_name: "localhost",
+                mode: Mode::Preparation,
+                user: "probe",
+                database: "probe",
+                password,
+            };
+            assert_eq!(
+                probe(&request, &trust, Instant::now() + MAX_DURATION),
+                Err(Error::Invalid)
+            );
+        }
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
     }
 }

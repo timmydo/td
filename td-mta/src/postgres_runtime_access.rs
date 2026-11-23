@@ -2,13 +2,13 @@
 mod service;
 pub use service::ServiceRole;
 
+use crate::postgres_probe::Client;
 use crate::{
     postgres_probe::{self, Request},
     postgres_schema::{self, Receipt},
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
-use tokio_postgres::Client;
 
 // Dedicated runtime logins have no role memberships. Owner-side configuration
 // and schema commands use a separate connection specification.
@@ -177,11 +177,9 @@ pub fn inspect(
     deadline: Instant,
 ) -> Result<Receipt, Error> {
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, |client| {
-        Box::pin(async move {
-            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
-            qualify(client).await?;
-            Ok(receipt)
-        })
+        let receipt = client.inspect_schema().map_err(Error::Schema)?;
+        qualify(client)?;
+        Ok(receipt)
     })
     .map_err(Error::Connection)?;
     if Instant::now() >= deadline {
@@ -190,10 +188,9 @@ pub fn inspect(
     result
 }
 
-pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
-    qualify_role(client, Authority::Primary).await?;
+pub(crate) fn qualify(client: &Client) -> Result<(), Error> {
+    qualify_role(client, Authority::Primary)?;
     if crate::postgres_replica_source::read(client)
-        .await
         .map_err(|_| Error::Database)?
         .is_some()
     {
@@ -202,13 +199,12 @@ pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) async fn qualify_replica(
+pub(crate) fn qualify_replica(
     client: &Client,
     source: &crate::postgres_replica_source::Source,
 ) -> Result<(), Error> {
-    qualify_role(client, Authority::Publisher).await?;
+    qualify_role(client, Authority::Publisher)?;
     let actual = crate::postgres_replica_source::read(client)
-        .await
         .map_err(|_| Error::Database)?
         .ok_or(Error::Replica)?;
     if &actual != source {
@@ -217,13 +213,12 @@ pub(crate) async fn qualify_replica(
     Ok(())
 }
 
-pub(crate) async fn qualify_replica_reader(
+pub(crate) fn qualify_replica_reader(
     client: &Client,
     epoch: crate::ids::StoreEpoch,
 ) -> Result<(), Error> {
-    qualify_role(client, Authority::Reader).await?;
+    qualify_role(client, Authority::Reader)?;
     let source = crate::postgres_replica_source::read(client)
-        .await
         .map_err(|_| Error::Database)?
         .ok_or(Error::Replica)?;
     if source.epoch() == epoch {
@@ -239,11 +234,8 @@ enum Authority {
     Reader,
 }
 
-async fn qualify_role(client: &Client, authority: Authority) -> Result<(), Error> {
-    let row = client
-        .query_typed_one(ROLE, &[])
-        .await
-        .map_err(|_| Error::Database)?;
+fn qualify_role(client: &Client, authority: Authority) -> Result<(), Error> {
+    let row = client.query_one(ROLE, &[]).map_err(|_| Error::Database)?;
     if !row.try_get::<_, bool>(0).map_err(|_| Error::Database)? {
         return Err(Error::Role);
     }
@@ -252,16 +244,15 @@ async fn qualify_role(client: &Client, authority: Authority) -> Result<(), Error
         if authority != Authority::Primary {
             return Err(Error::Role);
         }
-        service::qualify(client, role).await?;
+        service::qualify(client, role)?;
     } else {
-        qualify_shared(client, authority).await?;
+        qualify_shared(client, authority)?;
     }
     let rows = client
-        .query_typed(
+        .query(
             "SELECT singleton,blocked FROM td_mta.runtime_barrier LIMIT 2",
             &[],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let row = rows.first().ok_or(Error::Maintenance)?;
     if rows.len() != 1
@@ -273,16 +264,15 @@ async fn qualify_role(client: &Client, authority: Authority) -> Result<(), Error
     Ok(())
 }
 
-async fn qualify_shared(client: &Client, authority: Authority) -> Result<(), Error> {
+fn qualify_shared(client: &Client, authority: Authority) -> Result<(), Error> {
     let limit = i64::try_from(TABLES.len() + 1).map_err(|_| Error::Privileges)?;
     let rows = client
-        .query_typed(PRIVILEGES, &[(&limit, tokio_postgres::types::Type::INT8)])
-        .await
+        .query(PRIVILEGES, &[&limit])
         .map_err(|_| Error::Database)?;
     if rows.len() != TABLES.len() {
         return Err(Error::Privileges);
     }
-    for row in rows {
+    for row in &rows {
         let name: &str = row.try_get(0).map_err(|_| Error::Database)?;
         let access = TABLES
             .iter()

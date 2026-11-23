@@ -1,4 +1,5 @@
 //! Retained MIME draft creation for td-mail; no submission authority.
+use crate::postgres_probe::Client;
 use crate::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -20,7 +21,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::Client;
 
 pub const MAX_RECEIPTS: i64 = 1024;
 
@@ -379,15 +379,15 @@ fn sequence(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-async fn begin(client: &postgres_probe::ScopedClient, draft: &Draft) -> Result<(), Error> {
-    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+fn begin(client: &postgres_probe::Client, draft: &Draft) -> Result<(), Error> {
+    let schema = client.inspect_schema().map_err(Error::Schema)?;
     if schema.store_epoch != draft.binding.epoch() {
         return Err(Error::Epoch);
     }
-    client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)
+    client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_|Error::Database)
 }
-async fn receipt(client: &Client, draft: &Draft) -> Result<Option<Outcome>, Error> {
-    let rows=client.query("SELECT request_digest,email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM td_mta.draft_receipts WHERE account=$1 AND operation=$2 LIMIT 2", &[&draft.binding.account().as_bytes().as_slice(),&draft.operation.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+fn receipt(client: &Client, draft: &Draft) -> Result<Option<Outcome>, Error> {
+    let rows=client.query("SELECT request_digest,email_id,blob_id,thread_id,mailbox_id,length,created_at,old_sequence,new_sequence FROM td_mta.draft_receipts WHERE account=$1 AND operation=$2 LIMIT 2", &[&draft.binding.account().as_bytes().as_slice(),&draft.operation.as_bytes().as_slice()]).map_err(|_|Error::Database)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -435,17 +435,14 @@ pub fn inspect(
 ) -> Result<Option<Outcome>, Error> {
     let draft = draft.clone();
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            begin(client, &draft).await?;
-            client
-                .query_one(
-                    "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
-                    &[&draft.binding.account().as_bytes().as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            receipt(client, &draft).await
-        })
+        begin(client, &draft)?;
+        client
+            .query_one(
+                "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
+                &[&draft.binding.account().as_bytes().as_slice()],
+            )
+            .map_err(|_| Error::Database)?;
+        receipt(client, &draft)
     })
     .map_err(Error::Connection)?;
     if !matches!(result, Ok(Some(_))) && Instant::now() >= deadline {
@@ -473,242 +470,216 @@ pub fn publish(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_upload_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            begin(client, &draft).await?;
-            let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE",&[]).await.map_err(|_|Error::Database)?;
-            let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
-            let account_id = draft.binding.account();
-            let account = account_id.as_bytes().as_slice();
-            let state = client
-                .query_one(
-                    "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-                    &[&account],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            if let Some(outcome) = receipt(client, &draft).await? {
-                return Ok(outcome);
+        begin(client, &draft)?;
+        let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE",&[]).map_err(|_|Error::Database)?;
+        let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
+        let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
+        let account_id = draft.binding.account();
+        let account = account_id.as_bytes().as_slice();
+        let state = client
+            .query_one(
+                "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                &[&account],
+            )
+            .map_err(|_| Error::Database)?;
+        if let Some(outcome) = receipt(client, &draft)? {
+            return Ok(outcome);
+        }
+        if generation != draft.binding.selection().generation
+            || version != Some(draft.binding.selection().version.as_bytes().as_slice())
+            || !draft.binding.roles().jmap()
+        {
+            return Err(Error::Policy);
+        }
+        if postgres_devices::authenticate(client, account_id, presented)
+            .map_err(Error::Credential)?
+            != Some(draft.device)
+        {
+            return Err(Error::Unauthenticated);
+        }
+        let old = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
+        let floor = sequence(state.try_get(1).map_err(|_| Error::Integrity)?)?;
+        if floor > old {
+            return Err(Error::Integrity);
+        }
+        if draft.expected.is_some_and(|expected| expected != old) {
+            return Err(Error::State);
+        }
+        for source in &draft.sources {
+            if Instant::now() >= deadline {
+                return Err(Error::Connection(postgres_probe::Error::Deadline));
             }
-            if generation != draft.binding.selection().generation
-                || version != Some(draft.binding.selection().version.as_bytes().as_slice())
-                || !draft.binding.roles().jmap()
-            {
-                return Err(Error::Policy);
+            let rows = client.query("SELECT b.length,b.digest,EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id AND l.device_id=$3 AND l.expires_at>(extract(epoch FROM clock_timestamp())*1000)::bigint) FROM td_mta.blobs b WHERE b.account=$1 AND b.id=$2", &[&account,&source.blob.as_bytes().as_slice(),&draft.device.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
+            let row = rows.first().ok_or(Error::MissingAttachment)?;
+            let length: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
+            let digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+            let authorized: bool = row.try_get(2).map_err(|_| Error::Integrity)?;
+            if !authorized {
+                return Err(Error::MissingAttachment);
             }
-            if postgres_devices::authenticate(client, account_id, presented)
-                .await
-                .map_err(Error::Credential)?
-                != Some(draft.device)
-            {
-                return Err(Error::Unauthenticated);
-            }
-            let old = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let floor = sequence(state.try_get(1).map_err(|_| Error::Integrity)?)?;
-            if floor > old {
+            if u64::try_from(length).ok() != Some(source.length) || digest != source.digest {
                 return Err(Error::Integrity);
             }
-            if draft.expected.is_some_and(|expected| expected != old) {
-                return Err(Error::State);
-            }
-            for source in &draft.sources {
-                if Instant::now() >= deadline {
-                    return Err(Error::Connection(postgres_probe::Error::Deadline));
-                }
-                let rows = client.query("SELECT b.length,b.digest,EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.leases l WHERE l.account=b.account AND l.blob_id=b.id AND l.device_id=$3 AND l.expires_at>(extract(epoch FROM clock_timestamp())*1000)::bigint) FROM td_mta.blobs b WHERE b.account=$1 AND b.id=$2", &[&account,&source.blob.as_bytes().as_slice(),&draft.device.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-                let row = rows.first().ok_or(Error::MissingAttachment)?;
-                let length: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
-                let digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-                let authorized: bool = row.try_get(2).map_err(|_| Error::Integrity)?;
-                if !authorized {
-                    return Err(Error::MissingAttachment);
-                }
-                if u64::try_from(length).ok() != Some(source.length) || digest != source.digest {
-                    return Err(Error::Integrity);
-                }
-            }
-            let next = crate::postgres_sequence::next(client, account, old)
-                .await
-                .map_err(|error| match error {
-                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
-                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
-                    crate::postgres_sequence::Error::Database => Error::Database,
-                })?;
-            let created_at = expiry::admit(client, expiry::Ledger::Drafts, account, MAX_RECEIPTS)
-                .await
-                .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
-            let mailbox = draft.mailbox.as_bytes().as_slice();
-            let rows = client
-                .query(
-                    "SELECT changed FROM td_mta.mailboxes WHERE account=$1 AND id=$2 LIMIT 1",
-                    &[&account, &mailbox],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            let row = rows.first().ok_or(Error::MissingMailbox)?;
-            if sequence(row.try_get(0).map_err(|_| Error::Integrity)?)? > old {
-                return Err(Error::Integrity);
-            }
-            let email = draft.email.as_bytes().as_slice();
-            let used:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=3 AND object=$2)", &[&account,&email]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
+        }
+        let next =
+            crate::postgres_sequence::next(client, account, old).map_err(|error| match error {
+                crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                crate::postgres_sequence::Error::Database => Error::Database,
+            })?;
+        let created_at = expiry::admit(client, expiry::Ledger::Drafts, account, MAX_RECEIPTS)
+            .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
+        let mailbox = draft.mailbox.as_bytes().as_slice();
+        let rows = client
+            .query(
+                "SELECT changed FROM td_mta.mailboxes WHERE account=$1 AND id=$2 LIMIT 1",
+                &[&account, &mailbox],
+            )
+            .map_err(|_| Error::Database)?;
+        let row = rows.first().ok_or(Error::MissingMailbox)?;
+        if sequence(row.try_get(0).map_err(|_| Error::Integrity)?)? > old {
+            return Err(Error::Integrity);
+        }
+        let email = draft.email.as_bytes().as_slice();
+        let used:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=3 AND object=$2)", &[&account,&email]).map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
+        if used {
+            return Err(Error::Conflict);
+        }
+        let (thread_id, new_thread) =
+            publication::select_thread(client, account_id, &draft.anchors, draft.new_thread, old)
+                .map_err(publication_error)?;
+        let thread = thread_id.as_bytes().as_slice();
+        if new_thread {
+            let used:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=2 AND object=$2)", &[&account,&thread]).map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
             if used {
                 return Err(Error::Conflict);
             }
-            let (thread_id, new_thread) = publication::select_thread(
-                client,
-                account_id,
-                &draft.anchors,
-                draft.new_thread,
-                old,
-            )
-            .await
-            .map_err(publication_error)?;
-            let thread = thread_id.as_bytes().as_slice();
-            if new_thread {
-                let used:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=2 AND object=$2)", &[&account,&thread]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
-                if used {
-                    return Err(Error::Conflict);
-                }
-            }
-            let usage = publication::charge(
-                client,
-                account_id,
-                draft.binding.quotas(),
-                [draft.bytes.len() as u64, 1, 0, 0, 0],
-            )
-            .await
-            .map_err(publication_error)?;
-            publication::write_blob(
-                client,
-                publication::Blob {
-                    account: account_id,
-                    id: draft.blob,
-                    bytes: &draft.bytes,
-                    digest: &draft.body_digest,
-                    interpretation: draft.interpretation.as_deref(),
-                    created_at,
-                    changed: next,
-                },
-                deadline,
-            )
-            .await
-            .map_err(publication_error)?;
-            let changed = next.to_be_bytes();
-            let changed = changed.as_slice();
-            let thread_query = if new_thread {
-                "INSERT INTO td_mta.threads VALUES($1,$2,$3)"
-            } else {
-                "UPDATE td_mta.threads SET changed=$3 WHERE account=$1 AND id=$2"
-            };
-            if client
-                .execute(thread_query, &[&account, &thread, &changed])
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            if client.execute("INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES($1,$2,$3,$4,$5,2,$6)", &[&account,&email,&draft.blob.as_bytes().as_slice(),&thread,&created_at,&changed]).await.map_err(|_|Error::Database)?!=1 { return Err(Error::Integrity); }
-            if client
-                .execute(
-                    "INSERT INTO td_mta.memberships VALUES($1,$2,$3,$4)",
-                    &[&account, &email, &mailbox, &changed],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            if client
-                .execute(
-                    "INSERT INTO td_mta.keywords VALUES($1,$2,'$draft',$3),($1,$2,'$seen',$3)",
-                    &[&account, &email, &changed],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 2
-            {
-                return Err(Error::Integrity);
-            }
-            if client
-                .execute(
-                    "INSERT INTO td_mta.thread_anchors VALUES($1,$2,$3,$4)",
-                    &[&account, &draft.message_id, &email, &changed],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            if client
-                .execute(
-                    "UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=$2",
-                    &[&account, &mailbox, &changed],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            let thread_action = if new_thread { 1i64 } else { 2 };
-            if client.execute("INSERT INTO td_mta.changes VALUES($1,$2,0,3,1,$3),($1,$2,1,2,$6,$4),($1,$2,2,1,2,$5)", &[&account,&changed,&email,&thread,&mailbox,&thread_action]).await.map_err(|_|Error::Database)?!=3 { return Err(Error::Integrity); }
-            usage
-                .publish(client, account_id)
-                .await
-                .map_err(publication_error)?;
-            if client
-                .execute(
-                    "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
-                    &[&account, &changed],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            let length = i64::try_from(draft.bytes.len()).map_err(|_| Error::Capacity)?;
-            if client
-                .execute(
-                    "INSERT INTO td_mta.draft_receipts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-                    &[
-                        &account,
-                        &draft.operation.as_bytes().as_slice(),
-                        &draft.request_digest.as_slice(),
-                        &email,
-                        &draft.blob.as_bytes().as_slice(),
-                        &thread,
-                        &mailbox,
-                        &length,
-                        &created_at,
-                        &old.to_be_bytes().as_slice(),
-                        &changed,
-                    ],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Outcome {
-                email: draft.email,
-                blob: draft.blob,
-                thread: thread_id,
-                mailbox: draft.mailbox,
-                length: length as u64,
+        }
+        let usage = publication::charge(
+            client,
+            account_id,
+            draft.binding.quotas(),
+            [draft.bytes.len() as u64, 1, 0, 0, 0],
+        )
+        .map_err(publication_error)?;
+        publication::write_blob(
+            client,
+            publication::Blob {
+                account: account_id,
+                id: draft.blob,
+                bytes: &draft.bytes,
+                digest: &draft.body_digest,
+                interpretation: draft.interpretation.as_deref(),
                 created_at,
-                old_sequence: old,
-                new_sequence: next,
-            })
+                changed: next,
+            },
+            deadline,
+        )
+        .map_err(publication_error)?;
+        let changed = next.to_be_bytes();
+        let changed = changed.as_slice();
+        let thread_query = if new_thread {
+            "INSERT INTO td_mta.threads VALUES($1,$2,$3)"
+        } else {
+            "UPDATE td_mta.threads SET changed=$3 WHERE account=$1 AND id=$2"
+        };
+        if client
+            .execute(thread_query, &[&account, &thread, &changed])
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        if client.execute("INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES($1,$2,$3,$4,$5,2,$6)", &[&account,&email,&draft.blob.as_bytes().as_slice(),&thread,&created_at,&changed]).map_err(|_|Error::Database)?!=1 { return Err(Error::Integrity); }
+        if client
+            .execute(
+                "INSERT INTO td_mta.memberships VALUES($1,$2,$3,$4)",
+                &[&account, &email, &mailbox, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        if client
+            .execute(
+                "INSERT INTO td_mta.keywords VALUES($1,$2,'$draft',$3),($1,$2,'$seen',$3)",
+                &[&account, &email, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 2
+        {
+            return Err(Error::Integrity);
+        }
+        if client
+            .execute(
+                "INSERT INTO td_mta.thread_anchors VALUES($1,$2,$3,$4)",
+                &[&account, &draft.message_id, &email, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        if client
+            .execute(
+                "UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=$2",
+                &[&account, &mailbox, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        let thread_action = if new_thread { 1i64 } else { 2 };
+        if client.execute("INSERT INTO td_mta.changes VALUES($1,$2,0,3,1,$3),($1,$2,1,2,$6,$4),($1,$2,2,1,2,$5)", &[&account,&changed,&email,&thread,&mailbox,&thread_action]).map_err(|_|Error::Database)?!=3 { return Err(Error::Integrity); }
+        usage
+            .publish(client, account_id)
+            .map_err(publication_error)?;
+        if client
+            .execute(
+                "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
+                &[&account, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        let length = i64::try_from(draft.bytes.len()).map_err(|_| Error::Capacity)?;
+        if client
+            .execute(
+                "INSERT INTO td_mta.draft_receipts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                &[
+                    &account,
+                    &draft.operation.as_bytes().as_slice(),
+                    &draft.request_digest.as_slice(),
+                    &email,
+                    &draft.blob.as_bytes().as_slice(),
+                    &thread,
+                    &mailbox,
+                    &length,
+                    &created_at,
+                    &old.to_be_bytes().as_slice(),
+                    &changed,
+                ],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Outcome {
+            email: draft.email,
+            blob: draft.blob,
+            thread: thread_id,
+            mailbox: draft.mailbox,
+            length: length as u64,
+            created_at,
+            old_sequence: old,
+            new_sequence: next,
         })
     });
     match result {

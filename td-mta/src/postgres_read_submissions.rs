@@ -44,11 +44,11 @@ impl Snapshot<'_> {
     ) -> Result<Option<SubmissionMetadata>, Error> {
         self.check()?;
         let view = self.identity;
-        let result = self.worker.run(|client| Box::pin(async move {
+        let result = self.worker.run(|client| {
             let row = client.query_opt(
                 "SELECT email_id,thread_id,identity_id,send_at,changed FROM td_mta.submissions WHERE account=$1 AND id=$2",
                 &[&view.account.as_bytes().as_slice(), &submission.as_bytes().as_slice()],
-            ).await.map_err(|_| Error::Database)?;
+            ).map_err(|_| Error::Database)?;
             let Some(row) = row else { return Ok(None); };
             check_changed(row.try_get(4).map_err(|_| Error::Integrity)?, view)?;
             let id = |column| -> Result<[u8;16], Error> {
@@ -62,7 +62,7 @@ impl Snapshot<'_> {
                 identity: IdentityId::from_bytes(id(2)?),
                 send_at: row.try_get(3).map_err(|_| Error::Integrity)?,
             }))
-        })).map_err(Error::Connection).and_then(|result| result);
+        }).map_err(Error::Connection).and_then(|result| result);
         self.retain(result)
     }
 
@@ -74,7 +74,7 @@ impl Snapshot<'_> {
             return self.retain(Err(Error::Capacity));
         }
         let view = self.identity;
-        let result = self.worker.run(|client| Box::pin(async move {
+        let result = self.worker.run(|client| {
             let mut page = SubmissionPage {
                 state: QueryState::current(view, QueryType::Submission),
                 position: query.position,
@@ -89,7 +89,7 @@ impl Snapshot<'_> {
                 let row = client.query_one(
                     "SELECT count(*) FROM td_mta.submissions WHERE account=$1 AND identity_id=$2 AND send_at >= $3 AND send_at < $4",
                     &[&account, &identity, &query.after, &query.before],
-                ).await.map_err(|_| Error::Database)?;
+                ).map_err(|_| Error::Database)?;
                 let total: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
                 page.total = Some(u64::try_from(total).map_err(|_| Error::Integrity)?);
             }
@@ -100,11 +100,11 @@ impl Snapshot<'_> {
             } else {
                 "SELECT id,send_at,changed FROM td_mta.submissions WHERE account=$1 AND identity_id=$2 AND send_at >= $3 AND send_at < $4 ORDER BY send_at DESC,id ASC LIMIT $5 OFFSET $6"
             };
-            let rows = client.query(sql, &[&account, &identity, &query.after, &query.before, &limit, &position]).await.map_err(|_| Error::Database)?;
+            let rows = client.query(sql, &[&account, &identity, &query.after, &query.before, &limit, &position]).map_err(|_| Error::Database)?;
             page.ids.try_reserve_exact(query.limit).map_err(|_| Error::Capacity)?;
             page.has_more = rows.len() > query.limit;
             let mut previous: Option<(i64, [u8;16])> = None;
-            for row in rows {
+            for row in &rows {
                 let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
                 let id: [u8;16] = id.try_into().map_err(|_| Error::Integrity)?;
                 let date: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -118,7 +118,7 @@ impl Snapshot<'_> {
                 if page.ids.len() < query.limit { page.ids.push(SubmissionId::from_bytes(id)); }
             }
             Ok(page)
-        })).map_err(Error::Connection).and_then(|result| result);
+        }).map_err(Error::Connection).and_then(|result| result);
         self.retain(result)
     }
 }

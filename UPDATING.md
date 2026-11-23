@@ -370,12 +370,10 @@ waiver, so that commit has to touch a document.
   td-tls-provider's exact one into a single rustls in `net/Cargo.lock`, so
   bump it alongside and update td-net's lock with them. After that,
   update what `builder/src/crypto_policy.rs` pins: the manifest and lock
-  digests, and the active-graph strings (`ACTIVE`, `POSTGRES_ACTIVE`,
+  digests, and the active-graph strings (`ACTIVE`,
   `TLS_PROVIDER_ACTIVE`).
-  Also update the inventory tables in `td-crypto/DEPENDENCIES.md`. A
-  tokio-postgres bump also amends the normative documents that name its
-  version: `DEVELOPMENT.md`, `td-crypto/DESIGN.md`, `td-mta/DESIGN.md`,
-  `td-mta/POSTGRES.md` and `UNSAFE.md`. Check each crate with
+  Also update the inventory tables in `td-crypto/DEPENDENCIES.md`. Check
+  each crate with
   `td-builder gate-crates crypto-cargo test --manifest-path
   td-crypto/Cargo.toml` (and `td-mta/Cargo.toml`,
   `td-tls-provider/Cargo.toml`). `td-crypto/DESIGN.md`

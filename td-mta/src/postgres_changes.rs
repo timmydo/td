@@ -51,11 +51,7 @@ pub fn read(
     postgres_probe::with_body_worker(request, trust, deadline, |worker| {
         let identity = worker
             .run(|client| {
-                Box::pin(async move {
-                    postgres_snapshot::begin(client, &binding, presented)
-                        .await
-                        .map_err(snapshot_error)
-                })
+                postgres_snapshot::begin(client, &binding, presented).map_err(snapshot_error)
             })
             .map_err(Error::Connection)??;
         read_snapshot(worker, identity, since.kind, since, maximum, &mut || Ok(()))
@@ -116,12 +112,12 @@ impl History for View<'_> {
         if self.batch.is_empty() && !self.complete {
             let account = self.identity.account;
             let maximum = self.identity.committed_sequence;
-            let batch=self.worker.run(|client|Box::pin(async move {
-                let rows=client.query("SELECT sequence,operation,action,object,kind FROM td_mta.changes WHERE account=$1 AND kind=$2 AND (sequence,operation)>($3,$4) ORDER BY sequence,operation LIMIT 128", &[&account.as_bytes().as_slice(),&i64::from(kind.tag()),&after.sequence.number().to_be_bytes().as_slice(),&i64::from(after.operation)]).await.map_err(|_|database_error())?;
+            let batch=self.worker.run(|client|{
+                let rows=client.query("SELECT sequence,operation,action,object,kind FROM td_mta.changes WHERE account=$1 AND kind=$2 AND (sequence,operation)>($3,$4) ORDER BY sequence,operation LIMIT 128", &[&account.as_bytes().as_slice(),&i64::from(kind.tag()),&after.sequence.number().to_be_bytes().as_slice(),&i64::from(after.operation)]).map_err(|_|database_error())?;
                 let mut batch=VecDeque::new();
                 batch.try_reserve_exact(rows.len()).map_err(|_|ports::Error::Capacity)?;
                 let mut previous=after;
-                for row in rows {
+                for row in &rows {
                     let record=crate::postgres_change_row::read(&row)?;
                     let cursor=record.cursor;
                     if record.change.kind!=kind || cursor.sequence>maximum || (cursor.sequence,cursor.operation)<=(previous.sequence,previous.operation) { return Err(ports::Error::Corrupt); }
@@ -129,7 +125,7 @@ impl History for View<'_> {
                     previous=cursor;
                 }
                 Ok(batch)
-            })).map_err(connection_error)??;
+            }).map_err(connection_error)??;
             self.complete = batch.len() < 128;
             self.batch = batch;
         }

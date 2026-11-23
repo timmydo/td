@@ -104,28 +104,22 @@ impl ReplicaSession {
         worker.deadline = deadline;
         let expected = Source::new(source.origin(), source.epoch()).map_err(|_| Error::Invalid)?;
         worker.run(move |client| {
-            Box::pin(async move {
-                let receipt = postgres_schema::lock_and_inspect(client)
-                    .await
-                    .map_err(|_| Error::RuntimeSchema)?;
-                if receipt.store_epoch != epoch {
-                    return Err(Error::RuntimeSchema);
-                }
-                let mut timing =
-                    crate::performance::Timer::start(crate::performance::Phase::DbRuntime);
-                crate::postgres_runtime_access::qualify_replica(client, &expected)
-                    .await
-                    .map_err(|error| match error {
-                        crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
-                        crate::postgres_runtime_access::Error::Maintenance => {
-                            Error::RuntimeMaintenance
-                        }
-                        crate::postgres_runtime_access::Error::Replica => Error::RuntimeReplica,
-                        _ => Error::RuntimePrivileges,
-                    })?;
-                timing.succeeded();
-                Ok(())
-            })
+            let receipt =
+                postgres_schema::lock_and_inspect(client).map_err(|_| Error::RuntimeSchema)?;
+            if receipt.store_epoch != epoch {
+                return Err(Error::RuntimeSchema);
+            }
+            let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbRuntime);
+            crate::postgres_runtime_access::qualify_replica(client, &expected).map_err(
+                |error| match error {
+                    crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
+                    crate::postgres_runtime_access::Error::Maintenance => Error::RuntimeMaintenance,
+                    crate::postgres_runtime_access::Error::Replica => Error::RuntimeReplica,
+                    _ => Error::RuntimePrivileges,
+                },
+            )?;
+            timing.succeeded();
+            Ok(())
         })??;
         Ok(Self {
             worker,
@@ -209,37 +203,37 @@ impl ReplicaSession {
                 .begin_validation_turn()
                 .map_err(apply::Error::Connection)?;
             let epoch = self.epoch;
-            match self.worker.run(move |client|Box::pin(async move {
+            match self.worker.run(move |client|{
                 let begin = if matches!(&job, Job::Inspect { .. }) {
                     "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000"
                 } else {
                     "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=30000"
                 };
-                client.batch_execute(begin).await.map_err(|_|apply::Error::Database)?;
-                let row=client.query_typed_one("SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true",&[]).await.map_err(|_|apply::Error::Database)?;
+                client.batch(begin).map_err(|_|apply::Error::Database)?;
+                let row=client.query_one("SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true",&[]).map_err(|_|apply::Error::Database)?;
                 let observed:&[u8]=row.try_get(0).map_err(|_|apply::Error::Integrity)?;
                 let blocked:bool=row.try_get(1).map_err(|_|apply::Error::Integrity)?;
                 if observed!=epoch.as_bytes().as_slice(){return Err(apply::Error::Connection(Error::RuntimeSchema));}
                 if blocked{return Err(apply::Error::Connection(Error::RuntimeMaintenance));}
                 match job {
-                    Job::Mailboxes(graph)=>crate::postgres_replica_mailboxes::publish(client,&graph,deadline,&marker).await.map(Completed::Mailboxes),
+                    Job::Mailboxes(graph)=>crate::postgres_replica_mailboxes::publish(client,&graph,deadline,&marker).map(Completed::Mailboxes),
                     Job::Inspect {source,account}=>{
-                        let mut progress=crate::postgres_replica_progress::read_snapshot(client,source,account).await.map_err(|_|apply::Error::Integrity)?;
-                        progress.select_local_work(client).await.map_err(|_|apply::Error::Database)?;
-                        client.batch_execute("ROLLBACK").await.map_err(|_|apply::Error::Database)?;
+                        let mut progress=crate::postgres_replica_progress::read_snapshot(client,source,account).map_err(|_|apply::Error::Integrity)?;
+                        progress.select_local_work(client).map_err(|_|apply::Error::Database)?;
+                        client.rollback().map_err(|_|apply::Error::Database)?;
                         Ok(Completed::Inspected(Box::new(progress)))
                     },
-                    Job::Publish(effect)=>match apply::apply(client,&effect,deadline,&marker).await {
+                    Job::Publish(effect)=>match apply::apply(client,&effect,deadline,&marker) {
                         Ok(value)=>Ok(Completed::Published(value)),
                         Err(apply::Error::MissingBody)=>{
-                            client.batch_execute("ROLLBACK").await.map_err(|_|apply::Error::Database)?;
+                            client.rollback().map_err(|_|apply::Error::Database)?;
                             Ok(Completed::MissingBody)
                         },
                         Err(error)=>Err(error),
                     },
-                    Job::Advance(transition)=>crate::postgres_replica_transition::advance(client,&transition,deadline,&marker).await.map(Completed::Advanced),
+                    Job::Advance(transition)=>crate::postgres_replica_transition::advance(client,&transition,deadline,&marker).map(Completed::Advanced),
                 }
-            })){
+            }){
                 Ok(result)=>result,
                 Err(_) if attempted.load(Ordering::Relaxed)=>Err(apply::Error::Indeterminate),
                 Err(error)=>Err(apply::Error::Connection(error)),

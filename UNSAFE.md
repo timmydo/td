@@ -62,7 +62,7 @@ The twenty-second, `td-mta`, confines descriptor readiness to one library
 function and termination signals and IPv6 listener setup to the binary,
 for x86-64 and aarch64 Linux. The listener also adopts its newly created socket.
 Safe std owns local scratch-path and lock operations; §22 also records the
-admitted private PostgreSQL dependency boundary. The crypto admission
+PostgreSQL client boundary. The crypto admission
 is specified in [td-crypto/DESIGN.md](td-crypto/DESIGN.md). Test allocators
 remain separate. The twenty-third, `td-open`, compiles §12's module to send one
 file's descriptor to the portal and adopts none. The twenty-fourth,
@@ -210,7 +210,7 @@ one.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
-| 22 | `td-mta` | library `ppoll(2)` on bounded sets of borrowed connected sockets, listeners and wake receivers; binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; IPv6-only `socket(2)`, `setsockopt(2)` with fixed SO_REUSEADDR/IPV6_V6ONLY, `bind(2)`, `listen(2)` and one fresh descriptor adoption; see [§22](#22-td-mta--termination-signals-and-private-postgresql-backend) |
+| 22 | `td-mta` | library `ppoll(2)` on bounded sets of borrowed connected sockets, listeners and wake receivers; binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; IPv6-only `socket(2)`, `setsockopt(2)` with fixed SO_REUSEADDR/IPV6_V6ONLY, `bind(2)`, `listen(2)` and one fresh descriptor adoption; see [§22](#22-td-mta--termination-signals-and-the-postgresql-client) |
 | 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
 | 24 | `td-luks` | device-mapper ioctl requests; see §24 |
 | 25 | `td-time` | CLOCK_REALTIME clock_settime and RTC_SET_TIME ioctl; see §25 |
@@ -3700,7 +3700,7 @@ detached it; the read-back reports that case rather than hiding it. Any
 further syscall, request, configured field or flag, caller, or allowance
 amends this section and `td-install/DESIGN.md`.
 
-## 22. `td-mta` — termination signals and private PostgreSQL backend
+## 22. `td-mta` — termination signals and the PostgreSQL client
 
 The library denies `unsafe_code`. Its single function-scoped exception,
 `readiness_sys::ppoll`, invokes Linux `ppoll` (271 on x86-64, 73 on
@@ -3712,8 +3712,9 @@ streams; SMTP uses at most 64 of them. SMTP borrows TCP sockets. HTTPS also
 admits Unix sockets. The ACME HTTP-01 responder borrows a private stop
 receiver, at most one TCP listener and up to eight connected TCP sockets.
 Only connected sockets can request writable
-readiness. PostgreSQL and single-socket transport waits pass
-one connected socket and optionally a private Unix wake receiver.
+readiness. The single-socket transport wait, which the transitional
+PostgreSQL TLS stream also uses, passes one connected TCP socket and no
+wake receiver; a PostgreSQL Unix connection does not use `ppoll`.
 All descriptors remain borrowed through the call. The syscall receives
 the length of the initialized slice and a mutable two-i64 timespec. Its
 signal mask is null and the mask size argument is eight. The kernel
@@ -3817,15 +3818,10 @@ architectures still need their own execution qualification.
 Filesystem operations use safe std APIs under STORAGE.md's stable-path
 contract. The separate test executables retain T1 and T3 below.
 
-The user-approved private tokio-postgres 0.7.18 closure contains
-upstream unsafe and platform FFI, including its buffer, synchronization,
-entropy and operating-system support crates. Exact manifests, lock and
-active features are pinned by builder/src/crypto_policy.rs; the inventory
-is in td-crypto/DEPENDENCIES.md. Tokio runtime, network and time drivers
-are disabled. This dependency admission adds no td-owned unsafe,
-FFI, scoped allowance or syscall. The adapters retain the bounded I/O
-and authentication boundary in td-mta/POSTGRES.md; this admission does not permit new owned
-unsafe code or establish runtime resource qualification.
+The PostgreSQL client is the local `td-postgres`, which forbids
+`unsafe`; td-mta's adapters over it add no unsafe, FFI, scoped allowance
+or syscall. They retain the bounded I/O and authentication boundary in
+td-mta/POSTGRES.md.
 
 ## 23. `td-open` — one descriptor to the portal
 

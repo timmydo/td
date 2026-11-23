@@ -27,13 +27,14 @@ Aurora and database proxies require their own qualification. See
 [DEPLOYMENT.md](DEPLOYMENT.md) for provisioning and
 [PRODUCTION.md](PRODUCTION.md) for the current host's operations.
 
-The admitted driver is tokio-postgres 0.7.18 with default features disabled:
-no Tokio runtime or network/time driver is selected. Its private closure
-provides SCRAM crypto and string preparation; TLS remains the td-crypto
-boundary. Serving and owner commands use this driver; the connection probe
-in [Operator connection probe](#operator-connection-probe) is a diagnostic, not an
-alternative backend. No server package
-is admitted by the driver dependency; source-build rules still apply.
+The client is td's own synchronous `td-postgres`
+([td-postgres/DESIGN.md](../td-postgres/DESIGN.md)), a std-only sibling
+crate with no external dependency. Its SCRAM uses td-primitives; TLS
+remains the td-crypto boundary, through a connector td-mta supplies.
+Serving and owner commands use this client; the connection probe in
+[Operator connection probe](#operator-connection-probe) is a diagnostic,
+not an alternative backend. No server package is admitted by the client;
+source-build rules still apply.
 
 ### Storage authority
 
@@ -49,11 +50,11 @@ per-service least privilege (commit bdb4414ea; DESIGN.md, "Production
 service authority").
 
 The decision keeps the PostgreSQL server and sets two targets: a small
-synchronous td-owned client crate, `td-postgres`, replaces tokio-postgres
-and its closure of about 56 crates; and PostgreSQL 17 is built from source
-as a td recipe, so td-mta can run against a td-built server. Until each
-switch-over lands, the admitted driver above and an externally provided
-server remain in use. Rejected alternatives: returning
+synchronous td-owned client crate, `td-postgres`, in place of the
+external client closure td-mta first admitted, which it now is; and
+PostgreSQL 17 built from source as a td recipe, so td-mta can run against
+a td-built server. Until that switch-over lands, an externally provided
+server remains in use. Rejected alternatives: returning
 to SQLite behind a single storage-owner process, which would need the IPC
 and service layer td avoids and would lose database-enforced privileges;
 and leaving things unchanged, since an unbuilt server and an external
@@ -353,8 +354,8 @@ Connection pools, waiting jobs, result rows/bytes and retry queues have fixed
 configured maxima. Reserve capacity for health/reconnect and delivery result
 settlement separately from interactive reads and maintenance. Database-side
 statement, lock and idle-transaction timeouts supplement socket and whole-job
-deadlines. Bound driver buffering and server error/notice retention. No
-unbounded task-per-request or transparent driver retry of writes is allowed.
+deadlines. Bound client buffering and server error/notice retention. No
+unbounded task-per-request or transparent client retry of writes is allowed.
 
 Logical account/blob/upload/queue quotas are transactional database counters
 and reservations shared by all instances. Process-local counters only bound
@@ -452,7 +453,7 @@ The optional query accepts `sslmode=verify-full` and an absolute
 `sslrootcert` path, each at most once. Verification is mandatory even
 without sslmode. An absent root path means the public trust store; an
 explicit path replaces it. Unknown parameters, duplicate parameters and
-weaker TLS modes are refused, rather than forwarded to the driver. A root
+weaker TLS modes are refused, rather than forwarded to the client. A root
 path here is only a name; its reader enforces the protected-file policy.
 
 Local Unix syntax is `postgresql://USER:PASSWORD@[:PORT]/DATABASE?host=DIR`,
@@ -468,7 +469,8 @@ Input is at most 16 KiB of printable ASCII without whitespace or fragments.
 Percent escapes decode once, preserving literal plus signs. Encode URI
 separators in credentials/database and spaces or non-ASCII data. User and
 database are nonempty UTF-8 text without controls, at most 256 decoded
-bytes. Passwords are 1..4096 non-NUL decoded bytes; the trust path is
+bytes. Passwords are 1..4096 decoded ASCII bytes without NUL, since the
+client does no SASLprep; the trust path is
 nonempty UTF-8 without controls, at most 4096 bytes. Profiles are 1..64
 ASCII letters, digits, dots, underscores or hyphens, starting with a letter
 or digit. All parse failures return fixed categories without the input or
@@ -565,23 +567,26 @@ the operation's own section admits a longer one, and connection setup never
 receives more than ten seconds. The worker does not resolve DNS, read a
 connection file, load a profile, migrate a schema or retry. User/database
 names are nonempty, NUL-free and at most 256 bytes; passwords are 1..4096
-bytes. The TLS facade validates the at-most-253-byte TCP server name before
+ASCII bytes without NUL, refused otherwise before dialing. The TLS facade validates the at-most-253-byte TCP server name before
 dialing.
 
-One worker drives connect and its operation through tokio-postgres. For
-TCP, TLS is required. The driver sends SSLRequest; td-crypto's outbound
-Postgres selector verifies the certificate chain and server name before
+One worker drives connect and its operation through td-postgres. For
+TCP, TLS is required. The client sends SSLRequest and reads exactly one
+answer byte; on `S` td-mta's connector runs td-crypto's outbound Postgres
+selector, which verifies the certificate chain and server name before
 startup credentials enter the stream. There is no plaintext fallback,
 direct-TLS ALPN, client certificate or channel-binding claim. The plaintext
 framing guard requires the SASL challenge/final/OK sequence and refuses
-MD5, cleartext-password, trust and other authentication methods. The pinned
-driver selects SCRAM-SHA-256 and verifies its server signature; its
-100,000-iteration ceiling bounds the server-directed password work.
+MD5, cleartext-password, trust and other authentication methods, as
+td-postgres itself does. The client accepts only SCRAM-SHA-256 and
+verifies its server signature; td-mta's 100,000-iteration ceiling
+(`Limits::scram_iterations`) bounds the server-directed password work.
 
 For an explicit Unix endpoint the same worker uses the raw socket, with SSL
 disabled only for this endpoint type. The framing guard, SCRAM sequence,
-output limits and retained-session validation windows attach before driver
-startup; skipping the TLS connector cannot bypass them. No certificate
+output limits and retained-session validation windows wrap the socket
+before the startup message (`td_postgres::connect_unix_through`); skipping
+the TLS connector cannot bypass them. No certificate
 file, DNS lookup, TCP listener or TCP fallback is involved. Account/role,
 schema, transaction and commit-outcome handling are identical to the TCP
 path.
@@ -616,24 +621,37 @@ failures cannot accumulate unbounded threads. These helpers exist only
 while dialing Unix endpoints, with at most 2 MiB of requested stack
 reservation per process, in addition to thread overhead.
 
-### Connection driver and input bounds
+### Client connection and input bounds
 
-One worker polls the request future and the PostgreSQL connection on its
-own thread. TCP and Unix reads and writes stay nonblocking during startup,
-queries and shutdown. The worker retries after socket bytes, TLS record
-processing or a driver wake. Once idle it waits in Linux `ppoll` for the
-read and write directions that actually blocked, together with a private
-wake socket. Channel wakes can interrupt that wait. LISTEN uses the same
-mechanism within the caller's slice; idle health checks return directly.
-Each live driver owns one database socket and two local wake descriptors.
-Connection setup fails if it cannot reserve the pair.
+Each worker owns one synchronous td-postgres client on its own thread,
+with no executor, future or wake channel. A Unix socket blocks in
+td-postgres's socket timeouts, never past the operation's deadline. The
+transitional TCP endpoint's TLS stream reads its nonblocking socket:
+after a pending read it waits for the socket to become readable in the
+transport's one-socket `ppoll` wait, or, while TLS still holds buffered
+records or blocked output, parks for a millisecond before retrying. An idle wait (LISTEN within the caller's
+slice) reads only notifications, notices and parameter reports until it
+holds one or its slice ends; idle health checks read only what is
+already there. Each live connection owns one database socket and no other
+descriptor.
 
-The caller and driver share one database connection. Connect, handshake,
+The worker's deadline bounds every call it makes. Connect, handshake,
 each retained job and teardown keep their original deadlines, including
-the 100 ms cleanup cap. A signal-interrupted wait recomputes time left.
-Native crypto work remains subject to TLS.md's between-call limits.
+the 100 ms cleanup cap. Native crypto work remains subject to TLS.md's
+between-call limits.
 
-Before driver intake, the default allowance caps backend frames at 128 KiB
+A worker error has two layers. A deadline, or any failure that breaks
+the client (I/O, a protocol violation, a FATAL, a limit or a stream
+refusal, or a request td-postgres could not reserve), is sticky: every
+later call on that worker fails, and the `with_*` operation returns the
+connection error rather than its own result. A statement's ERROR, a row
+count other than the one asked for, and a request td-postgres refuses as
+invalid before writing it leave the session usable and are the
+operation's own result. td-postgres keeps only the SQLSTATE and
+severity of a server error; messages, details, hints and notices are
+dropped where they arrive, and none reaches a log.
+
+Before the client reads a byte, the default allowance caps backend frames at 128 KiB
 including their length word, 128 frames and one MiB total for the entire
 connection. Fragmented headers and authentication codes retain nine bytes
 of framing state. A refusal aborts the transport. Client output defaults to
@@ -642,7 +660,11 @@ operation class selects its own input and output allowance
 (`postgres_probe::with_*`), named in its section; a runtime-mode connection
 admits at least 1024 frames ("Qualification on each runtime connection").
 No allowance changes the 128-KiB per-frame cap or the authentication
-checks. These are input/work bounds, not a whole-process RSS qualification
+checks. td-postgres's own `Limits` follow from the allowance: a message of
+128 KiB less its length word, a request no larger than the connection's
+output cap, at most the allowance's frames as messages and rows an
+operation, 1664 columns, twice the input allowance as kept result bytes,
+and at most 64 notifications held between calls. These are input/work bounds, not a whole-process RSS qualification
 or a serving pool reservation.
 
 ### Session settings and primary qualification
@@ -657,16 +679,16 @@ durability settings and returns only the numeric version. Every schema
 ledger inspection additionally requires PostgreSQL major 17 and a UTF8
 database ("Schema ledger and migration versions").
 
-Worker teardown releases the client and drives pending responses,
-PostgreSQL Terminate and TLS shutdown for at most 100 milliseconds within
-the original deadline. Failed or expired connections still abort; cleanup
-never changes a known operation outcome or retries a write. Terminate ends
+Worker teardown writes PostgreSQL Terminate for at most 100 milliseconds
+within the original deadline; a TLS stream then sends close_notify if its
+socket takes it at once. Failed or expired connections abort without
+either; cleanup never changes a known operation outcome or retries a
+write. Terminate ends
 any remaining read transaction without a separate SQL round trip. The
 qualification query alone does not validate a schema, enforce a
 supported-version range, or establish replication/failover durability.
-Provider diagnostics and credentials never enter the fixed error enum. The
-worker drives `poll_message` and drops asynchronous notices without
-invoking the driver Future implementation, which logs raw server text. The
+Provider diagnostics and credentials never enter the fixed error enum;
+the client drops asynchronous notices and server message text unread. The
 framing boundary follows the
 [PostgreSQL message formats](https://www.postgresql.org/docs/17/protocol-message-formats.html).
 
@@ -880,7 +902,7 @@ After cold file loading, DNS receives at most five seconds and the whole
 network operation receives ten seconds. Resolved addresses are attempted in
 order with the same absolute deadline. Only TCP/transport refusal permits
 another address; authentication, TLS-policy, settings or deadline errors
-stop the operation. No attempt renews its budget. Driver
+stop the operation. No attempt renews its budget. Client
 connection/authentication failures are deliberately coarse. A slow first
 address may exhaust the budget before later addresses can be attempted.
 Every other `postgres` operator command shares this address and deadline
@@ -1092,10 +1114,10 @@ inventories; probe, inspection and material operations retain 128 in
 preparation mode. The per-frame 128 KiB and total 1 MiB input bounds,
 authentication checks and terminal budget refusal are unchanged. Schema
 operations permit 128 KiB of post-TLS output, including
-startup/authentication and statement names. Driver statement names grow
-with a process-wide counter; schema initialization must still fit after
-long owner audit runs. Probe output remains bounded to 64 KiB. Fixed SQL
-and typed parameters are private to the crate; arbitrary driver execution
+startup/authentication. Every extended query uses the unnamed statement,
+so no statement name grows with process age. Probe output remains bounded
+to 64 KiB. Fixed SQL
+and typed parameters are private to the crate; arbitrary SQL execution
 is not a public API.
 
 Initialization errors before COMMIT drop the session and leave no committed
@@ -1289,7 +1311,7 @@ statement timeout, one-second lock timeout, 128-KiB backend-frame bound,
 128-frame count and one-MiB input cap. Their post-TLS output cap is 256 KiB
 to carry a maximal trust bundle plus fixed SQL/authentication overhead;
 probe operations retain 64 KiB and schema operations permit 128 KiB. Each
-operation owns a cold, fallibly reserved copy of at most 128 KiB; driver
+operation owns a cold, fallibly reserved copy of at most 128 KiB; client
 encodings/row buffers and TLS/provider allocations are additional bounded
 inputs, not a complete RSS qualification. The returned Material owner
 intentionally has no Debug implementation, and errors contain no input
@@ -2207,7 +2229,7 @@ deadline/window checks. No transaction or account lock survives between
 jobs; the one shared migration lock does. Wrong-password refusals retain
 the clean connection without caching an authentication result. SQL
 failures, failed cleanup, expired jobs and framing failures retire it.
-Before submitting a later job, the adapter polls the clean idle driver
+Before submitting a later job, the adapter drains the clean idle connection
 without queuing SQL. An already-observable idle failure permits one fresh
 connection under the original deadline. No failure after job submission
 retries that job; a disconnect racing the idle check can still fail the
@@ -2222,14 +2244,14 @@ selects addresses under the writer endpoint resolution policy
 worker checks local idle state once per second, outside client-slot locks,
 and retires a session when fewer than ten seconds of its original lifetime
 remain or its job count is exhausted. This maintenance performs no
-authorization query, driver health poll or new task. A shutdown guard
+authorization query, connection health poll or new task. A shutdown guard
 closes retained resources on that same worker before it exits, including
 early failure paths.
 
 Only a clean idle session whose job completed with acknowledged rollback
 and final checks may use a separate termination allowance. Consuming
 retirement bounds that allowance by the caller deadline, original session
-expiry and the 100-ms driver cleanup ceiling. It cannot perform another
+expiry and the 100-ms connection cleanup ceiling. It cannot perform another
 job, renew TLS or replenish byte/frame windows. Failed or unfinished jobs
 retain their original deadline and sticky failure behavior. Cleanup is best
 effort if the peer fails or scheduling crosses the immutable TLS expiry; no
@@ -2358,7 +2380,7 @@ input and 128 KiB individual-frame ceilings. Snapshot and body operations
 have a 256 MiB total input budget, 8192 frames, 512 KiB output and the
 unchanged 128 KiB individual frame/authentication limits. The total
 includes initial verification and later reads, so sufficiently many cache
-misses refuse rather than consume unlimited wire or driver memory. These
+misses refuse rather than consume unlimited wire or client memory. These
 are wire budgets, not resident allocations. A snapshot's deadline is at
 most ten seconds; a body connection admits at most thirty, the HTTPS
 download cap.
@@ -2366,10 +2388,11 @@ download cap.
 Cache-hit and callback-return checks drain available connection messages
 without a SQL round trip and retain terminal failures; a queued notice
 cannot conceal a subsequent connection error. The worker tracks actual
-socket byte progress beneath TLS: consuming an encrypted header can return
-Pending before yielding plaintext, so it retries immediately after that
-progress and parks only when the socket made none. The same rule drives
-connection setup and query polling, without extending any allowance.
+socket readiness beneath TLS: consuming an encrypted header can return
+Pending before yielding plaintext. The transitional TLS stream's setup
+and query reads then wait in the socket's readiness wait, or park for a
+millisecond while TLS still holds buffered work, without extending any
+allowance; a Unix socket blocks under the same deadline.
 Database query failures report I/O failure; corruption remains a
 row-shape or digest failure.
 
@@ -2378,7 +2401,7 @@ connection, qualification and query polling. Its TLS transport uses
 whole-millisecond ticks, so the initial remaining allowance rounds upward
 when deriving that secondary cap. Rounding downward could expire TLS first
 by a fraction of a millisecond, losing the worker's deadline
-classification in a generic driver error. This does not extend the worker
+classification in a generic connection error. This does not extend the worker
 allowance: each poll still checks the exact original `Instant`, and phase
 tightening (`Snapshot::constrain_deadline`) can only shorten it. An
 unrepresentable transport tick is refused.
@@ -2469,7 +2492,7 @@ one-shot operation; its budgets do not qualify HTTP transfer limits.
 `with_interpreted_body` and the qualified `with_projected_body` path,
 whose callbacks build provisional output and cannot publish or admit new
 work, group connection-health polling across resident pin checks and
-cached body reads. They share one counter: a full driver check occurs at
+cached body reads. They share one counter: a full connection check occurs at
 least every 64 checkpoints. Every checkpoint still checks sticky failure
 and the original body/worker deadlines immediately. Cache misses check
 connection health before and after SQL; verification and callback
@@ -3395,7 +3418,7 @@ CONFIG.md records the default-plan increase.
 
 Owner `postgres summary-backfill --search` prepares these rows alongside
 header summaries, optionally with `--structure`. The interpreted pin
-batches at most 64 cached source checks between driver polls, while
+batches at most 64 cached source checks between connection checks, while
 retaining per-check deadlines and full checks at cache misses and
 completion. Text decoding samples the monotonic work clock at the fixed
 scalar-batch boundary, with original source checks before batches and on
@@ -5964,10 +5987,11 @@ migration or new privileges are required.
 
 The channel has an empty payload: every subscribed relay profile may wake,
 then uses its own bounded account rotation and current authorization.
-Driver polls coalesce matching notifications into one boolean, including
+Client reads coalesce matching notifications into one boolean, including
 those read during SQL. Unrelated channels and nonempty payloads are
-ignored. Existing finite input frame/byte budgets still apply; no
-notification queue is allocated. An idle pause blocks on the existing
+ignored. Existing finite input frame/byte budgets still apply; the
+client holds at most 64 notifications between calls, and the worker
+takes them all after each one. An idle pause blocks on the existing
 socket in at most fifty-millisecond slices and issues no SQL. Stop, repair
 and queue-clock confirmation requests interrupt it. A disconnect, missing
 subscription or finite session retirement also ends the pause; replacement
@@ -7172,7 +7196,7 @@ check without touching its retained final capacity.
 
 BodyChecks binds one authenticated PostgreSQL connection to the exact Body
 change, clock guard and original absolute deadline. It is non-cloneable and
-thread-bound because its worker waker targets the opening thread. It exposes
+thread-bound: its worker's client is not shared across threads. It exposes
 only passive validation and owns no SMTP authority, connection permit or
 work meter; its caller retains connection capacity and admission.
 
@@ -7818,9 +7842,9 @@ because it cannot perform another expiry mutation.
 ### Typed parameters for single-round-trip queries
 
 The schema, role, policy, owner, health, receipt and recipient reads of
-Body validation use explicit PostgreSQL parameter types so the driver can
-send each query in one round trip without separately preparing and closing
-a statement. SQL ordering, lock lifetimes and fresh observations are
+Body validation, like every td-postgres query, name each parameter's
+PostgreSQL type, so the client sends each query in one round trip without
+separately preparing and closing a statement. SQL ordering, lock lifetimes and fresh observations are
 unchanged, and no result is cached between validation turns. The same
 single-round-trip calls cover primary read snapshot selection and account
 state, device-token reads, body reauthorization, Email/query pagination and

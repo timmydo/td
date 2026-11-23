@@ -133,7 +133,7 @@ fn retained(
     })
 }
 
-fn selection(row: &tokio_postgres::Row) -> Result<Option<Selection>, Error> {
+fn selection(row: &crate::postgres_probe::Row) -> Result<Option<Selection>, Error> {
     let generation: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
     let generation = u64::from_be_bytes(generation.try_into().map_err(|_| Error::Integrity)?);
     let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -147,11 +147,11 @@ fn selection(row: &tokio_postgres::Row) -> Result<Option<Selection>, Error> {
     }
 }
 
-async fn receipt(
-    client: &tokio_postgres::Client,
+fn receipt(
+    client: &crate::postgres_probe::Client,
     change: Change,
 ) -> Result<Option<Selection>, Error> {
-    let rows = client.query("SELECT generation,version_id,request_digest FROM td_mta.config_selection_receipts WHERE operation=$1 LIMIT 2", &[&change.operation.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+    let rows = client.query("SELECT generation,version_id,request_digest FROM td_mta.config_selection_receipts WHERE operation=$1 LIMIT 2", &[&change.operation.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -163,7 +163,7 @@ async fn receipt(
     if digest != change.request_digest {
         return Err(Error::Conflict);
     }
-    let selected = selection(row)?.ok_or(Error::Integrity)?;
+    let selected = selection(&row)?.ok_or(Error::Integrity)?;
     if Some(selected.generation) != change.expected.checked_add(1)
         || selected.version != change.version
     {
@@ -184,24 +184,21 @@ pub fn inspect(
     change: Change,
 ) -> Result<Option<Selection>, Error> {
     postgres_probe::with_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
             let schema = client.inspect_schema()
-                .await
                 .map_err(Error::Schema)?;
             if schema.store_epoch != change.epoch {
                 return Err(Error::Epoch);
             }
-            client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
-            let found = receipt(client, change).await?;
-            let current = selection(&row)?.map_or(0, |selected| selected.generation);
+            client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_| Error::Database)?;
+            let found = receipt(client, change)?;
+            let current = selection(&row.row())?.map_or(0, |selected| selected.generation);
             let generation = change.expected.checked_add(1).ok_or(Error::Integrity)?;
             if found.is_none() && expired(generation, current) {
                 return Err(Error::Expired);
             }
             Ok(found)
         })
-    })
     .map_err(Error::Connection)?
 }
 
@@ -228,77 +225,68 @@ pub fn publish(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
-            if schema.store_epoch != change.epoch {
-                return Err(Error::Epoch);
-            }
-            client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR UPDATE", &[]).await.map_err(|_| Error::Database)?;
-            // A waiter must inspect the receipt after acquiring the publication
-            // lock, so an absence observation cannot race a duplicate publication.
-            if let Some(selected) = receipt(client, change).await? {
-                return Ok(selected);
-            }
-            let current = selection(&row)?.map_or(0, |selected| selected.generation);
-            let generation = change.expected.checked_add(1).ok_or(Error::Capacity)?;
-            if current != change.expected {
-                // Under the lock, as in inspect: a swept receipt is never
-                // reported as a definite refusal either.
-                return Err(if expired(generation, current) {
-                    Error::Expired
-                } else {
-                    Error::Conflict
-                });
-            }
-            // Keep the receipts of the latest RETAINED_GENERATIONS selections,
-            // this one included; big-endian bytea orders like the number.
-            let floor = generation
-                .saturating_sub(RETAINED_GENERATIONS)
-                .to_be_bytes();
-            client
-                .execute(
-                    "DELETE FROM td_mta.config_selection_receipts WHERE generation<=$1",
-                    &[&floor.as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            let count: i64 = client.query_one("SELECT count(*) FROM (SELECT operation FROM td_mta.config_selection_receipts LIMIT 1024) bounded", &[]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
-            if count >= MAX_RECEIPTS {
-                return Err(Error::Capacity);
-            }
-            let version_row = client
-                .query_one(
-                    "SELECT checksum FROM td_mta.config_versions WHERE id=$1",
-                    &[&change.version.as_bytes().as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            let digest: &[u8] = version_row.try_get(0).map_err(|_| Error::Integrity)?;
-            if digest != change.source_digest {
-                return Err(Error::Conflict);
-            }
-            bindings
-                .replace_if_installed(client, change.version)
-                .await?;
-            let bytes = generation.to_be_bytes();
-            let changed = client.execute("UPDATE td_mta.config_selection SET generation=$1,version_id=$2 WHERE singleton=true", &[&bytes.as_slice(), &change.version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-            if changed != 1 {
-                return Err(Error::Integrity);
-            }
-            let inserted = client.execute("INSERT INTO td_mta.config_selection_receipts (operation,request_digest,generation,version_id) VALUES ($1,$2,$3,$4)", &[&change.operation.as_bytes().as_slice(), &change.request_digest.as_slice(), &bytes.as_slice(), &change.version.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-            if inserted != 1 {
-                return Err(Error::Integrity);
-            }
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Selection {
-                generation,
-                version: change.version,
-            })
+        let schema = client.inspect_schema().map_err(Error::Schema)?;
+        if schema.store_epoch != change.epoch {
+            return Err(Error::Epoch);
+        }
+        client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+        let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR UPDATE", &[]).map_err(|_| Error::Database)?;
+        // A waiter must inspect the receipt after acquiring the publication
+        // lock, so an absence observation cannot race a duplicate publication.
+        if let Some(selected) = receipt(client, change)? {
+            return Ok(selected);
+        }
+        let current = selection(&row.row())?.map_or(0, |selected| selected.generation);
+        let generation = change.expected.checked_add(1).ok_or(Error::Capacity)?;
+        if current != change.expected {
+            // Under the lock, as in inspect: a swept receipt is never
+            // reported as a definite refusal either.
+            return Err(if expired(generation, current) {
+                Error::Expired
+            } else {
+                Error::Conflict
+            });
+        }
+        // Keep the receipts of the latest RETAINED_GENERATIONS selections,
+        // this one included; big-endian bytea orders like the number.
+        let floor = generation
+            .saturating_sub(RETAINED_GENERATIONS)
+            .to_be_bytes();
+        client
+            .execute(
+                "DELETE FROM td_mta.config_selection_receipts WHERE generation<=$1",
+                &[&floor.as_slice()],
+            )
+            .map_err(|_| Error::Database)?;
+        let count: i64 = client.query_one("SELECT count(*) FROM (SELECT operation FROM td_mta.config_selection_receipts LIMIT 1024) bounded", &[]).map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
+        if count >= MAX_RECEIPTS {
+            return Err(Error::Capacity);
+        }
+        let version_row = client
+            .query_one(
+                "SELECT checksum FROM td_mta.config_versions WHERE id=$1",
+                &[&change.version.as_bytes().as_slice()],
+            )
+            .map_err(|_| Error::Database)?;
+        let digest: &[u8] = version_row.try_get(0).map_err(|_| Error::Integrity)?;
+        if digest != change.source_digest {
+            return Err(Error::Conflict);
+        }
+        bindings.replace_if_installed(client, change.version)?;
+        let bytes = generation.to_be_bytes();
+        let changed = client.execute("UPDATE td_mta.config_selection SET generation=$1,version_id=$2 WHERE singleton=true", &[&bytes.as_slice(), &change.version.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
+        if changed != 1 {
+            return Err(Error::Integrity);
+        }
+        let inserted = client.execute("INSERT INTO td_mta.config_selection_receipts (operation,request_digest,generation,version_id) VALUES ($1,$2,$3,$4)", &[&change.operation.as_bytes().as_slice(), &change.request_digest.as_slice(), &bytes.as_slice(), &change.version.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
+        if inserted != 1 {
+            return Err(Error::Integrity);
+        }
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Selection {
+            generation,
+            version: change.version,
         })
     });
     match result {
@@ -333,12 +321,20 @@ pub fn observe(
     deadline: Instant,
     epoch: StoreEpoch,
 ) -> Result<Option<Selection>, Error> {
-    postgres_probe::with_client(request, trust, deadline, move |client| Box::pin(async move {
-        let schema = client.inspect_schema().await.map_err(Error::Schema)?;
-        if schema.store_epoch != epoch { return Err(Error::Epoch); }
-        let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true", &[]).await.map_err(|_| Error::Database)?;
-        selection(&row)
-    })).map_err(Error::Connection)?
+    postgres_probe::with_client(request, trust, deadline, move |client| {
+        let schema = client.inspect_schema().map_err(Error::Schema)?;
+        if schema.store_epoch != epoch {
+            return Err(Error::Epoch);
+        }
+        let row = client
+            .query_one(
+                "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true",
+                &[],
+            )
+            .map_err(|_| Error::Database)?;
+        selection(&row.row())
+    })
+    .map_err(Error::Connection)?
 }
 
 #[cfg(test)]

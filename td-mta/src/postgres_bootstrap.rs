@@ -68,6 +68,10 @@ impl Bootstrap {
         let (user, password) = credentials.split_once(':').ok_or(Error::Credentials)?;
         let user = text(user, 256).map_err(|_| Error::Credentials)?;
         let password = decode(password, 4096).map_err(|_| Error::Credentials)?;
+        // The client does no SASLprep, so it logs in with ASCII only.
+        if !password.is_ascii() {
+            return Err(Error::Credentials);
+        }
         let (host, port) = match endpoint.split_once(':') {
             Some((host, port)) => {
                 if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
@@ -362,6 +366,8 @@ mod tests {
             "postgresql://:pw@localhost/mail",
             "postgresql://alice:@localhost/mail",
             "postgresql://alice:%00@localhost/mail",
+            "postgresql://alice:p%C3%A9@localhost/mail",
+            "postgresql://alice:%80@localhost/mail",
             "postgresql://alice:%GG@localhost/mail",
             "postgresql://alice:%@localhost/mail",
             "postgresql://alice:pw@127.0.0.1/mail",

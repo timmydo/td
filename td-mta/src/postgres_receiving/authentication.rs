@@ -1,10 +1,10 @@
 //! Per-Email rows for direct-MX sender authentication, written in the
 //! delivery's publication transaction.
 use super::Error;
+use crate::postgres_probe::Client;
 use crate::sender_authentication::Results;
-use tokio_postgres::Client;
 
-pub(super) async fn write(
+pub(super) fn write(
     client: &Client,
     account: &[u8],
     email: &[u8],
@@ -34,7 +34,6 @@ pub(super) async fn write(
                 &dmarc.aligned.map(|aligned| aligned.as_str()),
             ],
         )
-        .await
         .map_err(|_| Error::Database)?;
     if written != 1 {
         return Err(Error::Integrity);
@@ -67,7 +66,7 @@ pub(super) async fn write(
             *a = row.algorithm.map(|algorithm| algorithm.as_str());
             *d = row.domain.as_deref();
             *s = row.selector.as_deref();
-            *b = row.key_bits.map(i32::from);
+            *b = row.key_bits.map(i64::from);
         } else {
             return Err(Error::Integrity);
         }
@@ -78,7 +77,7 @@ pub(super) async fn write(
             "INSERT INTO td_mta.email_dkim_signatures(account,email_id,ordinal,result,
                 algorithm,domain,selector,key_bits)
                 SELECT $1::bytea,$2::bytea,* FROM unnest($3::bigint[],$4::text[],$5::text[],$6::text[],
-                $7::text[],$8::integer[])",
+                $7::text[],$8::bigint[])",
             &[
                 &account,
                 &email,
@@ -90,7 +89,6 @@ pub(super) async fn write(
                 &bits.get(..count).ok_or(Error::Integrity)?,
             ],
         )
-        .await
         .map_err(|_| Error::Database)?;
     if usize::try_from(written).ok() != Some(count) {
         return Err(Error::Integrity);

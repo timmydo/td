@@ -14,7 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 use td_crypto::{Crypto, Digest, Provider, TrustStore};
-use tokio_postgres::types::Type;
 
 const CHUNK: u64 = 65536;
 const BATCH: u64 = 8;
@@ -189,7 +188,7 @@ impl<'a> SessionCache<'a> {
                 binding.epoch(),
                 postgres_probe::ReadIsolation::ReadCommitted,
                 deadline,
-                move |client| Box::pin(reauthorize_body(client, binding, presented, expires)),
+                move |client| reauthorize_body(client, binding, presented, expires),
             )
             .map_err(|error| {
                 if error == postgres_probe::Error::Transport {
@@ -317,19 +316,19 @@ pub fn with_email<T>(
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
     postgres_probe::with_body_worker(request, trust, deadline, |worker| {
-        let metadata = worker.run(|client| Box::pin(async move {
-            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+        let metadata = worker.run(|client| {
+            let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != selected.epoch { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            postgres_devices::authenticate(client, selected.account, presented).await.map_err(Error::Credential)?.ok_or(Error::Unauthenticated)?;
-            email_metadata(client,selected).await
-        })).map_err(Error::Connection)??;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            postgres_devices::authenticate(client, selected.account, presented).map_err(Error::Credential)?.ok_or(Error::Unauthenticated)?;
+            email_metadata(client,selected)
+        }).map_err(Error::Connection)??;
         with_verified_body(worker,BlobMetadata { identity:metadata.identity,blob:metadata.blob,body:metadata.body },deadline,|body|read(metadata,body))
     }).map_err(Error::Connection)?
 }
 
-pub(crate) async fn email_metadata(
-    client: &tokio_postgres::Client,
+pub(crate) fn email_metadata(
+    client: &crate::postgres_probe::Client,
     selected: ReadRequest,
 ) -> Result<Metadata, Error> {
     email_metadata_batch(
@@ -338,14 +337,13 @@ pub(crate) async fn email_metadata(
         selected.account,
         selected.maximum,
         &[selected.email],
-    )
-    .await?
+    )?
     .pop()
     .ok_or(Error::Missing)
 }
 
-pub(crate) async fn email_metadata_batch(
-    client: &tokio_postgres::Client,
+pub(crate) fn email_metadata_batch(
+    client: &crate::postgres_probe::Client,
     epoch: StoreEpoch,
     account: AccountId,
     maximum: u64,
@@ -361,7 +359,7 @@ pub(crate) async fn email_metadata_batch(
     ids.try_reserve_exact(emails.len())
         .map_err(|_| Error::Capacity)?;
     ids.extend(emails.iter().map(|id| id.as_bytes().as_slice()));
-    let rows = client.query_typed("SELECT a.sequence,a.floor,e.blob_id,e.thread_id,e.received_at,b.length,b.digest,b.created_at,b.chunk_count,e.changed,b.changed,t.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=a.id AND c.blob_id=e.blob_id),e.id FROM td_mta.accounts a JOIN td_mta.emails e ON e.account=a.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id WHERE a.id=$1 AND e.id=ANY($2) ORDER BY e.id LIMIT 17", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&ids, Type::BYTEA_ARRAY)]).await.map_err(|_| Error::Database)?;
+    let rows = client.query("SELECT a.sequence,a.floor,e.blob_id,e.thread_id,e.received_at,b.length,b.digest,b.created_at,b.chunk_count,e.changed,b.changed,t.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=a.id AND c.blob_id=e.blob_id),e.id FROM td_mta.accounts a JOIN td_mta.emails e ON e.account=a.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id WHERE a.id=$1 AND e.id=ANY($2) ORDER BY e.id LIMIT 17", &[&account.as_bytes().as_slice(), &ids]).map_err(|_| Error::Database)?;
     if rows.len() > emails.len() {
         return Err(Error::Integrity);
     }
@@ -370,7 +368,7 @@ pub(crate) async fn email_metadata_batch(
         .try_reserve_exact(rows.len())
         .map_err(|_| Error::Capacity)?;
     let mut previous: Option<EmailId> = None;
-    for row in rows {
+    for row in &rows {
         let bytes: &[u8] = row.try_get(13).map_err(|_| Error::Integrity)?;
         let email = EmailId::from_bytes(bytes.try_into().map_err(|_| Error::Integrity)?);
         if !emails.contains(&email) || previous.is_some_and(|id| id.as_bytes() >= email.as_bytes())
@@ -444,7 +442,7 @@ pub(crate) fn with_pin_checks<T>(
         metadata,
         deadline,
         failed: None,
-        cache: Vec::new(),
+        cache: None,
         cache_start: 0,
         checks_left: matches!(checks, PinChecks::Interpreted).then_some(0),
         chunks: None,
@@ -477,7 +475,7 @@ pub(crate) fn with_chunk_verified_pin<T>(
         metadata,
         deadline,
         failed: None,
-        cache: Vec::new(),
+        cache: None,
         cache_start: 0,
         checks_left: Some(0),
         chunks: Some(chunks),
@@ -574,27 +572,23 @@ fn with_pinned_blob_inner<T>(
     let read_body = |worker: &mut Worker| {
         let (metadata, expires) = worker
             .run(|client| {
-                Box::pin(async move {
-                    if retained {
-                        observe_blob(
-                            client,
-                            snapshot_binding,
-                            selected.blob,
-                            selected.maximum,
-                            presented,
-                        )
-                        .await
-                    } else {
-                        blob_snapshot(
-                            client,
-                            snapshot_binding,
-                            selected.blob,
-                            selected.maximum,
-                            presented,
-                        )
-                        .await
-                    }
-                })
+                if retained {
+                    observe_blob(
+                        client,
+                        snapshot_binding,
+                        selected.blob,
+                        selected.maximum,
+                        presented,
+                    )
+                } else {
+                    blob_snapshot(
+                        client,
+                        snapshot_binding,
+                        selected.blob,
+                        selected.maximum,
+                        presented,
+                    )
+                }
             })
             .map_err(Error::Connection)??;
         let mut body = Body {
@@ -602,7 +596,7 @@ fn with_pinned_blob_inner<T>(
             metadata,
             deadline,
             failed: None,
-            cache: Vec::new(),
+            cache: None,
             cache_start: 0,
             checks_left: None,
             chunks: None,
@@ -620,7 +614,7 @@ fn with_pinned_blob_inner<T>(
                 request,
                 trust,
                 deadline.min(Instant::now() + postgres_probe::MAX_DURATION),
-                |client| Box::pin(reauthorize_blob(client, binding, presented, expires)),
+                |client| reauthorize_blob(client, binding, presented, expires),
             )
             .map_err(Error::Connection)??;
         }
@@ -646,35 +640,34 @@ fn with_pinned_blob_inner<T>(
     }
 }
 
-async fn blob_snapshot(
-    client: &postgres_probe::ScopedClient,
+fn blob_snapshot(
+    client: &postgres_probe::Client,
     binding: Binding,
     blob: BlobId,
     maximum: u64,
     presented: Presented,
 ) -> Result<(BlobMetadata, Option<i64>), Error> {
-    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+    let schema = client.inspect_schema().map_err(Error::Schema)?;
     if schema.store_epoch != binding.epoch() {
         return Err(Error::Epoch);
     }
-    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-    observe_blob(client, binding, blob, maximum, presented).await
+    client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+    observe_blob(client, binding, blob, maximum, presented)
 }
 
-async fn observe_blob(
-    client: &tokio_postgres::Client,
+fn observe_blob(
+    client: &crate::postgres_probe::Client,
     binding: Binding,
     blob: BlobId,
     maximum: u64,
     presented: Presented,
 ) -> Result<(BlobMetadata, Option<i64>), Error> {
     let device = presented.id();
-    check_selection(client, &binding, false).await?;
+    check_selection(client, &binding, false)?;
     postgres_devices::authenticate(client, binding.account(), presented)
-        .await
         .map_err(Error::Credential)?
         .ok_or(Error::Unauthenticated)?;
-    let rows = client.query_typed("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id),l.device_id,l.expires_at,l.changed,(extract(epoch FROM clock_timestamp())*1000)::bigint FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id LEFT JOIN td_mta.leases l ON l.account=b.account AND l.blob_id=b.id WHERE a.id=$1 AND b.id=$2 LIMIT 2", &[(&binding.account().as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA)]).await.map_err(|_| Error::Database)?;
+    let rows = client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id),l.device_id,l.expires_at,l.changed,(extract(epoch FROM clock_timestamp())*1000)::bigint FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id LEFT JOIN td_mta.leases l ON l.account=b.account AND l.blob_id=b.id WHERE a.id=$1 AND b.id=$2 LIMIT 2", &[&binding.account().as_bytes().as_slice(), &blob.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
     if rows.is_empty() {
         return Err(Error::Missing);
     }
@@ -682,9 +675,9 @@ async fn observe_blob(
         return Err(Error::Integrity);
     }
     let row = rows.first().ok_or(Error::Integrity)?;
-    let sequence = number(row, 0)?;
-    let floor = number(row, 1)?;
-    if floor > sequence || number(row, 6)? > sequence {
+    let sequence = number(&row, 0)?;
+    let floor = number(&row, 1)?;
+    if floor > sequence || number(&row, 6)? > sequence {
         return Err(Error::Integrity);
     }
     let referenced: bool = row.try_get(8).map_err(|_| Error::Integrity)?;
@@ -698,20 +691,20 @@ async fn observe_blob(
         {
             return Err(Error::Missing);
         }
-        if number(row, 11)? > sequence {
+        if number(&row, 11)? > sequence {
             return Err(Error::Integrity);
         }
         expires
     };
     Ok((
-        blob_metadata(row, binding.account(), binding.epoch(), blob, maximum)?,
+        blob_metadata(&row, binding.account(), binding.epoch(), blob, maximum)?,
         expires,
     ))
 }
 
 /// Fixed blob-manifest columns shared by authenticated and relay snapshots.
 pub(crate) fn blob_metadata(
-    row: &tokio_postgres::Row,
+    row: &crate::postgres_probe::Row,
     account: AccountId,
     epoch: StoreEpoch,
     blob: BlobId,
@@ -752,43 +745,40 @@ pub(crate) fn blob_metadata(
     })
 }
 
-async fn reauthorize_blob(
-    client: &postgres_probe::ScopedClient,
+fn reauthorize_blob(
+    client: &postgres_probe::Client,
     binding: Binding,
     presented: Presented,
     expires: Option<i64>,
 ) -> Result<(), Error> {
-    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+    let schema = client.inspect_schema().map_err(Error::Schema)?;
     if schema.store_epoch != binding.epoch() {
         return Err(Error::Epoch);
     }
-    client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
-    reauthorize_body(client, binding, presented, expires).await
+    client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_|Error::Database)?;
+    reauthorize_body(client, binding, presented, expires)
 }
-async fn reauthorize_body(
-    client: &tokio_postgres::Client,
+fn reauthorize_body(
+    client: &crate::postgres_probe::Client,
     binding: Binding,
     presented: Presented,
     expires: Option<i64>,
 ) -> Result<(), Error> {
-    check_selection(client, &binding, true).await?;
+    check_selection(client, &binding, true)?;
     client
-        .query_typed_one(
+        .query_one(
             "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
-            &[(&binding.account().as_bytes().as_slice(), Type::BYTEA)],
+            &[&binding.account().as_bytes().as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?;
     postgres_devices::authenticate(client, binding.account(), presented)
-        .await
         .map_err(Error::Credential)?
         .ok_or(Error::Unauthenticated)?;
     let now: i64 = client
-        .query_typed_one(
+        .query_one(
             "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
             &[],
         )
-        .await
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Integrity)?;
@@ -798,8 +788,8 @@ async fn reauthorize_body(
     Ok(())
 }
 
-async fn check_selection(
-    client: &tokio_postgres::Client,
+fn check_selection(
+    client: &crate::postgres_probe::Client,
     binding: &Binding,
     locked: bool,
 ) -> Result<(), Error> {
@@ -808,12 +798,9 @@ async fn check_selection(
     } else {
         "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true"
     };
-    let row = client
-        .query_typed_one(query, &[])
-        .await
-        .map_err(|_| Error::Database)?;
+    let row = client.query_one(query, &[]).map_err(|_| Error::Database)?;
     let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
-    if number(&row, 0)? != binding.selection().generation
+    if number(&row.row(), 0)? != binding.selection().generation
         || version != Some(binding.selection().version.as_bytes().as_slice())
     {
         return Err(Error::Policy);
@@ -821,13 +808,13 @@ async fn check_selection(
     Ok(())
 }
 
-fn number(row: &tokio_postgres::Row, column: usize) -> Result<u64, Error> {
+fn number(row: &crate::postgres_probe::Row, column: usize) -> Result<u64, Error> {
     let bytes: &[u8] = row.try_get(column).map_err(|_| Error::Integrity)?;
     Ok(u64::from_be_bytes(
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-fn metadata(row: &tokio_postgres::Row, selected: ReadRequest) -> Result<Metadata, Error> {
+fn metadata(row: &crate::postgres_probe::Row, selected: ReadRequest) -> Result<Metadata, Error> {
     let sequence = number(row, 0)?;
     let floor = number(row, 1)?;
     if floor > sequence
@@ -888,7 +875,7 @@ struct Body<'a, 'h> {
     metadata: BlobMetadata,
     deadline: Instant,
     failed: Option<ports::Error>,
-    cache: Vec<tokio_postgres::Row>,
+    cache: Option<crate::postgres_probe::Rows>,
     cache_start: u64,
     checks_left: Option<u8>,
     chunks: Option<&'h crate::postgres_mime_evidence::ChunkEvidence>,
@@ -933,7 +920,7 @@ impl Body<'_, '_> {
         Ok(())
     }
 
-    fn batch(&mut self, start: u64, end: u64) -> Result<Vec<tokio_postgres::Row>, ports::Error> {
+    fn batch(&mut self, start: u64, end: u64) -> Result<crate::postgres_probe::Rows, ports::Error> {
         let timing = self
             .chunks
             .map(|_| crate::performance::Timer::start(crate::performance::Phase::ChunkVerify));
@@ -943,9 +930,9 @@ impl Body<'_, '_> {
         }
         let account = self.metadata.identity.account;
         let blob = self.metadata.blob;
-        let rows = self.worker.run(|client| Box::pin(async move {
-            client.query_typed("SELECT ordinal,bytes FROM td_mta.blob_chunks WHERE account=$1 AND blob_id=$2 AND ordinal>=$3 AND ordinal<$4 ORDER BY ordinal LIMIT 8", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&(start as i64), Type::INT8), (&(end as i64), Type::INT8)]).await
-        })).map_err(connection)?.map_err(|_| database())?;
+        let rows = self.worker.run(|client| {
+            client.query("SELECT ordinal,bytes FROM td_mta.blob_chunks WHERE account=$1 AND blob_id=$2 AND ordinal>=$3 AND ordinal<$4 ORDER BY ordinal LIMIT 8", &[&account.as_bytes().as_slice(), &blob.as_bytes().as_slice(), &(start as i64), &(end as i64)])
+        }).map_err(connection)?.map_err(|_| database())?;
         if rows.len() as u64 != end - start {
             return Err(ports::Error::Corrupt);
         }
@@ -977,10 +964,14 @@ impl Body<'_, '_> {
         let mut start = 0;
         while start < chunks {
             let end = (start + BATCH).min(chunks);
-            self.cache.clear();
-            self.cache = self.batch(start, end)?;
+            self.cache = None;
+            self.cache = Some(self.batch(start, end)?);
             self.cache_start = start;
-            for row in &self.cache {
+            for row in self
+                .cache
+                .iter()
+                .flat_map(crate::postgres_probe::Rows::iter)
+            {
                 let bytes: &[u8] = row.try_get(1).map_err(|_| ports::Error::Corrupt)?;
                 digest.update(bytes)?;
                 if classify_ascii && !has_non_ascii {
@@ -1006,7 +997,11 @@ impl Body<'_, '_> {
             return Ok(0);
         }
         let start = offset / CHUNK;
-        if start < self.cache_start || start >= self.cache_start + self.cache.len() as u64 {
+        let cached = self
+            .cache
+            .as_ref()
+            .map_or(0, crate::postgres_probe::Rows::len) as u64;
+        if start < self.cache_start || start >= self.cache_start + cached {
             let (aligned, end) = if self.chunks.is_some() {
                 let length = (self.len() - offset).min(output.len() as u64);
                 (start, (offset + length).div_ceil(CHUNK).min(start + BATCH))
@@ -1014,14 +1009,18 @@ impl Body<'_, '_> {
                 let aligned = start / BATCH * BATCH;
                 (aligned, (aligned + BATCH).min(self.len().div_ceil(CHUNK)))
             };
-            self.cache.clear();
-            self.cache = self.batch(aligned, end)?;
+            self.cache = None;
+            self.cache = Some(self.batch(aligned, end)?);
             self.cache_start = aligned;
         }
         let mut written = 0;
         let mut skip = (offset % CHUNK) as usize;
         let first = usize::try_from(start - self.cache_start).map_err(|_| ports::Error::Corrupt)?;
-        for row in self.cache.get(first..).ok_or(ports::Error::Corrupt)? {
+        let cache = self.cache.as_ref().ok_or(ports::Error::Corrupt)?;
+        if first > cache.len() {
+            return Err(ports::Error::Corrupt);
+        }
+        for row in cache.iter().skip(first) {
             let bytes: &[u8] = row.try_get(1).map_err(|_| ports::Error::Corrupt)?;
             let bytes = bytes.get(skip..).ok_or(ports::Error::Corrupt)?;
             let take = bytes.len().min(output.len().saturating_sub(written));

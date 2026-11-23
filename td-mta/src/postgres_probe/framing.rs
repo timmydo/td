@@ -1,4 +1,4 @@
-//! Bound input before the driver's codec allocates or authenticates.
+//! Bound input before the client parses, allocates or authenticates.
 use super::windows::Windows;
 
 pub(super) struct Input {
@@ -54,7 +54,7 @@ impl Input {
 
     pub(super) fn mutations() -> Self {
         Self {
-            // Account admission, statement closes and COMMIT share this allowance.
+            // Account admission and COMMIT share this allowance.
             frames: 1088,
             ..Self::new()
         }
@@ -152,6 +152,16 @@ impl Input {
 
     pub(super) fn window(&self) -> Option<Windows> {
         self.window.clone()
+    }
+
+    /// The connection's remaining frame allowance.
+    pub(super) fn frames(&self) -> usize {
+        self.frames
+    }
+
+    /// The connection's remaining input byte allowance.
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
     }
 
     pub(super) fn admit_output(&self, bytes: usize) -> Result<(), ()> {

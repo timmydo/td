@@ -1,4 +1,5 @@
 //! Shared selected-profile admission for finite primary read snapshots.
+use crate::postgres_probe::Client;
 use crate::{
     device_credentials::Presented,
     format::Sequence,
@@ -9,7 +10,6 @@ use crate::{
     postgres_schema,
     postgres_selection::Selection,
 };
-use tokio_postgres::{types::Type, Client};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
@@ -39,37 +39,36 @@ impl From<&Binding> for ReadBinding {
     }
 }
 
-pub(crate) async fn begin(
-    client: &crate::postgres_probe::ScopedClient,
+pub(crate) fn begin(
+    client: &crate::postgres_probe::Client,
     binding: &Binding,
     presented: Presented,
 ) -> Result<ViewIdentity, Error> {
     if !binding.roles().jmap() {
         return Err(Error::Policy);
     }
-    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+    let schema = client.inspect_schema().map_err(Error::Schema)?;
     if schema.store_epoch != binding.epoch() {
         return Err(Error::Epoch);
     }
-    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
-    observe(client, binding.into(), presented).await
+    client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_|Error::Database)?;
+    observe(client, binding.into(), presented)
 }
 
 // The caller owns a freshly qualified transaction and its migration lock.
-pub(crate) async fn observe(
+pub(crate) fn observe(
     client: &Client,
     binding: ReadBinding,
     presented: Presented,
 ) -> Result<ViewIdentity, Error> {
-    selected(client, binding).await?;
+    selected(client, binding)?;
     postgres_devices::authenticate(client, binding.account, presented)
-        .await
         .map_err(Error::Credential)?
         .ok_or(Error::Unauthenticated)?;
-    identity(client, binding).await
+    identity(client, binding)
 }
 
-pub(crate) async fn observe_events(
+pub(crate) fn observe_events(
     client: &Client,
     binding: ReadBinding,
     principal: crate::http_auth::Principal,
@@ -78,27 +77,25 @@ pub(crate) async fn observe_events(
     if principal.account != binding.account {
         return Err(Error::Unauthenticated);
     }
-    selected(client, binding).await?;
+    selected(client, binding)?;
     let credential_stamp = postgres_devices::event_stamp(client, principal, credential)
-        .await
         .map_err(Error::Credential)?
         .ok_or(Error::Unauthenticated)?;
     Ok(crate::http_auth::EventObservation {
         credential_stamp,
-        identity: identity(client, binding).await?,
+        identity: identity(client, binding)?,
     })
 }
 
-async fn selected(client: &Client, binding: ReadBinding) -> Result<(), Error> {
+fn selected(client: &Client, binding: ReadBinding) -> Result<(), Error> {
     if !binding.jmap {
         return Err(Error::Policy);
     }
     let selected = client
-        .query_typed_one(
+        .query_one(
             "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true",
             &[],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
     let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
@@ -110,13 +107,12 @@ async fn selected(client: &Client, binding: ReadBinding) -> Result<(), Error> {
     Ok(())
 }
 
-async fn identity(client: &Client, binding: ReadBinding) -> Result<ViewIdentity, Error> {
+fn identity(client: &Client, binding: ReadBinding) -> Result<ViewIdentity, Error> {
     let row = client
-        .query_typed_one(
+        .query_one(
             "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1",
-            &[(&binding.account.as_bytes().as_slice(), Type::BYTEA)],
+            &[&binding.account.as_bytes().as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let committed_sequence = sequence(row.try_get(0).map_err(|_| Error::Integrity)?)?;
     let history_floor = sequence(row.try_get(1).map_err(|_| Error::Integrity)?)?;

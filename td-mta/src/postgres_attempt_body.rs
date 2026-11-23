@@ -88,7 +88,7 @@ fn with_active_body<T>(
     postgres_probe::with_body_worker(request, trust, deadline, |worker| {
         let selected = value.clone();
         let metadata = worker
-            .run(|client| Box::pin(snapshot(client, selected, maximum)))
+            .run(|client| snapshot(client, selected, maximum))
             .map_err(|error| ReadError::Attempt(Error::Connection(error)))??;
         let checks = if let Some(charge) = charge_classification {
             charge(metadata.blob.body.length).map_err(ReadError::Output)?;
@@ -126,44 +126,32 @@ fn admit(
 ) -> Result<(), Error> {
     let value = value.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            if !owners::begin(client, &value.claim, true, false)
-                .await
-                .map_err(Error::Owner)?
-            {
-                return Err(Error::Policy);
-            }
-            owners::check_locked(client, &value.claim, value.generation)
-                .await
-                .map_err(Error::Owner)?;
-            super::active_receipt(client, &value).await?;
-            owners::check_locked(client, &value.claim, value.generation)
-                .await
-                .map_err(Error::Owner)?;
-            Ok(())
-        })
+        if !owners::begin(client, &value.claim, true, false).map_err(Error::Owner)? {
+            return Err(Error::Policy);
+        }
+        owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?;
+        super::active_receipt(client, &value)?;
+        owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?;
+        Ok(())
     })
     .map_err(Error::Connection)?
 }
 
-async fn snapshot(
-    client: &postgres_probe::ScopedClient,
+fn snapshot(
+    client: &postgres_probe::Client,
     value: Dispatch,
     maximum: u64,
 ) -> Result<BodyMetadata, ReadError> {
     let binding = value.claim.binding();
     let schema = client
         .inspect_schema()
-        .await
         .map_err(|e| ReadError::Body(postgres_body::Error::Schema(e)))?;
     if schema.store_epoch != binding.epoch() {
         return Err(ReadError::Body(postgres_body::Error::Epoch));
     }
-    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|ReadError::Attempt(Error::Database))?;
-    super::active_receipt(client, &value)
-        .await
-        .map_err(ReadError::Attempt)?;
-    let rows=client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),s.transmitted_blob_id,s.changed FROM td_mta.accounts a JOIN td_mta.submissions s ON s.account=a.id JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id LEFT JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE a.id=$1 AND s.id=$2 AND s.completed_at IS NULL AND r.route_name=$3 AND r.destination=$4", &[&binding.account().as_bytes().as_slice(),&value.submission.as_bytes().as_slice(),&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|ReadError::Attempt(Error::Database))?;
+    client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_|ReadError::Attempt(Error::Database))?;
+    super::active_receipt(client, &value).map_err(ReadError::Attempt)?;
+    let rows=client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),s.transmitted_blob_id,s.changed FROM td_mta.accounts a JOIN td_mta.submissions s ON s.account=a.id JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id LEFT JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE a.id=$1 AND s.id=$2 AND s.completed_at IS NULL AND r.route_name=$3 AND r.destination=$4", &[&binding.account().as_bytes().as_slice(),&value.submission.as_bytes().as_slice(),&binding.route().name(),&binding.route().destination().as_slice()]).map_err(|_|ReadError::Attempt(Error::Database))?;
     let row = rows.first().ok_or(ReadError::Attempt(Error::Missing))?;
     let bytes: &[u8] = row
         .try_get(8)
@@ -174,7 +162,7 @@ async fn snapshot(
             .map_err(|_| ReadError::Attempt(Error::Integrity))?,
     );
     let metadata =
-        postgres_body::blob_metadata(row, binding.account(), binding.epoch(), blob, maximum)
+        postgres_body::blob_metadata(&row, binding.account(), binding.epoch(), blob, maximum)
             .map_err(ReadError::Body)?;
     let changed = super::number(
         row.try_get(9)

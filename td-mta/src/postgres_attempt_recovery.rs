@@ -1,4 +1,5 @@
 //! Fenced settlement of interrupted or abandoned recipient attempts.
+use crate::postgres_probe::Client;
 use crate::{
     ids::{AttemptId, AttemptRecoveryId},
     postgres_probe::{self, Request},
@@ -13,7 +14,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::Client;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -81,13 +81,12 @@ pub fn active(
 ) -> Result<Option<(AttemptId, u64)>, Error> {
     let claim = claim.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            if !owners::begin(client, &claim, true, false).await.map_err(Error::Owner)? {
+            if !owners::begin(client, &claim, true, false).map_err(Error::Owner)? {
                 return Err(Error::Policy);
             }
-            owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
+            owners::check_locked(client, &claim, generation).map_err(Error::Owner)?;
             let binding = claim.binding();
-            let rows = client.query("SELECT attempt_id,generation FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND destination=$3 AND active LIMIT 2", &[&binding.account().as_bytes().as_slice(), &binding.route().name(), &binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
+            let rows = client.query("SELECT attempt_id,generation FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND destination=$3 AND active LIMIT 2", &[&binding.account().as_bytes().as_slice(), &binding.route().name(), &binding.route().destination().as_slice()]).map_err(|_|Error::Database)?;
             if rows.len() > 1 { return Err(Error::Integrity); }
             let result = rows.first().map(|row| {
                 let bytes: &[u8] = row.try_get(0).map_err(|_|Error::Integrity)?;
@@ -96,10 +95,9 @@ pub fn active(
                 if prior == 0 || prior > generation { return Err(Error::Integrity); }
                 Ok((id, prior))
             }).transpose()?;
-            owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
+            owners::check_locked(client, &claim, generation).map_err(Error::Owner)?;
             Ok(result)
-        })
-    }).map_err(Error::Connection)?
+        }).map_err(Error::Connection)?
 }
 
 pub fn prepare(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Recovery, Error> {
@@ -234,8 +232,8 @@ fn number(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-async fn receipt(client: &Client, value: &Recovery) -> Result<Option<Outcome>, Error> {
-    let rows=client.query("SELECT request_digest,attempt_id,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_recovery_receipts WHERE account=$1 AND operation=$2", &[&value.claim.binding().account().as_bytes().as_slice(),&value.operation.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+fn receipt(client: &Client, value: &Recovery) -> Result<Option<Outcome>, Error> {
+    let rows=client.query("SELECT request_digest,attempt_id,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_recovery_receipts WHERE account=$1 AND operation=$2", &[&value.claim.binding().account().as_bytes().as_slice(),&value.operation.as_bytes().as_slice()]).map_err(|_|Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -268,12 +266,8 @@ pub fn inspect(
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            owners::begin(client, &value.claim, false, false)
-                .await
-                .map_err(Error::Owner)?;
-            receipt(client, &value).await
-        })
+        owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
+        receipt(client, &value)
     })
     .map_err(Error::Connection)?
 }
@@ -319,268 +313,246 @@ pub fn publish(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let policy = owners::begin(client, &value.claim, true, true)
-                .await
-                .map_err(Error::Owner)?;
-            if let Some(outcome) = receipt(client, &value).await? {
-                return Ok(outcome);
-            }
-            if !policy {
-                return Err(Error::Policy);
-            }
-            let timestamp = owners::check_locked(client, &value.claim, value.generation)
-                .await
-                .map_err(Error::Owner)?;
-            let binding = value.claim.binding();
-            let account = binding.account();
-            let account = account.as_bytes().as_slice();
-            let attempt = value.attempt.as_bytes().as_slice();
-            let rows=client.query("SELECT submission_id,generation,ordinals,owner_boot,owner_operation FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4 AND active FOR UPDATE", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
-            let row = rows.first().ok_or(Error::Missing)?;
-            let submission: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
-            let prior = number(row.try_get(1).map_err(|_| Error::Integrity)?)?;
-            if value.current {
-                let boot: &[u8] = row.try_get(3).map_err(|_| Error::Integrity)?;
-                let operation: &[u8] = row.try_get(4).map_err(|_| Error::Integrity)?;
-                if prior != value.generation
-                    || boot != value.claim.boot().as_bytes()
-                    || operation != value.claim.operation().as_bytes()
-                {
-                    return Err(Error::StaleAttempt);
-                }
-            } else if prior >= value.generation {
-                return Err(Error::CurrentOwner);
-            }
-            let encoded: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
-            if submission.len() != 16
-                || prior == 0
-                || encoded.is_empty()
-                || encoded.len() > 400
-                || !encoded.len().is_multiple_of(4)
+        let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
+        if let Some(outcome) = receipt(client, &value)? {
+            return Ok(outcome);
+        }
+        if !policy {
+            return Err(Error::Policy);
+        }
+        let timestamp =
+            owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?;
+        let binding = value.claim.binding();
+        let account = binding.account();
+        let account = account.as_bytes().as_slice();
+        let attempt = value.attempt.as_bytes().as_slice();
+        let rows=client.query("SELECT submission_id,generation,ordinals,owner_boot,owner_operation FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4 AND active FOR UPDATE", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice()]).map_err(|_|Error::Database)?;
+        let row = rows.first().ok_or(Error::Missing)?;
+        let submission: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+        let prior = number(row.try_get(1).map_err(|_| Error::Integrity)?)?;
+        if value.current {
+            let boot: &[u8] = row.try_get(3).map_err(|_| Error::Integrity)?;
+            let operation: &[u8] = row.try_get(4).map_err(|_| Error::Integrity)?;
+            if prior != value.generation
+                || boot != value.claim.boot().as_bytes()
+                || operation != value.claim.operation().as_bytes()
             {
+                return Err(Error::StaleAttempt);
+            }
+        } else if prior >= value.generation {
+            return Err(Error::CurrentOwner);
+        }
+        let encoded: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
+        if submission.len() != 16
+            || prior == 0
+            || encoded.is_empty()
+            || encoded.len() > 400
+            || !encoded.len().is_multiple_of(4)
+        {
+            return Err(Error::Integrity);
+        }
+        let mut ordinals = Vec::new();
+        ordinals
+            .try_reserve_exact(encoded.len() / 4)
+            .map_err(|_| Error::Capacity)?;
+        for chunk in encoded.as_chunks::<4>().0 {
+            let n = u32::from_be_bytes(*chunk);
+            if n >= 1000 || ordinals.last().is_some_and(|last| *last >= n) {
                 return Err(Error::Integrity);
             }
-            let mut ordinals = Vec::new();
-            ordinals
-                .try_reserve_exact(encoded.len() / 4)
-                .map_err(|_| Error::Capacity)?;
-            for chunk in encoded.as_chunks::<4>().0 {
-                let n = u32::from_be_bytes(*chunk);
-                if n >= 1000 || ordinals.last().is_some_and(|last| *last >= n) {
-                    return Err(Error::Integrity);
-                }
-                ordinals.push(n);
-            }
-            let state = client
-                .query_one(
-                    "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1",
-                    &[&account],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            let old = number(state.try_get(0).map_err(|_| Error::Integrity)?)?;
-            if number(state.try_get(1).map_err(|_| Error::Integrity)?)? > old {
-                return Err(Error::Integrity);
-            }
-            let rows=client.query("SELECT expires_at,completed_at,changed FROM td_mta.submissions WHERE account=$1 AND id=$2 FOR UPDATE", &[&account,&submission]).await.map_err(|_|Error::Database)?;
-            let row = rows.first().ok_or(Error::Integrity)?;
-            let expires: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
-            let completed: Option<i64> = row.try_get(1).map_err(|_| Error::Integrity)?;
-            if number(row.try_get(2).map_err(|_| Error::Integrity)?)? > old {
-                return Err(Error::Integrity);
-            }
-            if completed.is_some() {
-                // Cancellation already committed the terminal recipients and
-                // change sequence. Release only the retained Prepared custody.
-                let released =
-                    owners::release_canceled(client, &value.claim, Some(binding.route().name()))
-                        .await
-                        .map_err(Error::Owner)?;
-                if released != 1 {
-                    return Err(Error::Integrity);
-                }
-                owners::check_locked(client, &value.claim, value.generation)
-                    .await
-                    .map_err(Error::Owner)?;
-                marker.store(true, Ordering::Relaxed);
-                client
-                    .batch_execute("COMMIT")
-                    .await
-                    .map_err(|_| Error::Indeterminate)?;
-                return Err(Error::Missing);
-            }
-            let rows=client.query("SELECT ordinal,uncertain,attempt_count,last_attempt_at,phase,rcpt_reply,data_reply,reason,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101 FOR UPDATE", &[&account,&submission,&attempt]).await.map_err(|_|Error::Database)?;
-            if rows.is_empty() || rows.len() > 100 {
-                return Err(Error::Integrity);
-            }
-            let mut possible = Vec::new();
-            let mut selected = Vec::new();
-            let mut states = Vec::new();
-            let mut uncertainties = Vec::new();
-            let mut retries = Vec::new();
-            let mut reasons = Vec::new();
-            for buffer in [
-                &mut possible,
-                &mut selected,
-                &mut states,
-                &mut uncertainties,
-                &mut retries,
-                &mut reasons,
-            ] {
-                buffer
-                    .try_reserve_exact(rows.len())
-                    .map_err(|_| Error::Capacity)?;
-            }
-            let mut matched_positive = 0usize;
-            let mut prepared_positive = 0u64;
-            for row in &rows {
-                let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
-                let uncertain: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
-                let count: i64 = row.try_get(2).map_err(|_| Error::Integrity)?;
-                let last: i64 = row.try_get(3).map_err(|_| Error::Integrity)?;
-                let phase: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
-                let rcpt: Option<&str> = row.try_get(5).map_err(|_| Error::Integrity)?;
-                let data: Option<&str> = row.try_get(6).map_err(|_| Error::Integrity)?;
-                let reason: i64 = row.try_get(7).map_err(|_| Error::Integrity)?;
-                let ordinal32 = u32::try_from(ordinal).map_err(|_| Error::Integrity)?;
-                if ordinals.binary_search(&ordinal32).is_err()
-                    || !(0..=1).contains(&uncertain)
-                    || !(1..=3).contains(&phase)
-                    || reason != 0
-                    || number(row.try_get(8).map_err(|_| Error::Integrity)?)? > old
-                {
-                    return Err(Error::Integrity);
-                }
-                if phase != 1
-                    && (crate::recipient_sweep::reply_class(rcpt) != Some(2) || data.is_some())
-                {
-                    return Err(Error::Integrity);
-                }
-                if let Ok(index) = value.positive_ordinals.binary_search(&ordinal) {
-                    if !value.current {
-                        return Err(Error::Integrity);
-                    }
-                    if phase == 1 {
-                        prepared_positive += 1;
-                    } else if !value.body_evidence
-                        || phase != 2
-                        || rcpt != value.positive_replies.get(index).map(String::as_str)
-                    {
-                        return Err(Error::Integrity);
-                    }
-                    matched_positive += 1;
-                }
-                if timestamp < last {
-                    return Err(Error::Clock);
-                }
-                let delay = retry_delay(
-                    &mut entropy,
-                    u32::try_from(count).map_err(|_| Error::Integrity)?,
-                    value.claim.retry_floor(),
-                )?;
-                // Equality is an expiry-wait marker, never eligible dispatch.
-                let retry = timestamp
-                    .checked_add(delay)
-                    .ok_or(Error::Clock)?
-                    .min(expires);
-                let uncertain = i64::from(uncertain == 1 || phase == 3);
-                let state = if uncertain == 1 { 7i64 } else { 3i64 };
-                let reason = if phase == 3 { 9i64 } else { 3i64 };
-                if phase == 3 {
-                    possible.push(ordinal);
-                }
-                selected.push(ordinal);
-                states.push(state);
-                uncertainties.push(uncertain);
-                retries.push(retry);
-                reasons.push(reason);
-            }
-            if matched_positive != value.positive_ordinals.len() {
-                return Err(Error::Integrity);
-            }
-            crate::postgres_final_capacity::consume(client, account, attempt, &possible)
-                .await
-                .map_err(capacity)?;
-            crate::postgres_final_capacity::admit_receipt(
-                client,
-                account,
-                crate::postgres_final_capacity::Receipt::Recovery,
+            ordinals.push(n);
+        }
+        let state = client
+            .query_one(
+                "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1",
+                &[&account],
             )
-            .await
-            .map_err(capacity)?;
-            let next = crate::postgres_sequence::next(client, account, old)
-                .await
-                .map_err(|error| match error {
-                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
-                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
-                    crate::postgres_sequence::Error::Database => Error::Database,
-                })?;
-            let changed = next.to_be_bytes();
-            let changed = changed.as_slice();
-            if !value.positive_ordinals.is_empty()
-                && client.execute("UPDATE td_mta.recipients r SET rcpt_reply=p.reply,data_reply=NULL FROM unnest($4::bigint[],$5::text[]) p(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.attempt_id=$3 AND r.state=2 AND r.phase=1 AND r.ordinal=p.ordinal", &[&account,&submission,&attempt,&value.positive_ordinals,&value.positive_replies]).await.map_err(|_|Error::Database)? != prepared_positive
-            {
+            .map_err(|_| Error::Database)?;
+        let old = number(state.try_get(0).map_err(|_| Error::Integrity)?)?;
+        if number(state.try_get(1).map_err(|_| Error::Integrity)?)? > old {
+            return Err(Error::Integrity);
+        }
+        let rows=client.query("SELECT expires_at,completed_at,changed FROM td_mta.submissions WHERE account=$1 AND id=$2 FOR UPDATE", &[&account,&submission]).map_err(|_|Error::Database)?;
+        let row = rows.first().ok_or(Error::Integrity)?;
+        let expires: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
+        let completed: Option<i64> = row.try_get(1).map_err(|_| Error::Integrity)?;
+        if number(row.try_get(2).map_err(|_| Error::Integrity)?)? > old {
+            return Err(Error::Integrity);
+        }
+        if completed.is_some() {
+            // Cancellation already committed the terminal recipients and
+            // change sequence. Release only the retained Prepared custody.
+            let released =
+                owners::release_canceled(client, &value.claim, Some(binding.route().name()))
+                    .map_err(Error::Owner)?;
+            if released != 1 {
                 return Err(Error::Integrity);
             }
-            if client.execute("UPDATE td_mta.recipients r SET state=u.state,uncertain=u.uncertain,phase=4,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$8 FROM unnest($3::bigint[],$4::bigint[],$5::bigint[],$6::bigint[],$7::bigint[]) u(ordinal,state,uncertain,retry,reason) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&selected,&states,&uncertainties,&retries,&reasons,&changed]).await.map_err(|_|Error::Database)?!=rows.len() as u64 {return Err(Error::Integrity)}
-            if client.execute("UPDATE td_mta.submission_attempts SET active=false WHERE account=$1 AND attempt_id=$2 AND active", &[&account,&attempt]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity)}
-            if client
-                .execute(
-                    "UPDATE td_mta.submissions SET changed=$3 WHERE account=$1 AND id=$2",
-                    &[&account, &submission, &changed],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            client
-                .execute(
-                    "INSERT INTO td_mta.changes VALUES($1,$2,0,5,2,$3)",
-                    &[&account, &changed, &submission],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            if client
-                .execute(
-                    "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
-                    &[&account, &changed],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            let count = i64::try_from(rows.len()).map_err(|_| Error::Capacity)?;
-            client
-                .execute(
-                    "INSERT INTO td_mta.attempt_recovery_receipts VALUES($1,$2,$3,$4,$5,$6,$7)",
-                    &[
-                        &account,
-                        &value.operation.as_bytes().as_slice(),
-                        &value.digest.as_slice(),
-                        &attempt,
-                        &count,
-                        &old.to_be_bytes().as_slice(),
-                        &changed,
-                    ],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
+            owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?;
             marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Outcome {
-                attempt: value.attempt,
-                recipients: u32::try_from(count).map_err(|_| Error::Integrity)?,
-                old_sequence: old,
-                new_sequence: next,
-            })
+            client.commit().map_err(|_| Error::Indeterminate)?;
+            return Err(Error::Missing);
+        }
+        let rows=client.query("SELECT ordinal,uncertain,attempt_count,last_attempt_at,phase,rcpt_reply,data_reply,reason,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101 FOR UPDATE", &[&account,&submission,&attempt]).map_err(|_|Error::Database)?;
+        if rows.is_empty() || rows.len() > 100 {
+            return Err(Error::Integrity);
+        }
+        let mut possible = Vec::new();
+        let mut selected = Vec::new();
+        let mut states = Vec::new();
+        let mut uncertainties = Vec::new();
+        let mut retries = Vec::new();
+        let mut reasons = Vec::new();
+        for buffer in [
+            &mut possible,
+            &mut selected,
+            &mut states,
+            &mut uncertainties,
+            &mut retries,
+            &mut reasons,
+        ] {
+            buffer
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+        }
+        let mut matched_positive = 0usize;
+        let mut prepared_positive = 0u64;
+        for row in &rows {
+            let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
+            let uncertain: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
+            let count: i64 = row.try_get(2).map_err(|_| Error::Integrity)?;
+            let last: i64 = row.try_get(3).map_err(|_| Error::Integrity)?;
+            let phase: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
+            let rcpt: Option<&str> = row.try_get(5).map_err(|_| Error::Integrity)?;
+            let data: Option<&str> = row.try_get(6).map_err(|_| Error::Integrity)?;
+            let reason: i64 = row.try_get(7).map_err(|_| Error::Integrity)?;
+            let ordinal32 = u32::try_from(ordinal).map_err(|_| Error::Integrity)?;
+            if ordinals.binary_search(&ordinal32).is_err()
+                || !(0..=1).contains(&uncertain)
+                || !(1..=3).contains(&phase)
+                || reason != 0
+                || number(row.try_get(8).map_err(|_| Error::Integrity)?)? > old
+            {
+                return Err(Error::Integrity);
+            }
+            if phase != 1
+                && (crate::recipient_sweep::reply_class(rcpt) != Some(2) || data.is_some())
+            {
+                return Err(Error::Integrity);
+            }
+            if let Ok(index) = value.positive_ordinals.binary_search(&ordinal) {
+                if !value.current {
+                    return Err(Error::Integrity);
+                }
+                if phase == 1 {
+                    prepared_positive += 1;
+                } else if !value.body_evidence
+                    || phase != 2
+                    || rcpt != value.positive_replies.get(index).map(String::as_str)
+                {
+                    return Err(Error::Integrity);
+                }
+                matched_positive += 1;
+            }
+            if timestamp < last {
+                return Err(Error::Clock);
+            }
+            let delay = retry_delay(
+                &mut entropy,
+                u32::try_from(count).map_err(|_| Error::Integrity)?,
+                value.claim.retry_floor(),
+            )?;
+            // Equality is an expiry-wait marker, never eligible dispatch.
+            let retry = timestamp
+                .checked_add(delay)
+                .ok_or(Error::Clock)?
+                .min(expires);
+            let uncertain = i64::from(uncertain == 1 || phase == 3);
+            let state = if uncertain == 1 { 7i64 } else { 3i64 };
+            let reason = if phase == 3 { 9i64 } else { 3i64 };
+            if phase == 3 {
+                possible.push(ordinal);
+            }
+            selected.push(ordinal);
+            states.push(state);
+            uncertainties.push(uncertain);
+            retries.push(retry);
+            reasons.push(reason);
+        }
+        if matched_positive != value.positive_ordinals.len() {
+            return Err(Error::Integrity);
+        }
+        crate::postgres_final_capacity::consume(client, account, attempt, &possible)
+            .map_err(capacity)?;
+        crate::postgres_final_capacity::admit_receipt(
+            client,
+            account,
+            crate::postgres_final_capacity::Receipt::Recovery,
+        )
+        .map_err(capacity)?;
+        let next =
+            crate::postgres_sequence::next(client, account, old).map_err(|error| match error {
+                crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                crate::postgres_sequence::Error::Database => Error::Database,
+            })?;
+        let changed = next.to_be_bytes();
+        let changed = changed.as_slice();
+        if !value.positive_ordinals.is_empty()
+                && client.execute("UPDATE td_mta.recipients r SET rcpt_reply=p.reply,data_reply=NULL FROM unnest($4::bigint[],$5::text[]) p(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.attempt_id=$3 AND r.state=2 AND r.phase=1 AND r.ordinal=p.ordinal", &[&account,&submission,&attempt,&value.positive_ordinals,&value.positive_replies]).map_err(|_|Error::Database)? != prepared_positive
+            {
+                return Err(Error::Integrity);
+            }
+        if client.execute("UPDATE td_mta.recipients r SET state=u.state,uncertain=u.uncertain,phase=4,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$8 FROM unnest($3::bigint[],$4::bigint[],$5::bigint[],$6::bigint[],$7::bigint[]) u(ordinal,state,uncertain,retry,reason) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&selected,&states,&uncertainties,&retries,&reasons,&changed]).map_err(|_|Error::Database)?!=rows.len() as u64 {return Err(Error::Integrity)}
+        if client.execute("UPDATE td_mta.submission_attempts SET active=false WHERE account=$1 AND attempt_id=$2 AND active", &[&account,&attempt]).map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity)}
+        if client
+            .execute(
+                "UPDATE td_mta.submissions SET changed=$3 WHERE account=$1 AND id=$2",
+                &[&account, &submission, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        client
+            .execute(
+                "INSERT INTO td_mta.changes VALUES($1,$2,0,5,2,$3)",
+                &[&account, &changed, &submission],
+            )
+            .map_err(|_| Error::Database)?;
+        if client
+            .execute(
+                "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
+                &[&account, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        let count = i64::try_from(rows.len()).map_err(|_| Error::Capacity)?;
+        client
+            .execute(
+                "INSERT INTO td_mta.attempt_recovery_receipts VALUES($1,$2,$3,$4,$5,$6,$7)",
+                &[
+                    &account,
+                    &value.operation.as_bytes().as_slice(),
+                    &value.digest.as_slice(),
+                    &attempt,
+                    &count,
+                    &old.to_be_bytes().as_slice(),
+                    &changed,
+                ],
+            )
+            .map_err(|_| Error::Database)?;
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Outcome {
+            attempt: value.attempt,
+            recipients: u32::try_from(count).map_err(|_| Error::Integrity)?,
+            old_sequence: old,
+            new_sequence: next,
         })
     });
     match result {

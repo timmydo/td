@@ -97,35 +97,28 @@ impl EnvelopeChecks {
         let deadline = self.limit;
         let (envelope, limit) = worker
             .run(move |client| {
-                Box::pin(async move {
-                    owners::begin_transaction(client).await?;
-                    let schema = crate::postgres_schema::lock_transaction_and_inspect(client)
-                        .await
-                        .map_err(|error| {
-                            if mode == Mode::Runtime {
-                                Error::Connection(postgres_probe::Error::RuntimeSchema)
-                            } else {
-                                Error::Owner(owners::Error::Schema(error))
-                            }
-                        })?;
-                    if schema.store_epoch != value.claim.binding().epoch() {
-                        return Err(owners::Error::Epoch.into());
-                    }
-                    if mode == Mode::Runtime {
-                        postgres_probe::qualify_runtime(client)
-                            .await
-                            .map_err(Error::Connection)?;
-                    }
-                    if !owners::lock_account_policy(client, &value.claim, true, false).await? {
-                        return Err(Error::Policy);
-                    }
-                    let result = check_locked(client, deadline, &value, Some(&observation)).await?;
-                    client
-                        .batch_execute("ROLLBACK")
-                        .await
-                        .map_err(|_| Error::Database)?;
-                    Ok(result)
-                })
+                owners::begin_transaction(client)?;
+                let schema = crate::postgres_schema::lock_transaction_and_inspect(client).map_err(
+                    |error| {
+                        if mode == Mode::Runtime {
+                            Error::Connection(postgres_probe::Error::RuntimeSchema)
+                        } else {
+                            Error::Owner(owners::Error::Schema(error))
+                        }
+                    },
+                )?;
+                if schema.store_epoch != value.claim.binding().epoch() {
+                    return Err(owners::Error::Epoch.into());
+                }
+                if mode == Mode::Runtime {
+                    postgres_probe::qualify_runtime(client).map_err(Error::Connection)?;
+                }
+                if !owners::lock_account_policy(client, &value.claim, true, false)? {
+                    return Err(Error::Policy);
+                }
+                let result = check_locked(client, deadline, &value, Some(&observation))?;
+                client.rollback().map_err(|_| Error::Database)?;
+                Ok(result)
             })
             .map_err(Error::Connection)??;
         if Instant::now() >= limit {

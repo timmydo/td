@@ -595,8 +595,6 @@ mod crypto_boundary_tests {
             dependencies,
             [
                 r#"td-alloc = { path = "../td-alloc" }"#,
-                r#"tokio = { version = "=1.54.1", default-features = false, features = ["io-util"] }"#,
-                r#"tokio-postgres = { version = "=0.7.18", default-features = false }"#,
                 r#"td-civil = { path = "../td-civil" }"#,
                 r#"td-crypto = { path = "../td-crypto" }"#,
                 r#"td-header = { path = "../td-header" }"#,
@@ -604,6 +602,7 @@ mod crypto_boundary_tests {
                 r#"td-json = { path = "../td-json" }"#,
                 r#"td-mime = { path = "../td-mime" }"#,
                 r#"td-nfc = { path = "../td-nfc" }"#,
+                r#"td-postgres = { path = "../td-postgres" }"#,
                 r#"td-fs = { path = "../td-fs" }"#
             ]
         );

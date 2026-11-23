@@ -1,4 +1,5 @@
 //! Cold bounded upload publication; runtime ingress reservations remain separate.
+use crate::postgres_probe::Client;
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
@@ -19,7 +20,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::Client;
 
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RECEIPTS: i64 = 1024;
@@ -230,15 +230,15 @@ fn sequence(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-async fn begin(client: &postgres_probe::ScopedClient, upload: &Upload) -> Result<(), Error> {
-    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+fn begin(client: &postgres_probe::Client, upload: &Upload) -> Result<(), Error> {
+    let schema = client.inspect_schema().map_err(Error::Schema)?;
     if schema.store_epoch != upload.binding.epoch() {
         return Err(Error::Epoch);
     }
-    client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)
+    client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)
 }
-async fn receipt(client: &Client, upload: &Upload) -> Result<Option<Outcome>, Error> {
-    let rows = client.query("SELECT request_digest,blob_id,length,created_at,expires_at,old_sequence,new_sequence FROM td_mta.upload_receipts WHERE account=$1 AND operation=$2 LIMIT 2", &[&upload.binding.account().as_bytes().as_slice(), &upload.operation.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+fn receipt(client: &Client, upload: &Upload) -> Result<Option<Outcome>, Error> {
+    let rows = client.query("SELECT request_digest,blob_id,length,created_at,expires_at,old_sequence,new_sequence FROM td_mta.upload_receipts WHERE account=$1 AND operation=$2 LIMIT 2", &[&upload.binding.account().as_bytes().as_slice(), &upload.operation.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -283,17 +283,14 @@ pub fn inspect(
 ) -> Result<Option<Outcome>, Error> {
     let upload = upload.clone();
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            begin(client, &upload).await?;
-            client
-                .query_one(
-                    "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
-                    &[&upload.binding.account().as_bytes().as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            receipt(client, &upload).await
-        })
+        begin(client, &upload)?;
+        client
+            .query_one(
+                "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
+                &[&upload.binding.account().as_bytes().as_slice()],
+            )
+            .map_err(|_| Error::Database)?;
+        receipt(client, &upload)
     })
     .map_err(Error::Connection)?;
     if !matches!(result, Ok(Some(_))) && Instant::now() >= deadline {
@@ -322,162 +319,143 @@ pub fn publish(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_upload_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            begin(client, &upload).await?;
-            let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_| Error::Database)?;
-            let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
-            let account = upload.binding.account();
-            let account = account.as_bytes().as_slice();
-            let state = client
-                .query_one(
-                    "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-                    &[&account],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            if let Some(outcome) = receipt(client, &upload).await? {
-                return Ok(outcome);
+        begin(client, &upload)?;
+        let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_| Error::Database)?;
+        let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
+        let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
+        let account = upload.binding.account();
+        let account = account.as_bytes().as_slice();
+        let state = client
+            .query_one(
+                "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                &[&account],
+            )
+            .map_err(|_| Error::Database)?;
+        if let Some(outcome) = receipt(client, &upload)? {
+            return Ok(outcome);
+        }
+        if generation != upload.binding.selection().generation
+            || version != Some(upload.binding.selection().version.as_bytes().as_slice())
+            || !upload.binding.roles().jmap()
+        {
+            return Err(Error::Policy);
+        }
+        if postgres_devices::authenticate(client, upload.binding.account(), presented)
+            .map_err(Error::Credential)?
+            != Some(upload.device)
+        {
+            return Err(Error::Unauthenticated);
+        }
+        let old = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
+        let floor = sequence(state.try_get(1).map_err(|_| Error::Integrity)?)?;
+        if floor > old {
+            return Err(Error::Integrity);
+        }
+        let next =
+            crate::postgres_sequence::next(client, account, old).map_err(|error| match error {
+                crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                crate::postgres_sequence::Error::Database => Error::Database,
+            })?;
+        let created_at = expiry::admit(client, expiry::Ledger::Uploads, account, MAX_RECEIPTS)
+            .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
+        let reclaimed = reclaim(client, account, created_at)? > 0;
+        let usage = match publication::charge(
+            client,
+            upload.binding.account(),
+            upload.binding.quotas(),
+            [
+                upload.bytes.len() as u64,
+                1,
+                upload.bytes.len() as u64,
+                0,
+                0,
+            ],
+        ) {
+            // Keep the batch, so repeated refusals still drain expired leases.
+            Err(publication::Error::Quota) if reclaimed => {
+                client.commit().map_err(|_| Error::Database)?;
+                return Err(Error::Quota);
             }
-            if generation != upload.binding.selection().generation
-                || version != Some(upload.binding.selection().version.as_bytes().as_slice())
-                || !upload.binding.roles().jmap()
-            {
-                return Err(Error::Policy);
-            }
-            if postgres_devices::authenticate(client, upload.binding.account(), presented)
-                .await
-                .map_err(Error::Credential)?
-                != Some(upload.device)
-            {
-                return Err(Error::Unauthenticated);
-            }
-            let old = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let floor = sequence(state.try_get(1).map_err(|_| Error::Integrity)?)?;
-            if floor > old {
-                return Err(Error::Integrity);
-            }
-            let next = crate::postgres_sequence::next(client, account, old)
-                .await
-                .map_err(|error| match error {
-                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
-                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
-                    crate::postgres_sequence::Error::Database => Error::Database,
-                })?;
-            let created_at = expiry::admit(client, expiry::Ledger::Uploads, account, MAX_RECEIPTS)
-                .await
-                .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
-            let reclaimed = reclaim(client, account, created_at).await? > 0;
-            let usage = match publication::charge(
-                client,
-                upload.binding.account(),
-                upload.binding.quotas(),
-                [
-                    upload.bytes.len() as u64,
-                    1,
-                    upload.bytes.len() as u64,
-                    0,
-                    0,
+            usage => usage.map_err(publication_error)?,
+        };
+        let expires_at = created_at
+            .checked_add(upload.ttl_ms)
+            .ok_or(Error::Integrity)?;
+        let blob = upload.blob.as_bytes().as_slice();
+        let length = i64::try_from(upload.bytes.len()).map_err(|_| Error::Capacity)?;
+        publication::write_blob(
+            client,
+            publication::Blob {
+                account: upload.binding.account(),
+                id: upload.blob,
+                bytes: &upload.bytes,
+                digest: &upload.body_digest,
+                interpretation: upload.interpretation.as_deref(),
+                created_at,
+                changed: next,
+            },
+            deadline,
+        )
+        .map_err(publication_error)?;
+        if client
+            .execute(
+                "INSERT INTO td_mta.leases VALUES($1,$2,$3,$4,3,$5)",
+                &[
+                    &account,
+                    &blob,
+                    &upload.device.as_bytes().as_slice(),
+                    &expires_at,
+                    &next.to_be_bytes().as_slice(),
                 ],
             )
-            .await
-            {
-                // Keep the batch, so repeated refusals still drain expired leases.
-                Err(publication::Error::Quota) if reclaimed => {
-                    client
-                        .batch_execute("COMMIT")
-                        .await
-                        .map_err(|_| Error::Database)?;
-                    return Err(Error::Quota);
-                }
-                usage => usage.map_err(publication_error)?,
-            };
-            let expires_at = created_at
-                .checked_add(upload.ttl_ms)
-                .ok_or(Error::Integrity)?;
-            let blob = upload.blob.as_bytes().as_slice();
-            let length = i64::try_from(upload.bytes.len()).map_err(|_| Error::Capacity)?;
-            publication::write_blob(
-                client,
-                publication::Blob {
-                    account: upload.binding.account(),
-                    id: upload.blob,
-                    bytes: &upload.bytes,
-                    digest: &upload.body_digest,
-                    interpretation: upload.interpretation.as_deref(),
-                    created_at,
-                    changed: next,
-                },
-                deadline,
-            )
-            .await
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        usage
+            .publish(client, upload.binding.account())
             .map_err(publication_error)?;
-            if client
-                .execute(
-                    "INSERT INTO td_mta.leases VALUES($1,$2,$3,$4,3,$5)",
-                    &[
-                        &account,
-                        &blob,
-                        &upload.device.as_bytes().as_slice(),
-                        &expires_at,
-                        &next.to_be_bytes().as_slice(),
-                    ],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            usage
-                .publish(client, upload.binding.account())
-                .await
-                .map_err(publication_error)?;
-            if client
-                .execute(
-                    "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
-                    &[&account, &next.to_be_bytes().as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            if client
-                .execute(
-                    "INSERT INTO td_mta.upload_receipts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-                    &[
-                        &account,
-                        &upload.operation.as_bytes().as_slice(),
-                        &upload.request_digest.as_slice(),
-                        &blob,
-                        &length,
-                        &created_at,
-                        &expires_at,
-                        &old.to_be_bytes().as_slice(),
-                        &next.to_be_bytes().as_slice(),
-                    ],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Outcome {
-                blob: upload.blob,
-                length: length as u64,
-                created_at,
-                expires_at,
-                old_sequence: old,
-                new_sequence: next,
-            })
+        if client
+            .execute(
+                "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
+                &[&account, &next.to_be_bytes().as_slice()],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        if client
+            .execute(
+                "INSERT INTO td_mta.upload_receipts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                &[
+                    &account,
+                    &upload.operation.as_bytes().as_slice(),
+                    &upload.request_digest.as_slice(),
+                    &blob,
+                    &length,
+                    &created_at,
+                    &expires_at,
+                    &old.to_be_bytes().as_slice(),
+                    &next.to_be_bytes().as_slice(),
+                ],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Outcome {
+            blob: upload.blob,
+            length: length as u64,
+            created_at,
+            expires_at,
+            old_sequence: old,
+            new_sequence: next,
         })
     });
     match result {
@@ -498,8 +476,8 @@ fn fits(taken: usize, bytes: i64) -> bool {
 /// bytes and retire each body nothing else reaches. Returns how many leases
 /// it reclaimed. Upload publication and relay retention both call it, so an
 /// account need not upload again to recover its quota.
-pub(crate) async fn reclaim(client: &Client, account: &[u8], now: i64) -> Result<u64, Error> {
-    let rows = client.query("SELECT l.blob_id,b.length FROM td_mta.leases l JOIN td_mta.blobs b ON b.account=l.account AND b.id=l.blob_id WHERE l.account=$1 AND l.expires_at<=$2 ORDER BY l.expires_at,l.blob_id LIMIT $3", &[&account, &now, &RECLAIM_LEASES]).await.map_err(|_| Error::Database)?;
+pub(crate) fn reclaim(client: &Client, account: &[u8], now: i64) -> Result<u64, Error> {
+    let rows = client.query("SELECT l.blob_id,b.length FROM td_mta.leases l JOIN td_mta.blobs b ON b.account=l.account AND b.id=l.blob_id WHERE l.account=$1 AND l.expires_at<=$2 ORDER BY l.expires_at,l.blob_id LIMIT $3", &[&account, &now, &RECLAIM_LEASES]).map_err(|_| Error::Database)?;
     if rows.is_empty() {
         return Ok(0);
     }
@@ -527,17 +505,13 @@ pub(crate) async fn reclaim(client: &Client, account: &[u8], now: i64) -> Result
             "DELETE FROM td_mta.leases WHERE account=$1 AND blob_id=ANY($2::bytea[])",
             &[&account, &blobs.as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?;
     if usize::try_from(deleted).ok() != Some(blobs.len()) {
         return Err(Error::Integrity);
     }
-    let (body, count) = publication::retire_blobs(client, account, blobs.as_slice())
-        .await
-        .map_err(publication_error)?;
-    publication::release(client, account, [body, count, bytes, 0, 0])
-        .await
-        .map_err(publication_error)?;
+    let (body, count) =
+        publication::retire_blobs(client, account, blobs.as_slice()).map_err(publication_error)?;
+    publication::release(client, account, [body, count, bytes, 0, 0]).map_err(publication_error)?;
     u64::try_from(blobs.len()).map_err(|_| Error::Integrity)
 }
 

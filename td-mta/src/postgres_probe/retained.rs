@@ -1,14 +1,13 @@
 //! Finite worker-owned read transactions under one qualified migration lock.
-use super::{connect_authenticated_until, Error, Input, Mode, Request, Worker, MAX_DURATION};
+use super::{
+    connect_authenticated_until, Client, Error, Input, Mode, Request, Worker, MAX_DURATION,
+};
 use crate::{ids::StoreEpoch, postgres_schema};
 use std::{
-    future::Future,
-    pin::Pin,
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
 use td_crypto::TrustStore;
-use tokio_postgres::Client;
 
 pub(super) const TURNS: usize = 64;
 pub(super) const BODY_TURNS: usize = 8;
@@ -121,13 +120,10 @@ impl ReadSession {
         worker.deadline = deadline;
         let mode = request.mode;
         let schema = worker.run(|client| {
-            Box::pin(async move {
-                let receipt = postgres_schema::lock_and_inspect(client)
-                    .await
-                    .map_err(|_| Error::RuntimeSchema)?;
-                super::qualify_runtime_mode(client, mode, Some(receipt.store_epoch)).await?;
-                Ok(receipt)
-            })
+            let receipt =
+                postgres_schema::lock_and_inspect(client).map_err(|_| Error::RuntimeSchema)?;
+            super::qualify_runtime_mode(client, mode, Some(receipt.store_epoch))?;
+            Ok(receipt)
         })??;
         Ok(Self {
             worker,
@@ -148,12 +144,9 @@ impl ReadSession {
         self.worker.deadline = deadline;
         // Autocommit the subscription before the first absence snapshot.
         self.worker.run(|client| {
-            Box::pin(async move {
-                client
-                    .batch_execute("LISTEN td_mta_relay")
-                    .await
-                    .map_err(|_| Error::Database)
-            })
+            client
+                .batch("LISTEN td_mta_relay")
+                .map_err(|_| Error::Database)
         })??;
         self.clean_idle = true;
         Ok(())
@@ -168,11 +161,7 @@ impl ReadSession {
         }
         // A timeout means no hint, not a failed SQL operation. The caller
         // bounds each wait so control requests and retirement stay responsive.
-        let readable = self.worker.driver.wait(deadline)?;
-        match readable {
-            true => self.relay_notified(Instant::now() + Duration::from_millis(50)),
-            false => Ok(false),
-        }
+        self.worker.wait_relay(deadline)
     }
     pub(crate) fn check_idle(&mut self, deadline: Instant) -> Result<(), Error> {
         if !self.clean_idle || !self.reusable(deadline) {
@@ -198,8 +187,7 @@ impl ReadSession {
         epoch: StoreEpoch,
         isolation: ReadIsolation,
         deadline: Instant,
-        operation: impl for<'a> FnOnce(&'a Client) -> Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>
-            + 'static,
+        operation: impl FnOnce(&Client) -> Result<T, E>,
     ) -> Result<Result<T, E>, Error> {
         self.read_worker(epoch, isolation, deadline, |worker| {
             worker.run(|client| operation(client))
@@ -256,30 +244,24 @@ impl ReadSession {
         self.worker.deadline = deadline;
         self.worker.check()?;
         self.worker.begin_validation_turn()?;
-        self.worker.run(move |client| Box::pin(async move {
+        self.worker.run(move |client| {
             let begin = match isolation {
                 ReadIsolation::RepeatableReadOnly => "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000",
                 ReadIsolation::ReadCommitted => "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000",
             };
-            client.batch_execute(begin).await.map_err(|_| Error::Database)?;
-            let row = client.query_typed_one(
+            client.batch(begin).map_err(|_| Error::Database)?;
+            let row = client.query_one(
                 "SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true", &[]
-            ).await.map_err(|_| Error::Database)?;
+            ).map_err(|_| Error::Database)?;
             let observed: &[u8] = row.try_get(0).map_err(|_| Error::RuntimeSchema)?;
             let blocked: bool = row.try_get(1).map_err(|_| Error::RuntimeMaintenance)?;
             if observed != epoch.as_bytes().as_slice() { return Err(Error::RuntimeSchema); }
             if blocked { return Err(Error::RuntimeMaintenance); }
             Ok(())
-        }))??;
-        let result = operation(&mut self.worker)?;
-        self.worker.run(|client| {
-            Box::pin(async move {
-                client
-                    .batch_execute("ROLLBACK")
-                    .await
-                    .map_err(|_| Error::Database)
-            })
         })??;
+        let result = operation(&mut self.worker)?;
+        self.worker
+            .run(|client| client.rollback().map_err(|_| Error::Database))??;
         self.worker.check_deadline()?;
         self.worker.finish_validation_turn()?;
         self.clean_idle = true;

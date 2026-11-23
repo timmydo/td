@@ -13,7 +13,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::TrustStore;
-use tokio_postgres::types::Type;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -99,15 +98,15 @@ pub fn run_with_options(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let operation = |worker: &mut postgres_probe::Worker| {
-        let rows = worker.run(move |client| Box::pin(async move {
-            crate::postgres_maintenance::owner(client).await.map_err(|_| Error::Owner)?;
-            let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+        let rows = worker.run(move |client| {
+            crate::postgres_maintenance::owner(client).map_err(|_| Error::Owner)?;
+            let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Invalid); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            if client.query_typed_opt("SELECT id FROM td_mta.accounts WHERE id=$1", &[(&account.as_bytes().as_slice(), Type::BYTEA)]).await.map_err(|_| Error::Database)?.is_none() { return Err(Error::Invalid); }
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            if client.query_opt("SELECT id FROM td_mta.accounts WHERE id=$1", &[&account.as_bytes().as_slice()]).map_err(|_| Error::Database)?.is_none() { return Err(Error::Invalid); }
             let after = after.map(|id| *id.as_bytes());
-            client.query_typed("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),b.id FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id WHERE a.id=$1 AND ($2::bytea IS NULL OR b.id>$2) AND EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) ORDER BY b.id LIMIT $3", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&after.as_ref().map(|id| id.as_slice()), Type::BYTEA), (&((maximum + 1) as i64), Type::INT8)]).await.map_err(|_| Error::Database)
-        })).map_err(Error::Connection)??;
+            client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),b.id FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id WHERE a.id=$1 AND ($2::bytea IS NULL OR b.id>$2) AND EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) ORDER BY b.id LIMIT $3", &[&account.as_bytes().as_slice(), &after.as_ref().map(|id| id.as_slice()), &((maximum + 1) as i64)]).map_err(|_| Error::Database)
+        }).map_err(Error::Connection)??;
         let mut report = Report {
             scanned: 0,
             written: 0,
@@ -126,7 +125,7 @@ pub fn run_with_options(
             let id: &[u8] = row.try_get(8).map_err(|_| Error::Invalid)?;
             let blob = BlobId::from_bytes(id.try_into().map_err(|_| Error::Invalid)?);
             let metadata = postgres_body::blob_metadata(
-                row,
+                &row,
                 account,
                 epoch,
                 blob,
@@ -208,17 +207,17 @@ pub fn run_with_options(
             search_bytes += search_size;
             output_bytes += size;
             if let Some(fields) = fields {
-                worker.run(move |client| Box::pin(async move {
-                    client.execute_typed("INSERT INTO td_mta.blob_summaries(account,blob_id,version,body_length,body_digest,fields) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,fields=EXCLUDED.fields", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&postgres_summaries::VERSION, Type::INT4), (&(metadata.body.length as i64), Type::INT8), (&metadata.body.digest.as_slice(), Type::BYTEA), (&fields, Type::BYTEA_ARRAY)]).await
-                })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
+                worker.run(move |client| {
+                    client.execute("INSERT INTO td_mta.blob_summaries(account,blob_id,version,body_length,body_digest,fields) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,fields=EXCLUDED.fields", &[&account.as_bytes().as_slice(), &blob.as_bytes().as_slice(), &postgres_summaries::VERSION, &(metadata.body.length as i64), &metadata.body.digest.as_slice(), &fields])
+                }).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
                 report.written += 1;
             } else {
                 report.skipped += 1;
             }
             if let Some(value) = interpretation {
-                worker.run(move |client| Box::pin(async move {
-                    client.execute_typed("INSERT INTO td_mta.blob_interpretations(account,blob_id,version,body_length,body_digest,header_bytes,part_table,chunk_hashes,manifest_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,header_bytes=EXCLUDED.header_bytes,part_table=EXCLUDED.part_table,chunk_hashes=EXCLUDED.chunk_hashes,manifest_digest=EXCLUDED.manifest_digest", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&crate::postgres_mime_evidence::VERSION, Type::INT4), (&(metadata.body.length as i64), Type::INT8), (&metadata.body.digest.as_slice(), Type::BYTEA), (&(value.header_bytes as i64), Type::INT8), (&value.table, Type::BYTEA), (&value.chunks, Type::BYTEA), (&value.digest.as_slice(), Type::BYTEA)]).await
-                })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
+                worker.run(move |client| {
+                    client.execute("INSERT INTO td_mta.blob_interpretations(account,blob_id,version,body_length,body_digest,header_bytes,part_table,chunk_hashes,manifest_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,header_bytes=EXCLUDED.header_bytes,part_table=EXCLUDED.part_table,chunk_hashes=EXCLUDED.chunk_hashes,manifest_digest=EXCLUDED.manifest_digest", &[&account.as_bytes().as_slice(), &blob.as_bytes().as_slice(), &crate::postgres_mime_evidence::VERSION, &(metadata.body.length as i64), &metadata.body.digest.as_slice(), &(value.header_bytes as i64), &value.table, &value.chunks, &value.digest.as_slice()])
+                }).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
                 report.structures_written += 1;
             } else if structure {
                 report.structures_skipped += 1;
@@ -226,11 +225,7 @@ pub fn run_with_options(
             if search {
                 let written = worker
                     .run(move |client| {
-                        Box::pin(crate::postgres_search::store(
-                            client,
-                            metadata,
-                            search_fields,
-                        ))
+                        crate::postgres_search::store(client, metadata, search_fields)
                     })
                     .map_err(Error::Connection)?
                     .map_err(|_| Error::Database)?;
@@ -248,7 +243,7 @@ pub fn run_with_options(
         }
         marker.store(true, Ordering::Relaxed);
         worker
-            .run(|client| Box::pin(async move { client.batch_execute("COMMIT").await }))
+            .run(|client| client.commit())
             .map_err(|_| Error::Indeterminate)?
             .map_err(|_| Error::Indeterminate)?;
         Ok(report)

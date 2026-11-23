@@ -1,4 +1,5 @@
 //! Explicit repair of a shared route hold after a newer selected configuration.
+use crate::postgres_probe::Client;
 use crate::{
     ids::RouteRepairId,
     postgres_probe::{self, Request},
@@ -13,7 +14,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::Client;
 #[derive(Clone)]
 pub struct Repair {
     claim: Claim,
@@ -62,9 +62,9 @@ pub fn prepare(claim: &Claim, generation: u64) -> Result<Repair, Error> {
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
 }
-async fn receipt(client: &Client, value: &Repair) -> Result<Option<Outcome>, Error> {
+fn receipt(client: &Client, value: &Repair) -> Result<Option<Outcome>, Error> {
     let binding = value.claim.binding();
-    let rows=client.query("SELECT request_digest,route_name,destination,action,old_revision,new_revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health_receipts WHERE account=$1 AND operation=$2", &[&binding.account().as_bytes().as_slice(),&value.operation.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT request_digest,route_name,destination,action,old_revision,new_revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health_receipts WHERE account=$1 AND operation=$2", &[&binding.account().as_bytes().as_slice(),&value.operation.as_bytes().as_slice()]).map_err(|_|Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -77,7 +77,7 @@ async fn receipt(client: &Client, value: &Repair) -> Result<Option<Outcome>, Err
     let action: i64 = row.try_get(3).map_err(|_| Error::Integrity)?;
     let old = health::number(row.try_get(4).map_err(|_| Error::Integrity)?)?;
     let new = health::number(row.try_get(5).map_err(|_| Error::Integrity)?)?;
-    let state = health::state(row, 6, new)?;
+    let state = health::state(&row, 6, new)?;
     if route != binding.route().name()
         || destination != binding.route().destination()
         || action != 2
@@ -102,12 +102,8 @@ pub fn inspect(
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            owners::begin(client, &value.claim, false, false)
-                .await
-                .map_err(Error::Owner)?;
-            receipt(client, &value).await
-        })
+        owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
+        receipt(client, &value)
     })
     .map_err(Error::Connection)?
 }
@@ -122,20 +118,11 @@ pub fn needed(
 ) -> Result<bool, Error> {
     let claim = claim.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            if !owners::begin(client, &claim, true, false)
-                .await
-                .map_err(Error::Owner)?
-            {
-                return Err(Error::Policy);
-            }
-            owners::check_locked(client, &claim, generation)
-                .await
-                .map_err(Error::Owner)?;
-            Ok(health::current(client, &claim)
-                .await?
-                .is_some_and(|state| state.repair_generation.is_some()))
-        })
+        if !owners::begin(client, &claim, true, false).map_err(Error::Owner)? {
+            return Err(Error::Policy);
+        }
+        owners::check_locked(client, &claim, generation).map_err(Error::Owner)?;
+        Ok(health::current(client, &claim)?.is_some_and(|state| state.repair_generation.is_some()))
     })
     .map_err(Error::Connection)?
 }
@@ -152,55 +139,44 @@ pub fn publish(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let policy = owners::begin(client, &value.claim, true, true)
-                .await
-                .map_err(Error::Owner)?;
-            if let Some(outcome) = receipt(client, &value).await? {
-                return Ok(outcome);
-            }
-            if !policy {
-                return Err(Error::Policy);
-            }
-            let timestamp = owners::check_locked(client, &value.claim, value.generation)
-                .await
-                .map_err(Error::Owner)?;
-            let mut state = health::current(client, &value.claim)
-                .await?
-                .ok_or(Error::Missing)?;
-            let held = state.repair_generation.ok_or(Error::Conflict)?;
-            let binding = value.claim.binding();
-            if binding.selection().generation <= held {
-                return Err(Error::RepairRequired);
-            }
-            if state.failed_at.is_none_or(|failed| timestamp < failed) {
-                return Err(Error::Clock);
-            }
-            let account = binding.account();
-            let account = account.as_bytes().as_slice();
-            health::reserve_write(client, &value.claim, timestamp, false).await?;
-            let old = state.revision;
-            state.revision = old.checked_add(1).ok_or(Error::Capacity)?;
-            state.repair_generation = None;
-            let revision = state.revision.to_be_bytes();
-            let revision = revision.as_slice();
-            if client.execute("UPDATE td_mta.route_health SET revision=$4,repair_generation=NULL WHERE account=$1 AND route_name=$2 AND destination=$3", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&revision]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
-            client.execute("INSERT INTO td_mta.route_health_receipts VALUES($1,$2,$3,$4,$5,2,$6,$7,$8,$9,$10,$11,NULL)", &[&account,&value.operation.as_bytes().as_slice(),&value.digest.as_slice(),&binding.route().name(),&binding.route().destination().as_slice(),&old.to_be_bytes().as_slice(),&revision,&i64::from(state.failure_count),&state.reason,&state.failed_at,&state.next_at]).await.map_err(|_|Error::Database)?;
-            let final_time = owners::check_locked(client, &value.claim, value.generation)
-                .await
-                .map_err(Error::Owner)?;
-            if final_time < timestamp {
-                return Err(Error::Clock);
-            }
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Outcome {
-                old_revision: old,
-                state,
-            })
+        let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
+        if let Some(outcome) = receipt(client, &value)? {
+            return Ok(outcome);
+        }
+        if !policy {
+            return Err(Error::Policy);
+        }
+        let timestamp =
+            owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?;
+        let mut state = health::current(client, &value.claim)?.ok_or(Error::Missing)?;
+        let held = state.repair_generation.ok_or(Error::Conflict)?;
+        let binding = value.claim.binding();
+        if binding.selection().generation <= held {
+            return Err(Error::RepairRequired);
+        }
+        if state.failed_at.is_none_or(|failed| timestamp < failed) {
+            return Err(Error::Clock);
+        }
+        let account = binding.account();
+        let account = account.as_bytes().as_slice();
+        health::reserve_write(client, &value.claim, timestamp, false)?;
+        let old = state.revision;
+        state.revision = old.checked_add(1).ok_or(Error::Capacity)?;
+        state.repair_generation = None;
+        let revision = state.revision.to_be_bytes();
+        let revision = revision.as_slice();
+        if client.execute("UPDATE td_mta.route_health SET revision=$4,repair_generation=NULL WHERE account=$1 AND route_name=$2 AND destination=$3", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&revision]).map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity);}
+        client.execute("INSERT INTO td_mta.route_health_receipts VALUES($1,$2,$3,$4,$5,2,$6,$7,$8,$9,$10,$11,NULL)", &[&account,&value.operation.as_bytes().as_slice(),&value.digest.as_slice(),&binding.route().name(),&binding.route().destination().as_slice(),&old.to_be_bytes().as_slice(),&revision,&i64::from(state.failure_count),&state.reason,&state.failed_at,&state.next_at]).map_err(|_|Error::Database)?;
+        let final_time =
+            owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?;
+        if final_time < timestamp {
+            return Err(Error::Clock);
+        }
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Outcome {
+            old_revision: old,
+            state,
         })
     });
     match result {

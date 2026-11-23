@@ -1,6 +1,6 @@
 //! Bounded explicit ACL preservation across an owner schema transaction.
+use crate::postgres_probe::Client;
 use crate::postgres_schema::Error;
-use tokio_postgres::Client;
 
 const MAX_GRANTS: usize = 4096;
 const ACLS: &str = "SELECT * FROM (
@@ -36,9 +36,8 @@ pub(super) struct Grant {
     grantable: bool,
 }
 
-pub(super) async fn owner(client: &Client) -> Result<(), Error> {
-    let owner: bool = client.query_one("SELECT current_user=session_user AND EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.rolname=current_user JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname='schema_migrations' WHERE n.nspname='td_mta' AND n.nspowner=r.oid AND c.relowner=r.oid AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity)", &[])
-        .await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Invalid)?;
+pub(super) fn owner(client: &Client) -> Result<(), Error> {
+    let owner: bool = client.query_one("SELECT current_user=session_user AND EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.rolname=current_user JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname='schema_migrations' WHERE n.nspname='td_mta' AND n.nspowner=r.oid AND c.relowner=r.oid AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity)", &[]).map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Invalid)?;
     if owner {
         Ok(())
     } else {
@@ -46,8 +45,8 @@ pub(super) async fn owner(client: &Client) -> Result<(), Error> {
     }
 }
 
-pub(super) async fn read(client: &Client) -> Result<Vec<Grant>, Error> {
-    let rows = client.query(ACLS, &[]).await.map_err(|_| Error::Database)?;
+pub(super) fn read(client: &Client) -> Result<Vec<Grant>, Error> {
+    let rows = client.query(ACLS, &[]).map_err(|_| Error::Database)?;
     if rows.len() > MAX_GRANTS {
         return Err(Error::Invalid);
     }
@@ -55,7 +54,7 @@ pub(super) async fn read(client: &Client) -> Result<Vec<Grant>, Error> {
     grants
         .try_reserve_exact(rows.len())
         .map_err(|_| Error::Invalid)?;
-    for row in rows {
+    for row in &rows {
         let privilege: &str = row.try_get(5).map_err(|_| Error::Invalid)?;
         let privilege = match privilege {
             "USAGE" => 1,

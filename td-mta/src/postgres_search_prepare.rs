@@ -14,7 +14,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::TrustStore;
-use tokio_postgres::types::Type;
 
 pub const VERSION: u32 = postgres_search::VERSION as u32;
 pub const MAXIMUM: usize = 16;
@@ -45,7 +44,7 @@ pub struct Report {
     pub verified_bytes: u64,
     pub done: bool,
 }
-fn key(row: &tokio_postgres::Row, account: usize, blob: usize) -> Result<Key, Error> {
+fn key(row: &crate::postgres_probe::Row, account: usize, blob: usize) -> Result<Key, Error> {
     let account: &[u8] = row.try_get(account).map_err(|_| Error::Invalid)?;
     let blob: &[u8] = row.try_get(blob).map_err(|_| Error::Invalid)?;
     Ok(Key {
@@ -75,28 +74,21 @@ pub fn run(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_search_backfill_worker(request, trust, deadline, |worker| {
-        let (rows, through) = worker.run(move |client| Box::pin(async move {
-            crate::postgres_maintenance::owner(client).await.map_err(|_| Error::Owner)?;
-            let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+        let (rows, through) = worker.run(move |client| {
+            crate::postgres_maintenance::owner(client).map_err(|_| Error::Owner)?;
+            let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Invalid); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
             let through = match options.through {
                 Some(end) => Some(end),
-                None => client.query_typed_opt("SELECT account,id FROM td_mta.blobs ORDER BY account DESC,id DESC LIMIT 1", &[]).await.map_err(|_| Error::Database)?.as_ref().map(|row| key(row,0,1)).transpose()?,
+                None => client.query_opt("SELECT account,id FROM td_mta.blobs ORDER BY account DESC,id DESC LIMIT 1", &[]).map_err(|_| Error::Database)?.as_ref().map(|row| key(&row.row(),0,1)).transpose()?,
             };
-            let Some(end) = through else { return Ok((Vec::new(), None)); };
+            let Some(end) = through else { return Ok((None, None)); };
             let after_account = options.after.map(|key| *key.account.as_bytes());
             let after_blob = options.after.map(|key| *key.blob.as_bytes());
-            let rows = client.query_typed("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),b.account,b.id FROM td_mta.blobs b JOIN td_mta.accounts a ON a.id=b.account WHERE ($1::bytea IS NULL OR (b.account,b.id)>($1,$2)) AND (b.account,b.id)<=($3,$4) AND EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.blob_search s WHERE s.account=b.account AND s.blob_id=b.id AND s.version=$5 AND s.body_length=b.length AND s.body_digest=b.digest AND s.candidate_text IS NOT NULL) ORDER BY b.account,b.id LIMIT $6", &[
-                (&after_account.as_ref().map(|v| v.as_slice()), Type::BYTEA),
-                (&after_blob.as_ref().map(|v| v.as_slice()), Type::BYTEA),
-                (&end.account.as_bytes().as_slice(), Type::BYTEA),
-                (&end.blob.as_bytes().as_slice(), Type::BYTEA),
-                (&postgres_search::VERSION, Type::INT4),
-                (&((options.maximum+1) as i64), Type::INT8),
-            ]).await.map_err(|_| Error::Database)?;
-            Ok((rows, through))
-        })).map_err(Error::Connection)??;
+            let rows = client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),b.account,b.id FROM td_mta.blobs b JOIN td_mta.accounts a ON a.id=b.account WHERE ($1::bytea IS NULL OR (b.account,b.id)>($1,$2)) AND (b.account,b.id)<=($3,$4) AND EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM td_mta.blob_search s WHERE s.account=b.account AND s.blob_id=b.id AND s.version=$5 AND s.body_length=b.length AND s.body_digest=b.digest AND s.candidate_text IS NOT NULL) ORDER BY b.account,b.id LIMIT $6", &[&after_account.as_ref().map(|v| v.as_slice()), &after_blob.as_ref().map(|v| v.as_slice()), &end.account.as_bytes().as_slice(), &end.blob.as_bytes().as_slice(), &postgres_search::VERSION, &((options.maximum+1) as i64)]).map_err(|_| Error::Database)?;
+            Ok((Some(rows), through))
+        }).map_err(Error::Connection)??;
         let mut report = Report {
             after: options.after,
             through,
@@ -104,13 +96,17 @@ pub fn run(
             written: 0,
             skipped: 0,
             verified_bytes: 0,
-            done: rows.len() <= options.maximum,
+            done: rows.as_ref().map_or(0, crate::postgres_probe::Rows::len) <= options.maximum,
         };
         let mut encoded_bytes = 0usize;
-        for row in rows.iter().take(options.maximum) {
-            let id = key(row, 8, 9)?;
+        for row in rows
+            .iter()
+            .flat_map(crate::postgres_probe::Rows::iter)
+            .take(options.maximum)
+        {
+            let id = key(&row, 8, 9)?;
             let metadata = postgres_body::blob_metadata(
-                row,
+                &row,
                 id.account,
                 epoch,
                 id.blob,
@@ -135,7 +131,7 @@ pub fn run(
             }
             encoded_bytes += size;
             let written = worker
-                .run(move |client| Box::pin(postgres_search::store(client, metadata, value)))
+                .run(move |client| postgres_search::store(client, metadata, value))
                 .map_err(Error::Connection)?
                 .map_err(|_| Error::Database)?;
             if written {
@@ -151,7 +147,7 @@ pub fn run(
         }
         marker.store(true, Ordering::Relaxed);
         worker
-            .run(|client| Box::pin(async move { client.batch_execute("COMMIT").await }))
+            .run(|client| client.commit())
             .map_err(|_| Error::Indeterminate)?
             .map_err(|_| Error::Indeterminate)?;
         Ok(report)

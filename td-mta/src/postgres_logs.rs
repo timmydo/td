@@ -79,7 +79,7 @@ pub fn append(
     let entered = std::cell::Cell::new(false);
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, |client| {
         entered.set(true);
-        Box::pin(write(client, epoch, profile, records))
+        write(client, epoch, profile, records)
     });
     match result {
         Ok(result) => result,
@@ -104,23 +104,23 @@ pub fn inspect(
     let limit = i64::try_from(limit).map_err(|_| Error::Invalid)?;
     let before = before.unwrap_or(i64::MAX);
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(read(client, epoch, before, limit))
+        read(client, epoch, before, limit)
     })
     .map_err(Error::Connection)?
 }
 
-async fn write(
-    client: &postgres_probe::ScopedClient,
+fn write(
+    client: &postgres_probe::Client,
     epoch: StoreEpoch,
     profile: String,
     mut records: Vec<String>,
 ) -> Result<Written, Error> {
-    let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
+    let receipt = client.inspect_schema().map_err(Error::Schema)?;
     if receipt.store_epoch != epoch {
         return Err(Error::Epoch);
     }
-    client.batch_execute("BEGIN; SET LOCAL lock_timeout=50; SET LOCAL statement_timeout=1000; SET LOCAL synchronous_commit=off").await.map_err(|_|Error::Database)?;
-    let row=client.query_one("SELECT next_id,window_ms,used,suppressed,evicted,(pg_total_relation_size('td_mta.application_logs')+pg_total_relation_size('td_mta.application_log_state')),(extract(epoch FROM clock_timestamp())*1000)::bigint FROM td_mta.application_log_state WHERE singleton FOR UPDATE",&[]).await.map_err(|_|Error::Database)?;
+    client.batch("BEGIN; SET LOCAL lock_timeout=50; SET LOCAL statement_timeout=1000; SET LOCAL synchronous_commit=off").map_err(|_|Error::Database)?;
+    let row=client.query_one("SELECT next_id,window_ms,used,suppressed,evicted,(pg_total_relation_size('td_mta.application_logs')+pg_total_relation_size('td_mta.application_log_state')),(extract(epoch FROM clock_timestamp())*1000)::bigint FROM td_mta.application_log_state WHERE singleton FOR UPDATE",&[]).map_err(|_|Error::Database)?;
     let next: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
     let window: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
     let used: i32 = row.try_get(2).map_err(|_| Error::Integrity)?;
@@ -161,32 +161,26 @@ async fn write(
         .ok_or(Error::Integrity)?;
     let suppressed = suppressed.saturating_add(i64::try_from(lost).map_err(|_| Error::Invalid)?);
     let cutoff = now.saturating_sub(RETENTION_MS);
-    client.execute("DELETE FROM td_mta.application_logs WHERE slot IN (SELECT slot FROM td_mta.application_logs WHERE recorded_ms<$1 ORDER BY recorded_ms,slot LIMIT 1024)",&[&cutoff]).await.map_err(|_|Error::Database)?;
+    client.execute("DELETE FROM td_mta.application_logs WHERE slot IN (SELECT slot FROM td_mta.application_logs WHERE recorded_ms<$1 ORDER BY recorded_ms,slot LIMIT 1024)",&[&cutoff]).map_err(|_|Error::Database)?;
     let mut evicted = evicted;
     if count > 0 {
-        let replaced:i64=client.query_one("SELECT count(*) FROM td_mta.application_logs WHERE slot IN (SELECT (($1::bigint+n)%65536)::integer FROM generate_series(0,$2::bigint-1) n)",&[&next,&(count as i64)]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
+        let replaced:i64=client.query_one("SELECT count(*) FROM td_mta.application_logs WHERE slot IN (SELECT (($1::bigint+n)%65536)::integer FROM generate_series(0,$2::bigint-1) n)",&[&next,&(count as i64)]).map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
         evicted = evicted.saturating_add(replaced);
-        client.execute("INSERT INTO td_mta.application_logs(slot,id,recorded_ms,profile,event) SELECT (($1::bigint+ordinality-1)%65536)::integer,$1::bigint+ordinality-1,$2::bigint,$3::text,event FROM unnest($4::text[]) WITH ORDINALITY AS v(event,ordinality) ON CONFLICT(slot) DO UPDATE SET id=EXCLUDED.id,recorded_ms=EXCLUDED.recorded_ms,profile=EXCLUDED.profile,event=EXCLUDED.event",&[&next,&now,&profile,&records]).await.map_err(|_|Error::Database)?;
+        client.execute("INSERT INTO td_mta.application_logs(slot,id,recorded_ms,profile,event) SELECT (($1::bigint+ordinality-1)%65536)::integer,$1::bigint+ordinality-1,$2::bigint,$3::text,event FROM unnest($4::text[]) WITH ORDINALITY AS v(event,ordinality) ON CONFLICT(slot) DO UPDATE SET id=EXCLUDED.id,recorded_ms=EXCLUDED.recorded_ms,profile=EXCLUDED.profile,event=EXCLUDED.event",&[&next,&now,&profile,&records]).map_err(|_|Error::Database)?;
     }
     if relation_bytes >= MAX_RELATION_BYTES {
-        client
-            .batch_execute("COMMIT")
-            .await
-            .map_err(|_| Error::Database)?;
+        client.commit().map_err(|_| Error::Database)?;
         return Ok(Written {
             stored: 0,
             suppressed: lost,
             paused: true,
         });
     }
-    let changed=client.execute("UPDATE td_mta.application_log_state SET next_id=$1,window_ms=$2,used=$3,suppressed=$4,evicted=$5 WHERE singleton",&[&following,&window,&used,&suppressed,&evicted]).await.map_err(|_|Error::Database)?;
+    let changed=client.execute("UPDATE td_mta.application_log_state SET next_id=$1,window_ms=$2,used=$3,suppressed=$4,evicted=$5 WHERE singleton",&[&following,&window,&used,&suppressed,&evicted]).map_err(|_|Error::Database)?;
     if changed != 1 {
         return Err(Error::Integrity);
     }
-    client
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|_| Error::Database)?;
+    client.commit().map_err(|_| Error::Database)?;
     Ok(Written {
         stored: count,
         suppressed: lost,
@@ -194,29 +188,26 @@ async fn write(
     })
 }
 
-async fn read(
-    client: &postgres_probe::ScopedClient,
+fn read(
+    client: &postgres_probe::Client,
     epoch: StoreEpoch,
     before: i64,
     limit: i64,
 ) -> Result<Page, Error> {
-    let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
+    let receipt = client.inspect_schema().map_err(Error::Schema)?;
     if receipt.store_epoch != epoch {
         return Err(Error::Epoch);
     }
     client
-        .batch_execute(
-            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout=1000",
-        )
-        .await
+        .batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout=1000")
         .map_err(|_| Error::Database)?;
-    let row=client.query_one("SELECT suppressed,evicted,(pg_total_relation_size('td_mta.application_logs')+pg_total_relation_size('td_mta.application_log_state')) FROM td_mta.application_log_state WHERE singleton",&[]).await.map_err(|_|Error::Database)?;
+    let row=client.query_one("SELECT suppressed,evicted,(pg_total_relation_size('td_mta.application_logs')+pg_total_relation_size('td_mta.application_log_state')) FROM td_mta.application_log_state WHERE singleton",&[]).map_err(|_|Error::Database)?;
     let suppressed: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
     let evicted: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
     let relation_bytes: i64 = row.try_get(2).map_err(|_| Error::Integrity)?;
-    let rows=client.query("SELECT id,recorded_ms,profile,event FROM td_mta.application_logs WHERE id<$1 AND recorded_ms>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 ORDER BY id DESC LIMIT $3",&[&before,&RETENTION_MS,&limit]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT id,recorded_ms,profile,event FROM td_mta.application_logs WHERE id<$1 AND recorded_ms>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 ORDER BY id DESC LIMIT $3",&[&before,&RETENTION_MS,&limit]).map_err(|_|Error::Database)?;
     let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in &rows {
         let id: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
         let recorded_ms: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
         let profile: String = row.try_get(2).map_err(|_| Error::Integrity)?;
@@ -235,10 +226,7 @@ async fn read(
             event,
         });
     }
-    client
-        .batch_execute("ROLLBACK")
-        .await
-        .map_err(|_| Error::Database)?;
+    client.rollback().map_err(|_| Error::Database)?;
     Ok(Page {
         records,
         suppressed,

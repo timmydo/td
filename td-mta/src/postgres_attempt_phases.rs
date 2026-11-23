@@ -1,4 +1,5 @@
 //! Durable DATA phases and final replies under the current attempt fence.
+use crate::postgres_probe::Client;
 use crate::{
     ids::AttemptId,
     ports::Clock,
@@ -14,7 +15,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::Client;
 
 #[path = "postgres_phase_current.rs"]
 mod current;
@@ -654,7 +654,7 @@ fn number(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-async fn receipt(client: &Client, value: &Fields) -> Result<Option<Outcome>, Error> {
+fn receipt(client: &Client, value: &Fields) -> Result<Option<Outcome>, Error> {
     let query = if value.phase >= 7 {
         "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_command_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
     } else if value.phase == 6 {
@@ -667,21 +667,14 @@ async fn receipt(client: &Client, value: &Fields) -> Result<Option<Outcome>, Err
         "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_phase_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
     };
     let rows = client
-        .query_typed(
+        .query(
             query,
             &[
-                (
-                    &value.claim.binding().account().as_bytes().as_slice(),
-                    tokio_postgres::types::Type::BYTEA,
-                ),
-                (
-                    &value.attempt.as_bytes().as_slice(),
-                    tokio_postgres::types::Type::BYTEA,
-                ),
-                (&value.phase, tokio_postgres::types::Type::INT8),
+                &value.claim.binding().account().as_bytes().as_slice(),
+                &value.attempt.as_bytes().as_slice(),
+                &value.phase,
             ],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok(None);
@@ -712,12 +705,8 @@ pub fn inspect(
 ) -> Result<Option<Outcome>, Error> {
     let value = value.inner.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            owners::begin(client, &value.claim, false, false)
-                .await
-                .map_err(Error::Owner)?;
-            receipt(client, &value).await
-        })
+        owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
+        receipt(client, &value)
     })
     .map_err(Error::Connection)?
 }
@@ -795,12 +784,11 @@ struct Observation {
     guard: Arc<Mutex<Guard>>,
 }
 impl Observation {
-    async fn check(&self, client: &Client, value: &Fields) -> Result<i64, Error> {
+    fn check(&self, client: &Client, value: &Fields) -> Result<i64, Error> {
         owners::check_locked_observed(client, &value.claim, value.generation, |utc_ms| {
             queue_clock::admit_database(self.clock.as_ref(), &self.guard, utc_ms, false)
                 .map_err(Error::Clock)
         })
-        .await
     }
 }
 impl From<owners::Error> for Error {
@@ -827,248 +815,235 @@ fn publish_inner(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let policy = owners::begin(client, &value.claim, true, true)
-                .await
-                .map_err(Error::Owner)?;
-            if let Some(outcome) = receipt(client, &value).await? {
-                return if new_only {
-                    Err(Error::Conflict)
-                } else {
-                    Ok(outcome)
-                };
-            }
-            if !policy {
-                return Err(Error::Policy);
-            }
-            let timestamp = if let Some(observation) = &observation {
-                observation.check(client, &value).await?
+        let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
+        if let Some(outcome) = receipt(client, &value)? {
+            return if new_only {
+                Err(Error::Conflict)
             } else {
-                owners::check_locked(client, &value.claim, value.generation)
-                    .await
-                    .map_err(Error::Owner)?
+                Ok(outcome)
             };
-            let binding = value.claim.binding();
-            let account_id = binding.account();
-            let account = account_id.as_bytes().as_slice();
-            let attempt = value.attempt.as_bytes().as_slice();
-            let rows = client.query("SELECT submission_id,ordinals FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4 AND generation=$5 AND owner_boot=$6 AND owner_operation=$7 AND active AND EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=$1 AND s.id=td_mta.submission_attempts.submission_id AND s.completed_at IS NULL) FOR UPDATE", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice(),&value.generation.to_be_bytes().as_slice(),&value.claim.boot().as_bytes().as_slice(),&value.claim.operation().as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-            let row = rows.first().ok_or(Error::Missing)?;
-            let submission: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
-            let encoded: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-            if submission.len() != 16
-                || encoded.is_empty()
-                || encoded.len() > 400
-                || !encoded.len().is_multiple_of(4)
-            {
-                return Err(Error::Integrity);
-            }
-            if value.phase == 7 && value.ordinals.len() != encoded.len() / 4 {
-                return Err(Error::Conflict);
-            }
-            if value.phase == 2 || value.phase == 8 {
-                // Finished recipients no longer appear in the InFlight scan.
-                let query = if value.phase == 2 {
-                    "SELECT 1 FROM td_mta.attempt_command_receipts WHERE account=$1 AND attempt_id=$2 AND phase=8"
-                } else {
-                    "SELECT 1 FROM td_mta.attempt_phase_receipts WHERE account=$1 AND attempt_id=$2 AND phase=2"
-                };
-                if !client
-                    .query(query, &[&account, &attempt])
-                    .await
-                    .map_err(|_| Error::Database)?
-                    .is_empty()
-                {
-                    return Err(Error::Conflict);
-                }
-            }
-            let mut previous = None;
-            for bytes in encoded.as_chunks::<4>().0 {
-                let ordinal = u32::from_be_bytes(*bytes);
-                if ordinal >= 1000 || previous.is_some_and(|p| p >= ordinal) {
-                    return Err(Error::Integrity);
-                }
-                previous = Some(ordinal);
-            }
-            if value.ordinals.iter().any(|n| {
-                !encoded
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .any(|b| i64::from(u32::from_be_bytes(*b)) == *n)
-            }) {
-                return Err(Error::Integrity);
-            }
-            let row = client.query_one("SELECT a.sequence,a.floor,s.changed,s.completed_at,s.expires_at FROM td_mta.accounts a JOIN td_mta.submissions s ON s.account=a.id WHERE a.id=$1 AND s.id=$2 FOR UPDATE OF s", &[&account,&submission]).await.map_err(|_| Error::Database)?;
-            let old = number(row.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let completed: Option<i64> = row.try_get(3).map_err(|_| Error::Integrity)?;
-            let expires: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
-            if number(row.try_get(1).map_err(|_| Error::Integrity)?)? > old
-                || number(row.try_get(2).map_err(|_| Error::Integrity)?)? > old
-                || completed.is_some()
-                || (value.phase < 4 && timestamp >= expires)
-            {
-                return Err(Error::Integrity);
-            }
-            if value.phase != 4 && value.phase != 5 {
-                let (count_query, ceiling) = if value.phase >= 7 {
-                    ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_command_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
-                } else if value.phase == 6 {
-                    ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_rcpt_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
-                } else {
-                    ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_phase_receipts WHERE account=$1 LIMIT 2048) receipts", 2048)
-                };
-                let count: i64 = client
-                    .query_one(count_query, &[&account])
-                    .await
-                    .map_err(|_| Error::Database)?
-                    .try_get(0)
-                    .map_err(|_| Error::Integrity)?;
-                if count >= ceiling {
-                    return Err(Error::Capacity);
-                }
-            }
-            let rows = client.query("SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,last_attempt_at,uncertain,attempt_count,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101 FOR UPDATE", &[&account,&submission,&attempt]).await.map_err(|_| Error::Database)?;
-            if rows.is_empty() || rows.len() > 100 {
-                return Err(Error::Integrity);
-            }
-            let prior_phase = if value.phase >= 6 {
-                1
-            } else if value.phase >= 4 {
-                3
+        }
+        if !policy {
+            return Err(Error::Policy);
+        }
+        let timestamp = if let Some(observation) = &observation {
+            observation.check(client, &value)?
+        } else {
+            owners::check_locked(client, &value.claim, value.generation).map_err(Error::Owner)?
+        };
+        let binding = value.claim.binding();
+        let account_id = binding.account();
+        let account = account_id.as_bytes().as_slice();
+        let attempt = value.attempt.as_bytes().as_slice();
+        let rows = client.query("SELECT submission_id,ordinals FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4 AND generation=$5 AND owner_boot=$6 AND owner_operation=$7 AND active AND EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=$1 AND s.id=td_mta.submission_attempts.submission_id AND s.completed_at IS NULL) FOR UPDATE", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice(),&value.generation.to_be_bytes().as_slice(),&value.claim.boot().as_bytes().as_slice(),&value.claim.operation().as_bytes().as_slice()]).map_err(|_| Error::Database)?;
+        let row = rows.first().ok_or(Error::Missing)?;
+        let submission: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+        let encoded: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+        if submission.len() != 16
+            || encoded.is_empty()
+            || encoded.len() > 400
+            || !encoded.len().is_multiple_of(4)
+        {
+            return Err(Error::Integrity);
+        }
+        if value.phase == 7 && value.ordinals.len() != encoded.len() / 4 {
+            return Err(Error::Conflict);
+        }
+        if value.phase == 2 || value.phase == 8 {
+            // Finished recipients no longer appear in the InFlight scan.
+            let query = if value.phase == 2 {
+                "SELECT 1 FROM td_mta.attempt_command_receipts WHERE account=$1 AND attempt_id=$2 AND phase=8"
             } else {
-                value.phase - 1
+                "SELECT 1 FROM td_mta.attempt_phase_receipts WHERE account=$1 AND attempt_id=$2 AND phase=2"
             };
-            let mut entropy = if value.phase >= 5 {
-                Some(SystemEntropy::try_new().map_err(|_| Error::Crypto)?)
-            } else {
-                None
-            };
-            let mut states = Vec::new();
-            let mut reasons = Vec::new();
-            reasons
-                .try_reserve_exact(value.ordinals.len())
-                .map_err(|_| Error::Capacity)?;
-            let mut retries: Vec<Option<i64>> = Vec::new();
-            states
-                .try_reserve_exact(value.ordinals.len())
-                .map_err(|_| Error::Capacity)?;
-            retries
-                .try_reserve_exact(value.ordinals.len())
-                .map_err(|_| Error::Capacity)?;
-            let mut selected = 0;
-            let mut prior_count = 0;
-            for row in &rows {
-                let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
-                let phase: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
-                let reply: Option<&str> = row.try_get(2).map_err(|_| Error::Integrity)?;
-                let data: Option<&str> = row.try_get(3).map_err(|_| Error::Integrity)?;
-                let reason: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
-                let last: i64 = row.try_get(6).map_err(|_| Error::Integrity)?;
-                let uncertain: i64 = row.try_get(7).map_err(|_| Error::Integrity)?;
-                let attempts: i64 = row.try_get(8).map_err(|_| Error::Integrity)?;
-                let retry: Option<i64> = row.try_get(9).map_err(|_| Error::Integrity)?;
-                if !encoded
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .any(|bytes| i64::from(u32::from_be_bytes(*bytes)) == ordinal)
-                    || reason != 0
-                    || number(row.try_get(5).map_err(|_| Error::Integrity)?)? > old
-                    || last > timestamp
-                    || !(0..=1).contains(&uncertain)
-                    || attempts <= 0
-                    || retry.is_some()
-                {
-                    return Err(Error::Integrity);
-                }
-                if phase == prior_phase {
-                    prior_count += 1;
-                }
-                if let Ok(index) = value.ordinals.binary_search(&ordinal) {
-                    selected += 1;
-                    if phase != prior_phase
-                        || (phase >= 2
-                            && (reply.is_none_or(|s| !valid_reply(s, false)) || data.is_some()))
-                    {
-                        return Err(Error::Conflict);
-                    }
-                    if value.phase >= 5 {
-                        let reply = value.replies.get(index).ok_or(Error::Integrity)?;
-                        let permanent = crate::recipient_sweep::reply_class(Some(reply)) == Some(5);
-                        let retry = if permanent {
-                            None
-                        } else {
-                            let delay = crate::postgres_attempt_recovery::retry_delay(
-                                entropy.as_mut().ok_or(Error::Integrity)?,
-                                u32::try_from(attempts).map_err(|_| Error::Integrity)?,
-                                value.claim.retry_floor(),
-                            )
-                            .map_err(|error| match error {
-                                crate::postgres_attempt_recovery::Error::Crypto => Error::Crypto,
-                                crate::postgres_attempt_recovery::Error::Capacity => {
-                                    Error::Capacity
-                                }
-                                _ => Error::Integrity,
-                            })?;
-                            // Preserve the actual reply while clock-confirmed
-                            // expiry remains held; equality cannot dispatch.
-                            Some(
-                                timestamp
-                                    .checked_add(delay)
-                                    .ok_or(Error::Capacity)?
-                                    .min(expires),
-                            )
-                        };
-                        states.push(if uncertain == 1 {
-                            7i64
-                        } else if permanent {
-                            5i64
-                        } else {
-                            3i64
-                        });
-                        retries.push(retry);
-                        reasons.push(if permanent { 2i64 } else { 1i64 });
-                    }
-                } else if phase != 1 {
-                    return Err(Error::Conflict);
-                }
-            }
-            if selected != value.ordinals.len()
-                || (((3..=5).contains(&value.phase) || value.phase == 7) && prior_count != selected)
+            if !client
+                .query(query, &[&account, &attempt])
+                .map_err(|_| Error::Database)?
+                .is_empty()
             {
                 return Err(Error::Conflict);
             }
-            if value.phase == 3 {
-                crate::postgres_final_capacity::reserve(client, account, attempt, &value.ordinals)
-                    .await
-                    .map_err(capacity)?;
-            } else if value.phase == 4 || value.phase == 5 {
-                crate::postgres_final_capacity::consume(client, account, attempt, &value.ordinals)
-                    .await
-                    .map_err(capacity)?;
-                let kind = if value.phase == 4 {
-                    crate::postgres_final_capacity::Receipt::Accepted
-                } else {
-                    crate::postgres_final_capacity::Receipt::Refused
-                };
-                crate::postgres_final_capacity::admit_receipt(client, account, kind)
-                    .await
-                    .map_err(capacity)?;
+        }
+        let mut previous = None;
+        for bytes in encoded.as_chunks::<4>().0 {
+            let ordinal = u32::from_be_bytes(*bytes);
+            if ordinal >= 1000 || previous.is_some_and(|p| p >= ordinal) {
+                return Err(Error::Integrity);
             }
-            let next = crate::postgres_sequence::next(client, account, old)
-                .await
-                .map_err(|error| match error {
-                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
-                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
-                    crate::postgres_sequence::Error::Database => Error::Database,
-                })?;
-            let changed = next.to_be_bytes();
-            let changed = changed.as_slice();
-            let affected = if value.phase == 2 {
-            client.execute("UPDATE td_mta.recipients r SET phase=2,rcpt_reply=u.reply,data_reply=NULL,changed=$5 FROM unnest($3::bigint[],$4::text[]) u(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&value.replies,&changed]).await
+            previous = Some(ordinal);
+        }
+        if value.ordinals.iter().any(|n| {
+            !encoded
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|b| i64::from(u32::from_be_bytes(*b)) == *n)
+        }) {
+            return Err(Error::Integrity);
+        }
+        let row = client.query_one("SELECT a.sequence,a.floor,s.changed,s.completed_at,s.expires_at FROM td_mta.accounts a JOIN td_mta.submissions s ON s.account=a.id WHERE a.id=$1 AND s.id=$2 FOR UPDATE OF s", &[&account,&submission]).map_err(|_| Error::Database)?;
+        let old = number(row.try_get(0).map_err(|_| Error::Integrity)?)?;
+        let completed: Option<i64> = row.try_get(3).map_err(|_| Error::Integrity)?;
+        let expires: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
+        if number(row.try_get(1).map_err(|_| Error::Integrity)?)? > old
+            || number(row.try_get(2).map_err(|_| Error::Integrity)?)? > old
+            || completed.is_some()
+            || (value.phase < 4 && timestamp >= expires)
+        {
+            return Err(Error::Integrity);
+        }
+        if value.phase != 4 && value.phase != 5 {
+            let (count_query, ceiling) = if value.phase >= 7 {
+                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_command_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
+            } else if value.phase == 6 {
+                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_rcpt_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
+            } else {
+                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_phase_receipts WHERE account=$1 LIMIT 2048) receipts", 2048)
+            };
+            let count: i64 = client
+                .query_one(count_query, &[&account])
+                .map_err(|_| Error::Database)?
+                .try_get(0)
+                .map_err(|_| Error::Integrity)?;
+            if count >= ceiling {
+                return Err(Error::Capacity);
+            }
+        }
+        let rows = client.query("SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,last_attempt_at,uncertain,attempt_count,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101 FOR UPDATE", &[&account,&submission,&attempt]).map_err(|_| Error::Database)?;
+        if rows.is_empty() || rows.len() > 100 {
+            return Err(Error::Integrity);
+        }
+        let prior_phase = if value.phase >= 6 {
+            1
+        } else if value.phase >= 4 {
+            3
+        } else {
+            value.phase - 1
+        };
+        let mut entropy = if value.phase >= 5 {
+            Some(SystemEntropy::try_new().map_err(|_| Error::Crypto)?)
+        } else {
+            None
+        };
+        let mut states = Vec::new();
+        let mut reasons = Vec::new();
+        reasons
+            .try_reserve_exact(value.ordinals.len())
+            .map_err(|_| Error::Capacity)?;
+        let mut retries: Vec<Option<i64>> = Vec::new();
+        states
+            .try_reserve_exact(value.ordinals.len())
+            .map_err(|_| Error::Capacity)?;
+        retries
+            .try_reserve_exact(value.ordinals.len())
+            .map_err(|_| Error::Capacity)?;
+        let mut selected = 0;
+        let mut prior_count = 0;
+        for row in &rows {
+            let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
+            let phase: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
+            let reply: Option<&str> = row.try_get(2).map_err(|_| Error::Integrity)?;
+            let data: Option<&str> = row.try_get(3).map_err(|_| Error::Integrity)?;
+            let reason: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
+            let last: i64 = row.try_get(6).map_err(|_| Error::Integrity)?;
+            let uncertain: i64 = row.try_get(7).map_err(|_| Error::Integrity)?;
+            let attempts: i64 = row.try_get(8).map_err(|_| Error::Integrity)?;
+            let retry: Option<i64> = row.try_get(9).map_err(|_| Error::Integrity)?;
+            if !encoded
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|bytes| i64::from(u32::from_be_bytes(*bytes)) == ordinal)
+                || reason != 0
+                || number(row.try_get(5).map_err(|_| Error::Integrity)?)? > old
+                || last > timestamp
+                || !(0..=1).contains(&uncertain)
+                || attempts <= 0
+                || retry.is_some()
+            {
+                return Err(Error::Integrity);
+            }
+            if phase == prior_phase {
+                prior_count += 1;
+            }
+            if let Ok(index) = value.ordinals.binary_search(&ordinal) {
+                selected += 1;
+                if phase != prior_phase
+                    || (phase >= 2
+                        && (reply.is_none_or(|s| !valid_reply(s, false)) || data.is_some()))
+                {
+                    return Err(Error::Conflict);
+                }
+                if value.phase >= 5 {
+                    let reply = value.replies.get(index).ok_or(Error::Integrity)?;
+                    let permanent = crate::recipient_sweep::reply_class(Some(reply)) == Some(5);
+                    let retry = if permanent {
+                        None
+                    } else {
+                        let delay = crate::postgres_attempt_recovery::retry_delay(
+                            entropy.as_mut().ok_or(Error::Integrity)?,
+                            u32::try_from(attempts).map_err(|_| Error::Integrity)?,
+                            value.claim.retry_floor(),
+                        )
+                        .map_err(|error| match error {
+                            crate::postgres_attempt_recovery::Error::Crypto => Error::Crypto,
+                            crate::postgres_attempt_recovery::Error::Capacity => Error::Capacity,
+                            _ => Error::Integrity,
+                        })?;
+                        // Preserve the actual reply while clock-confirmed
+                        // expiry remains held; equality cannot dispatch.
+                        Some(
+                            timestamp
+                                .checked_add(delay)
+                                .ok_or(Error::Capacity)?
+                                .min(expires),
+                        )
+                    };
+                    states.push(if uncertain == 1 {
+                        7i64
+                    } else if permanent {
+                        5i64
+                    } else {
+                        3i64
+                    });
+                    retries.push(retry);
+                    reasons.push(if permanent { 2i64 } else { 1i64 });
+                }
+            } else if phase != 1 {
+                return Err(Error::Conflict);
+            }
+        }
+        if selected != value.ordinals.len()
+            || (((3..=5).contains(&value.phase) || value.phase == 7) && prior_count != selected)
+        {
+            return Err(Error::Conflict);
+        }
+        if value.phase == 3 {
+            crate::postgres_final_capacity::reserve(client, account, attempt, &value.ordinals)
+                .map_err(capacity)?;
+        } else if value.phase == 4 || value.phase == 5 {
+            crate::postgres_final_capacity::consume(client, account, attempt, &value.ordinals)
+                .map_err(capacity)?;
+            let kind = if value.phase == 4 {
+                crate::postgres_final_capacity::Receipt::Accepted
+            } else {
+                crate::postgres_final_capacity::Receipt::Refused
+            };
+            crate::postgres_final_capacity::admit_receipt(client, account, kind)
+                .map_err(capacity)?;
+        }
+        let next =
+            crate::postgres_sequence::next(client, account, old).map_err(|error| match error {
+                crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                crate::postgres_sequence::Error::Database => Error::Database,
+            })?;
+        let changed = next.to_be_bytes();
+        let changed = changed.as_slice();
+        let affected = if value.phase == 2 {
+            client.execute("UPDATE td_mta.recipients r SET phase=2,rcpt_reply=u.reply,data_reply=NULL,changed=$5 FROM unnest($3::bigint[],$4::text[]) u(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&value.replies,&changed])
         } else if value.phase == 8 {
-            client.execute("UPDATE td_mta.recipients r SET state=u.state,phase=4,rcpt_reply=u.rcpt,data_reply=u.reply,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$9 FROM unnest($3::bigint[],$4::bigint[],$5::text[],$6::bigint[],$7::bigint[],$8::text[]) u(ordinal,state,reply,retry,reason,rcpt) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&states,&value.replies,&retries,&reasons,&value.rcpt_replies,&changed]).await
+            client.execute("UPDATE td_mta.recipients r SET state=u.state,phase=4,rcpt_reply=u.rcpt,data_reply=u.reply,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$9 FROM unnest($3::bigint[],$4::bigint[],$5::text[],$6::bigint[],$7::bigint[],$8::text[]) u(ordinal,state,reply,retry,reason,rcpt) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&states,&value.replies,&retries,&reasons,&value.rcpt_replies,&changed])
         } else if value.phase >= 5 {
             let query = if value.phase == 7 {
                 "UPDATE td_mta.recipients r SET state=u.state,phase=4,rcpt_reply=NULL,data_reply=u.reply,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$8 FROM unnest($3::bigint[],$4::bigint[],$5::text[],$6::bigint[],$7::bigint[]) u(ordinal,state,reply,retry,reason) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal"
@@ -1077,116 +1052,107 @@ fn publish_inner(
             } else {
                 "UPDATE td_mta.recipients r SET state=u.state,phase=4,data_reply=u.reply,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$8 FROM unnest($3::bigint[],$4::bigint[],$5::text[],$6::bigint[],$7::bigint[]) u(ordinal,state,reply,retry,reason) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal"
             };
-            client.execute(query, &[&account,&submission,&value.ordinals,&states,&value.replies,&retries,&reasons,&changed]).await
+            client.execute(query, &[&account,&submission,&value.ordinals,&states,&value.replies,&retries,&reasons,&changed])
         } else if value.phase == 4 {
-            client.execute("UPDATE td_mta.recipients r SET state=4,phase=4,data_reply=u.reply,changed=$5 FROM unnest($3::bigint[],$4::text[]) u(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&value.replies,&changed]).await
+            client.execute("UPDATE td_mta.recipients r SET state=4,phase=4,data_reply=u.reply,changed=$5 FROM unnest($3::bigint[],$4::text[]) u(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&value.replies,&changed])
         } else {
-            client.execute("UPDATE td_mta.recipients SET phase=3,changed=$4 WHERE account=$1 AND submission_id=$2 AND ordinal=ANY($3)", &[&account,&submission,&value.ordinals,&changed]).await
+            client.execute("UPDATE td_mta.recipients SET phase=3,changed=$4 WHERE account=$1 AND submission_id=$2 AND ordinal=ANY($3)", &[&account,&submission,&value.ordinals,&changed])
         }.map_err(|_| Error::Database)?;
-            if affected != value.ordinals.len() as u64 {
-                return Err(Error::Integrity);
-            }
-            if value.phase >= 4 {
-                let totals = client.query_one("SELECT count(*),min(ordinal),max(ordinal),count(*) FILTER (WHERE state IN (1,2,3) OR (state=7 AND next_attempt_at IS NOT NULL)),count(*) FILTER (WHERE state IN (5,7)) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2", &[&account,&submission]).await.map_err(|_| Error::Database)?;
-                let count: i64 = totals.try_get(0).map_err(|_| Error::Integrity)?;
-                let first: Option<i64> = totals.try_get(1).map_err(|_| Error::Integrity)?;
-                let last: Option<i64> = totals.try_get(2).map_err(|_| Error::Integrity)?;
-                let pending: i64 = totals.try_get(3).map_err(|_| Error::Integrity)?;
-                let failed: i64 = totals.try_get(4).map_err(|_| Error::Integrity)?;
-                let expected: i64 = client
-                    .query_one(
-                        "SELECT recipient_count FROM td_mta.submissions WHERE account=$1 AND id=$2",
-                        &[&account, &submission],
-                    )
-                    .await
-                    .map_err(|_| Error::Database)?
-                    .try_get(0)
-                    .map_err(|_| Error::Integrity)?;
-                if !(1..=1000).contains(&count)
-                    || count != expected
-                    || first != Some(0)
-                    || last != count.checked_sub(1)
-                {
-                    return Err(Error::Integrity);
-                }
-                if pending == 0 {
-                    client.execute("UPDATE td_mta.submissions SET completed_at=$3,notification=CASE WHEN notification=0 AND $4 THEN 1 ELSE notification END WHERE account=$1 AND id=$2 AND completed_at IS NULL", &[&account,&submission,&timestamp,&(failed != 0)]).await.map_err(|_| Error::Database)?;
-                }
-                client.execute("UPDATE td_mta.submission_attempts SET active=false WHERE account=$1 AND attempt_id=$2 AND NOT EXISTS (SELECT 1 FROM td_mta.recipients WHERE account=$1 AND submission_id=$3 AND attempt_id=$2 AND state=2)", &[&account,&attempt,&submission]).await.map_err(|_| Error::Database)?;
-            }
-            if client
-                .execute(
-                    "UPDATE td_mta.submissions SET changed=$3 WHERE account=$1 AND id=$2",
-                    &[&account, &submission, &changed],
+        if affected != value.ordinals.len() as u64 {
+            return Err(Error::Integrity);
+        }
+        if value.phase >= 4 {
+            let totals = client.query_one("SELECT count(*),min(ordinal),max(ordinal),count(*) FILTER (WHERE state IN (1,2,3) OR (state=7 AND next_attempt_at IS NOT NULL)),count(*) FILTER (WHERE state IN (5,7)) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2", &[&account,&submission]).map_err(|_| Error::Database)?;
+            let count: i64 = totals.try_get(0).map_err(|_| Error::Integrity)?;
+            let first: Option<i64> = totals.try_get(1).map_err(|_| Error::Integrity)?;
+            let last: Option<i64> = totals.try_get(2).map_err(|_| Error::Integrity)?;
+            let pending: i64 = totals.try_get(3).map_err(|_| Error::Integrity)?;
+            let failed: i64 = totals.try_get(4).map_err(|_| Error::Integrity)?;
+            let expected: i64 = client
+                .query_one(
+                    "SELECT recipient_count FROM td_mta.submissions WHERE account=$1 AND id=$2",
+                    &[&account, &submission],
                 )
-                .await
                 .map_err(|_| Error::Database)?
-                != 1
+                .try_get(0)
+                .map_err(|_| Error::Integrity)?;
+            if !(1..=1000).contains(&count)
+                || count != expected
+                || first != Some(0)
+                || last != count.checked_sub(1)
             {
                 return Err(Error::Integrity);
             }
-            client
-                .execute(
-                    "INSERT INTO td_mta.changes VALUES($1,$2,0,5,2,$3)",
-                    &[&account, &changed, &submission],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            if client
-                .execute(
-                    "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
-                    &[&account, &changed],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
+            if pending == 0 {
+                client.execute("UPDATE td_mta.submissions SET completed_at=$3,notification=CASE WHEN notification=0 AND $4 THEN 1 ELSE notification END WHERE account=$1 AND id=$2 AND completed_at IS NULL", &[&account,&submission,&timestamp,&(failed != 0)]).map_err(|_| Error::Database)?;
             }
-            let recipients = i64::try_from(value.ordinals.len()).map_err(|_| Error::Capacity)?;
-            let insert = if value.phase >= 7 {
-                "INSERT INTO td_mta.attempt_command_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
-            } else if value.phase == 6 {
-                "INSERT INTO td_mta.attempt_rcpt_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
-            } else if value.phase == 5 {
-                "INSERT INTO td_mta.attempt_refusal_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
-            } else if value.phase == 4 {
-                "INSERT INTO td_mta.attempt_acceptance_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
-            } else {
-                "INSERT INTO td_mta.attempt_phase_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
-            };
-            client
-                .execute(
-                    insert,
-                    &[
-                        &account,
-                        &attempt,
-                        &value.phase,
-                        &value.digest.as_slice(),
-                        &recipients,
-                        &old.to_be_bytes().as_slice(),
-                        &changed,
-                    ],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            if let Some(observation) = &observation {
-                let final_time = observation.check(client, &value).await?;
-                if final_time < timestamp || final_time >= expires {
-                    return Err(Error::ExpiryHold);
-                }
+            client.execute("UPDATE td_mta.submission_attempts SET active=false WHERE account=$1 AND attempt_id=$2 AND NOT EXISTS (SELECT 1 FROM td_mta.recipients WHERE account=$1 AND submission_id=$3 AND attempt_id=$2 AND state=2)", &[&account,&attempt,&submission]).map_err(|_| Error::Database)?;
+        }
+        if client
+            .execute(
+                "UPDATE td_mta.submissions SET changed=$3 WHERE account=$1 AND id=$2",
+                &[&account, &submission, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        client
+            .execute(
+                "INSERT INTO td_mta.changes VALUES($1,$2,0,5,2,$3)",
+                &[&account, &changed, &submission],
+            )
+            .map_err(|_| Error::Database)?;
+        if client
+            .execute(
+                "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
+                &[&account, &changed],
+            )
+            .map_err(|_| Error::Database)?
+            != 1
+        {
+            return Err(Error::Integrity);
+        }
+        let recipients = i64::try_from(value.ordinals.len()).map_err(|_| Error::Capacity)?;
+        let insert = if value.phase >= 7 {
+            "INSERT INTO td_mta.attempt_command_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
+        } else if value.phase == 6 {
+            "INSERT INTO td_mta.attempt_rcpt_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
+        } else if value.phase == 5 {
+            "INSERT INTO td_mta.attempt_refusal_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
+        } else if value.phase == 4 {
+            "INSERT INTO td_mta.attempt_acceptance_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
+        } else {
+            "INSERT INTO td_mta.attempt_phase_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
+        };
+        client
+            .execute(
+                insert,
+                &[
+                    &account,
+                    &attempt,
+                    &value.phase,
+                    &value.digest.as_slice(),
+                    &recipients,
+                    &old.to_be_bytes().as_slice(),
+                    &changed,
+                ],
+            )
+            .map_err(|_| Error::Database)?;
+        if let Some(observation) = &observation {
+            let final_time = observation.check(client, &value)?;
+            if final_time < timestamp || final_time >= expires {
+                return Err(Error::ExpiryHold);
             }
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Outcome {
-                attempt: value.attempt,
-                recipients: u32::try_from(recipients).map_err(|_| Error::Integrity)?,
-                old_sequence: old,
-                new_sequence: next,
-            })
+        }
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Outcome {
+            attempt: value.attempt,
+            recipients: u32::try_from(recipients).map_err(|_| Error::Integrity)?,
+            old_sequence: old,
+            new_sequence: next,
         })
     });
     match result {

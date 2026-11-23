@@ -1,6 +1,6 @@
 //! Age-bounded HTTP write receipt ledgers inside the caller's fenced account
 //! transaction (POSTGRES.md section 217).
-use tokio_postgres::Client;
+use crate::postgres_probe::Client;
 
 /// Six publication deadlines. A receipt only settles its own uncertain
 /// operation, and its publisher never replays an uncertain COMMIT.
@@ -84,7 +84,7 @@ pub(crate) fn live(table: &str) -> Option<&'static str> {
 /// once, deletes only this account's receipts in `ledger` older than the
 /// retention before it, then refuses while `ceiling` younger ones remain.
 /// The sample stamps the caller's new receipt.
-pub(crate) async fn admit(
+pub(crate) fn admit(
     client: &Client,
     ledger: Ledger,
     account: &[u8],
@@ -95,18 +95,15 @@ pub(crate) async fn admit(
             "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
             &[],
         )
-        .await
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Integrity)?;
     let cutoff = now.checked_sub(RETENTION_MS).ok_or(Error::Integrity)?;
     client
         .execute(ledger.expire(), &[&account, &cutoff])
-        .await
         .map_err(|_| Error::Database)?;
     let count: i64 = client
         .query_one(ledger.count(), &[&account, &ceiling])
-        .await
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Integrity)?;

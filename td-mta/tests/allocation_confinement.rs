@@ -34,7 +34,7 @@ fn readiness_users(relative: &str, source: &str) {
         }
         "td-mta/src/transport.rs" => {
             let compact: String = source.split_whitespace().collect();
-            assert!(compact.contains("readiness_sys::wait(Connected::Tcp(self.connected()?),Interest{read:true,write:false,},None,until,)"));
+            assert!(compact.contains("readiness_sys::wait(Connected::Tcp(self.connected()?),Interest{read:true,write:false,},until,)"));
             2
         }
         "td-mta/src/network_wake.rs" => {
@@ -116,19 +116,6 @@ fn readiness_users(relative: &str, source: &str) {
             }
             1
         }
-        "td-mta/src/postgres_probe/driver.rs" => {
-            let compact: String = source.split_whitespace().collect();
-            assert!(compact.contains("readiness_sys::wait(socket.wire.descriptor().map_err(|_|Error::Transport)?,socket.interest,Some(&self.receiver),deadline,)"));
-            assert!(compact.contains(
-                "let(sender,receiver)=UnixStream::pair().map_err(|_|Error::Transport)?;"
-            ));
-            assert!(compact.contains("receiver,signal:Arc::new(Signal{"));
-            assert_eq!(words(source, "receiver"), 6);
-            assert_eq!(source.matches("impl DriverTransport for ").count(), 2);
-            assert!(source.contains("self.connected().map(Connected::Tcp)"));
-            assert!(source.contains("self.connected().map(Connected::Unix)"));
-            2
-        }
         _ => 0,
     };
     assert_eq!(words(source, "readiness_sys"), uses, "{relative}");
@@ -158,7 +145,7 @@ fn scan(root: &Path, path: &Path) {
             assert_eq!(source.matches("std::arch::asm!").count(), 2);
             fingerprint(
                 &source,
-                "49b69bdb792f9c73ba8f2fadd8991cdaf264fdb1c10e1cffaa3e9ecbbb3a02ff",
+                "84f65d033def19485eae2b4b51625639cd0387614b0c0a0834aaf7eed3846693",
             );
         } else if relative == "td-mta/src/signal_sys.rs" {
             assert_eq!(words(&source, "unsafe"), 2);

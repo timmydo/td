@@ -251,9 +251,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 |worker| {
                     let binding = crate::postgres_snapshot::ReadBinding::from(self.binding);
                     let identity = worker.run(|client| {
-                        Box::pin(async move {
-                            crate::postgres_snapshot::observe(client, binding, presented).await
-                        })
+                        crate::postgres_snapshot::observe(client, binding, presented)
                     })?;
                     let identity = match identity {
                         Ok(identity) => identity,

@@ -103,31 +103,29 @@ pub fn list(
 ) -> Result<Listing, Error> {
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+            let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != epoch { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            let device = postgres_devices::authenticate(client, account, presented).await.map_err(Error::Credential)?.ok_or(Error::Unauthenticated)?;
-            let rows = client.query("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 LIMIT 2", &[&account.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            let device = postgres_devices::authenticate(client, account, presented).map_err(Error::Credential)?.ok_or(Error::Unauthenticated)?;
+            let rows = client.query("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 LIMIT 2", &[&account.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
             if rows.is_empty() { return Err(Error::Missing); }
             if rows.len() != 1 { return Err(Error::Integrity); }
             let row = rows.first().ok_or(Error::Integrity)?;
             let sequence = sequence(row.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let floor = sequence_from_row(row, 1)?;
+            let floor = sequence_from_row(&row, 1)?;
             if floor > sequence { return Err(Error::Integrity); }
             let identity = ViewIdentity { account, epoch, committed_sequence: Sequence::from_u64(sequence), history_floor: Sequence::from_u64(floor) };
-            let mailboxes = read(client, identity, deadline).await?;
+            let mailboxes = read(client, identity, deadline)?;
             Ok(Listing { identity, device, mailboxes })
-        })
-    }).map_err(Error::Connection)?;
+        }).map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
     result
 }
 
-pub(crate) async fn read(
-    client: &tokio_postgres::Client,
+pub(crate) fn read(
+    client: &crate::postgres_probe::Client,
     identity: ViewIdentity,
     deadline: Instant,
 ) -> Result<Vec<Mailbox>, Error> {
@@ -140,7 +138,6 @@ pub(crate) async fn read(
                 &sequence.as_slice(),
             ],
         )
-        .await
         .map_err(|_| Error::Database)?;
     if rows.len() > MAX_MAILBOXES {
         return Err(Error::Capacity);
@@ -153,7 +150,7 @@ pub(crate) async fn read(
         if Instant::now() >= deadline {
             return Err(Error::Connection(postgres_probe::Error::Deadline));
         }
-        mailboxes.push(decode(row, identity)?);
+        mailboxes.push(decode(&row, identity)?);
     }
     hierarchy(&mailboxes)?;
     Ok(mailboxes)
@@ -164,7 +161,7 @@ fn sequence(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-fn sequence_from_row(row: &tokio_postgres::Row, column: usize) -> Result<u64, Error> {
+fn sequence_from_row(row: &crate::postgres_probe::Row, column: usize) -> Result<u64, Error> {
     sequence(row.try_get(column).map_err(|_| Error::Integrity)?)
 }
 fn text(value: &str) -> Result<String, Error> {
@@ -174,7 +171,7 @@ fn text(value: &str) -> Result<String, Error> {
     copy.push_str(value);
     Ok(copy)
 }
-fn decode(row: &tokio_postgres::Row, identity: ViewIdentity) -> Result<Mailbox, Error> {
+fn decode(row: &crate::postgres_probe::Row, identity: ViewIdentity) -> Result<Mailbox, Error> {
     let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
     let id = MailboxId::from_bytes(id.try_into().map_err(|_| Error::Integrity)?);
     let name: &str = row.try_get(1).map_err(|_| Error::Integrity)?;

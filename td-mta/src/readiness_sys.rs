@@ -103,33 +103,10 @@ impl<'a> PollSet<'a> {
     }
 }
 
-pub(crate) enum Ready {
-    Timeout,
-    Socket,
-    Wake,
-}
-
-pub(crate) fn wait(
-    socket: Connected<'_>,
-    interest: Interest,
-    wake: Option<&UnixStream>,
-    until: Instant,
-) -> io::Result<Ready> {
+/// Wait until one connected socket is ready, or `until` passes (false).
+pub(crate) fn wait(socket: Connected<'_>, interest: Interest, until: Instant) -> io::Result<bool> {
     let mut socket = PollFd::connected(socket, interest);
-    if let Some(receiver) = wake {
-        let mut fds = [socket, PollFd::readable(receiver.as_fd())];
-        if !wait_until(&mut fds, until)? {
-            return Ok(Ready::Timeout);
-        }
-        let [_, wake] = fds;
-        return Ok(if wake.revents != 0 {
-            Ready::Wake
-        } else {
-            Ready::Socket
-        });
-    }
-    let ready = wait_until(std::slice::from_mut(&mut socket), until)?;
-    Ok(if ready { Ready::Socket } else { Ready::Timeout })
+    wait_until(std::slice::from_mut(&mut socket), until)
 }
 
 fn wait_until(fds: &mut [PollFd<'_>], until: Instant) -> io::Result<bool> {

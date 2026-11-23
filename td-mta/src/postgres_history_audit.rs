@@ -52,11 +52,11 @@ pub fn inspect(
     max_rows: u64,
 ) -> Result<Report, Error> {
     let result = postgres_probe::with_body_worker(request, trust, deadline, |worker| {
-        let identity = worker.run(move |client| Box::pin(async move {
-            let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+        let identity = worker.run(move |client| {
+            let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != epoch { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            let rows = client.query("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 LIMIT 2", &[&account.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+            let rows = client.query("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 LIMIT 2", &[&account.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
             if rows.is_empty() { return Err(Error::Missing); }
             if rows.len() != 1 { return Err(Error::Integrity); }
             let row = rows.first().ok_or(Error::Integrity)?;
@@ -68,21 +68,21 @@ pub fn inspect(
             let history_floor = sequence(1)?;
             if history_floor > committed_sequence { return Err(Error::Integrity); }
             Ok(ViewIdentity { account, epoch, committed_sequence, history_floor })
-        })).map_err(Error::Connection)??;
+        }).map_err(Error::Connection)??;
         let mut report = Report { identity, rows: 0, retired_rows: 0 };
         let mut after: Option<ChangeCursor> = None;
         loop {
-            let rows = worker.run(move |client| Box::pin(async move {
+            let rows = worker.run(move |client| {
                 let sequence = after.map(|cursor| cursor.sequence.number().to_be_bytes());
                 let sequence = sequence.as_ref().map(|bytes| bytes.as_slice());
                 let operation = after.map_or(0, |cursor| i64::from(cursor.operation));
-                client.query("SELECT sequence,operation,action,object,kind FROM td_mta.changes WHERE account=$1 AND ($2::bytea IS NULL OR (sequence,operation)>($2,$3)) ORDER BY sequence,operation LIMIT 128", &[&account.as_bytes().as_slice(), &sequence, &operation]).await
-            })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
+                client.query("SELECT sequence,operation,action,object,kind FROM td_mta.changes WHERE account=$1 AND ($2::bytea IS NULL OR (sequence,operation)>($2,$3)) ORDER BY sequence,operation LIMIT 128", &[&account.as_bytes().as_slice(), &sequence, &operation])
+            }).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
             if rows.len() > 128 { return Err(Error::Integrity); }
             for row in &rows {
                 let count = report.rows.checked_add(1).ok_or(Error::Capacity)?;
                 if count > max_rows { return Err(Error::Capacity); }
-                let change = postgres_change_row::read(row).map_err(|_| Error::Integrity)?;
+                let change = postgres_change_row::read(&row).map_err(|_| Error::Integrity)?;
                 let cursor = change.cursor;
                 if cursor.sequence > identity.committed_sequence
                     || after.is_some_and(|prior| (cursor.sequence, cursor.operation) <= (prior.sequence, prior.operation)) {
@@ -96,7 +96,7 @@ pub fn inspect(
             }
             if rows.len() < 128 { break; }
         }
-        worker.run(|client| Box::pin(async move { client.batch_execute("ROLLBACK").await })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
+        worker.run(|client| { client.rollback() }).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
         Ok(report)
     }).map_err(Error::Connection)?;
     if Instant::now() >= deadline {

@@ -1,4 +1,5 @@
 //! Retained folder creation and singleton deletion for td-mail.
+use crate::postgres_probe::Client;
 use crate::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -19,7 +20,6 @@ use std::{
     time::Instant,
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
-use tokio_postgres::Client;
 
 pub const MAX_CREATES: usize = 256;
 pub const MAX_RECEIPTS: i64 = 1024;
@@ -260,15 +260,15 @@ fn sequence(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-async fn begin(client: &postgres_probe::ScopedClient, creation: &Change) -> Result<(), Error> {
-    let schema = client.inspect_schema().await.map_err(Error::Schema)?;
+fn begin(client: &postgres_probe::Client, creation: &Change) -> Result<(), Error> {
+    let schema = client.inspect_schema().map_err(Error::Schema)?;
     if schema.store_epoch != creation.binding.epoch() {
         return Err(Error::Epoch);
     }
-    client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)
+    client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_|Error::Database)
 }
-async fn receipt(client: &Client, creation: &Change) -> Result<Option<Outcome>, Error> {
-    let row=client.query_opt("SELECT request_digest,old_sequence,new_sequence,results FROM td_mta.mailbox_create_receipts WHERE account=$1 AND operation=$2", &[&creation.binding.account().as_bytes().as_slice(),&creation.operation.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+fn receipt(client: &Client, creation: &Change) -> Result<Option<Outcome>, Error> {
+    let row=client.query_opt("SELECT request_digest,old_sequence,new_sequence,results FROM td_mta.mailbox_create_receipts WHERE account=$1 AND operation=$2", &[&creation.binding.account().as_bytes().as_slice(),&creation.operation.as_bytes().as_slice()]).map_err(|_|Error::Database)?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -339,17 +339,14 @@ pub fn inspect(
 ) -> Result<Option<Outcome>, Error> {
     let creation = creation.clone();
     let result = postgres_probe::with_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            begin(client, &creation).await?;
-            client
-                .query_one(
-                    "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
-                    &[&creation.binding.account().as_bytes().as_slice()],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            receipt(client, &creation).await
-        })
+        begin(client, &creation)?;
+        client
+            .query_one(
+                "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
+                &[&creation.binding.account().as_bytes().as_slice()],
+            )
+            .map_err(|_| Error::Database)?;
+        receipt(client, &creation)
     })
     .map_err(Error::Connection)?;
     if !matches!(result, Ok(Some(_))) && Instant::now() >= deadline {
@@ -377,100 +374,91 @@ pub fn publish(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            begin(client, &creation).await?;
-            let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_|Error::Database)?;
-            let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
-            let account = creation.binding.account();
-            let account_bytes = account.as_bytes().as_slice();
-            let state = client
-                .query_one(
-                    "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
-                    &[&account_bytes],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            if let Some(outcome) = receipt(client, &creation).await? {
-                return Ok(outcome);
-            }
-            if generation != creation.binding.selection().generation
-                || version != Some(creation.binding.selection().version.as_bytes().as_slice())
-                || !creation.binding.roles().jmap()
-            {
-                return Err(Error::Policy);
-            }
-            if postgres_devices::authenticate(client, account, presented)
-                .await
-                .map_err(Error::Credential)?
-                != Some(creation.device)
-            {
-                return Err(Error::Unauthenticated);
-            }
-            let old = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let floor = sequence(state.try_get(1).map_err(|_| Error::Integrity)?)?;
-            if floor > old {
-                return Err(Error::Integrity);
-            }
-            if creation.expected.is_some_and(|expected| expected != old) {
-                return Err(Error::State);
-            }
-            let created_at =
-                expiry::admit(client, expiry::Ledger::Folders, account_bytes, MAX_RECEIPTS)
-                    .await
-                    .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
-            let (next, results) = match creation.kind {
-                Kind::Create => apply_create(client, &creation, old).await?,
-                Kind::Destroy(target) => apply_delete(client, account_bytes, target, old).await?,
-            };
-            let mut encoded = Vec::new();
-            encoded
-                .try_reserve_exact(results.len() * 17)
-                .map_err(|_| Error::Capacity)?;
-            for result in &results {
-                match result {
-                    ResultEntry::Created(id) => {
-                        encoded.push(1);
-                        encoded.extend_from_slice(id.as_bytes());
-                    }
-                    ResultEntry::InvalidName => {
-                        encoded.push(2);
-                        encoded.extend_from_slice(&[0; 16]);
-                    }
-                    ResultEntry::AlreadyExists => {
-                        encoded.push(3);
-                        encoded.extend_from_slice(&[0; 16]);
-                    }
-                    ResultEntry::Destroyed(id) => {
-                        encoded.push(4);
-                        encoded.extend_from_slice(id.as_bytes());
-                    }
-                    ResultEntry::NotFound
-                    | ResultEntry::Forbidden
-                    | ResultEntry::HasChild
-                    | ResultEntry::HasEmail => {
-                        encoded.push(match result {
-                            ResultEntry::NotFound => 5,
-                            ResultEntry::Forbidden => 6,
-                            ResultEntry::HasChild => 7,
-                            ResultEntry::HasEmail => 8,
-                            _ => return Err(Error::Integrity),
-                        });
-                        encoded.extend_from_slice(&[0; 16]);
-                    }
+        begin(client, &creation)?;
+        let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_|Error::Database)?;
+        let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
+        let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
+        let account = creation.binding.account();
+        let account_bytes = account.as_bytes().as_slice();
+        let state = client
+            .query_one(
+                "SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
+                &[&account_bytes],
+            )
+            .map_err(|_| Error::Database)?;
+        if let Some(outcome) = receipt(client, &creation)? {
+            return Ok(outcome);
+        }
+        if generation != creation.binding.selection().generation
+            || version != Some(creation.binding.selection().version.as_bytes().as_slice())
+            || !creation.binding.roles().jmap()
+        {
+            return Err(Error::Policy);
+        }
+        if postgres_devices::authenticate(client, account, presented).map_err(Error::Credential)?
+            != Some(creation.device)
+        {
+            return Err(Error::Unauthenticated);
+        }
+        let old = sequence(state.try_get(0).map_err(|_| Error::Integrity)?)?;
+        let floor = sequence(state.try_get(1).map_err(|_| Error::Integrity)?)?;
+        if floor > old {
+            return Err(Error::Integrity);
+        }
+        if creation.expected.is_some_and(|expected| expected != old) {
+            return Err(Error::State);
+        }
+        let created_at =
+            expiry::admit(client, expiry::Ledger::Folders, account_bytes, MAX_RECEIPTS)
+                .map_err(|e| e.map(Error::Capacity, Error::Integrity, Error::Database))?;
+        let (next, results) = match creation.kind {
+            Kind::Create => apply_create(client, &creation, old)?,
+            Kind::Destroy(target) => apply_delete(client, account_bytes, target, old)?,
+        };
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(results.len() * 17)
+            .map_err(|_| Error::Capacity)?;
+        for result in &results {
+            match result {
+                ResultEntry::Created(id) => {
+                    encoded.push(1);
+                    encoded.extend_from_slice(id.as_bytes());
+                }
+                ResultEntry::InvalidName => {
+                    encoded.push(2);
+                    encoded.extend_from_slice(&[0; 16]);
+                }
+                ResultEntry::AlreadyExists => {
+                    encoded.push(3);
+                    encoded.extend_from_slice(&[0; 16]);
+                }
+                ResultEntry::Destroyed(id) => {
+                    encoded.push(4);
+                    encoded.extend_from_slice(id.as_bytes());
+                }
+                ResultEntry::NotFound
+                | ResultEntry::Forbidden
+                | ResultEntry::HasChild
+                | ResultEntry::HasEmail => {
+                    encoded.push(match result {
+                        ResultEntry::NotFound => 5,
+                        ResultEntry::Forbidden => 6,
+                        ResultEntry::HasChild => 7,
+                        ResultEntry::HasEmail => 8,
+                        _ => return Err(Error::Integrity),
+                    });
+                    encoded.extend_from_slice(&[0; 16]);
                 }
             }
-            client.execute("INSERT INTO td_mta.mailbox_create_receipts(account,operation,request_digest,old_sequence,new_sequence,results,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&account_bytes,&creation.operation.as_bytes().as_slice(),&creation.digest.as_slice(),&old.to_be_bytes().as_slice(),&next.to_be_bytes().as_slice(),&encoded,&created_at]).await.map_err(|_|Error::Database)?;
-            marker.store(true, Ordering::Relaxed);
-            client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|_| Error::Indeterminate)?;
-            Ok(Outcome {
-                old_sequence: old,
-                new_sequence: next,
-                results,
-            })
+        }
+        client.execute("INSERT INTO td_mta.mailbox_create_receipts(account,operation,request_digest,old_sequence,new_sequence,results,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&account_bytes,&creation.operation.as_bytes().as_slice(),&creation.digest.as_slice(),&old.to_be_bytes().as_slice(),&next.to_be_bytes().as_slice(),&encoded,&created_at]).map_err(|_|Error::Database)?;
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(Outcome {
+            old_sequence: old,
+            new_sequence: next,
+            results,
         })
     });
     match result {
@@ -480,7 +468,7 @@ pub fn publish(
     }
 }
 
-async fn apply_create(
+fn apply_create(
     client: &Client,
     creation: &Change,
     old: u64,
@@ -494,7 +482,7 @@ async fn apply_create(
     for entry in &creation.entries {
         requested.push(entry.name.as_str());
     }
-    let rows=client.query("SELECT name,changed FROM td_mta.mailboxes WHERE account=$1 AND parent_id IS NULL AND name=ANY($2::text[]) ORDER BY name LIMIT 257", &[&account_bytes,&requested]).await.map_err(|_|Error::Database)?;
+    let rows=client.query("SELECT name,changed FROM td_mta.mailboxes WHERE account=$1 AND parent_id IS NULL AND name=ANY($2::text[]) ORDER BY name LIMIT 257", &[&account_bytes,&requested]).map_err(|_|Error::Database)?;
     if rows.len() > MAX_CREATES {
         return Err(Error::Capacity);
     }
@@ -543,7 +531,6 @@ async fn apply_create(
         "SELECT count(*) FROM (SELECT 1 FROM td_mta.mailboxes WHERE account=$1 LIMIT $2) bounded",
         &[&account_bytes, &(mailbox_limit + 1)],
     )
-    .await
     .map_err(|_| Error::Database)?
     .try_get(0)
     .map_err(|_| Error::Integrity)?;
@@ -556,25 +543,23 @@ async fn apply_create(
     let next = if ids.is_empty() {
         old
     } else {
-        crate::postgres_sequence::next(client, account_bytes, old)
-            .await
-            .map_err(|error| match error {
-                crate::postgres_sequence::Error::Capacity => Error::Capacity,
-                crate::postgres_sequence::Error::Integrity => Error::Integrity,
-                crate::postgres_sequence::Error::Database => Error::Database,
-            })?
+        crate::postgres_sequence::next(client, account_bytes, old).map_err(|error| match error {
+            crate::postgres_sequence::Error::Capacity => Error::Capacity,
+            crate::postgres_sequence::Error::Integrity => Error::Integrity,
+            crate::postgres_sequence::Error::Database => Error::Database,
+        })?
     };
     if !ids.is_empty() {
-        let collision:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND id=ANY($2::bytea[])) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=1 AND object=ANY($2::bytea[]))", &[&account_bytes,&ids]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
+        let collision:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND id=ANY($2::bytea[])) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=1 AND object=ANY($2::bytea[]))", &[&account_bytes,&ids]).map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
         if collision {
             return Err(Error::Capacity);
         }
         let changed = next.to_be_bytes();
-        let written=client.execute("INSERT INTO td_mta.mailboxes(account,id,name,parent_id,role,sort_order,subscribed,changed) SELECT $1,id,name,NULL,NULL,0,1,$4 FROM unnest($2::bytea[],$3::text[]) q(id,name)", &[&account_bytes,&ids,&names,&changed.as_slice()]).await.map_err(|_|Error::Database)?;
+        let written=client.execute("INSERT INTO td_mta.mailboxes(account,id,name,parent_id,role,sort_order,subscribed,changed) SELECT $1,id,name,NULL,NULL,0,1,$4 FROM unnest($2::bytea[],$3::text[]) q(id,name)", &[&account_bytes,&ids,&names,&changed.as_slice()]).map_err(|_|Error::Database)?;
         if written != ids.len() as u64 {
             return Err(Error::Integrity);
         }
-        let written=client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,ordinality-1,1,1,id FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality)", &[&account_bytes,&ids,&changed.as_slice()]).await.map_err(|_|Error::Database)?;
+        let written=client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,ordinality-1,1,1,id FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality)", &[&account_bytes,&ids,&changed.as_slice()]).map_err(|_|Error::Database)?;
         if written != ids.len() as u64 {
             return Err(Error::Integrity);
         }
@@ -583,7 +568,6 @@ async fn apply_create(
                 "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
                 &[&account_bytes, &changed.as_slice()],
             )
-            .await
             .map_err(|_| Error::Database)?
             != 1
         {
@@ -593,7 +577,7 @@ async fn apply_create(
     Ok((next, results))
 }
 
-pub(crate) async fn apply_delete(
+pub(crate) fn apply_delete(
     client: &Client,
     account: &[u8],
     target: Option<MailboxId>,
@@ -603,7 +587,7 @@ pub(crate) async fn apply_delete(
     results.try_reserve_exact(1).map_err(|_| Error::Capacity)?;
     let mut next = old;
     let result = if let Some(id) = target {
-        let row = client.query_opt("SELECT role,changed,EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND parent_id=$2),EXISTS(SELECT 1 FROM td_mta.memberships WHERE account=$1 AND mailbox_id=$2) FROM td_mta.mailboxes WHERE account=$1 AND id=$2", &[&account,&id.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+        let row = client.query_opt("SELECT role,changed,EXISTS(SELECT 1 FROM td_mta.mailboxes WHERE account=$1 AND parent_id=$2),EXISTS(SELECT 1 FROM td_mta.memberships WHERE account=$1 AND mailbox_id=$2) FROM td_mta.mailboxes WHERE account=$1 AND id=$2", &[&account,&id.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
         if let Some(row) = row {
             if sequence(row.try_get(1).map_err(|_| Error::Integrity)?)? > old {
                 return Err(Error::Integrity);
@@ -616,26 +600,25 @@ pub(crate) async fn apply_delete(
             } else if row.try_get::<_, bool>(3).map_err(|_| Error::Integrity)? {
                 ResultEntry::HasEmail
             } else {
-                next = crate::postgres_sequence::next(client, account, old)
-                    .await
-                    .map_err(|error| match error {
+                next = crate::postgres_sequence::next(client, account, old).map_err(|error| {
+                    match error {
                         crate::postgres_sequence::Error::Capacity => Error::Capacity,
                         crate::postgres_sequence::Error::Integrity => Error::Integrity,
                         crate::postgres_sequence::Error::Database => Error::Database,
-                    })?;
+                    }
+                })?;
                 let changed = next.to_be_bytes();
                 if client
                     .execute(
                         "DELETE FROM td_mta.mailboxes WHERE account=$1 AND id=$2",
                         &[&account, &id.as_bytes().as_slice()],
                     )
-                    .await
                     .map_err(|_| Error::Database)?
                     != 1
                 {
                     return Err(Error::Integrity);
                 }
-                if client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) VALUES($1,$2,0,1,3,$3)", &[&account,&changed.as_slice(),&id.as_bytes().as_slice()]).await.map_err(|_| Error::Database)? != 1 {
+                if client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) VALUES($1,$2,0,1,3,$3)", &[&account,&changed.as_slice(),&id.as_bytes().as_slice()]).map_err(|_| Error::Database)? != 1 {
                     return Err(Error::Integrity);
                 }
                 if client
@@ -643,7 +626,6 @@ pub(crate) async fn apply_delete(
                         "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
                         &[&account, &changed.as_slice()],
                     )
-                    .await
                     .map_err(|_| Error::Database)?
                     != 1
                 {

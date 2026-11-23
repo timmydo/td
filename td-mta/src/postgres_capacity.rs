@@ -29,14 +29,14 @@ pub fn inspect(
     let sources = versions::read_sources(request, trust, deadline, epoch, selected.version)
         .map_err(|_| Error)?;
     let (mut rows, quotas) = configured(&sources)?;
-    let db = postgres_probe::with_capacity_client(request,trust,deadline, |client| Box::pin(async move {
-            let schema = client.inspect_schema().await.map_err(|_| ())?;
+    let db = postgres_probe::with_capacity_client(request,trust,deadline, |client| {
+            let schema = client.inspect_schema().map_err(|_| ())?;
             if schema.store_epoch != epoch { return Err(()); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout=5000; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| ())?;
-            let values = database(client, &quotas).await?;
-            client.batch_execute("ROLLBACK").await.map_err(|_| ())?;
+            client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout=5000; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| ())?;
+            let values = database(client, &quotas)?;
+            client.rollback().map_err(|_| ())?;
             Ok(values)
-        })).map_err(|_| failed())?.map_err(|_| failed())?;
+        }).map_err(|_| failed())?.map_err(|_| failed())?;
     rows.extend(db);
     // A selection change cannot silently pair new counters with old policy.
     if postgres_selection::observe(request, trust, deadline, epoch).map_err(|_| Error)?
@@ -166,8 +166,8 @@ fn configured(sources: &versions::Sources) -> Result<(Vec<Json>, [u64; 5]), Erro
     Ok((rows, quotas.ok_or_else(failed)?))
 }
 
-async fn count(
-    client: &tokio_postgres::Client,
+fn count(
+    client: &crate::postgres_probe::Client,
     table: &str,
     account: Option<&[u8]>,
     cap: u64,
@@ -176,9 +176,9 @@ async fn count(
     // distinguishes exhausted from over-limit without scanning an unbounded table.
     let n = i64::try_from(cap.checked_add(1).ok_or(())?).map_err(|_| ())?;
     let row = if let Some(account) = account {
-        client.query_one(&format!("SELECT count(*) FROM (SELECT 1 FROM td_mta.{table} WHERE account=$1 LIMIT $2) bounded"),&[&account,&n]).await
+        client.query_one(&format!("SELECT count(*) FROM (SELECT 1 FROM td_mta.{table} WHERE account=$1 LIMIT $2) bounded"),&[&account,&n])
     } else {
-        client.query_one(&format!("SELECT count(*) FROM (SELECT 1 FROM td_mta.{table} LIMIT $1) bounded"),&[&n]).await
+        client.query_one(&format!("SELECT count(*) FROM (SELECT 1 FROM td_mta.{table} LIMIT $1) bounded"),&[&n])
     }.map_err(|_| ())?;
     let value: i64 = row.try_get(0).map_err(|_| ())?;
     u64::try_from(value).map_err(|_| ())
@@ -186,8 +186,8 @@ async fn count(
 
 // Expired rows await the account's next publication of their kind and refuse
 // nothing.
-async fn live(
-    client: &tokio_postgres::Client,
+fn live(
+    client: &crate::postgres_probe::Client,
     account: &[u8],
     query: &str,
     retention: i64,
@@ -196,28 +196,25 @@ async fn live(
     let n = i64::try_from(cap.checked_add(1).ok_or(())?).map_err(|_| ())?;
     let row = client
         .query_one(query, &[&account, &retention, &n])
-        .await
         .map_err(|_| ())?;
     let value: i64 = row.try_get(0).map_err(|_| ())?;
     u64::try_from(value).map_err(|_| ())
 }
 
-async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<Vec<Json>, ()> {
+fn database(client: &crate::postgres_probe::Client, quotas: &[u64; 5]) -> Result<Vec<Json>, ()> {
     use crate::{
         postgres_drafts, postgres_email_set, postgres_mailbox_set, postgres_selection,
         postgres_submissions, postgres_uploads,
     };
     let mut rows = Vec::new();
-    let accounts = client.query("SELECT a.id,u.body_bytes,u.blob_count,u.upload_bytes,u.queue_bytes,u.queue_submissions FROM td_mta.accounts a LEFT JOIN td_mta.account_usage u ON a.id=u.account ORDER BY a.id LIMIT 17",&[]).await.map_err(|_| ())?;
+    let accounts = client.query("SELECT a.id,u.body_bytes,u.blob_count,u.upload_bytes,u.queue_bytes,u.queue_submissions FROM td_mta.accounts a LEFT JOIN td_mta.account_usage u ON a.id=u.account ORDER BY a.id LIMIT 17",&[]).map_err(|_| ())?;
     if accounts.len() > 16 {
         return Err(());
     }
-    for row in accounts {
+    for row in &accounts {
         let id: &[u8] = row.try_get(0).map_err(|_| ())?;
         let (health_states, health_receipts) =
-            crate::postgres_route_health::occupancy(client, id, None)
-                .await
-                .map_err(|_| ())?;
+            crate::postgres_route_health::occupancy(client, id, None).map_err(|_| ())?;
         let scope = crate::ids::AccountId::from_bytes(id.try_into().map_err(|_| ())?).to_string();
         for (i, name) in [
             "body_bytes",
@@ -238,7 +235,7 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
                 "capacity",
             ));
         }
-        let claims = count(client, "attempt_final_reservations", Some(id), 1024).await?;
+        let claims = count(client, "attempt_final_reservations", Some(id), 1024)?;
         for (table, cap, reserved) in [
             (
                 "upload_receipts",
@@ -305,16 +302,16 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
                 "route_health_receipts" => health_receipts,
                 "active_devices" => {
                     let n = i64::try_from(cap.checked_add(1).ok_or(())?).map_err(|_| ())?;
-                    let row = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.devices WHERE account=$1 AND revoked_at IS NULL LIMIT $2) bounded", &[&id, &n]).await.map_err(|_| ())?;
+                    let row = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.devices WHERE account=$1 AND revoked_at IS NULL LIMIT $2) bounded", &[&id, &n]).map_err(|_| ())?;
                     let value: i64 = row.try_get(0).map_err(|_| ())?;
                     u64::try_from(value).map_err(|_| ())?
                 }
-                "devices" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.devices WHERE account=$1 AND (revoked_at IS NULL OR revoked_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2) LIMIT $3) bounded", crate::postgres_devices::REVOKED_RETENTION_MS, cap).await?,
-                "submission_expiry_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_expiry_receipts WHERE account=$1 AND published_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_queue_expiry::RECEIPT_RETENTION_MS, cap).await?,
-                "route_owner_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owner_receipts WHERE account=$1 AND expires_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_route_owners::RECEIPT_RETENTION_MS, cap).await?,
+                "devices" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.devices WHERE account=$1 AND (revoked_at IS NULL OR revoked_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2) LIMIT $3) bounded", crate::postgres_devices::REVOKED_RETENTION_MS, cap)?,
+                "submission_expiry_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_expiry_receipts WHERE account=$1 AND published_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_queue_expiry::RECEIPT_RETENTION_MS, cap)?,
+                "route_owner_receipts" => live(client, id, "SELECT count(*) FROM (SELECT 1 FROM td_mta.route_owner_receipts WHERE account=$1 AND expires_at>=(extract(epoch FROM clock_timestamp())*1000)::bigint-$2 LIMIT $3) bounded", crate::postgres_route_owners::RECEIPT_RETENTION_MS, cap)?,
                 _ => match crate::postgres_receipt_expiry::live(table) {
-                    Some(query) => live(client, id, query, crate::postgres_receipt_expiry::RETENTION_MS, cap).await?,
-                    None => count(client, table, Some(id), cap).await?,
+                    Some(query) => live(client, id, query, crate::postgres_receipt_expiry::RETENTION_MS, cap)?,
+                    None => count(client, table, Some(id), cap)?,
                 },
             };
             rows.push(metric(
@@ -336,7 +333,7 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
         rows.push(metric(
             "database",
             table,
-            Some(count(client, table, None, cap).await?),
+            Some(count(client, table, None, cap)?),
             cap,
             if table == "application_logs" {
                 "rotation"
@@ -345,7 +342,7 @@ async fn database(client: &tokio_postgres::Client, quotas: &[u64; 5]) -> Result<
             },
         ));
     }
-    let row = client.query_one("SELECT (pg_total_relation_size('td_mta.application_logs')+pg_total_relation_size('td_mta.application_log_state')), (SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend'), current_setting('max_connections')::bigint, current_setting('superuser_reserved_connections')::bigint+current_setting('reserved_connections')::bigint",&[]).await.map_err(|_| ())?;
+    let row = client.query_one("SELECT (pg_total_relation_size('td_mta.application_logs')+pg_total_relation_size('td_mta.application_log_state')), (SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend'), current_setting('max_connections')::bigint, current_setting('superuser_reserved_connections')::bigint+current_setting('reserved_connections')::bigint",&[]).map_err(|_| ())?;
     let value = |i| -> Result<u64, ()> {
         let n: i64 = row.try_get(i).map_err(|_| ())?;
         u64::try_from(n).map_err(|_| ())

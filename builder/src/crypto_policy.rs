@@ -9,6 +9,7 @@ pub(crate) const LOCAL_SOURCES: &[&str] = &[
     "td-alloc",
     "td-civil",
     "td-crypto",
+    "td-encoding",
     "td-fs",
     "td-header",
     "td-html",
@@ -16,6 +17,7 @@ pub(crate) const LOCAL_SOURCES: &[&str] = &[
     "td-mime",
     "td-mta",
     "td-nfc",
+    "td-postgres",
     "td-primitives",
     "td-source-scan",
     "td-tls-provider",
@@ -37,13 +39,15 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
         "td-alloc" => "07b5c782ce2647c93f6b40d95ef7f65fe9850f87091f9be8738e8f9e965ec5f1",
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
         "td-crypto" => "720198b066801724a9d45a0cdc85d9c61f20033a6610795bb7cd897fe165b443",
-        "td-mta" => "688f02cac597de03132414496cb447423836ba337a5e30da9a89736d539bcb14",
+        "td-mta" => "51d52bcdf8503bc6dbcd3eb8c56a4e150271690da8d6979b4096c9dc08d6e9ac",
+        "td-encoding" => "82b8ed464a00b238bb06e35c4ccf339ee3eccb012c0af370b4195776ee636239",
         "td-fs" => "e685546b8dc4353148f58034fc27b8bd59490281944f9226f295b5d6d72240fc",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "dd14b103b756c1ca3c63dce4af68a72b3bf9ca6ddf732bd384eb7b1564996730",
         "td-json" => "31684b6cb14691bd585ec01f6711c55d34917ec6e3c26ce67126b7874f7a0cf1",
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
         "td-mime" => "3f14e32d7ee4f4b11e57845153df490fc4d0480f282477ecebf2349d5347b1d4",
+        "td-postgres" => "e3240524fbf9819bb8bedac949d890a7239839c9e813afdc6028947187d4f5db",
         "td-primitives" => "056b2c47072b8e101730f86e33fbe79a00917aaa91a12aa17a7a801070bd4b85",
         "td-source-scan" => "a380afb246633ec088b69078cd005c4d86fbccc442fac738bce8aa2519abd3c1",
         "td-tls-provider" => "b6c4742d6c92c053f6d1595dbb29ff11a8396775e23e30e0317bb6ee72f10298",
@@ -61,13 +65,15 @@ pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
         "td-alloc" => "6e733ef9f5e41869811c445314731457bb3766722c67b72ef251deb67db18e95",
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
         "td-crypto" => "63993ee6fdf15482e7a8493c2509e078aade1fe064bc65f46245999b368f66f2",
-        "td-mta" => "d8795c1e41f41e4876ec3c8ef2cc5e420b7a04882dab3bda5d2c5dbf24eaf146",
+        "td-mta" => "9dc368df8460e73ed0af4ee29ec509ca99821f30862529a25779e88d3cb6c425",
+        "td-encoding" => "61bc283bae646b0842bcff561acdc0846194192e9f41330711d7aedbe3ad1e9c",
         "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "9bddbfcd426c6a5af4dc9f493e343572288563d749a7512cf571ee4c574b2462",
         "td-json" => "6a5fb6c2c104c61c446b9ae3adb39d9276a95b05ef2be37a661ebd756e1270f7",
         "td-nfc" => "6b447fb42d5b4e2aa2a02da0817647db6f178d445f8dc3861c7c9a011cce4695",
         "td-mime" => "a3d5ea3d17240084cb6ca106dd6fa95841fac5ee2200fbe0a0b92c47de9db183",
+        "td-postgres" => "9d053bfc3b0177e193daf6ad7f8b2a58455d40761932edc7163b39ef9c50af22",
         "td-primitives" => "388616b0ea8bc440730c90424f57a66dd8921b6c6b08ab2518d51d6da561fd13",
         "td-source-scan" => "1b14eed16717e72e43ad4e8bbc33976a11fc3039bff763852ca1cb1a23010542",
         "td-tls-provider" => "46e710a0aaab04b17090c56ce3c7dcb46de35c18b4016ef2091f9969328cb389",
@@ -157,66 +163,8 @@ pub(crate) fn no_build_script(root: &Path, name: &str) -> Result<(), String> {
 // Cargo metadata can include inactive optional edges. Cargo tree's selected
 // normal/build graph is checked separately from the complete locked sources.
 // td-crypto's graph is td-tls-provider's and Mozilla's roots: no package in it
-// has a build script that compiles C.
+// has a build script that compiles C. td-mta's adds only local crates.
 const ACTIVE: &str = "webpki-roots v1.0.11|
-";
-
-const POSTGRES_ACTIVE: &str = "async-trait v0.1.92 (proc-macro)|
-base64 v0.22.1|alloc,default,std
-block-buffer v0.12.1|
-byteorder v1.5.0|default,std
-bytes v1.12.1|default,std
-cfg-if v1.0.5|
-chacha20 v0.10.2|rng
-cmov v0.5.4|
-const-oid v0.10.2|
-cpufeatures v0.3.1|
-crypto-common v0.2.2|
-ctutils v0.4.8|
-digest v0.11.3|alloc,block-api,default,mac,oid
-fallible-iterator v0.2.0|default,std
-futures-channel v0.3.34|alloc,default,futures-sink,sink,std
-futures-core v0.3.34|alloc,default,std
-futures-sink v0.3.34|alloc,default,std
-futures-task v0.3.34|
-futures-util v0.3.34|futures-sink,sink
-getrandom v0.4.3|std,sys_rng
-hmac v0.13.0|
-hybrid-array v0.4.15|
-libc v0.2.191|default,std
-lock_api v0.4.14|atomic_usize,default
-log v0.4.35|
-md-5 v0.11.0|alloc,default,oid
-memchr v2.8.3|alloc,default,std
-parking_lot v0.12.5|default
-parking_lot_core v0.9.12|
-percent-encoding v2.3.2|alloc,default,std
-phf v0.13.1|default,std
-phf_shared v0.13.1|std
-pin-project-lite v0.2.17|
-postgres-protocol v0.6.12|default
-postgres-types v0.2.14|
-proc-macro2 v1.0.107|default,proc-macro
-quote v1.0.47|default,proc-macro
-rand v0.10.3|alloc,default,std,std_rng,sys_rng,thread_rng
-rand_core v0.10.1|
-scopeguard v1.2.0|
-sha2 v0.11.1|alloc,default,oid
-siphasher v1.0.4|default,std
-smallvec v1.16.4|
-socket2 v0.6.5|all
-stringprep v0.1.5|
-syn v3.0.9|clone-impls,full,parsing,printing,proc-macro,visit-mut
-tinyvec v1.13.3|alloc,default
-tokio v1.54.1|bytes,default,io-util,sync
-tokio-postgres v0.7.18|
-tokio-util v0.7.20|codec,default,libc
-typenum v1.20.1|const-generics
-unicode-bidi v0.3.18|default,hardcoded-data,std
-unicode-ident v1.0.27|
-unicode-normalization v0.1.26|default,std
-unicode-properties v0.1.5|default,emoji,general-category
-whoami v2.1.3|default,std,wasi-wasite,wasm-web
 ";
 
 /// td-tls-provider's selected graph: rustls with no built-in backend, its
@@ -235,7 +183,6 @@ zeroize v1.9.1|alloc,default
 pub(crate) fn active_vendor_dirs() -> BTreeSet<String> {
     ACTIVE
         .lines()
-        .chain(POSTGRES_ACTIVE.lines())
         .chain(TLS_PROVIDER_ACTIVE.lines())
         .filter_map(|line| {
             let (name, rest) = line.split_once(" v")?;
@@ -258,10 +205,10 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
         local.push("td-crypto");
     }
     if name == "td-mta" {
-        expected.extend(POSTGRES_ACTIVE.lines().map(str::to_owned));
         local.extend([
             "td-alloc",
             "td-civil",
+            "td-encoding",
             "td-fs",
             "td-header",
             "td-html",
@@ -269,6 +216,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
             "td-mime",
             "td-mta",
             "td-nfc",
+            "td-postgres",
         ]);
     }
     for package in local {
@@ -289,11 +237,6 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     }
     Ok(())
 }
-
-pub(crate) const POSTGRES_DEPENDENCIES: &[&str] = &[
-    "tokio-postgres = { version = \"=0.7.18\", default-features = false }",
-    "tokio = { version = \"=1.54.1\", default-features = false, features = [\"io-util\"] }",
-];
 
 /// td-tls-provider's one external line: rustls's engine and nothing else, its
 /// built-in backends off.
@@ -418,12 +361,14 @@ mod tests {
         for name in [
             "td-alloc",
             "td-civil",
+            "td-encoding",
             "td-fs",
             "td-header",
             "td-html",
             "td-json",
             "td-mime",
             "td-nfc",
+            "td-postgres",
             "td-primitives",
             "td-source-scan",
         ] {
@@ -510,7 +455,6 @@ mod tests {
         // crypto graph's under other features.
         let packages: BTreeSet<&str> = ACTIVE
             .lines()
-            .chain(POSTGRES_ACTIVE.lines())
             .chain(TLS_PROVIDER_ACTIVE.lines())
             .filter_map(|line| line.split_once('|').map(|(package, _)| package))
             .collect();
@@ -518,10 +462,11 @@ mod tests {
         assert!(dirs.contains("webpki-roots-1.0.11"));
         assert!(!dirs.contains("aws-lc-rs-1.19.0"));
         assert!(!dirs.contains("cc-1.11.0"));
-        assert!(dirs.contains("async-trait-0.1.92"));
-        assert!(dirs.contains("whoami-2.1.3"));
-        assert!(!dirs.contains("objc2-core-foundation-0.3.2"));
-        assert!(!dirs.contains("wasite-1.0.2"));
+        assert!(dirs.contains("rustls-0.23.46"));
+        // The mail graph compiles no PostgreSQL closure, and no runtime.
+        assert!(!dirs.iter().any(|dir| dir.starts_with("tokio")));
+        assert!(!dirs.iter().any(|dir| dir.starts_with("postgres-")));
+        assert!(!dirs.contains("ring-0.17.14"));
         // A name or version that drifted from the lock would match no vendored
         // directory, and its notice would silently stop being required.
         let lock = std::fs::read_to_string(root().join("td-mta/Cargo.lock")).unwrap();
@@ -631,8 +576,10 @@ mod tests {
         let mime = root.join("td-mime").canonicalize().unwrap();
         let fs = root.join("td-fs").canonicalize().unwrap();
         let alloc = root.join("td-alloc").canonicalize().unwrap();
+        let encoding = root.join("td-encoding").canonicalize().unwrap();
+        let postgres = root.join("td-postgres").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}{POSTGRES_ACTIVE}td-alloc v0.1.0 ({})|\ntd-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\ntd-fs v0.1.0 ({})|\n",
+            "{graph}td-alloc v0.1.0 ({})|\ntd-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\ntd-fs v0.1.0 ({})|\ntd-encoding v0.1.0 ({})|\ntd-postgres v0.1.0 ({})|\n",
             alloc.display(),
             civil.display(),
             mail.display(),
@@ -641,7 +588,9 @@ mod tests {
             html.display(),
             nfc.display(),
             mime.display(),
-            fs.display()
+            fs.display(),
+            encoding.display(),
+            postgres.display()
         );
         assert!(active_graph(
             &root,
@@ -650,24 +599,21 @@ mod tests {
         )
         .is_err());
         assert!(active_graph(&root, "td-mta", &mailgraph).is_ok());
-        assert!(active_graph(&root, "td-crypto", &format!("{graph}{POSTGRES_ACTIVE}")).is_err());
         assert!(active_graph(&root, "td-other", &mailgraph).is_err());
         for bad in [
-            mailgraph.replace("smallvec v1.16.4|\n", ""),
-            mailgraph.replace("tokio-postgres v0.7.18|\n", ""),
+            // The retired driver closure, or any external package, is refused.
+            format!("{mailgraph}tokio-postgres v0.7.18|\n"),
+            format!("{mailgraph}tokio v1.54.1|bytes,default,io-util,sync\n"),
+            format!("{mailgraph}postgres-protocol v0.6.12|default\n"),
             mailgraph.replace(
-                "tokio-postgres v0.7.18|",
-                "tokio-postgres v0.7.18|default,runtime",
+                &format!("td-postgres v0.1.0 ({})|\n", postgres.display()),
+                "",
             ),
+            mailgraph.replace(&postgres.display().to_string(), "/wrong/postgres"),
             mailgraph.replace(
-                "tokio v1.54.1|bytes,default,io-util,sync",
-                "tokio v1.54.1|bytes,default,io-util,net,rt,sync,time",
+                &format!("td-encoding v0.1.0 ({})|\n", encoding.display()),
+                "",
             ),
-            mailgraph.replace(
-                "postgres-protocol v0.6.12|default",
-                "postgres-protocol v0.6.11|default",
-            ),
-            format!("{mailgraph}postgres-native-tls v0.5.0|\n"),
         ] {
             assert!(active_graph(&root, "td-mta", &bad).is_err());
         }

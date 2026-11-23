@@ -1,4 +1,5 @@
 //! Owner-derived, selected-profile grants for immutable inputs and active TLS pairs.
+use crate::postgres_probe::Client;
 use crate::{
     config::{certificate, gateway, inputs, profile::Roles, storage},
     ids::StoreEpoch,
@@ -11,7 +12,6 @@ use crate::{
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
-use tokio_postgres::Client;
 
 // PostgreSQL 17 deparses the reviewed definitions with search_path=pg_catalog.
 // The owner installs the same SQL checked at startup, including all row filters.
@@ -163,51 +163,50 @@ impl Bindings {
         td_alloc::push(&mut self.0, bindings).map_err(|_| ConfigError::Capacity)
     }
 
-    pub(crate) async fn replace_if_installed(
+    pub(crate) fn replace_if_installed(
         &self,
         client: &Client,
         version: Version,
     ) -> Result<(), Error> {
-        if installed(client).await? {
-            self.publish_bindings(client, version).await?;
+        if installed(client)? {
+            self.publish_bindings(client, version)?;
         }
         Ok(())
     }
 
-    async fn publish_bindings(&self, client: &Client, version: Version) -> Result<(), Error> {
+    fn publish_bindings(&self, client: &Client, version: Version) -> Result<(), Error> {
         if ServiceRole::ALL.iter().any(|role| {
             *role != ServiceRole::Acme && !self.0.iter().any(|binding| binding.role == *role)
         }) {
             return Err(Error::ServiceProfiles);
         }
-        qualify_catalog(client, None).await.map_err(|err| {
+        qualify_catalog(client, None).map_err(|err| {
             if err == AccessError::Privileges {
                 Error::Integrity
             } else {
                 Error::Database
             }
         })?;
-        client.batch_execute("DELETE FROM td_mta_service.material_bindings; DELETE FROM td_mta_service.certificate_bindings").await.map_err(|_| Error::Database)?;
+        client.batch("DELETE FROM td_mta_service.material_bindings; DELETE FROM td_mta_service.certificate_bindings").map_err(|_| Error::Database)?;
         for binding in &self.0 {
             let mut ids = Vec::new();
             for id in &binding.materials {
                 td_alloc::push(&mut ids, id.as_bytes().as_slice()).map_err(|_| Error::Capacity)?;
             }
             let login = binding.role.login();
-            client.execute("INSERT INTO td_mta_service.material_bindings (login,version_id,material_id) SELECT $1,$2,id FROM unnest($3::bytea[]) AS ids(id)", &[&login,&version.as_bytes().as_slice(),&ids]).await.map_err(|_| Error::Database)?;
-            client.execute("INSERT INTO td_mta_service.certificate_bindings (login,version_id,profile) SELECT $1,$2,profile FROM unnest($3::text[]) AS profiles(profile)", &[&login,&version.as_bytes().as_slice(),&binding.certificates]).await.map_err(|_| Error::Database)?;
+            client.execute("INSERT INTO td_mta_service.material_bindings (login,version_id,material_id) SELECT $1,$2,id FROM unnest($3::bytea[]) AS ids(id)", &[&login,&version.as_bytes().as_slice(),&ids]).map_err(|_| Error::Database)?;
+            client.execute("INSERT INTO td_mta_service.certificate_bindings (login,version_id,profile) SELECT $1,$2,profile FROM unnest($3::text[]) AS profiles(profile)", &[&login,&version.as_bytes().as_slice(),&binding.certificates]).map_err(|_| Error::Database)?;
         }
         Ok(())
     }
 }
 
-async fn installed(client: &Client) -> Result<bool, Error> {
+fn installed(client: &Client) -> Result<bool, Error> {
     client
         .query_one(
             "SELECT pg_catalog.to_regnamespace('td_mta_service') IS NOT NULL",
             &[],
         )
-        .await
         .map_err(|_| Error::Database)?
         .try_get(0)
         .map_err(|_| Error::Database)
@@ -225,41 +224,38 @@ pub fn bind(
         selection::read(request, trust, deadline, epoch)?.ok_or(Error::Conflict)?;
     let bindings = candidate.bindings;
     postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            let receipt = client.inspect_schema().await.map_err(Error::Schema)?;
+            let receipt = client.inspect_schema().map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED;
-                SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000")
-                .await.map_err(|_| Error::Database)?;
+            client.batch("BEGIN ISOLATION LEVEL READ COMMITTED;
+                SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
             let row = client.query_one(
                 "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton FOR UPDATE", &[]
-            ).await.map_err(|_| Error::Database)?;
+            ).map_err(|_| Error::Database)?;
             let generation: &[u8] = row.try_get(0).map_err(|_| Error::Database)?;
             let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Database)?;
             if generation != selected.generation.to_be_bytes() || version != Some(selected.version.as_bytes()) {
                 return Err(Error::Conflict);
             }
-            if !installed(client).await? {
-                client.batch_execute(include_str!("postgres_service_materials.sql")).await.map_err(|_| Error::Database)?;
+            if !installed(client)? {
+                client.batch(include_str!("postgres_service_materials.sql")).map_err(|_| Error::Database)?;
                 for (name, definition) in VIEWS {
                     let sql=td_alloc::format(format_args!(
                         "CREATE VIEW td_mta_service.{name} WITH (security_barrier=true) AS {definition}
                         REVOKE ALL ON td_mta_service.{name} FROM PUBLIC"
                     )).map_err(|_| Error::Capacity)?;
-                    client.batch_execute(&sql).await.map_err(|_| Error::Database)?;
+                    client.batch(&sql).map_err(|_| Error::Database)?;
                 }
             }
-            bindings.publish_bindings(client, selected.version).await?;
-            client.batch_execute("COMMIT").await.map_err(|_| Error::Indeterminate)?;
+            bindings.publish_bindings(client, selected.version)?;
+            client.commit().map_err(|_| Error::Indeterminate)?;
             Ok(selected)
-        })
-    }).map_err(Error::Connection)?
+        }).map_err(Error::Connection)?
 }
 
 // Both owner writes and service admission require the same reviewed objects.
 // Startup additionally verifies the effective rights of the authenticated login.
-pub(crate) async fn qualify_views(client: &Client, role: ServiceRole) -> Result<(), AccessError> {
-    qualify_catalog(client, Some(role)).await
+pub(crate) fn qualify_views(client: &Client, role: ServiceRole) -> Result<(), AccessError> {
+    qualify_catalog(client, Some(role))
 }
 
 const NAMESPACE: &str = "SELECT n.nspowner=(SELECT nspowner FROM pg_catalog.pg_namespace WHERE nspname='td_mta')
@@ -288,12 +284,11 @@ const OBJECTS: &str = "SELECT c.relname, c.relkind='v',
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace=n.oid
     WHERE n.nspname='td_mta_service' AND c.relkind<>'i' ORDER BY c.relname LIMIT 6";
 
-async fn qualify_catalog(client: &Client, role: Option<ServiceRole>) -> Result<(), AccessError> {
+fn qualify_catalog(client: &Client, role: Option<ServiceRole>) -> Result<(), AccessError> {
     let owner = role.is_none();
     let reads = role.is_some_and(|role| role != ServiceRole::Acme);
     let valid: bool = client
         .query_one(NAMESPACE, &[&owner, &reads])
-        .await
         .map_err(|_| AccessError::Privileges)?
         .try_get(0)
         .map_err(|_| AccessError::Database)?;
@@ -302,12 +297,11 @@ async fn qualify_catalog(client: &Client, role: Option<ServiceRole>) -> Result<(
     }
     let rows = client
         .query(OBJECTS, &[&owner, &reads])
-        .await
         .map_err(|_| AccessError::Database)?;
     if rows.len() != VIEWS.len() + 2 {
         return Err(AccessError::Privileges);
     }
-    for row in rows {
+    for row in &rows {
         let name: &str = row.try_get(0).map_err(|_| AccessError::Database)?;
         let view: bool = row.try_get(1).map_err(|_| AccessError::Database)?;
         let valid: Option<bool> = row.try_get(2).map_err(|_| AccessError::Database)?;

@@ -1,5 +1,5 @@
 //! One next-sequence check inside the caller's fenced account transaction.
-use tokio_postgres::Client;
+use crate::postgres_probe::Client;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
@@ -11,7 +11,7 @@ pub(crate) enum Error {
 /// Caller already holds this account's row lock in the documented lock order.
 /// Recheck the observed sequence under that lock; publication and COMMIT stay
 /// with the caller. Preserve one future increment for every final-result claim.
-pub(crate) async fn next(client: &Client, account: &[u8], observed: u64) -> Result<u64, Error> {
+pub(crate) fn next(client: &Client, account: &[u8], observed: u64) -> Result<u64, Error> {
     if account.len() != 16 {
         return Err(Error::Integrity);
     }
@@ -20,7 +20,6 @@ pub(crate) async fn next(client: &Client, account: &[u8], observed: u64) -> Resu
             "SELECT sequence,floor,(SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_final_reservations WHERE account=$1 LIMIT 1025) claims) FROM td_mta.accounts WHERE id=$1 FOR UPDATE",
             &[&account],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let claims: i64 = row.try_get(2).map_err(|_| Error::Integrity)?;
     if !(0..=1024).contains(&claims) {

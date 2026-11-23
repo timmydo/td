@@ -1,11 +1,11 @@
 //! Bounded value prefixes from the current immutable snapshot.
 use super::{check_changed, copy_text, Error, Values};
+use crate::postgres_probe::Client;
 use crate::{
     format::key::Key,
     ids::{EmailId, MailboxId},
     ports::ViewIdentity,
 };
-use tokio_postgres::{types::Type, Client};
 
 const VALUES: usize = 9;
 const _: () = assert!(VALUES == 9 && crate::postgres_body::MAX_METADATA_IDS == 16);
@@ -24,7 +24,7 @@ struct Prefix<T> {
     has_more: bool,
 }
 impl Window {
-    pub(super) async fn read(
+    pub(super) fn read(
         client: &Client,
         identity: ViewIdentity,
         emails: &[EmailId],
@@ -58,15 +58,15 @@ impl Window {
         }
         // Each bounded prefix occupies one protocol row, not one row per value.
         if mailboxes {
-            let rows = client.query_typed(
+            let rows = client.query(
                 "SELECT i.id,v.ids,v.changes,v.parents FROM unnest($2::bytea[]) i(id) CROSS JOIN LATERAL (SELECT COALESCE(array_agg(x.mailbox_id ORDER BY x.mailbox_id),'{}'::bytea[]) AS ids,COALESCE(array_agg(x.changed ORDER BY x.mailbox_id),'{}'::bytea[]) AS changes,COALESCE(array_agg(x.mailbox_changed ORDER BY x.mailbox_id),'{}'::bytea[]) AS parents FROM (SELECT m.mailbox_id,m.changed,b.changed AS mailbox_changed FROM td_mta.memberships m LEFT JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=$1 AND m.email_id=i.id ORDER BY m.mailbox_id LIMIT 9) x) v ORDER BY i.id LIMIT 17",
-                &[(&identity.account.as_bytes().as_slice(), Type::BYTEA), (&ids, Type::BYTEA_ARRAY)],
-            ).await.map_err(|_| Error::Database)?;
+                &[&identity.account.as_bytes().as_slice(), &ids],
+            ).map_err(|_| Error::Database)?;
             if rows.len() != window.entries.len() {
                 return Err(Error::Integrity);
             }
             let mut previous = None;
-            for row in rows {
+            for row in &rows {
                 let email: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
                 let email = EmailId::from_bytes(email.try_into().map_err(|_| Error::Integrity)?);
                 if previous.is_some_and(|id| id >= email) {
@@ -106,15 +106,15 @@ impl Window {
             }
         }
         if keywords {
-            let rows = client.query_typed(
+            let rows = client.query(
                 "SELECT i.id,v.words,v.changes FROM unnest($2::bytea[]) i(id) CROSS JOIN LATERAL (SELECT COALESCE(array_agg(x.keyword ORDER BY x.keyword COLLATE \"C\"),'{}'::text[]) AS words,COALESCE(array_agg(x.changed ORDER BY x.keyword COLLATE \"C\"),'{}'::bytea[]) AS changes FROM (SELECT keyword,changed FROM td_mta.keywords WHERE account=$1 AND email_id=i.id ORDER BY keyword COLLATE \"C\" LIMIT 9) x) v ORDER BY i.id LIMIT 17",
-                &[(&identity.account.as_bytes().as_slice(), Type::BYTEA), (&ids, Type::BYTEA_ARRAY)],
-            ).await.map_err(|_| Error::Database)?;
+                &[&identity.account.as_bytes().as_slice(), &ids],
+            ).map_err(|_| Error::Database)?;
             if rows.len() != window.entries.len() {
                 return Err(Error::Integrity);
             }
             let mut previous = None;
-            for row in rows {
+            for row in &rows {
                 let email: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
                 let email = EmailId::from_bytes(email.try_into().map_err(|_| Error::Integrity)?);
                 if previous.is_some_and(|id| id >= email) {

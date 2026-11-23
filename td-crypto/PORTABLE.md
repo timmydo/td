@@ -1257,8 +1257,8 @@ defines the attribution limits and remaining admission work.
 
 ## Mail database qualification
 
-The mail artifact includes the pinned PostgreSQL client without a Tokio
-runtime. Removed embedded-database allocation, RSS, worker-stack and backup
+The mail artifact includes td's own synchronous PostgreSQL client,
+`td-postgres`. Removed embedded-database allocation, RSS, worker-stack and backup
 scenarios are not qualification of PostgreSQL. Existing crypto, TLS, MIME,
 configuration and operator-CLI portable checks retain their stated scope.
 The native gate separately requires real PostgreSQL client and service

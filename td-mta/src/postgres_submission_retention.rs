@@ -1,5 +1,6 @@
 //! Retire completed submissions once their retention ends, and reclaim
 //! expired upload leases on the same relay turns.
+use crate::postgres_probe::Client;
 use crate::{
     postgres_probe::{self, Request},
     postgres_publication as publication,
@@ -8,7 +9,6 @@ use crate::{
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
-use tokio_postgres::Client;
 
 /// QUEUE.md: completed records stay 30 days after completion.
 pub const RETENTION_MS: i64 = 30 * 86_400_000;
@@ -56,42 +56,33 @@ impl Step {
         let stable_at = stable_at.into();
         let claim = claim.clone();
         postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
-            Box::pin(async move {
-                let now = lock(client, &claim, generation, stable_at).await?;
-                let account = claim.binding().account();
-                let account = account.as_bytes().as_slice();
-                let count = match self {
-                    Self::Retire => retire_locked(client, account, now).await?,
-                    Self::UploadLeases => crate::postgres_uploads::reclaim(client, account, now)
-                        .await
-                        .map_err(|error| match error {
-                            crate::postgres_uploads::Error::Database => Error::Database,
-                            crate::postgres_uploads::Error::Capacity => Error::Capacity,
-                            _ => Error::Integrity,
-                        })?,
-                    Self::AbandonedOwners => owners::reclaim_abandoned(client, &claim, now)
-                        .await
-                        .map_err(Error::Owner)?,
-                    Self::IdleAttempts => {
-                        crate::postgres_attempt_reclamation::reclaim(client, account, None, now)
-                            .await
-                            .map_err(|error| match error {
-                                crate::postgres_attempts::Error::Database => Error::Database,
-                                _ => Error::Integrity,
-                            })?
-                    }
-                };
-                if count > 0 {
-                    owners::check_locked(client, &claim, generation)
-                        .await
-                        .map_err(Error::Owner)?;
-                    client
-                        .batch_execute("COMMIT")
-                        .await
-                        .map_err(|_| Error::Database)?;
+            let now = lock(client, &claim, generation, stable_at)?;
+            let account = claim.binding().account();
+            let account = account.as_bytes().as_slice();
+            let count = match self {
+                Self::Retire => retire_locked(client, account, now)?,
+                Self::UploadLeases => crate::postgres_uploads::reclaim(client, account, now)
+                    .map_err(|error| match error {
+                        crate::postgres_uploads::Error::Database => Error::Database,
+                        crate::postgres_uploads::Error::Capacity => Error::Capacity,
+                        _ => Error::Integrity,
+                    })?,
+                Self::AbandonedOwners => {
+                    owners::reclaim_abandoned(client, &claim, now).map_err(Error::Owner)?
                 }
-                Ok(count)
-            })
+                Self::IdleAttempts => {
+                    crate::postgres_attempt_reclamation::reclaim(client, account, None, now)
+                        .map_err(|error| match error {
+                            crate::postgres_attempts::Error::Database => Error::Database,
+                            _ => Error::Integrity,
+                        })?
+                }
+            };
+            if count > 0 {
+                owners::check_locked(client, &claim, generation).map_err(Error::Owner)?;
+                client.commit().map_err(|_| Error::Database)?;
+            }
+            Ok(count)
         })
         .map_err(Error::Connection)?
     }
@@ -99,21 +90,16 @@ impl Step {
 
 /// Begin the relay's account transaction: the account row FOR UPDATE under
 /// a current owner fence, returning database time near the stable sample.
-async fn lock(
-    client: &postgres_probe::ScopedClient,
+fn lock(
+    client: &postgres_probe::Client,
     claim: &Claim,
     generation: u64,
     stable_at: RetentionTime,
 ) -> Result<i64, Error> {
-    if !owners::begin(client, claim, true, true)
-        .await
-        .map_err(Error::Owner)?
-    {
+    if !owners::begin(client, claim, true, true).map_err(Error::Owner)? {
         return Err(Error::Policy);
     }
-    let now = owners::check_locked(client, claim, generation)
-        .await
-        .map_err(Error::Owner)?;
+    let now = owners::check_locked(client, claim, generation).map_err(Error::Owner)?;
     if now.abs_diff(stable_at.observed) > CLOCK_SLACK_MS.unsigned_abs() {
         return Err(Error::Clock);
     }
@@ -127,9 +113,9 @@ fn fits(taken: usize, recipients: i64, bytes: i64) -> bool {
     taken == 0 || (recipients <= MAX_RECIPIENTS && bytes <= MAX_BYTES)
 }
 
-async fn retire_locked(client: &Client, account: &[u8], now: i64) -> Result<u64, Error> {
+fn retire_locked(client: &Client, account: &[u8], now: i64) -> Result<u64, Error> {
     let cutoff = now.checked_sub(RETENTION_MS).ok_or(Error::Integrity)?;
-    let candidates = client.query(concat!("SELECT s.id,s.recipient_count,b.length FROM td_mta.submissions s JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE s.account=$1 AND s.completed_at<$2 AND s.notification<>1 AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=s.account AND a.submission_id=s.id AND (a.active OR ",include_str!("postgres_pending_route_reset.sql")," OR EXISTS(SELECT 1 FROM td_mta.attempt_final_reservations f WHERE f.account=a.account AND f.attempt_id=a.attempt_id))) ORDER BY s.completed_at,s.id LIMIT $3 FOR UPDATE OF s"), &[&account, &cutoff, &MAX_SUBMISSIONS]).await.map_err(|_| Error::Database)?;
+    let candidates = client.query(concat!("SELECT s.id,s.recipient_count,b.length FROM td_mta.submissions s JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE s.account=$1 AND s.completed_at<$2 AND s.notification<>1 AND NOT EXISTS(SELECT 1 FROM td_mta.submission_attempts a WHERE a.account=s.account AND a.submission_id=s.id AND (a.active OR ",include_str!("postgres_pending_route_reset.sql")," OR EXISTS(SELECT 1 FROM td_mta.attempt_final_reservations f WHERE f.account=a.account AND f.attempt_id=a.attempt_id))) ORDER BY s.completed_at,s.id LIMIT $3 FOR UPDATE OF s"), &[&account, &cutoff, &MAX_SUBMISSIONS]).map_err(|_| Error::Database)?;
     if candidates.is_empty() {
         return Ok(0);
     }
@@ -157,9 +143,9 @@ async fn retire_locked(client: &Client, account: &[u8], now: i64) -> Result<u64,
     // otherwise linger until that route publishes again (section 123).
     // Attempt IDs stay server-side: an account may hold 1024 of them, more
     // rows than the connection's frame budget admits.
-    client.execute("WITH attempts AS (SELECT attempt_id FROM td_mta.submission_attempts WHERE account=$1 AND submission_id=ANY($2::bytea[])), phase AS (DELETE FROM td_mta.attempt_phase_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), acceptance AS (DELETE FROM td_mta.attempt_acceptance_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), refusal AS (DELETE FROM td_mta.attempt_refusal_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), rcpt AS (DELETE FROM td_mta.attempt_rcpt_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), command AS (DELETE FROM td_mta.attempt_command_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), recovery AS (DELETE FROM td_mta.attempt_recovery_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), health AS (DELETE FROM td_mta.route_health_receipts WHERE account=$1 AND action IN (1,3) AND operation IN (SELECT attempt_id FROM attempts)), submitted AS (DELETE FROM td_mta.submission_receipts WHERE account=$1 AND submission_id=ANY($2::bytea[])), canceled AS (DELETE FROM td_mta.submission_cancel_receipts WHERE account=$1 AND submission_id=ANY($2::bytea[])), expired AS (DELETE FROM td_mta.submission_expiry_receipts WHERE account=$1 AND submission_id=ANY($2::bytea[])) DELETE FROM td_mta.submission_attempts WHERE account=$1 AND submission_id=ANY($2::bytea[])", &[&account, &submissions.as_slice()]).await.map_err(|_| Error::Database)?;
+    client.execute("WITH attempts AS (SELECT attempt_id FROM td_mta.submission_attempts WHERE account=$1 AND submission_id=ANY($2::bytea[])), phase AS (DELETE FROM td_mta.attempt_phase_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), acceptance AS (DELETE FROM td_mta.attempt_acceptance_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), refusal AS (DELETE FROM td_mta.attempt_refusal_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), rcpt AS (DELETE FROM td_mta.attempt_rcpt_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), command AS (DELETE FROM td_mta.attempt_command_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), recovery AS (DELETE FROM td_mta.attempt_recovery_receipts WHERE account=$1 AND attempt_id IN (SELECT attempt_id FROM attempts)), health AS (DELETE FROM td_mta.route_health_receipts WHERE account=$1 AND action IN (1,3) AND operation IN (SELECT attempt_id FROM attempts)), submitted AS (DELETE FROM td_mta.submission_receipts WHERE account=$1 AND submission_id=ANY($2::bytea[])), canceled AS (DELETE FROM td_mta.submission_cancel_receipts WHERE account=$1 AND submission_id=ANY($2::bytea[])), expired AS (DELETE FROM td_mta.submission_expiry_receipts WHERE account=$1 AND submission_id=ANY($2::bytea[])) DELETE FROM td_mta.submission_attempts WHERE account=$1 AND submission_id=ANY($2::bytea[])", &[&account, &submissions.as_slice()]).map_err(|_| Error::Database)?;
     // submission_routes cascades; recipients are deferred to COMMIT.
-    let blob_rows = client.query("WITH removed AS (DELETE FROM td_mta.recipients WHERE account=$1 AND submission_id=ANY($2::bytea[])) DELETE FROM td_mta.submissions WHERE account=$1 AND id=ANY($2::bytea[]) RETURNING transmitted_blob_id", &[&account, &submissions.as_slice()]).await.map_err(|_| Error::Database)?;
+    let blob_rows = client.query("WITH removed AS (DELETE FROM td_mta.recipients WHERE account=$1 AND submission_id=ANY($2::bytea[])) DELETE FROM td_mta.submissions WHERE account=$1 AND id=ANY($2::bytea[]) RETURNING transmitted_blob_id", &[&account, &submissions.as_slice()]).map_err(|_| Error::Database)?;
     if blob_rows.len() != submissions.len() {
         return Err(Error::Integrity);
     }
@@ -172,37 +158,32 @@ async fn retire_locked(client: &Client, account: &[u8], now: i64) -> Result<u64,
     }
     // A blob another submission still transmits stays queued; one that an
     // Email or lease still reaches stays stored.
-    let queued: i64 = client.query_one("SELECT coalesce(sum(b.length),0)::bigint FROM td_mta.blobs b WHERE b.account=$1 AND b.id IN (SELECT DISTINCT unnest($2::bytea[])) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id)", &[&account, &blobs.as_slice()]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
+    let queued: i64 = client.query_one("SELECT coalesce(sum(b.length),0)::bigint FROM td_mta.blobs b WHERE b.account=$1 AND b.id IN (SELECT DISTINCT unnest($2::bytea[])) AND NOT EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id)", &[&account, &blobs.as_slice()]).map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
     let refused = |error| match error {
         publication::Error::Database => Error::Database,
         _ => Error::Integrity,
     };
-    let (bytes, count) = publication::retire_blobs(client, account, blobs.as_slice())
-        .await
-        .map_err(refused)?;
+    let (bytes, count) =
+        publication::retire_blobs(client, account, blobs.as_slice()).map_err(refused)?;
     let retired = i64::try_from(submissions.len()).map_err(|_| Error::Integrity)?;
-    publication::release(client, account, [bytes, count, 0, queued, retired])
-        .await
-        .map_err(refused)?;
+    publication::release(client, account, [bytes, count, 0, queued, retired]).map_err(refused)?;
     let state = client
         .query_one(
             "SELECT sequence FROM td_mta.accounts WHERE id=$1",
             &[&account],
         )
-        .await
         .map_err(|_| Error::Database)?;
     let old: &[u8] = state.try_get(0).map_err(|_| Error::Integrity)?;
     let old = u64::from_be_bytes(old.try_into().map_err(|_| Error::Integrity)?);
-    let next = crate::postgres_sequence::next(client, account, old)
-        .await
-        .map_err(|error| match error {
+    let next =
+        crate::postgres_sequence::next(client, account, old).map_err(|error| match error {
             crate::postgres_sequence::Error::Capacity => Error::Capacity,
             crate::postgres_sequence::Error::Integrity => Error::Integrity,
             crate::postgres_sequence::Error::Database => Error::Database,
         })?;
     let changed = next.to_be_bytes();
     // Destroyed rows advance every state string and keep each ID from reuse.
-    let written = client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,ordinality-1,5,3,id FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality)", &[&account, &submissions.as_slice(), &changed.as_slice()]).await.map_err(|_| Error::Database)?;
+    let written = client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,ordinality-1,5,3,id FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality)", &[&account, &submissions.as_slice(), &changed.as_slice()]).map_err(|_| Error::Database)?;
     if written != submissions.len() as u64 {
         return Err(Error::Integrity);
     }
@@ -211,7 +192,6 @@ async fn retire_locked(client: &Client, account: &[u8], now: i64) -> Result<u64,
             "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
             &[&account, &changed.as_slice()],
         )
-        .await
         .map_err(|_| Error::Database)?
         != 1
     {
