@@ -36,6 +36,7 @@ mod pcm;
 mod serve;
 mod session;
 mod sink;
+mod state;
 mod sys;
 mod tone;
 mod wav;
@@ -85,7 +86,7 @@ usage: td-audio devices [--proc PATH]
                      [--proc PATH]
        td-audio verify-tone [--wav PATH] [--hz HZ] [--voices N] [--ms MS]
        td-audio serve [--socket PATH] [--card N] [--device N] [--proc PATH]
-                      [--passes N] [--output-uid UID]
+                      [--state PATH] [--passes N] [--output-uid UID]
        td-audio probe [--socket PATH]
        td-audio status [--socket PATH]
        td-audio outputs [--socket PATH]
@@ -104,7 +105,9 @@ usage: td-audio devices [--proc PATH]
   verify-tone  check a recorded WAVE against the tone that should be in it:
                rate, duration, non-silence, and correlation with the waveform
   serve        run the PulseAudio-protocol daemon: bind the socket, mix every
-               client, and play the sum through the ALSA back end
+               client, and play the sum through the ALSA back end; keep the
+               outputs chosen and their levels in --state (default
+               /var/lib/td-audio/state)
   probe        connect to the supervised daemon's socket
   status       the active output, its level and mute, and the stream count
   outputs      every output; the active one is marked
@@ -171,7 +174,23 @@ fn parse_probe(arguments: &[OsString]) -> io::Result<PathBuf> {
 fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
     let mut options = parse(arguments)?;
     let wanted = options.card.zip(options.device);
-    let outputs = device::outputs(&options.proc_pcm, wanted)?;
+    let mut outputs = device::outputs(&options.proc_pcm, wanted)?;
+    let saved = match state::load(&options.state) {
+        Ok(saved) => saved.unwrap_or_default(),
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "td-audio: ignoring {}, the defaults apply: {error}",
+                options.state.display()
+            );
+            state::Saved::default()
+        }
+    };
+    // The output the human chose last plays, if it is here; a named one
+    // still comes first.
+    if wanted.is_none() {
+        prefer_first(&mut outputs, &saved.preference);
+    }
     let mut stdout = io::stdout();
     let (active, sink) = open_first(&outputs, wanted.is_some(), open_alsa, &mut io::stderr())?;
     for (position, output) in outputs.iter().enumerate() {
@@ -190,11 +209,25 @@ fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
         .map(|output| output.playback.node())
         .unwrap_or_default();
     // Everything that can fail is done before the socket exists.
-    let set = output::OutputSet::discovered(outputs, active)?;
+    let mut set = output::OutputSet::discovered(outputs, active)?;
+    set.restore(saved);
     let policy = options.admit(serve::Policy::for_deployment(current_uid()?)?);
     let mut server = serve::Server::bind(&options.socket, sink, policy)?
         .with_outputs(set, open_alsa)
         .rescanning(std::mem::take(&mut options.proc_pcm), wanted);
+    if !state::directory(&options.state).is_dir() {
+        let _ = writeln!(
+            io::stderr(),
+            "td-audio: nothing set is kept: {} has no directory",
+            options.state.display()
+        );
+    }
+    match state::Saver::spawn(std::mem::take(&mut options.state)) {
+        Ok(saver) => server = server.keeping_state(saver),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "td-audio: nothing set is kept: {error}");
+        }
+    }
     writeln!(
         stdout,
         "{}: serving {} at {} Hz, {} channels, for uid(s) {:?}",
@@ -218,6 +251,25 @@ fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
 /// Open an output's device in the daemon's fixed shape.
 fn open_alsa(playback: &device::Playback) -> io::Result<AlsaSink> {
     AlsaSink::open(playback, Request::default())
+}
+
+/// Move the outputs the human chose to the front, the most recent first,
+/// keeping the rest in discovery order.
+fn prefer_first(outputs: &mut [device::Output], preference: &[String]) {
+    let mut placed = 0;
+    for key in preference {
+        let Some(at) = outputs
+            .iter()
+            .skip(placed)
+            .position(|output| output.key == *key)
+        else {
+            continue;
+        };
+        if let Some(run) = outputs.get_mut(placed..=placed + at) {
+            run.rotate_right(1);
+        }
+        placed += 1;
+    }
 }
 
 /// The first output that opens, and where it is in `outputs`. A named one
@@ -284,6 +336,8 @@ struct Options {
     passes: Option<u32>,
     /// The compositor's uid, admitted to the output's level and mute alone.
     output_uid: Option<u32>,
+    /// Where `serve` keeps what the human set (`state::STATE_PATH`).
+    state: PathBuf,
 }
 
 impl Default for Options {
@@ -298,6 +352,7 @@ impl Default for Options {
             milliseconds: 2000,
             wav: None,
             socket: PathBuf::from(serve::SOCKET_PATH),
+            state: PathBuf::from(state::STATE_PATH),
             passes: None,
             output_uid: None,
         }
@@ -347,6 +402,10 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
             Some("--proc") => {
                 options.proc_pcm =
                     PathBuf::from(next.ok_or_else(|| bad("--proc needs a path".into()))?)
+            }
+            Some("--state") => {
+                options.state =
+                    PathBuf::from(next.ok_or_else(|| bad("--state needs a path".into()))?)
             }
             Some("--card") => options.card = Some(number("--card", next)?),
             Some("--device") => options.device = Some(number("--device", next)?),
@@ -869,6 +928,7 @@ mod tests {
             ("serve.rs", include_str!("serve.rs")),
             ("session.rs", include_str!("session.rs")),
             ("sink.rs", include_str!("sink.rs")),
+            ("state.rs", include_str!("state.rs")),
             ("sys.rs", include_str!("sys.rs")),
             ("tone.rs", include_str!("tone.rs")),
             ("wav.rs", include_str!("wav.rs")),
@@ -1661,5 +1721,35 @@ mod tests {
             "sys.rs must refuse to build for another architecture: every struct \
              length and request number there is an x86-64 fact"
         );
+    }
+
+    /// The human's choices lead, most recent first; the rest keep
+    /// discovery's order, and a choice not present is passed over.
+    #[test]
+    fn the_outputs_chosen_lead_in_the_order_chosen() {
+        let output = |card: u32, key: &str| device::Output {
+            playback: device::Playback {
+                card,
+                device: 0,
+                id: key.to_owned(),
+                name: key.to_owned(),
+                subdevices: 1,
+                capture_subdevices: 0,
+            },
+            key: key.to_owned(),
+            name: key.to_owned(),
+        };
+        let mut outputs = vec![
+            output(0, "A:0"),
+            output(1, "B:0"),
+            output(2, "C:0"),
+            output(3, "D:0"),
+        ];
+        prefer_first(&mut outputs, &["D:0".into(), "gone:0".into(), "B:0".into()]);
+        let keys: Vec<_> = outputs.iter().map(|output| output.key.as_str()).collect();
+        assert_eq!(keys, ["D:0", "B:0", "A:0", "C:0"]);
+        prefer_first(&mut outputs, &[]);
+        let keys: Vec<_> = outputs.iter().map(|output| output.key.as_str()).collect();
+        assert_eq!(keys, ["D:0", "B:0", "A:0", "C:0"]);
     }
 }

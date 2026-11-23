@@ -310,7 +310,7 @@ fn card_id(root: &Path, card: u32, strict: bool) -> io::Result<String> {
 }
 
 /// The most of `card<N>/id` that is read.
-const CARD_ID_BYTES: usize = 64;
+pub(crate) const CARD_ID_BYTES: usize = 64;
 
 /// A card id as a sink name's first part: lowercase, `_` as `-`.
 struct SinkId<'a>(&'a str);

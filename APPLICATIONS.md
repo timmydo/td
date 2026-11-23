@@ -8800,8 +8800,36 @@ table with no ordinary playback PCM left lists none, so every output is
 gone, and a named `--card`/`--device` no longer listed leads no longer.
 A table that cannot be read or parsed, or a card whose id cannot be
 read, keeps the outputs as they were, said once until it reads again.
-The preference list and the remembered levels live as long as the
-daemon; they are not persisted across a restart.
+The preference list and every level are kept across restarts (below).
+
+**Kept across restarts.** What the human sets on the outputs, the
+preference list and each output's level and mute by key, is kept in
+`/var/lib/td-audio/state` (`--state` names another file). The file is
+versioned (`td-audio-state 1`, a line per choice, most recent first,
+then a line per level: a tab-separated key, protocol volume and 0 or 1),
+since the current and the previous deployment share `/var`; it holds at
+most 64 of each, the levels of outputs present first, and each key once.
+At start the daemon reads it once: unless `--card`/`--device` names one,
+the output chosen most recently of those present is opened first, the
+rest following in discovery order, each output present takes its key's
+level, and the others' levels wait for their return. A file that is not
+exactly this version's shape (a later version, a key that is no
+output's, a volume above unity, a key twice, more than the caps, more
+than 16 KiB, not a plain file: it is opened without following a symlink
+or waiting on a FIFO) is ignored, said once, and the defaults apply.
+Only a choice, a level or a mute that changes counts as a change. About
+two seconds after the last change, so a slider dragged is one write, or
+ten seconds after the first change still unwritten, however often others
+follow, the audio thread hands a whole snapshot to a helper thread
+through a one-slot channel (offering the same snapshot again next pass
+while the helper still writes), and the helper writes it to `state.new`,
+syncs it, renames it over `state` and syncs the directory, so a crash
+leaves the old file or the new one. td-svc stops the daemon with
+`SIGTERM`, which ends it at once as a crash does, so a stop, a restart
+or a power-off loses at most that window; only the daemon's own end,
+every output gone, hands over what is unwritten and waits for the write.
+A failed write is said once until one succeeds, a missing directory is
+said at start, and the daemon plays on either way.
 
 The host oracle `qemu-boot-audio`, an integration-tier step, proves a
 switch on emulated hardware. Its machine has QEMU's HDA output and a USB
@@ -8926,8 +8954,18 @@ existing system identities, and the seat unit passes that exact identity
 to `td-seatd`. The assigner creates `/run/td-audio` as mode 0755 owned by
 `audio`, reads the result back, and keeps the uid/gid distinct from the
 graphical account. The account has a non-login `/bin/false` shell.
-Its home is the same volatile `/run/td-audio` directory; image generation
-does not create, chown, or probe a persistent `/var`-backed audio home.
+Its home is the same volatile `/run/td-audio` directory; image
+generation does not create, chown, or probe a persistent `/var`-backed
+audio home. The one thing it keeps is what the human sets on the outputs
+(§K.4, "Kept across restarts"): before each start `td-seatd exec-audio`,
+still root, makes `/var/lib/td-audio` mode 0700 for the account, or puts
+its owner and mode back, beneath root's 0755 `/var/lib`, refusing a name
+that is not a directory, a symlink included; on any failure it says so
+and starts the daemon, which then plays and keeps nothing. That makes
+`/var/lib/td-audio` the audio account's one persistent, writable place:
+a compromised daemon could fill `/var` through it or keep data there
+across reboots, which before it could do only in tmpfs; its own file is
+bounded at 16 KiB when read, but nothing quotas the directory.
 It recognizes only `/dev/snd/pcmC<card>D<device>p`, caps the scan at 64
 entries, and assigns those playback nodes mode 0600 to `audio`; capture,
 control and unknown nodes retain their existing ownership. The locked

@@ -25,6 +25,9 @@ const SOUND_DIR: &str = "/dev/snd";
 const MAX_PLAYBACK_DEVICES: usize = 64;
 const RUNTIME_BASE: &str = "/run/user";
 const AUDIO_RUNTIME: &str = "/run/td-audio";
+/// Where the audio daemon keeps what the human set across restarts
+/// (APPLICATIONS.md §K.5): its own, made by root before each start.
+const AUDIO_STATE: &str = "/var/lib/td-audio";
 const COMPOSITOR_RUNTIME_NAME: &str = "td-compositor";
 const READY_MARKER: &str = "TD-SEAT-READY";
 const PRIVATE_DEVICES_MARKER: &str = "TD-COMPOSITOR-DEVICES-PRIVATE";
@@ -757,11 +760,33 @@ fn prepare_audio_runtime(
     account: Account,
     require_root_base: bool,
 ) -> Result<(), String> {
+    prepare_audio_directory(path, account, 0o755, require_root_base)
+}
+
+/// One of the audio account's directories, `mode`, beneath a root-owned
+/// 0755 parent.
+fn prepare_audio_directory(
+    path: &Path,
+    account: Account,
+    mode: u32,
+    require_root_base: bool,
+) -> Result<(), String> {
     let base = path
         .parent()
-        .ok_or_else(|| format!("audio runtime path {} has no parent", path.display()))?;
+        .ok_or_else(|| format!("audio directory {} has no parent", path.display()))?;
     verify_runtime_base(base, require_root_base)?;
-    prepare_owned_runtime(path, account, 0o755)
+    prepare_owned_runtime(path, account, mode)
+}
+
+/// The audio account's state directory, mode 0700, beneath a root-owned
+/// 0755 parent: made if missing, and its owner and mode put back if not;
+/// anything there but a directory is refused, a symlink included.
+fn prepare_audio_state(
+    path: &Path,
+    account: Account,
+    require_root_base: bool,
+) -> Result<(), String> {
+    prepare_audio_directory(path, account, 0o700, require_root_base)
 }
 
 fn compositor_runtime(human_runtime: &Path) -> Result<PathBuf, String> {
@@ -958,6 +983,14 @@ fn assign_playback(
 fn exec_audio(args: &[String]) -> Result<(), String> {
     let options = parse_audio_exec(args)?;
     let _assigned = assign_playback(Path::new(SOUND_DIR), options.assignment.audio, true)?;
+    // Without it the daemon plays and keeps nothing, which it says too.
+    if let Err(error) = prepare_audio_state(Path::new(AUDIO_STATE), options.assignment.audio, true)
+    {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "td-seatd: exec-audio: nothing set on audio is kept: {error}"
+        );
+    }
     let error = Command::new(options.program).args(options.arguments).exec();
     Err(format!("exec {}: {error}", options.program))
 }
@@ -2366,5 +2399,55 @@ mod tests {
             0o700
         );
         assert!(!runtime.exists());
+    }
+
+    /// The audio state directory is made 0700 for the account, put back
+    /// when loosened, and refused when the name is anything but a
+    /// directory or its parent is not the expected 0755 one.
+    #[test]
+    fn the_audio_state_directory_is_the_accounts_alone() {
+        let root = td_fs::TempDir::new("td-seat-audio-state").unwrap();
+        let base = root.path().join("lib");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, Permissions::from_mode(0o755)).unwrap();
+        let account = own_account(root.path());
+        let state = base.join("td-audio");
+        prepare_audio_state(&state, account, false).unwrap();
+        verify_owner_mode(&state, account, 0o700).unwrap();
+        fs::set_permissions(&state, Permissions::from_mode(0o755)).unwrap();
+        fs::write(state.join("state"), b"kept").unwrap();
+        prepare_audio_state(&state, account, false).unwrap();
+        verify_owner_mode(&state, account, 0o700).unwrap();
+        assert_eq!(fs::read(state.join("state")).unwrap(), b"kept");
+        fs::remove_dir_all(&state).unwrap();
+        unix_fs::symlink(root.path(), &state).unwrap();
+        assert!(prepare_audio_state(&state, account, false).is_err());
+        fs::remove_file(&state).unwrap();
+        fs::write(&state, b"").unwrap();
+        assert!(prepare_audio_state(&state, account, false).is_err());
+        fs::remove_file(&state).unwrap();
+        fs::set_permissions(&base, Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_audio_state(&state, account, false).is_err());
+        assert!(!state.exists(), "nothing is made under a loose parent");
+        // As root, the parent must be root's too.
+        fs::set_permissions(&base, Permissions::from_mode(0o755)).unwrap();
+        let mine = fs::metadata(&base).unwrap().uid() != 0;
+        assert_eq!(prepare_audio_state(&state, account, true).is_err(), mine);
+        // `exec-audio` prepares it as root, after the playback nodes and
+        // before the exec, and a failure is said, not fatal.
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let exec = production.split("fn exec_audio(").nth(1).unwrap();
+        let exec = exec.split("\n}\n").next().unwrap();
+        let playback = exec.find("assign_playback(").unwrap();
+        let state = exec
+            .find(
+                "if let Err(error) = prepare_audio_state(Path::new(AUDIO_STATE), \
+                 options.assignment.audio, true)",
+            )
+            .unwrap();
+        let program = exec.find("Command::new(options.program)").unwrap();
+        assert!(playback < state && state < program);
+        assert_eq!(exec.matches("prepare_audio_state(").count(), 1);
     }
 }

@@ -8,8 +8,10 @@
 //! socket." The directory is 0755 and the socket is 0666, and the gate is
 //! `SO_PEERCRED` rather than mode bits, "in code that can say why it refused".
 //!
-//! One thread. Audio arrives from clients, is summed, and is handed to the
-//! device; a second thread would buy nothing but a lock around the mixer. The
+//! One audio thread. Audio arrives from clients, is summed, and is handed to
+//! the device; a second would buy nothing but a lock around the mixer. (A
+//! helper thread writes the kept state, `crate::state`, and touches nothing
+//! else.) The
 //! wait is one `poll(2)` over the listener, every client, and the PCM together,
 //! so a client that writes and a device that drains are the same event loop.
 
@@ -418,6 +420,17 @@ pub type Open<S> = fn(&crate::device::Playback) -> io::Result<S>;
 /// How often a running daemon reads its outputs again (§K.4, "Hotplug").
 const RESCAN_PERIOD: Duration = Duration::from_secs(1);
 
+/// Keeping what the human set across restarts (`crate::state`).
+struct Keeping {
+    saver: crate::state::Saver,
+    /// The output set's generation last seen.
+    seen: u64,
+    /// When the first change still unwritten was, and the last.
+    unsaved: Option<(Instant, Instant)>,
+    /// A snapshot the writer was too busy to take, and its generation.
+    pending: Option<(u64, String)>,
+}
+
 /// Where and when outputs are read again.
 struct Rescanning {
     pcm: PathBuf,
@@ -447,6 +460,8 @@ pub struct Server<S: AudioSink> {
     fallbacks_without_audio: usize,
     /// Rereading the outputs; `None` for a daemon that never does.
     rescan: Option<Rescanning>,
+    /// Writing what the human set; `None` for a daemon that keeps nothing.
+    state: Option<Keeping>,
     /// A resumption's ring fill, and since when it has not grown.
     resume_held: Option<(u64, Instant)>,
     policy: Policy,
@@ -493,6 +508,7 @@ impl<S: AudioSink> Server<S> {
             open: None,
             fallbacks_without_audio: 0,
             rescan: None,
+            state: None,
             resume_held: None,
             policy,
             spec,
@@ -516,6 +532,18 @@ impl<S: AudioSink> Server<S> {
     fn offer(&mut self, outputs: OutputSet, open: Open<S>) {
         *self.mixer.outputs_mut() = outputs;
         self.open = Some(open);
+    }
+
+    /// Keep what the human sets with `saver`: about two seconds after the
+    /// last change to a choice, a level or a mute, and as the daemon stops.
+    pub fn keeping_state(mut self, saver: crate::state::Saver) -> Self {
+        self.state = Some(Keeping {
+            saver,
+            seen: self.mixer.outputs().generation(),
+            unsaved: None,
+            pending: None,
+        });
+        self
     }
 
     /// Read the outputs again from `pcm` about once a second, as discovery
@@ -634,7 +662,48 @@ impl<S: AudioSink> Server<S> {
         if gone {
             self.finish_device_gone();
         }
+        self.keep_state();
         Ok(gone)
+    }
+
+    /// Hand the writer the state once the last change is `SAVE_AFTER` old,
+    /// or the first unwritten one `SAVE_AT_MOST`; while it is still writing
+    /// the last, offer the same snapshot again next pass.
+    fn keep_state(&mut self) {
+        let generation = self.mixer.outputs().generation();
+        let Some(keeping) = self.state.as_mut() else {
+            return;
+        };
+        if generation != keeping.seen {
+            keeping.seen = generation;
+            let now = Instant::now();
+            let first = keeping.unsaved.map_or(now, |(first, _)| first);
+            keeping.unsaved = Some((first, now));
+        }
+        let Some((first, last)) = keeping.unsaved else {
+            return;
+        };
+        if last.elapsed() < crate::state::SAVE_AFTER && first.elapsed() < crate::state::SAVE_AT_MOST
+        {
+            return;
+        }
+        let text = match keeping.pending.take() {
+            Some((of, text)) if of == generation => text,
+            _ => match self.mixer.outputs().state_text() {
+                Ok(text) => text,
+                Err(_) => {
+                    // Tried again after another pause.
+                    let now = Instant::now();
+                    keeping.unsaved = Some((now, now));
+                    let _ = writeln!(io::stderr(), "td-audio: no memory to keep the state");
+                    return;
+                }
+            },
+        };
+        match keeping.saver.offer(text) {
+            None => keeping.unsaved = None,
+            Some(text) => keeping.pending = Some((generation, text)),
+        }
     }
 
     fn finish_device_gone(&mut self) {
@@ -1699,6 +1768,19 @@ impl<S: AudioSink> Server<S> {
     pub fn shutdown(&mut self) {
         let _ = self.mixer.drain_all(&mut self.sink, 64);
         let _ = self.sink.drain();
+        let generation = self.mixer.outputs().generation();
+        if let Some(keeping) = self.state.as_mut() {
+            let unsaved = keeping.unsaved.is_some() || generation != keeping.seen;
+            let text = match keeping.pending.take() {
+                Some((of, text)) if unsaved && of == generation => Some(text),
+                _ => unsaved
+                    .then(|| self.mixer.outputs().state_text().ok())
+                    .flatten(),
+            };
+            keeping.saver.finish(text);
+            keeping.unsaved = None;
+            keeping.seen = generation;
+        }
         for diagnostic in &self.diagnostics {
             eprintln!("td-audio: {diagnostic}");
         }
@@ -5581,5 +5663,73 @@ pub(crate) mod tests {
             );
         }
         server.shutdown();
+    }
+
+    /// A change is written once it is two seconds old, not before, and
+    /// whatever is unwritten as the daemon stops is written then.
+    #[test]
+    fn what_the_human_sets_is_written_after_a_pause_and_at_the_end() {
+        let dir = td_fs::TempDir::new("td-audio-keeping").unwrap();
+        let path = dir.path().join("state");
+        let (server, _socket) = server_with_outputs(
+            "keeping",
+            &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+        );
+        let saver = crate::state::Saver::spawn(path.clone()).unwrap();
+        let mut server = server.keeping_state(saver);
+        let unsaved = |server: &Server<MemorySink>| server.state.as_ref().unwrap().unsaved;
+        let age = |server: &mut Server<MemorySink>, first: Duration, last: Duration| {
+            if let Some(keeping) = server.state.as_mut() {
+                keeping.unsaved = keeping
+                    .unsaved
+                    .map(|(a, b)| (a.checked_sub(first).unwrap(), b.checked_sub(last).unwrap()));
+            }
+        };
+        passes(&mut server, 1);
+        assert!(unsaved(&server).is_none());
+        server.mixer.outputs_mut().set_volume(1, 100);
+        passes(&mut server, 2);
+        assert!(unsaved(&server).is_some());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!path.exists(), "not before the pause");
+        // Another change restarts the pause, but not the clock on the first.
+        let (first, last) = unsaved(&server).unwrap();
+        server.mixer.outputs_mut().set_muted(1, true);
+        passes(&mut server, 1);
+        let (still_first, later) = unsaved(&server).unwrap();
+        assert!(still_first == first && later > last);
+        // Changes that never pause are written once the first is old.
+        age(&mut server, crate::state::SAVE_AT_MOST, Duration::ZERO);
+        server.mixer.outputs_mut().set_volume(1, 101);
+        passes(&mut server, 1);
+        assert!(unsaved(&server).is_none(), "written at the most");
+        server.mixer.outputs_mut().set_volume(1, 100);
+        passes(&mut server, 1);
+        age(&mut server, Duration::ZERO, crate::state::SAVE_AFTER);
+        passes(&mut server, 1);
+        // Taken, or, were the writer still on the last, held for it.
+        let generation = server.mixer.outputs().generation();
+        let keeping = server.state.as_ref().unwrap();
+        assert!(
+            keeping.unsaved.is_none()
+                || keeping
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(of, _)| *of == generation),
+            "taken or held"
+        );
+        let written = server.mixer.outputs().state_text().unwrap();
+        // The next change, inside its pause, waits for the end.
+        server.mixer.outputs_mut().set_volume(0, 7);
+        passes(&mut server, 1);
+        let last = server.mixer.outputs().state_text().unwrap();
+        assert_ne!(last, written);
+        server.shutdown();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), last);
+        assert_eq!(
+            crate::state::load(&path).unwrap().unwrap().levels.len(),
+            2,
+            "both outputs' levels"
+        );
     }
 }

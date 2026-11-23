@@ -84,6 +84,9 @@ pub struct OutputSet {
     /// Keys the human chose, most recent first.
     preference: Vec<String>,
     remembered: Vec<Remembered>,
+    /// Counts each change to what is kept across restarts: a choice, a
+    /// level, a mute (`crate::state`).
+    generation: u64,
 }
 
 impl Default for OutputSet {
@@ -103,6 +106,7 @@ impl Default for OutputSet {
             next_index: 0,
             preference: Vec::new(),
             remembered: Vec::new(),
+            generation: 0,
         }
     }
 }
@@ -292,8 +296,11 @@ impl OutputSet {
             return Ok(());
         };
         if let Some(at) = self.preference.iter().position(|key| *key == *entry.key) {
-            if let Some(earlier) = self.preference.get_mut(..=at) {
-                earlier.rotate_right(1);
+            if at > 0 {
+                if let Some(earlier) = self.preference.get_mut(..=at) {
+                    earlier.rotate_right(1);
+                }
+                self.generation = self.generation.wrapping_add(1);
             }
             return Ok(());
         }
@@ -303,7 +310,79 @@ impl OutputSet {
         }
         crate::allocation::push(&mut self.preference, key)?;
         self.preference.rotate_right(1);
+        self.generation = self.generation.wrapping_add(1);
         Ok(())
+    }
+
+    /// Which change to what is kept the set is at; another value means
+    /// there is something to write.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// What is kept across restarts, as the state file's text: the
+    /// preference list, then each output's level by key, those present
+    /// first, at most `MAX_OUTPUTS` and each key once.
+    pub fn state_text(&self) -> Result<String, crate::allocation::Error> {
+        let present = self
+            .discovered
+            .iter()
+            .map(|entry| (&*entry.key, entry.volume, entry.muted));
+        let departed = self
+            .remembered
+            .iter()
+            .map(|known| (known.key.as_str(), known.volume, known.muted));
+        let all = present.chain(departed);
+        let first = |at: usize, key: &str| {
+            !self
+                .discovered
+                .iter()
+                .map(|entry| &*entry.key)
+                .chain(self.remembered.iter().map(|known| known.key.as_str()))
+                .take(at)
+                .any(|earlier| earlier == key)
+        };
+        let levels = all
+            .enumerate()
+            .filter(move |(at, (key, _, _))| first(*at, key))
+            .map(|(_, level)| level)
+            .take(MAX_OUTPUTS);
+        crate::state::render(
+            self.preference.iter().map(String::as_str).take(MAX_OUTPUTS),
+            levels,
+        )
+    }
+
+    /// Take what was kept: the preference list, and each level, on the
+    /// output present under its key or remembered against its return.
+    /// Nothing to write follows from it.
+    pub fn restore(&mut self, saved: crate::state::Saved) {
+        if self.discovered.is_empty() {
+            return;
+        }
+        self.preference.clear();
+        for key in saved.preference.into_iter().take(MAX_OUTPUTS) {
+            let _ = crate::allocation::push(&mut self.preference, key);
+        }
+        for level in saved.levels {
+            let mut present = false;
+            for entry in &mut self.discovered {
+                if *entry.key == *level.key {
+                    (entry.volume, entry.muted) = (level.volume.min(VOLUME_MAX), level.muted);
+                    present = true;
+                }
+            }
+            if !present && self.remembered.len() < MAX_OUTPUTS {
+                let _ = crate::allocation::push(
+                    &mut self.remembered,
+                    Remembered {
+                        key: level.key,
+                        volume: level.volume.min(VOLUME_MAX),
+                        muted: level.muted,
+                    },
+                );
+            }
+        }
     }
 
     /// The `n`th output to fall back to: those the human chose, most recent
@@ -439,6 +518,9 @@ impl OutputSet {
         let volume = volume.min(VOLUME_MAX);
         let changed = entry.volume != volume;
         entry.volume = volume;
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
         changed
     }
 
@@ -449,6 +531,9 @@ impl OutputSet {
         };
         let changed = entry.muted != muted;
         entry.muted = muted;
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
         changed
     }
 }
@@ -735,5 +820,76 @@ mod tests {
         assert_eq!(set.preference.len(), MAX_OUTPUTS);
         assert_eq!(set.preference[0], "A:0");
         assert!(set.chosen(9).is_ok(), "no output there, nothing chosen");
+    }
+
+    /// A choice, a level or a mute is a change to keep; a write that
+    /// changes nothing, a rescan, or choosing what leads already, is not.
+    /// The state renders the choices and every level by key, those present
+    /// first, and restoring it puts each level back where its key is.
+    #[test]
+    fn what_is_kept_renders_and_restores_by_key() {
+        let mut set = pair();
+        let start = set.generation();
+        assert!(!set.set_volume(0, VOLUME_NORM));
+        assert!(!set.set_muted(0, false));
+        set.rescan(vec![output(0, 0, "PCH:0", "pch-0", "a")])
+            .unwrap();
+        assert_eq!(set.generation(), start, "nothing to keep yet");
+        set.rescan(vec![
+            output(0, 0, "PCH:0", "pch-0", "a"),
+            output(1, 0, "Device:0", "device-0", "b"),
+        ])
+        .unwrap();
+        assert!(set.set_volume(1, VOLUME_NORM / 2));
+        set.chosen(1).unwrap();
+        let after = set.generation();
+        assert_eq!(after, start + 2);
+        set.chosen(1).unwrap();
+        assert_eq!(set.generation(), after, "it leads already");
+        assert!(set.set_muted(0, true));
+        set.chosen(0).unwrap();
+        assert_eq!(set.generation(), after + 2);
+        // Gone, its level is still kept, after those present.
+        set.rescan(vec![output(0, 0, "PCH:0", "pch-0", "a")])
+            .unwrap();
+        let text = set.state_text().unwrap();
+        assert_eq!(
+            text,
+            "td-audio-state 1\nprefer\tPCH:0\nprefer\tDevice:0\n\
+             level\tPCH:0\t65536\t1\nlevel\tDevice:0\t32768\t0\n"
+        );
+        // A daemon started afresh, with Device back: each level is where
+        // its key is, the choices lead in their order, and nothing is new
+        // to write.
+        let mut fresh = pair();
+        let generation = fresh.generation();
+        fresh.restore(crate::state::parse(&text).unwrap());
+        assert_eq!(fresh.generation(), generation);
+        assert_eq!(
+            levels(&fresh),
+            [
+                (0, "pch-0", VOLUME_NORM, true),
+                (1, "device-0", VOLUME_NORM / 2, false)
+            ]
+        );
+        assert_eq!(fresh.preferred(0), Some(0));
+        assert_eq!(fresh.state_text().unwrap(), text);
+        // Without Device, its level waits for it.
+        let mut alone =
+            OutputSet::discovered(vec![output(0, 0, "PCH:0", "pch-0", "a")], 0).unwrap();
+        alone.restore(crate::state::parse(&text).unwrap());
+        let change = alone
+            .rescan(vec![
+                output(0, 0, "PCH:0", "pch-0", "a"),
+                output(1, 0, "Device:0", "device-0", "b"),
+            ])
+            .unwrap();
+        assert_eq!(change.added, [1]);
+        assert_eq!(levels(&alone)[1], (1, "device-0", VOLUME_NORM / 2, false));
+        // The stand-in keeps nothing.
+        let mut stand_in = OutputSet::default();
+        stand_in.restore(crate::state::parse(&text).unwrap());
+        assert_eq!(stand_in.preferred(0), Some(0));
+        assert_eq!(stand_in.state_text().unwrap(), "td-audio-state 1\n");
     }
 }

@@ -29,6 +29,7 @@ const MODULES: &[(&str, &str)] = &[
     ("serve", include_str!("../../../td-audio/src/serve.rs")),
     ("session", include_str!("../../../td-audio/src/session.rs")),
     ("sink", include_str!("../../../td-audio/src/sink.rs")),
+    ("state", include_str!("../../../td-audio/src/state.rs")),
     ("sys", include_str!("../../../td-audio/src/sys.rs")),
     ("tone", include_str!("../../../td-audio/src/tone.rs")),
     ("wav", include_str!("../../../td-audio/src/wav.rs")),
@@ -224,7 +225,7 @@ mod tests {
         declared.sort_unstable();
         written.sort_unstable();
         assert_eq!(written, declared);
-        assert_eq!(written.len(), 15);
+        assert_eq!(written.len(), 16);
 
         let mut pulse_declared = declared_in(PULSE_LIB_RS);
         let mut pulse_written: Vec<_> = PULSE
