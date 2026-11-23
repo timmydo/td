@@ -1,9 +1,6 @@
 # Provisional JMAP migration
 
 The production domains have moved from Stalwart to td-mta.
-[PRODUCTION.md](PRODUCTION.md), "Retired Stalwart source and recovery
-copies", records the retained source and the rollback procedure, whose
-td-mta side uses the export, verify, inventory and compare commands below.
 The owner decided that td-mail is the only client whose flows migration
 preserves: IMAP, POP and SMTP client submission compatibility are not
 migration requirements, and open connections seen on a source do not widen

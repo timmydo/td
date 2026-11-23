@@ -2796,9 +2796,8 @@ commands as a substitute for mail-serving work.
 ## M21 — Stalwart 0.15.2 export/import and cutover
 
 **Depends on:** M09/M14/M20. **Own:** migration CLI and archive schema
-(MIGRATION.md) and the documented procedures for the retained source and
-rollback (PRODUCTION.md); use the shared store transaction API and bounded
-HTTPS transport.
+(MIGRATION.md); use the shared store transaction API and bounded HTTPS
+transport.
 
 Paginate JMAP folders/emails, download raw blobs, build a digest/count manifest,
 and import under stable source-object mappings. Preserve hierarchy, memberships,
@@ -2884,7 +2883,7 @@ protocol worker, service identity, startup/renewal/restart behavior and limits.
 Provide systemd and td-svc examples only after reading their normative contracts;
 the executable cannot require either supervisor. Include direct/gateway DNS,
 Migadu identity/auth configuration, local test instructions and the migration
-procedures (MIGRATION.md, PRODUCTION.md). td image recipe/integration is a separate future change.
+procedures (MIGRATION.md). td image recipe/integration is a separate future change.
 
 **Acceptance:** the exact installed executable passes ELF static-link checks
 and runs on a clean non-td Linux fixture with no td helper installed. It loads

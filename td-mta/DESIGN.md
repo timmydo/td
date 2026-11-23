@@ -3015,10 +3015,9 @@ data. No API executes instructions obtained from messages or logs.
 
 ## 13. Migration and operational lifecycle
 
-The production domains have moved from Stalwart 0.15.2 to td-mta;
-PRODUCTION.md, "Retired Stalwart source and recovery copies", records the
-retained source and the rollback procedure. That cutover preserved mail:
-source deletions and state reconciliation were intentionally omitted.
+The production domains have moved from Stalwart 0.15.2 to td-mta. That
+cutover preserved mail: source deletions and state reconciliation were
+intentionally omitted.
 td-mail is the only client whose flows migration preserves (MIGRATION.md).
 
 Migrate from an external server through its authenticated JMAP interface and

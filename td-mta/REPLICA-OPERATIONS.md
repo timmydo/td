@@ -67,17 +67,19 @@ host's boot configuration. Give the replica user ownership of a private
 directory on it. Keep the *underlying*, unmounted mountpoint empty, owned
 by root and mode 000 so services cannot fall back to writing the host disk.
 
-For a fresh replica, choose a short path such as `/srv/tdreplica/mail` for
-`--root`. Mount the volume and prepare its parent first. Setup creates the
-final, previously absent directory. For an installed replica, preserve its
-absolute paths, which the services and clients retain. While every service
-is stopped and after the cold backup below, copy the complete root with
-ownership and modes intact into a private directory on the new volume.
-Extracting the cold archive into that empty directory and comparing it with
-`tar -df` before switching preserves the full root and its permissions.
-Keep the original offline. Bind-mount that directory at the old absolute
-path over an empty, inaccessible underlying mountpoint. Persist both mounts
-in the host configuration before re-enabling the user services.
+For a fresh replica, choose a short path such as `/srv/tdreplica/mail`
+for `--root`. Mount the volume and prepare its parent first. Setup
+creates the final, previously absent directory. For an installed
+replica, preserve its absolute paths, which the services and clients
+retain. While every service is stopped, save the root to a cold archive
+on another disk (`tar -cpf` under `umask 077`), then copy the complete
+root with ownership and modes intact into a private directory on the new
+volume. Extracting the cold archive into that empty directory and
+comparing it with `tar -df` before switching preserves the full root and
+its permissions. Keep the original offline. Bind-mount that directory at
+the old absolute path over an empty, inaccessible underlying mountpoint.
+Persist both mounts in the host configuration before re-enabling the
+user services.
 
 Verify the budget on the database host, before the first copy, after a move
 or resize and before restarting an upgraded copier. For an ext4 volume use
@@ -163,24 +165,23 @@ The normal installed td-mail launcher grants the configured private socket;
 restart td-mail after changing that path. See
 [td-mail's configuration](../td-mail/README.md) for the exact account fields.
 
-Guix Home users must keep the three service definitions in their own Home
-source. Installer output and a runtime `herd load` do not amend that source.
-Remove a migrated replica's old renewal service from it so a later reconfigure
-does not restore that job. Keep the currently working package profile and
-runtime GC roots; a binary update is not a reason to replace the Home profile.
-User services start according to the user manager's login/boot policy; this
+Guix Home users must keep the three service definitions in their own
+Home source. Installer output and a runtime `herd load` do not amend
+that source. Keep the currently working package profile and runtime GC
+roots; a binary update is not a reason to replace the Home profile. User
+services start according to the user manager's login/boot policy; this
 is not automatically an unattended system service.
 
 ## Search preparation and Home configuration
 
 Installations that enabled automatic search preparation also have
-`td-mta-maint-search` and `td-mta-maint-search-status`. These are optional
-scheduled jobs, separate from the three replica services. Keep both generated
-Shepherd definitions in your own Home source alongside the replica services;
-a helper that reconfigures the installed Home does not edit that source.
-Before your next reconfigure, build your Home configuration and check that
-all five service definitions remain present and that the old replica renewal
-job is absent. Retain the existing packages and runtime GC roots.
+`td-mta-maint-search` and `td-mta-maint-search-status`. These are
+optional scheduled jobs, separate from the three replica services. Keep
+both generated Shepherd definitions in your own Home source alongside
+the replica services; a helper that reconfigures the installed Home does
+not edit that source. Before your next reconfigure, build your Home
+configuration and check that all five service definitions remain
+present. Retain the existing packages and runtime GC roots.
 
 Check the durable search progress independently of synchronization:
 
@@ -241,118 +242,16 @@ search job before switching binaries. Restart their schedules after verifying
 the reader and copier. On systemd this means stopping the timers and their
 services; on Shepherd stop the two timed services. Preserve search progress.
 
-Schema changes need an explicit compatible upgrade procedure and a retained
-backup. Stop all users of the database, including search preparation and other
-maintenance jobs, before upgrading; binary rollback alone
-does not undo a schema upgrade. PostgreSQL package updates are a separate
-operation. Public-server deployment and ACME renewal are independent of local
-replica updates.
-
-### Fenced desktop upgrade from schema 43, 44 or 45 to 46
-
-This procedure is for a private Unix-socket replica with the three generated
-services. Keep the public deployment tooling on the primary. Schedule a
-desktop read outage. Run the mail commands as the installation user.
-
-1. Record the current `replica-progress` output, local epoch, source origin
-   and epoch, account ID, generation, cursor, pending-page counts and current
-   executable (`readlink -e "$replica_bin"`). Stop synchronization, the reader, optional search timers **and their active
-   jobs**, and any manual copy command. With writers now fenced, recapture
-   the progress values so the comparison uses the last committed page. Prevent supervisor respawn and interactive access for the
-   duration of the cutover. With Shepherd use `herd stop td-mta-replica-sync`,
-   `herd stop td-mta-replica`, then `herd stop td-mta-replica-postgres`.
-   The corresponding systemd commands are `systemctl --user stop NAME`.
-   Confirm the three services have stopped. Require PostgreSQL 17
-   `pg_controldata "$replica_root/postgres"` to report a clean shut down.
-2. Save the entire stopped root to a new mode-0700 recovery directory on a
-   **different volume**. Include PGDATA with WAL, local passwords and
-   connection files, configuration, copy-state and supervisor definitions.
-   First confirm the old PGDATA has a local pg_wal directory, an empty
-   pg_tblspc and no relocated cluster files. An installation that relocated
-   any of these needs a cold backup covering those locations as well and a
-   verified relocation into the capped volume before this procedure.
-   With the single-volume layout above, `tar -cpf "$backup/root.tar" -C
-   "$replica_root" .` and `tar -df "$backup/root.tar" -C "$replica_root"`
-   create and compare the archive. Run under `umask 077` and require success.
-   Protect the backup, record the previous executable beside it and retain
-   its release, runtime libraries and PostgreSQL 17 installation. If moving
-   from an unbounded filesystem, complete the volume move above now. Verify
-   the budget, identity of the volume, unused space and absence of relocated
-   WAL or tablespaces.
-3. Install the reviewed candidate with `./install-td-mta --prefix PREFIX`,
-   using the existing prefix. Leave supervisor services stopped. In the
-   private recovery directory create `owner.hba` containing exactly
-   `local td_mta td_mta_owner scram-sha-256` on one line and
-   `local all all reject` on the next. As the installation user, start
-   PostgreSQL in a separate foreground terminal. Its private owner-only
-   socket remains at the address in the existing connection file.
-
-   ```sh
-   postgres -D "$replica_root/postgres" -c "config_file=$replica_root/postgresql.conf" \
-     -c "hba_file=$backup/owner.hba" -c "listen_addresses=" \
-     -c "unix_socket_directories=$replica_root/socket"
-   ```
-
-4. Read the plan with the candidate. Require the recorded local store epoch
-   and target 46. From schema 45 expect one pending migration (46), which
-   adds two empty sender-authentication tables. From schema 44 expect 45
-   and 46, and from schema 43 expect 44, 45 and 46, in order. Budget space
-   and time for the Email order index build and its WAL when 45 is
-   pending. An upgrade from 43 also backfills replica identities. For
-   example:
-
-   ```sh
-   owner_file="$replica_root/owner-connection"
-   "$replica_bin" postgres schema-plan --connection-file "$owner_file"
-   ```
-
-   Read the plan output and verify all four values above. On a match,
-   run the upgrade in the same fenced maintenance window.
-
-   ```sh
-   "$replica_bin" postgres schema-upgrade --connection-file "$owner_file" --timeout-seconds 900
-   "$replica_bin" postgres schema-inspect --connection-file "$owner_file"
-   "$replica_bin" postgres replica-progress --connection-file "$owner_file" \
-     --epoch "$replica_epoch" --account "$replica_account"
-   ```
-
-   Require version 46 and the same epoch, source binding, account, generation,
-   cursor, pending ID count and unfinished ID count as before. When upgrading
-   from 43 the live receipt count can decrease. Keep the replica reader and
-   publisher privilege sets, and extend them to the two new tables with the
-   owner role over the private socket. Use the port from the socket's
-   `.s.PGSQL.PORT` filename and the password from the owner connection file:
-
-   ```sh
-   psql -h "$replica_root/socket" -p PORT -U td_mta_owner -d td_mta -v ON_ERROR_STOP=1 -c \
-     'GRANT SELECT, INSERT, UPDATE, DELETE ON td_mta.email_authentication, td_mta.email_dkim_signatures TO td_mta_runtime; GRANT SELECT ON td_mta.email_authentication, td_mta.email_dkim_signatures TO td_mta_reader'
-   ```
-
-   This step is required: until it runs, the reader and copier refuse to
-   qualify and the replica serves nothing, because qualification requires
-   the shared roles' privileges on every table. Replicated Emails carry no
-   sender-authentication rows; the tables stay empty on a replica. After a lost upgrade response, keep writers
-   fenced, wait for the migration lock to release and inspect the ledger.
-   The original version may be retried after diagnosis. A confirmed 46 goes through
-   the same verification before serving.
-5. Stop the private foreground server with `pg_ctl -D "$replica_root/postgres"
-   -m fast -w stop`. Confirm clean shutdown. Start the normal PostgreSQL
-   service with its original HBA, then start the reader. Check
-   `status --json --require-ready` and read one saved message. Start the
-   copier, require a successful round recorded *after* startup, then resume
-   the search schedules. Keep the rollback copy until verification finishes.
-
-If the cutover fails, stop the copier, reader, scheduled jobs and **both**
-possible PostgreSQL launches. Preserve the failed cluster separately.
-Restore the verified pre-upgrade cold archive with `tar -xpf "$backup/root.tar"
--C "$replica_root"` into an **empty, mode-0700 root** at the original absolute
-path on the capped volume. Select the saved old executable by atomically
-replacing the installation's `bin/td-mta` symlink. Start PostgreSQL, verify
-the original schema version, local epoch, source binding and checkpoints with the old
-binary, then restart and verify the reader and copier. Recheck freshness.
-Copy progress made after the archive must be fetched again. If the required source history has expired,
-keep this copy for reading and provision a separate fresh replica from the
-source before switching clients. The previous binary requires its original ledger.
+Schema changes need an explicit compatible upgrade procedure, run in a
+fenced maintenance window, and a retained cold backup of the stopped
+root on a different volume. Stop all users of the database, including
+search preparation and other maintenance jobs, before upgrading; binary
+rollback alone does not undo a schema upgrade. A migration that adds
+tables also needs the replica's publisher (`td_mta_runtime`) and reader
+(`td_mta_reader`) grants extended to them; until then the copier and
+reader refuse to qualify. PostgreSQL package updates are a separate
+operation. Public-server deployment and ACME renewal are independent of
+local replica updates.
 
 ## Integrity and recovery evidence
 

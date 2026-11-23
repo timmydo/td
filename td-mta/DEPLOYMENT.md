@@ -978,62 +978,6 @@ status in the supervisor, and arrange operator notification appropriate to the
 host. A timer alone does not send an alert. Check free disk space and off-host
 backup copies separately; a recent local archive does not cover VM loss.
 
-## Existing TCP/TLS local installations
-
-Local setups made before PostgreSQL moved to its private socket listen on
-loopback TCP with a private TLS leaf, and may run the generated
-`td-mta-maint-postgres-tls-renew` job. New operator helpers no longer have
-that renewal mode, so disable the job in its supervisor and delete its
-generated `td-mta-maint-postgres-tls-renew.service`, `.timer` and `.scm`
-under `PREFIX/share/td-mta/services` before installing a new operations
-helper; the retained older helper still serves it until then. td-mta
-refuses a TCP connection file, so migrate before running it, retaining
-credentials, epochs and mail data:
-
-1. Stop the MTA services, scheduled jobs that use the database, then
-   PostgreSQL.
-2. In `ROOT/postgresql.conf` set `listen_addresses = ''`, `ssl = off`,
-   `unix_socket_directories = 'ROOT/socket'` and `unix_socket_permissions =
-   0600`, and remove `ssl_cert_file` and `ssl_key_file`. Create
-   `ROOT/socket` mode 0700 if it does not exist.
-3. Replace the `hostssl` lines in the cluster's `pg_hba.conf` with `local
-   td_mta td_mta_ROLE scram-sha-256` for each login, ending with the
-   existing reject rules.
-4. Rewrite the owner and runtime connection files (mode 0600) to
-   `postgresql://td_mta_ROLE:PASSWORD@:PORT/td_mta?host=ROOT/socket`, and
-   the backup libpq service and password files as in "Local logical backup
-   and an isolated restore drill".
-5. Start PostgreSQL, run `postgres runtime-check` and `schema-inspect`, start
-   the services and require each profile's readiness, then run a backup.
-
-The leaf and CA remain the mail listeners' certificates; renew them as
-below. Retain the old files until validation is complete.
-
-## Local replica transport
-
-Fresh `--setup-replica` installations use private Unix sockets for both
-PostgreSQL and JMAP. They generate no CA, certificate, private TLS key, or
-renewal job. The local JMAP socket is `ROOT/jmap/socket`; PostgreSQL uses
-`ROOT/socket/.s.PGSQL.PORT` (default PORT 35433). Both directories are private,
-and sockets are mode 0600. PostgreSQL still authenticates owner, publisher and
-reader roles with SCRAM; td-mail still authenticates with its separate local
-device password. The source synchronization connection remains verified HTTPS.
-
-The previous replica-specific TLS renewal options and job generation have
-been retired. Existing TLS installations need a deliberate transport migration
-before their old job is disabled: retain their credentials, epochs, copy state
-and mail data; stop the sync and reader; select a `local_jmap` profile; configure
-private PostgreSQL sockets and SCRAM-only local role rules; update protected
-connection files and the td-mail account; restart and verify discovery,
-mailboxes, body reads and sync progress. Remove the old renewal service from
-its persistent supervisor configuration. Retain recovery files until validation
-is complete. Do not run fresh setup over an existing root: it intentionally
-refuses existing data. A pending old renewal journal is retained for
-inspection; no current helper renews or overwrites it.
-
-Public HTTPS/ACME is independent of this local transport and remains enabled
-where configured.
-
 ## Renew a local private certificate
 
 A local `localhost` deployment uses its explicitly trusted private CA;
@@ -1225,7 +1169,7 @@ origin, a protected password file, your local mailbox address, resolver and
 explicit body/blob/Email/receipt quotas. Place the database on a dedicated
 size-limited volume and verify the mount before enabling the generated copy
 worker. The [desktop replica runbook](REPLICA-OPERATIONS.md#size-and-verify-the-replica-volume)
-covers new and installed volumes and the fenced upgrade to schema 46.
+covers new and installed volumes.
 Source credentials stay separate from
 the new local JMAP password. The installer discovers source IDs through HTTPS;
 no custom SQL or PostgreSQL access to the source is needed.
