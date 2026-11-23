@@ -103,9 +103,13 @@ kernel) takes only versions of three or more parts. A fresh line such as
 7.3 therefore waits for 7.3.1, as td follows the newest stable point
 release. A `Line` watch (PostgreSQL) takes only one release line's
 versions: td-mta qualifies PostgreSQL 17, so a new major moves td-mta, and
-then this watch's line, before it moves the pin. A version whose release
-part contains `alpha`, `beta`, `rc`, `pre` or `dev`, or carries a `-TAG`
-pre-release, is never taken. `+build` metadata is ignored.
+then this watch's line, before it moves the pin. A PostgreSQL minor bump
+also extends td-mta-deploy's minor-release table
+(`td-mta/src/bin/td-mta-deploy/postgres_minors.rs`) from each new
+release's migration notes; a td-mta test fails until it does. A
+version whose release part contains `alpha`, `beta`, `rc`, `pre` or
+`dev`, or carries a `-TAG` pre-release, is never taken. `+build`
+metadata is ignored.
 `td-recipe-eval source-watches` prints the joined table.
 
 Before bumping, read the release notes and advisories between the pin and

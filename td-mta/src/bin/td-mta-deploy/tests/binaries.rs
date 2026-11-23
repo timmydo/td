@@ -9,7 +9,7 @@ const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 
 fn job(closure: &str, reviewed: &str) -> Json {
     td_json::parse(&format!(
-        r#"{{"mode":"postgres-binaries","closure":{closure},"postgres_minor_reviewed":"{reviewed}"}}"#
+        r#"{{"mode":"postgres-binaries","closure":{closure},"postgres_launcher_minor":"{reviewed}"}}"#
     ))
     .unwrap()
 }
@@ -21,9 +21,14 @@ fn entries(first: &str, second: &str) -> String {
 }
 
 #[test]
-fn the_job_names_postgresql_then_glibc_and_a_reviewed_older_minor() {
+fn the_job_names_postgresql_then_glibc_and_an_older_live_minor() {
     let closure = Closure::from_job(&job(&entries(PG, GLIBC), "17.6")).unwrap();
-    assert_eq!((closure.minor, closure.reviewed), (12, 6));
+    assert_eq!((closure.minor, closure.live), (12, 6));
+    assert!(closure.rebuilds_gin().unwrap());
+    assert!(!Closure::from_job(&job(&entries(PG, GLIBC), "17.12"))
+        .unwrap()
+        .rebuilds_gin()
+        .unwrap());
     assert_eq!(closure.basenames(), [PG, GLIBC]);
     assert_eq!(
         closure.postgres().unwrap(),
@@ -641,4 +646,34 @@ fn store_entries_are_verified_before_and_after_unpacking_and_never_replaced() {
     assert!(place(&mut store, &entry, partial).is_err());
     assert!(!store.steps.iter().any(|s| s.starts_with("publish")));
     assert!(store.steps.last().unwrap().starts_with("discard"));
+}
+
+#[test]
+fn minor_release_notes_refuse_what_they_concern_and_size_the_window() {
+    let (release, note) = postgres_minors::span(5, 6).unwrap().next().unwrap();
+    concerned(release, note, "0").unwrap();
+    let refused = concerned(release, note, "2").unwrap_err().to_string();
+    assert!(
+        refused.contains("17.6") && refused.contains(note.id),
+        "{refused}"
+    );
+    assert!(concerned(release, note, "x").is_err());
+    assert_eq!(last_count("\n3\n").unwrap(), 3);
+    assert!(last_count("").is_err());
+    assert_eq!(gin_window(0.2), (31, 60));
+    assert_eq!(gin_window(20.0), (70, 120));
+    assert_eq!(gin_window(1e9), (1230, 1560));
+    let rows = postgres_minors::span(10, 12)
+        .unwrap()
+        .map(|(r, n)| note_record(r, n).unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(rows.iter().any(|r| r.contains("GIN rebuild rehearsed")));
+    assert!(rows.iter().any(|r| r.contains("exempt: ")));
+    assert!(rows
+        .iter()
+        .all(|r| r.contains(r#""release":"17.11""#) || r.contains(r#""release":"17.12""#)));
+    // A td release the table does not list cannot be switched to.
+    let unlisted = PG.replace("17.12", "17.13");
+    let job = job(&entries(&unlisted, GLIBC), "17.6");
+    assert!(Closure::from_job(&job).is_err());
 }

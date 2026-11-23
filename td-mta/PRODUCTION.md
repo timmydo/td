@@ -1407,40 +1407,45 @@ store on a foreign deployment host", says what enters the host's
 `/td/store` and what runs it. The switch keeps the live release and the
 data directory in place. The host must already use the private socket.
 
-First read the PostgreSQL 17 release notes from the live Debian minor
-up to td's release, the version in the `postgresql-x86-64` store name
-(17.12 at this writing), for steps an update needs, such as a reindex.
-Find the live minor with:
+What updating across each PostgreSQL 17 minor release asks of an
+installation is a reviewed table in the controller,
+`td-mta/src/bin/td-mta-deploy/postgres_minors.rs`, transcribed from each
+release's "Migration to Version 17.N" notes and the changelog entries
+they name. Each note is one of: a count over the catalogs that must be
+zero, in every database of the trial copy or once on the live server;
+the rebuild of every GIN index; or an exemption whose reason the table
+states. The switch evaluates the notes of every release after the live
+Debian minor up to td's, the version in the `postgresql-x86-64` store
+name (17.12 at this writing), and refuses a release the table does not
+list, naming the table: extending it, from that release's notes, is a
+reviewed change that precedes the switch. From the reviewed development
+checkout run:
 
 ```text
-sudo LD_LIBRARY_PATH=/opt/td-mta/postgresql/usr/lib/x86_64-linux-gnu \
-  /opt/td-mta/postgresql/usr/lib/postgresql/17/bin/postgres --version
-```
-
-Then run, from the reviewed development checkout:
-
-```text
-./td-mta/deploy --postgres-binaries --postgres-minor-reviewed 17.N
+./td-mta/deploy --postgres-binaries
 ```
 
 `--window-seconds` and `--jmap-account` work as for a deployment. Before
 building anything the launcher reads the live Debian `postgres
---version` over its SSH connection (read-only) and refuses unless it
-reports the reviewed minor. In the clean checkout of the controller
+--version` over its SSH connection (read-only) and refuses a release the
+table does not list. In the clean checkout of the controller
 revision, it then builds td-builder and td-recipe-eval and runs
 `td-recipe-eval build-run postgresql-x86-64 postgresql-x86-64
 glibc-x86-64`. When the development machine built that revision's graph
 before, this is a cache hit; otherwise it is a cold build of up to six
-hours. The reviewed minor must not be newer than the built one. The
-launcher refuses an output whose ELF interpreter or run path leaves the
-two store paths, and resolves what each executable and shared object of
+hours. The live minor must not be newer than the built one, and the
+table must list every release up to it; a unit test of td-mta-deploy
+fails while it does not list the pinned release, so a pin bump extends
+the table before it reaches a host. The launcher refuses an output
+whose ELF interpreter or run path leaves the two store paths, and
+resolves what each executable and shared object of
 the PostgreSQL output loads as td's loader would: every NEEDED library
 must be one already loaded or one the needing object's own run path
 finds inside the closure, never the loader's default directories or
 cache. It writes each output with `td-builder nar-dump` and uploads the
 NAR into the job directory (root 0600), checking its SHA-256 there.
 job.json records the `postgres-binaries` operation, each basename with
-its NAR hash and the reviewed minor.
+its NAR hash and the live minor it read (`postgres_launcher_minor`).
 
 The controller then checks, unfenced, what an activation checks, the
 private socket, that the live server's executable is the Debian
@@ -1478,12 +1483,18 @@ The in-place switch needs all six gates:
 4. After the Debian server stops, td's `pg_controldata` reports `shut
    down`.
 5. The td server's first start is on a fresh physical copy.
-6. `--postgres-minor-reviewed` names the live Debian minor, both as its
-   `postgres --version` and its `server_version_num` report it.
+6. The live Debian minor, both as its `postgres --version` and its
+   `server_version_num` report it, is the one the launcher read, and
+   every minor-release note from it up to td's release holds: each
+   count is zero, and a GIN rebuild finds GIN indexes only in `td_mta`.
 
 Gates 1 to 3 run on the live server through the owner login (`td_mta`)
-and the marker login (`postgres`). For gate 5 the controller takes a
-fresh online base backup, checks it with td's `pg_controldata`, and
+and the marker login (`postgres`), and the notes' cluster counts
+through the owner login. When a note rebuilds GIN indexes, the
+filesystem of the data directory must have free twice their size and a
+GiB more; that refusal leaves the Debian server running until space
+is freed. For gate 5 the controller takes a fresh online base backup,
+checks it with td's `pg_controldata`, and
 starts td's server on it with the production `postgresql.conf` and
 `pg_hba.conf`, overriding only the trial's paths and socket, plus a peer
 rule that lets root in as `setup_admin` on that copy alone. Through a
@@ -1495,7 +1506,18 @@ every database that takes connections, scans every stored value for lz4
 (gate 2's scan; the error and the receipt's `postgres_lz4_values` name
 each offending column), and requires that each database's collation version
 and each used libc collation's version are what td glibc reports, and
-that every installed extension is available to td's server. Through the
+that every installed extension is available to td's server. It runs
+every database count of the minor-release notes, and when a note
+rebuilds GIN indexes it rebuilds, through the owner login as production
+will, every GIN index of `td_mta` (td-mta's trigram search index) in one
+transaction of at most 600 seconds, timing it, and requires none in
+another database. That time sizes the production rebuild: unless
+`--window-seconds` is at least twice it and thirty seconds more, the
+switch refuses before fencing and names a window a quarter longer, in
+whole minutes, to run again with.
+The receipt's `postgres_minor_notes` lists each note with `verified`,
+`GIN rebuild rehearsed` or `exempt` and its reason, and
+`postgres_gin_rebuild_trial_ms` the trial's time. Through the
 owner login `pg_trgm` must answer and serve a probe of td-mta's search
 through its trigram index, and td's `pg_dump --schema-only` of
 `td_mta` must complete. The copy is then removed.
@@ -1515,8 +1537,10 @@ file, stops PostgreSQL, checks gate 4, and installs
 `UnsetEnvironment=LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT`. After
 `daemon-reload` systemd's command must match it. It starts PostgreSQL
 and requires a closed socket, the production primary, td's executable
-with the closure's mappings and no loader variable, td's release in
-`server_version_num`, and the trigram probe. Then it opens the socket,
+with the closure's mappings and no loader variable, and td's release in
+`server_version_num`; when the notes rebuild GIN indexes it rebuilds
+them through the owner login, requiring the trial's count, and records
+`rebuilt GIN indexes`; then the trigram probe. Then it opens the socket,
 starts the services and timers, and verifies the live release, every
 login and health as after an activation. The receipt records the store
 entries (`installed` or `present`), `postgres_debian_minor`, and the
@@ -1581,9 +1605,12 @@ isolated restore drill"), restore it into a new cluster that td's
 `wal_compression` td supports), qualify it as the restore drill does,
 and only then point the service at it. This controller does not automate
 that move. A gate 4 or 5 failure leaves the Debian server running;
-inspect the receipt and the trial's evidence. A gate 6 refusal means the
-named minor is not the live one: read the notes from the live minor and
-run again.
+inspect the receipt and the trial's evidence. A gate 6 refusal names the
+release and note: a release the table does not list needs the table
+extended in a reviewed change first; a nonzero count means the cluster
+holds what that note concerns, which the switch does not repair, so stay
+on the Debian server; a live release other than the launcher's means it
+changed meanwhile, so run the switch again.
 
 `--postgres-binaries` moves only from the Debian binaries to a td
 closure. Moving from one td closure to another, as after the

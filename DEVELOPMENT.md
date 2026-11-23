@@ -1268,7 +1268,8 @@ target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
 them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL
 read, plain-text send, foreground-service, schema-bounds, uploads,
 email-views, SMTP-owner, deployment WAL replay, service-login
-provisioning and socket writer fence cases, each in its own process.
+provisioning, socket writer fence and PostgreSQL minor-release check
+cases, each in its own process.
 Each requires a positive passing libtest summary and exit success. The
 other ignored `postgres_probe` cases, the performance harness aside,
 run only by hand: one `--exact` case per `cargo test --release` process,
@@ -1299,8 +1300,9 @@ The test host needs unprivileged Linux namespaces and PostgreSQL's catalog,
 shared libraries and extensions. The performance harness launches its
 database directly and accepts other PostgreSQL 17 package layouts.
 The deployment fixtures exercise streaming backup and exact recovery, SCRAM
-and per-role grants over a private Unix socket, and the socket writer fence,
-on disposable clusters. The native mail leg also runs the host operator’s
+and per-role grants over a private Unix socket, the socket writer fence,
+and the binary switch's minor-release checks and GIN rebuild, on
+disposable clusters. The native mail leg also runs the host operator’s
 scheduled logical backup, off-host transfer and isolated restore drill
 against a disposable PostgreSQL cluster. Interactive service-login tests use
 util-linux `setsid` to exercise detached password prompting. The wrapper

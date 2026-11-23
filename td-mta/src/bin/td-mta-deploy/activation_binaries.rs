@@ -6,9 +6,10 @@
 //! The Debian tree stays for rollback.
 use super::*;
 use crate::{
-    common::{banner_minor, postgres_minor, store_basename, DEBIAN_TOOLS},
+    common::{banner_minor, free_bytes, postgres_minor, store_basename, DEBIAN_TOOLS},
     isolation::files::{self, Setting},
     physical::SOCKET_DIR,
+    postgres_minors::{self, Check, Note, GIN_BYTES, GIN_INDEXES, REINDEX_GIN},
 };
 use database::OWNER_SERVICE;
 use fence::{open_socket, LiveSocket, SocketFence};
@@ -120,14 +121,15 @@ pub(super) struct Entry {
     pub(super) nar_sha256: String,
 }
 
-/// The job's closure, PostgreSQL first, and the operator's review.
+/// The job's closure, PostgreSQL first, and the live release it replaces.
 pub(super) struct Closure {
     pub(super) postgres: Entry,
     pub(super) glibc: Entry,
     /// N of the td-built 17.N.
     pub(super) minor: u32,
-    /// The live Debian minor whose release notes up to 17.N were read.
-    pub(super) reviewed: u32,
+    /// The live Debian minor the launcher read, which the minor-release
+    /// table covers up to 17.N.
+    pub(super) live: u32,
 }
 
 fn entry(json: &Json) -> R<Entry> {
@@ -148,17 +150,25 @@ impl Closure {
         let (postgres, glibc) = (entry(postgres)?, entry(glibc)?);
         let minor = postgres_minor(store_basename(&postgres.basename, "postgresql-x86-64")?)?;
         store_basename(&glibc.basename, "glibc-x86-64")?;
-        let reviewed = postgres_minor(field(job, "postgres_minor_reviewed")?)?;
-        require(
-            reviewed <= minor,
-            "the reviewed release is newer than the td-built server",
-        )?;
+        let live = postgres_minor(field(job, "postgres_launcher_minor")?)?;
+        postgres_minors::movable(live, minor)?;
         Ok(Self {
             postgres,
             glibc,
             minor,
-            reviewed,
+            live,
         })
+    }
+
+    /// The minor-release notes from the live release up to td's.
+    fn notes(&self) -> R<impl Iterator<Item = (u32, &'static Note)>> {
+        postgres_minors::span(self.live, self.minor)
+    }
+
+    fn rebuilds_gin(&self) -> R<bool> {
+        Ok(self
+            .notes()?
+            .any(|(_, note)| matches!(note.check, Check::ReindexGin)))
     }
 
     fn basenames(&self) -> [&str; 2] {
@@ -391,6 +401,66 @@ pub(super) fn trigram(output: &str) -> R<()> {
     )
 }
 
+const LIVE_CHANGED: &str = "the live Debian PostgreSQL is not the release the launcher read: run td-mta/deploy --postgres-binaries again";
+
+/// A minor-release note's count, which must be zero.
+pub(super) fn concerned(release: u32, note: &Note, count: &str) -> R<()> {
+    if count == "0" {
+        return Ok(());
+    }
+    count
+        .parse::<u64>()
+        .map_err(|_| "unexpected minor-release check result")?;
+    Err(fmt(format_args!(
+        "PostgreSQL 17.{release} note {}: the cluster holds what it concerns, which the switch does not repair; stay on the Debian server",
+        note.id
+    ))?
+    .into())
+}
+
+/// The count a script prints last.
+pub(super) fn last_count(output: &str) -> R<u64> {
+    Ok(output
+        .lines()
+        .last()
+        .ok_or("missing count")?
+        .trim()
+        .parse()?)
+}
+
+/// What the receipt records of each minor-release note: `verified`,
+/// `exempt` with its reason, or the GIN rebuild.
+fn note_record(release: u32, note: &Note) -> R<Json> {
+    let mut row = Json::Obj(Vec::new());
+    set(
+        &mut row,
+        "release",
+        Json::Str(fmt(format_args!("17.{release}"))?),
+    )?;
+    set(&mut row, "id", Json::Str(owned(note.id)?))?;
+    let result = match note.check {
+        Check::Database(_) | Check::Cluster(_) => owned("verified")?,
+        // Production's rebuild is the event "rebuilt GIN indexes".
+        Check::ReindexGin => owned("GIN rebuild rehearsed")?,
+        Check::Exempt(reason) => fmt(format_args!("exempt: {reason}"))?,
+    };
+    set(&mut row, "result", Json::Str(result))?;
+    Ok(row)
+}
+
+/// The rebuild's own limit, on the copy and in production.
+const GIN_LIMIT: u64 = 600;
+
+/// The window a switch needs for a GIN rebuild that took `trial` seconds
+/// on the copy, twice that and half a minute for the rest, and the window
+/// a refusal names: a quarter more, in whole minutes, so a rerun's
+/// slightly slower trial still fits.
+pub(super) fn gin_window(trial: f64) -> (u64, u64) {
+    // Bounded by the rebuild's limit.
+    let needed = (trial.clamp(0.0, GIN_LIMIT as f64) * 2.0 + 30.0).ceil() as u64;
+    (needed, (needed + needed / 4).div_ceil(60) * 60)
+}
+
 fn line_uses_index(line: &str) -> bool {
     line.trim_start()
         .trim_start_matches("->")
@@ -540,7 +610,7 @@ impl Deployment {
         )
     }
 
-    // Gate 6: the operator read the release notes from exactly this minor.
+    // Gate 6: the live server is the release the launcher read.
     fn debian_server(&mut self, closure: &Closure) -> R<()> {
         let debian = child(Path::new(DEBIAN_TOOLS), "postgres")?;
         let exe = fs::canonicalize(fmt(format_args!("/proc/{}/exe", self.pid(PG)?))?)?;
@@ -554,10 +624,7 @@ impl Deployment {
             "postgres_debian_minor",
             Json::from(u64::from(minor)),
         )?;
-        require(
-            minor == closure.reviewed,
-            "--postgres-minor-reviewed must name the live Debian release",
-        )
+        require(minor == closure.live, LIVE_CHANGED)
     }
 
     fn binaries_cutover(&mut self, closure: &Closure, switch: &mut Switch) -> R<()> {
@@ -624,6 +691,17 @@ impl Deployment {
             )?)? == closure.minor,
             "the switched server reports another release",
         )?;
+        if closure.rebuilds_gin()? {
+            let count = self.reindex_gin(&[])?;
+            require(
+                self.record
+                    .get("postgres_gin_indexes")
+                    .and_then(Json::as_u64)
+                    == Some(count),
+                "production's GIN indexes differ from the trial's",
+            )?;
+            self.event("rebuilt GIN indexes")?;
+        }
         trigram(&self.sql("owner", TRIGRAM, &[], true)?)?;
         self.event("td-built PostgreSQL started")?;
         self.admit()?;
@@ -639,14 +717,48 @@ impl Deployment {
     // marker (postgres) logins.
     fn live_gates(&self, closure: &Closure) -> R<()> {
         let minor = cluster_gates(&self.sql("owner", CLUSTER_GATES, &[], false)?)?;
-        require(
-            minor == closure.reviewed,
-            "--postgres-minor-reviewed must name the live server's release",
-        )?;
+        require(minor == closure.live, LIVE_CHANGED)?;
         for role in ["owner", "marker"] {
             database_gates(&self.sql(role, DATABASE_GATES, &[], false)?, false)?;
         }
+        // The minor-release notes about the cluster as a whole.
+        for (release, note) in closure.notes()? {
+            if let Check::Cluster(count) = note.check {
+                concerned(release, note, &self.sql("owner", count, &[], false)?)?;
+            }
+        }
+        // REINDEX writes each new index beside the old one, and its WAL.
+        if closure.rebuilds_gin()? {
+            let size: u64 = self.sql("owner", GIN_BYTES, &[], false)?.parse()?;
+            require(
+                free_bytes(Path::new(PGDATA))? > size.saturating_mul(2).saturating_add(GIB),
+                "too little space beside the data directory for the GIN rebuild",
+            )?;
+        }
         Ok(())
+    }
+
+    // As the owner: on the trial copy, then on production before writer
+    // admission.
+    fn reindex_gin(&self, ns: &[String]) -> R<u64> {
+        let mut cmd = self.in_namespace(ns, self.host.tool("psql")?);
+        cmd.args(["-XwqAt", "-v", "ON_ERROR_STOP=1", "service=td-mta-backup"])
+            .env("PGSERVICEFILE", OWNER_SERVICE);
+        let out = self
+            .host
+            .exec(
+                &mut cmd,
+                REINDEX_GIN.as_bytes(),
+                Duration::from_secs(GIN_LIMIT),
+                true,
+            )
+            .map_err(|e| {
+                fmt(format_args!(
+                    "the GIN rebuild failed (its limit: {GIN_LIMIT} seconds or the writer window): {e}"
+                ))
+                .map_or_else(|_| e, Into::into)
+            })?;
+        last_count(std::str::from_utf8(&out.stdout)?)
     }
 
     /// Gate 5: the td server's first start is on a fresh copy, with the
@@ -683,9 +795,27 @@ impl Deployment {
                     == closure.minor,
                 "the trial reports another release",
             )?;
+            let gin = closure.rebuilds_gin()?;
+            let mut rebuilt = None;
             for name in copy.superuser(host, "td_mta", DATABASES, short)?.lines() {
                 require(role_name(name), "unexpected database name")?;
                 database_gates(&copy.superuser(host, name, DATABASE_GATES, short)?, true)?;
+                for (release, note) in closure.notes()? {
+                    if let Check::Database(count) = note.check {
+                        concerned(release, note, &copy.superuser(host, name, count, short)?)?;
+                    }
+                }
+                if gin && name == "td_mta" {
+                    // As production will: the owner, through its own login.
+                    let start = Instant::now();
+                    let count = d.reindex_gin(&ns)?;
+                    rebuilt = Some((count, start.elapsed().as_secs_f64()));
+                } else if gin {
+                    require(
+                        copy.superuser(host, name, GIN_INDEXES, short)? == "0",
+                        "a GIN index outside the mail database, which the switch does not rebuild; stay on the Debian server",
+                    )?;
+                }
                 let scan = copy.superuser(host, name, LZ4_SCAN, Duration::from_secs(3600))?;
                 let found = lz4_values(&scan)?;
                 if !found.is_empty() {
@@ -703,6 +833,29 @@ impl Deployment {
                     set(&mut d.record, "postgres_lz4_values", row)?;
                     return Err(message.into());
                 }
+            }
+            let mut notes = Vec::new();
+            for (release, note) in closure.notes()? {
+                td_alloc::push(&mut notes, note_record(release, note)?)?;
+            }
+            set(&mut d.record, "postgres_minor_notes", Json::Arr(notes))?;
+            if let Some((count, seconds)) = rebuilt {
+                set(&mut d.record, "postgres_gin_indexes", Json::from(count))?;
+                set(
+                    &mut d.record,
+                    "postgres_gin_rebuild_trial_ms",
+                    Json::from((seconds * 1000.0).round()),
+                )?;
+                // The production rebuild runs inside the writer window.
+                let (needed, suggested) = gin_window(seconds);
+                if d.budget.as_secs() < needed {
+                    return Err(fmt(format_args!(
+                        "the GIN rebuild needs a longer writer window: run td-mta/deploy --postgres-binaries --window-seconds {suggested}"
+                    ))?
+                    .into());
+                }
+            } else {
+                require(!gin, "the mail database was not rehearsed")?;
             }
             trigram(&d.sql("owner", TRIGRAM, &ns, true)?)?;
             d.dump_schema(&ns)

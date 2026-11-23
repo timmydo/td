@@ -141,30 +141,15 @@ fn fetches_only_advertised_main_and_requires_an_already_submitted_controller() {
 }
 
 #[test]
-fn the_binary_switch_takes_the_reviewed_release_and_nothing_else() {
+fn the_binary_switch_takes_no_attestation() {
     let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let both = args(&["--postgres-binaries", "--postgres-minor-reviewed", "17.6"]);
-    let opts = parse(&both).unwrap();
+    let only = args(&["--postgres-binaries"]);
+    let opts = parse(&only).unwrap();
     assert!(opts.binaries && !opts.socket);
-    assert_eq!(opts.reviewed, Some("17.6"));
     for refused in [
-        args(&["--postgres-binaries"]),
-        args(&["--postgres-minor-reviewed", "17.6"]),
-        args(&["--postgres-binaries", "--postgres-minor-reviewed", "16.4"]),
-        args(&["--postgres-binaries", "--postgres-minor-reviewed", "17"]),
-        args(&["--postgres-binaries", "--postgres-minor-reviewed"]),
-        args(&[
-            "--postgres-binaries",
-            "--postgres-minor-reviewed",
-            "17.6",
-            "--skip-tests",
-        ]),
-        args(&[
-            "--postgres-binaries",
-            "--postgres-minor-reviewed",
-            "17.6",
-            "--postgres-socket",
-        ]),
+        args(&["--postgres-binaries", "--postgres-minor-reviewed", "17.6"]),
+        args(&["--postgres-binaries", "--skip-tests"]),
+        args(&["--postgres-binaries", "--postgres-socket"]),
     ] {
         assert!(parse(&refused).is_err(), "{refused:?}");
     }

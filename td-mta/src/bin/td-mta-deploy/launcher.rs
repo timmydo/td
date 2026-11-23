@@ -25,7 +25,7 @@ const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [OPTIONS]
-       td-mta/deploy --postgres-binaries --postgres-minor-reviewed 17.N [OPTIONS]
+       td-mta/deploy --postgres-binaries [OPTIONS]
        td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
          --identity KEY --jmap-account ACCOUNT --jmap-url URL [--config FILE] [--replace]
        td-mta/deploy --provision-host --build-account ACCOUNT --build-home DIR
@@ -33,9 +33,9 @@ const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
 Options: [--window-seconds 1..3600] [--jmap-account ACCOUNT] [--config FILE]
 Select a verified origin/main revision and deploy it to the configured host,
 move the live release's database from loopback TLS to its private socket, or
-switch it from the Debian PostgreSQL to td's source-built one. 17.N is the
-live Debian release whose notes up to td's release the operator read. The
-target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
+switch it from the Debian PostgreSQL to td's source-built one, applying
+what the reviewed minor-release table says each release in between needs.
+The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
 and installs its /var/lib/td-mta-operator/host.json. Either refuses to
@@ -47,7 +47,6 @@ struct Options<'a> {
     config: Option<&'a str>,
     socket: bool,
     binaries: bool,
-    reviewed: Option<&'a str>,
 }
 fn parse(args: &[String]) -> R<Options<'_>> {
     let mut out = Options {
@@ -57,7 +56,6 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         config: None,
         socket: false,
         binaries: false,
-        reviewed: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -74,11 +72,6 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--config" => out.config = Some(it.next().ok_or("missing target configuration")?),
             "--postgres-socket" => out.socket = true,
             "--postgres-binaries" => out.binaries = true,
-            "--postgres-minor-reviewed" => {
-                let release = it.next().ok_or("missing reviewed PostgreSQL release")?;
-                postgres_minor(release)?;
-                out.reviewed = Some(release);
-            }
             _ => return Err(HELP.into()),
         }
     }
@@ -89,10 +82,6 @@ fn parse(args: &[String]) -> R<Options<'_>> {
     require(
         !(out.socket && out.binaries),
         "one PostgreSQL operation per job",
-    )?;
-    require(
-        out.binaries == out.reviewed.is_some(),
-        "--postgres-binaries requires --postgres-minor-reviewed 17.N, which nothing else takes",
     )?;
     Ok(out)
 }
@@ -331,8 +320,9 @@ impl Local {
             "uploaded NAR mismatch",
         )
     }
-    // Gate 6 early, read-only: the live Debian server is the reviewed minor.
-    fn debian_release(&self, reviewed: &str) -> R<()> {
+    // Early and read-only, before a build of up to hours: the live Debian
+    // release, which the minor-release table must list.
+    fn debian_release(&self) -> R<u32> {
         let library = fmt(format_args!("LD_LIBRARY_PATH={DEBIAN_LIBRARIES}"))?;
         let server = child(Path::new(DEBIAN_TOOLS), "postgres")?;
         let banner = self.sudo(&[
@@ -342,10 +332,9 @@ impl Local {
             server.to_str().ok_or("Debian path")?,
             "--version",
         ])?;
-        require(
-            banner_minor(&banner)? == postgres_minor(reviewed)?,
-            "--postgres-minor-reviewed must name the live Debian release",
-        )
+        let minor = banner_minor(&banner)?;
+        crate::postgres_minors::covered(minor)?;
+        Ok(minor)
     }
     fn cargo(&self, checkout: &Path) -> R<Command> {
         let mut build = Command::new("cargo");
@@ -638,23 +627,23 @@ pub(super) fn run(args: &[String]) -> R<()> {
     )?;
     revision(&tree)?;
     println!("{} current {live}, selected {selected}", site.host_name);
-    if let Some(reviewed) = opts.reviewed {
-        local.debian_release(reviewed)?;
-    }
+    let live_minor = if opts.binaries {
+        Some(local.debian_release()?)
+    } else {
+        None
+    };
     let cache = child(&local.root, ".td-build-cache")?;
     fs::create_dir_all(&cache)?;
     let scratch = td_fs::TempDir::new_in(&cache, "mta-deploy")?;
     let binary = local.artifact(scratch.path(), &controller)?;
-    let closure = match opts.reviewed {
-        Some(reviewed) => {
+    let closure = match live_minor {
+        Some(live_minor) => {
             let built = local.closure(scratch.path())?;
             let server = built.first().ok_or("missing PostgreSQL output")?;
-            require(
-                postgres_minor(reviewed)?
-                    <= postgres_minor(store_basename(&server.basename, "postgresql-x86-64")?)?,
-                "--postgres-minor-reviewed is newer than the td-built server",
-            )?;
-            Some(built)
+            let td_minor = postgres_minor(store_basename(&server.basename, "postgresql-x86-64")?)?;
+            // Before anything reaches the host: the table covers the move.
+            crate::postgres_minors::movable(live_minor, td_minor)?;
+            Some((built, live_minor))
         }
         None => None,
     };
@@ -698,8 +687,10 @@ pub(super) fn run(args: &[String]) -> R<()> {
         "invalid operator job",
     )?;
     let (program, hash) = local.install(&binary, &controller, &job)?;
-    for built in closure.iter().flatten() {
-        local.send_nar(built, &job)?;
+    for (built, _) in closure.iter() {
+        for built in built {
+            local.send_nar(built, &job)?;
+        }
     }
     let mut spec = Json::Obj(Vec::new());
     for (k, v) in [
@@ -716,7 +707,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
     if opts.socket {
         set(&mut spec, "mode", Json::Str(owned("postgres-socket")?))?;
     }
-    if let (Some(built), Some(reviewed)) = (&closure, opts.reviewed) {
+    if let Some((built, live_minor)) = &closure {
         set(&mut spec, "mode", Json::Str(owned("postgres-binaries")?))?;
         let mut entries = Vec::new();
         for item in built {
@@ -726,10 +717,11 @@ pub(super) fn run(args: &[String]) -> R<()> {
             td_alloc::push(&mut entries, entry)?;
         }
         set(&mut spec, "closure", Json::Arr(entries))?;
+        // What the launcher read; the controller requires the same.
         set(
             &mut spec,
-            "postgres_minor_reviewed",
-            Json::Str(owned(reviewed)?),
+            "postgres_launcher_minor",
+            Json::Str(fmt(format_args!("17.{live_minor}"))?),
         )?;
     }
     set(&mut spec, "budget", Json::from(opts.budget))?;

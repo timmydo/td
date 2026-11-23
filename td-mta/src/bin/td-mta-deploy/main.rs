@@ -8,6 +8,7 @@ mod physical;
 #[cfg(test)]
 #[path = "tests/postgres_fixture.rs"]
 mod postgres_fixture;
+mod postgres_minors;
 mod probes;
 mod readiness;
 mod service_database;
