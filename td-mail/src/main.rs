@@ -338,9 +338,23 @@ mod portal_tests {
         assert!(err.starts_with("password command exited with"), "{err}");
     }
 
+    /// A helper script holding `body`, written by a child shell, not this
+    /// process: a descriptor open for writing here is copied into any child
+    /// a sibling test thread is spawning, and until that child execs,
+    /// running the script fails with ETXTBSY (td-install's
+    /// `scratch::executable`). Each is a file of its own, so a test that
+    /// keeps several runs each.
     fn helper(dir: &std::path::Path, body: &str) -> String {
-        let path = dir.join("td-secret");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("td-secret-{made}"));
+        let written = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s\\n' \"$2\" > \"$1\"", "sh"])
+            .arg(&path)
+            .arg(format!("#!/bin/sh\n{body}"))
+            .status()
+            .unwrap();
+        assert!(written.success(), "{written}: {}", path.display());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path.to_string_lossy().into_owned()
     }
