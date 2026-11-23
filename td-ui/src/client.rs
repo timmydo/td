@@ -1414,6 +1414,10 @@ impl<T: Tag> Client<T> {
         self.retry_live_pools = true;
     }
 
+    pub(crate) fn frame_deferred(&self) -> bool {
+        self.frame_retry.deadline.is_some()
+    }
+
     /// Sets the pointer image at the pointer's enter serial, building the
     /// one immutable ARGB pool on the first call. Nothing happens until
     /// the pointer is inside and ARGB was advertised.
@@ -2300,6 +2304,87 @@ mod tests {
             .unwrap();
         assert_eq!(contents, [3; 16]);
         assert!(client.frame_retry.deadline.is_none());
+    }
+
+    #[test]
+    fn widget_actions_resume_at_the_recovered_frames_callback() {
+        use crate::raster::{Raster, Surface};
+        use crate::window::{Clipboard, Flow, Handler, Input, PointerPhase, Window};
+
+        #[derive(Default)]
+        struct Presses(usize);
+        impl Handler for Presses {
+            fn retry_live_pool_writes(&self) -> bool {
+                true
+            }
+            fn app_id(&self) -> &str {
+                "test"
+            }
+            fn title(&self) -> &str {
+                "test"
+            }
+            fn poll(&mut self, _: u64) -> Flow {
+                Flow::Continue
+            }
+            fn wait_ms(&self, _: u64) -> u64 {
+                100
+            }
+            fn input(&mut self, input: Input<'_>, _: &mut dyn Clipboard) -> Flow {
+                if matches!(
+                    input,
+                    Input::Pointer {
+                        phase: PointerPhase::Press,
+                        ..
+                    }
+                ) {
+                    self.0 += 1;
+                }
+                Flow::Continue
+            }
+            fn needs_redraw(&self) -> bool {
+                true
+            }
+            fn paint(&mut self, _: &mut Raster<'_, '_>, _: Surface) -> Result<()> {
+                Ok(())
+            }
+        }
+        fn message(object: u32, opcode: u16, words: &[u32]) -> Message {
+            Message {
+                object,
+                opcode,
+                payload: words.iter().flat_map(|w| w.to_ne_bytes()).collect(),
+            }
+        }
+
+        let mut handler = Presses::default();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut w = Window::new(&mut handler, socket, std::env::temp_dir()).unwrap();
+        w.client().configured = true;
+        w.client().xrgb = true;
+        let pointer = w.client().allocate_kind(Kind::Pointer).unwrap();
+        w.client().pointer = Some(pointer);
+        w.event(message(pointer, 0, &[1, SURFACE, 0, 0])).unwrap();
+        let press = || message(pointer, 3, &[2, 0, 0x110, 1]);
+        w.draw().unwrap();
+        let callback = w.client().frame_callback().unwrap();
+        w.event(message(callback, 0, &[0])).unwrap();
+        let id = w.client().buffers[0].id;
+        w.event(message(id, 0, &[])).unwrap();
+        let full = File::options().write(true).open("/dev/full").unwrap();
+        let original = std::mem::replace(&mut w.client().buffers[0].file, full);
+        w.draw().unwrap();
+        assert!(w.client().frame_deferred());
+        w.event(press()).unwrap();
+        assert_eq!(w.handler().0, 0);
+        w.client().buffers[0].file = original;
+        w.client().frame_retry.deadline = Some(Instant::now());
+        w.draw().unwrap();
+        w.event(press()).unwrap();
+        assert_eq!(w.handler().0, 0, "a queued press preceded the callback");
+        let callback = w.client().frame_callback().unwrap();
+        w.event(message(callback, 0, &[0])).unwrap();
+        w.event(press()).unwrap();
+        assert_eq!(w.handler().0, 1);
     }
 
     use std::io::{Read, Seek, SeekFrom};

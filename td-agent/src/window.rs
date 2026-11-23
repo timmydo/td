@@ -967,6 +967,10 @@ impl Window {
 }
 
 impl Handler for Window {
+    fn retry_live_pool_writes(&self) -> bool {
+        true
+    }
+
     fn app_id(&self) -> &str {
         "td-agent"
     }

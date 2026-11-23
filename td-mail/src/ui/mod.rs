@@ -2345,6 +2345,10 @@ fn fit_note(note: &str) -> String {
 }
 
 impl Handler for Session {
+    fn retry_live_pool_writes(&self) -> bool {
+        true
+    }
+
     fn title(&self) -> &str {
         &self.title
     }

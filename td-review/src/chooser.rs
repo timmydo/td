@@ -656,6 +656,10 @@ impl<T> Window<T> {
 }
 
 impl<T> Handler for Window<T> {
+    fn retry_live_pool_writes(&self) -> bool {
+        true
+    }
+
     fn app_id(&self) -> &str {
         "td-review"
     }

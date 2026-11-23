@@ -383,6 +383,14 @@ struct Board {
 /// window's inputs, is polled each turn, and paints the surface when it
 /// says it must.
 pub trait Handler {
+    /// Keep a mapped window alive while frame or cursor storage is full.
+    fn retry_live_pool_writes(&self) -> bool {
+        false
+    }
+    /// Called after an unobscured handler frame was submitted. A deferred paint has
+    /// not been shown and cannot establish when an action became visible.
+    fn frame_submitted(&mut self, _surface: Surface) {}
+
     fn app_id(&self) -> &str;
     /// The toplevel's title, read at binding and again before every
     /// present, so a handler may retitle the window from its state.
@@ -493,6 +501,7 @@ pub struct Window<'h, H: Handler> {
     moved: Option<(i64, i64)>,
     wheel: Wheel,
     dirty: bool,
+    input_paused: bool,
     /// The title the toplevel was last given, re-read from the handler
     /// before each present.
     title: String,
@@ -507,8 +516,12 @@ impl<'h, H: Handler> Window<'h, H> {
     pub fn new(handler: &'h mut H, stream: UnixStream, temporary: PathBuf) -> Result<Self> {
         let surface = Surface::new(DEFAULT_WIDTH, DEFAULT_HEIGHT, Scale::default())
             .map_err(|why| why.to_string())?;
+        let mut client = Client::new(stream, temporary)?;
+        if handler.retry_live_pool_writes() {
+            client.retry_live_pool_writes();
+        }
         Ok(Self {
-            client: Client::new(stream, temporary)?,
+            client,
             handler,
             font: crate::font::pinned()?,
             typeface: None,
@@ -523,6 +536,7 @@ impl<'h, H: Handler> Window<'h, H> {
             moved: None,
             wheel: Wheel::default(),
             dirty: true,
+            input_paused: false,
             title: String::new(),
             focused: false,
             board: Board::default(),
@@ -653,8 +667,11 @@ impl<'h, H: Handler> Window<'h, H> {
     /// Tells the handler where the pointer is with no button held, or
     /// that it no longer is: a change only.
     fn moved(&mut self) {
-        let at = (self.client.entered().is_some() && !self.held && !self.keys.is_open())
-            .then_some(self.pointer);
+        let at = (!self.input_paused
+            && self.client.entered().is_some()
+            && !self.held
+            && !self.keys.is_open())
+        .then_some(self.pointer);
         if at == self.moved || self.client.closed() {
             return;
         }
@@ -666,7 +683,9 @@ impl<'h, H: Handler> Window<'h, H> {
     /// the surface, as the keyboard's synchronized state reports it while
     /// the window has focus, or that it no longer is: a change only.
     fn hover(&mut self) -> Result<()> {
-        let at = (self.client.entered().is_some() && self.client.input().held().control)
+        let at = (!self.input_paused
+            && self.client.entered().is_some()
+            && self.client.input().held().control)
             .then_some(self.pointer);
         if at == self.hover {
             return Ok(());
@@ -741,6 +760,7 @@ impl<'h, H: Handler> Window<'h, H> {
 
     fn keyboard(&mut self, event: KeyboardEvent) -> Result<()> {
         match event {
+            KeyboardEvent::Key { .. } if self.input_paused => {}
             KeyboardEvent::Key {
                 serial,
                 key,
@@ -830,6 +850,7 @@ impl<'h, H: Handler> Window<'h, H> {
                     })?;
                 }
             }
+            _ if self.input_paused => {}
             P::Leave(_) => {
                 self.wheel = Wheel::default();
                 self.cancel_pointer()?;
@@ -1099,7 +1120,10 @@ impl<H: Handler> App for Window<'_, H> {
                     message.object, message.opcode
                 ))
             }
-            Handled::Done | Handled::FrameDone | Handled::GlobalRemoved { .. } => {}
+            // Input already in the socket can precede the recovered frame.
+            // The compositor orders its callback among those input events.
+            Handled::FrameDone => self.input_paused = false,
+            Handled::Done | Handled::GlobalRemoved { .. } => {}
         }
         // Whatever moved the pointer, Control, focus or the devices: the
         // motion first, then the hover.
@@ -1188,6 +1212,21 @@ impl<H: Handler> App for Window<'_, H> {
         })?;
         if presented {
             self.dirty = false;
+            if !self.keys.is_open() {
+                self.handler.frame_submitted(surface);
+            }
+        } else if !self.input_paused && self.client.frame_deferred() {
+            self.input_paused = true;
+            // A paint can advance a handler's hit targets before the file
+            // write fails. Discard gestures aimed at the old frame.
+            self.client.cancel_repeat();
+            self.wheel = Wheel::default();
+            self.cancel_pointer()?;
+            if self.board.incoming.take().is_some() {
+                self.handler.notice("paste cancelled: frame storage full");
+            }
+            self.moved();
+            self.hover()?;
         }
         Ok(())
     }

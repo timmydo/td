@@ -943,6 +943,10 @@ impl Session {
 }
 
 impl Handler for Session {
+    fn retry_live_pool_writes(&self) -> bool {
+        true
+    }
+
     fn app_id(&self) -> &str {
         "td-review"
     }
@@ -1038,13 +1042,16 @@ impl Handler for Session {
                 .map_err(|e| e.to_string())?;
         }
         self.dirty = false;
+        Ok(())
+    }
+
+    fn frame_submitted(&mut self, surface: Surface) {
         if let Some((generation, frame)) = self.shown.take() {
             if fits(&frame, surface) {
                 self.shown_at(generation, frame.picks(), Instant::now());
             }
             self.shown = Some((generation, frame));
         }
-        Ok(())
     }
 
     fn notice(&mut self, message: &str) {
@@ -1453,11 +1460,17 @@ mod tests {
         let small = surface(800, 54, 1);
         let mut raster = Raster::new(&mut pixels, &font, small, 800 * 4).unwrap();
         session.paint(&mut raster, small).unwrap();
+        session.frame_submitted(small);
         assert!(session.painted.is_empty());
         let mut pixels = vec![0; 800 * 600 * 4];
         let big = surface(800, 600, 1);
         let mut raster = Raster::new(&mut pixels, &font, big, 800 * 4).unwrap();
         session.paint(&mut raster, big).unwrap();
+        assert!(
+            session.painted.is_empty(),
+            "a paint alone cannot authorize a pick"
+        );
+        session.frame_submitted(big);
         assert_eq!(session.painted.back().map(|s| s.generation), Some(1));
     }
 

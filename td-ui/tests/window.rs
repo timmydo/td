@@ -95,6 +95,7 @@ struct Recorder {
     wait: u64,
     redraw: bool,
     paints: Vec<Surface>,
+    submitted: usize,
     title: String,
     /// A chord (or `press` and `release`, the left button's) on which
     /// the recorder copies the text, and one on which it pastes; what
@@ -134,6 +135,7 @@ impl Recorder {
             wait: 5000,
             redraw: false,
             paints: Vec::new(),
+            submitted: 0,
             title: "Recorder".into(),
             copy_on: None,
             owned_copy: None,
@@ -295,6 +297,10 @@ impl Handler for Recorder {
     fn notice(&mut self, message: &str) {
         self.notices.push(message.to_string());
     }
+    fn frame_submitted(&mut self, _: Surface) {
+        self.submitted += 1;
+    }
+
     fn take_withdrawal(&mut self) -> bool {
         std::mem::take(&mut self.withdraw)
     }
@@ -792,6 +798,11 @@ fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
     assert_eq!(w.handler().paints(), 2);
     let mut bytes = vec![0; 400 * 240 * 4];
     file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(
+        w.handler().submitted,
+        1,
+        "the overlay obscures the second paint"
+    );
     let panel = keys::Panel::new(w.surface()).unwrap();
     let title = panel.title;
     assert_eq!(
@@ -837,6 +848,7 @@ fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
     assert_eq!(w.handler().inputs.len(), seen);
     w.draw().unwrap();
     assert_eq!(w.handler().paints(), paints + 1, "closing repaints");
+    assert_eq!(w.handler().submitted, 2);
     w.end_turn(12_000, true).unwrap();
     w.end_turn(13_000, true).unwrap();
     assert_eq!(w.handler().inputs.len(), seen, "the held j repeats nowhere");
@@ -882,6 +894,7 @@ fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
     let paints = w.handler().paints();
     w.draw().unwrap();
     assert_eq!(w.handler().paints(), paints + 1, "closing repaints");
+    assert_eq!(w.handler().submitted, 3);
     release(&mut w, keyboard, 47, F1);
     // A drag under way when the list opens ends there: the handler hears
     // it cancelled, and neither the motion nor the release after.

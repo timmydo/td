@@ -762,7 +762,13 @@ of its own files may name each module.
   of the wrong size is retired before allocating its replacement. A partial
   frame stays private and forces a full
   repaint on retry. Initial presentation and frame scrubbing still propagate
-  errors. The client also owns the
+  errors. Widget handlers opt in through `Handler::retry_live_pool_writes`.
+  The review, mail and agent windows keep polling through a deferred frame.
+  Keys, clicks, wheel input and pending paste cannot act on unseen controls.
+  Input resumes at the compositor’s callback for the recovered frame.
+  The handler receives `frame_submitted` only for a successful submission
+  with the key list closed.
+  The client also owns the
   devices (`seat`, `keyboard`, `pointer`, `entered` for the pointer's enter
   serial, `input` for the keyboard's state, and the repeat half of that
   state a consumer drives: `cancel_repeat`, `arm`, `repeat` and
@@ -854,7 +860,8 @@ of its own files may name each module.
   and `NoClipboard`, which refuses everything, for a test or a headless
   run; the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
   `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`,
-  `take_withdrawal`, `take_scrub`, `keys`, `take_show_keys`); `Object`,
+  `take_withdrawal`, `take_scrub`, `keys`, `take_show_keys`, `retry_live_pool_writes`,
+  `frame_submitted`); `Object`,
   the empty tag; `Window<'h, H>` (`new`, `with_typeface`, `with_prose`,
   `with_theme_file`, `theme`, `help`, `handler`, `handler_mut`,
   `surface`), the `App` over a handler it borrows; and `run` with an
