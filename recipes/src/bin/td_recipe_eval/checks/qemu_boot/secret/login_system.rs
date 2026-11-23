@@ -18,6 +18,7 @@ const UNREADABLE: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT B
 /// No settings change waits on this guest.
 const MENU: &[&str] = &[
     "TD SECURE ATTENTION",
+    "U: UPDATE FROM TRUSTED MAIN",
     "V: CREDENTIAL STORE",
     "W: REVIEW PENDING CREDENTIAL WRITE",
     "I: REVIEW PENDING SYSTEM INSTALLATION",

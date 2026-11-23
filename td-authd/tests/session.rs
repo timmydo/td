@@ -2515,6 +2515,112 @@ fn suspend_requires_idle_preparation_and_a_lock_for_enforced_login() {
     assert_eq!(session.suspend_status().unwrap(), [0xa5, 2]);
 }
 
+/// Request `2e` (td-authd/DESIGN.md, "Elevation operations"): the menu's
+/// `U` is refused while unprepared or anything else runs, then by the
+/// principal table's `admin-update` row, before any helper starts;
+/// admitted, `td-admin submit`'s success is `ae 04` and its failure
+/// `ae 03`, each answered once, and a second start waits for the first.
+#[test]
+fn the_menus_update_admits_by_table_and_reports_its_submission() {
+    use crate::elevation::tests::V1;
+    use crate::elevation::Table;
+    assert_eq!(Request::decode(&[0x2e, 0]).unwrap(), Request::Update);
+    assert_eq!(Request::decode(&[0x2e, 1]).unwrap(), Request::UpdateStatus);
+    for bad in [&[0x2e][..], &[0x2e, 2], &[0x2e, 0, 0]] {
+        assert!(Request::decode(bad).is_err(), "{bad:?}");
+    }
+    assert!(Request::Update.takes_slot());
+    assert!(!Request::UpdateStatus.takes_slot());
+    let unasked = || -> Result<Table, String> { panic!("table read while busy") };
+    let unstarted = || -> Result<Inspection, String> { panic!("helper started") };
+    let mut session = quiet();
+    assert_eq!(session.begin_update(unasked, unstarted).unwrap(), [0xae, 1]);
+    assert_eq!(session.update_status().unwrap(), [0xae, 3]);
+    prepare(&mut session);
+    for table in [
+        Table::parse("td-elevation-v1\n1001\tadmin-update\n"),
+        Table::parse("td-elevation-v1\n1000\tdeploy-rollback\n"),
+        Err("no table".to_string()),
+    ] {
+        assert_eq!(
+            session.begin_update(|| table, unstarted).unwrap(),
+            [0xae, 2]
+        );
+        assert!(session.updating.is_none());
+    }
+    // Through the session's dispatch: `2e 01` with nothing started, and a
+    // pending suspend refusing `2e 00` as every slot request.
+    assert_eq!(session.answer(Request::UpdateStatus).unwrap(), [0xae, 3]);
+    session.suspending = Some(crate::inspection::tests::printed(b"", 0, true, 128, WAIT).unwrap());
+    assert!(session.answer(Request::Update).is_err());
+    session.suspending.take().unwrap().reap_for_teardown();
+    // Another operation's helper holds it off.
+    session.inspection =
+        Some(Inspection::printing(fixture("cleanup_child"), 128, Duration::from_secs(2)).unwrap());
+    assert_eq!(session.begin_update(unasked, unstarted).unwrap(), [0xae, 1]);
+    session.inspection = None;
+    for (code, outcome) in [(0, 4), (1, 3)] {
+        let start =
+            || crate::inspection::tests::printed(b"job 1: queued\n", code, false, 128, WAIT);
+        assert_eq!(
+            session.begin_update(|| Table::parse(V1), start).unwrap(),
+            [0xae, 0]
+        );
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let reply = session.update_status().unwrap();
+            if reply != [0xae, 0] {
+                assert_eq!(reply, [0xae, outcome], "{code}");
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.updating.is_none());
+        assert_eq!(session.update_status().unwrap(), [0xae, 3]);
+    }
+    // A start fails closed.
+    assert_eq!(
+        session
+            .begin_update(|| Table::parse(V1), || Err("no helper".into()))
+            .unwrap(),
+        [0xae, 3]
+    );
+    // One submission at a time: a helper still running holds the next off.
+    let hanging = || crate::inspection::tests::printed(b"", 0, true, 128, WAIT);
+    assert_eq!(
+        session.begin_update(|| Table::parse(V1), hanging).unwrap(),
+        [0xae, 0]
+    );
+    assert_eq!(session.begin_update(unasked, unstarted).unwrap(), [0xae, 1]);
+    assert_eq!(session.update_status().unwrap(), [0xae, 0]);
+    session.updating.take().unwrap().reap_for_teardown();
+    // A submission nobody asked after does not hold the next start off.
+    let start = || crate::inspection::tests::printed(b"", 0, false, 128, WAIT);
+    assert_eq!(
+        session.begin_update(|| Table::parse(V1), start).unwrap(),
+        [0xae, 0]
+    );
+    let deadline = Instant::now() + WAIT;
+    while session
+        .updating
+        .as_mut()
+        .unwrap()
+        .finished()
+        .unwrap()
+        .is_none()
+    {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(2));
+    }
+    let start = || crate::inspection::tests::printed(b"", 0, false, 128, WAIT);
+    assert_eq!(
+        session.begin_update(|| Table::parse(V1), start).unwrap(),
+        [0xae, 0]
+    );
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
 #[test]
 fn notebook_lock_is_idempotent_and_takes_no_operation_slot() {
     let mut session = quiet();

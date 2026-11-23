@@ -38,6 +38,14 @@ pub(crate) enum Notice {
     AdminKeySaved,
     /// Root's success for tag 46: the admin service started the job.
     AdminUpdateSubmitted,
+    /// Root's `ae 04`: the menu's `U` started trusted main's update.
+    UpdateStarted,
+    /// Root's `ae 03`, or no end in time: `td-admin submit` failed, could
+    /// not start or timed out, which proves nothing about the service.
+    UpdateNotSubmitted,
+    /// A letter the menu does not bind: the lifetime ends unchosen, so a
+    /// burst of typed letters reaches no later one.
+    NoChoice,
     PublisherSaved,
     /// A committed device-bound disk installation, before its recovery key:
     /// the screen then closes by itself (secret_client).
@@ -687,7 +695,7 @@ fn hostname_row(intake: HostnameIntake) -> String {
 /// boot oracles' rows do not move.
 fn notice_rows(notice: Notice) -> Vec<String> {
     let first = match notice {
-        Notice::Menu(_) => "V: CREDENTIAL STORE",
+        Notice::Menu(_) => "U: UPDATE FROM TRUSTED MAIN",
         Notice::Pending => "PREPARING REQUEST",
         Notice::PowerConfirm(crate::authority::consent::Power::Restart) => "RESTART THE COMPUTER?",
         Notice::PowerConfirm(crate::authority::consent::Power::Off) => "POWER OFF THE COMPUTER?",
@@ -708,6 +716,9 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::VolumeSaved => "VOLUME CHANGE APPLIED",
         Notice::AdminKeySaved => "REMOTE ADMIN KEY ENROLLED",
         Notice::AdminUpdateSubmitted => "UPDATE JOB SUBMITTED",
+        Notice::UpdateStarted => "UPDATE FROM MAIN STARTED",
+        Notice::UpdateNotSubmitted => "UPDATE NOT SUBMITTED",
+        Notice::NoChoice => "NOT A MENU CHOICE - REOPEN TO TRY AGAIN",
         Notice::PublisherSaved => "UPDATE PUBLISHER TRUST REPLACED",
         Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
@@ -757,6 +768,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::SleepConfirm => &["ENTER TO CONFIRM", "ENROLLED SESSIONS LOCK BEFORE SLEEP"],
         Notice::PowerConfirm(_) => &["ENTER TO CONFIRM", "UNSAVED WORK MAY BE LOST"],
         Notice::Menu(_) => &[
+            "V: CREDENTIAL STORE",
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
             "K: LOGIN KEYS",
@@ -821,6 +833,11 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             &["R: THE DISK RECOVERY KEY", "S: A DISK SECURITY KEY"]
         }
         Notice::HostnameSaved => &["A RESTART COMPLETES THE CHANGE"],
+        Notice::UpdateStarted => &[
+            "IT INSTALLS FOR THE NEXT BOOT",
+            "TD-ADMIN STATUS FOLLOWS IT",
+        ],
+        Notice::UpdateNotSubmitted => &["TD-ADMIN STATUS SAYS WHAT RUNS"],
         Notice::Uncertain(rows) => rows,
         _ => &[],
     };
@@ -1166,13 +1183,15 @@ mod tests {
 
     /// The menu's rows where the update and setup oracles read them on a
     /// 1280x800 output: the title at 276, the selections from 312, 36
-    /// apart, `V` first, then `W`, `I` at 384, `K`, `L`, `B` at 492, `H` at
-    /// 528, `S` at 564, power at 600 and Escape at 636. On 800x600 the
-    /// eleven rows start at 176; on 320x200 they keep an 18-pixel pitch.
+    /// apart, `U` first, then `V`, `W`, `I` at 420, `K`, `L`, `B` at 528,
+    /// `H` at 564, `S` at 600, power at 636 and Escape at 672. On 800x600
+    /// the twelve rows start at 176; on 320x200 they close to a 17-pixel
+    /// pitch.
     #[test]
     fn the_menu_keeps_its_large_output_rows_and_fits_power_choices() {
         const MENU: &[&str] = &[
             "TD SECURE ATTENTION",
+            "U: UPDATE FROM TRUSTED MAIN",
             "V: CREDENTIAL STORE",
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
@@ -1187,7 +1206,7 @@ mod tests {
         for (width, height, top, scale, pitch) in [
             (1280, 800, 276, 2, 36),
             (800, 600, 176, 2, 36),
-            (320, 200, 0, 1, 18),
+            (320, 200, 0, 1, 17),
         ] {
             let stride = width * 4;
             let mut painted = vec![0; stride * height];
@@ -1227,12 +1246,12 @@ mod tests {
             }
             assert!(painted == expected, "{width}x{height}");
         }
-        // Eleven doubled rows, the last row's foot included, are 374
-        // tall and keep their top on 800 and 600 lines; on 200 eleven
-        // single rows, 187 tall at their pitch, start at the top.
-        assert_eq!(rows_top(800, 10 * 36 + 14), 276);
-        assert_eq!(rows_top(600, 10 * 36 + 14), 176);
-        assert_eq!(rows_top(200, 10 * 18 + 7), 0);
+        // Twelve doubled rows, the last row's foot included, are 410
+        // tall and keep their top on 800 and 600 lines; on 200 twelve
+        // single rows, 194 tall at their closed-up pitch, start at the top.
+        assert_eq!(rows_top(800, 11 * 36 + 14), 276);
+        assert_eq!(rows_top(600, 11 * 36 + 14), 176);
+        assert_eq!(rows_top(200, 11 * 17 + 7), 0);
     }
 
     /// The `H` row says what root's last `9f` answer said: nothing waits,
@@ -1410,6 +1429,9 @@ mod tests {
         Notice::Unavailable,
         Notice::Failed,
         Notice::Busy,
+        Notice::UpdateStarted,
+        Notice::UpdateNotSubmitted,
+        Notice::NoChoice,
         Notice::CredentialStore,
         Notice::LoginKeys,
         Notice::StateUnknown,
@@ -1706,6 +1728,9 @@ mod tests {
             Notice::SleepConfirm,
             Notice::Resumed,
             Notice::Enrolled,
+            Notice::UpdateStarted,
+            Notice::UpdateNotSubmitted,
+            Notice::NoChoice,
             Notice::CredentialStore,
             Notice::LoginKeys,
             Notice::StateUnknown,
@@ -1892,9 +1917,9 @@ mod tests {
                 .chain(notice_rows(menu))
                 .enumerate()
                 .collect();
-            assert_eq!(rows[3], (3, "I: REVIEW PENDING SYSTEM INSTALLATION".into()));
-            rows.push((10, text.into()));
-            rows.push((11, "ESC TO RETURN".into()));
+            assert_eq!(rows[4], (4, "I: REVIEW PENDING SYSTEM INSTALLATION".into()));
+            rows.push((11, text.into()));
+            rows.push((12, "ESC TO RETURN".into()));
             let rows: Vec<(usize, &str)> =
                 rows.iter().map(|(at, row)| (*at, row.as_str())).collect();
             assert!(painted == expected(&rows), "menu {text}");
@@ -1939,7 +1964,7 @@ mod tests {
             Some(RESTARTING_NOTICE),
         );
         let inked = |y: usize| (0..width).any(|x| small[y * stride + x * 4] == 0xff);
-        // Twelve rows at a 17-pixel pitch: the last foot ends at 194.
+        // Fourteen rows at a 14-pixel pitch: the last foot ends at 189.
         assert!(inked(0) && (180..200).any(inked) && !inked(199));
     }
 

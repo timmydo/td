@@ -351,6 +351,8 @@ pub(crate) enum Selection {
     Elevation(Elevation),
     Power(crate::authority::consent::Power),
     Suspend,
+    /// The menu's `U`: trusted main's update, which no prompt confirms.
+    Update,
 }
 impl From<Role> for Selection {
     fn from(role: Role) -> Self {
@@ -366,7 +368,8 @@ impl Selection {
             | Self::Login(_)
             | Self::Elevation(_)
             | Self::Power(_)
-            | Self::Suspend => return None,
+            | Self::Suspend
+            | Self::Update => return None,
             Self::Unlock(role) => Operation::Unlock { role: *role },
             Self::Enroll(recovery) => Operation::Enroll {
                 platform: Platform::TpmPcr7,
@@ -380,6 +383,7 @@ impl Selection {
             Self::Website(_) => return Err("website uses the virtual authenticator".into()),
             Self::Suspend => return Err("suspend requires a lock presentation receipt".into()),
             Self::Power(choice) => vec![0x21, choice.byte()],
+            Self::Update => return Err("the update's requests are fixed slices".into()),
             Self::Write => vec![0x18],
             Self::Install => vec![0x19],
             Self::Unlock(Role::Primary) => vec![0x12, 1],
@@ -1659,6 +1663,8 @@ pub(crate) struct Client {
     revocation: crate::authority::Revocation,
     /// The check before a PIN field opens.
     memory: fn() -> Result<(), String>,
+    /// The menu's `U` submission root still runs, and when to stop asking.
+    update: Option<(Arc<Attempt>, Instant)>,
 }
 
 impl Default for Client {
@@ -1671,6 +1677,7 @@ impl Default for Client {
             inspection: None,
             revocation: crate::authority::Revocation::Settled,
             memory: protected_memory,
+            update: None,
         }
     }
 }
@@ -1988,6 +1995,23 @@ impl Client {
                 Notice::PowerFailed
             });
         }
+        if attempt.selection == Selection::Update {
+            // Claimed before anything is sent: Escape that wins sends nothing.
+            if !attempt.commit() {
+                return Ok(());
+            }
+            let deadline = Instant::now()
+                .checked_add(UPDATE_WAIT)
+                .ok_or("update deadline overflow")?;
+            return match update_end(&wire.exchange(&[0x2e, 0])?)? {
+                Some(notice) => attempt.notice(notice),
+                // Polled from `tick`, so the worker serves everything else.
+                None => {
+                    self.update = Some((attempt, deadline));
+                    Ok(())
+                }
+            };
+        }
         if matches!(attempt.selection, Selection::Power(_)) && !attempt.commit() {
             return Ok(());
         }
@@ -2083,7 +2107,27 @@ impl Client {
         Ok(())
     }
 
+    /// The menu's `U`: one `2e 01` a turn until root says how it ended, or
+    /// the wait passes, which is shown as not submitted; never `2e 00`
+    /// again.
+    fn poll_update(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
+        let Some((_, deadline)) = &self.update else {
+            return Ok(());
+        };
+        let deadline = *deadline;
+        let end = match update_end(&wire.exchange(&[0x2e, 1])?)? {
+            Some(notice) => notice,
+            None if Instant::now() < deadline => return Ok(()),
+            None => Notice::UpdateNotSubmitted,
+        };
+        match self.update.take() {
+            Some((attempt, _)) => attempt.notice(end),
+            None => Ok(()),
+        }
+    }
+
     pub fn tick(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
+        self.poll_update(wire)?;
         if self.inspection.is_some() {
             return self.poll_inspection(wire);
         }
@@ -2261,6 +2305,23 @@ impl Client {
             _ => crate::attention::Notice::Unavailable,
         })
     }
+}
+
+/// How long the client asks after the menu's `U`: root's helper has
+/// fifteen seconds, and this leaves a reply's margin.
+const UPDATE_WAIT: Duration = Duration::from_secs(20);
+
+/// Root's `ae` answer to `2e` (td-authd/DESIGN.md, "Elevation operations"):
+/// `None` while the submission runs, else the screen that ends it.
+fn update_end(response: &[u8]) -> Result<Option<Notice>, String> {
+    Ok(Some(match response {
+        [0xae, 0] => return Ok(None),
+        [0xae, 1] => Notice::Busy,
+        [0xae, 2] => Notice::ElevationRefused,
+        [0xae, 3] => Notice::UpdateNotSubmitted,
+        [0xae, 4] => Notice::UpdateStarted,
+        _ => return Err("invalid update response".into()),
+    }))
 }
 
 /// Poll a single submitted operation; never resubmit after an uncertain reply.
@@ -3769,6 +3830,116 @@ mod tests {
                 .start(&mut wire, Arc::clone(&screen.attempt))
                 .unwrap();
             assert_eq!(wire.sent, !cancel);
+        }
+    }
+
+    /// The menu's `U`: `2e 00`, then one `2e 01` a worker turn while root
+    /// answers `ae 00`, each end its notice; the wait's end shows as not
+    /// submitted; nothing else is accepted, and nothing is sent again
+    /// after an end.
+    #[test]
+    fn the_update_polls_its_submission_on_the_workers_turns() {
+        assert!(Selection::Update.request().is_err());
+        assert!(!Selection::Update.confirms());
+        assert!(Selection::Update.operation().is_none());
+        for (reply, end) in [
+            (vec![0xae, 0], Some(None)),
+            (vec![0xae, 1], Some(Some(Notice::Busy))),
+            (vec![0xae, 2], Some(Some(Notice::ElevationRefused))),
+            (vec![0xae, 3], Some(Some(Notice::UpdateNotSubmitted))),
+            (vec![0xae, 4], Some(Some(Notice::UpdateStarted))),
+            (vec![0xae, 5], None),
+            (vec![0xae], None),
+            (vec![0xa1, 0], None),
+        ] {
+            assert_eq!(update_end(&reply).ok(), end, "{reply:?}");
+        }
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Update;
+        let mut wire = Wire {
+            replies: VecDeque::from([vec![0xae, 0], vec![0xae, 0], vec![0xae, 4]]),
+            calls: vec![],
+            typist: None,
+        };
+        let mut client = Client::default();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        assert_eq!(wire.calls, [vec![0x2e, 0]]);
+        assert!(client.update.is_some());
+        client.tick(&mut wire).unwrap();
+        assert!(client.update.is_some());
+        client.tick(&mut wire).unwrap();
+        assert!(client.update.is_none());
+        client.tick(&mut wire).unwrap();
+        assert_eq!(wire.calls, [vec![0x2e, 0], vec![0x2e, 1], vec![0x2e, 1]]);
+        // Past the wait, still running: ended, never asked again.
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Update;
+        let mut wire = Wire {
+            replies: VecDeque::from([vec![0xae, 0], vec![0xae, 0]]),
+            calls: vec![],
+            typist: None,
+        };
+        let mut client = Client::default();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        if let Some((_, deadline)) = client.update.as_mut() {
+            *deadline = Instant::now();
+        }
+        client.tick(&mut wire).unwrap();
+        assert!(client.update.is_none());
+        client.tick(&mut wire).unwrap();
+        assert_eq!(wire.calls, [vec![0x2e, 0], vec![0x2e, 1]]);
+        // An invalid poll answer fails the channel, as any does.
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Update;
+        let mut wire = Wire {
+            replies: VecDeque::from([vec![0xae, 0], vec![0xae, 9]]),
+            calls: vec![],
+            typist: None,
+        };
+        let mut client = Client::default();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        assert!(client.tick(&mut wire).is_err());
+    }
+
+    /// The update claims its commit before it sends, so Escape that wins
+    /// sends nothing.
+    #[test]
+    fn the_update_claims_commit_and_never_sends_a_cancelled_attempt() {
+        for cancel in [true, false] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Update;
+            if cancel {
+                screen.attempt.cancel();
+            }
+            struct UpdateWire {
+                attempt: Arc<Attempt>,
+                sent: usize,
+            }
+            impl Exchange for UpdateWire {
+                fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+                    assert_eq!(self.attempt.state.load(Ordering::SeqCst), COMMITTED);
+                    assert_eq!(bytes, [0x2e, 0]);
+                    self.sent += 1;
+                    Ok(())
+                }
+                fn receive(&mut self) -> Result<Vec<u8>, String> {
+                    Ok(vec![0xae, 4])
+                }
+            }
+            let mut wire = UpdateWire {
+                attempt: Arc::clone(&screen.attempt),
+                sent: 0,
+            };
+            Client::default()
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            assert_eq!(wire.sent, usize::from(!cancel));
         }
     }
 

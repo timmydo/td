@@ -46,6 +46,24 @@ fn power_request(choice: crate::consent::Power) -> Option<Vec<u8>> {
 }
 
 const CLEANUP_TIME: Duration = Duration::from_secs(2);
+/// How long `td-admin submit` may take: two seconds to send, ten to answer,
+/// as for the settings intake's approved update.
+const UPDATE_SUBMIT: Duration = Duration::from_secs(15);
+
+/// Root's `ae` answer to `2e`: one reply, so one allocation site.
+fn update_reply(byte: u8) -> Vec<u8> {
+    vec![0xae, byte]
+}
+
+/// The attention menu's `U`: trusted main built and installed with no
+/// reboot, through the admin service's root-only `submit`.
+fn update_request() -> Result<Inspection, String> {
+    let mut command = Command::new("/bin/td-admin");
+    command
+        .arg("submit")
+        .args(crate::consent::admin_update_words(true, false));
+    Inspection::printing(command, 511, UPDATE_SUBMIT)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Request {
@@ -81,6 +99,10 @@ pub(crate) enum Request {
     SuspendStatus,
     /// `20`: a storage operation (amendment 10).
     Storage(crate::storage::Selection),
+    /// `2e 00`: start trusted main's update, the menu's `U`.
+    Update,
+    /// `2e 01`: whether that update's submission finished.
+    UpdateStatus,
 }
 
 impl Request {
@@ -100,6 +122,7 @@ impl Request {
                 | Self::Storage(_)
                 | Self::Power(_)
                 | Self::Suspend { .. }
+                | Self::Update
         )
     }
 
@@ -121,6 +144,8 @@ impl Request {
                 locked: *locked == 1,
             }),
             [0x26] => Ok(Self::SuspendStatus),
+            [0x2e, 0] => Ok(Self::Update),
+            [0x2e, 1] => Ok(Self::UpdateStatus),
             [0x21, choice] => Ok(Self::Power(crate::consent::Power::decode(*choice)?)),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
@@ -366,6 +391,8 @@ pub(crate) struct Session {
     event: Option<Event>,
     inspection: Option<Inspection>,
     suspending: Option<Inspection>,
+    /// The menu's `U`: its `td-admin submit`, beside the slot.
+    updating: Option<Inspection>,
     inspection_event: Option<InspectionEvent>,
     login_state: crate::login_status::Status,
     /// None on a live boot, which runs no check.
@@ -404,6 +431,7 @@ impl Session {
             event: None,
             inspection: None,
             suspending: None,
+            updating: None,
             inspection_event: None,
             login_state: crate::login_status::Status::new(owner, username)?,
             revocation: Some(crate::revocation::Revocation::new()),
@@ -546,6 +574,11 @@ impl Session {
                 Inspection::printing(command, 128, Duration::from_secs(60))
             }),
             Request::SuspendStatus => self.suspend_status(),
+            Request::Update => self.begin_update(crate::elevation::Table::load, update_request),
+            Request::UpdateStatus => {
+                self.tick()?;
+                self.update_status()
+            }
             // Beside any operation: the menu's row reads it.
             Request::HostnameState => {
                 self.tick()?;
@@ -737,6 +770,63 @@ impl Session {
                 2
             },
         ])
+    }
+
+    /// `2e 00`: the menu's `U`, which no prompt confirms (AGENTS.md,
+    /// principle 7's exceptions; td-update/ADMIN.md, "The attention
+    /// menu's U"): `ae 01` while anything else runs or one is still being
+    /// submitted, `ae 02` unless the table grants the owner
+    /// `admin-update`, `ae 03` if the helper cannot start, else `ae 00`.
+    fn begin_update(
+        &mut self,
+        table: impl FnOnce() -> Result<crate::elevation::Table, String>,
+        start: impl FnOnce() -> Result<Inspection, String>,
+    ) -> Result<Vec<u8>, String> {
+        // A submission nobody asked after does not hold the next one off.
+        if let Some(helper) = &mut self.updating {
+            if helper.finished()?.is_some() {
+                self.updating = None;
+            }
+        }
+        // A pending suspend or a restarting revocation never reaches here:
+        // `answer_with` refuses every slot request first.
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+            || self.updating.is_some()
+        {
+            return Ok(update_reply(1));
+        }
+        // A live boot has no installed system to update.
+        if self.setup.is_some()
+            || !table().is_ok_and(|table| {
+                table.grants(self.owner, crate::elevation::Operation::AdminUpdate)
+            })
+        {
+            return Ok(update_reply(2));
+        }
+        match start() {
+            Ok(helper) => {
+                self.updating = Some(helper);
+                Ok(update_reply(0))
+            }
+            Err(_) => Ok(update_reply(3)),
+        }
+    }
+
+    /// `2e 01`: `ae 00` while `td-admin submit` runs, `ae 04` once it
+    /// succeeded, so the service queued the job, `ae 03` once it failed or
+    /// when none was started.
+    fn update_status(&mut self) -> Result<Vec<u8>, String> {
+        let Some(helper) = &mut self.updating else {
+            return Ok(update_reply(3));
+        };
+        let Some(result) = helper.finished()? else {
+            return Ok(update_reply(0));
+        };
+        self.updating = None;
+        Ok(update_reply(if result.is_some() { 4 } else { 3 }))
     }
 
     fn power(
@@ -1172,6 +1262,10 @@ impl Session {
         if let Some(helper) = &mut self.suspending {
             let _ = helper.finished()?;
         }
+        // Its deadline holds even while nobody asks after it.
+        if let Some(helper) = &mut self.updating {
+            let _ = helper.finished()?;
+        }
         let slot_free = self.operation.is_none()
             && self.inspection.is_none()
             && self.suspending.is_none()
@@ -1300,6 +1394,9 @@ impl Session {
             return Ok(());
         }
         if let Some(helper) = self.suspending.take() {
+            helper.reap_for_teardown();
+        }
+        if let Some(helper) = self.updating.take() {
             helper.reap_for_teardown();
         }
         if let Some(operation) = self.operation.take() {

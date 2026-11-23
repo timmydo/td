@@ -1018,6 +1018,10 @@ impl KeyBindings {
             }
             KEY_W => Some(Selection::Write),
             KEY_I => Some(Selection::Install),
+            // Trusted main's update, with no prompt: root's `2e`. Only a
+            // press the menu's own sight preceded chooses it; an earlier
+            // one ends the lifetime as any unbound letter does.
+            KEY_U if self.update_press(timestamp) => Some(Selection::Update),
             KEY_V => {
                 self.login_screen = LoginScreen::Store;
                 decision.notice = Some(Notice::CredentialStore);
@@ -1047,6 +1051,15 @@ impl KeyBindings {
                 } else {
                     decision.notice = Some(no_login_keys(self.login.state()));
                 }
+                None
+            }
+            // Any other typed character ends the lifetime unchosen: a
+            // security key's one-time or static password that the keyboard
+            // exclusion missed reaches no later `u` (DESIGN.md, "The update
+            // key").
+            _ if launcher_character(code).is_some() => {
+                self.secret_selected = true;
+                decision.notice = Some(Notice::NoChoice);
                 None
             }
             _ => None,
@@ -1113,6 +1126,19 @@ impl KeyBindings {
         } else {
             ApprovalPress::Other
         })
+    }
+
+    /// The menu's `U`: stamped at least the approval settle after the
+    /// menu's own paint was on glass, with no Ctrl, Alt or Super held, as
+    /// an approving Enter is (DESIGN.md, "The update key").
+    fn update_press(&self, timestamp: u128) -> bool {
+        let held = |left, right| self.attention_pressed(left) || self.attention_pressed(right);
+        !(held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
+            || held(KEY_LEFTALT, KEY_RIGHTALT)
+            || held(KEY_LEFTMETA, KEY_RIGHTMETA))
+            && self.login_shown.as_ref().is_some_and(|shown| {
+                shown.settled(timestamp, crate::secret_client::APPROVAL_SETTLE)
+            })
     }
 
     /// Whether root's last `1a` answer locks: enrolled or unavailable.
@@ -1909,6 +1935,11 @@ trait InputTarget {
         &mut self,
         _notice: crate::attention::Notice,
     ) -> Option<crate::runtime::NoticePresentation> {
+        None
+    }
+    /// The menu's own presentation, which its `U` must follow; a target
+    /// with none never offers `U`.
+    fn attention_menu_shown(&mut self) -> Option<crate::runtime::NoticePresentation> {
         None
     }
     fn attention_closed(&mut self) {}
@@ -2934,6 +2965,13 @@ impl InputTarget for LiveInputTarget {
             }
         }
         Ok(())
+    }
+
+    fn attention_menu_shown(&mut self) -> Option<crate::runtime::NoticePresentation> {
+        self.runtime
+            .lock()
+            .ok()
+            .map(|mut runtime| runtime.attention_menu_shown(&EvdevOrigin { _private: () }))
     }
 
     fn attention_notice(
@@ -4488,6 +4526,7 @@ fn deliver_key_decision<T: InputTarget>(
             finish_attention(runtime, bindings)?;
         } else if !runtime.session_locked() {
             runtime.attention(true)?;
+            bindings.login_shown = runtime.attention_menu_shown();
         } else if decision.unlock {
             // On the lock surface the chord is the selection, with no
             // menu: a login unlock, the lifetime's one operation, while the
@@ -7762,6 +7801,17 @@ mod tests {
             Ok(())
         }
 
+        /// The menu's own paint, epoch 0: on glass at time 0 unless the
+        /// screens' paints are owed or fail.
+        fn attention_menu_shown(&mut self) -> Option<crate::runtime::NoticePresentation> {
+            if self.notice_fails {
+                return None;
+            }
+            if !self.notices_owed {
+                self.clock.publish_for_test(0);
+            }
+            Some(crate::runtime::NoticePresentation::for_test(&self.clock, 0))
+        }
         fn attention_notice(
             &mut self,
             notice: crate::attention::Notice,
@@ -13065,9 +13115,9 @@ mod tests {
             }
             read_reports(&target, &bindings, 0, &chord_reports(10));
             let typed = target.lock().unwrap().keys.len();
-            // The menu does not take the key-management screen's keys.
-            read_reports(&target, &bindings, 0, &presses(&[code], 20));
-            assert!(target.lock().unwrap().secret_roles.is_empty());
+            // The menu takes none of the key-management screen's keys: they
+            // end the lifetime there
+            // (the_menus_u_updates_once_seen_and_unbound_characters_end_it).
             read_reports(&target, &bindings, 0, &presses(&[KEY_K, code], 30));
             // One operation: nothing else selects in this lifetime.
             read_reports(
@@ -13094,11 +13144,12 @@ mod tests {
         read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_A], 20));
         read_reports(&target, &bindings, 0, &presses(&[KEY_ESC], 30));
         assert!(bindings.lock().unwrap().attention == AttentionState::Closed);
-        // A fresh report after the close's cutoff, then a new lifetime whose
-        // `1` is not the key-management screen's until `K` opens it again.
+        // A fresh report after the close's cutoff, then a new lifetime that
+        // starts at the menu, where `K` opens the key-management screen
+        // again for its `1`.
         let mut reopen = vec![syn(40)];
         reopen.extend(chord_reports(41));
-        reopen.extend(presses(&[KEY_1, KEY_K, KEY_1], 50));
+        reopen.extend(presses(&[KEY_K, KEY_1], 50));
         read_reports(&target, &bindings, 0, &reopen);
         let target = target.lock().unwrap();
         assert_eq!(target.attention_events, [true, false, true]);
@@ -13883,6 +13934,89 @@ mod tests {
         }
     }
 
+    /// The menu's `U` selects trusted main's update with no prompt, but
+    /// only once the menu has been on glass for the approval settle and
+    /// with no modifier held. An earlier `U`, and every other letter,
+    /// digit, `-` or space the menu does not bind, ends the lifetime
+    /// unchosen, so a burst a security key types reaches no later `u`;
+    /// keys that type nothing stay inert; and a security key's own
+    /// keyboard selects nothing.
+    #[test]
+    fn the_menus_u_updates_once_seen_and_unbound_characters_end_it() {
+        use crate::attention::Notice;
+        use crate::secret_client::Selection;
+        let opened = |target: RecordingTarget| {
+            let target = Mutex::new(target);
+            let bindings = attention_bindings(None);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            (target, bindings)
+        };
+        let (target, bindings) = opened(RecordingTarget::default());
+        read_reports(&target, &bindings, 0, &presses(&[KEY_U, KEY_U], 600));
+        {
+            let target = target.lock().unwrap();
+            assert!(target.notices.is_empty());
+            assert_eq!(target.secret_roles, [Selection::Update]);
+        }
+        // Inside the settle, before the menu is on glass, or with Ctrl
+        // held: ended unchosen, and a later `U` is too late.
+        let early = opened(RecordingTarget::default());
+        read_reports(&early.0, &early.1, 0, &presses(&[KEY_U, KEY_U], 400));
+        let unseen = opened(RecordingTarget {
+            notices_owed: true,
+            ..RecordingTarget::default()
+        });
+        read_reports(&unseen.0, &unseen.1, 0, &presses(&[KEY_U], 600));
+        let held = opened(RecordingTarget::default());
+        // One read: a device whose reader ends releases what it held.
+        let mut ctrl = vec![at_millis(key(KEY_LEFTCTRL, KEY_PRESS), 590), syn(590)];
+        ctrl.extend(presses(&[KEY_U, KEY_U], 600));
+        read_reports(&held.0, &held.1, 0, &ctrl);
+        for (case, (target, _)) in [early, unseen, held].into_iter().enumerate() {
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, [Notice::NoChoice], "{case}");
+            assert!(target.secret_roles.is_empty());
+        }
+        let bound = [
+            KEY_U, KEY_V, KEY_W, KEY_I, KEY_K, KEY_L, KEY_B, KEY_H, KEY_S, KEY_R, KEY_P, KEY_Z,
+        ];
+        let typed = [
+            KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J, KEY_K, KEY_L,
+            KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X,
+            KEY_Y, KEY_Z, KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,
+            KEY_MINUS, KEY_SPACE,
+        ];
+        for code in typed.into_iter().filter(|code| !bound.contains(code)) {
+            let (target, bindings) = opened(RecordingTarget::default());
+            // A security key's `cccc...u...` after a missed exclusion.
+            read_reports(
+                &target,
+                &bindings,
+                0,
+                &presses(&[code, KEY_U, KEY_ENTER], 600),
+            );
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, [Notice::NoChoice], "{code}");
+            assert!(target.secret_roles.is_empty(), "{code}");
+            assert_eq!(target.attention_events, [true], "{code}");
+        }
+        // A key that types nothing stays inert.
+        let (target, bindings) = opened(RecordingTarget::default());
+        read_reports(&target, &bindings, 0, &presses(&[KEY_TAB, KEY_U], 600));
+        assert_eq!(target.lock().unwrap().secret_roles, [Selection::Update]);
+        const KEY: usize = 1;
+        for code in [KEY_U, KEY_C] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            bindings.lock().unwrap().attention_excluded.insert(KEY);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, KEY, &presses(&[code], 600));
+            let target = target.lock().unwrap();
+            assert!(target.notices.is_empty(), "{code}");
+            assert!(target.secret_roles.is_empty(), "{code}");
+        }
+    }
+
     /// `V` opens the credential store's screen, where alone `U`, `T`, `E`
     /// and `X` select, and only once its paint is on glass. The menu's own
     /// letters select nothing there, and a security key's own keyboard
@@ -13899,14 +14033,15 @@ mod tests {
             (KEY_X, Selection::Enroll(Recovery::Unrecoverable)),
         ];
         for (code, selected) in store.clone() {
-            // On the menu the letter is no choice.
+            // On the menu the letter is not the store's: pressed at once,
+            // `U` as the others ends the lifetime unchosen.
             let target = Mutex::new(RecordingTarget::default());
             let bindings = attention_bindings(None);
             read_reports(&target, &bindings, 0, &chord_reports(10));
             read_reports(&target, &bindings, 0, &presses(&[code], 20));
             {
                 let target = target.lock().unwrap();
-                assert!(target.notices.is_empty(), "{code}");
+                assert_eq!(target.notices, [Notice::NoChoice], "{code}");
                 assert!(target.secret_roles.is_empty(), "{code}");
             }
             // On the store screen it is, once that screen is on glass.
@@ -14508,7 +14643,7 @@ mod tests {
             &target,
             &bindings,
             0,
-            &presses(&[KEY_Q, KEY_K, KEY_Z, KEY_A], 30),
+            &presses(&[KEY_TAB, KEY_K, KEY_Z, KEY_A], 30),
         );
         let target = target.lock().unwrap();
         assert_eq!(target.secret_roles.len(), 1);

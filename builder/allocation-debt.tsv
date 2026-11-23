@@ -1203,7 +1203,7 @@ td-authd/src/secret_request.rs	allocation-macro	1
 td-authd/src/secret_request.rs	unchecked-growth-or-clone	7
 td-authd/src/secret_sys.rs	unchecked-growth-or-clone	2
 td-authd/src/session.rs	allocating-conversion	1
-td-authd/src/session.rs	allocation-macro	55
+td-authd/src/session.rs	allocation-macro	56
 td-authd/src/session.rs	heap-owner	9
 td-authd/src/session.rs	unchecked-growth-or-clone	19
 td-authd/src/set_hostname.rs	allocating-constructor	2

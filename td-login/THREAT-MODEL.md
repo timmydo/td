@@ -52,6 +52,11 @@ is invalid, though every paired session consumes `Super+l` and shows
 `L`. That document says when the tier may be called usable and what it
 does not protect.
 
+The attention menu's `U` is principle 7's fourth exception: one
+physical press, which no process of the account can make, starts
+trusted main's no-reboot installation without a prompt
+(`td-update/ADMIN.md`, "The attention menu's U").
+
 The trusted password notebook is principle 7's third exception
 (`AGENTS.md`): its window, a human-account process, takes its key's
 approval and PIN in its own prompt, while root owns the token slot and

@@ -6118,11 +6118,38 @@ client directory. A bare readiness filename without a directory is refused.
 ## Physical secure attention
 
 **The menu's rows.** Below the title, 36 pixels apart on 1280x800 (title
-at 276): `V: CREDENTIAL STORE` at 312, `W` at 348, `I` at 384, `K` at
-420, `L` at 456, `B` at 492, `H` at 528, `S` at 564, the power row at
-600 and `ESC TO RETURN` at 636. The eleven rows are 374 pixels tall at
-double scale and start at 176 on 800x600; on 320x200 they keep an
-18-pixel pitch from 0. Every other attention screen pads to the title
+at 276): `U: UPDATE FROM TRUSTED MAIN` at 312, `V: CREDENTIAL STORE` at
+348, `W` at 384, `I` at 420, `K` at 456, `L` at 492, `B` at 528, `H` at
+564, `S` at 600, the power row at 636 and `ESC TO RETURN` at 672. The
+twelve rows are 410 pixels tall at double scale and start at 176 on
+800x600; on 320x200 they close to a 17-pixel pitch from 0.
+
+**The update key.** A fresh physical `U` on the menu, under the menu's
+rules, selects trusted main's update with no prompt and no Enter
+(`td-update/ADMIN.md`, "The attention menu's U"; principle 7's fourth
+exception), but only as an approving Enter would: stamped at least
+`APPROVAL_SETTLE` (500 ms) after the menu's own paint completed on
+glass, with no Ctrl, Alt or Super held. Opening the menu records that
+paint's presentation (`Runtime::attention_menu_shown`, the first paint
+showing it); a target without one never offers `U`. An earlier `U` ends
+the lifetime as an unbound key does, so neither habit (`U` was the
+store's unlock) nor a `u` in flight with the chord starts a build the
+person did not see offered. The private client claims the lifetime's
+commit before it sends anything, so an Escape that wins sends nothing,
+then sends root's `2e 00` as a fixed slice and, from the authority
+worker's ordinary turns, `2e 01` until root says how it ended, never
+starting again: `ae 04` shows `UPDATE FROM MAIN STARTED` with `IT
+INSTALLS FOR THE NEXT BOOT` and `TD-ADMIN STATUS FOLLOWS IT`, `ae 03`
+`UPDATE NOT SUBMITTED` with `TD-ADMIN STATUS SAYS WHAT RUNS` (a
+failure, a timeout or another job running), `ae 01` the busy notice and
+`ae 02` the elevation table's refusal. After 20 seconds without an end
+the client stops asking and shows `UPDATE NOT SUBMITTED`; any other
+reply fails the authority channel, as an invalid reply to any request
+does. `U` is modhex, so beside the exclusion of a security key's own
+keyboard, every letter, digit, `-` or space the menu does not bind ends
+the lifetime unchosen with `NOT A MENU CHOICE - REOPEN TO TRY AGAIN`: a
+password typed past a failed exclusion is spent on its first character.
+Keys that type nothing, such as Tab, stay inert. Every other attention screen pads to the title
 and six rows and draws its last at 528. Places an increment below gives
 for the menu's rows were that increment's; these are current.
 
@@ -6256,7 +6283,8 @@ capture or synthetic-input portal is implemented by this increment. The
 lock surface ("The lock surface" below) is a private screen in each of
 these respects.
 
-A fresh physical V opens the credential store's screen, whose U, T, E and
+A fresh physical U selects trusted main's update ("The update key"
+above). V opens the credential store's screen, whose U, T, E and
 X select primary unlock, recovery unlock, enrollment with a second
 recovery token and explicit unrecoverability ("The credential store
 screen" above); W selects the ready credential write queued through
@@ -7168,7 +7196,7 @@ doubled only on an output of at least 800x600 as a prompt's Unifont
 is, and 18 scaled pixels apart. The first row keeps its long-standing
 place, `(height - 248) / 2`, wherever the whole block, the last row's
 foot included, fits below it, so the boot oracles' rows do not move (on
-1280x800 the title at 276, the notice at 312 and `I` at 384); only an
+1280x800 the title at 276, the notice at 312 and `I` at 420); only an
 output too short for that moves the block up, as little as makes it
 fit. Rows that cannot all fit at that pitch even from the top close up
 to the output's height, never closer than the glyph's height and one

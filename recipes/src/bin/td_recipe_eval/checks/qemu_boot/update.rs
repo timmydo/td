@@ -585,7 +585,7 @@ impl Guest {
                 |pixels| {
                     shown = menu_row_matches(pixels, HOSTNAME_ROW, row)?;
                     Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
-                        && menu_row_matches(pixels, 492, "B: ROLL BACK TO THE PREVIOUS SYSTEM")?
+                        && menu_row_matches(pixels, 528, "B: ROLL BACK TO THE PREVIOUS SYSTEM")?
                         && menu_row_matches(pixels, HOSTNAME_ROW + 36, "S: DISK ENCRYPTION")?
                         && menu_row_matches(
                             pixels,
@@ -1057,7 +1057,7 @@ const BUSY_NOTICE: &str = "PREVIOUS REQUEST IS STILL FINISHING";
 const ROLLED_BACK_NOTICE: &str = "ROLLED BACK - RESTART TO BOOT IT";
 /// The menu's `H` row, below `B` (td-compositor/DESIGN.md, "Elevation
 /// consent"), and its two queue states.
-const HOSTNAME_ROW: usize = 528;
+const HOSTNAME_ROW: usize = 564;
 const HOSTNAME_EMPTY: &str = "H: NO SETTINGS WAITING";
 const HOSTNAME_WAITING: &str = "H: REVIEW SETTINGS";
 const NO_HOSTNAME_NOTICE: &str = "NO SETTINGS CHANGE IS READY";
@@ -2096,7 +2096,7 @@ fn menu_matches(bytes: &[u8]) -> Result<bool> {
 /// installation.
 pub(super) fn menu_pixels_match(pixels: &[u8]) -> Result<bool> {
     Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
-        && menu_row_matches(pixels, 384, "I: REVIEW PENDING SYSTEM INSTALLATION")?)
+        && menu_row_matches(pixels, 420, "I: REVIEW PENDING SYSTEM INSTALLATION")?)
 }
 
 /// Whether a capture's pixels are the trusted installation prompt for
@@ -2289,7 +2289,7 @@ mod tests {
                 "397854906d2ca6aee82037ec663f1339a0a2b29569e813eab7252652b6063bed",
             ),
             (
-                384,
+                420,
                 "I: REVIEW PENDING SYSTEM INSTALLATION",
                 "aa378e2216f5d66058da6da5b203f0e4c3da804f3bd82dec032dbe542ab9ecf9",
             ),
@@ -2327,7 +2327,7 @@ mod tests {
         let mut bytes = b"P6\n1280 800\n255\n".to_vec();
         bytes.extend_from_slice(&pixels);
         assert!(menu_matches(&bytes).unwrap());
-        let entry = b"P6\n1280 800\n255\n".len() + 384 * 3840;
+        let entry = b"P6\n1280 800\n255\n".len() + 420 * 3840;
         bytes[entry..entry + 14 * 3840].fill(0);
         assert!(!menu_matches(&bytes).unwrap());
     }
@@ -2674,7 +2674,7 @@ mod tests {
     fn the_ending_key_is_a_letter_no_screen_selects_with() {
         assert_eq!(OTHER_KEY.len(), 1);
         assert!(OTHER_KEY.bytes().all(|byte| byte.is_ascii_lowercase()));
-        for selection in ["i", "b", "h", "s", "r", "p", "l"] {
+        for selection in ["u", "v", "w", "i", "k", "b", "h", "s", "r", "p", "z", "l"] {
             assert_ne!(OTHER_KEY, selection);
         }
         assert!(APPROVAL_WAIT >= Duration::from_millis(600));

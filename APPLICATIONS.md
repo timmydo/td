@@ -9709,7 +9709,7 @@ confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
 | `replace-publisher` | `td-admin trust-publisher` queues a typed settings request; H selects it | the complete public-root SHA-256; future-release authority and version-history reset | `/bin/td-admin accept-publisher SHA256` |
 | `manage-time` | `td-time` queues a typed settings request; the menu's `H` selects it | exact UTC timestamp, timezone identifier, or automatic on/off | `/bin/td-time apply ACTION VALUE` |
 | `manage-volumes` | `td-disks` queues a typed settings request; the menu's `H` selects it | the volume's name, filesystem UUID and kind, and whether its programs may run | `/bin/td-disks apply add\|remove ...` |
-| `admin-update` | `td-admin update` or `update-from-source`, run locally, queues a typed settings request; the menu's `H` selects it | signed release or trusted main, and whether it restarts | `/bin/td-admin submit update\|update-from-source [--no-reboot]` |
+| `admin-update` | `td-admin update` or `update-from-source`, run locally, queues a typed settings request; the menu's `H` selects it. The menu's `U` starts trusted main's, without reboot, with no request or prompt | signed release or trusted main, and whether it restarts | `/bin/td-admin submit update\|update-from-source [--no-reboot]` |
 
 **`deploy-rollback`.** The person opens secure attention and presses
 `B`; nothing outside the compositor asks, so there is no requester to
@@ -9737,7 +9737,10 @@ that restart `/etc/hostname` and the kernel name disagree, and the
 prompt says a restart completes the change.
 
 **Consent.** The same for every v1 operation: Ctrl+Alt+Esc, the menu's
-letter, the request's rows, then Enter. The first counted key press after
+letter, the request's rows, then Enter. The one exception is the menu's
+`U`, principle 7's fourth: its single press starts `admin-update`'s
+trusted-main job without reboot, and no rows or Enter follow
+(`td-update/ADMIN.md`, "The attention menu's U"). The first counted key press after
 the prompt is on glass decides: Enter at least 500 ms after presentation,
 with no Ctrl, Alt or Super held, approves; any other key, or an Enter
 inside those 500 ms, ends the request as Escape does. Only a fresh
@@ -9764,7 +9767,12 @@ keyboard"): it types modhex letters before its Enter, so its first
 letter ends the request. That exclusion now carries more weight: a
 missed device whose static-password slot was reprogrammed to type a bare
 Enter would approve a prompt the person opened. What such a device
-keeps besides is selecting `B`, `H` or `I`, all modhex. Consent is the
+keeps besides is selecting `B`, `H` or `I`, all modhex, and `U`, which
+has no prompt: on the menu every letter, digit, `-` or space it does not
+bind ends the lifetime unchosen, and `U` counts only half a second after
+the menu is on glass, so a missed device starts an update only when the
+first character it types is `u` and arrives that late, as a public ID
+or static password beginning with it would. Consent is the
 same with or without an enrolled login key: a login-key assertion over
 the request is deferred, and nothing here claims one.
 

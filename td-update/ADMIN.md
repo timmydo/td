@@ -7,7 +7,9 @@ policy; `update-from-source` builds and installs `main` from
 unless `--no-reboot` was requested. Neither needs a further physical consent
 prompt. Download failures never select the source path automatically. The
 primary account can request the same two jobs on the machine itself,
-approving each on secure attention ("Local consent").
+approving each on secure attention ("Local consent"), and the attention
+menu's `U` starts trusted main's without a prompt ("The attention menu's
+U").
 
 Whoever controls a trusted release key can authorize bytes for that policy's
 profile; a signed source commit is the publisher's assertion, not a proof of
@@ -142,6 +144,46 @@ installs nothing and requests no reboot. A failed or timed-out
 submission is not proof that nothing started: the request may already
 have reached the service. Rollback has its own local consent
 (`deploy-rollback`, B).
+
+## The attention menu's U
+
+`U: UPDATE FROM TRUSTED MAIN`, the secure attention menu's first row,
+starts `update-from-source --no-reboot` with no prompt: one fresh
+physical `U`, read under the menu's rules, is the whole consent. It is
+principle 7's fourth exception (`AGENTS.md`), made because the job is
+the one the admin SSH key may start unprompted, it restarts nothing, and
+only a person at the machine's own keyboard can press it: no program, SSH
+session or workload of the primary account reaches the attention screen.
+
+The compositor counts `U` only half a second after the menu is on
+glass, with no Ctrl, Alt or Super held, then sends td-authd request
+`2e 00`. Root refuses it while the session is unprepared, being cleaned
+up, or running any operation, inspection or earlier `U` submission
+(`ae 01`), and on a live boot or unless the elevation table
+grants the session owner `admin-update` (`ae 02`), the same grant tag 46
+needs. While a suspend is pending or a failed revocation restarts the
+machine, root refuses the request outright, as it does every slot
+request. Admitted, it runs `/bin/td-admin submit update-from-source
+--no-reboot` beside the operation slot, and `2e 01` reports its end:
+`ae 04` when `submit` succeeded, so the service queued exactly that job,
+`ae 03` when it failed, timed out or could not start. The screen says
+`UPDATE FROM MAIN STARTED`, `UPDATE NOT SUBMITTED` with `TD-ADMIN STATUS
+SAYS WHAT RUNS`, the busy notice or the elevation table's refusal
+(`td-authd/DESIGN.md`, "Elevation operations"). As for "Local consent",
+a failed or timed-out submission is not proof that nothing started, and
+while another job runs (an SSH job, say) `submit` fails without starting
+one.
+
+What it can do: fetch upstream main under the fast-forward rule, build it
+as UID 985 and install it as the next boot's deployment, as any trusted
+main job does; the running system and its selectors' rollback are
+untouched until the person restarts. It cannot pick a source, revision
+or reboot, and while another job runs it starts nothing. A security
+key's keyboard is excluded from the attention screen, and any letter,
+digit, `-` or space the menu does not bind ends that lifetime unchosen,
+so a password such a key types past a failed exclusion reaches no later
+`u`; only one whose first character is `u`, arriving after the half
+second, could start this job.
 
 ## Release policy and download boundary
 

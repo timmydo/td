@@ -277,6 +277,23 @@ fn the_production_source_and_raw_boundary_are_closed() {
         2,
         "session.rs: cleanup_time's uses"
     );
+    // Request 2e, the menu's `U` (td-authd/DESIGN.md, "Elevation
+    // operations"): no prompt, so only the owner's `admin-update` row
+    // admits it, and the one helper is td-admin's root-only `submit` of
+    // the codec's own words for trusted main without reboot.
+    for pin in [
+        "    let mut command = Command::new(\"/bin/td-admin\");\n    command\n        .arg(\"submit\")\n        .args(crate::consent::admin_update_words(true, false));\n    Inspection::printing(command, 511, UPDATE_SUBMIT)\n",
+        "const UPDATE_SUBMIT: Duration = Duration::from_secs(15);",
+        "            Request::Update => self.begin_update(crate::elevation::Table::load, update_request),\n",
+        "table.grants(self.owner, crate::elevation::Operation::AdminUpdate)",
+        "            [0x2e, 0] => Ok(Self::Update),",
+    ] {
+        assert_eq!(session.matches(pin).count(), 1, "session.rs: {pin}");
+    }
+    assert_eq!(
+        session.matches("Command::new(\"/bin/td-admin\")").count(),
+        1
+    );
     // Amendment 10: no storage worker starts in production until
     // td-install/ENCRYPTION.md's item 9, and the one worker is td-install's
     // fixed verb.
@@ -1872,10 +1889,10 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
 const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
-const LAUNCH_FINGERPRINT: u64 = 0x8c225f6d6c3ed892;
+const LAUNCH_FINGERPRINT: u64 = 0xa844e56de0e34a39;
 const MAIN_FINGERPRINT: u64 = 0xaca9c2323ccde7ee;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
-const SESSION_FINGERPRINT: u64 = 0xa2c3deda3c2d3b91;
+const SESSION_FINGERPRINT: u64 = 0xde66f15e9adba263;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0x755e883a75780a83;

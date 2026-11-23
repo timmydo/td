@@ -3409,10 +3409,11 @@ APPLICATIONS.md §L.1, "The v1 operations", says what
 `deploy-rollback`, `set-hostname` and `deploy-publish` are and why,
 and its "Elevation increments" which commit lands each part;
 `td-compositor/DESIGN.md`, "Elevation consent", says which presses
-confirm. The private channel routes requests `10` to `1f` to the secret
-session and refuses `20` and above; ENCRYPTION.md increment 8e's storage
-commit routes `20` there too ("Login keys and session lock", amendment
-10).
+confirm. At `10` and above the private channel routes requests `10` to
+`21`, `25`, `26`, `28` to `2b`, `2d` and `2e` to the secret session, and
+`22` to `24`, `27` and `2c` to their own handlers, and refuses the rest;
+ENCRYPTION.md increment 8e's storage commit first routed `20` there
+("Login keys and session lock", amendment 10).
 
 **Consent tags.** Tags 11 (`deploy-rollback`) and 12 (`set-hostname`)
 follow the login tags. No consent description carries an approval key:
@@ -3490,9 +3491,31 @@ each turn of its authority worker and the attention menu's `H` row shows
 the answer it holds when the menu opens. The answer grants nothing; `1e`
 selects the request and checks the table again.
 
-**Principal table.** `elevation.rs` reads it at each `1d` and `1e`, at
-each request 19 on an installed system, and at each hostname and update
-admission. `/etc` is opened as a directory without following a link and
+`2e 00` is the attention menu's `U`: trusted main's update with no
+reboot and no prompt, principle 7's fourth exception (`AGENTS.md`;
+`td-update/ADMIN.md`, "The attention menu's U"). It takes no slot and no
+description. Like every slot request it is refused while a failed
+revocation restarts the machine or a suspend is pending. Root answers
+`ae 01` while the generation is unprepared, is being cleaned up, or has
+an operation, inspection or earlier `U` submission running; `ae 02` on a
+live boot, which has no installed system to update, or unless the table
+grants the owner `admin-update`, read here before anything starts; `ae
+03` if the helper cannot start; and otherwise `ae 00`, having started
+`/bin/td-admin submit update-from-source --no-reboot` through Inspection
+under the fifteen-second bound tag 46's commit uses ("Local admin
+updates"). `2e 01` answers `ae 00` while it runs, then once `ae 04` when
+it succeeded or `ae 03` when it failed or timed out, which does not
+prove the service started nothing, and `ae 03` when none was started;
+each `2e 01` runs the session's tick first, as `1f` does. The tick also
+polls a running submission, so its deadline holds while nobody asks; a
+finished one nobody asked after is dropped at the next `2e 00`, and
+generation teardown reaps one still running. Root cannot observe the
+`U` press: it trusts the paired compositor for it, as for Enter.
+Request `2f` is unassigned.
+
+**Principal table.** `elevation.rs` reads it at each `1d`, `1e` and
+`2e 00`, at each request 19 on an installed system, and at each hostname
+and update admission. `/etc` is opened as a directory without following a link and
 must be root's and writable by neither group nor other; the table is
 opened through that descriptor's `/proc/self/fd` path with `O_NOFOLLOW |
 O_NONBLOCK` and admitted only as a regular root-owned file of mode
@@ -5036,6 +5059,11 @@ timed-out helper never retries, and its failure does not prove the
 service started nothing. Tag 46 authorizes no
 other admin verb, no key or publisher change, and no credential-store or
 disk-protector operation.
+
+The same `admin-update` grant also admits request `2e 00`, the
+attention menu's `U`, which starts the same helper with
+`update-from-source --no-reboot` and no tag, prompt or backoff
+("Elevation operations", "Requests").
 
 ## Root helpers' stderr
 

@@ -917,7 +917,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x21 | 0x25 | 0x26 | 0x28..=0x2b | 0x2d, ..] => {
+        [0x10..=0x21 | 0x25 | 0x26 | 0x28..=0x2b | 0x2d | 0x2e, ..] => {
             Ok(Request::Secret(crate::session::Request::decode(bytes)?))
         }
         [0x24, operands @ ..] => Ok(Request::Software(crate::software::Request::decode(
@@ -1306,7 +1306,7 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
     // None of these takes an operand, `20` takes exactly one but for an
     // upgrade's two, `21` exactly one, `22` none or a name, `23` none,
     // `24` a verb and a name, and nothing above `24` is a request but the
-    // secret session's and `27`'s, and `2c`'s grant requests.
+    // secret session's, `27`'s and `2e`'s, and `2c`'s grant requests.
     assert!(request(&[0x1d, 0]).is_err());
     assert!(request(&[0x1e, 0]).is_err());
     assert!(request(&[0x1f, 0]).is_err());
@@ -1330,6 +1330,18 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
     }
     assert!(request(&[0x16, 2]).is_err());
     assert_eq!(request(&[0x23])?, Request::Installed);
+    // `2e` takes exactly one operand, start or status.
+    assert_eq!(
+        request(&[0x2e, 0])?,
+        Request::Secret(crate::session::Request::Update)
+    );
+    assert_eq!(
+        request(&[0x2e, 1])?,
+        Request::Secret(crate::session::Request::UpdateStatus)
+    );
+    for bad in [&[0x2e][..], &[0x2e, 2], &[0x2e, 0, 0], &[0x2f]] {
+        assert!(request(bad).is_err(), "{bad:?}");
+    }
     // `2c` reaches the grant decoder, which takes nothing malformed.
     assert_eq!(
         request(&[&[0x2c, 1, 0, 7][..], b"firefoxPictures"].concat())?,

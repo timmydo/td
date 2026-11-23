@@ -229,6 +229,15 @@ pub(crate) struct NoticePresentation {
 }
 
 impl NoticePresentation {
+    /// A press generated at least `settle` after this screen completed: a
+    /// choice the screen's own sight must precede.
+    pub fn settled(&self, timestamp: u128, settle: u128) -> bool {
+        self.on_glass()
+            && self.after.lock().is_ok_and(|after| {
+                after.is_some_and(|after| timestamp > after.saturating_add(settle))
+            })
+    }
+
     /// Physical confirmation must be generated after this screen completed.
     pub fn answers(&self, timestamp: u128) -> bool {
         self.on_glass()
@@ -3198,6 +3207,15 @@ impl Runtime {
             return Err("no PIN field is open on the attention screen".into());
         }
         self.paint_attention_field(field)
+    }
+
+    /// The attention menu just opened, as the first paint that shows it:
+    /// its `U` counts only once that paint is on glass.
+    pub(crate) fn attention_menu_shown(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+    ) -> NoticePresentation {
+        self.presented.notice(self.current_epoch())
     }
 
     /// Show `notice` on the attention screen. With a flip in flight the
