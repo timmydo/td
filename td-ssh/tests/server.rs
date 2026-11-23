@@ -255,6 +255,29 @@ fn stderr(output: &Output) -> String {
 /// The child's `PATH` is `/bin`, which on a build host may hold no utilities, so
 /// these commands name nothing but the shell's built-ins.
 #[test]
+fn lost_local_output_overrides_a_successful_remote_exit() {
+    let server = start("");
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    for (destination, errno) in [(full, 28), (fs::File::open("/dev/null").unwrap(), 9)] {
+        let output = server
+            .ssh("client")
+            .args(["tester@127.0.0.1", "printf audit"])
+            .stdout(destination)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(255));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("write local stdout") && error.contains(&format!("os error {errno}")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn exec_status_stderr_and_environment() {
     let server = start("");
     let output = server.run("echo hello; echo oops >&2; exit 42");

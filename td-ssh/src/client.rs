@@ -2091,7 +2091,7 @@ fn session_loop(
         }))
     };
     let (stdout, stdout_handle) = conn::spawn_sink(
-        Patient(io::stdout()),
+        crate::error::stdout_writer().map_err(Error::Stdout)?,
         SESSION_CHANNEL,
         WhenBroken::Report,
         events.clone(),
@@ -2149,6 +2149,7 @@ fn session_loop(
     let mut last_probe = Instant::now();
     let mut last_seen = conn.arrivals();
 
+    let mut stdout_failure = None;
     let outcome = loop {
         let Ok(event) = receiver.recv() else {
             break Err(Error::protocol("the connection loop lost its events"));
@@ -2226,6 +2227,10 @@ fn session_loop(
                     }
                 }
             }
+            Event::SinkBroken { error, .. } if error.kind() != io::ErrorKind::BrokenPipe => {
+                stdout_failure = Some(error);
+                break Ok(Ending::ChannelClosed);
+            }
             Event::SinkBroken { .. } => {
                 if let Err(error) = session.on_stdout_broken(&mut conn) {
                     break Err(error);
@@ -2274,11 +2279,17 @@ fn session_loop(
                 }
             }
             Event::TransportEnded(error) if lost => transport_end = Some(error),
+            Event::SinkBroken { error, .. } if error.kind() != io::ErrorKind::BrokenPipe => {
+                stdout_failure = Some(error);
+            }
             _ => {}
         },
     );
     // The sinks are closed by now, so output in that queue has nowhere to go, and a
     // success on top of it would say the command's output had all arrived.
+    if let Some(error) = stdout_failure {
+        return Err(Error::Stdout(error));
+    }
     if dropped_output {
         session.exit_code = None;
         if !escaped.load(Ordering::SeqCst) {

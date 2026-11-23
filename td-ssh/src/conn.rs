@@ -63,6 +63,7 @@ pub enum Event {
     /// A sink that reports its consumer going away found it gone.
     SinkBroken {
         channel: u32,
+        error: std::io::Error,
     },
     ChildExited {
         channel: u32,
@@ -849,10 +850,12 @@ pub fn spawn_sink<W: Write + Send + 'static>(
             // consumer reopens the window as it goes, and not only once all that
             // waited is through.
             for piece in data.chunks(CHANNEL_MAX_PACKET as usize) {
-                if !broken && (output.write_all(piece).is_err() || output.flush().is_err()) {
-                    broken = true;
-                    if when_broken == WhenBroken::Report {
-                        let _ = events.send(Event::SinkBroken { channel });
+                if !broken {
+                    if let Err(error) = output.write_all(piece).and_then(|()| output.flush()) {
+                        broken = true;
+                        if when_broken == WhenBroken::Report {
+                            let _ = events.send(Event::SinkBroken { channel, error });
+                        }
                     }
                 }
                 owed = owed.saturating_add(u32::try_from(piece.len()).unwrap_or(u32::MAX));
@@ -1362,7 +1365,7 @@ mod tests {
         while let Ok(event) = receiver.recv_timeout(Duration::from_millis(50)) {
             seen.push(event);
         }
-        assert!(matches!(seen[0], Event::SinkBroken { channel: 5 }));
+        assert!(matches!(seen[0], Event::SinkBroken { channel: 5, .. }));
         let credits: Vec<u32> = seen[1..]
             .iter()
             .filter_map(|event| match event {

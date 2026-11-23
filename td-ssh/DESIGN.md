@@ -552,7 +552,9 @@ without `want_reply`, once, so `ssh h yes | head -1` ends. What still comes for 
 discarded and its window granted, since stderr shares that window and the status follows
 both: a server that takes no notice of eow can finish, and one with no end to its output
 is a connection that does not end, as with stock `ssh`. A stderr that has gone is only
-discarded. A stream inherited with `O_NONBLOCK` is retried on `EAGAIN` after 5 ms on
+discarded. Other local stdout write or flush failures end the client with status
+255 and a diagnostic, including a failure while draining the last packet after
+the remote exit status. A stream inherited with `O_NONBLOCK` is retried on `EAGAIN` after 5 ms on
 stdin, stdout and stderr, by the session's sinks, by diagnostics and by a tool's primary
 output, losing nothing and reading as no false end of input: `std` has no `poll`, and
 td-ssh adds none.

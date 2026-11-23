@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -13,6 +14,8 @@ pub enum Error {
     Protocol(String),
     /// The transport ended, in an orderly way or not.
     Io(io::Error),
+    /// Required local session output could not be delivered.
+    Stdout(io::Error),
     /// The peer sent `SSH_MSG_DISCONNECT`.
     Disconnected(String),
     /// Refused by local policy or configuration, before any protocol failure.
@@ -37,6 +40,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
+            Self::Stdout(error) => write!(f, "write local stdout: {error}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Disconnected(message) => write!(f, "disconnected by peer: {message}"),
             Self::Refused(message) => write!(f, "{message}"),
@@ -154,9 +158,14 @@ pub fn diagnostic(text: &str) {
     let _ = Patient(io::stderr().lock()).write_all(line.as_bytes());
 }
 
+/// Use the descriptor itself: Stdout treats EBADF as a successful write.
+pub(crate) fn stdout_writer() -> io::Result<Patient<std::fs::File>> {
+    Ok(Patient(io::stdout().as_fd().try_clone_to_owned()?.into()))
+}
+
 /// A tool's primary output, whose loss is the caller's failure.
 pub fn primary_output(text: &str) -> io::Result<()> {
-    let mut out = Patient(io::stdout().lock());
+    let mut out = stdout_writer()?;
     out.write_all(text.as_bytes())?;
     out.flush()
 }
