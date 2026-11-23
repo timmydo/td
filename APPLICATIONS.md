@@ -8727,10 +8727,10 @@ or unreadable is `card<N>`). Its sink name is that id lowercased with
 `_` as `-` and the device appended (`pch-0`); a name an earlier output
 already took, which that folding can make of ids the kernel keeps apart,
 gains `.<card>`, which no derived name otherwise holds. Its description
-is the PCM line's name. The list is read once, at start: the key is what
-follows an adapter across the renumbering of a restart, and an adapter
-plugged in later is an output only after one. Hotplug is a later rung.
-The implicit choice, or the named `--card`/`--device`, is first and the
+is the PCM line's name. The key is what follows an adapter across the
+renumbering of a restart or a replug. The list is read at start and
+again while the daemon runs ("Hotplug" below). The implicit choice, or
+the named `--card`/`--device`, is first and the
 rest follow by card and device; a named loopback is an output, an
 unnamed one is not. Only the active output is open. At start the daemon
 opens the first that will (a named one must; another that will not is
@@ -8747,7 +8747,8 @@ every connection carry on; a stream whose queue ran out with the old
 ring was cut off, not starved, so it is sent no `UNDERFLOW` and keeps
 its prebuffer released. Losing the active output, whether a poll or an
 ioctl (`ENODEV`) finds it gone, switches to the first other output that
-opens, in that order; losing it with none left ends the daemon as losing
+opens, in preference order ("Hotplug" below); losing it with none left
+ends the daemon as losing
 its one device always has. So does losing every output in turn without
 one taking a frame, which would otherwise switch between them forever
 with the supervisor never told. Every switch, asked for or forced, is
@@ -8761,13 +8762,55 @@ queue ran out with the old ring and that never writes again stays
 running, and owed no `UNDERFLOW`, until it is corked, drained or
 deleted: dropping it would send a second `STARTED` when it did write.
 
+**Hotplug.** The daemon reads `/proc/asound/pcm` again about once a
+second, between passes and before any request is read, so no request
+resolved in a pass sees the set change under it, and a
+`SET_DEFAULT_SINK` reaches the router by sink index, not place;
+meanwhile `td-seatd watch` has given a new card's playback node to audio
+(§K.5). Each output newly listed, keyed and named as at start (a name
+another output holds gains `.<card>`; one that still collides is not
+offered, nor any past 64), is offered under the next sink index, never
+one used before in the daemon's life, at the level and mute its key left
+with, and announced as a sink new event; it follows the outputs already
+offered, so discovery order is order of arrival. Each output no longer
+listed is dropped, its level and mute remembered by key (the latest 64
+keys), and announced as a sink remove event. A card plugged back in
+under another number is a new output under its old key; when the playing
+output is gone and its card is back so in the same table, the new output
+takes its name and level. A new output never takes over. The human's
+choices, each `SET_DEFAULT_SINK` including one naming the output that
+plays, form a preference list of keys, most recent first (the latest
+64). A fallback tries those present in that order, then the rest in
+discovery order. Going down the list, the first chosen output present
+that is newly listed, or awaiting a retry, is switched to as if asked,
+logging that a chosen output came back, unless one chosen more recently
+plays; a chosen output listed but neither, such as one whose device
+failed, is passed over. A return refused as `ACCESS`, a node not yet
+handed to audio, is tried again at each rescan while the output stays
+listed; any other refusal waits for it to be plugged in again. The
+playing output no longer listed is lost: the daemon switches to the next
+in preference order that opens, announcing the switch, then drops it;
+none opening ends the daemon, including when the only other is one whose
+node is not yet audio's, and the supervisor's restart finds it then.
+Such a move does not count toward the limit on fallbacks without a
+frame, and an output the table drops resets that count, since the table,
+not a failing device, says the output went; without that, a headset
+unplugged and replugged while nothing plays would run the limit down. A
+table with no ordinary playback PCM left lists none, so every output is
+gone, and a named `--card`/`--device` no longer listed leads no longer.
+A table that cannot be read or parsed, or a card whose id cannot be
+read, keeps the outputs as they were, said once until it reads again.
+The preference list and the remembered levels live as long as the
+daemon; they are not persisted across a restart.
+
 The host oracle `qemu-boot-audio`, an integration-tier step, proves a
 switch on emulated hardware. Its machine has QEMU's HDA output and a USB
 audio device behind its own xHCI controller, each captured to its own
 exact 48 kHz stereo S16 WAV. QEMU attaches both at power-on, and the
-daemon reads its outputs once, at start, so they are its `intel-0`
-(output 0, active) and `audio-0` (output 1); a USB card the guest
-enumerated late would fail the first step, which says so. On ttyS0 the
+daemon finds both at start as its `intel-0` (output 0, active) and
+`audio-0` (output 1); a USB card the guest enumerated after the daemon
+started would join only at a rescan, and the first step, which reads
+the outputs once, says so. On ttyS0 the
 primary account, a controller, waits for the daemon to answer and
 requires exactly those two, starts `td-audio play 4000` (§K.5), and a
 second in makes output 1 the one that plays. The HDA capture must hold
@@ -8897,10 +8940,11 @@ scan and assignment before literally executing the service credential
 transition and `td-audio serve`; this covers sound nodes that enumerate
 after the seat oneshot without giving the daemon root. A playback node
 that appears while the daemon runs, such as a USB DAC plugged in later,
-is given the same assignment within about one 250 ms poll by the `[seat-watch]`
-root daemon (`td-compositor/DESIGN.md`, "Playback nodes"); the daemon
-still reads its outputs once at start, so such a card becomes an output
-at its next start. Its readiness probe
+is given the same assignment within about one 250 ms poll by the
+`[seat-watch]`
+root daemon (`td-compositor/DESIGN.md`, "Playback nodes"), and the
+daemon's next rescan, about a second later, offers it (§K.4,
+"Hotplug"). Its readiness probe
 connects to that running instance's socket under the same service identity.
 With no non-loopback playback PCM, device selection fails and the service
 remains in supervised restart rather than exposing a silent fake sink;
@@ -9060,7 +9104,8 @@ named by its decimal index, in plain digits with no sign or space,
 resolves as the index: `pactl` sends `pactl get-sink-volume 0` as the
 name `"0"`.
 A controller or the compositor is shown every output (§K.4) as its own
-sink, indexed from zero in that order: the active one in the mixer's
+sink, indexed from zero in that order at start and each output added
+later under the next index (§K.4, "Hotplug"): the active one in the mixer's
 state, the others `SUSPENDED`, each with its own level and mute, and the
 active one as the server's default sink; `@DEFAULT_SINK@` and `td-audio`
 name the active one. A controller is told every stream plays on the
@@ -9075,8 +9120,11 @@ captured from the pinned `pactl` naming the output by name and by number;
 a NULL name is `INVALID` (upstream reads it as "the automatic default";
 td has no automatic choice to return to after a switch, so it refuses
 rather than guess), one no output has is `NOENTITY`, and the active one,
-or one another controller switched to in the same pass, is answered at
-once without reopening it. The compositor and a player are answered
+or one another controller switched to in the same pass, is answered
+without reopening it, recorded as the human's choice all the same.
+The router finds the output by sink index, and one no longer there would
+be `NOENTITY`; as rescans run before requests are read, that is a guard. The
+compositor and a player are answered
 `NOTIMPLEMENTED`. A switch, asked for or forced by a loss, is a server
 change event, a sink change event for each of the two outputs and a
 sink-input change event for every stream, to whoever hears them. The

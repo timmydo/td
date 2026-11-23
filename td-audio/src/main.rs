@@ -169,7 +169,7 @@ fn parse_probe(arguments: &[OsString]) -> io::Result<PathBuf> {
 /// account comes from the deployment's policy, and the compositor's only
 /// from `--output-uid`.
 fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
-    let options = parse(arguments)?;
+    let mut options = parse(arguments)?;
     let wanted = options.card.zip(options.device);
     let outputs = device::outputs(&options.proc_pcm, wanted)?;
     let mut stdout = io::stdout();
@@ -192,8 +192,9 @@ fn serve_daemon(arguments: &[OsString]) -> io::Result<()> {
     // Everything that can fail is done before the socket exists.
     let set = output::OutputSet::discovered(outputs, active)?;
     let policy = options.admit(serve::Policy::for_deployment(current_uid()?)?);
-    let mut server =
-        serve::Server::bind(&options.socket, sink, policy)?.with_outputs(set, open_alsa);
+    let mut server = serve::Server::bind(&options.socket, sink, policy)?
+        .with_outputs(set, open_alsa)
+        .rescanning(std::mem::take(&mut options.proc_pcm), wanted);
     writeln!(
         stdout,
         "{}: serving {} at {} Hz, {} channels, for uid(s) {:?}",

@@ -269,11 +269,11 @@ pub enum GlobalRequest {
         tag: u32,
         version: u32,
     },
-    /// A controller's switch to the output at `position` in the output set,
-    /// which is not the one playing.
+    /// A controller's choice of the output with sink index `index`, which
+    /// the router makes the one playing and records as the human's.
     DefaultSink {
         tag: u32,
-        position: usize,
+        index: u32,
     },
 }
 
@@ -1916,8 +1916,8 @@ impl Session {
     }
 
     /// `SET_DEFAULT_SINK` from a controller: a sink's name, or its number as
-    /// a name. Switching opens a device, which is the daemon's to do; the
-    /// output already playing is answered here and announces nothing.
+    /// a name. Switching opens a device and records the human's choice, the
+    /// output already playing included, which is the daemon's to do.
     fn set_default_sink(
         &mut self,
         mut reader: tag::Reader<'_>,
@@ -1931,15 +1931,19 @@ impl Session {
             return Ok(());
         };
         let outputs = mixer.outputs();
-        let Some(position) = outputs.resolve(tag::INVALID_INDEX, Some(&name)) else {
+        let Some(entry) = outputs
+            .resolve(tag::INVALID_INDEX, Some(&name))
+            .and_then(|position| outputs.entries().get(position))
+        else {
             self.error(tag, error::NOENTITY);
             return Ok(());
         };
-        if position == outputs.active_position() {
-            self.reply(tag, |_| {});
-            return Ok(());
-        }
-        self.route(GlobalRequest::DefaultSink { tag, position });
+        // Routed even when it already plays: choosing it is the human's
+        // preference all the same.
+        self.route(GlobalRequest::DefaultSink {
+            tag,
+            index: entry.index,
+        });
         Ok(())
     }
 

@@ -203,7 +203,35 @@ pub struct Output {
 /// can make, gains `.<card>`: no derived name holds a `.`, and a card's
 /// number is its own.
 pub fn outputs(pcm: &Path, wanted: Option<(u32, u32)>) -> io::Result<Vec<Output>> {
-    let mut devices = read(pcm)?;
+    listed(read(pcm)?, pcm, wanted, false)
+}
+
+/// Every output as a running daemon rescans them: as `outputs` finds them,
+/// except that a table with no ordinary playback PCM left is an empty list,
+/// every output gone, and `wanted` leads only while it is listed. A table
+/// that cannot be read or parsed is an error, which the caller answers by
+/// keeping what it had, and so is a card id that cannot be read: keyed
+/// `card<N>` instead, a playing output would seem gone.
+pub fn rescan(pcm: &Path, wanted: Option<(u32, u32)>) -> io::Result<Vec<Output>> {
+    let devices = read(pcm)?;
+    let wanted = wanted.filter(|(card, device)| {
+        devices
+            .iter()
+            .any(|playback| (playback.card, playback.device) == (*card, *device))
+    });
+    if wanted.is_none() && !devices.iter().any(|playback| !is_test_loopback(playback)) {
+        return Ok(Vec::new());
+    }
+    listed(devices, pcm, wanted, true)
+}
+
+/// `strict`: a card id that cannot be read is an error, not `card<N>`.
+fn listed(
+    mut devices: Vec<Playback>,
+    pcm: &Path,
+    wanted: Option<(u32, u32)>,
+    strict: bool,
+) -> io::Result<Vec<Output>> {
     let first = select(&devices, wanted).map(|first| (first.card, first.device))?;
     devices.sort_unstable_by_key(|playback| {
         (
@@ -219,7 +247,7 @@ pub fn outputs(pcm: &Path, wanted: Option<(u32, u32)>) -> io::Result<Vec<Output>
         if !chosen && is_test_loopback(&playback) {
             continue;
         }
-        let id = card_id(root, playback.card)?;
+        let id = card_id(root, playback.card, strict)?;
         let key =
             crate::allocation::format(format_args!("{id}:{}", playback.device)).map_err(refused)?;
         let mut name =
@@ -242,10 +270,11 @@ pub fn outputs(pcm: &Path, wanted: Option<(u32, u32)>) -> io::Result<Vec<Output>
     Ok(found)
 }
 
-/// A card's id as the kernel keeps it, or `card<N>` when it keeps none or
-/// it cannot be read. Only `[A-Za-z0-9_-]`, the characters the kernel
-/// itself allows in an id, survive, so a key can carry nothing else.
-fn card_id(root: &Path, card: u32) -> io::Result<String> {
+/// A card's id as the kernel keeps it, or `card<N>` when it keeps none or,
+/// unless `strict`, it cannot be read. Only `[A-Za-z0-9_-]`, the characters
+/// the kernel itself allows in an id, survive, so a key can carry nothing
+/// else.
+fn card_id(root: &Path, card: u32, strict: bool) -> io::Result<String> {
     // One formatted path rather than a join: a root that is not UTF-8,
     // which only a diagnostic `--proc` can give, finds no id and is keyed
     // `card<N>`.
@@ -254,9 +283,16 @@ fn card_id(root: &Path, card: u32) -> io::Result<String> {
     // The kernel's id is at most 15 bytes and a newline; a longer file is
     // not one, and only its first bytes are read.
     let mut text = [0u8; CARD_ID_BYTES];
-    let length = fs::File::open(file)
-        .and_then(|mut file| io::Read::read(&mut file, &mut text))
-        .unwrap_or(0);
+    let length =
+        match fs::File::open(&file).and_then(|mut opened| io::Read::read(&mut opened, &mut text)) {
+            Ok(length) => length,
+            Err(error) if strict => {
+                let what =
+                    crate::allocation::format(format_args!("{file}: {error}")).map_err(refused)?;
+                return Err(io::Error::new(error.kind(), what));
+            }
+            Err(_) => 0,
+        };
     let mut id = String::new();
     crate::allocation::reserve_string(&mut id, length).map_err(refused)?;
     let mut encoded = [0u8; 4];
@@ -726,5 +762,46 @@ mod tests {
             assert!(playback.subdevices >= 1);
             assert!(playback.node().starts_with("/dev/snd/"));
         }
+    }
+
+    /// A rescan lists what `outputs` would, but no ordinary PCM left is an
+    /// empty list rather than an error, and a named PCM that went leads no
+    /// longer; an unparsable table stays an error.
+    #[test]
+    fn a_rescan_reads_no_pcm_as_no_outputs() {
+        let dir = proc_tree("rescan", REAL, &[(0, "HDMI\n"), (1, "PCH\n")]);
+        let pcm = dir.path().join("pcm");
+        assert_eq!(rescan(&pcm, None).unwrap(), outputs(&pcm, None).unwrap());
+        assert_eq!(
+            rescan(&pcm, Some((1, 1))).unwrap(),
+            outputs(&pcm, Some((1, 1))).unwrap()
+        );
+        assert_eq!(
+            rescan(&pcm, Some((5, 0))).unwrap(),
+            outputs(&pcm, None).unwrap(),
+            "a named PCM gone leads no longer"
+        );
+        fs::write(&pcm, ALOOP).unwrap();
+        assert!(outputs(&pcm, None).is_err());
+        assert!(rescan(&pcm, None).unwrap().is_empty());
+        assert_eq!(
+            rescan(&pcm, Some((0, 1))).unwrap().len(),
+            1,
+            "the named loopback"
+        );
+        fs::write(&pcm, "").unwrap();
+        assert!(rescan(&pcm, None).unwrap().is_empty());
+        fs::write(&pcm, "garbage\n").unwrap();
+        assert!(rescan(&pcm, None).is_err());
+        // A card id that cannot be read keys the card `card<N>` at start,
+        // but fails a rescan, which keeps the outputs it had.
+        fs::write(&pcm, REAL).unwrap();
+        fs::remove_dir_all(dir.path().join("card1")).unwrap();
+        assert!(outputs(&pcm, None)
+            .unwrap()
+            .iter()
+            .any(|o| o.key == "card1:0"));
+        let refused = rescan(&pcm, None).unwrap_err();
+        assert!(refused.to_string().contains("card1/id"), "{refused}");
     }
 }

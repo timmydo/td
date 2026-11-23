@@ -415,6 +415,21 @@ pub enum Stopped {
 /// Opens an output's device, in the fixed shape, for a switch.
 pub type Open<S> = fn(&crate::device::Playback) -> io::Result<S>;
 
+/// How often a running daemon reads its outputs again (§K.4, "Hotplug").
+const RESCAN_PERIOD: Duration = Duration::from_secs(1);
+
+/// Where and when outputs are read again.
+struct Rescanning {
+    pcm: PathBuf,
+    wanted: Option<(u32, u32)>,
+    last: Instant,
+    /// The last read failed, so the next failure is not said again.
+    failing: bool,
+    /// The index of a returning output whose open was refused as a node
+    /// still being handed to audio is: tried again each rescan it stays.
+    retry: Option<u32>,
+}
+
 /// The daemon.
 pub struct Server<S: AudioSink> {
     listener: UnixListener,
@@ -430,6 +445,8 @@ pub struct Server<S: AudioSink> {
     open: Option<Open<S>>,
     /// Fallbacks since an output last took a frame.
     fallbacks_without_audio: usize,
+    /// Rereading the outputs; `None` for a daemon that never does.
+    rescan: Option<Rescanning>,
     /// A resumption's ring fill, and since when it has not grown.
     resume_held: Option<(u64, Instant)>,
     policy: Policy,
@@ -475,6 +492,7 @@ impl<S: AudioSink> Server<S> {
             sink,
             open: None,
             fallbacks_without_audio: 0,
+            rescan: None,
             resume_held: None,
             policy,
             spec,
@@ -498,6 +516,20 @@ impl<S: AudioSink> Server<S> {
     fn offer(&mut self, outputs: OutputSet, open: Open<S>) {
         *self.mixer.outputs_mut() = outputs;
         self.open = Some(open);
+    }
+
+    /// Read the outputs again from `pcm` about once a second, as discovery
+    /// first read them with `wanted`, adding the outputs that appear and
+    /// dropping those that go (§K.4, "Hotplug").
+    pub fn rescanning(mut self, pcm: PathBuf, wanted: Option<(u32, u32)>) -> Self {
+        self.rescan = Some(Rescanning {
+            pcm,
+            wanted,
+            last: Instant::now(),
+            failing: false,
+            retry: None,
+        });
+        self
     }
 
     /// The device that plays now, for a test to play it.
@@ -576,6 +608,14 @@ impl<S: AudioSink> Server<S> {
         // A CORK/UNCORK or DRAIN cannot retroactively change whether an
         // already-crossed stream endpoint was intentional.
         if self.observe_device()? && !self.fall_back() {
+            self.finish_device_gone();
+            return Ok(true);
+        }
+        let due = self
+            .rescan
+            .as_ref()
+            .is_some_and(|rescan| rescan.last.elapsed() >= RESCAN_PERIOD);
+        if due && self.rescan_outputs() {
             self.finish_device_gone();
             return Ok(true);
         }
@@ -819,13 +859,26 @@ impl<S: AudioSink> Server<S> {
                 GlobalRequest::ClientList { tag, version } => {
                     self.reply_clients(requester, tag, version, None);
                 }
-                GlobalRequest::DefaultSink { tag, position } => {
+                GlobalRequest::DefaultSink { tag, index } => {
                     let from = self.mixer.outputs().active_position();
-                    let outcome = self.switch_to(position);
-                    if let Some(client) = self.clients.get_mut(requester) {
-                        client.session.finish_default_sink(tag, outcome);
+                    // By index, as an output a rescan dropped since the
+                    // request was read is gone, not another one.
+                    let outcome = match self.mixer.outputs().position_of(index) {
+                        Some(position) => self.switch_to(position).map(|()| position),
+                        None => Err(error::NOENTITY),
+                    };
+                    if let Ok(position) = outcome {
+                        if self.mixer.outputs_mut().chosen(position).is_err() {
+                            diagnostic(
+                                &mut self.diagnostics,
+                                format_args!("no memory to remember the output chosen"),
+                            );
+                        }
                     }
-                    if outcome.is_ok() && position != from {
+                    if let Some(client) = self.clients.get_mut(requester) {
+                        client.session.finish_default_sink(tag, outcome.map(|_| ()));
+                    }
+                    if outcome.is_ok_and(|position| position != from) {
                         self.announce_switch(from, "asked for");
                     }
                 }
@@ -1235,13 +1288,139 @@ impl<S: AudioSink> Server<S> {
         }
         self.fallbacks_without_audio = self.fallbacks_without_audio.saturating_add(1);
         let lost = self.mixer.outputs().active_position();
-        for position in 0..outputs {
+        self.switch_away(lost, "fell back from a lost output")
+    }
+
+    /// Play on the first output other than `lost` that opens, in
+    /// preference order: those the human chose, most recent first, then
+    /// the rest. `false` when none does.
+    fn switch_away(&mut self, lost: usize, why: &str) -> bool {
+        for n in 0..self.mixer.outputs().entries().len() {
+            let Some(position) = self.mixer.outputs().preferred(n) else {
+                break;
+            };
             if position != lost && self.switch_to(position).is_ok() {
-                self.announce_switch(lost, "fell back from a lost output");
+                self.announce_switch(lost, why);
                 return true;
             }
         }
         false
+    }
+
+    /// Read the outputs again and follow them: announce each that appears
+    /// and each that goes, move off the playing one when it went, and
+    /// bring back the output the human chose most recently when it
+    /// reappears. A table that cannot be read keeps the outputs as they
+    /// were. `true` when the playing output went and none other opens,
+    /// which ends the daemon as losing its last device always has.
+    fn rescan_outputs(&mut self) -> bool {
+        let Some(rescan) = self.rescan.as_mut() else {
+            return false;
+        };
+        rescan.last = Instant::now();
+        let retry = rescan.retry.take();
+        let found = match crate::device::rescan(&rescan.pcm, rescan.wanted) {
+            Ok(found) => {
+                if std::mem::take(&mut rescan.failing) {
+                    let _ = writeln!(io::stderr(), "td-audio: the outputs read again");
+                }
+                found
+            }
+            Err(failure) => {
+                if !std::mem::replace(&mut rescan.failing, true) {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "td-audio: keeping the outputs as they were: {failure}"
+                    );
+                }
+                rescan.retry = retry;
+                return false;
+            }
+        };
+        let Ok(change) = self.mixer.outputs_mut().rescan(found) else {
+            let _ = writeln!(io::stderr(), "td-audio: no memory to follow the outputs");
+            if let Some(rescan) = self.rescan.as_mut() {
+                rescan.retry = retry;
+            }
+            return false;
+        };
+        // An output the table dropped was lost for real, not a device that
+        // opens and fails, so the fallbacks it took count no longer: a
+        // headset unplugged and replugged while nothing plays would
+        // otherwise run the limit down and end the daemon.
+        if !change.removed.is_empty() || change.active_gone {
+            self.fallbacks_without_audio = 0;
+        }
+        if change.refused > 0 {
+            let _ = writeln!(
+                io::stderr(),
+                "td-audio: {} listed output(s) not offered",
+                change.refused
+            );
+        }
+        for entry in &change.removed {
+            self.announce_output(entry, "went away", subscription::EVENT_REMOVE);
+        }
+        for index in &change.added {
+            let outputs = self.mixer.outputs();
+            if let Some(entry) = outputs
+                .position_of(*index)
+                .and_then(|position| outputs.entries().get(position))
+            {
+                let _ = writeln!(
+                    io::stderr(),
+                    "td-audio: output {} ({}) appeared",
+                    entry.name,
+                    entry.key
+                );
+            }
+            self.notify_others(
+                None,
+                subscription::EVENT_SINK | subscription::EVENT_NEW,
+                *index,
+            );
+        }
+        if change.active_gone {
+            let lost = self.mixer.outputs().active_position();
+            if !self.switch_away(lost, "the playing output went away") {
+                return true;
+            }
+            if let Some(entry) = self.mixer.outputs_mut().remove(lost) {
+                self.announce_output(&entry, "went away", subscription::EVENT_REMOVE);
+            }
+        }
+        let outputs = self.mixer.outputs();
+        let fresh = |index| change.added.contains(&index) || retry == Some(index);
+        let Some((position, index)) = outputs.returning(fresh).and_then(|position| {
+            outputs
+                .entries()
+                .get(position)
+                .map(|entry| (position, entry.index))
+        }) else {
+            return false;
+        };
+        let from = outputs.active_position();
+        match self.switch_to(position) {
+            Ok(()) => self.announce_switch(from, "an output chosen before came back"),
+            Err(error::ACCESS) => {
+                if let Some(rescan) = self.rescan.as_mut() {
+                    rescan.retry = Some(index);
+                }
+            }
+            Err(_) => {}
+        }
+        false
+    }
+
+    /// Log an output's coming or going and tell whoever hears outputs.
+    fn announce_output(&mut self, entry: &crate::output::Entry, what: &str, event: u32) {
+        let _ = writeln!(
+            io::stderr(),
+            "td-audio: output {} ({}) {what}",
+            entry.name,
+            entry.key
+        );
+        self.notify_others(None, subscription::EVENT_SINK | event, entry.index);
     }
 
     /// Tell whoever hears it that another output plays: the server's
@@ -5137,6 +5316,270 @@ pub(crate) mod tests {
         alone.sink.unplug();
         assert!(alone.pass().unwrap(), "no output is left");
         alone.shutdown();
+        server.shutdown();
+    }
+
+    /// A `/proc/asound` listing one playback PCM, device 0, per `(card,
+    /// id)`, each described as `<id> Audio`.
+    fn write_proc(dir: &Path, cards: &[(u32, &str)]) {
+        let mut table = String::new();
+        for (card, id) in cards {
+            table.push_str(&format!("{card:02}-00: {id} : {id} Audio : playback 1\n"));
+            let card = dir.join(format!("card{card}"));
+            let _ = std::fs::create_dir(&card);
+            std::fs::write(card.join("id"), format!("{id}\n")).unwrap();
+        }
+        std::fs::write(dir.join("pcm"), table).unwrap();
+    }
+
+    /// A daemon on the first of `cards`, offering every one and rescanning
+    /// the table `write_proc` keeps in the returned directory.
+    fn hotplug_server(
+        name: &str,
+        cards: &[(u32, &str)],
+    ) -> (Server<MemorySink>, PathBuf, td_fs::TempDir) {
+        let proc = td_fs::TempDir::new(name).unwrap();
+        write_proc(proc.path(), cards);
+        let pcm = proc.path().join("pcm");
+        let found = crate::device::outputs(&pcm, None).unwrap();
+        let (server, path) = server(name);
+        let server = server
+            .with_outputs(OutputSet::discovered(found, 0).unwrap(), memory_output)
+            .rescanning(pcm, None);
+        (server, path, proc)
+    }
+
+    fn names(server: &Server<MemorySink>) -> Vec<(u32, String)> {
+        server
+            .mixer
+            .outputs()
+            .entries()
+            .iter()
+            .map(|entry| (entry.index, entry.name.to_string()))
+            .collect()
+    }
+
+    /// An output plugged in is offered under a new index and announced, and
+    /// does not take over; one unplugged is dropped and announced; the
+    /// playing one unplugged moves the streams to the next and goes; and
+    /// the output the human chose last, plugged back in, plays again at
+    /// the level it left with.
+    #[test]
+    fn outputs_come_and_go_and_a_chosen_one_comes_back() {
+        let (mut server, path, proc) = hotplug_server("hotplug-follow", &[(0, "Intel")]);
+        server.policy = browser_policy(own_uid());
+        let mut player = admit_as(&mut server, BROWSER_UID, 7);
+        let mut controller = UnixStream::connect(&path).unwrap();
+        for socket in [&mut player, &mut controller] {
+            socket.write_all(&auth_packet()).unwrap();
+            socket
+                .write_all(&build(command::SUBSCRIBE, 2, |writer| {
+                    writer.u32(subscription::MASK_ALL);
+                }))
+                .unwrap();
+        }
+        passes(&mut server, 2);
+        let _ = drain_socket(&mut controller);
+        let _ = drain_socket(&mut player);
+        let (new, change, remove) = (
+            subscription::EVENT_NEW,
+            subscription::EVENT_CHANGE,
+            subscription::EVENT_REMOVE,
+        );
+        let sink = subscription::EVENT_SINK;
+        let server_change = (subscription::EVENT_SERVER | change, tag::INVALID_INDEX);
+
+        // Plugged in: offered, announced, and the old output plays on.
+        write_proc(proc.path(), &[(0, "Intel"), (1, "Device")]);
+        assert!(!server.rescan_outputs());
+        passes(&mut server, 1);
+        assert_eq!(
+            subscription_events(&drain_socket(&mut controller)),
+            [(sink | new, 1)]
+        );
+        assert_eq!(
+            names(&server),
+            [(0, "intel-0".into()), (1, "device-0".into())]
+        );
+        assert_eq!(server.mixer.outputs().active().name, "intel-0");
+
+        // Chosen at half its level, then unplugged while it plays: the
+        // stream moves to the next and the output goes.
+        let half = crate::mixer::VOLUME_NORM / 2;
+        let mut asks = set_default(3, Some("device-0"));
+        asks.extend(build(command::SET_SINK_VOLUME, 4, |writer| {
+            writer.u32(1).null_string().cvolume(&[half, half]);
+        }));
+        controller.write_all(&asks).unwrap();
+        passes(&mut server, 2);
+        assert_eq!(server.mixer.outputs().active().name, "device-0");
+        let _ = drain_socket(&mut controller);
+        write_proc(proc.path(), &[(0, "Intel")]);
+        assert!(!server.rescan_outputs());
+        passes(&mut server, 1);
+        assert_eq!(
+            subscription_events(&drain_socket(&mut controller)),
+            [
+                server_change,
+                (sink | change, 1),
+                (sink | change, 0),
+                (sink | remove, 1)
+            ]
+        );
+        assert_eq!(names(&server), [(0, "intel-0".into())]);
+        assert_eq!(server.mixer.outputs().active().name, "intel-0");
+
+        // Back: a new index, the level it left with, and it plays again.
+        write_proc(proc.path(), &[(0, "Intel"), (1, "Device")]);
+        assert!(!server.rescan_outputs());
+        passes(&mut server, 1);
+        assert_eq!(
+            subscription_events(&drain_socket(&mut controller)),
+            [
+                (sink | new, 2),
+                server_change,
+                (sink | change, 0),
+                (sink | change, 2)
+            ]
+        );
+        let outputs = server.mixer.outputs();
+        assert_eq!(outputs.active().name, "device-0");
+        assert_eq!((outputs.active().index, outputs.active().volume), (2, half));
+
+        // Unplugged again, then the human chooses the output that plays:
+        // that is a choice all the same, so the other, back, stays off.
+        write_proc(proc.path(), &[(0, "Intel")]);
+        assert!(!server.rescan_outputs());
+        assert_eq!(server.mixer.outputs().active().name, "intel-0");
+        passes(&mut server, 1);
+        let _ = drain_socket(&mut controller);
+        controller
+            .write_all(&set_default(5, Some("intel-0")))
+            .unwrap();
+        passes(&mut server, 2);
+        let seen = drain_socket(&mut controller);
+        assert!(
+            reply_packet(&seen, 5).is_some(),
+            "choosing what plays is no error"
+        );
+        assert_eq!(subscription_events(&seen), [], "and no switch");
+        // Back with another never chosen: neither takes over.
+        write_proc(proc.path(), &[(0, "Intel"), (1, "Device"), (2, "Other")]);
+        assert!(!server.rescan_outputs());
+        assert_eq!(server.mixer.outputs().active().name, "intel-0");
+        assert_eq!(server.mixer.outputs().entries().len(), 3);
+        // The playing one lost: the fallback takes the human's choices,
+        // most recent first, before discovery order, so Other, chosen
+        // after Device, plays though Device comes first in discovery.
+        controller
+            .write_all(&set_default(6, Some("other-0")))
+            .unwrap();
+        passes(&mut server, 2);
+        controller
+            .write_all(&set_default(7, Some("intel-0")))
+            .unwrap();
+        passes(&mut server, 2);
+        write_proc(proc.path(), &[(1, "Device"), (2, "Other")]);
+        assert!(!server.rescan_outputs());
+        assert_eq!(server.mixer.outputs().active().name, "other-0");
+        passes(&mut server, 1);
+        assert_eq!(
+            subscription_events(&drain_socket(&mut player)),
+            [],
+            "a player hears nothing of outputs coming, going or switching"
+        );
+        server.shutdown();
+    }
+
+    /// A returning output whose node is still being handed to audio is
+    /// tried again each rescan while it stays; one that cannot take the
+    /// ring is not, until it is plugged in again.
+    #[test]
+    fn a_refused_return_is_retried_only_while_the_node_is_not_yet_audios() {
+        let (mut server, _path, proc) = hotplug_server("hotplug-retry", &[(0, "Intel")]);
+        let attempts = |server: &Server<MemorySink>| server.diagnostics.len();
+        for (card, id, retried) in [(7, "Slow", true), (8, "Small", false)] {
+            write_proc(proc.path(), &[(0, "Intel"), (card, id)]);
+            assert!(!server.rescan_outputs());
+            server.mixer.outputs_mut().chosen(1).unwrap();
+            write_proc(proc.path(), &[(0, "Intel")]);
+            assert!(!server.rescan_outputs());
+            write_proc(proc.path(), &[(0, "Intel"), (card, id)]);
+            let before = attempts(&server);
+            assert!(!server.rescan_outputs());
+            assert_eq!(attempts(&server), before + 1, "{id}: tried as it returned");
+            assert!(!server.rescan_outputs());
+            let again = usize::from(retried);
+            assert_eq!(
+                attempts(&server),
+                before + 1 + again,
+                "{id}: retried {retried}"
+            );
+            assert_eq!(server.mixer.outputs().active().name, "intel-0");
+            write_proc(proc.path(), &[(0, "Intel")]);
+            assert!(!server.rescan_outputs());
+        }
+        server.shutdown();
+    }
+
+    /// A table that cannot be read keeps the outputs as they were, and
+    /// every output gone ends the daemon as losing its one device does.
+    #[test]
+    fn an_unreadable_table_keeps_the_outputs_and_none_left_ends_the_daemon() {
+        let (mut server, _path, proc) =
+            hotplug_server("hotplug-unreadable", &[(0, "Intel"), (1, "Device")]);
+        std::fs::write(proc.path().join("pcm"), "garbage\n").unwrap();
+        assert!(!server.rescan_outputs());
+        assert!(!server.rescan_outputs());
+        assert_eq!(names(&server).len(), 2);
+        assert!(server.rescan.as_ref().unwrap().failing);
+        write_proc(proc.path(), &[(0, "Intel"), (1, "Device")]);
+        assert!(!server.rescan_outputs());
+        assert!(!server.rescan.as_ref().unwrap().failing);
+        // Rescanned on the pass, once its period is up.
+        write_proc(proc.path(), &[(0, "Intel")]);
+        assert!(!server.pass().unwrap());
+        assert_eq!(names(&server).len(), 2, "not before its period");
+        server.rescan.as_mut().unwrap().last -= RESCAN_PERIOD;
+        assert!(!server.pass().unwrap());
+        assert_eq!(names(&server).len(), 1);
+        std::fs::write(proc.path().join("pcm"), "").unwrap();
+        server.rescan.as_mut().unwrap().last -= RESCAN_PERIOD;
+        assert!(server.pass().unwrap(), "no output is left");
+        server.shutdown();
+    }
+
+    /// A chosen headset unplugged and replugged while nothing plays: the
+    /// device finds the loss first and falls back, the table then drops it,
+    /// and it comes back. However often, the daemon plays on, as the
+    /// table's drop resets the count of fallbacks without a frame.
+    #[test]
+    fn replugging_an_idle_chosen_output_never_runs_the_fallbacks_down() {
+        let (mut server, path, proc) =
+            hotplug_server("hotplug-replug", &[(0, "Intel"), (1, "Device")]);
+        let mut controller = UnixStream::connect(&path).unwrap();
+        controller.write_all(&auth_packet()).unwrap();
+        controller
+            .write_all(&set_default(2, Some("device-0")))
+            .unwrap();
+        passes(&mut server, 2);
+        assert_eq!(server.mixer.outputs().active().name, "device-0");
+        for round in 0..4 {
+            assert!(
+                server.fall_back(),
+                "round {round}: the device finds the loss"
+            );
+            assert_eq!(server.mixer.outputs().active().name, "intel-0");
+            write_proc(proc.path(), &[(0, "Intel")]);
+            assert!(!server.rescan_outputs());
+            write_proc(proc.path(), &[(0, "Intel"), (1, "Device")]);
+            assert!(!server.rescan_outputs());
+            assert_eq!(
+                server.mixer.outputs().active().name,
+                "device-0",
+                "round {round}: chosen, it came back"
+            );
+        }
         server.shutdown();
     }
 }

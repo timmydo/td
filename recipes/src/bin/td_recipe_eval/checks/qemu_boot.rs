@@ -3242,8 +3242,8 @@ pub(crate) fn run_audio(runner: &RecipeCheckRunner) -> Result<(), String> {
     .map_err(|error| {
         if the_outputs_step_failed(&error) {
             format!(
-                "{error}\n(td-audio reads its outputs once, at start: a USB audio device the \
-                 guest enumerated after the audio service started is not among them)"
+                "{error}\n(a USB audio device the guest enumerated after td-audio started \
+                 joins only at a rescan, about a second later; this step reads the outputs once)"
             )
         } else {
             error
