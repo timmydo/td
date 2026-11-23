@@ -8930,29 +8930,35 @@ events has one five-second deadline, which a daemon that drips bytes
 cannot stretch; `play`'s adds twice the tone's length.
 The protocol codec they share with the daemon, the pstream framing, the
 tagstruct reader and writer and the captured command table, is the
-separate safe, std-only `td-pulse` crate, which
-forbids `unsafe` and which the td-audio recipe compiles to an rlib before
-linking the daemon against it; surface #13 stays in td-audio. td-pulse
-also holds the blocking control client the personalities, and later the
-compositor and the mixer panel, are built on, and the one playback
-stream a connection of it may play. The client owns no socket: the
-caller hands it a transport, and the one each controller hands it is
-td-pulse's `socket` module, a connected Unix stream with a deadline over
-whole requests. That module is the crate's only file that names an OS
-facility, and only the stream, its path, its io traits and errors and a
-monotonic clock; the rest stays bytes in and bytes out. Every request it
-sends is pinned to a packet captured from libpulse for the same
-question, a stream's create, drain and delete to paplay's, 16.1's where
-libpulse 17.0 sends the same bytes and 17.0's own otherwise; the
-handshake differs from the captured one only in asking for no shared
-memory and sending a zero cookie. It parses a reply at version 35 only
-and refuses, without panicking, an older server, a frame over the
-control bound, audio data once it outgrows any control frame, an event
-before it subscribed, a stream's grant before it plays one or for a
-channel it does not play, an answer to a tag not in flight, a wait that
-consumes two control frames' worth of bytes without its answer, and any
-entry that breaks its schema. After any failure but a refusal the
-connection is broken, since its framing or tags are no longer known.
+separate safe, std-only `td-pulse` crate, which forbids `unsafe` and
+which the td-audio recipe compiles to an rlib before linking the daemon
+against it; surface #13 stays in td-audio. td-pulse also holds the
+blocking control client the personalities, and later the compositor and
+the mixer panel, are built on, and the one playback stream a connection
+of it may play. Its `apps` module is what a controller shows and groups
+of a stream listing, the same for the CLI and, later, the panel:
+`shown`, the characters a name may show to a controller, which the
+daemon also filters its replies with; the application a stream belongs
+to, its `application.name` as a token or `client-N`; and an
+application's level, its loudest stream's, muted only when every stream
+is. The client owns no socket: the caller hands it a transport, and the
+one each controller hands it is td-pulse's `socket` module, a connected
+Unix stream with a deadline over whole requests. That module is the
+crate's only file that names an OS facility, and only the stream, its
+path, its io traits and errors and a monotonic clock; the rest stays
+bytes in and bytes out. Every request it sends is pinned to a packet
+captured from libpulse for the same question, a stream's create, drain
+and delete to paplay's, 16.1's where libpulse 17.0 sends the same bytes
+and 17.0's own otherwise; the handshake differs from the captured one
+only in asking for no shared memory and sending a zero cookie. It parses
+a reply at version 35 only and refuses, without panicking, an older
+server, a frame over the control bound, audio data once it outgrows any
+control frame, an event before it subscribed, a stream's grant before it
+plays one or for a channel it does not play, an answer to a tag not in
+flight, a wait that consumes two control frames' worth of bytes without
+its answer, and any entry that breaks its schema. After any failure but
+a refusal the connection is broken, since its framing or tags are no
+longer known.
 
 **It runs as a dedicated `audio` uid, not as uid 1000 — CONFIRMED by the
 maintainer**, which §O listed as the one privilege question the two

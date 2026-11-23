@@ -21,6 +21,7 @@ use crate::sink::Spec;
 use crate::tag::{self, Property, SampleSpec};
 use crate::wire::{self, Frame, Seek};
 use std::collections::HashMap;
+use td_pulse::apps::shown;
 
 /// What this server calls its one sink.
 pub const SINK_NAME: &str = "td-audio";
@@ -2142,22 +2143,6 @@ const SINK_INDEX_NAME: &str = "0";
 /// td-pulse's decoder accepts. At 96 a full table of maximum names fits one
 /// frame, which a test pins.
 pub const DISPLAY_MAX: usize = 96;
-
-/// Whether a character may reach a controller's display. Control characters
-/// (C0, DEL, C1) would let a name drive a terminal; the bidirectional
-/// overrides, embeddings and isolates would let it reorder its own row and
-/// its neighbours'; zero-width characters and the line and paragraph
-/// separators would hide or break it.
-pub(crate) fn shown(character: char) -> bool {
-    !character.is_control()
-        && !matches!(
-            character,
-            '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2069}'
-                | '\u{FEFF}'
-        )
-}
 
 /// `text` as a controller may see it: control characters removed, since a
 /// stream name is chosen by the application and the human reads it in a

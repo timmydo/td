@@ -226,6 +226,10 @@ const PULSE_LIB_RS: &str = include_str!("../../../td-pulse/src/lib.rs");
 const PULSE: &[(&str, &str)] = &[
     ("td-pulse/src/lib.rs", PULSE_LIB_RS),
     (
+        "td-pulse/src/apps.rs",
+        include_str!("../../../td-pulse/src/apps.rs"),
+    ),
+    (
         "td-pulse/src/client.rs",
         include_str!("../../../td-pulse/src/client.rs"),
     ),

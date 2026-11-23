@@ -2,7 +2,8 @@
 //! (`wire`), the tagstruct codec (`tag`), the captured command table, error
 //! codes and version negotiation (`proto`), the blocking control client td's
 //! controllers share, which also plays one stream for `td-audio play`
-//! (`client`), and td-audio's socket as its transport (`socket`).
+//! (`client`), td-audio's socket as its transport (`socket`), and what a
+//! controller shows and groups of a stream listing (`apps`).
 //!
 //! The normative design is `APPLICATIONS.md` §K.3. `td-audio` serves this
 //! protocol on its socket; a control client speaks the same bytes, so the
@@ -10,6 +11,7 @@
 //! safe code: the daemon's syscall surface stays in `td-audio`.
 #![forbid(unsafe_code)]
 
+pub mod apps;
 pub mod client;
 pub mod proto;
 pub mod socket;
@@ -21,6 +23,7 @@ mod tests {
     /// Every source file of this crate, read at compile time.
     fn sources() -> Vec<(&'static str, &'static str)> {
         vec![
+            ("apps.rs", include_str!("apps.rs")),
             ("client.rs", include_str!("client.rs")),
             ("lib.rs", include_str!("lib.rs")),
             ("proto.rs", include_str!("proto.rs")),

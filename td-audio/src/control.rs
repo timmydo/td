@@ -12,7 +12,7 @@
 //! path, switches included, from a client's side.
 
 use crate::proto::{self, error, subscription};
-use crate::session::{shown, CHANNEL_MAP};
+use crate::session::CHANNEL_MAP;
 use crate::sink::Spec;
 use crate::tone::{Generator, Tone};
 use std::ffi::OsString;
@@ -20,6 +20,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
+use td_pulse::apps::{shown, summary, title, token_chars, App};
 use td_pulse::client::{
     self, level, levels_like, percent, volume_of, Client, Listing, SinkInput, DEFAULT_SINK,
     MAX_PERCENT,
@@ -321,18 +322,6 @@ struct Token<'a>(&'a str);
 /// handed dropped.
 struct Text<'a>(&'a str);
 
-fn token_chars(text: &str) -> impl Iterator<Item = char> + '_ {
-    text.chars()
-        .filter(|character| shown(*character))
-        .map(|character| {
-            if character.is_whitespace() {
-                '_'
-            } else {
-                character
-            }
-        })
-}
-
 impl fmt::Display for Token<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut empty = true;
@@ -362,87 +351,6 @@ fn on_off(muted: bool) -> &'static str {
     } else {
         "off"
     }
-}
-
-/// The application a stream is grouped and addressed under: its
-/// `application.name` as a token, which td's daemon sets from the uid for a
-/// confined application, or `client-N` for a stream whose client never
-/// named itself, or named itself `client-` anything, which would pass for
-/// another client's.
-#[derive(Clone, Copy)]
-enum App<'a> {
-    Named(&'a str),
-    Client(u32),
-}
-
-impl<'a> App<'a> {
-    fn of(stream: &'a SinkInput) -> Self {
-        match stream.property("application.name") {
-            Some(name)
-                if token_chars(name).next().is_some()
-                    && !token_chars(name)
-                        .take(CLIENT_PREFIX.len())
-                        .eq(CLIENT_PREFIX.chars()) =>
-            {
-                Self::Named(name)
-            }
-            _ => Self::Client(stream.client),
-        }
-    }
-
-    /// Whether `text`, as typed, names this application.
-    fn is(self, text: &str) -> bool {
-        match self {
-            Self::Named(name) => token_chars(name).eq(text.chars()),
-            Self::Client(index) => text.strip_prefix(CLIENT_PREFIX).is_some_and(|digits| {
-                let decimal = digits.bytes().all(|byte| byte.is_ascii_digit())
-                    && (digits == "0" || !digits.starts_with('0'));
-                decimal && digits.parse::<u32>().ok() == Some(index)
-            }),
-        }
-    }
-
-    fn same(self, other: App<'_>) -> bool {
-        match (self, other) {
-            (Self::Named(one), App::Named(two)) => token_chars(one).eq(token_chars(two)),
-            (Self::Client(one), App::Client(two)) => one == two,
-            _ => false,
-        }
-    }
-}
-
-impl fmt::Display for App<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Named(name) => Token(name).fmt(f),
-            Self::Client(index) => write!(f, "{CLIENT_PREFIX}{index}"),
-        }
-    }
-}
-
-const CLIENT_PREFIX: &str = "client-";
-
-/// An application's level is its loudest stream's, and it is muted when
-/// every stream is: on td's daemon a confined application's streams all
-/// show the one level the human set for it.
-struct Summary {
-    volume: u32,
-    muted: bool,
-    streams: usize,
-}
-
-fn summary(streams: &Listing<SinkInput>, belongs: impl Fn(&SinkInput) -> bool) -> Summary {
-    let mut summary = Summary {
-        volume: 0,
-        muted: true,
-        streams: 0,
-    };
-    for stream in streams.iter().flatten().filter(|stream| belongs(stream)) {
-        summary.volume = summary.volume.max(level(&stream.volume));
-        summary.muted &= stream.muted;
-        summary.streams += 1;
-    }
-    summary
 }
 
 /// Every entry of a listing parses, so later walks may skip none.
@@ -477,13 +385,6 @@ fn each_stream<'a>(
     } else {
         Err(Failure::NoApp(name))
     }
-}
-
-fn title(stream: &SinkInput) -> &str {
-    stream
-        .property("media.name")
-        .or(stream.name.as_deref())
-        .unwrap_or("")
 }
 
 fn execute<'a>(
@@ -566,7 +467,7 @@ fn execute<'a>(
                 if seen {
                     continue;
                 }
-                let summary = summary(&streams, |other| App::of(other).same(app));
+                let summary = summary(streams.iter().flatten(), |other| App::of(other).same(app));
                 writeln!(
                     out,
                     "app {app} volume {}% mute {} streams {}",
@@ -595,7 +496,7 @@ fn execute<'a>(
         Command::AppVolume(name, wanted) => {
             let streams = client.sink_inputs()?;
             whole(&streams)?;
-            let current = summary(&streams, |stream| App::of(stream).is(name));
+            let current = summary(streams.iter().flatten(), |stream| App::of(stream).is(name));
             if current.streams == 0 {
                 return Err(Failure::NoApp(name));
             }
@@ -610,7 +511,7 @@ fn execute<'a>(
         Command::AppMute(name, wanted) => {
             let streams = client.sink_inputs()?;
             whole(&streams)?;
-            let current = summary(&streams, |stream| App::of(stream).is(name));
+            let current = summary(streams.iter().flatten(), |stream| App::of(stream).is(name));
             if current.streams == 0 {
                 return Err(Failure::NoApp(name));
             }
@@ -1241,23 +1142,6 @@ mod tests {
         ));
     }
 
-    /// A client cannot pass for another: a name in the `client-N` form is
-    /// that client's own `client-N`, and only the canonical decimal names
-    /// a client.
-    #[test]
-    fn an_app_name_cannot_pass_for_another_client() {
-        let impostor = stream(1, 7, Some("client-4"));
-        assert_eq!(App::of(&impostor).to_string(), "client-7");
-        assert!(!App::of(&impostor).is("client-4"));
-        let unnamed = stream(2, 4, None);
-        assert!(App::of(&unnamed).is("client-4"));
-        for refused in ["client-04", "client-+4", "client-4x", "client-", "4"] {
-            assert!(!App::of(&unnamed).is(refused), "{refused}");
-        }
-        assert!(App::of(&stream(3, 0, None)).is("client-0"));
-        assert!(App::of(&stream(4, 9, Some("\u{1b}"))).is("client-9"));
-    }
-
     /// 0 for success, 1 when the daemon refuses or is not there, 2 for a
     /// usage error, which names only the personality's own forms and never
     /// reaches the daemon.
@@ -1440,7 +1324,5 @@ mod tests {
         assert_eq!(Token("\u{1b}\u{7}").to_string(), "-");
         assert_eq!(Token("").to_string(), "-");
         assert_eq!(Text("a tab\u{7}\u{2066} title").to_string(), "a tab title");
-        assert!(App::Named("Pacat Test").is("Pacat_Test"));
-        assert!(!App::Named("Pacat Test").is("Pacat Test"));
     }
 }
