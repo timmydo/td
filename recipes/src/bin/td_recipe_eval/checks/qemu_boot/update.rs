@@ -1059,8 +1059,8 @@ const ROLLED_BACK_NOTICE: &str = "ROLLED BACK - RESTART TO BOOT IT";
 /// consent"), and its two queue states.
 const HOSTNAME_ROW: usize = 600;
 const HOSTNAME_EMPTY: &str = "H: NO SETTINGS WAITING";
-const HOSTNAME_WAITING: &str = "H: REVIEW HOSTNAME/TIME";
-const NO_HOSTNAME_NOTICE: &str = "NO HOSTNAME OR TIME CHANGE IS READY";
+const HOSTNAME_WAITING: &str = "H: REVIEW SETTINGS";
+const NO_HOSTNAME_NOTICE: &str = "NO SETTINGS CHANGE IS READY";
 const HOSTNAME_SAVED_NOTICE: &str = "HOSTNAME SAVED";
 const RESTART_COMPLETES: &str = "A RESTART COMPLETES THE CHANGE";
 /// The name the oracle asks for; the fixture boots as `td`.

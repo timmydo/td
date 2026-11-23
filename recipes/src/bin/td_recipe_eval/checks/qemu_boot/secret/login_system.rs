@@ -15,7 +15,7 @@ const RECORD: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "RECORD DAMAGED"];
 const UNREADABLE: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT BE READ"];
 /// The attention menu, as the update oracle reads it from 276: its
 /// selections 36 apart, and its last row five lower than other screens'.
-/// No hostname change waits on this guest.
+/// No settings change waits on this guest.
 const MENU: &[&str] = &[
     "TD SECURE ATTENTION",
     "U: UNLOCK  T: RECOVERY TOKEN",

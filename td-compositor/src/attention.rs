@@ -29,7 +29,7 @@ pub(crate) enum Notice {
     /// Root's `9d 02`: the boot selectors cannot be read or name one
     /// deployment, so there is no previous system to roll back to.
     NoPrevious,
-    /// Root's `9e 00`: no hostname change waits, or the slot is busy.
+    /// Root's `9e 00`: no settings change waits, or the slot is busy.
     NoHostname,
     /// Root's success for `set-hostname`.
     HostnameSaved,
@@ -665,13 +665,13 @@ fn wrap(text: &str, columns: usize) -> Vec<String> {
 }
 
 /// The menu's `H` row (td-compositor/DESIGN.md, "Elevation consent"):
-/// whether a hostname change waits and, when there are any, the intake's
+/// whether a settings change waits and, when there are any, the intake's
 /// consecutive unapproved requests; or that the intake refuses every
 /// request while root cannot read or write its backoff.
 fn hostname_row(intake: HostnameIntake) -> String {
     let state = match intake.queue() {
         Queue::Refusing => return "H: REFUSED - SETTINGS BACKOFF UNUSABLE".into(),
-        Queue::Waiting => "H: REVIEW HOSTNAME/TIME",
+        Queue::Waiting => "H: REVIEW SETTINGS",
         Queue::Empty => "H: NO SETTINGS WAITING",
     };
     match intake.denied() {
@@ -700,7 +700,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::RolledBack => "ROLLED BACK - RESTART TO BOOT IT",
         Notice::ElevationRefused => "REFUSED BY THE ELEVATION TABLE",
         Notice::NoPrevious => "NO PREVIOUS SYSTEM TO ROLL BACK TO",
-        Notice::NoHostname => "NO HOSTNAME OR TIME CHANGE IS READY",
+        Notice::NoHostname => "NO SETTINGS CHANGE IS READY",
         Notice::HostnameSaved => "HOSTNAME SAVED",
         Notice::TimeSaved => "TIME SETTINGS SAVED",
         Notice::VolumeSaved => "VOLUME CHANGE APPLIED",
@@ -1243,8 +1243,8 @@ mod tests {
             (&[0x9f, 0, 0][..], "H: NO SETTINGS WAITING"),
             (&[0x9f, 0, 1][..], "H: NO SETTINGS WAITING - 1 DENIED"),
             (&[0x9f, 0, 255][..], "H: NO SETTINGS WAITING - 255 DENIED"),
-            (&[0x9f, 1, 0][..], "H: REVIEW HOSTNAME/TIME"),
-            (&[0x9f, 1, 12][..], "H: REVIEW HOSTNAME/TIME - 12 DENIED"),
+            (&[0x9f, 1, 0][..], "H: REVIEW SETTINGS"),
+            (&[0x9f, 1, 12][..], "H: REVIEW SETTINGS - 12 DENIED"),
             (&[0x9f, 2, 0][..], "H: REFUSED - SETTINGS BACKOFF UNUSABLE"),
         ] {
             assert_eq!(row(answer), text);

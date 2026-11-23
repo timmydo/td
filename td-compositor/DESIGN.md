@@ -6884,7 +6884,7 @@ operations", says what the operations are and why, and
 which input confirms.
 
 A fresh physical `B` on the attention menu asks root for a rollback
-(`1d`), and a fresh physical `H` selects the queued hostname request
+(`1d`), and a fresh physical `H` selects the queued settings request
 (`1e`), each under the menu's rules for a selection: one per
 attention lifetime, never from a held key or a repeat. Both letters are
 modhex, so the exclusion of a security key's own keyboard above extends
@@ -6895,11 +6895,13 @@ TO RETURN` moves down (item 5 of "Session lock and login-key entry"
 gives the places). The `H` row is root's last `1f` answer
 (td-authd/DESIGN.md, "Elevation operations"), which the authority worker
 asks for on each turn of its loop and the menu reads as it opens,
-keeping it for that lifetime: `H: NO HOSTNAME CHANGE WAITING` or `H:
-REVIEW HOSTNAME CHANGE`, each followed by ` - N DENIED` while the count
-`1f` carries is not zero (td-authd/DESIGN.md, "Elevation operations",
-says which requests it counts), or `H: REFUSED - HOSTNAME BACKOFF
-UNUSABLE` while root cannot read or write the backoff. Any other `1f`
+keeping it for that lifetime: `H: NO SETTINGS WAITING` or `H: REVIEW
+SETTINGS`, each followed by ` - N DENIED` while the count `1f` carries
+is not zero (td-authd/DESIGN.md, "Elevation operations", says which
+requests it counts), or `H: REFUSED - SETTINGS BACKOFF UNUSABLE` while
+root cannot read or write the backoff. The settings intake queues a
+hostname, time, extra-volume, admin-key, publisher or local
+admin-update request; the prompt's first line names which. Any other `1f`
 answer ends the paired generation; the direct profile, which has no
 authority, shows nothing waiting. The row is a notice: `H` asks root
 whatever it says, and root decides. Root's description must be the
@@ -6912,8 +6914,8 @@ its notice and presents nothing: `00` `PREVIOUS REQUEST IS STILL
 FINISHING`, `01` `REFUSED BY THE ELEVATION TABLE` and `02` `NO PREVIOUS
 SYSTEM TO ROLL BACK TO`. `9d` with another byte, or answering another
 selection, ends the paired generation. Root's refusal of `1e`, `9e`
-and one byte, does the same: `00` `NO HOSTNAME CHANGE IS READY TO
-REVIEW`, which covers a busy slot and a request that failed before its
+and one byte, does the same: `00` `NO SETTINGS CHANGE IS READY`, which
+covers nothing queued, a busy slot and a request that failed before its
 description, and `01` `REFUSED BY THE ELEVATION TABLE`; `9e` with
 another byte, or answering another selection, ends the paired
 generation. After a rollback's commit, root's success (`06`) shows
