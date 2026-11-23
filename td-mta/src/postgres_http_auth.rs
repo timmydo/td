@@ -6,11 +6,9 @@ use crate::{
     ports::{Deadline, Error},
     postgres_input::Loaded,
     postgres_probe::{self, AuthenticationSession, Mode},
-    postgres_resolver,
     postgres_runtime_profile::Binding,
 };
 use std::{
-    path::Path,
     sync::{Mutex, TryLockError},
     thread::{self, ThreadId},
     time::{Duration, Instant},
@@ -21,7 +19,6 @@ use std::{
 /// Its retained connection has finite lifetime and byte/frame/job allowances.
 pub struct Authentication<'a> {
     loaded: &'a Loaded,
-    executable: &'a Path,
     accounts: &'a [(&'a str, &'a Binding)],
     clock: &'a RuntimeClock,
     mode: Mode,
@@ -34,13 +31,11 @@ struct State {
 impl<'a> Authentication<'a> {
     pub fn new(
         loaded: &'a Loaded,
-        executable: &'a Path,
         accounts: &'a [(&'a str, &'a Binding)],
         clock: &'a RuntimeClock,
     ) -> Result<Self, Error> {
         let mode = accounts.first().ok_or(Error::Invalid)?.1.runtime_mode();
-        if !executable.is_absolute()
-            || accounts.is_empty()
+        if accounts.is_empty()
             || accounts.len() > crate::config::identities::MAX_ACCOUNTS
             || accounts
                 .iter()
@@ -63,7 +58,6 @@ impl<'a> Authentication<'a> {
         }
         Ok(Self {
             loaded,
-            executable,
             accounts,
             clock,
             mode,
@@ -227,31 +221,15 @@ impl Authentication<'_> {
         Ok(())
     }
     fn connect(&self, deadline: Instant) -> Result<AuthenticationSession, Error> {
-        let dns_deadline = deadline.min(
-            Instant::now()
-                .checked_add(Duration::from_secs(5))
-                .ok_or(Error::Invalid)?,
-        );
-        let addresses =
-            postgres_resolver::resolve(self.executable, &self.loaded.bootstrap, dns_deadline)
-                .map_err(|error| match error {
-                    postgres_resolver::Error::Deadline => Error::Deadline,
-                    _ => Error::Dns,
-                })?;
-        for address in addresses {
-            let mut request = self.loaded.bootstrap.request(address);
-            request.mode = self.mode;
-            let result = AuthenticationSession::open(&request, &self.loaded.trust, deadline);
-            if Instant::now() >= deadline {
-                return Err(Error::Deadline);
-            }
-            match result {
-                Ok(session) => return Ok(session),
-                Err(postgres_probe::Error::Transport) => continue,
-                Err(postgres_probe::Error::Deadline) => return Err(Error::Deadline),
-                Err(_) => return Err(Error::Invalid),
-            }
+        let mut request = self.loaded.bootstrap.request();
+        request.mode = self.mode;
+        let result = AuthenticationSession::open(&request, deadline);
+        if Instant::now() >= deadline {
+            return Err(Error::Deadline);
         }
-        Err(Error::Invalid)
+        result.map_err(|error| match error {
+            postgres_probe::Error::Deadline => Error::Deadline,
+            _ => Error::Invalid,
+        })
     }
 }

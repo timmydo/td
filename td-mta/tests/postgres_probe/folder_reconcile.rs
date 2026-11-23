@@ -1,6 +1,5 @@
 use super::imports::{email, folder, key, write};
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     format::key::SourceKind,
     ids::{AccountId, StoreEpoch},
@@ -29,12 +28,11 @@ fn untouched(f: &Fixture) -> String {
 pub fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     epoch: StoreEpoch,
     connection: &std::path::Path,
 ) {
     let account = AccountId::from_bytes([0xaa; 16]);
-    let authority = db::prepare(request, trust, deadline(), epoch, account).unwrap();
+    let authority = db::prepare(request, deadline(), epoch, account).unwrap();
     let initial = vec![
         folder("inbox", "Inbox", None, Some("inbox")),
         folder("child", "Nested", Some(b"inbox"), None),
@@ -43,7 +41,7 @@ pub fn exercise(
         folder("occupied", "Occupied", Some(b"other"), None),
     ];
     for value in &initial {
-        db::publish_mailbox(request, trust, deadline(), &authority, value).unwrap();
+        db::publish_mailbox(request, deadline(), &authority, value).unwrap();
     }
     let desired = Mailbox::new(
         key("child", SourceKind::Mailbox),
@@ -59,12 +57,11 @@ pub fn exercise(
     let mut definitions = initial.clone();
     definitions[1] = desired.clone();
     let plan = |value: &Mailbox, definitions: &[Mailbox]| {
-        reconcile::plan(request, trust, deadline(), &authority, value, definitions).unwrap()
+        reconcile::plan(request, deadline(), &authority, value, definitions).unwrap()
     };
     let apply = |value: &Mailbox, definitions: &[Mailbox], baseline: &Baseline| {
         reconcile::apply(
             request,
-            trust,
             deadline(),
             &authority,
             value,
@@ -82,7 +79,6 @@ pub fn exercise(
     let raw = b"Message-ID: <folder-reconcile@example.test>\r\n\r\nraw\0bytes\xff";
     db::publish_email(
         request,
-        trust,
         deadline(),
         &authority,
         &email("arrival", raw, &["$seen"]),
@@ -244,7 +240,7 @@ pub fn exercise(
     );
     assert!(matches!(plan(&absent, &definitions), Plan::Absent));
     cli(fixture, connection, epoch, account);
-    deletion_checks(fixture, request, trust, &authority);
+    deletion_checks(fixture, request, &authority);
     // Fill the account with long-name local descendants, without source receipts.
     sql(fixture,"INSERT INTO td_mta.mailboxes SELECT a.id,decode(lpad(to_hex(n),32,'0'),'hex'),repeat('x',1020)||n::text,CASE WHEN n=1000 THEN (SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('other','UTF8')) ELSE decode(lpad(to_hex(n-1),32,'0'),'hex') END,NULL,0,1,a.sequence FROM td_mta.accounts a CROSS JOIN generate_series(1000,1251) n");
     let largest = folder("other", "Large subtree", None, None);
@@ -259,7 +255,6 @@ pub fn exercise(
     assert!(matches!(
         reconcile::plan(
             request,
-            trust,
             deadline(),
             &authority,
             &folder("other", "Other again", None, None),
@@ -352,21 +347,15 @@ fn cli(fixture: &Fixture, connection: &std::path::Path, epoch: StoreEpoch, accou
     );
 }
 
-fn deletion_checks(
-    fixture: &Fixture,
-    request: &Request<'_>,
-    trust: &TrustStore,
-    authority: &db::Authority,
-) {
+fn deletion_checks(fixture: &Fixture, request: &Request<'_>, authority: &db::Authority) {
     use td_mta::postgres_imports::mailbox_reconcile::deletion::{self, Applied, Plan};
     let parent = folder("delete-parent", "Delete parent", None, None);
     let child = folder("delete-child", "Delete child", Some(b"delete-parent"), None);
     let protected = folder("delete-protected", "Protected", None, Some("archive"));
-    let plan =
-        |value: &Mailbox| deletion::plan(request, trust, deadline(), authority, value).unwrap();
+    let plan = |value: &Mailbox| deletion::plan(request, deadline(), authority, value).unwrap();
     assert!(matches!(plan(&parent), Plan::Unmapped));
     for value in [&parent, &child, &protected] {
-        db::publish_mailbox(request, trust, deadline(), authority, value).unwrap();
+        db::publish_mailbox(request, deadline(), authority, value).unwrap();
     }
     assert!(matches!(plan(&parent), Plan::HasChild));
     assert!(matches!(plan(&protected), Plan::Role));
@@ -375,7 +364,7 @@ fn deletion_checks(
         _ => panic!("expected leaf"),
     };
     let apply = |value: &Mailbox, baseline: &deletion::Baseline| {
-        deletion::apply(request, trust, deadline(), authority, value, baseline)
+        deletion::apply(request, deadline(), authority, value, baseline)
     };
     let id = baseline
         .local
@@ -413,7 +402,7 @@ fn deletion_checks(
     assert_eq!(apply(&child, &baseline), Ok(Applied::Absent));
     assert_eq!(state(fixture), settled);
     assert!(
-        !db::publish_mailbox(request, trust, deadline(), authority, &child)
+        !db::publish_mailbox(request, deadline(), authority, &child)
             .unwrap()
             .present
     );

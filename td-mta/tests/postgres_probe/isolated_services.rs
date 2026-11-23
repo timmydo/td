@@ -18,7 +18,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &td_crypto::TrustStore,
     epoch: StoreEpoch,
     shared: &str,
     desktop: &str,
@@ -59,20 +58,12 @@ pub(super) fn exercise(
         roles: Roles::from_bits(bits).unwrap(),
         source: source.as_bytes(),
     });
-    let candidate = config::prepare(
-        request,
-        trust,
-        deadline(),
-        epoch,
-        shared.as_bytes(),
-        &profiles,
-    )
-    .unwrap();
+    let candidate =
+        config::prepare(request, deadline(), epoch, shared.as_bytes(), &profiles).unwrap();
     let version = versions::Version::from_bytes([92; 16]);
-    versions::publish(request, trust, deadline(), version, &candidate).unwrap();
+    versions::publish(request, deadline(), version, &candidate).unwrap();
     selection::publish(
         request,
-        trust,
         deadline(),
         selection::prepare(epoch, 1, version, &candidate).unwrap(),
     )
@@ -128,7 +119,6 @@ pub(super) fn exercise(
             mode: td_mta::postgres_probe::Mode::Runtime,
             ..*request
         },
-        trust,
     );
     super::acme::publish_fixture_pair_as(
         fixture,
@@ -213,7 +203,7 @@ pub(super) fn exercise(
     let account = td_mta::ids::AccountId::from_bytes([0xaa; 16]);
     let device =
         td_mta::postgres_devices::prepare_creation(epoch, account, "isolated client", 1).unwrap();
-    td_mta::postgres_devices::publish_creation(request, trust, deadline(), &device).unwrap();
+    td_mta::postgres_devices::publish_creation(request, deadline(), &device).unwrap();
     let credentials = [b"user:".as_slice(), device.password()].concat();
     let pem = super::certificate::pem("BASIC", &credentials);
     let basic = std::str::from_utf8(&pem)

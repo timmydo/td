@@ -1,6 +1,5 @@
-//! The byte stream a client runs over, and the plain sockets it opens.
+//! The byte stream a client runs over, and the Unix socket it opens.
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -27,90 +26,23 @@ pub trait Stream {
     fn write_all(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), StreamError>;
 }
 
-/// A TLS client the caller supplies for TCP connections. The server has
-/// already accepted the SSLRequest and nothing past its one-byte answer
-/// has been read, so the handshake starts on a clean socket.
-pub trait TlsConnect {
-    type Stream: Stream;
-
-    /// Run the handshake over `socket` by `deadline`, verifying the
-    /// server's chain and name. The socket is blocking; its read and write
-    /// timeouts may be set and are the connector's to change.
-    fn connect(self, socket: TcpStream, deadline: Instant) -> Result<Self::Stream, StreamError>;
-}
-
-/// A plain socket: a Unix-domain connection, or a TCP one only until its
-/// TLS request is answered.
+/// A connected Unix-domain socket.
 #[derive(Debug)]
-pub struct Socket(Kind);
-
-#[derive(Debug)]
-enum Kind {
-    Unix(UnixStream),
-    Tcp(TcpStream),
-}
+pub struct Socket(UnixStream);
 
 impl Socket {
-    pub(crate) fn unix(stream: UnixStream) -> Self {
-        Self(Kind::Unix(stream))
-    }
-
-    pub(crate) fn tcp(stream: TcpStream) -> Self {
-        Self(Kind::Tcp(stream))
-    }
-
-    pub(crate) fn into_tcp(self) -> Option<TcpStream> {
-        match self.0 {
-            Kind::Tcp(stream) => Some(stream),
-            Kind::Unix(_) => None,
-        }
+    pub(crate) fn new(stream: UnixStream) -> Self {
+        Self(stream)
     }
 }
 
 impl Stream for Socket {
     fn read(&mut self, buffer: &mut [u8], deadline: Instant) -> Result<usize, StreamError> {
-        match &mut self.0 {
-            Kind::Unix(stream) => read_until(stream, buffer, deadline),
-            Kind::Tcp(stream) => read_until(stream, buffer, deadline),
-        }
+        read_until(&mut self.0, buffer, deadline)
     }
 
     fn write_all(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), StreamError> {
-        match &mut self.0 {
-            Kind::Unix(stream) => write_until(stream, bytes, deadline),
-            Kind::Tcp(stream) => write_until(stream, bytes, deadline),
-        }
-    }
-}
-
-/// What the two socket types share for deadline-bounded I/O.
-trait Timed: Read + Write {
-    fn read_timeout(&self, wait: Option<Duration>) -> io::Result<()>;
-    fn write_timeout(&self, wait: Option<Duration>) -> io::Result<()>;
-    fn nonblocking(&self, on: bool) -> io::Result<()>;
-}
-
-impl Timed for UnixStream {
-    fn read_timeout(&self, wait: Option<Duration>) -> io::Result<()> {
-        self.set_read_timeout(wait)
-    }
-    fn write_timeout(&self, wait: Option<Duration>) -> io::Result<()> {
-        self.set_write_timeout(wait)
-    }
-    fn nonblocking(&self, on: bool) -> io::Result<()> {
-        self.set_nonblocking(on)
-    }
-}
-
-impl Timed for TcpStream {
-    fn read_timeout(&self, wait: Option<Duration>) -> io::Result<()> {
-        self.set_read_timeout(wait)
-    }
-    fn write_timeout(&self, wait: Option<Duration>) -> io::Result<()> {
-        self.set_write_timeout(wait)
-    }
-    fn nonblocking(&self, on: bool) -> io::Result<()> {
-        self.set_nonblocking(on)
+        write_until(&mut self.0, bytes, deadline)
     }
 }
 
@@ -121,8 +53,8 @@ pub(crate) fn remaining(deadline: Instant) -> Option<Duration> {
         .filter(|wait| !wait.is_zero())
 }
 
-fn read_until<T: Timed>(
-    stream: &mut T,
+fn read_until(
+    stream: &mut UnixStream,
     buffer: &mut [u8],
     deadline: Instant,
 ) -> Result<usize, StreamError> {
@@ -133,14 +65,18 @@ fn read_until<T: Timed>(
         let wait = remaining(deadline);
         let result = match wait {
             None => {
-                stream.nonblocking(true).map_err(|_| StreamError::Failed)?;
+                stream
+                    .set_nonblocking(true)
+                    .map_err(|_| StreamError::Failed)?;
                 let result = stream.read(buffer);
-                stream.nonblocking(false).map_err(|_| StreamError::Failed)?;
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|_| StreamError::Failed)?;
                 result
             }
             Some(wait) => {
                 stream
-                    .read_timeout(Some(wait))
+                    .set_read_timeout(Some(wait))
                     .map_err(|_| StreamError::Failed)?;
                 stream.read(buffer)
             }
@@ -165,8 +101,8 @@ fn read_until<T: Timed>(
     }
 }
 
-fn write_until<T: Timed>(
-    stream: &mut T,
+fn write_until(
+    stream: &mut UnixStream,
     bytes: &[u8],
     deadline: Instant,
 ) -> Result<(), StreamError> {
@@ -174,7 +110,7 @@ fn write_until<T: Timed>(
     while !rest.is_empty() {
         let wait = remaining(deadline).ok_or(StreamError::TimedOut)?;
         stream
-            .write_timeout(Some(wait))
+            .set_write_timeout(Some(wait))
             .map_err(|_| StreamError::Failed)?;
         match stream.write(rest) {
             Ok(0) => return Err(StreamError::Failed),
@@ -200,7 +136,7 @@ mod tests {
     #[test]
     fn a_read_waits_for_its_deadline_and_a_poll_does_not() {
         let (near, far) = UnixStream::pair().unwrap();
-        let mut socket = Socket::unix(near);
+        let mut socket = Socket::new(near);
         let mut byte = [0u8; 1];
         let started = Instant::now();
         assert_eq!(
@@ -224,7 +160,7 @@ mod tests {
     #[test]
     fn a_write_the_peer_never_reads_times_out() {
         let (near, _far) = UnixStream::pair().unwrap();
-        let mut socket = Socket::unix(near);
+        let mut socket = Socket::new(near);
         let big = vec![0u8; 16 << 20];
         let started = Instant::now();
         assert_eq!(

@@ -12,7 +12,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 const MIGRATIONS: &[&str] = &[
     include_str!("postgres_schema.sql"),
@@ -90,38 +90,24 @@ pub struct Receipt {
 
 /// Requires an explicit schema-owner credential. Refuses any existing td_mta
 /// namespace, even an empty one. This remains a preparation schema.
-pub fn initialize(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-) -> Result<Receipt, Error> {
+pub fn initialize(request: &Request<'_>, deadline: Instant) -> Result<Receipt, Error> {
     let mut epoch = [0; 16];
     SystemEntropy::try_new()
         .and_then(|mut entropy| entropy.fill(&mut epoch))
         .map_err(|_| Error::Crypto)?;
-    write_schema(
-        request,
-        trust,
-        deadline,
-        Some(StoreEpoch::from_bytes(epoch)),
-    )
+    write_schema(request, deadline, Some(StoreEpoch::from_bytes(epoch)))
 }
 
 pub const MAX_UPGRADE_DURATION: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Explicit owner migration. Validate every prior checksum before any DDL.
 /// A current compatible ledger returns its receipt without another write.
-pub fn upgrade(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-) -> Result<Receipt, Error> {
-    write_schema(request, trust, deadline, None)
+pub fn upgrade(request: &Request<'_>, deadline: Instant) -> Result<Receipt, Error> {
+    write_schema(request, deadline, None)
 }
 
 fn write_schema(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     fresh_epoch: Option<StoreEpoch>,
 ) -> Result<Receipt, Error> {
@@ -135,7 +121,7 @@ fn write_schema(
     } else {
         MAX_UPGRADE_DURATION
     };
-    let result = with_migration_client(request, trust, deadline, maximum, move |client| {
+    let result = with_migration_client(request, deadline, maximum, move |client| {
         version(client)?;
         client
             .batch("BEGIN; SET LOCAL synchronous_commit = on")
@@ -214,14 +200,9 @@ fn write_schema(
 
 /// Inspect the complete ledger under a shared session migration lock. The
 /// connection closes before return; its receipt grants no later SQL authority.
-pub fn inspect(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-) -> Result<Receipt, Error> {
-    let result =
-        postgres_probe::with_client(request, trust, deadline, |client| client.inspect_schema())
-            .map_err(Error::Connection)?;
+pub fn inspect(request: &Request<'_>, deadline: Instant) -> Result<Receipt, Error> {
+    let result = postgres_probe::with_client(request, deadline, |client| client.inspect_schema())
+        .map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
@@ -229,15 +210,10 @@ pub fn inspect(
 }
 
 /// Accept a recognized ledger prefix to plan an explicit owner migration.
-pub fn plan(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-) -> Result<Receipt, Error> {
-    let result = postgres_probe::with_client(request, trust, deadline, |client| {
-        inspect_prefix(client, false)
-    })
-    .map_err(Error::Connection)?;
+pub fn plan(request: &Request<'_>, deadline: Instant) -> Result<Receipt, Error> {
+    let result =
+        postgres_probe::with_client(request, deadline, |client| inspect_prefix(client, false))
+            .map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }

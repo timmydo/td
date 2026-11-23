@@ -1,19 +1,18 @@
 //! Verify authority on the authenticated session after a real owner changes ACLs.
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     postgres_probe::{Mode, Request},
     postgres_runtime_access::{self as access, ServiceRole},
 };
 
-pub(super) fn rejects_drift(fixture: &Fixture, request: &Request<'_>, trust: &TrustStore) {
+pub(super) fn rejects_drift(fixture: &Fixture, request: &Request<'_>) {
     assert_eq!(request.user, ServiceRole::Receive.login());
     let check = Request {
         // runtime-check uses preparation mode to report its own precise error.
         mode: Mode::Preparation,
         ..*request
     };
-    let receipt = access::inspect(&check, trust, deadline()).unwrap();
+    let receipt = access::inspect(&check, deadline()).unwrap();
     for (change, restore) in [
         (
             "GRANT SELECT ON td_mta.config_material_chunks TO td_mta_receive",
@@ -42,11 +41,11 @@ pub(super) fn rejects_drift(fixture: &Fixture, request: &Request<'_>, trust: &Tr
     ] {
         sql(fixture, change);
         assert_eq!(
-            access::inspect(&check, trust, deadline()),
+            access::inspect(&check, deadline()),
             Err(access::Error::Privileges),
             "{change}"
         );
         sql(fixture, restore);
     }
-    assert_eq!(access::inspect(&check, trust, deadline()).unwrap(), receipt);
+    assert_eq!(access::inspect(&check, deadline()).unwrap(), receipt);
 }

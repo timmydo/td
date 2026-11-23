@@ -1,5 +1,5 @@
 //! Bounded, passive capacity observations. No message or credential contents.
-use super::{configuration_snapshot, report_error, with_addresses, AttemptError};
+use super::{configuration_snapshot, report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -24,9 +24,8 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    let result = with_addresses(&loaded, |request, deadline| {
-        td_mta::postgres_capacity::inspect(request, &loaded.trust, deadline, epoch)
-            .map_err(|_| failed())
+    let result = with_connection(&loaded, |request, deadline| {
+        td_mta::postgres_capacity::inspect(request, deadline, epoch).map_err(|_| failed())
     });
     match result {
         Ok(value) => {

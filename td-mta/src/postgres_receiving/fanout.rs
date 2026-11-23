@@ -167,24 +167,18 @@ pub(crate) fn prepare_observed(
 
 pub fn publish_fanout(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     fanout: &Fanout,
 ) -> Result<FanoutOutcome, Error> {
     let fanout = fanout.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_fanout_client(
-        request,
-        trust,
-        deadline,
-        fanout.count(),
-        move |client| {
+    let result =
+        postgres_probe::with_fanout_client(request, deadline, fanout.count(), move |client| {
             let binding = &fanout.deliveries.first().ok_or(Error::Integrity)?.binding;
             begin(client, binding)?;
             publish_body(client, &fanout, deadline, &marker)
-        },
-    );
+        });
     match result {
         Ok(result) => result,
         Err(_) if attempted.load(Ordering::Relaxed) => Err(Error::Indeterminate),
@@ -375,13 +369,12 @@ pub(crate) fn recipient_body(
 /// This is startup/admission evidence; publication rechecks the entire transaction.
 pub fn ready_many(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     bindings: &[&Binding],
 ) -> Result<(), Error> {
     let values = ready_bindings(bindings)?;
     let result =
-        postgres_probe::with_fanout_client(request, trust, deadline, values.len(), move |client| {
+        postgres_probe::with_fanout_client(request, deadline, values.len(), move |client| {
             begin(client, values.first().ok_or(Error::Integrity)?)?;
             ready_body(client, &values)
         })

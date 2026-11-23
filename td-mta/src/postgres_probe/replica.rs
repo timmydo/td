@@ -22,7 +22,6 @@ use std::{
     thread,
     time::Instant,
 };
-use td_crypto::TrustStore;
 pub(super) const TURNS: usize = 16;
 pub(crate) struct ReplicaSession {
     worker: Worker,
@@ -79,7 +78,6 @@ impl Job {
 impl ReplicaSession {
     pub(crate) fn open(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         epoch: StoreEpoch,
         source: Source,
@@ -94,7 +92,6 @@ impl ReplicaSession {
         let bounds = Bounds::with_turns(Instant::now(), TURNS)?;
         let mut worker = connect_authenticated_until(
             request,
-            trust,
             bounds.expires,
             deadline,
             TURNS * 72 * 1024 * 1024,

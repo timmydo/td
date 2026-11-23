@@ -7,7 +7,6 @@ use std::{
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 
 pub(super) const TURNS: usize = 64;
 pub(super) const BODY_TURNS: usize = 8;
@@ -73,26 +72,13 @@ pub(crate) struct ReadSession {
     body: bool,
 }
 impl ReadSession {
-    pub(crate) fn open(
-        request: &Request<'_>,
-        trust: &TrustStore,
-        deadline: Instant,
-    ) -> Result<Self, Error> {
-        Self::open_kind(request, trust, deadline, false)
+    pub(crate) fn open(request: &Request<'_>, deadline: Instant) -> Result<Self, Error> {
+        Self::open_kind(request, deadline, false)
     }
-    pub(crate) fn open_body(
-        request: &Request<'_>,
-        trust: &TrustStore,
-        deadline: Instant,
-    ) -> Result<Self, Error> {
-        Self::open_kind(request, trust, deadline, true)
+    pub(crate) fn open_body(request: &Request<'_>, deadline: Instant) -> Result<Self, Error> {
+        Self::open_kind(request, deadline, true)
     }
-    fn open_kind(
-        request: &Request<'_>,
-        trust: &TrustStore,
-        deadline: Instant,
-        body: bool,
-    ) -> Result<Self, Error> {
+    fn open_kind(request: &Request<'_>, deadline: Instant, body: bool) -> Result<Self, Error> {
         if request.mode == Mode::Preparation || super::remaining(deadline)? > MAX_DURATION {
             return Err(Error::Invalid);
         }
@@ -102,7 +88,6 @@ impl ReadSession {
         }
         let mut worker = connect_authenticated_until(
             request,
-            trust,
             bounds.expires,
             deadline,
             if body {

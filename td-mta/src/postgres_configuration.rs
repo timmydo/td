@@ -9,7 +9,7 @@ use crate::{
     tls_policy::TlsPolicies,
 };
 use std::{sync::Arc, time::Instant};
-use td_crypto::{ClockHandle, Crypto, Digest, Provider, TrustStore};
+use td_crypto::{ClockHandle, Crypto, Digest, Provider};
 
 pub const MAX_PROFILES: usize = 16;
 pub const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
@@ -158,13 +158,12 @@ fn copy(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 /// No source/configuration row is written or activated by this operation.
 pub fn prepare(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     shared: &[u8],
     profiles: &[Profile<'_>],
 ) -> Result<Candidate, Error> {
-    let (inventory, bindings) = build(request, trust, deadline, epoch, shared, profiles, true)?;
+    let (inventory, bindings) = build(request, deadline, epoch, shared, profiles, true)?;
     Ok(Candidate {
         inventory,
         bindings,
@@ -175,7 +174,6 @@ pub fn prepare(
 // profiles provide structural route declarations, never credentials.
 fn build(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     shared: &[u8],
@@ -250,7 +248,6 @@ fn build(
         }
         let input = ProfileInput {
             request,
-            trust,
             deadline,
             epoch,
             shared,
@@ -348,7 +345,6 @@ fn build(
 
 pub(crate) struct ProfileInput<'a, 'r> {
     pub request: &'a Request<'r>,
-    pub trust: &'a TrustStore,
     pub deadline: Instant,
     pub epoch: StoreEpoch,
     pub shared: &'a [u8],
@@ -358,13 +354,12 @@ pub(crate) struct ProfileInput<'a, 'r> {
 
 pub(crate) fn selected_sources(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     sources: &crate::postgres_configuration_store::Sources,
 ) -> Result<ProfileInventory, Error> {
     let (shared, profiles) = sources.parts().map_err(|_| Error::Profile)?;
-    build(request, trust, deadline, epoch, shared, &profiles, false).map(|(inventory, _)| inventory)
+    build(request, deadline, epoch, shared, &profiles, false).map(|(inventory, _)| inventory)
 }
 
 fn parse_profile(
@@ -405,7 +400,7 @@ pub(crate) fn resolve_profile(
         return Err(Error::Deadline);
     }
     let prepared = parse_profile(&input, storage, pending, scratch)?;
-    let mut loader = Loader::new(input.request, input.trust, input.epoch, input.deadline);
+    let mut loader = Loader::new(input.request, input.epoch, input.deadline);
     let read_text = if isolated {
         materialize::read_service_text
     } else {
@@ -486,21 +481,20 @@ mod tests {
     fn invalid_profile_inventory_refuses_before_database_work() {
         use super::*;
         let request = Request {
-            address: crate::postgres_probe::Endpoint::Tcp("127.0.0.1:1".parse().unwrap()),
-            server_name: "localhost",
+            socket: td_fs::SocketPath::new(std::path::Path::new("/nonexistent/.s.PGSQL.5432"))
+                .unwrap(),
             mode: crate::postgres_probe::Mode::Preparation,
             user: "fixture",
             database: "fixture",
             password: b"unused",
         };
-        let trust = TrustStore::public_roots().unwrap();
         let epoch = StoreEpoch::from_bytes([1; 16]);
         for deadline in [
             Instant::now(),
             Instant::now() + std::time::Duration::from_secs(11),
         ] {
             assert_eq!(
-                prepare(&request, &trust, deadline, epoch, b"", &[]).err(),
+                prepare(&request, deadline, epoch, b"", &[]).err(),
                 Some(Error::Deadline)
             );
         }
@@ -513,7 +507,6 @@ mod tests {
         let run = |profiles: &[Profile<'_>]| {
             prepare(
                 &request,
-                &trust,
                 Instant::now() + std::time::Duration::from_secs(10),
                 epoch,
                 b"version = 1",

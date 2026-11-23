@@ -8,7 +8,6 @@ use crate::{
     postgres_route_owners as owners,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadError {
@@ -30,26 +29,18 @@ pub struct BodyMetadata {
 /// transport ownership and durable phase fences still precede any SMTP output.
 pub fn with_body<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
     maximum: u64,
     read: impl FnOnce(BodyMetadata, &mut dyn BlobReader) -> Result<T, ports::Error>,
 ) -> Result<T, ReadError> {
-    with_active_body(
-        request,
-        trust,
-        deadline,
-        value,
-        maximum,
-        None,
-        |meta, body, _| read(meta, body),
-    )
+    with_active_body(request, deadline, value, maximum, None, |meta, body, _| {
+        read(meta, body)
+    })
 }
 
 pub(crate) fn body_mode(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
     maximum: u64,
@@ -57,7 +48,6 @@ pub(crate) fn body_mode(
 ) -> Result<crate::smtp_data_encode::Body, ReadError> {
     with_active_body(
         request,
-        trust,
         deadline,
         value,
         maximum,
@@ -74,7 +64,6 @@ pub(crate) fn body_mode(
 
 fn with_active_body<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
     maximum: u64,
@@ -84,8 +73,8 @@ fn with_active_body<T>(
     if maximum > postgres_body::MAX_BODY_BYTES {
         return Err(ReadError::Body(postgres_body::Error::Capacity));
     }
-    admit(request, trust, deadline, value).map_err(ReadError::Attempt)?;
-    postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    admit(request, deadline, value).map_err(ReadError::Attempt)?;
+    postgres_probe::with_body_worker(request, deadline, |worker| {
         let selected = value.clone();
         let metadata = worker
             .run(|client| snapshot(client, selected, maximum))
@@ -99,7 +88,7 @@ fn with_active_body<T>(
         postgres_body::with_pin_checks(worker, metadata.blob, deadline, checks, |body, high_bit| {
             Ok(replay(
                 body,
-                || admit(request, trust, deadline, value).map_err(ReadError::Attempt),
+                || admit(request, deadline, value).map_err(ReadError::Attempt),
                 |body| read(metadata, body, high_bit),
             ))
         })
@@ -118,14 +107,9 @@ fn replay<T>(
     read(body).map_err(ReadError::Output)
 }
 
-fn admit(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    value: &Dispatch,
-) -> Result<(), Error> {
+fn admit(request: &Request<'_>, deadline: Instant, value: &Dispatch) -> Result<(), Error> {
     let value = value.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         if !owners::begin(client, &value.claim, true, false).map_err(Error::Owner)? {
             return Err(Error::Policy);
         }

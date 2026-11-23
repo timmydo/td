@@ -19,7 +19,6 @@ use crate::{
     store_fs::ResponseCoordinator,
 };
 use std::cell::RefCell;
-use std::path::Path;
 use std::time::Instant;
 
 struct CachedRead<'a> {
@@ -103,10 +102,9 @@ impl https_api::Worker for ApiWorker<'_, '_, '_, '_> {
 
 /// The prepared session must belong
 /// to this binding. HTTPS and response retention must share this exact clock.
-/// Read capacity is reserved before endpoint resolution. Workers own all SQL.
+/// Read capacity is reserved before connecting. Workers own all SQL.
 pub struct Service<'s, 'sr, 'a> {
     pub loaded: &'s Loaded,
-    pub executable: &'s Path,
     pub binding: &'s Binding,
     pub slots: &'s ReadSlots,
     pub pending: &'s crate::postgres_http_updates::Pending,
@@ -190,11 +188,9 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         headers: Option<&mut crate::postgres_header_cache::Cache>,
         read: impl FnOnce(&mut Snapshot<'_>) -> Result<T, ApiError>,
     ) -> Result<T, ApiError> {
-        use crate::postgres_probe::{self, ReadIsolation, ReadSession};
+        use crate::postgres_probe::{ReadIsolation, ReadSession};
         let mut headers = headers.map(|cache| cache.transaction());
-        if !self.executable.is_absolute()
-            || self.loaded.bootstrap.profile() != self.binding.profile()
-            || !self.binding.roles().jmap()
+        if self.loaded.bootstrap.profile() != self.binding.profile() || !self.binding.roles().jmap()
         {
             return Err(Error::Forbidden.into());
         }
@@ -213,27 +209,9 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 .slots
                 .acquire()
                 .map_err(|error| ApiError::Io(read_error(error)))?;
-            let dns_deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(5));
-            let addresses = crate::postgres_resolver::resolve(
-                self.executable,
-                &self.loaded.bootstrap,
-                dns_deadline,
-            )
-            .map_err(|error| ApiError::Io(read_error(postgres_read::Error::Resolution(error))))?;
-            let mut opened = None;
-            for address in addresses {
-                let mut request = self.loaded.bootstrap.request(address);
-                request.mode = self.binding.runtime_mode();
-                match ReadSession::open_body(&request, &self.loaded.trust, deadline) {
-                    Ok(session) => {
-                        opened = Some(session);
-                        break;
-                    }
-                    Err(postgres_probe::Error::Transport) => (),
-                    Err(error) => return Err(probe_error(error)),
-                }
-            }
-            let session = opened.ok_or_else(|| probe_error(postgres_probe::Error::Transport))?;
+            let mut request = self.loaded.bootstrap.request();
+            request.mode = self.binding.runtime_mode();
+            let session = ReadSession::open_body(&request, deadline).map_err(probe_error)?;
             *cache = Some(CachedRead {
                 session: Some(session),
                 _permit: permit,
@@ -387,9 +365,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         if request.target.account() != self.binding.account() {
             return Err(Error::NotFound);
         }
-        if !self.binding.roles().jmap()
-            || self.loaded.bootstrap.profile() != self.binding.profile()
-            || !self.executable.is_absolute()
+        if !self.binding.roles().jmap() || self.loaded.bootstrap.profile() != self.binding.profile()
         {
             return Err(Error::Forbidden);
         }
@@ -406,7 +382,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         sender.deadline = until;
         let deadline = self.clock.deadline_instant(until)?;
         // Verification retains one snapshot while fresh authorization opens
-        // another connection. Reserve both before launching the DNS helper.
+        // another connection. Reserve both before connecting.
         let _transient_slots = if let Some(cache) = cache {
             cache.reserve(self.slots, deadline).map_err(read_error)?;
             None
@@ -416,20 +392,6 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 self.slots.acquire().map_err(read_error)?,
             ))
         };
-        let dns_deadline = deadline.min(
-            std::time::Instant::now()
-                .checked_add(std::time::Duration::from_secs(5))
-                .ok_or(Error::Invalid)?,
-        );
-        let addresses = crate::postgres_resolver::resolve(
-            self.executable,
-            &self.loaded.bootstrap,
-            dns_deadline,
-        )
-        .map_err(|error| match error {
-            crate::postgres_resolver::Error::Deadline => Error::Deadline,
-            _ => Error::Dns,
-        })?;
         let work = self.admission.work();
         let mut meter = Meter::new(
             until,
@@ -440,60 +402,44 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 ..Default::default()
             },
         );
-        for address in addresses {
-            if let Some(cache) = cache {
-                cache.reserve(self.slots, deadline).map_err(read_error)?;
-            }
-            let mut connection = self.loaded.bootstrap.request(address);
-            connection.mode = self.binding.runtime_mode();
-            let result = postgres_body::with_pinned_blob_cached(
-                &connection,
-                &self.loaded.trust,
-                deadline,
-                postgres_body::BlobRequest {
-                    binding: self.binding,
-                    blob: request.target.blob(),
-                    maximum: postgres_body::MAX_BODY_BYTES,
-                },
-                request.credentials.password(),
-                cache,
-                |_, pin| {
-                    crate::https_download::send_verified(
-                        pin,
-                        &mut meter,
-                        request.target,
-                        self.resources.limits(),
-                        started_at,
-                        until,
-                        sender,
-                    )
-                },
-            );
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::Deadline);
-            }
-            match result {
-                Ok(()) => return Ok(()),
-                Err(postgres_body::Error::Connection(postgres_probe::Error::Transport))
-                    if !sender.started => {}
-                Err(error) => {
-                    return Err(match error {
-                        postgres_body::Error::Connection(postgres_probe::Error::Deadline) => {
-                            Error::Deadline
-                        }
-                        postgres_body::Error::Read(error) => error,
-                        postgres_body::Error::Missing => Error::NotFound,
-                        postgres_body::Error::Unauthenticated | postgres_body::Error::Policy => {
-                            Error::Forbidden
-                        }
-                        postgres_body::Error::Capacity => Error::Capacity,
-                        postgres_body::Error::Integrity => Error::Corrupt,
-                        _ => Error::Invalid,
-                    })
-                }
-            }
+        let mut connection = self.loaded.bootstrap.request();
+        connection.mode = self.binding.runtime_mode();
+        let result = postgres_body::with_pinned_blob_cached(
+            &connection,
+            deadline,
+            postgres_body::BlobRequest {
+                binding: self.binding,
+                blob: request.target.blob(),
+                maximum: postgres_body::MAX_BODY_BYTES,
+            },
+            request.credentials.password(),
+            cache,
+            |_, pin| {
+                crate::https_download::send_verified(
+                    pin,
+                    &mut meter,
+                    request.target,
+                    self.resources.limits(),
+                    started_at,
+                    until,
+                    sender,
+                )
+            },
+        );
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Deadline);
         }
-        Err(Error::Invalid)
+        result.map_err(|error| match error {
+            postgres_body::Error::Connection(postgres_probe::Error::Deadline) => Error::Deadline,
+            postgres_body::Error::Read(error) => error,
+            postgres_body::Error::Missing => Error::NotFound,
+            postgres_body::Error::Unauthenticated | postgres_body::Error::Policy => {
+                Error::Forbidden
+            }
+            postgres_body::Error::Capacity => Error::Capacity,
+            postgres_body::Error::Integrity => Error::Corrupt,
+            _ => Error::Invalid,
+        })
     }
     fn execute(
         &self,
@@ -579,10 +525,9 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             }
             *cache.try_borrow_mut().map_err(|_| Error::Busy)? = None;
         }
-        let mut snapshot = Snapshot::open_resolved(
+        let mut snapshot = Snapshot::open_loaded(
             self.slots,
             self.loaded,
-            self.executable,
             self.clock.deadline_instant(execution)?,
             self.binding,
             request.credentials.password(),
@@ -601,7 +546,6 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             if mutation == Some(b"Mailbox/set".as_slice()) {
                 let mailboxes = crate::postgres_http_mailboxes::Mailboxes {
                     loaded: self.loaded,
-                    executable: self.executable,
                     binding: self.binding,
                     slots: self.slots,
                     clock: self.clock,
@@ -619,7 +563,6 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             } else {
                 let updates = crate::postgres_http_updates::Updates {
                     loaded: self.loaded,
-                    executable: self.executable,
                     binding: self.binding,
                     slots: self.slots,
                     clock: self.clock,
@@ -628,7 +571,6 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 };
                 let drafts = crate::postgres_http_drafts::Drafts {
                     loaded: self.loaded,
-                    executable: self.executable,
                     binding: self.binding,
                     slots: self.slots,
                     clock: self.clock,
@@ -639,7 +581,6 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 if mutation == Some(b"EmailSubmission/set".as_slice()) {
                     let submissions = crate::postgres_http_submissions::Submissions {
                         loaded: self.loaded,
-                        executable: self.executable,
                         binding: self.binding,
                         slots: self.slots,
                         clock: self.clock,
@@ -648,7 +589,6 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                     };
                     let cancellations = crate::postgres_http_cancellations::Cancellations {
                         loaded: self.loaded,
-                        executable: self.executable,
                         binding: self.binding,
                         slots: self.slots,
                         clock: self.clock,
@@ -723,7 +663,6 @@ fn read_error(error: postgres_read::Error) -> Error {
         postgres_read::Error::Busy => Error::Busy,
         postgres_read::Error::Unauthenticated | postgres_read::Error::Policy => Error::Forbidden,
         postgres_read::Error::Capacity => Error::Capacity,
-        postgres_read::Error::Resolution(_) => Error::Dns,
         _ => Error::Invalid,
     }
 }

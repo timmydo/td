@@ -12,7 +12,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Entropy, SystemEntropy, TrustStore};
+use td_crypto::{Entropy, SystemEntropy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -70,15 +70,10 @@ pub fn prepare(epoch: StoreEpoch, account: AccountId) -> Result<Creation, Error>
 /// Atomically create account sequence one, Inbox and its Created history row.
 /// Matching retained receipts succeed without touching later mailbox/state
 /// changes. An existing account without this receipt is never repaired/reset.
-pub fn publish(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    creation: Creation,
-) -> Result<(), Error> {
+pub fn publish(request: &Request<'_>, deadline: Instant, creation: Creation) -> Result<(), Error> {
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         let receipt = client.inspect_schema().map_err(Error::Schema)?;
         if receipt.store_epoch != creation.epoch {
             return Err(Error::Epoch);
@@ -161,12 +156,11 @@ pub fn publish(
 /// creation; the original operation must finish before interpreting absence.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
 ) -> Result<Creation, Error> {
-    let result = postgres_probe::with_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_client(request, deadline, move |client| {
             let receipt = client.inspect_schema().map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout = 10000").map_err(|_| Error::Database)?;

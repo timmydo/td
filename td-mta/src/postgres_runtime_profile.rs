@@ -14,7 +14,7 @@ use crate::{
     tls_policy::TlsPolicies,
 };
 use std::{sync::Arc, time::Instant};
-use td_crypto::{ClockHandle, TrustStore};
+use td_crypto::ClockHandle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -157,13 +157,11 @@ impl PublishedProfile {
     pub fn refresh_certificates(
         &self,
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         revisions: &[(String, i64)],
     ) -> Result<(), Error> {
         let epoch = self.binding.epoch();
-        let mut loader =
-            crate::postgres_profile_materials::Loader::new(request, trust, epoch, deadline);
+        let mut loader = crate::postgres_profile_materials::Loader::new(request, epoch, deadline);
         let policies = self.policies.value();
         let prepared = policies
             .prepare_certificates(&self.configuration, |reference| {
@@ -173,7 +171,7 @@ impl PublishedProfile {
             })
             .map_err(Error::TlsPolicy)?;
         if !loader.matches_certificates(revisions)
-            || selection::observe(request, trust, deadline, epoch).map_err(Error::Selection)?
+            || selection::observe(request, deadline, epoch).map_err(Error::Selection)?
                 != Some(self.binding.selection())
         {
             return Err(Error::Superseded);
@@ -285,7 +283,6 @@ impl Prepared {
 /// the result still requires fresh policy fencing before runtime publication.
 pub fn load(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     profile: &str,
@@ -299,32 +296,30 @@ pub fn load(
         return Err(Error::Deadline);
     }
     values::profile_name(profile).map_err(|_| Error::Name)?;
-    let (selected, candidate) = if let Some(role) =
-        crate::postgres_runtime_access::ServiceRole::for_login(request.user)
-    {
-        if role.name() != profile {
-            return Err(Error::Name);
-        }
-        let selected = selection::observe(request, trust, deadline, epoch)
-            .map_err(Error::Selection)?
-            .ok_or(Error::Unselected)?;
-        let sources = crate::postgres_configuration_store::read_sources(
-            request,
-            trust,
-            deadline,
-            epoch,
-            selected.version,
-        )
-        .map_err(|e| Error::Selection(selection::Error::Configuration(e)))?;
-        let inventory = configuration::selected_sources(request, trust, deadline, epoch, &sources)
-            .map_err(Error::Configuration)?;
-        (selected, inventory)
-    } else {
-        let (selected, candidate) = selection::read(request, trust, deadline, epoch)
-            .map_err(Error::Selection)?
-            .ok_or(Error::Unselected)?;
-        (selected, candidate.inventory)
-    };
+    let (selected, candidate) =
+        if let Some(role) = crate::postgres_runtime_access::ServiceRole::for_login(request.user) {
+            if role.name() != profile {
+                return Err(Error::Name);
+            }
+            let selected = selection::observe(request, deadline, epoch)
+                .map_err(Error::Selection)?
+                .ok_or(Error::Unselected)?;
+            let sources = crate::postgres_configuration_store::read_sources(
+                request,
+                deadline,
+                epoch,
+                selected.version,
+            )
+            .map_err(|e| Error::Selection(selection::Error::Configuration(e)))?;
+            let inventory = configuration::selected_sources(request, deadline, epoch, &sources)
+                .map_err(Error::Configuration)?;
+            (selected, inventory)
+        } else {
+            let (selected, candidate) = selection::read(request, deadline, epoch)
+                .map_err(Error::Selection)?
+                .ok_or(Error::Unselected)?;
+            (selected, candidate.inventory)
+        };
     let chosen = (0..candidate.profile_count())
         .filter_map(|index| candidate.profile(index))
         .find(|entry| entry.name == profile)
@@ -351,7 +346,6 @@ pub fn load(
     let (configuration, policies) = configuration::resolve_profile(
         ProfileInput {
             request,
-            trust,
             deadline,
             epoch,
             shared: candidate.shared(),
@@ -426,8 +420,7 @@ pub fn load(
                 email,
             });
         }
-        postgres_accounts::inspect(request, trust, deadline, epoch, account)
-            .map_err(Error::Bootstrap)?;
+        postgres_accounts::inspect(request, deadline, epoch, account).map_err(Error::Bootstrap)?;
         let identity_catalog = if roles.jmap() {
             Some(Arc::new(
                 crate::identity_catalog::Catalog::prepare_for_account(
@@ -471,9 +464,7 @@ pub fn load(
         .map_err(|_| Error::Capacity)?;
     additional.extend(bindings);
     drop(candidate);
-    if selection::observe(request, trust, deadline, epoch).map_err(Error::Selection)?
-        != Some(selected)
-    {
+    if selection::observe(request, deadline, epoch).map_err(Error::Selection)? != Some(selected) {
         return Err(Error::Superseded);
     }
     if Instant::now() >= deadline {

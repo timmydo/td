@@ -30,7 +30,7 @@ impl Dispatches<'_, '_> {
         let Some(Operation::RouteClaim(claim)) = pending.as_ref() else {
             return Err(ports::Error::Invalid.into());
         };
-        match owners::acquire(self.connection.request, self.connection.trust, limit, claim) {
+        match owners::acquire(self.connection.request, limit, claim) {
             Ok(grant) => {
                 *pending = None;
                 Ok(grant)

@@ -11,7 +11,6 @@ use crate::{
     postgres_selection::{self as selection, Error, Selection},
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 // PostgreSQL 17 deparses the reviewed definitions with search_path=pg_catalog.
 // The owner installs the same SQL checked at startup, including all row filters.
@@ -216,14 +215,13 @@ fn installed(client: &Client) -> Result<bool, Error> {
 /// mismatch rolls back the entire installation. Re-running after an uncertain commit is safe.
 pub fn bind(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
 ) -> Result<Selection, Error> {
     let (selected, candidate) =
-        selection::read(request, trust, deadline, epoch)?.ok_or(Error::Conflict)?;
+        selection::read(request, deadline, epoch)?.ok_or(Error::Conflict)?;
     let bindings = candidate.bindings;
-    postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mutation_client(request, deadline, move |client| {
             let receipt = client.inspect_schema().map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch("BEGIN ISOLATION LEVEL READ COMMITTED;

@@ -140,7 +140,6 @@ impl Registry {
         };
         let grant = match owners::acquire(
             worker.request,
-            worker.trust,
             Instant::now() + Duration::from_secs(10),
             &claim,
         ) {
@@ -167,7 +166,6 @@ impl Registry {
         };
         match owners::observe(
             worker.request,
-            worker.trust,
             Instant::now() + Duration::from_secs(10),
             &claim,
             grant.generation,
@@ -208,8 +206,8 @@ impl Registry {
         let leases = leases(&snapshot)?;
         let deadline = Instant::now() + Duration::from_secs(10);
         let observed = database(match renewer {
-            Some(renewer) => renewer.renew(worker.request, worker.trust, deadline, &leases),
-            None => owners::renew_many(worker.request, worker.trust, deadline, &leases),
+            Some(renewer) => renewer.renew(worker.request, deadline, &leases),
+            None => owners::renew_many(worker.request, deadline, &leases),
         })?;
         let mut slots = self.slots.lock().map_err(|_| Error::Worker)?;
         for (index, claim, grant) in snapshot {
@@ -338,7 +336,6 @@ pub(super) fn run(
     let dispatch = Dispatches {
         connection: Connection {
             request: worker.request,
-            trust: worker.trust,
             slots: &slots,
             clock: worker.clock.clone(),
         },
@@ -349,8 +346,7 @@ pub(super) fn run(
     let mut dns_cache = crate::dns_owner::Cache::default();
     let mut repairing = None;
     let mut idle = IdlePause::new();
-    let mut idle_reader =
-        crate::postgres_queue_candidates::IdleReader::new(&slots, worker.request, worker.trust);
+    let mut idle_reader = crate::postgres_queue_candidates::IdleReader::new(&slots, worker.request);
     let mut active_round = false;
     let mut empty_round = false;
     let mut round_subscription = idle_reader.subscription();
@@ -449,7 +445,6 @@ pub(super) fn run(
     let leases = leases(&snapshot)?;
     result.and(database(owners::release_many(
         worker.request,
-        worker.trust,
         Instant::now() + Duration::from_secs(10),
         &leases,
     )))?;

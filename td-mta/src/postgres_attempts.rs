@@ -14,7 +14,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 #[path = "postgres_attempt_body.rs"]
 mod body;
@@ -293,12 +293,11 @@ fn active_receipt(client: &Client, value: &Dispatch) -> Result<Outcome, Error> {
 }
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
         receipt(client, &value)
     })
@@ -311,36 +310,33 @@ pub fn inspect(
 /// Historical replay precedes clock admission and authorizes no send.
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
 ) -> Result<Outcome, Error> {
-    publish_inner(request, trust, deadline, value, clock, guard, false)
+    publish_inner(request, deadline, value, clock, guard, false)
 }
 /// Only a newly committed Prepared attempt succeeds. Historical receipt replay
 /// and settlement cannot reconstruct live worker custody.
 pub fn publish_new(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
 ) -> Result<Outcome, Error> {
-    publish_inner(request, trust, deadline, value, clock, guard, true)
+    publish_inner(request, deadline, value, clock, guard, true)
 }
 fn publish_inner(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
     new_only: bool,
 ) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, value)? {
+    if let Some(outcome) = inspect(request, deadline, value)? {
         return if new_only {
             Err(Error::Conflict)
         } else {
@@ -350,7 +346,7 @@ fn publish_inner(
     let value = value.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
         if let Some(outcome) = receipt(client, &value)? {
             return if new_only {

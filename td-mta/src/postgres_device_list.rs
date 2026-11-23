@@ -1,7 +1,7 @@
 //! Bounded historical device metadata for explicit administration.
 use super::{
     device_credentials, postgres_probe, AccountId, DeviceId, Error, Request, StoreEpoch,
-    TrustStore, DEVICE_RECORDS,
+    DEVICE_RECORDS,
 };
 use std::time::Instant;
 
@@ -18,12 +18,11 @@ pub struct DeviceSummary {
 /// The caller supplies database administration credentials and an expected epoch.
 pub fn list(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
 ) -> Result<Vec<DeviceSummary>, Error> {
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mailbox_client(request, deadline, move |client| {
             let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != epoch {
                 return Err(Error::Epoch);

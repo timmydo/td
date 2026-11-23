@@ -4,12 +4,12 @@
 
 Serving and administration use PostgreSQL as the sole durable authority.
 Receive, JMAP and relay profiles are active, with account-scoped authorization
-and several cooperating processes sharing one writable database. A cloud VM
-can receive and relay mail while a local process serves JMAP or relays through
-a configured smart host. This remains a bounded personal service, not a general
+and several cooperating processes on the database's host sharing one writable
+database over its Unix socket. One instance can receive and relay mail while
+another serves JMAP or relays through a configured smart host. This remains a bounded personal service, not a general
 multi-tenant platform. Peer-to-peer replication, an offline writable mail store
 and routing reads to a PostgreSQL standby are outside its scope: serving reads
-use the writer endpoint (section 3). Application-level account replication
+use the writable primary (section 3). Application-level account replication
 into a separate local database served read-only is a distinct feature owned
 by [REPLICATION.md](REPLICATION.md); it uses this schema and grants its
 serving instance no mail write authority.
@@ -20,17 +20,16 @@ backend, local configuration authority and file-backed device registry are
 removed. [STORAGE.md](STORAGE.md) owns local runtime and response scratch;
 [CONFORMANCE.md](CONFORMANCE.md) owns implemented td-mail flows and evidence.
 
-Database deployment targets include independently installed PostgreSQL,
-Azure Database for PostgreSQL Flexible Server and Amazon RDS for PostgreSQL.
-Provider qualification is separate from the native PostgreSQL fixtures;
-Aurora and database proxies require their own qualification. See
+The database is an independently installed PostgreSQL on the same host,
+reached only over its local Unix socket. Managed network databases and
+database proxies are not deployment targets. See
 [DEPLOYMENT.md](DEPLOYMENT.md) for provisioning and
 [PRODUCTION.md](PRODUCTION.md) for the current host's operations.
 
 The client is td's own synchronous `td-postgres`
 ([td-postgres/DESIGN.md](../td-postgres/DESIGN.md)), a std-only sibling
-crate with no external dependency. Its SCRAM uses td-primitives; TLS
-remains the td-crypto boundary, through a connector td-mta supplies.
+crate with no external dependency. Its SCRAM uses td-primitives; it
+speaks only over a Unix socket and carries no TLS.
 Serving and owner commands use this client; the connection probe in
 [Operator connection probe](#operator-connection-probe) is a diagnostic,
 not an alternative backend. No server package is admitted by the client;
@@ -108,24 +107,19 @@ while enabling different listeners. Several instances may select one profile;
 each process generates its own unpredictable boot identity. A profile is
 configuration, not an authorization credential or a singleton lock.
 
-Keep only unavoidable bootstrap inputs outside the database: endpoint,
-database and login credentials, database TLS trust, profile selector and
-host-local runtime/scratch/log placement. Supply secret-bearing connection
+Keep only unavoidable bootstrap inputs outside the database: socket,
+database and login credentials, profile selector and host-local
+runtime/scratch/log placement. Supply secret-bearing connection
 specifications through a protected file or inherited input, never require
 passwords in argv. Reject unknown connection options and redact the complete
 specification and provider errors. A database row must not override its own
-bootstrap endpoint or trust roots. Defaults permit the simple connection plus
+bootstrap socket. Defaults permit the simple connection plus
 profile launch without a second full MTA configuration file.
 
-Network connections require certificate-chain and endpoint-name verification;
-there is no opportunistic TLS fallback. Local TCP follows the same rule.
-A protected Unix-domain socket is a separately explicit local transport,
-with SCRAM database login and trusted socket-directory ownership.
-It does not silently replace a failed TLS connection. Initial authentication
-is PostgreSQL SCRAM over verified TLS or the private socket; cloud
-identity-token login is not supported. Select addresses for the configured
-writer endpoint within bounded DNS and connection deadlines, under the
-one-second positive-answer policy in [Writer endpoint resolution](#writer-endpoint-resolution).
+td-mta reaches its database only over a local Unix-domain socket whose
+directory ownership it checks, with SCRAM database login. There is no TCP,
+TLS or DNS path to the database, and no network database is supported.
+Cloud identity-token login is not supported.
 
 Startup connects, verifies writable-primary status and supported schema,
 loads and validates a complete profile/configuration generation, checks
@@ -239,8 +233,8 @@ for policy, account, route and attempt rows to avoid lock-order inversions.
 Bound contention with lock/statement/transaction deadlines and bounded retry
 for definite rollback only. Never hold account locks across SMTP round trips.
 
-Read operations use finite read-only repeatable-read snapshots on the writer
-endpoint, binding state tokens and object/body reads to the same view.
+Read operations use finite read-only repeatable-read snapshots on the writable
+primary, binding state tokens and object/body reads to the same view.
 Snapshot deadlines include MIME work and response production; slow clients
 cannot indefinitely prevent vacuum/reclamation. The effective transfer
 deadline is the minimum of the HTTP allowance and the remaining snapshot
@@ -400,35 +394,29 @@ real td-mail; concurrent mutation/state/quotas; revocation across instances;
 worker death/takeover and stale phase/result refusal; lost COMMIT receipts;
 database restart/connection interruption; orderly one-instance shutdown;
 restore with epoch and delivery quarantine. Local protocol fixtures remain
-offline. Provider qualification is a separate opt-in operator exercise on
-empty disposable databases: TLS/name refusal, reconnect through failover,
-role privileges and acknowledgement durability. Never silently use a live
-mailbox or claim cloud qualification from a local mock.
+offline. Never silently use a live mailbox or claim qualification from a
+local mock.
 
 ## 7. Backend boundary
 
 PostgreSQL is the only backend. The SQLite backend, its dependencies and
 pins, private device files, exclusive-store assumptions and SQLite
 qualification are removed. There is no selectable dual backend and no
-conversion of SQLite data. Do not claim provider support, automatic delivery
-takeover or cloud qualification beyond the integration evidence section 6
-and [CONFORMANCE.md](CONFORMANCE.md) name.
+conversion of SQLite data. Do not claim automatic delivery takeover beyond
+the integration evidence section 6 and [CONFORMANCE.md](CONFORMANCE.md)
+name.
 
 ## References
 
 - [PostgreSQL commit durability](https://www.postgresql.org/docs/18/runtime-config-wal.html)
 - [PostgreSQL row locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE)
-- [Azure PostgreSQL TLS](https://learn.microsoft.com/en-us/azure/postgresql/security/security-tls-how-to-connect)
-- [Azure PostgreSQL high availability](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-high-availability)
-- [RDS PostgreSQL TLS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.html)
-- [RDS failover and endpoint changes](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html)
 
 ## 8. Connection, bootstrap and serving startup
 
 This chapter specifies how a td-mta process reaches its database: the
-protected connection specification and trust inputs, bounded writer-name
-resolution, the verified-TLS or explicit private Unix connection worker with
-SCRAM authentication, primary and durability qualification, the runtime
+protected connection specification, the Unix socket connection worker with
+socket admission and SCRAM authentication, primary and durability
+qualification, the runtime
 logins and the qualification every runtime connection repeats, request
 credential ownership, the operator probe and the foreground `serve` command.
 Section 1 states the bootstrap policy these mechanisms implement.
@@ -441,46 +429,36 @@ environment lookup, DNS, connection or service activation. Never put its
 secret-bearing input in argv or diagnostics. Neither the parsed value nor
 the connection request implements Debug.
 
-The syntax is one `postgresql://USER:PASSWORD@HOST[:PORT]/DATABASE` URI
-(`postgres://` is also accepted). Credentials and database are explicit;
-there are no environment defaults, password files, service-name expansion,
-multiple hosts or Unix-socket fallback. For TCP, HOST is an ASCII DNS name,
-including localhost, authenticated by the TLS facade; literal IPs, numeric
-address shorthand, numeric final labels and encoded hosts are refused. The
-default port is 5432. TLS verifies HOST on every connection.
+The syntax is one `postgresql://USER:PASSWORD@[:PORT]/DATABASE?host=DIR`
+URI (`postgres://` is also accepted), with an empty authority host and an
+absolute socket directory in the `host` query. The socket is
+`DIR/.s.PGSQL.PORT`; PORT defaults to 5432. Encode URI separators in DIR.
+Credentials and database are explicit; there are no environment defaults,
+password files, service-name expansion or multiple hosts. A directory of at
+most 107 bytes is required; the resulting socket path must satisfy the
+socket bounds under "Unix socket transport", and filesystem admission
+happens at connect.
 
-The optional query accepts `sslmode=verify-full` and an absolute
-`sslrootcert` path, each at most once. Verification is mandatory even
-without sslmode. An absent root path means the public trust store; an
-explicit path replaces it. Unknown parameters, duplicate parameters and
-weaker TLS modes are refused, rather than forwarded to the client. A root
-path here is only a name; its reader enforces the protected-file policy.
-
-Local Unix syntax is `postgresql://USER:PASSWORD@[:PORT]/DATABASE?host=DIR`,
-with an empty authority host and an absolute socket directory in the `host`
-query. The socket is `DIR/.s.PGSQL.PORT`; PORT defaults to 5432. Encode URI
-separators in DIR. Only this form accepts `sslmode=disable` (also its
-default); it rejects `sslrootcert` and any other SSL mode. A `host` query
-cannot replace a nonempty authority host. Directory spelling and the
-resulting socket path must satisfy the socket bounds under "Verified TLS and
-private Unix transport"; filesystem admission happens at connect.
+A nonempty authority host, the network form, is refused as an endpoint
+error, and so is a missing or relative `host` directory. The query accepts
+`sslmode=disable`, also the default, at most once; any other SSL mode,
+`sslrootcert`, every other parameter and a repeated one are refused in the
+one TLS-policy category, rather than forwarded to the client.
 
 Input is at most 16 KiB of printable ASCII without whitespace or fragments.
 Percent escapes decode once, preserving literal plus signs. Encode URI
 separators in credentials/database and spaces or non-ASCII data. User and
 database are nonempty UTF-8 text without controls, at most 256 decoded
 bytes. Passwords are 1..4096 decoded ASCII bytes without NUL, since the
-client does no SASLprep; the trust path is
-nonempty UTF-8 without controls, at most 4096 bytes. Profiles are 1..64
+client does no SASLprep. Profiles are 1..64
 ASCII letters, digits, dots, underscores or hyphens, starting with a letter
 or digit. All parse failures return fixed categories without the input or
-credentials. This decoder does not claim cloud connectivity or a supported
-schema.
+credentials. This decoder does not claim a supported schema.
 
 ### Protected connection files
 
-`postgres_input::Loaded::open` reads a connection file and constructs its
-TLS trust store without DNS, database access or service admission. It takes
+`postgres_input::Loaded::open` reads and parses a connection file without
+DNS, database access or service admission. It takes
 the file path and profile, never a password argument. Every `postgres`
 operator command and `serve` load their bootstrap through it; `serve`
 reopens the file on every configuration reload. The file's parent must
@@ -498,102 +476,40 @@ parent. The URI is at most 16 KiB, optionally followed by one LF or CRLF.
 Other whitespace, comments, extra lines and invalid UTF-8 refuse. The
 reader retains at most 16 KiB plus three bytes of source scratch before
 parsing; parsed credentials are separate bounded allocations. It makes no
-secure memory-erasure claim.
-
-An explicit sslrootcert is opened as a public input under the same owner
-and ancestor policy, including secret/public inode-alias refusal, and read
-with 128 KiB plus one byte of scratch. `TrustStore::from_pem` enforces its
-complete private-CA bundle contract. Explicit trust replaces public roots;
-missing, unreadable, oversized or invalid explicit trust never falls back.
-Without sslrootcert, only the facade's compiled public roots are loaded.
-Every failure is a fixed category, without file paths, file bytes or
-provider messages. Reads are bounded in bytes, not wall time:
+secure memory-erasure claim. Every failure is a fixed category, without
+file paths or file bytes. Reads are bounded in bytes, not wall time:
 operator-provisioned regular files are cold trusted I/O, outside the
-network deadline.
+connection deadline.
 
-### Writer endpoint resolution
-
-For an explicit Unix bootstrap, `postgres_resolver::resolve` returns the
-single typed socket endpoint under the supplied deadline, without launching
-a child. For TCP it accepts the parsed bootstrap, the caller's trusted
-absolute td-mta executable path and an absolute deadline at most five
-seconds away. On a cache miss it starts that executable in private resolver
-mode with a cleared environment, hostname-only stdin, bounded stdout and
-discarded stderr. No connection URI, credentials, profile or trust bytes
-enter the child.
-
-One parsed bootstrap may reuse its most recent positive answer, in resolver
-order, for one second from lookup start. A hit never extends that interval.
-The platform supplies no DNS TTL. If the address changes, a new connection
-can see the old answer until the interval expires. Existing transport
-fallback, TLS hostname verification, primary qualification and mutation
-settlement apply as usual. The next lookup after expiry consults the system
-resolver even if all recent connections failed. Negative answers and
-expired answers are never served from the cache. Each parsed bootstrap
-starts with no answer. The cache retains at most sixteen IP addresses, with
-no credentials or trust material. Concurrent misses run independently,
-without waiting for another caller's helper; no resolver-specific limit
-bounds them beyond their callers' own worker limits. The dedicated outbound
-HTTP lookup has no such cache.
-
-The child uses the platform resolver and may consult trusted host resolver
-configuration. Blocking libc/NSS resolution stays outside service workers.
-The parent polls child completion, kills and reaps it on deadline or error,
-and admits only a complete versioned response with at most sixteen unique
-IP addresses and 1024 bytes. IPv6 scope IDs are unsupported. The child
-checks the same DNS-name policy as bootstrap and caps result traversal at
-128 addresses. It writes only after complete validation, within pipe
-capacity; no streaming partial result is accepted.
-
-Before reading stdin, the dedicated child starts a watchdog that exits its
-whole process after five seconds. This requests expiry after parent loss
-and during blocked input/read/lookup; native exit cleanup may delay it. The
-internal entry point always exits; it cannot leave a watchdog behind in a
-serving process. Ordinary shutdown still owns and reaps an in-flight
-helper. Native process creation, scheduling, kill/reaping, native exit
-cleanup and filesystem/libc calls retain the platform's between-call
-limitations; this is not a hard real-time or resolver RSS claim. The child
-uses no shell, external resolver program or new dependency. This resolver
-is not cloud DNS-failover or writer-reconnection qualification.
-
-### Verified TLS and private Unix transport
+### Unix socket transport
 
 Every database operation, owner command and serving connection runs on one
 `postgres_probe` connection worker; `postgres_probe::probe` is its
-diagnostic entry point. The caller supplies an explicit TCP or Unix
-endpoint, server DNS name for TCP, borrowed credentials, trust store and an
-absolute Instant deadline. The deadline is at most ten seconds away unless
-the operation's own section admits a longer one, and connection setup never
-receives more than ten seconds. The worker does not resolve DNS, read a
-connection file, load a profile, migrate a schema or retry. User/database
-names are nonempty, NUL-free and at most 256 bytes; passwords are 1..4096
-ASCII bytes without NUL, refused otherwise before dialing. The TLS facade validates the at-most-253-byte TCP server name before
+diagnostic entry point. The caller supplies the socket path, borrowed
+credentials and an absolute Instant deadline. The deadline is at most ten
+seconds away unless the operation's own section admits a longer one, and
+connection setup never receives more than ten seconds. The worker does not
+read a connection file, load a profile, migrate a schema or retry.
+User/database names are nonempty, NUL-free and at most 256 bytes;
+passwords are 1..4096 ASCII bytes without NUL, refused otherwise before
 dialing.
 
-One worker drives connect and its operation through td-postgres. For
-TCP, TLS is required. The client sends SSLRequest and reads exactly one
-answer byte; on `S` td-mta's connector runs td-crypto's outbound Postgres
-selector, which verifies the certificate chain and server name before
-startup credentials enter the stream. There is no plaintext fallback,
-direct-TLS ALPN, client certificate or channel-binding claim. The plaintext
-framing guard requires the SASL challenge/final/OK sequence and refuses
-MD5, cleartext-password, trust and other authentication methods, as
-td-postgres itself does. The client accepts only SCRAM-SHA-256 and
-verifies its server signature; td-mta's 100,000-iteration ceiling
-(`Limits::scram_iterations`) bounds the server-directed password work.
-
-For an explicit Unix endpoint the same worker uses the raw socket, with SSL
-disabled only for this endpoint type. The framing guard, SCRAM sequence,
-output limits and retained-session validation windows wrap the socket
-before the startup message (`td_postgres::connect_unix_through`); skipping
-the TLS connector cannot bypass them. No certificate
-file, DNS lookup, TCP listener or TCP fallback is involved. Account/role,
-schema, transaction and commit-outcome handling are identical to the TCP
-path.
+One worker drives connect and its operation through td-postgres over the
+socket. The framing guard, output limits and retained-session validation
+windows wrap the socket before the startup message
+(`td_postgres::connect_unix_through`), so they see every byte of the
+startup and the login. The framing guard requires the SASL
+challenge/final/OK sequence and refuses MD5, cleartext-password, trust and
+other authentication methods, as td-postgres itself does. The client
+accepts only SCRAM-SHA-256 and verifies its server signature; td-mta's
+100,000-iteration ceiling (`Limits::scram_iterations`) bounds the
+server-directed password work. There is no SSL negotiation, certificate,
+DNS lookup or TCP connection. A socket that is refused admission, or a
+dial that fails before any byte moves, is a transport failure.
 
 Shared `td-fs` admission (`check_server_socket`) checks an absolute
 pathname of at most 107 bytes, with no empty, dot or parent components,
-symlink, or abstract namespace. The endpoint must take one of two forms. A
+symlink, or abstract namespace. The socket must take one of two forms. A
 private socket and its direct parent are owned by the current UID, with
 modes 0600 and 0700; physical ancestors must belong to root or this UID,
 and shared-writable ones require the sticky bit, which protects their
@@ -613,23 +529,20 @@ authenticates the role, and the group decides only which accounts may
 reach the socket. Inside a user namespace unmapped owners all read as the
 overflow ID, so these checks assume the initial namespace's IDs. These
 are stable-path checks, not atomic lookup against hostile code holding
-that authority. Every connect rechecks the endpoint.
+that authority. Every connect rechecks the socket.
 Dialing shares one absolute deadline with admission to at most eight
 helper threads, each with a 256-KiB stack. A timed-out connect retains its
 slot until the kernel call returns; its late stream is closed. Repeated
 failures cannot accumulate unbounded threads. These helpers exist only
-while dialing Unix endpoints, with at most 2 MiB of requested stack
+while dialing the socket, with at most 2 MiB of requested stack
 reservation per process, in addition to thread overhead.
 
 ### Client connection and input bounds
 
 Each worker owns one synchronous td-postgres client on its own thread,
-with no executor, future or wake channel. A Unix socket blocks in
-td-postgres's socket timeouts, never past the operation's deadline. The
-transitional TCP endpoint's TLS stream reads its nonblocking socket:
-after a pending read it waits for the socket to become readable in the
-transport's one-socket `ppoll` wait, or, while TLS still holds buffered
-records or blocked output, parks for a millisecond before retrying. An idle wait (LISTEN within the caller's
+with no executor, future or wake channel. Its socket blocks in
+td-postgres's socket timeouts, never past the operation's deadline. An
+idle wait (LISTEN within the caller's
 slice) reads only notifications, notices and parameter reports until it
 holds one or its slice ends; idle health checks read only what is
 already there. Each live connection owns one database socket and no other
@@ -637,8 +550,7 @@ descriptor.
 
 The worker's deadline bounds every call it makes. Connect, handshake,
 each retained job and teardown keep their original deadlines, including
-the 100 ms cleanup cap. Native crypto work remains subject to TLS.md's
-between-call limits.
+the 100 ms cleanup cap.
 
 A worker error has two layers. A deadline, or any failure that breaks
 the client (I/O, a protocol violation, a FATAL, a limit or a stream
@@ -655,7 +567,7 @@ Before the client reads a byte, the default allowance caps backend frames at 128
 including their length word, 128 frames and one MiB total for the entire
 connection. Fragmented headers and authentication codes retain nine bytes
 of framing state. A refusal aborts the transport. Client output defaults to
-a 64 KiB connection cap; TLS retains its existing two wire buffers. Each
+a 64 KiB connection cap. Each
 operation class selects its own input and output allowance
 (`postgres_probe::with_*`), named in its section; a runtime-mode connection
 admits at least 1024 frames ("Qualification on each runtime connection").
@@ -680,9 +592,8 @@ ledger inspection additionally requires PostgreSQL major 17 and a UTF8
 database ("Schema ledger and migration versions").
 
 Worker teardown writes PostgreSQL Terminate for at most 100 milliseconds
-within the original deadline; a TLS stream then sends close_notify if its
-socket takes it at once. Failed or expired connections abort without
-either; cleanup never changes a known operation outcome or retries a
+within the original deadline. Failed or expired connections abort without
+it; cleanup never changes a known operation outcome or retries a
 write. Terminate ends
 any remaining read transaction without a separate SQL round trip. The
 qualification query alone does not validate a schema, enforce a
@@ -695,8 +606,11 @@ framing boundary follows the
 Native PostgreSQL fixtures use only a new private disposable cluster built
 from the first `initdb` on `PATH` (PostgreSQL 17, with `postgres`, `pg_ctl`
 and `psql` in the same directory) and never connect to an operator's
-existing database. They are host qualification, not a shipped server
-package or evidence for Azure/RDS.
+existing database. Each cluster listens only on a socket in its own
+private temporary directory, so that directory's path must leave the
+socket within the 107-byte limit; the builder's
+`TD_TEST_TRUSTED_ROOT=private` mode provides a short private `/tmp`.
+They are host qualification, not a shipped server package.
 
 ### Runtime database logins
 
@@ -831,7 +745,7 @@ grants, rules, triggers, functions or column ACLs.
 
 The internal database request distinguishes preparation from runtime mode.
 Preparation remains the default of the protected bootstrap parser and all
-operator commands. Runtime mode authenticates TLS/SCRAM, checks primary and
+operator commands. Runtime mode authenticates with SCRAM, checks primary and
 durability settings, acquires the shared migration lock, validates the
 current schema and checks the dedicated runtime role/table privileges and
 the maintenance barrier ([Runtime maintenance barrier (schema
@@ -890,28 +804,26 @@ backend's credential check; HTTP decoding is not app-password validation.
 ### Operator connection probe
 
 `td-mta postgres probe --connection-file PATH --profile NAME` runs the
-protected loader, owned resolver helper and TLS/SCRAM probe together. Run
+protected loader and the socket/SCRAM probe together. Run
 as the connection directory's dedicated owner. It writes one bounded JSON
 result to stdout and exits zero on success, one on qualification failure,
 or two for invalid arguments. Passwords/URIs are file contents, never
-required arguments. Diagnostics include no input path, endpoint,
+required arguments. Diagnostics include no input path, socket path,
 credentials or raw provider text. The selected profile is syntax-checked
 only; it is not loaded from the database.
 
-After cold file loading, DNS receives at most five seconds and the whole
-network operation receives ten seconds. Resolved addresses are attempted in
-order with the same absolute deadline. Only TCP/transport refusal permits
-another address; authentication, TLS-policy, settings or deadline errors
-stop the operation. No attempt renews its budget. Client
-connection/authentication failures are deliberately coarse. A slow first
-address may exhaust the budget before later addresses can be attempted.
-Every other `postgres` operator command shares this address and deadline
-policy unless its section says otherwise.
+After cold file loading, the whole database operation receives ten seconds.
+It makes one connection attempt to the bootstrap's socket and never
+retries: a refused socket admission or a dial that fails before any byte
+moves reports a transport failure, and authentication, settings or deadline
+errors stop the operation. Client connection/authentication failures are
+deliberately coarse. Every other `postgres` operator command shares this
+single-attempt and deadline policy unless its section says otherwise.
 
 Success reports the server version and explicitly sets `schema_checked` and
 `profile_checked` false. It proves only the connection/settings checks of
 "Session settings and primary qualification" at that instant, not service
-readiness, replication durability or cloud failover qualification. It
+readiness or replication durability. It
 writes no mail/configuration, installs no schema and never opens serving
 listeners.
 
@@ -922,14 +834,14 @@ td-mta serve --connection-file PATH --profile NAME --runtime PATH \
     --scratch PATH [--read-only] [--minimum-retry-seconds 1..300]
 ```
 
-`serve` loads its bootstrap through the protected loader, resolves the
-writer (at most five seconds within a ten-second startup deadline) and, on
-the first address that does not refuse at the transport, qualifies a
-runtime-mode connection, reads the managed-certificate revisions and
+`serve` loads its bootstrap through the protected loader and, within a
+ten-second startup deadline, qualifies a runtime-mode connection over the
+bootstrap's socket, reads the managed-certificate revisions and
 prepares the selected database profile ([Selected-profile runtime preparation](#selected-profile-runtime-preparation)) with a dedicated or
 shared runtime login. `--read-only` selects the restricted replica-reader
-mode, which admits only a JMAP-only profile. Any other failure stops
-startup with a fixed redacted category before listeners open. The process
+mode, which admits only a JMAP-only profile. A transport failure stops
+startup as `connection`, and any other failure with its own fixed redacted
+category, before listeners open. The process
 then publishes its TLS generation, binds its private control endpoint and
 starts the selected roles' workers. CONFIG.md owns syntax and local
 runtime/scratch placement; the minimum retry interval is specified in
@@ -941,7 +853,7 @@ JMAP-only instance and a listener-free relay instance. The embedded
 backend, local-store commands and file-backed device registry are removed.
 The ready line on stdout reports `"reload":true` and `"signal_drain":true`.
 
-A watcher observes the selection every 30 seconds with a fresh resolution
+A watcher observes the selection every 30 seconds with a fresh connection
 and a passive primary observation under a ten-second deadline. When the
 selected generation or version differs from the one the process loaded, it
 requests orderly drain of every worker; the process then repeats the
@@ -1113,7 +1025,7 @@ timeout stays) and protocol byte caps. Owner initialization/upgrade permits
 inventories; probe, inspection and material operations retain 128 in
 preparation mode. The per-frame 128 KiB and total 1 MiB input bounds,
 authentication checks and terminal budget refusal are unchanged. Schema
-operations permit 128 KiB of post-TLS output, including
+operations permit 128 KiB of client output, including
 startup/authentication. Every extended query uses the unnamed statement,
 so no statement name grows with process age. Probe output remains bounded
 to 64 KiB. Fixed SQL
@@ -1145,12 +1057,11 @@ N]` applies every missing migration or reports an already current ledger.
 None of these commands takes a profile: the namespace and epoch are
 deployment-wide.
 
-These commands use the protected bootstrap, verified TLS/SCRAM, fresh
-bounded DNS lookup and ten-second default deadline of the probe. Schema
-upgrade accepts a longer maintenance deadline, up to 3600 seconds. They try
-another resolved address only on a definite transport refusal before
-COMMIT; the schema worker converts every connection loss after COMMIT may
-have been sent to Indeterminate. No schema error, migration conflict or
+These commands use the protected bootstrap, the socket/SCRAM connection and
+ten-second default deadline of the probe. Schema upgrade accepts a longer
+maintenance deadline, up to 3600 seconds. Each makes one connection attempt;
+the schema worker converts every connection loss after COMMIT may have been
+sent to Indeterminate. No schema error, migration conflict or
 uncertain commit is retried. Exit codes remain zero for success, one for
 failure and two for invalid arguments. Provider text and supplied arguments
 never enter the fixed JSON diagnostics.
@@ -1308,12 +1219,12 @@ permission to pick a fresh version and duplicate an uncertain write.
 
 Material operations retain the ten-second worker deadline, five-second
 statement timeout, one-second lock timeout, 128-KiB backend-frame bound,
-128-frame count and one-MiB input cap. Their post-TLS output cap is 256 KiB
+128-frame count and one-MiB input cap. Their client output cap is 256 KiB
 to carry a maximal trust bundle plus fixed SQL/authentication overhead;
 probe operations retain 64 KiB and schema operations permit 128 KiB. Each
 operation owns a cold, fallibly reserved copy of at most 128 KiB; client
-encodings/row buffers and TLS/provider allocations are additional bounded
-inputs, not a complete RSS qualification. The returned Material owner
+encodings and row buffers are additional bounded inputs, not a complete
+RSS qualification. The returned Material owner
 intentionally has no Debug implementation, and errors contain no input
 bytes or SQL/provider diagnostics. Dropping memory does not claim secure
 erasure. Database owners, backups and authorized processes remain inside
@@ -1340,18 +1251,17 @@ commands store or compare raw bytes only; they neither validate text/PEM
 contents nor activate a configuration. No profile selector applies. There
 is no secret-bearing argument or command that prints stored bytes.
 
-The protected loader opens connection, optional explicit database trust and
-material in one owner/inode inventory. Passwords and private keys require
+The protected loader opens connection and material in one owner/inode
+inventory. Passwords and private keys require
 secret-file permissions; chains, trust and signatures use the public-input
 policy. Secret/public inode aliases refuse even across different paths.
 The connection directory's checked owner binds every input. Each input is
-read under its existing raw-byte ceiling before DNS; trusted regular-file
+read under its existing raw-byte ceiling before connecting; trusted regular-file
 I/O is bounded in bytes, not wall time. Raw material owners have no Debug
 representation; memory cleanup makes no secure-erasure claim.
 
-Network work shares the existing ten-second deadline and five-second DNS
-allowance, with address retry only for definite transport refusal before
-any possible COMMIT. Import appends the caller's retained version, refusing
+Database work shares the existing ten-second deadline in one connection
+attempt. Import appends the caller's retained version, refusing
 replacement. Check validates the stored manifest/chunks and compares exact
 bytes with the protected input, without outputting either value. A lost
 COMMIT response reports indeterminate-do-not-retry. Wait for the original
@@ -1540,15 +1450,15 @@ jmap and relay. All profile sources refer to already imported immutable
 material IDs using the `/postgres-material/` reference syntax. No source
 version becomes selected here.
 
-One protected input inventory binds the connection, database trust, shared
-source and all profile files to the bootstrap owner. Sources are public
+One protected input inventory binds the connection, shared source and all
+profile files to the bootstrap owner. Sources are public
 operator inputs under the existing stable trusted-namespace contract; they
 cannot alias the secret connection file, including through hard links.
 Inventory names/counts are checked before files are opened. Source/name
 bytes and inserted separators share the preparer's 2 MiB ceiling while
 loading; an extra byte or a later file exceeding the remaining allowance
 refuses. Sources are not printed. Complete candidate validation and
-publication share one absolute ten-second DNS/network deadline after cold
+publication share one absolute ten-second database deadline after cold
 file loading.
 
 `config-check --connection-file PATH --epoch HEX --version HEX` loads the
@@ -1558,8 +1468,8 @@ emit bounded JSON with epoch, version, digest and profile count on success,
 `content_validated:true` and `profile_activated:false`. Errors expose fixed
 categories, not paths, credentials, source values or provider text. Exit
 status is zero for success, one for validation/database/input refusal and
-two for arguments. Only definite transport refusal permits another resolved
-address, under the original deadline. Indeterminate publication stops and
+two for arguments. Each makes one connection attempt under the original
+deadline. Indeterminate publication stops and
 reports indeterminate-retain-version. Keep the same ID and source set, wait
 for the original operation to settle, then check/retry that retained
 version. A failed check (including changed or missing material) is not
@@ -1681,7 +1591,7 @@ retained receipt under the policy-row lock. The public request may be
 supplied as an argument; it contains no password, source text or private
 material. Malformed length, non-hex input and duplicate or mixed operation
 arguments refuse. The protected connection file and ordinary bounded
-DNS/TLS/SCRAM rules still apply.
+socket/SCRAM rules still apply.
 
 A recorded result prints the operation, historical generation and version.
 Inspection can return `recorded:false`; that observation is not permission
@@ -1814,10 +1724,10 @@ adopted, and this is not a SQLite or Stalwart migration interface.
 ### Account bootstrap commands
 
 `td-mta postgres account-init --connection-file PATH --epoch HEX --account
-ID` prepares one random Inbox identity before bounded address attempts and
-uses the atomic account bootstrap. A confirmed publication prints its
-public epoch/account/Inbox receipt. The protected connection input, fresh
-DNS, TLS/SCRAM and ten-second operation deadline match other explicit
+ID` prepares one random Inbox identity before connecting and uses the
+atomic account bootstrap. A confirmed publication prints its public
+epoch/account/Inbox receipt. The protected connection input, socket/SCRAM
+connection and ten-second operation deadline match other explicit
 owner commands. Initialization neither activates account policy nor admits
 a serving backend.
 
@@ -1984,9 +1894,8 @@ The command is:
 td-mta postgres device-list --connection-file PATH --epoch HEX --account ID
 ```
 
-It uses the protected connection-file loader, verified TLS/SCRAM, fresh
-bounded DNS resolution and the existing shared ten-second
-connection/operation deadline. Database credentials must have the required
+It uses the protected connection-file loader, the socket/SCRAM connection
+and the existing shared ten-second connection/operation deadline. Database credentials must have the required
 schema/account and metadata-column read privileges. The command grants
 none. The syntactic bootstrap profile placeholder selects no running
 profile. JSON output binds the expected epoch and account and contains the
@@ -2000,14 +1909,13 @@ activates a credential or service.
 
 `td-mta postgres device-revoke --connection-file PATH --epoch HEX
 --account ID --device ID` publishes one owner-side revocation. The
-protected connection input, fresh DNS resolution, verified TLS/SCRAM and
-overall ten-second worker deadline are the same as other explicit
+protected connection input, socket/SCRAM connection and overall ten-second
+worker deadline are the same as other explicit
 administration commands. The committed revocation is visible to the active
 PostgreSQL authentication and operation fences.
 
 The command samples checked UTC milliseconds and prepares one random
-revocation operation before address attempts. It retains that exact value
-through transport fallback. The account write fence, expected epoch and
+revocation operation before connecting. The account write fence, expected epoch and
 immutable receipt rules of the device registry apply. Success names the
 public epoch, account, device and current invocation's operation ID, with
 `recorded` or `already-revoked`. The latter does not claim that the
@@ -2030,11 +1938,11 @@ retry or on-disk operation recovery.
 
 `td-mta postgres device-create --connection-file PATH --epoch HEX
 --account ID --label LABEL` creates one owner-side credential. The
-protected connection input, fresh DNS, TLS/SCRAM, ten-second worker and
+protected connection input, socket/SCRAM connection, ten-second worker and
 expected epoch rules match other explicit owner commands. The label retains
 the registry's 128-byte UTF-8 limit and control-character refusal. The
 command takes checked UTC milliseconds and prepares one Creation before
-address attempts. The registry's 256-unrevoked and 320-record ceilings and
+connecting. The registry's 256-unrevoked and 320-record ceilings and
 retirement of old revoked records apply.
 
 Only confirmed creation success prints the password, once, in the local
@@ -2236,11 +2144,11 @@ retries that job; a disconnect racing the idle check can still fail the
 request.
 
 A session admits at most 64 jobs within sixty seconds of creation. Each job
-keeps its own original deadline, capped at ten seconds including initial
-DNS, TCP, TLS and SCRAM. Before starting a later job whose complete
+keeps its own original deadline, capped at ten seconds including the
+initial socket connect and SCRAM. Before starting a later job whose complete
 allowance would outlive the session, the adapter closes the old connection,
-selects addresses under the writer endpoint resolution policy
-([Writer endpoint resolution](#writer-endpoint-resolution)) and repeats TLS/SCRAM admission. The fixed authentication
+connects again to the bootstrap's socket and repeats SCRAM admission. The
+fixed authentication
 worker checks local idle state once per second, outside client-slot locks,
 and retires a session when fewer than ten seconds of its original lifetime
 remain or its job count is exhausted. This maintenance performs no
@@ -2252,9 +2160,9 @@ Only a clean idle session whose job completed with acknowledged rollback
 and final checks may use a separate termination allowance. Consuming
 retirement bounds that allowance by the caller deadline, original session
 expiry and the 100-ms connection cleanup ceiling. It cannot perform another
-job, renew TLS or replenish byte/frame windows. Failed or unfinished jobs
-retain their original deadline and sticky failure behavior. Cleanup is best
-effort if the peer fails or scheduling crosses the immutable TLS expiry; no
+job or replenish byte/frame windows. Failed or unfinished jobs retain
+their original deadline and sticky failure behavior. Cleanup is best
+effort if the peer fails or scheduling crosses the session expiry; no
 cleanup outcome changes an already completed authentication result.
 
 Authentication and the first job share the initial one-MiB input,
@@ -2264,8 +2172,8 @@ session totals only decrease. Per-frame and SCRAM limits remain unchanged.
 Available idle messages consume the preceding window before the next
 starts; parser state, connection authentication and sticky failures are
 never reset. Windows are work limits, not resident allocations. The
-one-authentication-worker capacity covers the retained socket and TLS
-buffers, independently of account count.
+one-authentication-worker capacity covers the retained socket and its
+client buffers, independently of account count.
 
 API reads, downloads, post-verification reauthorization and mutation
 connections keep their own admission and teardown paths; authentication
@@ -2290,7 +2198,7 @@ serving instance drains and reloads into it ("Foreground serve command").
 
 Every JMAP read, blob download and read-side reconciliation query runs on a
 freshly authenticated, finite, read-only repeatable-read snapshot of the
-writer endpoint (section 3). This chapter specifies the process-local read
+writable primary (section 3). This chapter specifies the process-local read
 connection slots, snapshot admission and custody, the bounded storage reads
 a snapshot offers, verified body custody, the HTTPS path that authenticates
 and executes requests on the fixed body workers, the per-method read
@@ -2328,17 +2236,14 @@ account sequence and history floor. The handle and connection cannot
 escape their owner; returned passive values confer no authority on later
 operations.
 
-`Snapshot::open_resolved` reserves a read slot before selecting addresses
-for the protected bootstrap endpoint and qualifying the runtime
-connection. The same slot and original finite allowance cover resolution,
-all attempted addresses, authentication and snapshot ownership. Only
-transport connection failures advance to another resolved address;
-policy, credential, schema and database failures have no fallback. The
-selected bootstrap profile must match the binding, and the binding must
-enable the JMAP role. Resolution has a five-second cap within the
-original request allowance; the ten-second worker ceiling can only
-shorten that allowance. No connection or DNS queue is created, and all
-failed paths release their slot after closing owned work.
+`Snapshot::open_loaded` reserves a read slot before connecting to the
+protected bootstrap's socket and qualifying the runtime connection. The
+same slot and original finite allowance cover the one connection attempt,
+authentication and snapshot ownership; no failure retries. The selected
+bootstrap profile must match the binding, and the binding must enable the
+JMAP role. The ten-second worker ceiling can only shorten the original
+request allowance. No connection queue is created, and all failed paths
+release their slot after closing owned work.
 
 `Snapshot::open_runtime` requires the binding's runtime connection mode
 (replica read for a read-only binding) and acquires a
@@ -2387,24 +2292,15 @@ download cap.
 
 Cache-hit and callback-return checks drain available connection messages
 without a SQL round trip and retain terminal failures; a queued notice
-cannot conceal a subsequent connection error. The worker tracks actual
-socket readiness beneath TLS: consuming an encrypted header can return
-Pending before yielding plaintext. The transitional TLS stream's setup
-and query reads then wait in the socket's readiness wait, or park for a
-millisecond while TLS still holds buffered work, without extending any
-allowance; a Unix socket blocks under the same deadline.
-Database query failures report I/O failure; corruption remains a
+cannot conceal a subsequent connection error. Setup and query reads block
+on the Unix socket under td-postgres's socket timeouts, never past the
+original deadline. Database query failures report I/O failure; corruption remains a
 row-shape or digest failure.
 
 The worker's original `Instant` deadline remains authoritative through
-connection, qualification and query polling. Its TLS transport uses
-whole-millisecond ticks, so the initial remaining allowance rounds upward
-when deriving that secondary cap. Rounding downward could expire TLS first
-by a fraction of a millisecond, losing the worker's deadline
-classification in a generic connection error. This does not extend the worker
-allowance: each poll still checks the exact original `Instant`, and phase
-tightening (`Snapshot::constrain_deadline`) can only shorten it. An
-unrepresentable transport tick is refused.
+connection, qualification and query polling: each read and write derives
+its socket timeout from the exact original `Instant`, and phase tightening
+(`Snapshot::constrain_deadline`) can only shorten it.
 
 ### Snapshot metadata and value windows
 
@@ -2738,18 +2634,18 @@ interface. Its bounded registry selects an account binding, and fresh
 snapshots check configuration, store epoch, maintenance and device. The
 connection lifecycle, connect-time qualification, idle recovery and finite
 reuse bounds are specified in
-[Retained HTTPS authentication sessions](#retained-https-authentication-sessions). DNS runs on connection
-admission rather than on every lookup. Later operations require their own
+[Retained HTTPS authentication sessions](#retained-https-authentication-sessions). Connection admission
+happens once per session rather than on every lookup. Later operations require their own
 fresh authorization and publication fence.
 
-One nonblocking mutex bounds concurrent lookup, including DNS; contention
-returns Busy without a queue. The original HTTPS deadline converts through
-the same `RuntimeClock` origin without a fresh allowance. A ten-second
-lookup ceiling and five-second DNS ceiling only shorten it. Results are
+One nonblocking mutex bounds concurrent lookup, including connection;
+contention returns Busy without a queue. The original HTTPS deadline
+converts through the same `RuntimeClock` origin without a fresh allowance.
+A ten-second lookup ceiling only shortens it. Results are
 refused after expiry. Malformed and inactive/wrong credentials return no
 principal; configuration, schema, privilege and connection failures
 remain service errors, not invalid-password observations. Errors carry no
-endpoint, secret or provider text.
+socket path, secret or provider text.
 
 EventSource uses that worker's PostgreSQL session to verify the selected
 configuration, account and device and capture the account sequence in one
@@ -2833,7 +2729,7 @@ response cleanup stops admission.
 
 For API reads, each fixed HTTPS body worker retains at most one read
 connection for its last account and configured origin, holding one read
-permit. Connection admission performs DNS, schema and runtime-role
+permit. Connection admission performs schema and runtime-role
 qualification and retains the shared migration lock. Each job begins a
 fresh read-only repeatable-read transaction, checks epoch, maintenance,
 selected configuration and the complete presented credential, and
@@ -2916,13 +2812,13 @@ The reservation keeps the connection slot until it reopens or drops; this
 is conservative capacity accounting, not a retained database transaction.
 A borrowed snapshot has no reservation to return.
 
-Reopening performs bounded endpoint resolution, runtime-role
+Reopening performs one connection to the bootstrap's socket, runtime-role
 qualification and full device secret authentication against the original
 profile/account binding. It captures a new account state. The original
 deadline is capped once at read admission and never extended by closing or
 reopening. The reservation stores no password and refuses a different
 device ID. Every failed reopen releases its capacity. A failed snapshot
-cannot produce a reservation. `open_resolved` admits every uncached
+cannot produce a reservation. `open_loaded` admits every uncached
 snapshot through this reopen path.
 
 A mutation request first opens a snapshot, which authenticates the device
@@ -3123,7 +3019,7 @@ become success.
 The HTTPS backend serves raw blobs and direct MIME-part locators through
 the shared download encoder. Target account and observed device must
 match before connection admission. It reserves two read slots before
-endpoint resolution: one for the verified body snapshot, one for fresh
+connecting: one for the verified body snapshot, one for fresh
 primary reauthorization before the callback. Both runtime connections
 qualify the database role. The snapshot, MIME processing and transmission
 share the original deadline capped at thirty seconds; no reconnect renews
@@ -3135,9 +3031,8 @@ Whole-body digest verification and account-reference/upload-lease policy
 remain `postgres_body::with_pinned_blob` responsibilities. Forged locators
 are checked against the verified MIME tree and decoded length is counted
 before headers. A single foreground work meter covers interpretation and
-replay; no full-message resident buffer is introduced. Only transport
-connection failures before response output try another resolved address.
-Permits are released only after their sockets drop, including failed
+replay; no full-message resident buffer is introduced. No connection
+failure is retried. Permits are released only after their sockets drop, including failed
 writes. A worker without a retained pair needs two free slots and refuses
 immediately if either is unavailable. Active body custody survives
 callback output; the idle checker may retire during that output.
@@ -3176,7 +3071,7 @@ verification begins. Idle disconnect replacement is permitted only before
 admission; no failed SQL or response is retried transparently. Every
 failed download retires both sessions.
 
-Reserve both read permits before DNS, or two transient permits for a
+Reserve both read permits before connecting, or two transient permits for a
 standalone call. After a successful download, the worker checks the
 shared read-slot count. If the pool is full, it retires its authorization
 connection and releases that permit. With spare capacity it can keep both
@@ -3774,12 +3669,11 @@ retained body but not the retained draft or submission bodies; qualifying
 those against the memory plan is a separate requirement.
 
 Every write charges the original HTTP request work meter and keeps that
-request's absolute deadline, capped at ten seconds for the database phase
-and five seconds for endpoint resolution. It reserves a foreground
-database slot before DNS. Typed output vectors and the complete response
-storage are reserved before effects. A transport failure on one resolved
-address retries the same prepared operation on the next address; no
-failure falls back to another profile, route or operation. Known outcomes
+request's absolute deadline, capped at ten seconds for the database phase.
+It reserves a foreground database slot before connecting. Typed output
+vectors and the complete response storage are reserved before effects. Each
+write makes one connection attempt; no failure is retried or falls back to
+another profile, route or operation. Known outcomes
 survive a late local deadline poll. Completions carry only the actual
 original epoch and sequence, without a fabricated read-history floor or
 snapshot identity.
@@ -4114,10 +4008,10 @@ rewritten or base64-encoded: the message/global allowance in
 does not change message/rfc822's restrictions. Other message subtypes and
 multipart attachment types are refused.
 
-One original ten-second-or-shorter request deadline covers resolution,
-source verification, composition and publication. Each body read reserves
-two foreground connection permits and prepays its bounded verification and
-replay work before I/O, including fallback addresses. Aggregate decoded
+One original ten-second-or-shorter request deadline covers source
+verification, composition and publication. Each body read reserves two
+foreground connection permits and prepays its bounded verification and
+replay work before I/O. Aggregate decoded
 source bytes stay within the profile's upload maximum and composed bytes
 within the selected message ceiling, each at most 32 MiB; raw sources are
 dropped before publication.
@@ -4193,12 +4087,12 @@ source after enqueueing does not cancel delivery or retire its separately
 owned outgoing body.
 
 The HTTPS submission owner admits one active or uncertain submission. It
-acquires the owner and foreground connection allowance before DNS, source
-reading or body preparation. Fresh Runtime qualification, account/device
+acquires the owner and foreground connection allowance before connecting,
+source reading or body preparation. Fresh Runtime qualification, account/device
 checks, original request work and a shared absolute deadline cover
-authenticated input preparation and queue publication. Transport retries
-retain the same prepared operation and submitting route; other failures
-do not fall back to another profile. One outgoing body is bounded by
+authenticated input preparation and queue publication. Publication makes
+one connection attempt with the prepared operation and submitting route; no
+failure falls back to another profile. One outgoing body is bounded by
 preparation's 32 MiB cap, alongside the temporary verified source during
 preparation. The HTTP mutation owner holds this submission owner
 separately from drafts and Email mutations.
@@ -4437,22 +4331,19 @@ credential shape and optional epoch before admission; the publisher checks
 current device authority, selected configuration and account state under
 its locks. No request can choose another profile's database or route. The
 service cancels through the frontend preparation; the owner's route-owner
-entry point, which takes the relay owner's claim, generation and an
-idempotent local abort callback, is not called by the serving runtime.
+entry point, which takes the relay owner's claim, generation and a local
+abort callback, is not called by the serving runtime.
 
 The worker preserves the request/meter's original absolute deadline, with a
-ten-second database phase and a five-second resolver phase. Before database
-work it charges each attempted address for the receipt/publication
-connection ceilings (three MiB plus 192 KiB of protocol I/O and 8192
-records, including runtime admission and whole-group validation). A
-transport fallback spends another charge and never refreshes the deadline
-or substitutes another operation. A local abort callback must be
-idempotent: a connection failure after local closure but before COMMIT
-can retry the same operation. It performs no SQL or SMTP round trips and
-is invoked only after complete reservation. Neither password nor callback
+ten-second database phase. Before database work it charges its one
+connection for the receipt/publication connection ceilings (three MiB plus
+192 KiB of protocol I/O and 8192 records, including runtime admission and
+whole-group validation); no failure retries the operation. The local abort
+callback runs at most once, performs no SQL or SMTP round trips and is
+invoked only after complete reservation. Neither password nor callback
 survives the foreground call.
 
-Absence at the publishing endpoint releases an uncertain cancellation for
+Absence at the publishing socket releases an uncertain cancellation for
 frontend and route-owner operations alike. Restart needs no local journal:
 durable canceled state is an idempotent update, and a rolled-back request
 can be issued again.
@@ -4462,21 +4353,22 @@ can be issued again.
 Every HTTP write owner (Email update, deletion and filing; folder creation
 and deletion; draft; upload; submission; cancellation) obeys the same
 custody rule. Known success or refusal releases the prepared operation.
-An uncertain COMMIT retains the exact prepared operation with the endpoint
-its COMMIT went to; no transparent replay replaces it and no owner
+An uncertain COMMIT retains the exact prepared operation; no
+transparent replay replaces it and no owner
 republishes it. The original request still stops admission on an
 uncertain write; an uncertain upload retires its exchange as described in
 [HTTPS upload ingress](#https-upload-ingress). Reads and the service remain available.
 
 Settlement inspects that exact retained operation under Runtime
 qualification and the existing account lock that excludes a still-running
-COMMIT. It connects only to the endpoint the operation was published to,
-never resolving again or falling back, because the share lock proves nothing
-on another server ([Settlement of retained HTTPS
+COMMIT. It connects over the bootstrap the operation was published
+through; the retained operation does not outlive that bootstrap, since a
+reload replaces both, so the share lock is taken on the server the COMMIT
+went to ([Settlement of retained HTTPS
 writes](#settlement-of-retained-https-writes)). It borrows no app password
 and does not authorize or retry a mutation. A confirmed receipt returns its
 operation ID and complete original outcome and releases the owner; absence
-at the publishing endpoint releases it with nothing to return; a failed
+at the publishing socket releases it with nothing to return; a failed
 inspection or deadline leaves the original operation retained. A confirmed
 success survives a late local deadline poll. Settlement after device
 revocation still confirms without credentials or a transport callback.
@@ -4494,7 +4386,7 @@ For inline inspection the current write prepays each connection from its
 meter, 1088 records for one inspection (cancellation charges its own
 connection ceilings instead). A refused charge returns that refusal,
 Capacity or Deadline, rather than busy. Settlement then runs under the
-write's deadline capped at three seconds, so an unreachable endpoint
+write's deadline capped at three seconds, so an unreachable socket
 cannot hold the owner, worker and a foreground slot for the whole
 request, and that slot is released before the write takes its own. The
 write is admitted only if settlement empties the owner; otherwise it is
@@ -4639,8 +4531,8 @@ Inbox with a valid ID and change sequence. Publication uses the same Inbox
 validator under its account write lock. Readiness writes no mail or receipt
 and does not replace fresh publication authorization or reserve quota.
 
-The one-shot check reserves foreground capacity before endpoint resolution
-and retains one ten-second phase under the caller's deadline. Errors remain
+The one-shot check reserves foreground capacity before connecting and
+retains one ten-second phase under the caller's deadline. Errors remain
 typed; there is no local fallback.
 
 ### Receiving header and trace preparation
@@ -4719,14 +4611,15 @@ through cleanup.
 
 `postgres_smtp_receiving` publishes completed, caller-admitted DATA under the
 original work meter. It validates the receiving profile and configured
-header/recipient bounds, reserves a foreground connection before resolution
+header/recipient bounds, reserves a foreground connection before connecting
 (the storage worker's retained session holds that slot; see [Retained
 receiving database session](#retained-receiving-database-session)), and uses
 runtime-qualified primary connections. A ten-second phase and original
 deadline cover preparation and publication; publication is prepaid using the
 final filtered body's extent and recipient count. Known outcomes survive later
-time/accounting refusal. Connection failures before publication may try the
-next bounded resolved address; unknown COMMIT is never replayed.
+time/accounting refusal. Each publication makes one connection attempt; a
+connection failure is a temporary failure, and unknown COMMIT is never
+replayed.
 
 Known publication yields the account, epoch and sequence required for SMTP's
 final success reply. A known database rollback produces 451; the worker stays
@@ -5031,7 +4924,7 @@ accounts exactly cover the accepted envelope, with at least one delivery.
 The closed fanout driver admits 40 MiB outgoing bytes, 1 MiB incoming bytes
 and 1088 response frames per target account, for at most sixteen accounts;
 an RCPT check takes one account's allowance. These are cumulative transport limits, not resident allocations; the existing
-per-frame, authentication, TLS and ten-second connection limits remain intact.
+per-frame, authentication and ten-second connection limits remain intact.
 The DATA
 worker's output meter includes the separate 2-MiB fanout metadata reservation,
 including when the configured message ceiling is smaller than that metadata.
@@ -5449,8 +5342,8 @@ and revokes confirmation. Individual sample-to-sample discontinuities are
 checked separately so that a jump cannot hide by canceling prior drift.
 Smaller observations do not move the comparison anchor. An explicitly
 signaled primary change forces the same hold even when its clock matches.
-The serving relay pins the configured endpoint and raises no such signal:
-it cannot distinguish a primary replaced behind that endpoint with
+The serving relay pins the configured socket and raises no such signal:
+it cannot distinguish a primary replaced behind that socket with
 agreeing clocks.
 
 Missing, damaged, dirty or differently bound evidence, unreadable boot
@@ -5464,8 +5357,10 @@ pauses dispatch. CONFIG.md describes `queue-clock-status` and
 
 The relay's exclusively locked private runtime directory holds its
 mode-0600 `queue-clock` checkpoint. A checksum binds its clock evidence
-to the database epoch, profile, database name, verified endpoint and
-server name, Linux boot ID and time namespace. Only trusted directory
+to the database epoch, profile, database name, socket path, Linux boot ID
+and time namespace. Its identity digest has six length-prefixed parts: the
+version label, epoch, profile, socket path, an empty part and the database
+name. Only trusted directory
 writers may replace it. Before even attempting to acquire or renew a
 route lease, the relay replaces the clean checkpoint with a dirty record,
 syncing the file and parent directory. A failed owner operation therefore
@@ -5856,7 +5751,7 @@ semantics and must restart for each scheduling pass.
 A serving process with the relay role runs one foreground relay worker
 for every configured account of its profile, at most sixteen, plus one
 lease-renewal thread. Within one serving generation it pins the startup
-primary address and published configuration/TLS generation; there is no
+primary socket and published configuration/TLS generation; there is no
 transparent primary fallback. A newly selected configuration reaches the
 relay only through the process's drain and reload (section 2), which
 starts a new worker with a fresh boot identity, claims and retry guard.
@@ -6058,7 +5953,7 @@ The foreground worker retains one qualified idle-reader connection across
 account turns and empty-round pauses. It holds one existing ordinary read
 permit until connection close. The shared finite read-session
 implementation also backs HTTPS authentication: at most 64 jobs in sixty
-seconds, immutable TLS lifetime, finite cumulative/per-job wire windows,
+seconds, finite cumulative/per-job wire windows,
 one owning thread and ten-second job deadlines. Connection admission
 qualifies schema and runtime role once and holds the migration lock until
 close. Each idle job begins a fresh READ COMMITTED transaction, checks
@@ -6532,15 +6427,15 @@ the worker owns those duties.
 
 ### Relay worker admission
 
-Dispatches joins one Connection (the request, trust store, ordinary read
-slots and runtime clock), the process's shared queue-clock Guard and the
+Dispatches joins one Connection (the request, ordinary read slots and
+runtime clock), the process's shared queue-clock Guard and the
 single Pending slot. Every operation admitted through it requires a
 Runtime-mode connection and otherwise refuses Forbidden. Its limit is the
 earliest of the supplied deadline, the work meter's deadline and ten seconds
 from admission; an already expired limit refuses Deadline. Admission
 prepays a fixed I/O and record allowance on the meter, so exhaustion refuses
 Capacity before connecting, then acquires an ordinary slot without waiting.
-There is no waiter queue, address fallback or hidden DNS operation.
+There is no waiter queue or connection retry.
 
 The trusted caller selects the primary and shares its runtime clock with the
 guard; the foreground relay pins its startup primary for the service
@@ -7638,7 +7533,7 @@ The proof needs four things this design must keep: every publisher of these
 kinds locks the account row FOR UPDATE before COMMIT and every inspector locks
 it FOR SHARE before reading the receipt; lock and statement timeouts surface
 as errors, which retain custody; all of them use the single pinned primary,
-and an HTTP owner inspects only the endpoint it published to; and no path
+and an HTTP owner inspects only the socket it published to; and no path
 deletes such a receipt while its operation can still be pending, beyond the
 bounded sweeps of [Route-owner acquisition receipt
 retention](#route-owner-acquisition-receipt-retention), [Expiry receipt
@@ -7663,9 +7558,10 @@ creation](#root-folder-creation), [Email deletion](#email-deletion),
 [Submission publication](#submission-publication), [Success filing after
 submission](#success-filing-after-submission) and [Whole-submission
 cancellation publication](#whole-submission-cancellation-publication)). Each
-retains an uncertain operation with the endpoint its COMMIT went to and
-inspects only there, never resolving again or falling back, because the
-share lock proves nothing on another server. Within the account and time
+retains an uncertain operation only as long as the bootstrap it was
+published through, since a reload replaces both, so it inspects on the
+server its COMMIT went to; the share lock proves nothing on another. Within
+the account and time
 limits of [Uncertain HTTP writes and inline
 settlement](#uncertain-http-writes-and-inline-settlement), a new write
 inspects the retained operation. A found receipt or absence releases it.
@@ -7678,7 +7574,7 @@ Once released, the family is no longer fenced, and the server does not
 deduplicate a second draft or submission of the same Email. A client whose
 create response was lost must therefore reconcile before retrying, as
 td-mail does for submissions by querying its identity and sendAt interval
-(DESIGN.md). Loss of the old endpoint can delay another write to the same
+(DESIGN.md). An unreachable database can delay another write to the same
 account during the one-minute inspection window. Releasing the local slot
 leaves the original result indeterminate.
 
@@ -7983,7 +7879,7 @@ The caller supplies one deadline no more than an hour away. Connection and
 authentication still have at most ten seconds, individual SQL statements
 five seconds and locks one second. The original audit deadline covers every
 turn and acknowledged ROLLBACK and is checked after worker destruction.
-No turn, address attempt or logical allowance renews time. Runtime workers
+No turn, connection or logical allowance renews time. Runtime workers
 retain their ordinary bounds and cannot use this owner path. Connection
 failure during metadata reads retains its connection classification rather
 than being reported as canonical metadata corruption. A large account may
@@ -8074,9 +7970,8 @@ cumulative limits apply.
 loads the protected owner-side connection file and invokes the read-only
 counter audit ([Historical account usage
 audit](#historical-account-usage-audit)) for one explicit account and store
-epoch. It shares one DNS/connection/operation deadline across
-resolved-address attempts; only transport refusal permits another address.
-No profile is selected or served.
+epoch. One connection attempt and the operation share one deadline. No
+profile is selected or served.
 
 Successful schema-1 JSON reports the account, epoch, snapshot sequence and
 history floor, plus `body_bytes`, `blob_count`, `upload_bytes`, `queue_bytes`
@@ -8102,9 +7997,8 @@ are required exactly once. Unknown, duplicate, missing and malformed
 arguments refuse before opening the protected connection file. The command
 has no repair, download or profile option.
 
-Address resolution and body verification share the original ten-second
-deadline. Only pre-connection transport failure permits another resolved
-address; database or body failures do not renew work. The 64-MiB stored-body ceiling, bounded chunk batches and worker byte/frame ceilings apply.
+The connection and body verification share the original ten-second
+deadline in one connection attempt; no failure renews work. The 64-MiB stored-body ceiling, bounded chunk batches and worker byte/frame ceilings apply.
 
 Success JSON schema 1 identifies the epoch, account, blob, captured account
 sequence/history floor, verified byte count and manifest creation time.
@@ -8130,11 +8024,10 @@ bounded scan refusal. Unknown, duplicate, missing and malformed arguments
 refuse before protected-file access. Body-limit flags belong to
 account-audit and are refused here.
 
-One trusted UTC sample supplies lease-reference policy. DNS and verification
-share the original selected deadline; DNS retains a five-second ceiling.
-Logical limits select the metadata audit's finite cumulative worker
-allowance; no operation renews wire or time budgets. Only pre-connection
-transport failures permit address fallback. Failure emits fixed categories
+One trusted UTC sample supplies lease-reference policy. The connection and
+verification share the original selected deadline in one connection
+attempt. Logical limits select the metadata audit's finite cumulative
+worker allowance; no operation renews wire or time budgets. Failure emits fixed categories
 without SQL or secrets and never changes a row or returns a partial success
 report.
 
@@ -8161,9 +8054,8 @@ unsigned decimal with at most 20 ASCII digits and checked u64 range; zero is
 allowed. Duplicate, unknown, incomplete and malformed options refuse before
 opening the protected connection file. There is no profile, all-accounts,
 force or repair option. The command samples trusted process wall time once
-for metadata policy and shares one DNS/connection/operation deadline across
-address attempts. Only transport refusal permits another address, with no
-renewed deadline.
+for metadata policy; one connection attempt and the operation share one
+deadline, with no renewal.
 
 Successful schema-1 JSON reports account, epoch, sequence and history floor,
 metadata row count, verified blob/byte totals and the five usage counters.
@@ -8269,9 +8161,8 @@ epoch-generation option. Recovery release is a separate owner command
 31)](#restored-store-delivery-quarantine-schema-31)).
 
 Both commands use the owner and expected-epoch checks above, the protected
-bootstrap loader and one original DNS/connection deadline. Only a
-transport failure before any COMMIT attempt permits another resolved address;
-indeterminate entry is not silently replayed. Retain the exact epoch after
+bootstrap loader and one original connection deadline in one connection
+attempt; indeterminate entry is not silently replayed. Retain the exact epoch after
 uncertainty and inspect or repeat at that epoch.
 
 Schema-1 JSON reports the expected epoch, historical blocked state and

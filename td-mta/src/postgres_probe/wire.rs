@@ -1,45 +1,30 @@
 //! The byte stream under td-postgres: the input filter and output windows
-//! around a private Unix socket or, transitionally, a verified TLS stream.
+//! around the server's Unix socket.
 use super::framing::Input;
-use crate::{
-    ports::{Clock, Deadline, FlushProgress, IoProgress, Transport},
-    tls_io::{TlsIo, TLS_WIRE_BYTES},
-    transport::TcpTransport,
-};
 use std::{
-    net::TcpStream,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
-use td_crypto::TlsSession;
-use td_postgres::{Socket, Stream, StreamError, TlsConnect};
-
-/// TLS hands the client at most this much plaintext a read.
-const READ_BYTES: usize = 16 * 1024;
-
-enum Inner<S> {
-    Plain(S),
-    Tls(Box<Secure>),
-}
+use td_postgres::{Socket, Stream, StreamError};
 
 /// Every byte td-postgres reads passes `Input` before the client parses
 /// it, and every request is charged to the connection's output allowance
 /// and the open window before it is written. A refusal, or the worker's
 /// abort, fails the stream for good.
 pub(crate) struct Wire<S = Socket> {
-    inner: Inner<S>,
+    stream: S,
     input: Input,
     output_left: usize,
     aborted: Arc<AtomicBool>,
 }
 
 impl<S: Stream> Wire<S> {
-    pub(super) fn plain(stream: S, input: Input, output: usize, abort: Arc<AtomicBool>) -> Self {
+    pub(super) fn new(stream: S, input: Input, output: usize, abort: Arc<AtomicBool>) -> Self {
         Self {
-            inner: Inner::Plain(stream),
+            stream,
             input,
             output_left: output,
             aborted: abort,
@@ -49,9 +34,6 @@ impl<S: Stream> Wire<S> {
     fn refuse(&mut self) -> StreamError {
         self.input.fail();
         self.aborted.store(true, Ordering::Release);
-        if let Inner::Tls(secure) = &mut self.inner {
-            secure.0.abort();
-        }
         StreamError::Failed
     }
 
@@ -67,10 +49,7 @@ impl<S: Stream> Wire<S> {
 impl<S: Stream> Stream for Wire<S> {
     fn read(&mut self, buffer: &mut [u8], deadline: Instant) -> Result<usize, StreamError> {
         self.live()?;
-        let count = match &mut self.inner {
-            Inner::Plain(stream) => stream.read(buffer, deadline)?,
-            Inner::Tls(secure) => secure.read(buffer, deadline)?,
-        };
+        let count = self.stream.read(buffer, deadline)?;
         let received = buffer.get(..count).ok_or(StreamError::Failed)?;
         if self.input.accept(received).is_err() {
             return Err(self.refuse());
@@ -83,138 +62,12 @@ impl<S: Stream> Stream for Wire<S> {
         if bytes.len() > self.output_left || self.input.admit_output(bytes.len()).is_err() {
             return Err(self.refuse());
         }
-        match &mut self.inner {
-            Inner::Plain(stream) => stream.write_all(bytes, deadline)?,
-            Inner::Tls(secure) => secure.write_all(bytes, deadline)?,
-        }
+        self.stream.write_all(bytes, deadline)?;
         self.output_left -= bytes.len();
         if self.input.output(bytes.len()).is_err() {
             return Err(self.refuse());
         }
         Ok(())
-    }
-}
-
-impl<S> Drop for Wire<S> {
-    /// After Terminate, a live TLS stream sends close_notify if its socket
-    /// takes it at once; an aborted one just ends.
-    fn drop(&mut self) {
-        if let Inner::Tls(secure) = &mut self.inner {
-            if !self.aborted.load(Ordering::Acquire) {
-                let _ = secure.0.close();
-            }
-        }
-    }
-}
-
-type Tls = TlsIo<TcpTransport, Box<[u8; TLS_WIRE_BYTES]>>;
-
-/// A blocking view of the nonblocking TLS adapter, polling its socket.
-/// Transitional: it serves only the TCP endpoint.
-struct Secure(Tls);
-
-fn stream_error(error: crate::ports::Error) -> StreamError {
-    if error == crate::ports::Error::Deadline {
-        StreamError::TimedOut
-    } else {
-        StreamError::Failed
-    }
-}
-
-/// Wait a moment for progress the socket cannot signal, or time out.
-fn pause(deadline: Instant) -> Result<(), StreamError> {
-    if Instant::now() >= deadline {
-        return Err(StreamError::TimedOut);
-    }
-    std::thread::sleep(Duration::from_millis(1));
-    Ok(())
-}
-
-impl Secure {
-    fn read(&mut self, buffer: &mut [u8], deadline: Instant) -> Result<usize, StreamError> {
-        let length = buffer.len().min(READ_BYTES);
-        let buffer = buffer.get_mut(..length).ok_or(StreamError::Failed)?;
-        loop {
-            match self.0.read(buffer).map_err(stream_error)? {
-                IoProgress::Bytes(count) => return Ok(count),
-                IoProgress::Closed => return Ok(0),
-                IoProgress::Pending => {
-                    if Instant::now() >= deadline {
-                        return Err(StreamError::TimedOut);
-                    }
-                    if !self.0.wait_input(deadline).map_err(stream_error)? {
-                        pause(deadline)?;
-                    }
-                }
-            }
-        }
-    }
-
-    fn write_all(&mut self, mut bytes: &[u8], deadline: Instant) -> Result<(), StreamError> {
-        if Instant::now() >= deadline {
-            return Err(StreamError::TimedOut);
-        }
-        while !bytes.is_empty() {
-            match self.0.write(bytes).map_err(stream_error)? {
-                IoProgress::Bytes(count) => {
-                    bytes = bytes.get(count..).ok_or(StreamError::Failed)?;
-                }
-                IoProgress::Pending => pause(deadline)?,
-                IoProgress::Closed => return Err(StreamError::Failed),
-            }
-        }
-        while self.0.flush().map_err(stream_error)? != FlushProgress::Complete {
-            pause(deadline)?;
-        }
-        Ok(())
-    }
-}
-
-/// The TLS connector td-postgres calls once the server accepts the
-/// SSLRequest: td-crypto's verified session over the bare socket, then
-/// the same filter and windows as a Unix connection. Transitional, with
-/// the TCP endpoint it serves.
-pub(super) struct Connector {
-    pub(super) session: TlsSession,
-    pub(super) clock: Arc<dyn Clock>,
-    pub(super) cap: Deadline,
-    pub(super) handshake_cap: Deadline,
-    pub(super) output: usize,
-    pub(super) input: Input,
-    pub(super) abort: Arc<AtomicBool>,
-}
-
-impl TlsConnect for Connector {
-    type Stream = Wire;
-
-    fn connect(self, socket: TcpStream, deadline: Instant) -> Result<Wire, StreamError> {
-        let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbTls);
-        let transport = TcpTransport::from_stream(socket).map_err(|_| StreamError::Failed)?;
-        let mut secure = TlsIo::new(
-            transport,
-            self.session,
-            self.clock,
-            self.cap,
-            self.handshake_cap,
-            Box::new([0; TLS_WIRE_BYTES]),
-            Box::new([0; TLS_WIRE_BYTES]),
-        )
-        .map_err(|refusal| stream_error(refusal.error()))?;
-        while secure.handshake().map_err(stream_error)?.is_none() {
-            if !secure
-                .wait_handshake_input(deadline)
-                .map_err(stream_error)?
-            {
-                pause(deadline)?;
-            }
-        }
-        timing.succeeded();
-        Ok(Wire {
-            inner: Inner::Tls(Box::new(Secure(secure))),
-            input: self.input,
-            output_left: self.output,
-            aborted: self.abort,
-        })
     }
 }
 
@@ -224,6 +77,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::time::Duration;
 
     /// A blocking socket for the filter to wrap.
     struct Pair(UnixStream);
@@ -241,7 +95,7 @@ mod tests {
         let (near, far) = UnixStream::pair().unwrap();
         let abort = Arc::new(AtomicBool::new(false));
         (
-            Wire::plain(Pair(near), input, output, Arc::clone(&abort)),
+            Wire::new(Pair(near), input, output, Arc::clone(&abort)),
             far,
             abort,
         )

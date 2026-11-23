@@ -8,8 +8,8 @@ it first admitted: a std-only client whose every bound is the caller's.
 
 The crate depends on std and on td-alloc, td-encoding, td-fs and
 td-primitives. It forbids `unsafe`. Its cryptography is td-primitives'
-SHA-256, HMAC, PBKDF2, entropy and constant-time comparison; TLS is a
-connector the caller supplies.
+SHA-256, HMAC, PBKDF2, entropy and constant-time comparison. It connects
+only to a Unix-domain socket and carries no TLS.
 
 ## What td-mta uses
 
@@ -22,8 +22,7 @@ td-alloc.
 
 | Concern | What td-mta does |
 | --- | --- |
-| Endpoint | A private or group-shared Unix-domain socket whose ownership td-mta checks first (`td_fs::check_server_socket`), through `connect_unix_through` with td-mta's stream filter; transitionally, TCP to a caller-resolved address |
-| TLS | TCP always: the SSLRequest handshake (`start_tls`, after td-mta's own TCP connect), then td-mta's connector, its own `TlsIo` over a td-crypto `TlsSession` verifying chain and name. Unix sockets: none. No direct TLS, no fallback, no channel binding |
+| Endpoint | A private or group-shared Unix-domain socket whose ownership td-mta checks first (`td_fs::check_server_socket`), through `connect_unix_through` with td-mta's stream filter. No TCP, no TLS, no channel binding |
 | Login | SCRAM-SHA-256 only. td-mta's input filter (`postgres_probe/framing.rs`) refuses any other authentication request, AuthenticationOk without the SASL exchange, and any ReadyForQuery before authentication. Passwords are generated hex tokens, at most 4096 bytes |
 | Startup parameters | user, dbname, password, `application_name = td-mta-postgres`, and `options = -c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000 -c search_path=pg_catalog` |
 | Simple query | `batch`: BEGIN with isolation and `SET LOCAL` lines, LISTEN and NOTIFY, a few SET and DML statements; rows, as from `SELECT pg_advisory_xact_lock(...)`, are discarded. The connection probe reads its five text settings with `query` |
@@ -63,14 +62,11 @@ enforced by td-mta's stream-level filter before the client reads.
 
 ## Surface
 
-- `connect_unix(path, config, limits, deadline)` and
-  `connect_tls(address, connector, config, limits, deadline)` open a
-  session; `connect_unix_through(path, wrap, ...)` runs the Unix one
-  over the `Stream` that `wrap` makes of the connected `Socket`, so
-  a caller's own filter sees the startup and login too;
-  `start_tls(socket, connector, ...)` is `connect_tls` over a TCP stream
-  the caller connected, so it can tell a failed connect from a failed
-  negotiation; `startup(stream, ...)` starts one over any `Stream`.
+- `connect_unix(path, config, limits, deadline)` opens a session;
+  `connect_unix_through(path, wrap, ...)` runs it over the `Stream` that
+  `wrap` makes of the connected `Socket`, so a caller's own filter sees
+  the startup and login too; `startup(stream, ...)` starts one over any
+  `Stream`.
 - `Client::batch(sql, deadline)`: the simple query, several statements,
   rows discarded.
 - `Client::query`, `query_one`, `query_opt`, `execute`: the extended query,
@@ -90,31 +86,17 @@ Every parameter names its own type, so a value the server would
 otherwise infer as another type (`name`, `varchar`) is sent as `text`
 and the SQL casts where it must. Owned results are read borrowed, `&str`
 or `&[u8]`, then copied through td-alloc, and arrays as `Array`
-iterations. td-mta names one `Stream` type over its Unix and TLS
-sessions.
+iterations. td-mta's `Stream` is its filter over the `Socket`.
 
-## Stream and TLS
+## Stream
 
 `Stream` is `read(buffer, deadline)` and `write_all(bytes, deadline)`.
 A deadline already past makes `read` take only what is ready, which is
 how `wait` polls. `Socket` implements it for Unix sockets with
 `SO_RCVTIMEO`/`SO_SNDTIMEO` and a nonblocking poll; no `poll(2)` and no
-`unsafe`.
-
-`connect_tls` (or `start_tls` on a stream the caller connected) sends
-the 8-byte SSLRequest and reads exactly one byte of
-answer: `S` hands the bare, blocking `TcpStream` to the caller's
-`TlsConnect`,
-which must verify chain and name; `N` is `TlsRefused`, with no plaintext
-fallback; anything else is `Protocol`. Reading one byte, not a buffer,
-means nothing the server sends before its handshake can be taken for
-protected data. The crate carries no TLS: td-crypto may not be a
-dependency of a crate outside the crypto admission, and td-mta's TLS
-stream lives in td-mta, so td-mta supplies the connector. Direct TLS
-(PostgreSQL 17's `sslnegotiation=direct`) is not offered. `start_tls`
-first makes the caller's stream blocking, and consumes it: on any
-failure, a refused configuration or a past deadline included, the
-stream is closed.
+`unsafe`. The socket is dialed by `td_fs::unix_connect_until` within the
+connection's deadline. No SSLRequest is sent: the session is plaintext
+over the local socket, whose access the caller decides.
 
 ## Startup and SCRAM
 
@@ -205,11 +187,9 @@ or PANIC breaks it.
 An operation may thus read up to `messages` times `message_bytes`, most
 of it discarded. A total byte budget per connection or per turn, such
 as td-mta's stream filter keeps, stays a wrapper of the caller's around
-its `Stream`: `connect_unix_through` puts it around the Unix socket,
-and a TLS connector returns it around its own TLS stream. The
-SSLRequest's eight bytes and its one-byte answer pass on the bare
-socket, before the connector's stream exists, and outside such a
-budget.
+its `Stream`: `connect_unix_through` puts it around the Unix socket
+before the startup message, so every byte the session moves passes
+through it.
 
 Every server length, count and terminator is checked against the bytes
 present, every message must be consumed exactly, negative counts and
@@ -280,7 +260,7 @@ too, waiting at most 100 ms.
 
 ## Not supported
 
-Direct TLS, channel binding (SCRAM-SHA-256-PLUS), every login but
+TCP, TLS of any form, channel binding (SCRAM-SHA-256-PLUS), every login but
 SCRAM-SHA-256, SASLprep of non-ASCII passwords, named prepared
 statements, portals and row-at-a-time fetch, pipelining, COPY,
 cancellation requests, function calls, protocol 3.2, the text result
@@ -289,8 +269,7 @@ format in the extended query, and every type not listed above.
 ## Tests
 
 Unit tests run against byte fixtures and a scripted in-memory stream,
-and the connect forms against a Unix listener in a `td_fs::TempDir` or
-a loopback TCP listener:
+and the connect forms against a Unix listener in a `td_fs::TempDir`:
 
 - framing of every backend message at every fragmentation, lengths
   below four or above the limit refused from the header, and every
@@ -302,11 +281,8 @@ a loopback TCP listener:
   `hashlib` and `hmac`), and each hostile server-first and server-final
   refused;
 - startup: trust, cleartext, MD5, GSS, a PLUS-only offer, a missing or
-  forged proof, AuthenticationOk out of turn, a non-UTF8 encoding, a
-  Unix login carried, or cut short, by a caller's wrapper, and
-  `start_tls` on a loopback stream: exactly the SSLRequest out, each
-  answer byte, a nonblocking stream handed on blocking, and nothing
-  sent past a deadline;
+  forged proof, AuthenticationOk out of turn, a non-UTF8 encoding, and a
+  Unix login carried, or cut short, by a caller's wrapper;
 - queries: rows read and typed, errors that keep or end the session,
   every protocol-order violation, each limit, a stalled server's
   deadline;
@@ -322,7 +298,7 @@ fixtures find theirs: the first `initdb` on `PATH`, with `postgres` and
 `pg_ctl` beside it, each tool run with only `PATH` and `LC_ALL=C`. It
 covers SCRAM login over the Unix socket, directly and through a
 counting wrapper, a wrong password, cleartext and trust refused by the
-client, an SSLRequest the server answers `N`, every
+client, every
 type both ways (arrays with NULLs, `name`, the extremes of each integer,
 all 256 byte values), the extended and simple queries, commit and
 rollback, a failed transaction's COMMIT, a deferred constraint failing
@@ -334,6 +310,4 @@ NOTIFY, an ended idle session found by a poll, a query and a COMMIT
 written to a session the server already ended (its FATAL reported, the
 COMMIT unknown), and each result limit. The test is ignored in ordinary
 runs, since the sandbox gate has no PostgreSQL; the host preflight runs
-it through `test-args = "--include-ignored"`. TLS itself is not
-exercised here: the connector is td-mta's, and its end-to-end test
-belongs with it.
+it through `test-args = "--include-ignored"`.

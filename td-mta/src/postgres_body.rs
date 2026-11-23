@@ -13,7 +13,7 @@ use std::{
     cell::RefCell,
     time::{Duration, Instant},
 };
-use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_crypto::{Crypto, Digest, Provider};
 
 const CHUNK: u64 = 65536;
 const BATCH: u64 = 8;
@@ -131,13 +131,7 @@ impl<'a> SessionCache<'a> {
         }
         Ok(())
     }
-    fn prepare(
-        &self,
-        request: &Request<'_>,
-        trust: &TrustStore,
-        through: Instant,
-        body: bool,
-    ) -> Result<(), Error> {
+    fn prepare(&self, request: &Request<'_>, through: Instant, body: bool) -> Result<(), Error> {
         let deadline = through.min(Instant::now() + postgres_probe::MAX_DURATION);
         let mut slot = self
             .0
@@ -157,9 +151,9 @@ impl<'a> SessionCache<'a> {
         if slot.session.is_none() {
             slot.session = Some(
                 if body {
-                    postgres_probe::ReadSession::open_body(request, trust, deadline)
+                    postgres_probe::ReadSession::open_body(request, deadline)
                 } else {
-                    postgres_probe::ReadSession::open(request, trust, deadline)
+                    postgres_probe::ReadSession::open(request, deadline)
                 }
                 .map_err(Error::Connection)?,
             );
@@ -190,13 +184,7 @@ impl<'a> SessionCache<'a> {
                 deadline,
                 move |client| reauthorize_body(client, binding, presented, expires),
             )
-            .map_err(|error| {
-                if error == postgres_probe::Error::Transport {
-                    Error::Database
-                } else {
-                    Error::Connection(error)
-                }
-            })
+            .map_err(Error::Connection)
             .and_then(|result| result);
         if reused {
             crate::performance::record(
@@ -250,14 +238,9 @@ impl<'a> DownloadCache<'a> {
         }
         Ok(())
     }
-    fn prepare(
-        &self,
-        request: &Request<'_>,
-        trust: &TrustStore,
-        deadline: Instant,
-    ) -> Result<(), Error> {
-        self.body.prepare(request, trust, deadline, true)?;
-        self.authorization.prepare(request, trust, deadline, false)
+    fn prepare(&self, request: &Request<'_>, deadline: Instant) -> Result<(), Error> {
+        self.body.prepare(request, deadline, true)?;
+        self.authorization.prepare(request, deadline, false)
     }
     fn read_body<T>(
         &self,
@@ -278,12 +261,7 @@ impl<'a> DownloadCache<'a> {
             .ok_or(Error::Capacity)?
             .read_body_worker(epoch, deadline, |worker| Ok(read(worker)))
             .map_err(Error::Connection)
-            .and_then(|result| result)
-            .map_err(|error| match error {
-                // Only preparation may try another resolved address.
-                Error::Connection(postgres_probe::Error::Transport) => Error::Database,
-                error => error,
-            });
+            .and_then(|result| result);
         if reused {
             crate::performance::record(
                 crate::performance::Phase::DbReuse,
@@ -305,7 +283,6 @@ impl<'a> DownloadCache<'a> {
 /// all its own work and I/O by the original deadline. No snapshot escapes.
 pub fn with_email<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     selected: ReadRequest,
     password: &[u8],
@@ -315,7 +292,7 @@ pub fn with_email<T>(
         return Err(Error::Capacity);
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
-    postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    postgres_probe::with_body_worker(request, deadline, |worker| {
         let metadata = worker.run(|client| {
             let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != selected.epoch { return Err(Error::Epoch); }
@@ -500,45 +477,37 @@ pub(crate) fn with_chunk_verified_pin<T>(
 /// admission; an admitted callback retains its original finite deadline.
 pub fn with_blob<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     selected: BlobRequest<'_>,
     password: &[u8],
     read: impl FnOnce(BlobMetadata, &mut dyn BlobReader) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
-    with_pinned_blob(
-        request,
-        trust,
-        deadline,
-        selected,
-        password,
-        |metadata, pin| read(metadata, pin),
-    )
+    with_pinned_blob(request, deadline, selected, password, |metadata, pin| {
+        read(metadata, pin)
+    })
 }
 
 /// Download custody for the existing MIME-part readers. Fresh primary
 /// reauthorization still follows verification and precedes the callback.
 pub fn with_pinned_blob<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     selected: BlobRequest<'_>,
     password: &[u8],
     read: impl FnOnce(BlobMetadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
-    with_pinned_blob_cached(request, trust, deadline, selected, password, None, read)
+    with_pinned_blob_cached(request, deadline, selected, password, None, read)
 }
 
 pub(crate) fn with_pinned_blob_cached<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     selected: BlobRequest<'_>,
     password: &[u8],
     cache: Option<&DownloadCache<'_>>,
     read: impl FnOnce(BlobMetadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
-    let result = with_pinned_blob_inner(request, trust, deadline, selected, password, cache, read);
+    let result = with_pinned_blob_inner(request, deadline, selected, password, cache, read);
     if result.is_err() {
         if let Some(cache) = cache {
             cache.clear();
@@ -549,7 +518,6 @@ pub(crate) fn with_pinned_blob_cached<T>(
 
 fn with_pinned_blob_inner<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     selected: BlobRequest<'_>,
     password: &[u8],
@@ -566,7 +534,7 @@ fn with_pinned_blob_inner<T>(
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
     let snapshot_binding = binding.clone();
     if let Some(cache) = cache {
-        cache.prepare(request, trust, deadline)?;
+        cache.prepare(request, deadline)?;
     }
     let retained = cache.is_some();
     let read_body = |worker: &mut Worker| {
@@ -612,7 +580,6 @@ fn with_pinned_blob_inner<T>(
         } else {
             postgres_probe::with_mailbox_client(
                 request,
-                trust,
                 deadline.min(Instant::now() + postgres_probe::MAX_DURATION),
                 |client| reauthorize_blob(client, binding, presented, expires),
             )
@@ -635,8 +602,7 @@ fn with_pinned_blob_inner<T>(
     if let Some(cache) = cache {
         cache.read_body(binding.epoch(), deadline, read_body)
     } else {
-        postgres_probe::with_body_worker(request, trust, deadline, read_body)
-            .map_err(Error::Connection)?
+        postgres_probe::with_body_worker(request, deadline, read_body).map_err(Error::Connection)?
     }
 }
 

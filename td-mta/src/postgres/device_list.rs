@@ -1,5 +1,5 @@
 //! Explicit read-only inspection of the preparation database's device registry.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -47,15 +47,8 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    match with_addresses(&loaded, |request, deadline| {
-        postgres_devices::list(
-            request,
-            &loaded.trust,
-            deadline,
-            options.epoch,
-            options.account,
-        )
-        .map_err(classify)
+    match with_connection(&loaded, |request, deadline| {
+        postgres_devices::list(request, deadline, options.epoch, options.account).map_err(classify)
     }) {
         Ok(devices) => {
             output(

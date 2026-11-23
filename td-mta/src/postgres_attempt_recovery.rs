@@ -13,7 +13,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -74,13 +74,12 @@ pub struct Outcome {
 /// the generation again. The route permits at most one active attempt.
 pub fn active(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
 ) -> Result<Option<(AttemptId, u64)>, Error> {
     let claim = claim.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
             if !owners::begin(client, &claim, true, false).map_err(Error::Owner)? {
                 return Err(Error::Policy);
             }
@@ -260,12 +259,11 @@ fn receipt(client: &Client, value: &Recovery) -> Result<Option<Outcome>, Error> 
 }
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Recovery,
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
         receipt(client, &value)
     })
@@ -301,18 +299,17 @@ pub(crate) fn retry_delay(
 /// settle historically, without publishing an alternative or resuming transport.
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Recovery,
 ) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, value)? {
+    if let Some(outcome) = inspect(request, deadline, value)? {
         return Ok(outcome);
     }
     let value = value.clone();
     let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_batch_client(request, deadline, move |client| {
         let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
         if let Some(outcome) = receipt(client, &value)? {
             return Ok(outcome);

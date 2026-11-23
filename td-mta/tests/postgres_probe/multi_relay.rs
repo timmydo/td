@@ -6,7 +6,6 @@ use td_mta::{
 pub(super) fn leases(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &td_crypto::TrustStore,
     profile: &PublishedProfile,
 ) -> (owners::Claim, owners::Grant) {
     let claims: Vec<_> = profile
@@ -15,7 +14,7 @@ pub(super) fn leases(
         .collect();
     let grants: Vec<_> = claims
         .iter()
-        .map(|claim| owners::acquire(request, trust, deadline(), claim).unwrap())
+        .map(|claim| owners::acquire(request, deadline(), claim).unwrap())
         .collect();
     let mut leases: Vec<_> = claims
         .iter()
@@ -23,7 +22,7 @@ pub(super) fn leases(
         .map(|(claim, grant)| (claim, grant.generation))
         .collect();
     leases.reverse();
-    let observed = owners::renew_many(request, trust, deadline(), &leases).unwrap();
+    let observed = owners::renew_many(request, deadline(), &leases).unwrap();
     assert_eq!(
         sql(
             fixture,
@@ -32,32 +31,31 @@ pub(super) fn leases(
         "16"
     );
     assert_eq!(
-        owners::renew_many(request, trust, deadline(), &[leases[0], leases[0]]),
+        owners::renew_many(request, deadline(), &[leases[0], leases[0]]),
         Err(owners::Error::Policy)
     );
     let mut runtime = fixture.request();
     runtime.user = "mail_runtime";
     runtime.mode = td_mta::postgres_probe::Mode::Runtime;
     let mut renewer = owners::Renewer::default();
-    renewer.renew(&runtime, trust, deadline(), &leases).unwrap();
+    renewer.renew(&runtime, deadline(), &leases).unwrap();
     let pid = super::body_checks::backend(fixture);
-    renewer.renew(&runtime, trust, deadline(), &leases).unwrap();
+    renewer.renew(&runtime, deadline(), &leases).unwrap();
     assert_eq!(super::body_checks::backend(fixture), pid);
     let baseline = sql(fixture, "SELECT string_agg(encode(account,'hex')||':'||expires_at::text,',' ORDER BY account) FROM td_mta.route_owners");
     leases[0].1 += 1;
     assert_eq!(
-        renewer.renew(&runtime, trust, deadline(), &leases),
+        renewer.renew(&runtime, deadline(), &leases),
         Err(owners::Error::Stale)
     );
     assert_eq!(sql(fixture, "SELECT string_agg(encode(account,'hex')||':'||expires_at::text,',' ORDER BY account) FROM td_mta.route_owners"), baseline);
     super::body_checks::closed(fixture, &pid);
     leases[0].1 -= 1;
-    renewer.renew(&runtime, trust, deadline(), &leases).unwrap();
+    renewer.renew(&runtime, deadline(), &leases).unwrap();
     sql(fixture, "CREATE FUNCTION public.delay_multi_lease() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.25); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_multi_lease AFTER UPDATE ON td_mta.route_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_multi_lease()");
     assert_eq!(
         renewer.renew(
             &runtime,
-            trust,
             std::time::Instant::now() + std::time::Duration::from_secs(2),
             &leases
         ),
@@ -77,7 +75,7 @@ pub(super) fn leases(
     );
     drop(renewer);
     for (claim, grant) in claims.iter().zip(&grants) {
-        owners::observe(request, trust, deadline(), claim, grant.generation).unwrap();
+        owners::observe(request, deadline(), claim, grant.generation).unwrap();
     }
     // Keep the first account unavailable to the process until the test releases it.
     let rest: Vec<_> = claims
@@ -86,7 +84,7 @@ pub(super) fn leases(
         .skip(1)
         .map(|(claim, grant)| (claim, grant.generation))
         .collect();
-    owners::release_many(request, trust, deadline(), &rest).unwrap();
-    owners::renew(request, trust, deadline(), &claims[0], grants[0].generation).unwrap();
+    owners::release_many(request, deadline(), &rest).unwrap();
+    owners::renew(request, deadline(), &claims[0], grants[0].generation).unwrap();
     (claims[0].clone(), grants[0])
 }

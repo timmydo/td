@@ -4,7 +4,6 @@ use std::{
     os::unix::fs::PermissionsExt,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::AccountId, metadata_sweep, postgres_account_audit as audit, postgres_accounts,
     postgres_metadata_audit, postgres_probe, postgres_schema,
@@ -18,14 +17,12 @@ fn real_postgres_owner_audits_scale_with_explicit_finite_limits() {
 
 pub(super) fn exercise() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
     postgres_accounts::publish(
         &fixture.request(),
-        &trust,
         deadline(),
         postgres_accounts::prepare(epoch, account).unwrap(),
     )
@@ -41,7 +38,6 @@ pub(super) fn exercise() {
     for _ in 0..6 {
         let report = postgres_metadata_audit::inspect(
             &fixture.request(),
-            &trust,
             Instant::now() + Duration::from_secs(60),
             epoch,
             account,
@@ -53,13 +49,11 @@ pub(super) fn exercise() {
     }
     {
         let next = Fixture::new();
-        let trust = TrustStore::from_pem(&next.ca).unwrap();
-        postgres_schema::initialize(&next.request(), &trust, deadline()).unwrap();
+        postgres_schema::initialize(&next.request(), deadline()).unwrap();
     }
     assert!(matches!(
         postgres_metadata_audit::inspect(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -74,7 +68,6 @@ pub(super) fn exercise() {
     assert_eq!(
         postgres_metadata_audit::inspect(
             &fixture.request(),
-            &trust,
             Instant::now() + Duration::from_secs(3601),
             epoch,
             account,
@@ -88,7 +81,7 @@ pub(super) fn exercise() {
     let mut runtime = fixture.request();
     runtime.mode = postgres_probe::Mode::Runtime;
     assert_eq!(
-        postgres_metadata_audit::inspect(&runtime, &trust, deadline(), epoch, account, 0, metadata),
+        postgres_metadata_audit::inspect(&runtime, deadline(), epoch, account, 0, metadata),
         Err(postgres_metadata_audit::Error::Connection(
             postgres_probe::Error::Invalid
         ))
@@ -96,7 +89,6 @@ pub(super) fn exercise() {
     assert_eq!(
         postgres_metadata_audit::inspect(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -121,7 +113,6 @@ pub(super) fn exercise() {
     let inspect = |limits| {
         audit::inspect(
             &fixture.request(),
-            &trust,
             Instant::now() + Duration::from_secs(60),
             epoch,
             account,
@@ -152,16 +143,14 @@ pub(super) fn exercise() {
     );
 
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("audit.connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://td_probe:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -193,7 +182,6 @@ pub(super) fn exercise() {
     assert_eq!(
         audit::inspect(
             &fixture.request(),
-            &trust,
             Instant::now(),
             epoch,
             account,

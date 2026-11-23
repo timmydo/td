@@ -1,5 +1,5 @@
 //! Explicit finite missing-search page, with caller-retained continuation keys.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -94,15 +94,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    match with_addresses(&loaded, |request, deadline| {
-        postgres_search_prepare::run(
-            request,
-            &loaded.trust,
-            deadline,
-            options.epoch,
-            options.page,
-        )
-        .map_err(classify)
+    match with_connection(&loaded, |request, deadline| {
+        postgres_search_prepare::run(request, deadline, options.epoch, options.page)
+            .map_err(classify)
     }) {
         Ok(report) => {
             writeln!(io::stdout().lock(),"{{\"schema\":1,\"command\":\"{COMMAND}\",\"status\":\"ok\",\"store_epoch\":\"{}\",\"search_version\":{},\"scanned\":{},\"written\":{},\"skipped\":{},\"verified_bytes\":{},\"after\":{},\"through\":{},\"done\":{}}}",options.epoch,postgres_search_prepare::VERSION,report.scanned,report.written,report.skipped,report.verified_bytes,encode_key(report.after),encode_key(report.through),report.done)?;

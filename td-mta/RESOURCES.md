@@ -27,8 +27,8 @@ the read end, up to 16 listeners and 96 connections. Polling borrows the origina
 worker-owned connections stay outside the wait. The array uses 904 bytes on
 the supported 64-bit targets.
 
-Each live PostgreSQL connection uses one descriptor, its connected TCP or
-Unix socket. This applies to each admitted fresh connection and each retained connection,
+Each live PostgreSQL connection uses one descriptor, its connected Unix
+socket. This applies to each admitted fresh connection and each retained connection,
 including while idle. POSTGRES.md describes readiness and retirement.
 
 ## Default reservation
@@ -4533,8 +4533,8 @@ are selected; the 128-byte label bound makes the command's complete
 escaped JSON output less than 128 KiB. Overflow and
 invalid metadata return no partial listing. One mailbox-profile connection
 caps input at one MiB, output at 64 KiB and frames at 512 in Preparation mode
-(1024 in Runtime mode). The original deadline remains capped at ten seconds;
-the preparation command includes fresh DNS in that same operation deadline.
+(1024 in Runtime mode). The original deadline remains capped at ten seconds,
+connection included.
 A successful snapshot acknowledges rollback; every connection closes before
 command output. No
 connection pool, response spool, retained credential or serving authority is
@@ -4672,10 +4672,10 @@ primary authorization; the existing bounded body cache/protocol buffers
 remain additional. No new thread, unbounded queue or connection pool is added.
 
 All reads share the original request meter and ten-second-or-shorter deadline.
-Before each source/address attempt the owner prepays 192 KiB plus three times
+Before each source the owner prepays 192 KiB plus three times
 the remaining aggregate source allowance in I/O, and 1024 plus three times
 ceil(remaining/4096) records. This conservative charge covers verification,
-replay and framing even on fallback. Composition and source/body digests
+replay and framing. Composition and source/body digests
 charge the same meter separately. Refusal discards provisional bytes; the
 existing pending owner retains only the prepared message/manifests after an
 unknown COMMIT, within the account and time limits for subsequent writes

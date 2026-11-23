@@ -91,15 +91,8 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
         .identity()
         .map_err(|_| config_failure("acme", "settings"))?;
     let mut first_claim = Some(
-        claim_turn(
-            &loaded,
-            &executable,
-            &options.profile,
-            settings_hash,
-            owner,
-            &initial,
-        )
-        .map_err(|_| config_failure("acme", "runtime-claim"))?,
+        claim_turn(&loaded, &options.profile, settings_hash, owner, &initial)
+            .map_err(|_| config_failure("acme", "runtime-claim"))?,
     );
     super::signal_sys::block().map_err(|_| config_failure("acme", "signals"))?;
     let listener =
@@ -133,14 +126,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
             let result = (|| -> Result<(), acme::Error> {
                 let (request, receipt, lease) = match first_claim.take() {
                     Some(value) => value,
-                    None => claim_turn(
-                        &loaded,
-                        &executable,
-                        &options.profile,
-                        settings_hash,
-                        owner,
-                        &initial,
-                    )?,
+                    None => claim_turn(&loaded, &options.profile, settings_hash, owner, &initial)?,
                 };
                 let mut state = lease.state;
                 {
@@ -151,7 +137,6 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                 }
                 let mut writer = postgres_acme::Writer {
                     request: &request,
-                    trust: &loaded.trust,
                     epoch: receipt.store_epoch,
                     profile: &options.profile,
                     owner,
@@ -176,7 +161,6 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                     // before persisting backoff; never save speculative in-memory state.
                     let recovered = postgres_acme::claim(
                         &request,
-                        &loaded.trust,
                         Instant::now() + Duration::from_secs(10),
                         receipt.store_epoch,
                         postgres_acme::Claim {
@@ -210,7 +194,6 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                     };
                     let _ = td_mta::postgres_logs::append(
                         &request,
-                        &loaded.trust,
                         Instant::now() + Duration::from_secs(2),
                         receipt.store_epoch,
                         "acme",
@@ -296,45 +279,33 @@ pub(super) fn status(args: impl Iterator<Item = OsString>) -> Result<bool, Confi
     let profile = options.profile;
     let loaded = td_mta::postgres_input::Loaded::open(&connection, "acme")
         .map_err(|_| config_failure("acme", "connection-file"))?;
-    let executable = std::env::current_exe().map_err(|_| config_failure("acme", "executable"))?;
-    let addresses = td_mta::postgres_resolver::resolve(
-        &executable,
-        &loaded.bootstrap,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .map_err(|_| config_failure("acme", "resolution"))?;
-    for address in addresses {
-        let mut request = loaded.bootstrap.request(address);
-        if !acme_login(request.user) {
-            return Err(config_failure("acme", "runtime"));
-        }
-        request.mode = Mode::Runtime;
-        let receipt = match td_mta::postgres_runtime_access::inspect(
-            &request,
-            &loaded.trust,
-            Instant::now() + Duration::from_secs(10),
-        ) {
-            Ok(value) => value,
-            Err(td_mta::postgres_runtime_access::Error::Connection(
-                td_mta::postgres_probe::Error::Transport,
-            )) => continue,
-            Err(_) => return Err(config_failure("acme", "runtime")),
-        };
-        let status = postgres_acme::status(
-            &request,
-            &loaded.trust,
-            Instant::now() + Duration::from_secs(10),
-            receipt.store_epoch,
-            &profile,
-        )
-        .map_err(|_| config_failure("acme", "status"))?;
-        let now = now().map_err(|_| config_failure("acme", "clock"))?;
-        let health = status_health(&status, now, options.minimum_validity_ms);
-        use std::io::Write;
-        writeln!(std::io::stdout().lock(),"{{\"schema\":1,\"command\":\"acme-status\",\"status\":\"{health}\",\"generation\":{},\"expires_utc_ms\":{},\"next_attempt_utc_ms\":{},\"failures\":{},\"leased\":{}}}",status.generation,status.expires_ms,status.next_ms,status.failures,status.leased).map_err(|_|config_failure("acme","output"))?;
-        return Ok(!options.require_ready || health == "ready");
+    let mut request = loaded.bootstrap.request();
+    if !acme_login(request.user) {
+        return Err(config_failure("acme", "runtime"));
     }
-    Err(config_failure("acme", "connection"))
+    request.mode = Mode::Runtime;
+    let receipt = match td_mta::postgres_runtime_access::inspect(
+        &request,
+        Instant::now() + Duration::from_secs(10),
+    ) {
+        Ok(value) => value,
+        Err(td_mta::postgres_runtime_access::Error::Connection(
+            td_mta::postgres_probe::Error::Transport,
+        )) => return Err(config_failure("acme", "connection")),
+        Err(_) => return Err(config_failure("acme", "runtime")),
+    };
+    let status = postgres_acme::status(
+        &request,
+        Instant::now() + Duration::from_secs(10),
+        receipt.store_epoch,
+        &profile,
+    )
+    .map_err(|_| config_failure("acme", "status"))?;
+    let now = now().map_err(|_| config_failure("acme", "clock"))?;
+    let health = status_health(&status, now, options.minimum_validity_ms);
+    use std::io::Write;
+    writeln!(std::io::stdout().lock(),"{{\"schema\":1,\"command\":\"acme-status\",\"status\":\"{health}\",\"generation\":{},\"expires_utc_ms\":{},\"next_attempt_utc_ms\":{},\"failures\":{},\"leased\":{}}}",status.generation,status.expires_ms,status.next_ms,status.failures,status.leased).map_err(|_|config_failure("acme","output"))?;
+    Ok(!options.require_ready || health == "ready")
 }
 
 fn acme_login(user: &str) -> bool {
@@ -346,7 +317,6 @@ fn acme_login(user: &str) -> bool {
 // Empty-database replica initialization subsequently refuses that row.
 fn claim_turn<'a>(
     loaded: &'a td_mta::postgres_input::Loaded,
-    executable: &std::path::Path,
     profile: &str,
     settings: [u8; 32],
     owner: [u8; 16],
@@ -360,34 +330,20 @@ fn claim_turn<'a>(
     acme::Error,
 > {
     let until = Instant::now() + Duration::from_secs(10);
-    let addresses = td_mta::postgres_resolver::resolve(
-        executable,
-        &loaded.bootstrap,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .map_err(|_| acme::Error::Transport)?;
-    let mut selected = None;
-    for address in addresses {
-        let mut request = loaded.bootstrap.request(address);
-        if !acme_login(request.user) {
-            return Err(acme::Error::Database);
-        }
-        request.mode = Mode::Runtime;
-        match td_mta::postgres_runtime_access::inspect(&request, &loaded.trust, until) {
-            Ok(receipt) => {
-                selected = Some((request, receipt));
-                break;
-            }
-            Err(td_mta::postgres_runtime_access::Error::Connection(
-                td_mta::postgres_probe::Error::Transport,
-            )) => continue,
-            Err(_) => return Err(acme::Error::Database),
-        }
+    let mut request = loaded.bootstrap.request();
+    if !acme_login(request.user) {
+        return Err(acme::Error::Database);
     }
-    let (request, receipt) = selected.ok_or(acme::Error::Transport)?;
+    request.mode = Mode::Runtime;
+    let receipt =
+        td_mta::postgres_runtime_access::inspect(&request, until).map_err(|error| match error {
+            td_mta::postgres_runtime_access::Error::Connection(
+                td_mta::postgres_probe::Error::Transport,
+            ) => acme::Error::Transport,
+            _ => acme::Error::Database,
+        })?;
     let lease = postgres_acme::claim(
         &request,
-        &loaded.trust,
         Instant::now() + Duration::from_secs(10),
         receipt.store_epoch,
         postgres_acme::Claim {

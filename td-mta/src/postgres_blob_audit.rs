@@ -6,7 +6,6 @@ use crate::{
     postgres_schema,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -23,13 +22,12 @@ pub enum Error {
 /// is not a device-authorized download and never returns body bytes.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
     blob: BlobId,
 ) -> Result<BlobMetadata, Error> {
-    let result = postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    let result = postgres_probe::with_body_worker(request, deadline, |worker| {
         let metadata = worker.run(|client| {
             let schema=client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch!=epoch { return Err(Error::Epoch); }

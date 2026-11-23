@@ -1,5 +1,5 @@
 //! Historical counter inspection, without repair or serving authority.
-use super::{account, report_error, with_addresses, AttemptError};
+use super::{account, report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -21,15 +21,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    let result = with_addresses(&loaded, |request, deadline| {
-        postgres_usage_audit::inspect(
-            request,
-            &loaded.trust,
-            deadline,
-            options.epoch,
-            options.account,
-        )
-        .map_err(classify)
+    let result = with_connection(&loaded, |request, deadline| {
+        postgres_usage_audit::inspect(request, deadline, options.epoch, options.account)
+            .map_err(classify)
     });
     match result {
         Ok(report) => {

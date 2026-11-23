@@ -1,42 +1,22 @@
-//! Certificate-free database transport, with the existing authentication boundary.
+//! The database socket keeps its admission check on every connect.
 use super::*;
 
 #[test]
 #[ignore = "requires PostgreSQL 17 and private trusted TMPDIR"]
-fn local_database_keeps_scram_and_publication_without_certificates() {
+fn local_database_admits_only_its_private_socket() {
     exercise();
 }
 
 pub(super) fn exercise() {
     private_listener_lifetime_and_permissions();
-    let mut fixture = Fixture::new();
-    fixture.stop();
-    for name in ["server.crt", "server.key", "root.der"] {
-        fs::remove_file(fixture.root.join(name)).unwrap();
-    }
-    fixture.start_unix("scram-sha-256");
-    let socket = fixture.root.join(format!(".s.PGSQL.{}", fixture.port));
-    let trust = TrustStore::public_roots().unwrap();
-    let request = || Request {
-        address: Endpoint::Unix(td_fs::SocketPath::new(&socket).unwrap()),
-        server_name: "",
-        mode: td_mta::postgres_probe::Mode::Preparation,
-        user: "td_probe",
-        database: "postgres",
-        password: PASSWORD,
-    };
-    let status = probe(&request(), &trust, deadline()).unwrap();
+    let fixture = Fixture::new();
+    let socket = fixture.socket().as_path().to_path_buf();
+    let request = || fixture.request();
+    let status = probe(&request(), deadline()).unwrap();
     assert!(status.server_version >= 170000);
-    let mut wrong = request();
-    wrong.password = b"wrong";
-    assert_eq!(probe(&wrong, &trust, deadline()), Err(Error::Database));
+    let receipt = td_mta::postgres_schema::initialize(&request(), deadline()).unwrap();
     assert_eq!(
-        probe(&request(), &trust, Instant::now()),
-        Err(Error::Deadline)
-    );
-    let receipt = td_mta::postgres_schema::initialize(&request(), &trust, deadline()).unwrap();
-    assert_eq!(
-        td_mta::postgres_schema::inspect(&request(), &trust, deadline()).unwrap(),
+        td_mta::postgres_schema::inspect(&request(), deadline()).unwrap(),
         receipt
     );
 
@@ -51,19 +31,9 @@ pub(super) fn exercise() {
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(command_probe(&fixture, true).contains("\"status\":\"ok\""));
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660)).unwrap();
-    assert_eq!(probe(&request(), &trust, deadline()), Err(Error::Transport));
+    assert_eq!(probe(&request(), deadline()), Err(Error::Transport));
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(probe(&request(), &trust, deadline()).unwrap(), status);
-
-    fixture.stop();
-    assert_eq!(probe(&request(), &trust, deadline()), Err(Error::Transport));
-    for method in ["trust", "password"] {
-        fixture.start_unix(method);
-        assert_eq!(probe(&request(), &trust, deadline()), Err(Error::Database));
-        fixture.stop();
-    }
-    fixture.start_unix("scram-sha-256");
-    assert_eq!(probe(&request(), &trust, deadline()).unwrap(), status);
+    assert_eq!(probe(&request(), deadline()).unwrap(), status);
 }
 
 fn private_listener_lifetime_and_permissions() {

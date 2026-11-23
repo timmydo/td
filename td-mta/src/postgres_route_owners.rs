@@ -14,7 +14,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 pub const LEASE_MS: i64 = 30_000;
 /// An acquisition receipt stays inspectable this long after its first lease.
@@ -196,12 +196,11 @@ fn receipt(client: &Client, claim: &Claim) -> Result<Option<Grant>, Error> {
 }
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
 ) -> Result<Option<Grant>, Error> {
     let claim = claim.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         begin(client, &claim, false, false)?;
         receipt(client, &claim)
     })
@@ -383,19 +382,14 @@ fn finish<T>(
         Err(error) => Err(Error::Connection(error)),
     }
 }
-pub fn acquire(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    claim: &Claim,
-) -> Result<Grant, Error> {
-    if let Some(grant) = inspect(request, trust, deadline, claim)? {
+pub fn acquire(request: &Request<'_>, deadline: Instant, claim: &Claim) -> Result<Grant, Error> {
+    if let Some(grant) = inspect(request, deadline, claim)? {
         return Ok(grant);
     }
     let claim = claim.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         let current_policy = begin(client, &claim, true, true)?;
         if let Some(grant) = receipt(client, &claim)? {
             return Ok(grant);
@@ -471,13 +465,12 @@ pub fn acquire(
 /// Observe under fresh policy; historical acquisition receipts are insufficient.
 pub fn observe(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
 ) -> Result<i64, Error> {
     let claim = claim.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         if !begin(client, &claim, true, false)? {
             return Err(Error::Policy);
         }
@@ -489,26 +482,23 @@ pub fn observe(
 }
 pub fn renew(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
 ) -> Result<i64, Error> {
-    update(request, trust, deadline, claim, generation, false)
+    update(request, deadline, claim, generation, false)
 }
 /// The caller closes its owned SMTP transport before releasing coordination.
 pub fn release(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
 ) -> Result<(), Error> {
-    update(request, trust, deadline, claim, generation, true).map(|_| ())
+    update(request, deadline, claim, generation, true).map(|_| ())
 }
 fn update(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
@@ -517,7 +507,7 @@ fn update(
     let claim = claim.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         if !release {
             // A local publication may hold the account through its COMMIT.
             // Keep this wait inside the caller's original deadline.
@@ -550,27 +540,24 @@ fn update(
 /// Returns fresh database UTC sampled after all locks, not a receipt timestamp.
 pub fn renew_many(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     leases: &[(&Claim, u64)],
 ) -> Result<i64, Error> {
-    update_many(request, trust, deadline, leases, false)
+    update_many(request, deadline, leases, false)
 }
 /// All owned SMTP transports must be closed before this bounded cleanup call.
 pub fn release_many(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     leases: &[(&Claim, u64)],
 ) -> Result<(), Error> {
     if leases.is_empty() {
         return Ok(());
     }
-    update_many(request, trust, deadline, leases, true).map(|_| ())
+    update_many(request, deadline, leases, true).map(|_| ())
 }
 fn update_many(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     leases: &[(&Claim, u64)],
     release: bool,
@@ -578,7 +565,7 @@ fn update_many(
     let values = prepare_leases(leases)?;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         let first = &values.first().ok_or(Error::Integrity)?.0;
         if client.inspect_schema().map_err(Error::Schema)?.store_epoch != first.binding.epoch() {
             return Err(Error::Epoch);
@@ -681,7 +668,6 @@ impl Renewer {
     pub fn renew(
         &mut self,
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         leases: &[(&Claim, u64)],
     ) -> Result<i64, Error> {
@@ -703,7 +689,7 @@ impl Renewer {
         let reused = self.session.is_some();
         if self.session.is_none() {
             self.session = Some(
-                postgres_probe::MutationSession::open_renewal(request, trust, deadline)
+                postgres_probe::MutationSession::open_renewal(request, deadline)
                     .map_err(Error::Connection)?,
             );
         }

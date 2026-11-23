@@ -1,6 +1,5 @@
 use super::{deadline, sql, Fixture};
 use std::time::Instant;
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, StoreEpoch},
     postgres_accounts, postgres_schema,
@@ -11,17 +10,15 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_usage_audit_compares_one_account_without_repair() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
-    let inspect = || audit::inspect(&fixture.request(), &trust, deadline(), epoch, account);
+    let inspect = || audit::inspect(&fixture.request(), deadline(), epoch, account);
     assert_eq!(inspect(), Err(Error::Missing));
     for account in [account, AccountId::from_bytes([2; 16])] {
         postgres_accounts::publish(
             &fixture.request(),
-            &trust,
             deadline(),
             postgres_accounts::prepare(epoch, account).unwrap(),
         )
@@ -45,7 +42,6 @@ fn real_postgres_usage_audit_compares_one_account_without_repair() {
     assert_eq!(
         audit::inspect(
             &fixture.request(),
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([0; 16]),
             account
@@ -53,7 +49,7 @@ fn real_postgres_usage_audit_compares_one_account_without_repair() {
         Err(Error::Epoch)
     );
     assert_eq!(
-        audit::inspect(&fixture.request(), &trust, Instant::now(), epoch, account),
+        audit::inspect(&fixture.request(), Instant::now(), epoch, account),
         Err(Error::Connection(td_mta::postgres_probe::Error::Deadline))
     );
     sql(

@@ -27,7 +27,6 @@ pub(crate) fn receive(
         || request.account != service.binding.account()
         || !service.binding.roles().jmap()
         || service.loaded.bootstrap.profile() != service.binding.profile()
-        || !service.executable.is_absolute()
         || Presented::parse(request.credentials.password()).is_none_or(|p| p.id() != request.device)
     {
         return Err(Error::Forbidden);
@@ -78,7 +77,6 @@ pub(crate) fn receive(
     );
     let uploads = Uploads {
         loaded: service.loaded,
-        executable: service.executable,
         binding: service.binding,
         slots: service.slots,
         clock: service.clock,
@@ -236,7 +234,6 @@ fn publication_error(error: owner::Error) -> Error {
                 kind: std::io::ErrorKind::ConnectionReset,
                 os_code: None,
             },
-            changes::Error::Connection(postgres_probe::Error::Tls) => Error::Tls,
             _ => Error::Corrupt,
         },
     }

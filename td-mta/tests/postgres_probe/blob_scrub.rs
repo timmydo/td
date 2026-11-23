@@ -1,5 +1,4 @@
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, BlobId, StoreEpoch},
     postgres_accounts, postgres_blob_scrub as scrub, postgres_schema,
@@ -8,8 +7,7 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 pub(super) fn real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let options = scrub::Options {
@@ -22,7 +20,6 @@ pub(super) fn real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance
     let inspect = |options| {
         scrub::inspect(
             &fixture.request(),
-            &trust,
             std::time::Instant::now() + std::time::Duration::from_secs(30),
             epoch,
             options,
@@ -31,7 +28,7 @@ pub(super) fn real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance
     let mut runtime = fixture.request();
     runtime.mode = td_mta::postgres_probe::Mode::Runtime;
     assert_eq!(
-        scrub::inspect(&runtime, &trust, deadline(), epoch, options),
+        scrub::inspect(&runtime, deadline(), epoch, options),
         Err(scrub::Error::Owner)
     );
     let empty = inspect(options).unwrap();
@@ -41,7 +38,6 @@ pub(super) fn real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance
         let account = AccountId::from_bytes([n; 16]);
         postgres_accounts::publish(
             &fixture.request(),
-            &trust,
             deadline(),
             postgres_accounts::prepare(epoch, account).unwrap(),
         )
@@ -103,7 +99,6 @@ pub(super) fn real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance
     assert!(matches!(
         scrub::inspect(
             &fixture.request(),
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([0; 16]),
             options
@@ -147,16 +142,14 @@ pub(super) fn real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.blobs"), "3");
     use std::{fs, os::unix::fs::PermissionsExt};
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("scrub-ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("scrub-connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://td_probe:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(super::PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();

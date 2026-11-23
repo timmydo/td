@@ -11,7 +11,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &td_crypto::TrustStore,
     epoch: StoreEpoch,
     connection: &Path,
 ) {
@@ -87,7 +86,7 @@ pub(super) fn exercise(
         .contains("\"generation\":2"));
     }
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.accounts"), "2");
-    let (_, candidate) = selection::read(request, trust, deadline(), epoch)
+    let (_, candidate) = selection::read(request, deadline(), epoch)
         .unwrap()
         .unwrap();
     for index in 0..candidate.profile_count() {
@@ -113,7 +112,6 @@ pub(super) fn exercise(
     // Competing retained edits cannot clobber one another.
     let first = admin::prepare(
         request,
-        trust,
         deadline(),
         epoch,
         &Edit::Update {
@@ -126,7 +124,6 @@ pub(super) fn exercise(
     .unwrap();
     let second = admin::prepare(
         request,
-        trust,
         deadline(),
         epoch,
         &Edit::Update {
@@ -137,14 +134,14 @@ pub(super) fn exercise(
         },
     )
     .unwrap();
-    let receipt = admin::apply(request, trust, deadline(), &first).unwrap();
+    let receipt = admin::apply(request, deadline(), &first).unwrap();
     assert_eq!(receipt.generation, 3);
     assert_eq!(
-        admin::apply(request, trust, deadline(), &second),
+        admin::apply(request, deadline(), &second),
         Err(admin::Error::Selection(selection::Error::Conflict))
     );
     assert_eq!(
-        admin::apply(request, trust, deadline(), &retained)
+        admin::apply(request, deadline(), &retained)
             .unwrap()
             .generation,
         2
@@ -167,7 +164,7 @@ pub(super) fn exercise(
         root,
         0,
     );
-    let before = selection::read(request, trust, deadline(), epoch)
+    let before = selection::read(request, deadline(), epoch)
         .unwrap()
         .unwrap();
     assert_eq!(before.0.generation, 4);
@@ -188,7 +185,7 @@ pub(super) fn exercise(
         root,
         0,
     );
-    let after = selection::read(request, trust, deadline(), epoch)
+    let after = selection::read(request, deadline(), epoch)
         .unwrap()
         .unwrap();
     assert!(!std::str::from_utf8(after.1.shared())
@@ -200,7 +197,6 @@ pub(super) fn exercise(
     // A lost selection reply is resolved from the same retained request.
     let rename = admin::prepare(
         request,
-        trust,
         deadline(),
         epoch,
         &Edit::Update {
@@ -214,7 +210,6 @@ pub(super) fn exercise(
     sql(fixture,"CREATE FUNCTION public.admin_delay_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(12); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER admin_delay AFTER INSERT ON td_mta.config_selection_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.admin_delay_commit()");
     let result = admin::apply(
         request,
-        trust,
         std::time::Instant::now() + std::time::Duration::from_secs(10),
         &rename,
     );
@@ -236,7 +231,7 @@ pub(super) fn exercise(
         "DROP TRIGGER admin_delay ON td_mta.config_selection_receipts",
     );
     assert_eq!(
-        admin::apply(request, trust, deadline(), &rename)
+        admin::apply(request, deadline(), &rename)
             .unwrap()
             .generation,
         6
@@ -278,7 +273,7 @@ pub(super) fn exercise(
         "identity-add.operation",
         0,
     );
-    let selected = selection::read(request, trust, deadline(), epoch)
+    let selected = selection::read(request, deadline(), epoch)
         .unwrap()
         .unwrap();
     let source = std::str::from_utf8(selected.1.shared()).unwrap();
@@ -307,7 +302,7 @@ pub(super) fn exercise(
         0,
     );
     assert_eq!(
-        selection::read(request, trust, deadline(), epoch)
+        selection::read(request, deadline(), epoch)
             .unwrap()
             .unwrap()
             .0
@@ -320,7 +315,7 @@ pub(super) fn exercise(
         "identity-update.operation",
         0,
     );
-    let selected = selection::read(request, trust, deadline(), epoch)
+    let selected = selection::read(request, deadline(), epoch)
         .unwrap()
         .unwrap();
     let source = std::str::from_utf8(selected.1.shared()).unwrap();
@@ -332,7 +327,7 @@ pub(super) fn exercise(
         "identity-remove.operation",
         0,
     );
-    let selected = selection::read(request, trust, deadline(), epoch)
+    let selected = selection::read(request, deadline(), epoch)
         .unwrap()
         .unwrap();
     let source = std::str::from_utf8(selected.1.shared()).unwrap();
@@ -378,7 +373,6 @@ pub(super) fn exercise(
     assert!(matches!(
         admin::prepare(
             request,
-            trust,
             deadline(),
             epoch,
             &Edit::IdentityRemove {

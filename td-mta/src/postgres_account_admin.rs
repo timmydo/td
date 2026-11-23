@@ -9,7 +9,7 @@ use crate::{
     postgres_selection::{self as selection, Change, Selection},
 };
 use std::time::Instant;
-use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_crypto::{Crypto, Digest, Provider};
 
 const MAGIC: &[u8] = b"td-mta account operation v1\0";
 pub const MAX_OPERATION_BYTES: usize = configuration::MAX_SOURCE_BYTES + 2048;
@@ -121,12 +121,11 @@ fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], Error> {
 /// No database writes. All IDs and the CAS request are fixed before returning.
 pub fn prepare(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     edit: &Edit<'_>,
 ) -> Result<Operation, Error> {
-    let (selected, original) = selection::read(request, trust, deadline, epoch)
+    let (selected, original) = selection::read(request, deadline, epoch)
         .map_err(Error::Selection)?
         .ok_or(Error::MissingSelection)?;
     let ids = editor::accounts(original.shared()).map_err(Error::Edit)?;
@@ -162,7 +161,7 @@ pub fn prepare(
             source,
         });
     }
-    let candidate = configuration::prepare(request, trust, deadline, epoch, &shared, &profiles)
+    let candidate = configuration::prepare(request, deadline, epoch, &shared, &profiles)
         .map_err(Error::Configuration)?;
     let version = versions::fresh_version().map_err(Error::Version)?;
     let change = selection::prepare(epoch, selected.generation, version, &candidate)
@@ -205,27 +204,24 @@ fn source_bytes(candidate: &Candidate) -> Result<Vec<u8>, Error> {
 /// or that any service has restarted. Absence never permits new operation IDs.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: &Operation,
 ) -> Result<Option<Selection>, Error> {
-    selection::inspect(request, trust, deadline, operation.change).map_err(Error::Selection)
+    selection::inspect(request, deadline, operation.change).map_err(Error::Selection)
 }
 
 pub fn apply(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: &Operation,
 ) -> Result<Selection, Error> {
-    if let Some(receipt) = inspect(request, trust, deadline, operation)? {
+    if let Some(receipt) = inspect(request, deadline, operation)? {
         return Ok(receipt);
     }
     let (shared, profiles) =
         versions::decode(&operation.source, operation.change.epoch()).map_err(Error::Version)?;
     let candidate = configuration::prepare(
         request,
-        trust,
         deadline,
         operation.change.epoch(),
         shared,
@@ -240,15 +236,9 @@ pub fn apply(
         return Err(Error::Integrity);
     }
     if let Some(creation) = operation.creation {
-        accounts::publish(request, trust, deadline, creation).map_err(Error::Account)?;
+        accounts::publish(request, deadline, creation).map_err(Error::Account)?;
     }
-    versions::publish(
-        request,
-        trust,
-        deadline,
-        operation.change.version(),
-        &candidate,
-    )
-    .map_err(Error::Version)?;
-    selection::publish(request, trust, deadline, operation.change).map_err(Error::Selection)
+    versions::publish(request, deadline, operation.change.version(), &candidate)
+        .map_err(Error::Version)?;
+    selection::publish(request, deadline, operation.change).map_err(Error::Selection)
 }

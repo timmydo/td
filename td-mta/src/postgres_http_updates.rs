@@ -19,7 +19,6 @@ use crate::{
     },
 };
 use std::{
-    path::Path,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -40,28 +39,24 @@ impl Operation {
     fn inspect(
         &self,
         connection: &postgres_probe::Request<'_>,
-        trust: &td_crypto::TrustStore,
         deadline: Instant,
     ) -> Result<Option<changes::BatchOutcome>, changes::Error> {
         match self {
-            Self::Update(value) => changes::inspect_batch(connection, trust, deadline, value),
-            Self::Destroy(value) => deletion::inspect(connection, trust, deadline, value),
-            Self::Filing(value) => filing::inspect(connection, trust, deadline, value),
+            Self::Update(value) => changes::inspect_batch(connection, deadline, value),
+            Self::Destroy(value) => deletion::inspect(connection, deadline, value),
+            Self::Filing(value) => filing::inspect(connection, deadline, value),
         }
     }
     fn publish(
         &self,
         connection: &postgres_probe::Request<'_>,
-        trust: &td_crypto::TrustStore,
         deadline: Instant,
         password: &[u8],
     ) -> Result<changes::BatchOutcome, changes::Error> {
         match self {
-            Self::Update(value) => {
-                changes::publish_batch(connection, trust, deadline, value, password)
-            }
-            Self::Destroy(value) => deletion::publish(connection, trust, deadline, value, password),
-            Self::Filing(value) => filing::publish(connection, trust, deadline, value, password),
+            Self::Update(value) => changes::publish_batch(connection, deadline, value, password),
+            Self::Destroy(value) => deletion::publish(connection, deadline, value, password),
+            Self::Filing(value) => filing::publish(connection, deadline, value, password),
         }
     }
 }
@@ -174,14 +169,10 @@ impl Pending {
     pub fn settle(
         &self,
         loaded: &Loaded,
-        executable: &Path,
         settlement_slots: &ReadSlots,
         clock: &RuntimeClock,
         until: Deadline,
     ) -> Result<Option<Settled>, Error> {
-        if !executable.is_absolute() {
-            return Err(Error::Invalid);
-        }
         let mut pending = self.change.try_lock().map_err(|_| Error::Busy)?;
         if pending.is_none() {
             return Ok(None);
@@ -197,7 +188,7 @@ impl Pending {
         settle_held(&mut pending, loaded, settlement_slots, deadline)
     }
 }
-/// Inspect only at the retained endpoint (section 165).
+/// Inspect only at the retained socket (section 165).
 fn settle_held(
     pending: &mut Option<Retained<Operation>>,
     loaded: &Loaded,
@@ -208,10 +199,10 @@ fn settle_held(
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| Error::Busy)?;
-    let connection = settlement::request(loaded, held.endpoint);
+    let connection = settlement::request(loaded);
     let Some(outcome) = held
         .change
-        .inspect(&connection, &loaded.trust, deadline)
+        .inspect(&connection, deadline)
         .map_err(map_error)?
     else {
         *pending = None;
@@ -225,7 +216,6 @@ fn settle_held(
 /// Borrows the request secret only for this synchronous call. No background SQL.
 pub struct Updates<'a> {
     pub loaded: &'a Loaded,
-    pub executable: &'a Path,
     pub binding: &'a Binding,
     pub slots: &'a ReadSlots,
     pub clock: &'a RuntimeClock,
@@ -353,8 +343,7 @@ impl Updates<'_> {
         })
     }
     fn apply(&self, request: MutationRequest<'_>, meter: &mut Meter) -> Result<Completion, Error> {
-        if !self.executable.is_absolute()
-            || !self.binding.roles().jmap()
+        if !self.binding.roles().jmap()
             || self.loaded.bootstrap.profile() != self.binding.profile()
             || request.account != self.binding.account()
             || Presented::parse(self.password).is_none_or(|value| value.id() != request.device)
@@ -414,34 +403,8 @@ impl Updates<'_> {
             request.device,
             request.expected.map(|(_, sequence)| sequence.number()),
         )?;
-        let dns_deadline = deadline.min(
-            Instant::now()
-                .checked_add(Duration::from_secs(5))
-                .ok_or(Error::Invalid)?,
-        );
-        let addresses = crate::postgres_resolver::resolve(
-            self.executable,
-            &self.loaded.bootstrap,
-            dns_deadline,
-        )
-        .map_err(|error| match error {
-            crate::postgres_resolver::Error::Deadline => Error::Deadline,
-            _ => Error::Dns,
-        })?;
-        let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-        let mut endpoint = None;
-        for address in addresses {
-            endpoint = Some(address);
-            let connection = settlement::request(self.loaded, address);
-            outcome = change.publish(&connection, &self.loaded.trust, deadline, self.password);
-            if !matches!(
-                outcome,
-                Err(changes::Error::Connection(postgres_probe::Error::Transport))
-            ) {
-                break;
-            }
-        }
-        match outcome {
+        let connection = settlement::request(self.loaded);
+        match change.publish(&connection, deadline, self.password) {
             Ok(outcome) => {
                 if outcome.results.len() != request.input.len() {
                     return Err(Error::Corrupt);
@@ -461,11 +424,7 @@ impl Updates<'_> {
                 })
             }
             Err(changes::Error::Indeterminate) => {
-                *pending = Some(Retained::new(
-                    change,
-                    endpoint.ok_or(Error::Invalid)?,
-                    self.binding.account(),
-                ));
+                *pending = Some(Retained::new(change, self.binding.account()));
                 Ok(Completion {
                     before_sequence: Sequence::from_u64(0),
                     outcome: Err(CommitFailure::Indeterminate(Error::WriterStopped)),

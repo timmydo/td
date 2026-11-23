@@ -105,7 +105,7 @@ The direct dependencies are the local `td-alloc`, `td-civil`, `td-crypto`,
 `td-fs` crates; td-mta has no direct external dependency. `td-postgres` is
 the synchronous PostgreSQL client (td-postgres/DESIGN.md). Std-only `td-fs` owns
 bounded private Unix socket dialing and checks, real-file opening, bounded
-reads, file replacement and disposable fixture directories. POSTGRES.md, [8. Connection, bootstrap and serving startup](POSTGRES.md#8-connection-bootstrap-and-serving-startup), owns the verified-TLS or explicit private Unix transport, SCRAM
+reads, file replacement and disposable fixture directories. POSTGRES.md, [8. Connection, bootstrap and serving startup](POSTGRES.md#8-connection-bootstrap-and-serving-startup), owns the Unix socket transport, SCRAM
 connection probe and PostgreSQL serving contract. The client's SCRAM uses
 td-primitives and accepts only ASCII passwords, so it needs no Unicode
 preparation; it does not replace td-crypto or td-mime. Application protocols, configuration and scheduling use std plus
@@ -917,8 +917,7 @@ Linux descriptor readiness. The x86-64 and aarch64 `ppoll` wrapper in
 `readiness_sys.rs` borrows connected sockets, listeners and wake receivers
 through each deadline-bounded wait. HTTPS and direct SMTP each wait on a
 fixed set sized for a private wake receiver, 16 listeners and 96 client slots.
-Single-connection transport waits, the transitional PostgreSQL TLS stream's
-included, use one entry. The dedicated
+Single-connection transport waits use one entry. The dedicated
 HTTP-01 responder waits on its private stop receiver, one TCP listener and
 up to eight connected TCP sockets. UNSAFE.md
 section 22 pins the syscall ABI.
@@ -1383,13 +1382,12 @@ SMTP and JMAP so unauthenticated connections cannot starve an authenticated
 mail reader or health checks. Resolve configured outbound hostnames using a
 bounded std-only DNS adapter with explicit UDP/TCP deadlines and A/AAAA/CNAME
 limits; do not hide uninterruptible resolver work in unbounded threads.
-The PostgreSQL bootstrap/writer endpoint is a separate cold-path exception:
-POSTGRES.md, [Writer endpoint resolution](POSTGRES.md#writer-endpoint-resolution), uses a disposable, deadline-owned system-resolver
-process with a five-second cap. A parsed bootstrap can reuse a positive
-answer for one second from lookup start. The child uses the trusted platform
-resolver, which supplies no TTL. Outbound HTTPS clients, including the
-native ACME worker and replica copying, resolve their fixed origin through
-the same helper. Mail-routing DNS uses its own Resolver port.
+Outbound HTTPS clients, including the native ACME worker, replica copying
+and the migration source, are a separate cold-path exception: they resolve
+their fixed origin through the [System-resolver helper](#system-resolver-helper).
+The database needs no lookup: it is reached only over its Unix socket
+(POSTGRES.md). Mail-routing DNS uses its own Resolver port.
+
 Never perform recipient-MX lookups for outbound mail. Saturation produces SMTP
 temporary failure, HTTP/JMAP limit responses, or bounded retry, as appropriate.
 
@@ -1498,7 +1496,8 @@ No raw-host registration API admits incoming names, alias targets or
 arbitrary application destinations. The service owner has two fixed
 endpoint slots; offline migration's separately authorized temporary
 destination is outside this service owner. The native ACME worker does not
-use this owner; it resolves through the system-resolver helper above.
+use this owner; it resolves through the
+[System-resolver helper](#system-resolver-helper).
 
 The cache binding includes that generation, canonical configured
 hostnames (including optional ACME presence), and ordered numeric resolver
@@ -1558,6 +1557,36 @@ or storage failure. Do not use catch_unwind as storage recovery. An unexpected
 worker failure makes health fail and the service stop accepting new mutations;
 restart recovers committed state. A supervisor restarts the process. Release
 tests cover both orderly shutdown and abrupt termination.
+
+### System-resolver helper
+
+`resolver::resolve_host` takes the caller's trusted absolute td-mta
+executable path, an already authorized ASCII DNS name and an absolute
+deadline at most five seconds away. Literal IPs, numeric address
+shorthand, numeric final labels and encoded hosts are refused before any
+child starts. It starts that executable in its private `--internal-resolve`
+mode with a cleared environment, hostname-only stdin, bounded stdout and
+discarded stderr. No URI, credential, profile or trust bytes enter the
+child, and no answer is cached: every lookup consults the system resolver.
+
+The child uses the platform resolver and may consult trusted host resolver
+configuration, which supplies no TTL. Blocking libc/NSS resolution stays
+outside service workers. The parent polls child completion, kills and reaps
+it on deadline or error, and admits only a complete versioned response with
+at most sixteen unique IP addresses and 1024 bytes. IPv6 scope IDs are
+unsupported. The child checks the same DNS-name policy and caps result
+traversal at 128 addresses. It writes only after complete validation,
+within pipe capacity; no streaming partial result is accepted.
+
+Before reading stdin, the child starts a watchdog that exits its whole
+process after five seconds. This requests expiry after parent loss and
+during blocked input/read/lookup; native exit cleanup may delay it. The
+internal entry point always exits; it cannot leave a watchdog behind in a
+serving process. Ordinary shutdown still owns and reaps an in-flight
+helper. Native process creation, scheduling, kill/reaping, native exit
+cleanup and filesystem/libc calls retain the platform's between-call
+limitations; this is not a hard real-time or resolver RSS claim. The child
+uses no shell, external resolver program or new dependency.
 
 ## 6. Configuration and local administration
 

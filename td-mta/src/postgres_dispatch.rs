@@ -18,7 +18,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 
 #[path = "postgres_dispatch_expiry.rs"]
 mod expiration;
@@ -55,12 +54,11 @@ impl From<ports::Error> for Error {
         Self::Admission(error)
     }
 }
-/// A trusted caller resolves and selects one primary before admission. It owns
+/// A trusted caller selects the primary's socket before admission. It owns
 /// primary-change notification and shares this runtime clock with its guard.
-/// No address fallback, DNS work or credential retention occurs here.
+/// No reconnection, DNS work or credential retention occurs here.
 pub struct Connection<'a, 'r> {
     pub request: &'a Request<'r>,
-    pub trust: &'a TrustStore,
     pub slots: &'a ReadSlots,
     pub clock: Arc<RuntimeClock>,
 }
@@ -197,36 +195,24 @@ impl Pending {
         let limit = connection.admit(until, meter, io)?;
         let _slot = connection.slots.acquire().map_err(|_| ports::Error::Busy)?;
         let outcome = match operation {
-            Operation::Dispatch(value) => {
-                attempts::inspect(connection.request, connection.trust, limit, value)
-                    .map_err(Error::Publication)?
-                    .map(Settlement::Dispatch)
-            }
-            Operation::Phase(value) => {
-                phases::inspect(connection.request, connection.trust, limit, value)
-                    .map_err(Error::Phase)?
-                    .map(Settlement::Phase)
-            }
-            Operation::Recovery(value) => {
-                recovery::inspect(connection.request, connection.trust, limit, value)
-                    .map_err(Error::Recovery)?
-                    .map(Settlement::Recovery)
-            }
-            Operation::RouteFailure(value) => {
-                health::inspect(connection.request, connection.trust, limit, value)
-                    .map_err(Error::RouteFailure)?
-                    .map(Settlement::RouteFailure)
-            }
-            Operation::Expiry(value) => {
-                expiry::inspect(connection.request, connection.trust, limit, value)
-                    .map_err(Error::Expiry)?
-                    .map(Settlement::Expiry)
-            }
-            Operation::RouteClaim(value) => {
-                owners::inspect(connection.request, connection.trust, limit, value)
-                    .map_err(Error::Owner)?
-                    .map(Settlement::RouteClaim)
-            }
+            Operation::Dispatch(value) => attempts::inspect(connection.request, limit, value)
+                .map_err(Error::Publication)?
+                .map(Settlement::Dispatch),
+            Operation::Phase(value) => phases::inspect(connection.request, limit, value)
+                .map_err(Error::Phase)?
+                .map(Settlement::Phase),
+            Operation::Recovery(value) => recovery::inspect(connection.request, limit, value)
+                .map_err(Error::Recovery)?
+                .map(Settlement::Recovery),
+            Operation::RouteFailure(value) => health::inspect(connection.request, limit, value)
+                .map_err(Error::RouteFailure)?
+                .map(Settlement::RouteFailure),
+            Operation::Expiry(value) => expiry::inspect(connection.request, limit, value)
+                .map_err(Error::Expiry)?
+                .map(Settlement::Expiry),
+            Operation::RouteClaim(value) => owners::inspect(connection.request, limit, value)
+                .map_err(Error::Owner)?
+                .map(Settlement::RouteClaim),
         };
         *pending = None;
         Ok(outcome)
@@ -278,7 +264,6 @@ impl<'a, 'r> Dispatches<'a, 'r> {
             .map_err(|_| ports::Error::Busy)?;
         let page = crate::postgres_queue_candidates::scan(
             self.connection.request,
-            self.connection.trust,
             limit,
             claim,
             generation,
@@ -361,7 +346,6 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         };
         let result = publish(
             self.connection.request,
-            self.connection.trust,
             limit,
             value,
             self.connection.clock.clone(),
@@ -416,8 +400,7 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         let Some(Operation::Recovery(value)) = pending.as_ref() else {
             return Err(ports::Error::Invalid.into());
         };
-        let result =
-            recovery::publish(self.connection.request, self.connection.trust, limit, value);
+        let result = recovery::publish(self.connection.request, limit, value);
         match result {
             Ok(outcome) => {
                 *pending = None;
@@ -558,7 +541,6 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         };
         check(
             worker.connection.request,
-            worker.connection.trust,
             limit,
             value,
             worker.connection.clock.clone(),
@@ -676,7 +658,6 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
             .map_err(|_| ports::Error::Busy)?;
         match attempts::body_mode(
             self.worker.connection.request,
-            self.worker.connection.trust,
             limit,
             &self.published.dispatch,
             maximum,
@@ -792,7 +773,6 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
             .map_err(|_| ports::Error::Busy)?;
         attempts::observe_envelope(
             worker.connection.request,
-            worker.connection.trust,
             limit,
             &self.published.dispatch,
             worker.connection.clock.clone(),
@@ -974,7 +954,6 @@ impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
             .map_err(|_| ports::Error::Busy)?;
         let checks = attempts::EnvelopeChecks::transfer(
             worker.connection.request,
-            worker.connection.trust,
             limit,
             &self.prepared.published.dispatch,
             worker.connection.clock.clone(),
@@ -1678,7 +1657,6 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
         self.final_plan.work.limit = limit;
         Ok(BodySourceWork {
             request: worker.connection.request,
-            trust: worker.connection.trust,
             limit,
             _first: first,
             _second: second,
@@ -1718,7 +1696,6 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
             .map_err(|_| ports::Error::Busy)?;
         let checks = phases::BodyChecks::transfer(
             worker.connection.request,
-            worker.connection.trust,
             limit,
             &self.body.body,
             worker.connection.clock.clone(),
@@ -1766,7 +1743,6 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
 // inside with_body before either independently reserved source permit drops.
 pub(crate) struct BodySourceWork<'s, 'a, 'r> {
     request: &'a Request<'r>,
-    trust: &'a TrustStore,
     limit: Instant,
     _first: ReadPermit<'s>,
     _second: ReadPermit<'s>,
@@ -1778,7 +1754,7 @@ impl BodySourceWork<'_, '_, '_> {
         maximum: u64,
         read: impl FnOnce(attempts::BodyMetadata, &mut dyn ports::BlobReader) -> Result<T, ports::Error>,
     ) -> Result<T, attempts::ReadError> {
-        attempts::with_body(self.request, self.trust, self.limit, value, maximum, read)
+        attempts::with_body(self.request, self.limit, value, maximum, read)
     }
 }
 
@@ -2078,14 +2054,13 @@ fn publish_phase(
             };
             publish(
                 connection.request,
-                connection.trust,
                 limit,
                 value,
                 connection.clock.clone(),
                 guard.clone(),
             )
         }
-        None => phases::publish(connection.request, connection.trust, limit, value),
+        None => phases::publish(connection.request, limit, value),
     };
     match result {
         Ok(outcome) => {

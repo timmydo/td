@@ -12,7 +12,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
-use td_crypto::TrustStore;
 
 /// Thread-bound passive envelope validator. Every successful check acknowledges
 /// rollback before returning, with cumulative protocol bounds and the original
@@ -30,35 +29,32 @@ pub struct EnvelopeChecks {
 impl EnvelopeChecks {
     pub fn open(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         value: &Dispatch,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
     ) -> Result<Self, Error> {
-        Self::open_profile(request, trust, deadline, value, clock, guard, None)
+        Self::open_profile(request, deadline, value, clock, guard, None)
     }
     pub(crate) fn transfer(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         value: &Dispatch,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
         budget: ValidationBudget,
     ) -> Result<Self, Error> {
-        Self::open_profile(request, trust, deadline, value, clock, guard, Some(budget))
+        Self::open_profile(request, deadline, value, clock, guard, Some(budget))
     }
     fn open_profile(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         value: &Dispatch,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
         budget: Option<ValidationBudget>,
     ) -> Result<Self, Error> {
-        let worker = postgres_probe::validation_worker(request, trust, deadline, budget)
+        let worker = postgres_probe::validation_worker(request, deadline, budget)
             .map_err(Error::Connection)?;
         Ok(Self {
             worker: Some(worker),

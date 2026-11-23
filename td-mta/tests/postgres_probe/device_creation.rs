@@ -1,6 +1,5 @@
 use super::{command_output, deadline, sql, Fixture, PASSWORD};
 use std::{fs, os::unix::fs::PermissionsExt};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, DeviceId, StoreEpoch},
     postgres_accounts, postgres_devices as devices, postgres_schema,
@@ -10,14 +9,12 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_device_creation_command_discloses_only_known_success() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
     postgres_accounts::publish(
         &fixture.request(),
-        &trust,
         deadline(),
         postgres_accounts::prepare(epoch, account).unwrap(),
     )
@@ -27,16 +24,14 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
     );
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://td_probe:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -68,7 +63,7 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
         assert!(!output.contains("invalid\nlabel"));
     }
     assert!(
-        devices::list(&fixture.request(), &trust, deadline(), epoch, account)
+        devices::list(&fixture.request(), deadline(), epoch, account)
             .unwrap()
             .is_empty()
     );
@@ -91,7 +86,6 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -100,7 +94,7 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
         .unwrap(),
         Some(id)
     );
-    let listed = devices::list(&fixture.request(), &trust, deadline(), epoch, account).unwrap();
+    let listed = devices::list(&fixture.request(), deadline(), epoch, account).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, id);
     assert_eq!(listed[0].label, label);
@@ -126,7 +120,6 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -159,7 +152,7 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
         ),
         "1|t"
     );
-    let listed = devices::list(&fixture.request(), &trust, deadline(), epoch, account).unwrap();
+    let listed = devices::list(&fixture.request(), deadline(), epoch, account).unwrap();
     assert!(listed.len() <= 2);
     if listed.iter().any(|row| row.id == uncertain_id) {
         let revoked = command_output(
@@ -198,7 +191,7 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
         .unwrap()
     };
     let listed = |fixture: &Fixture| {
-        devices::list(&fixture.request(), &trust, deadline(), epoch, account)
+        devices::list(&fixture.request(), deadline(), epoch, account)
             .unwrap()
             .len()
     };
@@ -228,21 +221,13 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
     // A revocation records the database's time, whatever was requested; a
     // retired credential stays unusable and cannot be revoked again.
     let retired = devices::prepare_creation(epoch, account, "retired", 1).unwrap();
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &retired).unwrap();
-    let check = |password: &[u8]| {
-        devices::check(
-            &fixture.request(),
-            &trust,
-            deadline(),
-            epoch,
-            account,
-            password,
-        )
-    };
+    devices::publish_creation(&fixture.request(), deadline(), &retired).unwrap();
+    let check =
+        |password: &[u8]| devices::check(&fixture.request(), deadline(), epoch, account, password);
     assert_eq!(check(retired.password()), Ok(Some(retired.device_id())));
     let revoke = devices::prepare_revocation(epoch, account, retired.device_id(), 2).unwrap();
     assert_eq!(
-        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        devices::publish_revocation(&fixture.request(), deadline(), &revoke),
         Ok(devices::RevocationOutcome::Recorded)
     );
     let id = format!("decode('{}','hex')", retired.device_id());
@@ -262,12 +247,12 @@ fn real_postgres_device_creation_command_discloses_only_known_success() {
         ),
     );
     let later = devices::prepare_creation(epoch, account, "later", 1).unwrap();
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &later).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &later).unwrap();
     assert_eq!(count(&fixture, &format!(" WHERE id={id}")), 0);
     assert_eq!(check(retired.password()), Ok(None));
     let again = devices::prepare_revocation(epoch, account, retired.device_id(), 3).unwrap();
     assert_eq!(
-        devices::publish_revocation(&fixture.request(), &trust, deadline(), &again),
+        devices::publish_revocation(&fixture.request(), deadline(), &again),
         Err(devices::Error::Missing)
     );
 }

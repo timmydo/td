@@ -8,7 +8,6 @@ use crate::{
     postgres_schema,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -38,12 +37,11 @@ pub struct Report {
 /// delivery outcomes, policy, credentials or service-admission authority.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
 ) -> Result<Report, Error> {
-    let result=postgres_probe::with_client(request,trust,deadline,move |client| {
+    let result=postgres_probe::with_client(request,deadline,move |client| {
         let schema=client.inspect_schema().map_err(Error::Schema)?;
         if schema.store_epoch!=epoch { return Err(Error::Epoch); }
         client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_|Error::Database)?;

@@ -11,7 +11,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 const CHUNK: usize = 65536;
 
@@ -79,7 +79,6 @@ impl Material {
 /// generation publication are separate required boundaries.
 pub fn insert(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     version: Version,
@@ -99,7 +98,7 @@ pub fn insert(
     let count = i16::try_from(owned.len().div_ceil(CHUNK)).map_err(|_| Error::Invalid)?;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_material_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_material_client(request, deadline, move |client| {
         let receipt = client.inspect_schema().map_err(Error::Schema)?;
         if receipt.store_epoch != epoch {
             return Err(Error::Epoch);
@@ -135,7 +134,6 @@ pub fn insert(
 /// No raw bytes escape until length, ordinals and digest have all matched.
 pub fn read(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     version: Version,
@@ -152,7 +150,7 @@ pub fn read(
     } else {
         "SELECT ordinal, bytes FROM td_mta.config_material_chunks WHERE material_id = $1 ORDER BY ordinal LIMIT 3"
     };
-    let result = postgres_probe::with_material_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_material_client(request, deadline, move |client| {
         let receipt = client.inspect_schema().map_err(Error::Schema)?;
         if receipt.store_epoch != epoch {
             return Err(Error::Epoch);

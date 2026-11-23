@@ -3,7 +3,6 @@
 //! their upload bytes and retires each body nothing else reaches, so a full
 //! upload quota recovers instead of being a lifetime budget.
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -27,17 +26,12 @@ fn list(blobs: &[BlobId]) -> String {
 
 /// Runs on the upload fixture's account after its own checks, whose
 /// earlier uploads are the `old` leases here.
-pub(super) fn exercise(
-    fixture: &Fixture,
-    request: &Request<'_>,
-    trust: &TrustStore,
-    binding: &Binding,
-) {
+pub(super) fn exercise(fixture: &Fixture, request: &Request<'_>, binding: &Binding) {
     let account = binding.account();
     let acc = format!("decode('{account}','hex')");
     let creation =
         devices::prepare_creation(binding.epoch(), account, "reclamation fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let (device, password) = (creation.device_id(), creation.password());
     let clock = RuntimeClock::new();
     let publish = |bytes: &[u8]| {
@@ -54,7 +48,7 @@ pub(super) fn exercise(
             uploads::prepare_with_meter(binding, device, bytes, deadline(), &mut meter, &clock)
                 .unwrap();
         (
-            uploads::publish(request, trust, deadline(), &upload, password),
+            uploads::publish(request, deadline(), &upload, password),
             upload.blob(),
         )
     };
@@ -67,7 +61,7 @@ pub(super) fn exercise(
         <[i64; 3]>::try_from(values).unwrap()
     };
     let audited = || {
-        let report = audit::inspect(request, trust, deadline(), binding.epoch(), account).unwrap();
+        let report = audit::inspect(request, deadline(), binding.epoch(), account).unwrap();
         let [body, blobs, upload] = usage();
         assert_eq!(
             (
@@ -90,7 +84,6 @@ pub(super) fn exercise(
     let read = |blob| {
         bodies::with_blob(
             request,
-            trust,
             deadline(),
             bodies::BlobRequest {
                 binding,

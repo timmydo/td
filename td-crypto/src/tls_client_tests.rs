@@ -93,7 +93,7 @@ fn client_configuration_pins_policy_and_redacts_state() {
     fn shareable<T: Send + Sync>() {}
     shareable::<ClientConfig>();
     let roots = TrustStore::public_roots().unwrap();
-    for protocol in [TlsProtocol::Http1, TlsProtocol::Smtp, TlsProtocol::Postgres] {
+    for protocol in [TlsProtocol::Http1, TlsProtocol::Smtp] {
         let (_, clock) = clock();
         let config = ClientConfig::new(&roots, clock.clone(), protocol).unwrap();
         let native = &config.native;
@@ -176,7 +176,6 @@ fn client_configuration_verifies_trust_name_alpn_and_full_handshakes() {
     for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
         for (protocol, alpn) in [
             (TlsProtocol::Smtp, None),
-            (TlsProtocol::Postgres, None),
             (TlsProtocol::Http1, None),
             (TlsProtocol::Http1, Some(b"http/1.1".as_slice())),
         ] {

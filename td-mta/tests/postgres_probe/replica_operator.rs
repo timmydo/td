@@ -3,7 +3,6 @@ use super::{
     PASSWORD,
 };
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
-use td_crypto::TrustStore;
 use td_mta::{
     postgres_replica_source::{self, Source},
     postgres_schema,
@@ -13,17 +12,13 @@ use td_mta::{
 pub(super) fn exercise(origin: &str, source_ca: &[u8], password: &[u8], binding: Binding) {
     let fixture = Fixture::new();
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let source = Source::new(origin, binding.epoch).unwrap();
-    postgres_replica_source::initialize(&fixture.request(), &trust, deadline(), epoch, &source)
-        .unwrap();
-    let ca = fixture.root.join("local-ca.pem");
+    postgres_replica_source::initialize(&fixture.request(), deadline(), epoch, &source).unwrap();
     let remote_ca = fixture.root.join("source-ca.pem");
     let secret = fixture.root.join("source-password");
-    fs::write(&ca, &fixture.ca).unwrap();
     fs::write(&remote_ca, source_ca).unwrap();
     fs::write(&secret, [password, b"\r\n"].concat()).unwrap();
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
@@ -32,10 +27,10 @@ pub(super) fn exercise(origin: &str, source_ca: &[u8], password: &[u8], binding:
         fs::write(
             &path,
             format!(
-                "postgresql://{user}:{}@localhost:{}/postgres?sslrootcert={}\n",
+                "postgresql://{user}:{}@:{}/postgres?host={}\n",
                 std::str::from_utf8(PASSWORD).unwrap(),
                 fixture.port,
-                ca.display()
+                fixture.root.display()
             ),
         )
         .unwrap();

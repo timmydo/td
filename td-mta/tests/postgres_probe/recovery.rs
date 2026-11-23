@@ -1,6 +1,5 @@
 use super::{deadline, sql, wait_command, Fixture, ProbeChild, PASSWORD};
 use std::{fs, process::Stdio};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, StoreEpoch},
     postgres_accounts,
@@ -13,14 +12,12 @@ use td_mta::{
 #[ignore = "real local PostgreSQL 17 tools and private trusted TMPDIR required"]
 pub(super) fn real_postgres_restore_quarantines_pending_delivery_and_changes_epoch() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
-    let old = postgres_schema::initialize(&owner, &trust, deadline())
+    let old = postgres_schema::initialize(&owner, deadline())
         .unwrap()
         .store_epoch;
     postgres_accounts::publish(
         &owner,
-        &trust,
         deadline(),
         postgres_accounts::prepare(old, AccountId::from_bytes([1; 16])).unwrap(),
     )
@@ -46,15 +43,9 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
         let mut command = fixture.command(name);
         command
             .env("PGPASSWORD", std::str::from_utf8(PASSWORD).unwrap())
-            .env("PGSSLMODE", "require")
-            .args([
-                "-h",
-                "localhost",
-                "-p",
-                &fixture.port.to_string(),
-                "-U",
-                "td_probe",
-            ]);
+            .arg("-h")
+            .arg(fixture.root.path())
+            .args(["-p", &fixture.port.to_string(), "-U", "td_probe"]);
         let mut child = ProbeChild(
             command
                 .args(extra)
@@ -85,16 +76,15 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
         ],
     );
     assert_eq!(
-        postgres_schema::inspect(&owner, &trust, deadline())
+        postgres_schema::inspect(&owner, deadline())
             .unwrap()
             .store_epoch,
         old
     );
     let account = AccountId::from_bytes([1; 16]);
-    let before_usage =
-        td_mta::postgres_usage_audit::inspect(&owner, &trust, deadline(), old, account)
-            .unwrap()
-            .usage;
+    let before_usage = td_mta::postgres_usage_audit::inspect(&owner, deadline(), old, account)
+        .unwrap()
+        .usage;
     let plan = Plan {
         old_epoch: old,
         new_epoch: StoreEpoch::from_bytes([0x44; 16]),
@@ -104,7 +94,6 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
     let release = |plan| {
         postgres_recovery::release(
             &owner,
-            &trust,
             deadline(),
             plan,
             ExternalChecks::InstancesAndSmtpFencedAndConfigurationReviewed,
@@ -113,7 +102,6 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
     assert_eq!(release(plan), Err(Error::BarrierRequired));
     postgres_maintenance::enter(
         &owner,
-        &trust,
         deadline(),
         old,
         ExternalFence::InstancesAndSmtpEgressStopped,
@@ -145,7 +133,7 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
         "3"
     );
     assert_eq!(
-        postgres_schema::inspect(&owner, &trust, deadline())
+        postgres_schema::inspect(&owner, deadline())
             .unwrap()
             .store_epoch,
         old
@@ -159,14 +147,13 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
     assert_eq!(report.completed_submissions, 4);
     assert_eq!(report.epoch, plan.new_epoch);
     assert_eq!(
-        td_mta::postgres_usage_audit::inspect(&owner, &trust, deadline(), plan.new_epoch, account)
+        td_mta::postgres_usage_audit::inspect(&owner, deadline(), plan.new_epoch, account)
             .unwrap()
             .usage,
         before_usage
     );
     assert!(td_mta::postgres_blob_audit::inspect(
         &owner,
-        &trust,
         deadline(),
         plan.new_epoch,
         account,
@@ -240,7 +227,7 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
         "t"
     );
     assert_eq!(
-        postgres_maintenance::inspect(&owner, &trust, deadline(), plan.new_epoch),
+        postgres_maintenance::inspect(&owner, deadline(), plan.new_epoch),
         Ok(false)
     );
     assert_eq!(release(plan), Err(Error::Epoch));
@@ -254,14 +241,12 @@ pub(super) fn real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch()
         time::{Duration, Instant},
     };
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
-    let old = postgres_schema::initialize(&owner, &trust, deadline())
+    let old = postgres_schema::initialize(&owner, deadline())
         .unwrap()
         .store_epoch;
     postgres_maintenance::enter(
         &owner,
-        &trust,
         deadline(),
         old,
         ExternalFence::InstancesAndSmtpEgressStopped,
@@ -277,7 +262,6 @@ pub(super) fn real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch()
     assert_eq!(
         postgres_recovery::release(
             &owner,
-            &trust,
             Instant::now() + Duration::from_secs(2),
             plan,
             ExternalChecks::InstancesAndSmtpFencedAndConfigurationReviewed
@@ -294,19 +278,18 @@ pub(super) fn real_postgres_recovery_uncertain_commit_keeps_retained_new_epoch()
         thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(
-        postgres_schema::inspect(&owner, &trust, deadline())
+        postgres_schema::inspect(&owner, deadline())
             .unwrap()
             .store_epoch,
         plan.new_epoch
     );
     assert_eq!(
-        postgres_maintenance::inspect(&owner, &trust, deadline(), plan.new_epoch),
+        postgres_maintenance::inspect(&owner, deadline(), plan.new_epoch),
         Ok(false)
     );
     assert_eq!(
         postgres_recovery::release(
             &owner,
-            &trust,
             deadline(),
             plan,
             ExternalChecks::InstancesAndSmtpFencedAndConfigurationReviewed

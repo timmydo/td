@@ -3714,9 +3714,9 @@ streams; SMTP uses at most 64 of them. SMTP borrows TCP sockets. HTTPS also
 admits Unix sockets. The ACME HTTP-01 responder borrows a private stop
 receiver, at most one TCP listener and up to eight connected TCP sockets.
 Only connected sockets can request writable
-readiness. The single-socket transport wait, which the transitional
-PostgreSQL TLS stream also uses, passes one connected TCP socket and no
-wake receiver; a PostgreSQL Unix connection does not use `ppoll`.
+readiness. The single-socket transport wait passes one connected TCP
+socket and no wake receiver; a PostgreSQL connection does not use
+`ppoll`.
 All descriptors remain borrowed through the call. The syscall receives
 the length of the initialized slice and a mutable two-i64 timespec. Its
 signal mask is null and the mask size argument is eight. The kernel

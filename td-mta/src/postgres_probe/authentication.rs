@@ -8,16 +8,11 @@ use crate::{
     postgres_snapshot,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 pub(crate) struct AuthenticationSession(ReadSession);
 impl AuthenticationSession {
-    pub(crate) fn open(
-        request: &Request<'_>,
-        trust: &TrustStore,
-        deadline: Instant,
-    ) -> Result<Self, Error> {
-        ReadSession::open(request, trust, deadline).map(Self)
+    pub(crate) fn open(request: &Request<'_>, deadline: Instant) -> Result<Self, Error> {
+        ReadSession::open(request, deadline).map(Self)
     }
     pub(crate) fn reusable(&self, deadline: Instant) -> bool {
         self.0.reusable(deadline)

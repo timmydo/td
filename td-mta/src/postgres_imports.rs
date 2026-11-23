@@ -8,7 +8,6 @@ use crate::{
     postgres_selection::{self, Selection},
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 mod email;
 mod folders;
 mod mailbox;
@@ -50,7 +49,6 @@ pub struct Outcome {
 }
 pub fn prepare(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
@@ -58,7 +56,7 @@ pub fn prepare(
     if request.mode != Mode::Preparation {
         return Err(Error::Owner);
     }
-    postgres_probe::with_client(request, trust, deadline, |client| {
+    postgres_probe::with_client(request, deadline, |client| {
         let receipt =
             crate::postgres_schema::lock_and_inspect(client).map_err(|_| Error::Database)?;
         if receipt.store_epoch != epoch {
@@ -67,7 +65,7 @@ pub fn prepare(
         crate::postgres_maintenance::owner(client).map_err(|_| Error::Owner)
     })
     .map_err(Error::Connection)??;
-    let (selection, candidate) = postgres_selection::read(request, trust, deadline, epoch)
+    let (selection, candidate) = postgres_selection::read(request, deadline, epoch)
         .map_err(|_| Error::Policy)?
         .ok_or(Error::Policy)?;
     let accounts =
@@ -179,7 +177,6 @@ fn mapped_row(
 pub const MAX_MAPPING_BATCH: usize = 256;
 pub fn inspect_mappings(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     keys: &[Key],
@@ -203,7 +200,7 @@ pub fn inspect_mappings(
     let count = keys.len();
     let first = first.clone();
     let authority = authority.clone();
-    postgres_probe::with_batch_client(request, trust, deadline, move |client| {
+    postgres_probe::with_batch_client(request, deadline, move |client| {
             let receipt = crate::postgres_schema::lock_and_inspect(client).map_err(|_| Error::Database)?;
             if receipt.store_epoch != authority.epoch {
                 return Err(Error::Epoch);
@@ -279,18 +276,16 @@ fn publication_error(error: crate::postgres_publication::Error) -> Error {
 /// Account locking makes an absent receipt conclusive after a pending writer.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     key: &Key,
     digest: &[u8; 32],
 ) -> Result<Option<Outcome>, Error> {
-    inspect_policy(request, trust, deadline, authority, key, Some(digest))
+    inspect_policy(request, deadline, authority, key, Some(digest))
 }
 /// Presence of an exact source receipt is a skip, not synchronization evidence.
 pub fn inspect_mapping(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     key: &Key,
@@ -301,11 +296,10 @@ pub fn inspect_mapping(
     ) {
         return Err(Error::Invalid);
     }
-    inspect_policy(request, trust, deadline, authority, key, None)
+    inspect_policy(request, deadline, authority, key, None)
 }
 fn inspect_policy(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     key: &Key,
@@ -317,7 +311,7 @@ fn inspect_policy(
     let authority = authority.clone();
     let key = key.clone();
     let digest = digest.copied();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         let receipt =
             crate::postgres_schema::lock_and_inspect(client).map_err(|_| Error::Database)?;
         if receipt.store_epoch != authority.epoch {

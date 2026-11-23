@@ -35,20 +35,18 @@ impl Deletion {
 }
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     deletion: &Deletion,
 ) -> Result<Option<BatchOutcome>, Error> {
-    inspect_record(request, trust, deadline, &deletion.0)
+    inspect_record(request, deadline, &deletion.0)
 }
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     deletion: &Deletion,
     password: &[u8],
 ) -> Result<BatchOutcome, Error> {
-    publish_record(request, trust, deadline, &deletion.0, password)
+    publish_record(request, deadline, &deletion.0, password)
 }
 
 pub(super) fn apply(

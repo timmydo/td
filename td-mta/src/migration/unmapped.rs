@@ -21,8 +21,8 @@ pub(super) fn run(
         InstanceId::parse(string(source, "instance")?).map_err(|_| "migration-invalid-source")?;
     let source_account = string(source, "account")?.as_bytes();
     let folders = Folders::new(array(&manifest, "mailboxes")?)?;
-    let (loaded, address, authority) = import::connect(connection, epoch, account)?;
-    let request = loaded.bootstrap.request(address);
+    let (loaded, authority) = import::connect(connection, epoch, account)?;
+    let request = loaded.bootstrap.request();
     let mut created_mailboxes = 0usize;
     let mut created_messages = 0usize;
     let mut adopted_mailboxes = 0usize;
@@ -33,14 +33,9 @@ pub(super) fn run(
         let id = string(record, "id")?;
         let key = Key::new(instance, SourceKind::Mailbox, source_account, id.as_bytes())
             .map_err(|_| "migration-unrepresentable")?;
-        if let Some(outcome) = database::inspect_mapping(
-            &request,
-            &loaded.trust,
-            import::deadline(),
-            &authority,
-            &key,
-        )
-        .map_err(import::code)?
+        if let Some(outcome) =
+            database::inspect_mapping(&request, import::deadline(), &authority, &key)
+                .map_err(import::code)?
         {
             absent += usize::from(!outcome.present);
             skipped_mailboxes += 1;
@@ -53,7 +48,6 @@ pub(super) fn run(
             .ok_or("migration-missing-parent")?;
         let outcome = database::publish_unmapped_mailbox(
             &request,
-            &loaded.trust,
             import::deadline(),
             &authority,
             value,
@@ -84,14 +78,8 @@ pub(super) fn run(
                 .map_err(|_| "migration-unrepresentable")
             })
             .collect::<Result<Vec<_>>>()?;
-        let outcomes = database::inspect_mappings(
-            &request,
-            &loaded.trust,
-            import::deadline(),
-            &authority,
-            &keys,
-        )
-        .map_err(import::code)?;
+        let outcomes = database::inspect_mappings(&request, import::deadline(), &authority, &keys)
+            .map_err(import::code)?;
         if outcomes.len() != records.len() {
             return Err("migration-integrity");
         }
@@ -116,7 +104,6 @@ pub(super) fn run(
             let bytes = archive.read_body(body, *size)?;
             let outcome = database::publish_unmapped_email(
                 &request,
-                &loaded.trust,
                 import::email_deadline(value),
                 &authority,
                 value,

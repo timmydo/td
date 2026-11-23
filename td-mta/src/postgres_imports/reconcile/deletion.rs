@@ -25,7 +25,6 @@ pub enum Applied {
 
 pub fn plan(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     previous: &Email,
@@ -35,7 +34,7 @@ pub fn plan(
     }
     let authority = authority.clone();
     let previous = previous.clone();
-    postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
+    postgres_probe::with_reconcile_client(request, deadline, move |client| {
         let old = begin(client, &authority)?;
         let Some(receipt) = receipt(client, &authority, &previous.key, old)? else {
             return Ok(Plan::Unmapped);
@@ -68,7 +67,6 @@ pub fn plan(
 /// Caller owns explicit source-absence evidence and operator selection.
 pub fn apply(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     previous: &Email,
@@ -89,7 +87,7 @@ pub fn apply(
     let expected = expected.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_reconcile_client(request, deadline, move |client| {
         let old = begin(client, &authority)?;
         let receipt = receipt(client, &authority, &previous.key, old)?.ok_or(Error::Conflict)?;
         if receipt.local != expected.local

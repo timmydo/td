@@ -19,7 +19,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 pub const MAX_CREATES: usize = 256;
 pub const MAX_RECEIPTS: i64 = 1024;
@@ -333,12 +333,11 @@ fn receipt(client: &Client, creation: &Change) -> Result<Option<Outcome>, Error>
 /// Owner-side receipt resolution waits behind a prior account publisher.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     creation: &Change,
 ) -> Result<Option<Outcome>, Error> {
     let creation = creation.clone();
-    let result = postgres_probe::with_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_client(request, deadline, move |client| {
         begin(client, &creation)?;
         client
             .query_one(
@@ -358,12 +357,11 @@ pub fn inspect(
 /// success remains success after revocation; fresh writes require current state.
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     creation: &Change,
     password: &[u8],
 ) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, creation)? {
+    if let Some(outcome) = inspect(request, deadline, creation)? {
         return Ok(outcome);
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
@@ -373,7 +371,7 @@ pub fn publish(
     let creation = creation.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_batch_client(request, deadline, move |client| {
         begin(client, &creation)?;
         let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_|Error::Database)?;
         let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;

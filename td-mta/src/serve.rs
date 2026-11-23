@@ -103,60 +103,36 @@ fn run_once(
     let clock = Arc::new(RuntimeClock::new());
     let loaded = td_mta::postgres_input::Loaded::open(&options.connection, &options.profile)
         .map_err(|error| config_failure("postgres", error.code()))?;
-    let executable =
-        std::env::current_exe().map_err(|_| config_failure("postgres", "executable"))?;
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let addresses = td_mta::postgres_resolver::resolve(
-        &executable,
-        &loaded.bootstrap,
-        until.min(std::time::Instant::now() + std::time::Duration::from_secs(5)),
-    )
-    .map_err(|_| config_failure("postgres", "resolution"))?;
     let mut generations = td_mta::generations::GenerationSet::at_startup();
-    let mut prepared = None;
-    let mut selected_address = None;
-    let mut certificate_revisions = Vec::new();
-    for address in addresses {
-        let mut request = loaded.bootstrap.request(address);
-        request.mode = mode;
-        let schema = match td_mta::postgres_schema::inspect(&request, &loaded.trust, until) {
-            Ok(schema) => schema,
-            Err(td_mta::postgres_schema::Error::Connection(
-                td_mta::postgres_probe::Error::Transport,
-            )) => continue,
-            Err(_) => return Err(config_failure("postgres", "runtime-qualification")),
-        };
-        certificate_revisions =
-            td_mta::postgres_acme::generations(&request, &loaded.trust, until, schema.store_epoch)
-                .map_err(|_| config_failure("certificate", "database"))?;
-        prepared = Some(
-            td_mta::postgres_runtime_profile::load(
-                &request,
-                &loaded.trust,
-                until,
-                schema.store_epoch,
-                &options.profile,
-                generations
-                    .reserve()
-                    .map_err(|error| adapter("tls", error))?,
-            )
-            .map_err(|_| config_failure("postgres", "profile"))?,
-        );
-        selected_address = Some(address);
-        break;
-    }
-    let (published, retired) = prepared
-        .ok_or_else(|| config_failure("postgres", "connection"))?
-        .publish(&mut generations)
-        .map_err(|error| adapter("tls", error.error))?;
+    let mut database = loaded.bootstrap.request();
+    database.mode = mode;
+    let schema = match td_mta::postgres_schema::inspect(&database, until) {
+        Ok(schema) => schema,
+        Err(td_mta::postgres_schema::Error::Connection(
+            td_mta::postgres_probe::Error::Transport,
+        )) => return Err(config_failure("postgres", "connection")),
+        Err(_) => return Err(config_failure("postgres", "runtime-qualification")),
+    };
+    let mut certificate_revisions =
+        td_mta::postgres_acme::generations(&database, until, schema.store_epoch)
+            .map_err(|_| config_failure("certificate", "database"))?;
+    let (published, retired) = td_mta::postgres_runtime_profile::load(
+        &database,
+        until,
+        schema.store_epoch,
+        &options.profile,
+        generations
+            .reserve()
+            .map_err(|error| adapter("tls", error))?,
+    )
+    .map_err(|_| config_failure("postgres", "profile"))?
+    .publish(&mut generations)
+    .map_err(|error| adapter("tls", error.error))?;
     drop(retired);
     let binding = published.binding();
     let resolved = published.configuration();
     let relay = binding.roles().relay();
-    let mut relay_request = loaded
-        .bootstrap
-        .request(selected_address.ok_or_else(|| config_failure("postgres", "connection"))?);
-    relay_request.mode = mode;
     let mailbox_access = binding.roles().jmap();
     let candidate = resolved.candidate();
     let runtime_path = options.runtime.as_str();
@@ -378,7 +354,6 @@ fn run_once(
                 api_services.push(td_mta::postgres_http_api::Service {
                     memory: &request_memory,
                     loaded: &loaded,
-                    executable: &executable,
                     binding,
                     slots: &slots,
                     pending: &http_pending,
@@ -395,7 +370,6 @@ fn run_once(
                 Some(
                     td_mta::postgres_http_auth::Authentication::new(
                         &loaded,
-                        &executable,
                         &authentication_accounts,
                         clock.as_ref(),
                     )
@@ -453,7 +427,6 @@ fn run_once(
                     td_mta::postgres_smtp_storage::Backend::new(
                         td_mta::postgres_smtp_receiving::Receiving {
                             loaded: &loaded,
-                            executable: &executable,
                             binding,
                             additional: &receiving_bindings,
                             slots: &slots,
@@ -519,7 +492,6 @@ fn run_once(
                                 log_writer.run(
                                     producer,
                                     &loaded,
-                                    &executable,
                                     binding.epoch(),
                                     binding.profile(),
                                     &log_finished,
@@ -549,64 +521,47 @@ fn run_once(
                             let until =
                                 std::time::Instant::now() + std::time::Duration::from_secs(10);
                             let observation = (|| {
-                                let addresses = td_mta::postgres_resolver::resolve(
-                                    &executable,
-                                    &loaded.bootstrap,
-                                    until.min(
-                                        std::time::Instant::now()
-                                            + std::time::Duration::from_secs(5),
-                                    ),
+                                let mut request = loaded.bootstrap.request();
+                                request.mode = mode;
+                                let selected = td_mta::postgres_selection::observe(
+                                    &request,
+                                    until,
+                                    binding.epoch(),
                                 )
                                 .ok()?;
-                                for address in addresses {
-                                    let mut request = loaded.bootstrap.request(address);
-                                    request.mode = mode;
-                                    let selected = match td_mta::postgres_selection::observe(
-                                        &request,
-                                        &loaded.trust,
-                                        until,
-                                        binding.epoch(),
-                                    ) {
-                                        Ok(selected) => selected,
-                                        Err(_) => continue,
-                                    };
-                                    if selected != Some(binding.selection()) {
-                                        return Some(true);
-                                    }
-                                    if managed_names.is_empty()
-                                        || (listeners.is_empty() && https_listeners.is_empty())
-                                    {
-                                        return Some(false);
-                                    }
-                                    if let Ok(mut revisions) = td_mta::postgres_acme::generations(
-                                        &request,
-                                        &loaded.trust,
-                                        until,
-                                        binding.epoch(),
-                                    ) {
-                                        revisions.retain(|(name, _)| managed_names.contains(name));
-                                        if revisions != certificate_revisions {
-                                            use td_mta::postgres_runtime_profile::Error;
-                                            match published.refresh_certificates(
-                                                &request,
-                                                &loaded.trust,
-                                                until,
-                                                &revisions,
-                                            ) {
-                                                Ok(()) => certificate_revisions = revisions,
-                                                Err(Error::TlsPolicy(td_mta::ports::Error::Busy)
-                                                    | Error::Superseded) => (),
-                                                Err(_) => control.log(
-                                                    td_mta::observability::Kind::CertificateRenewalFailed,
-                                                    None,
-                                                    None,
-                                                ),
-                                            }
+                                if selected != Some(binding.selection()) {
+                                    return Some(true);
+                                }
+                                if managed_names.is_empty()
+                                    || (listeners.is_empty() && https_listeners.is_empty())
+                                {
+                                    return Some(false);
+                                }
+                                if let Ok(mut revisions) = td_mta::postgres_acme::generations(
+                                    &request,
+                                    until,
+                                    binding.epoch(),
+                                ) {
+                                    revisions.retain(|(name, _)| managed_names.contains(name));
+                                    if revisions != certificate_revisions {
+                                        use td_mta::postgres_runtime_profile::Error;
+                                        match published.refresh_certificates(
+                                            &request,
+                                            until,
+                                            &revisions,
+                                        ) {
+                                            Ok(()) => certificate_revisions = revisions,
+                                            Err(Error::TlsPolicy(td_mta::ports::Error::Busy)
+                                                | Error::Superseded) => (),
+                                            Err(_) => control.log(
+                                                td_mta::observability::Kind::CertificateRenewalFailed,
+                                                None,
+                                                None,
+                                            ),
                                         }
-                                        return Some(false);
                                     }
                                 }
-                                None
+                                Some(false)
                             })();
                             if observation.is_some_and(|changed| changed)
                                 && !control.stop_requested()
@@ -665,8 +620,7 @@ fn run_once(
                 let relay_worker = if relay {
                     let relay_service = td_mta::postgres_relay_worker::Worker {
                         queue: &queue_control,
-                        request: &relay_request,
-                        trust: &loaded.trust,
+                        request: &database,
                         profile: &published,
                         clock: clock.clone(),
                         handshakes: &handshakes,

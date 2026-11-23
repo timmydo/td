@@ -15,7 +15,6 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -36,7 +35,6 @@ pub enum Error {
 /// A matching existing receipt never overwrites later mail or copy progress.
 pub fn initialize(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     seed: Arc<Seed>,
@@ -49,7 +47,7 @@ pub fn initialize(
     }
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_reconcile_client(request, deadline, move |client| {
         let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
         if receipt.store_epoch != epoch {
             return Err(Error::Epoch);

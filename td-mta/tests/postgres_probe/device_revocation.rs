@@ -1,6 +1,5 @@
 use super::{command_output, deadline, sql, Fixture, PASSWORD};
 use std::{fs, os::unix::fs::PermissionsExt};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, DeviceId, StoreEpoch},
     postgres_accounts, postgres_devices as devices, postgres_schema,
@@ -10,24 +9,21 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_device_revocation_command_preserves_receipts() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
     postgres_accounts::publish(
         &fixture.request(),
-        &trust,
         deadline(),
         postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
     let creation = devices::prepare_creation(epoch, account, "revoke-command", 10).unwrap();
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &creation).unwrap();
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -41,16 +37,14 @@ fn real_postgres_device_revocation_command_preserves_receipts() {
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
     );
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://td_probe:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -92,7 +86,6 @@ fn real_postgres_device_revocation_command_preserves_receipts() {
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -116,7 +109,6 @@ fn real_postgres_device_revocation_command_preserves_receipts() {
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -126,7 +118,7 @@ fn real_postgres_device_revocation_command_preserves_receipts() {
         None
     );
     assert!(
-        devices::list(&fixture.request(), &trust, deadline(), epoch, account).unwrap()[0]
+        devices::list(&fixture.request(), deadline(), epoch, account).unwrap()[0]
             .revoked_at
             .is_some()
     );
@@ -161,7 +153,7 @@ fn real_postgres_device_revocation_command_preserves_receipts() {
     assert!(refused.contains("invalid-arguments"));
     assert!(!refused.contains("not-for-output"));
     let delayed = devices::prepare_creation(epoch, account, "uncertain-revoke", 11).unwrap();
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &delayed).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &delayed).unwrap();
     sql(&fixture, "CREATE SEQUENCE public.revoke_attempts; CREATE FUNCTION public.delay_device_revoke() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('public.revoke_attempts'); PERFORM pg_sleep(11); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_device_revoke AFTER UPDATE ON td_mta.devices DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_device_revoke()");
     let uncertain = invoke(epoch, account, delayed.device_id(), 1);
     assert!(uncertain.contains("indeterminate-inspect-device"));
@@ -178,7 +170,7 @@ fn real_postgres_device_revocation_command_preserves_receipts() {
         ),
         "1|t"
     );
-    let settled = devices::list(&fixture.request(), &trust, deadline(), epoch, account).unwrap();
+    let settled = devices::list(&fixture.request(), deadline(), epoch, account).unwrap();
     let was_revoked = settled
         .iter()
         .find(|row| row.id == delayed.device_id())
@@ -198,7 +190,6 @@ fn real_postgres_device_revocation_command_preserves_receipts() {
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,

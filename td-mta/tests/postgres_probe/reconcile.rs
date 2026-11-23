@@ -1,7 +1,6 @@
 use super::imports::{email, folder, key};
 use super::{deadline, sql, Fixture};
 use std::time::{Duration, Instant};
-use td_crypto::TrustStore;
 use td_mta::{
     format::key::SourceKind,
     ids::{AccountId, StoreEpoch},
@@ -21,38 +20,28 @@ fn update(plan: Plan) -> Baseline {
 pub fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     epoch: StoreEpoch,
     connection: &std::path::Path,
 ) {
     let account = AccountId::from_bytes([0xaa; 16]);
-    let authority = db::prepare(request, trust, deadline(), epoch, account).unwrap();
+    let authority = db::prepare(request, deadline(), epoch, account).unwrap();
     let folders = vec![
         folder("inbox", "Inbox", None, Some("inbox")),
         folder("child", "Nested", Some(b"inbox"), None),
     ];
     for value in &folders {
-        db::publish_mailbox(request, trust, deadline(), &authority, value).unwrap();
+        db::publish_mailbox(request, deadline(), &authority, value).unwrap();
     }
     let raw = b"Message-ID: <reconcile@example.test>\r\nSubject: untouched\r\n\r\nraw\0bytes\xff";
     let initial = email("one", raw, &["$seen", "custom"]);
     let desired = email("one", raw, &["$flagged", "custom"]);
-    let plan = |value: &Email| {
-        reconcile::plan(request, trust, deadline(), &authority, value, &folders).unwrap()
-    };
+    let plan =
+        |value: &Email| reconcile::plan(request, deadline(), &authority, value, &folders).unwrap();
     let apply = |value: &Email, baseline: &Baseline| {
-        reconcile::apply(
-            request,
-            trust,
-            deadline(),
-            &authority,
-            value,
-            &folders,
-            baseline,
-        )
+        reconcile::apply(request, deadline(), &authority, value, &folders, baseline)
     };
     assert!(matches!(plan(&initial), Plan::New));
-    db::publish_email(request, trust, deadline(), &authority, &initial, raw).unwrap();
+    db::publish_email(request, deadline(), &authority, &initial, raw).unwrap();
     let invariant=sql(fixture,"SELECT encode(e.blob_id,'hex'),encode(e.thread_id,'hex'),e.received_at,encode(b.digest,'hex'),b.length,u.body_bytes,u.blob_count FROM td_mta.emails e JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id JOIN td_mta.account_usage u ON u.account=e.account");
     let before = sql(
         fixture,
@@ -218,8 +207,8 @@ pub fn exercise(
     assert!(matches!(plan(&initial), Plan::Absent));
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
     cli(fixture, connection, epoch, account);
-    bounds(fixture, request, trust, &authority, folders);
-    deletion_checks(fixture, request, trust, &authority);
+    bounds(fixture, request, &authority, folders);
+    deletion_checks(fixture, request, &authority);
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -343,7 +332,6 @@ fn cli(fixture: &Fixture, connection: &std::path::Path, epoch: StoreEpoch, accou
 fn bounds(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     authority: &db::Authority,
     mut folders: Vec<td_mta::import_snapshot::Mailbox>,
 ) {
@@ -399,7 +387,6 @@ fn bounds(
     assert!(
         db::publish_unmapped_email(
             request,
-            trust,
             // This exercises maximum import capacity, not a five-second
             // throughput target. Keep the production worker's finite ceiling.
             Instant::now() + Duration::from_secs(10),
@@ -415,19 +402,10 @@ fn bounds(
     let mut flags = keyword_refs;
     flags[0] = &extra;
     let desired = value(&flags);
-    let plan =
-        update(reconcile::plan(request, trust, deadline(), authority, &desired, &folders).unwrap());
+    let plan = update(reconcile::plan(request, deadline(), authority, &desired, &folders).unwrap());
     assert_eq!(plan.folders.len(), 256);
     assert_eq!(
-        reconcile::apply(
-            request,
-            trust,
-            deadline(),
-            authority,
-            &desired,
-            &folders,
-            &plan
-        ),
+        reconcile::apply(request, deadline(), authority, &desired, &folders, &plan),
         Ok(Applied::Updated)
     );
     assert_eq!(
@@ -437,27 +415,21 @@ fn bounds(
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE email_id=(SELECT local_object FROM td_mta.imports WHERE source_object=convert_to('capacity','UTF8'))"), "256");
 }
 
-fn deletion_checks(
-    fixture: &Fixture,
-    request: &Request<'_>,
-    trust: &TrustStore,
-    authority: &db::Authority,
-) {
+fn deletion_checks(fixture: &Fixture, request: &Request<'_>, authority: &db::Authority) {
     use td_mta::postgres_imports::reconcile::deletion::{self, Applied, Plan};
     let raw = b"Message-ID: <deletion@example.test>\r\n\r\nkeep raw";
     let value = email("delete-one", raw, &["$seen"]);
     let other = email("delete-two", raw, &["$seen"]);
-    let plan =
-        |value: &Email| deletion::plan(request, trust, deadline(), authority, value).unwrap();
+    let plan = |value: &Email| deletion::plan(request, deadline(), authority, value).unwrap();
     assert!(matches!(plan(&value), Plan::Unmapped));
-    let first = db::publish_email(request, trust, deadline(), authority, &value, raw).unwrap();
-    let second = db::publish_email(request, trust, deadline(), authority, &other, raw).unwrap();
+    let first = db::publish_email(request, deadline(), authority, &value, raw).unwrap();
+    let second = db::publish_email(request, deadline(), authority, &other, raw).unwrap();
     let retained = match plan(&value) {
         Plan::Delete(b) => b,
         _ => panic!("expected delete"),
     };
     let apply = |baseline: &deletion::Baseline| {
-        deletion::apply(request, trust, deadline(), authority, &value, baseline)
+        deletion::apply(request, deadline(), authority, &value, baseline)
     };
     let id = hex(&first.local_object);
     let other_id = hex(&second.local_object);
@@ -517,7 +489,7 @@ fn deletion_checks(
     assert_eq!(apply(&retained), Ok(Applied::Absent));
     assert!(matches!(plan(&value), Plan::Absent));
     assert!(
-        !db::publish_email(request, trust, deadline(), authority, &value, raw)
+        !db::publish_email(request, deadline(), authority, &value, raw)
             .unwrap()
             .present
     );
@@ -536,12 +508,12 @@ fn deletion_checks(
     .unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_import_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(11); RETURN OLD; END $$; CREATE CONSTRAINT TRIGGER delay_import_delete AFTER DELETE ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_import_delete()");
     assert_eq!(
-        deletion::apply(request, trust, deadline(), authority, &other, &second_plan),
+        deletion::apply(request, deadline(), authority, &other, &second_plan),
         Err(db::Error::Indeterminate)
     );
     sql(fixture, "DROP TRIGGER delay_import_delete ON td_mta.emails");
     assert!(matches!(
-        deletion::apply(request, trust, deadline(), authority, &other, &second_plan),
+        deletion::apply(request, deadline(), authority, &other, &second_plan),
         Ok(Applied::Deleted | Applied::Absent)
     ));
     assert_eq!(

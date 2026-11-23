@@ -19,11 +19,10 @@ use crate::{
     },
 };
 use std::{
-    path::Path,
     sync::Mutex,
     time::{Duration, Instant},
 };
-/// One active or uncertain mutation and the endpoint it was published to.
+/// One active or uncertain mutation and the socket it was published to.
 /// Retain this owner across HTTP requests.
 /// Production startup/recovery wiring remains part of the backend cutover.
 #[derive(Default)]
@@ -54,14 +53,10 @@ impl Pending {
     pub fn settle(
         &self,
         loaded: &Loaded,
-        executable: &Path,
         settlement_slots: &ReadSlots,
         clock: &RuntimeClock,
         until: Deadline,
     ) -> Result<Option<Settled>, Error> {
-        if !executable.is_absolute() {
-            return Err(Error::Invalid);
-        }
         let mut pending = self.change.try_lock().map_err(|_| Error::Busy)?;
         if pending.is_none() {
             return Ok(None);
@@ -77,7 +72,7 @@ impl Pending {
         settle_held(&mut pending, loaded, settlement_slots, deadline)
     }
 }
-/// Inspect only at the retained endpoint. Absence proves rollback unless another
+/// Inspect only at the retained socket. Absence proves rollback unless another
 /// process swept the expired receipt (POSTGRES.md section 165).
 fn settle_held(
     pending: &mut Option<Retained<Change>>,
@@ -89,8 +84,8 @@ fn settle_held(
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| Error::Busy)?;
-    let connection = settlement::request(loaded, held.endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
+    let connection = settlement::request(loaded);
+    let settled = changes::inspect(&connection, deadline, &held.change)
         .map_err(map_error)?
         .map(|outcome| Settled {
             operation: held.change.operation(),
@@ -103,7 +98,6 @@ fn settle_held(
 /// Borrows the request secret only during bounded synchronous publication.
 pub struct Mailboxes<'a> {
     pub loaded: &'a Loaded,
-    pub executable: &'a Path,
     pub binding: &'a Binding,
     pub slots: &'a ReadSlots,
     pub clock: &'a RuntimeClock,
@@ -206,8 +200,7 @@ struct Completion {
 }
 impl Mailboxes<'_> {
     fn apply(&self, request: Request<'_>, meter: &mut Meter) -> Result<Completion, Error> {
-        if !self.executable.is_absolute()
-            || !self.binding.roles().jmap()
+        if !self.binding.roles().jmap()
             || self.loaded.bootstrap.profile() != self.binding.profile()
             || request.account != self.binding.account()
             || Presented::parse(self.password).is_none_or(|value| value.id() != request.device)
@@ -284,47 +277,11 @@ impl Mailboxes<'_> {
             ),
         }
         .map_err(map_error)?;
-        let dns_deadline = deadline.min(
-            Instant::now()
-                .checked_add(Duration::from_secs(5))
-                .ok_or(Error::Invalid)?,
-        );
-        let addresses = crate::postgres_resolver::resolve(
-            self.executable,
-            &self.loaded.bootstrap,
-            dns_deadline,
-        )
-        .map_err(|error| match error {
-            crate::postgres_resolver::Error::Deadline => Error::Deadline,
-            _ => Error::Dns,
-        })?;
-        let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-        let mut endpoint = None;
-        for address in addresses {
-            endpoint = Some(address);
-            let connection = settlement::request(self.loaded, address);
-            outcome = changes::publish(
-                &connection,
-                &self.loaded.trust,
-                deadline,
-                &change,
-                self.password,
-            );
-            if !matches!(
-                outcome,
-                Err(changes::Error::Connection(postgres_probe::Error::Transport))
-            ) {
-                break;
-            }
-        }
-        match outcome {
+        let connection = settlement::request(self.loaded);
+        match changes::publish(&connection, deadline, &change, self.password) {
             Ok(outcome) => {
                 if outcome.results.len() != count {
-                    *pending = Some(Retained::new(
-                        change,
-                        endpoint.ok_or(Error::Invalid)?,
-                        self.binding.account(),
-                    ));
+                    *pending = Some(Retained::new(change, self.binding.account()));
                     return Err(Error::Corrupt);
                 }
                 results.extend(outcome.results);
@@ -337,11 +294,7 @@ impl Mailboxes<'_> {
                 })
             }
             Err(changes::Error::Indeterminate) => {
-                *pending = Some(Retained::new(
-                    change,
-                    endpoint.ok_or(Error::Invalid)?,
-                    self.binding.account(),
-                ));
+                *pending = Some(Retained::new(change, self.binding.account()));
                 Ok(Completion {
                     before_epoch: self.binding.epoch(),
                     before_sequence: Sequence::from_u64(0),

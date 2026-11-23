@@ -9,17 +9,15 @@ use td_crypto::{Digest, Sha256};
 
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     value: &Email,
     bytes: &[u8],
 ) -> Result<Outcome, Error> {
-    publish_policy(request, trust, deadline, authority, value, bytes, None)
+    publish_policy(request, deadline, authority, value, bytes, None)
 }
 pub fn publish_unmapped(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     value: &Email,
@@ -28,7 +26,6 @@ pub fn publish_unmapped(
 ) -> Result<Outcome, Error> {
     publish_policy(
         request,
-        trust,
         deadline,
         authority,
         value,
@@ -38,7 +35,6 @@ pub fn publish_unmapped(
 }
 fn publish_policy(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     value: &Email,
@@ -54,7 +50,6 @@ fn publish_policy(
     }
     if let Some(outcome) = inspect_policy(
         request,
-        trust,
         deadline.min(Instant::now() + postgres_probe::MAX_DURATION),
         authority,
         &value.key,
@@ -89,7 +84,6 @@ fn publish_policy(
     let marker = attempted.clone();
     let result = postgres_probe::with_import_client(
         request,
-        trust,
         deadline,
         value.length,
         guarded,

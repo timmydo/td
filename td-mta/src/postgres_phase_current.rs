@@ -12,14 +12,13 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_crypto::{Crypto, Digest, Provider};
 
 /// Validate the exact still-active AcceptancePossible subset and its durable
 /// capacity under fresh policy, ownership and queue-clock checks. All database
 /// locks end before return. Revalidation cannot revoke already buffered bytes.
 pub fn check_current_possible(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
     clock: Arc<dyn Clock>,
@@ -28,14 +27,13 @@ pub fn check_current_possible(
     if value.inner.phase != 3 {
         return Err(Error::Integrity);
     }
-    check_current(request, trust, deadline, value, clock, guard)
+    check_current(request, deadline, value, clock, guard)
 }
 /// Validate the exact live Body subset and its actual retained RCPT replies.
 /// This passive observation ends all database locks before returning; the
 /// caller still owns actual 354, immutable source and transport admission.
 pub fn check_current_body(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
     clock: Arc<dyn Clock>,
@@ -44,7 +42,7 @@ pub fn check_current_body(
     if value.inner.phase != 2 {
         return Err(Error::Integrity);
     }
-    BodyChecks::open(request, trust, deadline, value, clock, guard)?.check()
+    BodyChecks::open(request, deadline, value, clock, guard)?.check()
 }
 
 /// A thread-bound, passive Body validator. Each successful turn acknowledges
@@ -64,28 +62,25 @@ pub struct BodyChecks {
 impl BodyChecks {
     pub fn open(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         value: &Change,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
     ) -> Result<Self, Error> {
-        Self::open_profile(request, trust, deadline, value, clock, guard, None)
+        Self::open_profile(request, deadline, value, clock, guard, None)
     }
     pub(crate) fn transfer(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         value: &Change,
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
         budget: ValidationBudget,
     ) -> Result<Self, Error> {
-        Self::open_profile(request, trust, deadline, value, clock, guard, Some(budget))
+        Self::open_profile(request, deadline, value, clock, guard, Some(budget))
     }
     fn open_profile(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         value: &Change,
         clock: Arc<dyn Clock>,
@@ -95,7 +90,7 @@ impl BodyChecks {
         if value.inner.phase != 2 {
             return Err(Error::Integrity);
         }
-        let worker = postgres_probe::validation_worker(request, trust, deadline, budget)
+        let worker = postgres_probe::validation_worker(request, deadline, budget)
             .map_err(Error::Connection)?;
         Ok(Self {
             worker: Some(worker),
@@ -172,7 +167,6 @@ impl BodyChecks {
 
 fn check_current(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
     clock: Arc<dyn Clock>,
@@ -180,7 +174,7 @@ fn check_current(
 ) -> Result<Instant, Error> {
     let value = value.inner.clone();
     let observation = Observation { clock, guard };
-    let limit = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
+    let limit = postgres_probe::with_batch_client(request, deadline, move |client| {
         if !owners::begin(client, &value.claim, true, false)? {
             return Err(Error::Policy);
         }

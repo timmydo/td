@@ -33,8 +33,7 @@ pub(super) fn exercise(
     let possible = phases::acceptance_possible(claim, generation, attempt, &[0]).unwrap();
     let mut budget = meter();
     let preparation = td_mta::postgres_probe::Request {
-        address: worker.connection.request.address,
-        server_name: worker.connection.request.server_name,
+        socket: worker.connection.request.socket,
         user: worker.connection.request.user,
         database: worker.connection.request.database,
         password: worker.connection.request.password,
@@ -43,7 +42,6 @@ pub(super) fn exercise(
     let forbidden = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &preparation,
-            trust: worker.connection.trust,
             slots: worker.connection.slots,
             clock: clock.clone(),
         },
@@ -108,19 +106,11 @@ pub(super) fn exercise(
         Err(Error::Admission(ports::Error::Deadline))
     ));
 
-    owners::renew(
-        worker.connection.request,
-        worker.connection.trust,
-        deadline(),
-        claim,
-        generation,
-    )
-    .unwrap();
+    owners::renew(worker.connection.request, deadline(), claim, generation).unwrap();
     let slots = ReadSlots::new(2).unwrap();
     let roomy = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: worker.connection.request,
-            trust: worker.connection.trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -217,13 +207,7 @@ pub(super) fn exercise(
     assert_eq!(failed.attempt(), Some(attempt));
     let outcome = failed.retry(&mut meter()).unwrap();
     assert_eq!(
-        phases::inspect(
-            worker.connection.request,
-            worker.connection.trust,
-            deadline(),
-            &final_change
-        )
-        .unwrap(),
+        phases::inspect(worker.connection.request, deadline(), &final_change).unwrap(),
         Some(outcome)
     );
     assert_eq!(outcome.attempt, attempt);

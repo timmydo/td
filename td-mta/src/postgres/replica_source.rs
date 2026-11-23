@@ -1,5 +1,5 @@
 //! Owner-only replica identity preparation; no network copy or promotion.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -78,13 +78,12 @@ pub(super) fn run(
             return Ok(ExitCode::FAILURE);
         }
     };
-    let result = with_addresses(&loaded, |request, deadline| {
+    let result = with_connection(&loaded, |request, deadline| {
         if let Some(source) = options.source.as_ref() {
-            replica::initialize(request, &loaded.trust, deadline, options.epoch, source)
-                .map_err(classify)?;
+            replica::initialize(request, deadline, options.epoch, source).map_err(classify)?;
             return Ok(None);
         }
-        replica::inspect(request, &loaded.trust, deadline, options.epoch).map_err(classify)
+        replica::inspect(request, deadline, options.epoch).map_err(classify)
     });
     match result {
         Ok(source) => {

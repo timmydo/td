@@ -200,7 +200,6 @@ impl Dispatches<'_, '_> {
         }
         let connection = Connection {
             request: self.connection.request,
-            trust: self.connection.trust,
             slots,
             clock: self.connection.clock.clone(),
         };
@@ -230,7 +229,7 @@ impl Dispatches<'_, '_> {
         let Some(Operation::RouteFailure(value)) = pending.as_ref() else {
             return Err(ports::Error::Invalid.into());
         };
-        match health::publish(self.connection.request, self.connection.trust, limit, value) {
+        match health::publish(self.connection.request, limit, value) {
             Ok(outcome) => {
                 *pending = None;
                 Ok(outcome)

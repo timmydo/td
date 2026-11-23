@@ -1,5 +1,5 @@
 //! Explicit finite scrub page with caller-retained continuation keys.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -74,15 +74,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    match with_addresses(&loaded, |request, deadline| {
-        postgres_blob_scrub::inspect(
-            request,
-            &loaded.trust,
-            deadline,
-            options.epoch,
-            options.page,
-        )
-        .map_err(classify)
+    match with_connection(&loaded, |request, deadline| {
+        postgres_blob_scrub::inspect(request, deadline, options.epoch, options.page)
+            .map_err(classify)
     }) {
         Ok(report) => {
             let status = if report.failed == 0 { "ok" } else { "corrupt" };

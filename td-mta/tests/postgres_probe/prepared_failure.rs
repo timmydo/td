@@ -4,7 +4,6 @@ use std::{
     thread,
     time::Duration,
 };
-use td_crypto::TrustStore;
 use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     admission::work::{Charge, Meter},
@@ -23,7 +22,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -34,7 +32,7 @@ pub(super) fn exercise(
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
         sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},0,'failed@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         let clock = Arc::new(RuntimeClock::new());
         let guard = Arc::new(Mutex::new(
             Guard::new(Time {
@@ -49,8 +47,7 @@ pub(super) fn exercise(
             .unwrap(),
         ));
         let runtime = Request {
-            address: request.address,
-            server_name: request.server_name,
+            socket: request.socket,
             user: "mail_runtime",
             database: request.database,
             password: PASSWORD,
@@ -62,7 +59,6 @@ pub(super) fn exercise(
         let worker = dispatch::Dispatches {
             connection: dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &slots,
                 clock: clock.clone(),
             },
@@ -71,7 +67,6 @@ pub(super) fn exercise(
         };
         let settle = dispatch::Connection {
             request: &runtime,
-            trust,
             slots: &settlement,
             clock: clock.clone(),
         };
@@ -79,7 +74,6 @@ pub(super) fn exercise(
         let capacity = dispatch::Dispatches {
             connection: dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &slots,
                 clock: clock.clone(),
             },
@@ -89,7 +83,6 @@ pub(super) fn exercise(
         let settlement_capacity = dispatch::Dispatches {
             connection: dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &settlement,
                 clock: clock.clone(),
             },
@@ -426,7 +419,7 @@ pub(super) fn exercise(
                 fixture,
                 "DROP TRIGGER rollback_failed_recovery ON td_mta.attempt_recovery_receipts",
             );
-            owners::renew(request, trust, deadline(), claim, generation).unwrap();
+            owners::renew(request, deadline(), claim, generation).unwrap();
             sql(fixture,"CREATE FUNCTION public.delay_failed_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_failed_recovery AFTER INSERT ON td_mta.attempt_recovery_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_failed_recovery()");
             assert_eq!(
                 failed.step(until(1500), &mut meter(), &settlement),
@@ -470,7 +463,7 @@ pub(super) fn exercise(
             let other = SubmissionId::from_bytes([166; 16]);
             let other_sub = format!("decode('{other}','hex')");
             sql(fixture,&format!("UPDATE td_mta.route_health SET failed_at=failed_at-1200000,next_at=next_at-1200000; INSERT INTO td_mta.submissions SELECT account,{other_sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{other_sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{other_sub},0,'other@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={other_sub}"));
-            owners::renew(request, trust, deadline(), claim, generation).unwrap();
+            owners::renew(request, deadline(), claim, generation).unwrap();
             // The relay steps a failure continuation to completion before it
             // publishes again; this interleaving would reclaim the retired
             // attempt (POSTGRES.md section 218), so a reservation holds it.
@@ -592,15 +585,7 @@ pub(super) fn exercise(
             "3|0|4"
         );
         assert!(matches!(
-            candidates::scan(
-                request,
-                trust,
-                deadline(),
-                claim,
-                generation,
-                Kind::Fresh,
-                None
-            ),
+            candidates::scan(request, deadline(), claim, generation, Kind::Fresh, None),
             Err(candidates::Error::RouteHealth(
                 health::Error::RepairRequired
             )) | Err(candidates::Error::RouteHealth(health::Error::Backoff))

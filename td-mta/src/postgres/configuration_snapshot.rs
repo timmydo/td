@@ -1,5 +1,5 @@
 //! Passive owner export for configuration repair; never validates or activates.
-use super::{configuration, report_error, selection, with_addresses, AttemptError};
+use super::{configuration, report_error, selection, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -37,17 +37,16 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    let result = with_addresses(&loaded, |request, deadline| {
-        let selected = postgres_selection::observe(request, &loaded.trust, deadline, epoch)
-            .map_err(selection::classify)?;
+    let result = with_connection(&loaded, |request, deadline| {
+        let selected =
+            postgres_selection::observe(request, deadline, epoch).map_err(selection::classify)?;
         let Some(selected) = selected else {
             return Ok(json!({"schema":1,"command":NAME,"status":"ok",
                 "store_epoch":epoch.to_string(),"selected":false,
                 "content_validated":false,"profile_activated":false}));
         };
-        let sources =
-            versions::read_sources(request, &loaded.trust, deadline, epoch, selected.version)
-                .map_err(configuration::classify)?;
+        let sources = versions::read_sources(request, deadline, epoch, selected.version)
+            .map_err(configuration::classify)?;
         report(epoch, selected, &sources)
     });
     match result {

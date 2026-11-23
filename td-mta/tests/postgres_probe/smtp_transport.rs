@@ -571,21 +571,20 @@ pub(super) fn exercise(
     let loaded = td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: td_crypto::TrustStore::from_pem(&fixture.ca).unwrap(),
     };
     let clock = Arc::new(RuntimeClock::new());
     let slots = ReadSlots::new(1).unwrap();
     let storage = Backend::new(
         Owner {
             loaded: &loaded,
-            executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
             binding,
             additional: &[],
             slots: &slots,

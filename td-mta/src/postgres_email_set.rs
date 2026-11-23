@@ -16,7 +16,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 pub mod deletion;
 pub mod filing;
@@ -314,36 +314,33 @@ fn receipt(client: &Client, change: &Change) -> Result<Option<BatchOutcome>, Err
 /// proves the historical result, even after policy change or device revocation.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     change: &Change,
 ) -> Result<Option<Outcome>, Error> {
     if !change.single {
         return Err(Error::Invalid);
     }
-    inspect_record(request, trust, deadline, change)?
+    inspect_record(request, deadline, change)?
         .map(single)
         .transpose()
 }
 pub fn inspect_batch(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     change: &Change,
 ) -> Result<Option<BatchOutcome>, Error> {
     if change.single || change.destroy || change.filing.is_some() {
         return Err(Error::Invalid);
     }
-    inspect_record(request, trust, deadline, change)
+    inspect_record(request, deadline, change)
 }
 fn inspect_record(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     change: &Change,
 ) -> Result<Option<BatchOutcome>, Error> {
     let change = change.clone();
-    let result = postgres_probe::with_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_client(request, deadline, move |client| {
         begin(client, &change)?;
         client
             .query_one(
@@ -371,7 +368,6 @@ fn finish_inspection<T>(
 /// missing objects and state mismatch roll back without a receipt.
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     change: &Change,
     password: &[u8],
@@ -379,11 +375,10 @@ pub fn publish(
     if !change.single {
         return Err(Error::Invalid);
     }
-    single(publish_record(request, trust, deadline, change, password)?)
+    single(publish_record(request, deadline, change, password)?)
 }
 pub fn publish_batch(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     change: &Change,
     password: &[u8],
@@ -391,7 +386,7 @@ pub fn publish_batch(
     if change.single || change.destroy || change.filing.is_some() {
         return Err(Error::Invalid);
     }
-    publish_record(request, trust, deadline, change, password)
+    publish_record(request, deadline, change, password)
 }
 struct Plan {
     mailbox: Option<MailboxId>,
@@ -414,12 +409,11 @@ fn ids(plans: &[Plan], include: impl Fn(&Plan) -> bool) -> Result<Vec<&[u8]>, Er
 }
 fn publish_record(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     change: &Change,
     password: &[u8],
 ) -> Result<BatchOutcome, Error> {
-    if let Some(outcome) = inspect_record(request, trust, deadline, change)? {
+    if let Some(outcome) = inspect_record(request, deadline, change)? {
         return Ok(outcome);
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
@@ -429,7 +423,7 @@ fn publish_record(
     let change = change.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         begin(client, &change)?;
         let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_| Error::Database)?;
         let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;

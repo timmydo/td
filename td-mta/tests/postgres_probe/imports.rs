@@ -1,6 +1,6 @@
 use super::{command_output, deadline, sql, Fixture};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
-use td_crypto::{Digest, Sha256, TrustStore};
+use td_crypto::{Digest, Sha256};
 use td_json::json;
 use td_mta::{
     format::key::SourceKind,
@@ -55,19 +55,12 @@ pub(super) fn email(id: &str, body: &[u8], keywords: &[&str]) -> snapshot::Email
     )
     .unwrap()
 }
-pub fn exercise(
-    fixture: &Fixture,
-    request: &Request<'_>,
-    trust: &TrustStore,
-    epoch: StoreEpoch,
-    connection: &Path,
-) {
+pub fn exercise(fixture: &Fixture, request: &Request<'_>, epoch: StoreEpoch, connection: &Path) {
     let account = AccountId::from_bytes([0xaa; 16]);
-    let authority = db::prepare(request, trust, deadline(), epoch, account).unwrap();
+    let authority = db::prepare(request, deadline(), epoch, account).unwrap();
     assert!(matches!(
         db::prepare(
             request,
-            trust,
             deadline(),
             StoreEpoch::from_bytes([0; 16]),
             account
@@ -77,15 +70,15 @@ pub fn exercise(
     let mut runtime = fixture.request();
     runtime.mode = td_mta::postgres_probe::Mode::Runtime;
     assert!(matches!(
-        db::prepare(&runtime, trust, deadline(), epoch, account),
+        db::prepare(&runtime, deadline(), epoch, account),
         Err(db::Error::Owner)
     ));
     let inbox = folder("inbox", "Inbox", None, Some("inbox"));
-    let adopted = db::publish_mailbox(request, trust, deadline(), &authority, &inbox).unwrap();
+    let adopted = db::publish_mailbox(request, deadline(), &authority, &inbox).unwrap();
     assert!(!adopted.created);
     assert!(adopted.present);
     let child = folder("child", "Nested", Some(b"inbox"), None);
-    let nested = db::publish_mailbox(request, trust, deadline(), &authority, &child).unwrap();
+    let nested = db::publish_mailbox(request, deadline(), &authority, &child).unwrap();
     assert!(nested.created);
     assert_eq!(
         sql(
@@ -97,7 +90,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_mailbox(
             request,
-            trust,
             deadline(),
             &authority,
             &folder("orphan", "Orphan", Some(b"missing"), None)
@@ -107,7 +99,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_mailbox(
             request,
-            trust,
             deadline(),
             &authority,
             &folder("inbox", "Changed", None, Some("inbox"))
@@ -117,7 +108,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_mailbox(
             request,
-            trust,
             deadline(),
             &authority,
             &folder("duplicate", "Inbox", None, Some("inbox"))
@@ -126,10 +116,10 @@ pub fn exercise(
     );
     let body=b"Return-Path: <original@example.test>\r\nMessage-ID: <original@example.test>\r\nSubject: untouched\r\n\r\nraw\0binary\xff\n";
     let one = email("one", body, &["$Seen", "Custom"]);
-    let first = db::publish_email(request, trust, deadline(), &authority, &one, body).unwrap();
+    let first = db::publish_email(request, deadline(), &authority, &one, body).unwrap();
     assert!(first.created);
     let two = email("two", body, &["$seen", "custom"]);
-    let second = db::publish_email(request, trust, deadline(), &authority, &two, body).unwrap();
+    let second = db::publish_email(request, deadline(), &authority, &two, body).unwrap();
     assert_ne!(first.local_object, second.local_object);
     assert_eq!(sql(fixture,"SELECT count(*),count(DISTINCT blob_id),count(DISTINCT thread_id),min(received_at),min(origin) FROM td_mta.emails"),"2|2|1|1704164645123|3");
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.memberships"), "4");
@@ -150,12 +140,12 @@ pub fn exercise(
     );
     let state=sql(fixture,"SELECT encode(sequence,'hex'),(SELECT count(*) FROM td_mta.changes),body_bytes,blob_count FROM td_mta.accounts JOIN td_mta.account_usage ON account=id");
     assert!(
-        !db::publish_email(request, trust, deadline(), &authority, &one, body)
+        !db::publish_email(request, deadline(), &authority, &one, body)
             .unwrap()
             .created
     );
     assert!(
-        !db::publish_mailbox(request, trust, deadline(), &authority, &child)
+        !db::publish_mailbox(request, deadline(), &authority, &child)
             .unwrap()
             .created
     );
@@ -163,7 +153,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_email(
             request,
-            trust,
             deadline(),
             &authority,
             &email("one", body, &["$flagged"]),
@@ -175,7 +164,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_email(
             request,
-            trust,
             deadline(),
             &authority,
             &email("bad", body, &[]),
@@ -191,7 +179,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_email(
             request,
-            trust,
             deadline(),
             &authority,
             &email("quota", body, &[]),
@@ -210,10 +197,10 @@ pub fn exercise(
     // Concurrent identical requests settle to one publication.
     let concurrent = email("concurrent", body, &[]);
     let outcomes = std::thread::scope(|scope| {
-        let left = scope
-            .spawn(|| db::publish_email(request, trust, deadline(), &authority, &concurrent, body));
-        let right = scope
-            .spawn(|| db::publish_email(request, trust, deadline(), &authority, &concurrent, body));
+        let left =
+            scope.spawn(|| db::publish_email(request, deadline(), &authority, &concurrent, body));
+        let right =
+            scope.spawn(|| db::publish_email(request, deadline(), &authority, &concurrent, body));
         (
             left.join().unwrap().unwrap(),
             right.join().unwrap().unwrap(),
@@ -228,7 +215,7 @@ pub fn exercise(
         .map(|b| format!("{b:02x}"))
         .collect();
     sql(fixture,&format!("DELETE FROM td_mta.memberships WHERE email_id=decode('{local}','hex'); DELETE FROM td_mta.keywords WHERE email_id=decode('{local}','hex'); DELETE FROM td_mta.thread_anchors WHERE email_id=decode('{local}','hex'); DELETE FROM td_mta.emails WHERE id=decode('{local}','hex')"));
-    let historical = db::publish_email(request, trust, deadline(), &authority, &one, body).unwrap();
+    let historical = db::publish_email(request, deadline(), &authority, &one, body).unwrap();
     assert!(!historical.present);
     assert!(!historical.created);
     assert_eq!(historical.local_object, first.local_object);
@@ -276,16 +263,14 @@ pub fn exercise(
     sql(fixture,"CREATE SEQUENCE public.import_attempts; CREATE FUNCTION public.delay_import() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('public.import_attempts'); PERFORM pg_sleep(11); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_import AFTER INSERT ON td_mta.imports DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_import()");
     let delayed = email("delayed", body, &[]);
     assert_eq!(
-        db::publish_email(request, trust, deadline(), &authority, &delayed, body),
+        db::publish_email(request, deadline(), &authority, &delayed, body),
         Err(db::Error::Indeterminate)
     );
     sql(fixture, "DROP TRIGGER delay_import ON td_mta.imports");
-    let resolved =
-        db::publish_email(request, trust, deadline(), &authority, &delayed, body).unwrap();
+    let resolved = db::publish_email(request, deadline(), &authority, &delayed, body).unwrap();
     assert_eq!(
         db::inspect(
             request,
-            trust,
             deadline(),
             &authority,
             &key("delayed", SourceKind::Email),
@@ -324,11 +309,7 @@ pub fn exercise(
     let small = email("over-allowance", body, &[]);
     // Refused before any connection: an unreachable server would be Transport.
     let unreachable = Request {
-        address: td_mta::postgres_probe::Endpoint::Tcp(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            1,
-        ))),
-        server_name: request.server_name,
+        socket: td_fs::SocketPath::new(&fixture.root.join("absent.sock")).unwrap(),
         user: request.user,
         database: request.database,
         password: request.password,
@@ -337,7 +318,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_email(
             &unreachable,
-            trust,
             std::time::Instant::now() + std::time::Duration::from_secs(25),
             &authority,
             &small,
@@ -350,7 +330,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_email(
             request,
-            trust,
             std::time::Instant::now() + std::time::Duration::from_secs(25),
             &authority,
             &small,
@@ -362,7 +341,6 @@ pub fn exercise(
     );
     assert!(db::inspect(
         request,
-        trust,
         deadline(),
         &authority,
         &key("over-allowance", SourceKind::Email),
@@ -373,7 +351,6 @@ pub fn exercise(
     assert!(
         db::publish_email(
             request,
-            trust,
             std::time::Instant::now() + allowance,
             &authority,
             &largest,
@@ -387,7 +364,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_mailbox(
             request,
-            trust,
             deadline(),
             &authority,
             &folder("too-many", "Overflow", None, None)
@@ -398,7 +374,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_email(
             request,
-            trust,
             deadline(),
             &authority,
             &email("maintenance", body, &[]),
@@ -412,7 +387,7 @@ pub fn exercise(
     let mut nonowner = fixture.request();
     nonowner.user = "mail_runtime";
     assert!(matches!(
-        db::prepare(&nonowner, trust, deadline(), epoch, account),
+        db::prepare(&nonowner, deadline(), epoch, account),
         Err(db::Error::Owner)
     ));
     // New writes are fenced by the selected generation; old receipts remain known.
@@ -423,7 +398,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_email(
             request,
-            trust,
             deadline(),
             &authority,
             &email("stale", body, &[]),
@@ -432,7 +406,7 @@ pub fn exercise(
         Err(db::Error::Policy)
     );
     assert!(
-        !db::publish_email(request, trust, deadline(), &authority, &two, body)
+        !db::publish_email(request, deadline(), &authority, &two, body)
             .unwrap()
             .created
     );

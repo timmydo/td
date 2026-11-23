@@ -9,7 +9,6 @@ use crate::{
     postgres_schema,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -35,7 +34,6 @@ pub struct ReadRequest<'a> {
 /// transmission must separately acquire and retain current attempt authority.
 pub fn with_submission<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     selected: ReadRequest<'_>,
     read: impl FnOnce(BlobMetadata, &mut dyn BlobReader) -> Result<T, ports::Error>,
@@ -52,7 +50,7 @@ pub fn with_submission<T>(
         return Err(Error::Capacity);
     }
     let binding = binding.clone();
-    postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    postgres_probe::with_body_worker(request, deadline, |worker| {
         let metadata = worker.run(|client| {
             let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != binding.epoch() { return Err(Error::Epoch); }

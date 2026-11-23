@@ -6,14 +6,12 @@ use crate::{
     ids::{AccountId, DeviceId, UploadOperationId},
     ports::{self, Clock, Deadline},
     postgres_input::Loaded,
-    postgres_probe,
     postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
     postgres_settlement::{self as settlement, Retained},
     postgres_uploads::{self as changes, Upload},
 };
 use std::{
-    path::Path,
     sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -29,7 +27,7 @@ impl From<ports::Error> for Error {
     }
 }
 
-/// One active or uncertain upload body and the endpoint it was published to.
+/// One active or uncertain upload body and the socket it was published to.
 /// Retain across requests; no password survives the call. Runtime
 /// startup/recovery wiring belongs to cutover.
 #[derive(Default)]
@@ -80,14 +78,10 @@ impl Pending {
     pub fn settle(
         &self,
         loaded: &Loaded,
-        executable: &Path,
         slots: &ReadSlots,
         clock: &RuntimeClock,
         until: Deadline,
     ) -> Result<Option<Settled>, Error> {
-        if !executable.is_absolute() {
-            return Err(ports::Error::Invalid.into());
-        }
         let mut pending = self.change.try_lock().map_err(|_| ports::Error::Busy)?;
         if pending.is_none() {
             return Ok(None);
@@ -96,7 +90,7 @@ impl Pending {
         settle_held(&mut pending, loaded, slots, deadline)
     }
 }
-/// Inspect only at the retained endpoint. Absence proves rollback unless another
+/// Inspect only at the retained socket. Absence proves rollback unless another
 /// process swept the expired receipt (POSTGRES.md section 165).
 fn settle_held(
     pending: &mut Option<Retained<Upload>>,
@@ -108,8 +102,8 @@ fn settle_held(
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
-    let connection = settlement::request(loaded, held.endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
+    let connection = settlement::request(loaded);
+    let settled = changes::inspect(&connection, deadline, &held.change)
         .map_err(Error::Publication)?
         .map(|outcome| Settled {
             operation: held.change.operation(),
@@ -127,7 +121,6 @@ pub struct Input<'a> {
 }
 pub struct Uploads<'a> {
     pub loaded: &'a Loaded,
-    pub executable: &'a Path,
     pub binding: &'a Binding,
     pub slots: &'a ReadSlots,
     pub clock: &'a RuntimeClock,
@@ -176,8 +169,7 @@ impl Uploads<'_> {
         if !std::ptr::eq(ingress.owner, self.pending) {
             return Err(ports::Error::Invalid.into());
         }
-        if !self.executable.is_absolute()
-            || !self.binding.roles().jmap()
+        if !self.binding.roles().jmap()
             || self.loaded.bootstrap.profile() != self.binding.profile()
             || input.account != self.binding.account()
             || Presented::parse(self.password).is_none_or(|value| value.id() != input.device)
@@ -207,7 +199,6 @@ impl Uploads<'_> {
         // Caller-admitted ingress and one retained copy are each at most
         // 32 MiB. The owner prevents another preparation while either is live.
         let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
-        let addresses = addresses(self.loaded, self.executable, deadline)?;
         let change = changes::prepare_with_meter(
             self.binding,
             input.device,
@@ -228,27 +219,10 @@ impl Uploads<'_> {
                 },
             )
             .map_err(stop)?;
-        let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-        let mut endpoint = None;
-        for address in addresses {
-            endpoint = Some(address);
-            let connection = settlement::request(self.loaded, address);
-            outcome = changes::publish(
-                &connection,
-                &self.loaded.trust,
-                deadline,
-                &change,
-                self.password,
-            );
-            if !matches!(
-                outcome,
-                Err(changes::Error::Connection(postgres_probe::Error::Transport))
-            ) {
-                break;
-            }
-        }
-        if let (Err(changes::Error::Indeterminate), Some(endpoint)) = (&outcome, endpoint) {
-            *pending = Some(Retained::new(change, endpoint, self.binding.account()));
+        let connection = settlement::request(self.loaded);
+        let outcome = changes::publish(&connection, deadline, &change, self.password);
+        if let Err(changes::Error::Indeterminate) = &outcome {
+            *pending = Some(Retained::new(change, self.binding.account()));
         }
         outcome.map_err(Error::Publication)
     }
@@ -271,24 +245,6 @@ fn phase(clock: &RuntimeClock, until: Deadline) -> Result<Instant, ports::Error>
     }
     Ok(deadline)
 }
-fn addresses(
-    loaded: &Loaded,
-    executable: &Path,
-    deadline: Instant,
-) -> Result<Vec<crate::postgres_probe::Endpoint>, ports::Error> {
-    let deadline = deadline.min(
-        Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .ok_or(ports::Error::Invalid)?,
-    );
-    crate::postgres_resolver::resolve(executable, &loaded.bootstrap, deadline).map_err(|error| {
-        match error {
-            crate::postgres_resolver::Error::Deadline => ports::Error::Deadline,
-            _ => ports::Error::Dns,
-        }
-    })
-}
-
 #[cfg(test)]
 mod ingress_tests {
     use super::*;

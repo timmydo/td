@@ -53,7 +53,7 @@ milliseconds, not a five-millisecond network timeout.
 | --- | --- |
 | TLS handshake | 10 seconds total |
 | Mail-routing configured-name DNS lookup | 5 seconds total across UDP/TCP/CNAME work |
-| PostgreSQL writer-name lookup | 5 seconds total in the disposable helper; POSTGRES.md, [Writer endpoint resolution](POSTGRES.md#writer-endpoint-resolution) |
+| Outbound HTTPS origin lookup | 5 seconds total in the disposable helper; DESIGN.md, [System-resolver helper](DESIGN.md#system-resolver-helper) |
 | TCP dial | 10 seconds total across returned addresses |
 | HTTP headers | 15 seconds idle, 30 seconds total |
 | HTTP request/upload body | 15 seconds idle; total derived from admitted bytes below |

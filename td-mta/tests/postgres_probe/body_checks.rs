@@ -8,7 +8,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ports::{Clock, Time},
     postgres_attempt_phases::{self as phases, BodyChecks},
@@ -19,22 +18,13 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     change: &phases::Change,
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
 ) {
     let open = || {
         quiet(fixture);
-        BodyChecks::open(
-            request,
-            trust,
-            deadline(),
-            change,
-            clock.clone(),
-            guard.clone(),
-        )
-        .unwrap()
+        BodyChecks::open(request, deadline(), change, clock.clone(), guard.clone()).unwrap()
     };
     let mut checks = open();
     let first = checks.check().unwrap();
@@ -125,8 +115,7 @@ pub(super) fn exercise(
     // A completed turn cannot refresh the original absolute deadline.
     quiet(fixture);
     let cap = Instant::now() + Duration::from_secs(1);
-    let mut checks =
-        BodyChecks::open(request, trust, cap, change, clock.clone(), guard.clone()).unwrap();
+    let mut checks = BodyChecks::open(request, cap, change, clock.clone(), guard.clone()).unwrap();
     assert!(checks.check().unwrap() <= cap);
     thread::sleep(cap.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
     let failure = checks.check().unwrap_err();
@@ -137,7 +126,7 @@ pub(super) fn exercise(
     assert_eq!(checks.check(), Err(failure));
 
     quiet(fixture);
-    cleanup_failure(fixture, request, trust, change, clock, guard);
+    cleanup_failure(fixture, request, change, clock, guard);
 }
 pub(super) fn quiet(fixture: &Fixture) {
     let stop = deadline();
@@ -194,7 +183,6 @@ impl Clock for CleanupClock {
 fn cleanup_failure(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     change: &phases::Change,
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
@@ -207,8 +195,7 @@ fn cleanup_failure(
         reached,
         proceed: Mutex::new(resume),
     });
-    let mut checks =
-        BodyChecks::open(request, trust, deadline(), change, clock.clone(), guard).unwrap();
+    let mut checks = BodyChecks::open(request, deadline(), change, clock.clone(), guard).unwrap();
     let pid = backend(fixture);
     thread::scope(|scope| {
         let kill_pid = pid.clone();

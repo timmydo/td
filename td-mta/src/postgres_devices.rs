@@ -15,7 +15,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 #[path = "postgres_device_list.rs"]
 mod listing;
@@ -199,7 +199,6 @@ enum Change {
 
 pub fn publish_creation(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     creation: &Creation,
 ) -> Result<(), Error> {
@@ -214,7 +213,6 @@ pub fn publish_creation(
     };
     mutate(
         request,
-        trust,
         deadline,
         creation.epoch,
         creation.account,
@@ -225,13 +223,11 @@ pub fn publish_creation(
 
 pub fn publish_revocation(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     revocation: &Revocation,
 ) -> Result<RevocationOutcome, Error> {
     mutate(
         request,
-        trust,
         deadline,
         revocation.epoch,
         revocation.account,
@@ -241,7 +237,6 @@ pub fn publish_revocation(
 
 fn mutate(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
@@ -250,7 +245,7 @@ fn mutate(
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     // Retirement and the record counts outgrow the ordinary 128-frame budget.
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         begin(client, epoch)?;
         // Every device writer takes the account fence before device rows.
         let rows = client
@@ -386,7 +381,6 @@ fn revoke(client: &Client, operation: Revocation) -> Result<Change, Error> {
 /// snapshot before return and grants no authority for a later mail operation.
 pub fn check(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
@@ -395,7 +389,7 @@ pub fn check(
     let Some(presented) = Presented::parse(password) else {
         return Ok(None);
     };
-    let result = postgres_probe::with_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_client(request, deadline, move |client| {
             let receipt = client.inspect_schema().map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;

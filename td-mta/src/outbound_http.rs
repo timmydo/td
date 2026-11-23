@@ -127,7 +127,7 @@ fn validate<'a>(origin: &str, request: &Request<'a>) -> Result<HttpsUri<'a>, Err
     Ok(uri)
 }
 fn connect(client: &Client<'_>, uri: HttpsUri<'_>, deadline: Instant) -> Result<Connection, Error> {
-    let addresses = crate::postgres_resolver::resolve_host(
+    let addresses = crate::resolver::resolve_host(
         client.executable,
         uri.host(),
         deadline.min(Instant::now() + Duration::from_secs(5)),

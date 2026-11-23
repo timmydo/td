@@ -4,7 +4,6 @@
 //! uncompleted submission names.
 use super::submission_retention::{count, id, submission, Group, NOW};
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{BootId, SubmissionId},
     postgres_probe::Request,
@@ -19,7 +18,6 @@ fn fill(byte: &str, bytes: usize) -> String {
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     source: SubmissionId,
 ) {
@@ -118,8 +116,8 @@ pub(super) fn exercise(
     );
     let acquire = |boot: u8| {
         let claim = owners::prepare(binding, BootId::from_bytes([boot; 16])).unwrap();
-        let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
-        owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+        let grant = owners::acquire(request, deadline(), &claim).unwrap();
+        owners::release(request, deadline(), &claim, grant.generation).unwrap();
     };
     acquire(95);
     assert_eq!(

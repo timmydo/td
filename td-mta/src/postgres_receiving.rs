@@ -17,7 +17,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 mod authentication;
 pub(crate) mod fanout;
 mod input;
@@ -264,7 +264,6 @@ fn inbox(client: &Client, account: crate::ids::AccountId, state: u64) -> Result<
 /// Hold configuration then account share locks for one coherent Inbox check.
 pub fn ready(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     binding: &Binding,
 ) -> Result<MailboxId, Error> {
@@ -272,7 +271,7 @@ pub fn ready(
         return Err(Error::Policy);
     }
     let binding = binding.clone();
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mailbox_client(request, deadline, move |client| {
             begin(client, &binding)?;
             let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_| Error::Database)?;
             let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
@@ -297,14 +296,13 @@ pub fn ready(
 
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     delivery: &Delivery,
 ) -> Result<Outcome, Error> {
     let delivery = delivery.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_upload_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_upload_client(request, deadline, move |client| {
         begin(client, &delivery.binding)?;
         let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE",&[]).map_err(|_|Error::Database)?;
         let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;

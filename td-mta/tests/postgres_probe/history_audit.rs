@@ -5,7 +5,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, StoreEpoch},
     postgres_accounts, postgres_history_audit as audit, postgres_schema,
@@ -15,26 +14,15 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_history_audit_checks_retained_rows_in_one_snapshot() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
-    let inspect = |limit| {
-        audit::inspect(
-            &fixture.request(),
-            &trust,
-            deadline(),
-            epoch,
-            account,
-            limit,
-        )
-    };
+    let inspect = |limit| audit::inspect(&fixture.request(), deadline(), epoch, account, limit);
     assert_eq!(inspect(1000), Err(audit::Error::Missing));
     for selected in [account, AccountId::from_bytes([2; 16])] {
         postgres_accounts::publish(
             &fixture.request(),
-            &trust,
             deadline(),
             postgres_accounts::prepare(epoch, selected).unwrap(),
         )
@@ -52,7 +40,6 @@ fn real_postgres_history_audit_checks_retained_rows_in_one_snapshot() {
     assert_eq!(
         audit::inspect(
             &fixture.request(),
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([0; 16]),
             account,
@@ -61,14 +48,7 @@ fn real_postgres_history_audit_checks_retained_rows_in_one_snapshot() {
         Err(audit::Error::Epoch)
     );
     assert_eq!(
-        audit::inspect(
-            &fixture.request(),
-            &trust,
-            Instant::now(),
-            epoch,
-            account,
-            1
-        ),
+        audit::inspect(&fixture.request(), Instant::now(), epoch, account, 1),
         Err(audit::Error::Connection(
             td_mta::postgres_probe::Error::Deadline
         ))
@@ -120,8 +100,7 @@ fn real_postgres_history_audit_checks_retained_rows_in_one_snapshot() {
     wait("SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.application_name='td-history-audit-lock' AND l.relation='td_mta.changes'::regclass AND l.mode='AccessExclusiveLock' AND l.granted");
     let request = fixture.request();
     let historical = thread::scope(|scope| {
-        let running =
-            scope.spawn(|| audit::inspect(&request, &trust, deadline(), epoch, account, 1000));
+        let running = scope.spawn(|| audit::inspect(&request, deadline(), epoch, account, 1000));
         wait("SELECT count(*) FROM pg_locks WHERE relation='td_mta.changes'::regclass AND mode='AccessShareLock' AND NOT granted");
         sql(&fixture,"UPDATE td_mta.accounts SET sequence=decode('0000000000000002','hex') WHERE id=decode(repeat('01',16),'hex')");
         writeln!(locker.0.stdin.as_mut().unwrap(),"INSERT INTO td_mta.changes VALUES(decode(repeat('01',16),'hex'),decode('0000000000000002','hex'),0,3,1,decode(repeat('09',16),'hex')); COMMIT;").unwrap();

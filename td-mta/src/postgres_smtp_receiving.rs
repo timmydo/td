@@ -10,10 +10,7 @@ use crate::{
     postgres_runtime_profile::Binding,
     postgres_settlement as settlement,
 };
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -28,7 +25,6 @@ impl From<ports::Error> for Error {
 
 pub struct Receiving<'a> {
     pub loaded: &'a Loaded,
-    pub executable: &'a Path,
     pub binding: &'a Binding,
     pub additional: &'a [&'a Binding],
     pub slots: &'a ReadSlots,
@@ -36,8 +32,7 @@ pub struct Receiving<'a> {
 }
 impl Receiving<'_> {
     pub(crate) fn valid(&self) -> bool {
-        self.executable.is_absolute()
-            && self.binding.roles().receive()
+        self.binding.roles().receive()
             && self.loaded.bootstrap.profile() == self.binding.profile()
             && self.additional.len() < crate::config::identities::MAX_ACCOUNTS
             && !self.additional.iter().enumerate().any(|(index, binding)| {
@@ -73,18 +68,10 @@ impl Receiving<'_> {
             .map_err(|_| ports::Error::Capacity)?;
         bindings.push(self.binding);
         bindings.extend(self.additional.iter().copied());
-        for address in addresses(self.loaded, self.executable, deadline)? {
-            let connection = settlement::request(self.loaded, address);
-            let ready = changes::ready_many(&connection, &self.loaded.trust, deadline, &bindings);
-            match ready {
-                Ok(_) => return Ok(()),
-                Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
-                Err(error) => return Err(Error::Publication(error)),
-            }
-        }
-        Err(Error::Publication(changes::Error::Connection(
-            postgres_probe::Error::Transport,
-        )))
+        let connection = settlement::request(self.loaded);
+        changes::ready_many(&connection, deadline, &bindings)
+            .map(|_| ())
+            .map_err(Error::Publication)
     }
 
     pub(crate) fn ready_cached(
@@ -204,11 +191,6 @@ impl Receiving<'_> {
         } else {
             None
         };
-        let addresses = if session.is_none() {
-            addresses(self.loaded, self.executable, deadline)?
-        } else {
-            Vec::new()
-        };
         let change = {
             let mut timing =
                 crate::performance::Timer::start(crate::performance::Phase::SmtpPrepare);
@@ -239,19 +221,8 @@ impl Receiving<'_> {
         let outcome = if let Some(session) = session {
             session.publish(&change, deadline)
         } else {
-            let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-            for address in addresses {
-                let connection = settlement::request(self.loaded, address);
-                outcome =
-                    changes::publish_fanout(&connection, &self.loaded.trust, deadline, &change);
-                if !matches!(
-                    outcome,
-                    Err(changes::Error::Connection(postgres_probe::Error::Transport))
-                ) {
-                    break;
-                }
-            }
-            outcome
+            let connection = settlement::request(self.loaded);
+            changes::publish_fanout(&connection, deadline, &change)
         };
         if outcome.is_ok() {
             timing.succeeded();
@@ -277,21 +248,4 @@ fn phase(clock: &RuntimeClock, until: Deadline) -> Result<Instant, ports::Error>
         return Err(ports::Error::Deadline);
     }
     Ok(deadline)
-}
-fn addresses(
-    loaded: &Loaded,
-    executable: &Path,
-    deadline: Instant,
-) -> Result<Vec<crate::postgres_probe::Endpoint>, ports::Error> {
-    let deadline = deadline.min(
-        Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .ok_or(ports::Error::Invalid)?,
-    );
-    crate::postgres_resolver::resolve(executable, &loaded.bootstrap, deadline).map_err(|error| {
-        match error {
-            crate::postgres_resolver::Error::Deadline => ports::Error::Deadline,
-            _ => ports::Error::Dns,
-        }
-    })
 }

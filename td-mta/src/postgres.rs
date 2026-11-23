@@ -5,7 +5,7 @@ use std::{
     process::ExitCode,
     time::{Duration, Instant},
 };
-use td_mta::{postgres_input::Loaded, postgres_probe, postgres_resolver, postgres_schema};
+use td_mta::{postgres_input::Loaded, postgres_probe, postgres_schema};
 
 mod account;
 mod account_admin;
@@ -306,35 +306,32 @@ fn check(
     operation: Operation,
     timeout: Duration,
 ) -> Result<Outcome, (&'static str, &'static str)> {
-    with_addresses_timeout(loaded, timeout, |request, deadline| {
+    with_connection_timeout(loaded, timeout, |request, deadline| {
         if matches!(
             operation,
             Operation::RuntimeCheck | Operation::ServiceProfileCheck
         ) {
             let receipt =
-                td_mta::postgres_runtime_access::inspect(request, &loaded.trust, deadline)
-                    .map_err(|error| {
-                        use td_mta::postgres_runtime_access::Error;
-                        match error {
-                            Error::Connection(error) => {
-                                AttemptError::from(postgres_schema::Error::Connection(error))
-                            }
-                            Error::Schema(error) => AttemptError::from(error),
-                            Error::Role => {
-                                AttemptError::Failed("runtime", "owner-or-privileged-role")
-                            }
-                            Error::Maintenance => {
-                                AttemptError::Failed("runtime", "maintenance-barrier")
-                            }
-                            Error::Replica => AttemptError::Failed("runtime", "replica-read-only"),
-                            Error::Privileges => {
-                                AttemptError::Failed("runtime", "incorrect-data-privileges")
-                            }
-                            Error::Database => {
-                                AttemptError::Failed("runtime", "privilege-check-failed")
-                            }
+                td_mta::postgres_runtime_access::inspect(request, deadline).map_err(|error| {
+                    use td_mta::postgres_runtime_access::Error;
+                    match error {
+                        Error::Connection(error) => {
+                            AttemptError::from(postgres_schema::Error::Connection(error))
                         }
-                    })?;
+                        Error::Schema(error) => AttemptError::from(error),
+                        Error::Role => AttemptError::Failed("runtime", "owner-or-privileged-role"),
+                        Error::Maintenance => {
+                            AttemptError::Failed("runtime", "maintenance-barrier")
+                        }
+                        Error::Replica => AttemptError::Failed("runtime", "replica-read-only"),
+                        Error::Privileges => {
+                            AttemptError::Failed("runtime", "incorrect-data-privileges")
+                        }
+                        Error::Database => {
+                            AttemptError::Failed("runtime", "privilege-check-failed")
+                        }
+                    }
+                })?;
             if operation == Operation::ServiceProfileCheck {
                 use td_mta::{generations::GenerationSet, postgres_runtime_access::ServiceRole};
                 let role = ServiceRole::for_login(request.user)
@@ -347,7 +344,6 @@ fn check(
                 let generations = GenerationSet::at_startup();
                 td_mta::postgres_runtime_profile::load(
                     &runtime,
-                    &loaded.trust,
                     deadline,
                     receipt.store_epoch,
                     role.name(),
@@ -359,21 +355,15 @@ fn check(
             return Ok(Outcome::Runtime(receipt));
         }
         match operation {
-            Operation::Probe => postgres_probe::probe(request, &loaded.trust, deadline)
+            Operation::Probe => postgres_probe::probe(request, deadline)
                 .map(Outcome::Probe)
                 .map_err(postgres_schema::Error::Connection),
             Operation::Initialize => {
-                postgres_schema::initialize(request, &loaded.trust, deadline).map(Outcome::Schema)
+                postgres_schema::initialize(request, deadline).map(Outcome::Schema)
             }
-            Operation::Upgrade => {
-                postgres_schema::upgrade(request, &loaded.trust, deadline).map(Outcome::Schema)
-            }
-            Operation::Plan => {
-                postgres_schema::plan(request, &loaded.trust, deadline).map(Outcome::Plan)
-            }
-            Operation::Inspect => {
-                postgres_schema::inspect(request, &loaded.trust, deadline).map(Outcome::Schema)
-            }
+            Operation::Upgrade => postgres_schema::upgrade(request, deadline).map(Outcome::Schema),
+            Operation::Plan => postgres_schema::plan(request, deadline).map(Outcome::Plan),
+            Operation::Inspect => postgres_schema::inspect(request, deadline).map(Outcome::Schema),
             Operation::RuntimeCheck | Operation::ServiceProfileCheck => {
                 Err(postgres_schema::Error::Invalid)
             }
@@ -397,46 +387,26 @@ impl From<postgres_schema::Error> for AttemptError {
     }
 }
 
-fn with_addresses<T>(
+fn with_connection<T>(
     loaded: &Loaded,
-    operation: impl FnMut(&postgres_probe::Request<'_>, Instant) -> Result<T, AttemptError>,
+    operation: impl FnOnce(&postgres_probe::Request<'_>, Instant) -> Result<T, AttemptError>,
 ) -> Result<T, (&'static str, &'static str)> {
-    with_addresses_timeout(loaded, Duration::from_secs(10), operation)
+    with_connection_timeout(loaded, Duration::from_secs(10), operation)
 }
 
-fn with_addresses_timeout<T>(
+fn with_connection_timeout<T>(
     loaded: &Loaded,
     timeout: Duration,
-    mut operation: impl FnMut(&postgres_probe::Request<'_>, Instant) -> Result<T, AttemptError>,
+    operation: impl FnOnce(&postgres_probe::Request<'_>, Instant) -> Result<T, AttemptError>,
 ) -> Result<T, (&'static str, &'static str)> {
-    let executable = std::env::current_exe().map_err(|_| ("resolver", "executable"))?;
-    // Cold files precede one shared DNS/connection/operation deadline.
-    let now = Instant::now();
-    let deadline = now
+    // Cold files precede one shared connection/operation deadline.
+    let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(("arguments", "invalid-timeout"))?;
-    let addresses = postgres_resolver::resolve(
-        &executable,
-        &loaded.bootstrap,
-        deadline.min(now + Duration::from_secs(5)),
-    )
-    .map_err(|error| {
-        (
-            "resolver",
-            match error {
-                postgres_resolver::Error::Deadline => "deadline",
-                _ => "resolution-failed",
-            },
-        )
-    })?;
-    for address in addresses {
-        match operation(&loaded.bootstrap.request(address), deadline) {
-            Ok(value) => return Ok(value),
-            Err(AttemptError::Transport) => continue,
-            Err(AttemptError::Failed(stage, code)) => return Err((stage, code)),
-        }
-    }
-    Err(exhausted(deadline))
+    operation(&loaded.bootstrap.request(), deadline).map_err(|error| match error {
+        AttemptError::Transport => refused(deadline),
+        AttemptError::Failed(stage, code) => (stage, code),
+    })
 }
 
 fn classify(error: postgres_schema::Error) -> (&'static str, &'static str) {
@@ -447,7 +417,6 @@ fn classify(error: postgres_schema::Error) -> (&'static str, &'static str) {
             match error {
                 postgres_probe::Error::Invalid => "invalid-request",
                 postgres_probe::Error::Deadline => "deadline",
-                postgres_probe::Error::Tls => "tls",
                 postgres_probe::Error::Database => "connection-or-authentication",
                 postgres_probe::Error::Settings => "primary-or-durability-settings",
                 postgres_probe::Error::RuntimeSchema => "runtime-schema-qualification",
@@ -475,7 +444,7 @@ fn classify(error: postgres_schema::Error) -> (&'static str, &'static str) {
     }
 }
 
-fn exhausted(deadline: Instant) -> (&'static str, &'static str) {
+fn refused(deadline: Instant) -> (&'static str, &'static str) {
     (
         "database",
         if Instant::now() >= deadline {
@@ -539,10 +508,10 @@ mod tests {
         assert!(args("schema-init", "60").is_none());
     }
     #[test]
-    fn last_address_exhaustion_distinguishes_deadline_from_transport() {
-        assert_eq!(exhausted(Instant::now()), ("database", "deadline"));
+    fn a_transport_refusal_distinguishes_deadline_from_transport() {
+        assert_eq!(refused(Instant::now()), ("database", "deadline"));
         assert_eq!(
-            exhausted(Instant::now() + Duration::from_secs(60)),
+            refused(Instant::now() + Duration::from_secs(60)),
             ("database", "transport")
         );
     }

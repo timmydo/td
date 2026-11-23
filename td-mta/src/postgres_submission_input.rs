@@ -13,7 +13,6 @@ use crate::{
     submission_envelope, transmitted_headers,
 };
 use std::{sync::Arc, time::Instant};
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -88,7 +87,6 @@ impl std::fmt::Debug for Prepared {
 /// password, connection, quota reservation or delivery responsibility escapes.
 pub fn prepare(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     input: Input<'_>,
     password: &[u8],
@@ -115,9 +113,7 @@ pub fn prepare(
             ..Charge::default()
         },
     );
-    prepare_with_meter(
-        request, trust, deadline, input, password, &mut meter, &clock,
-    )
+    prepare_with_meter(request, deadline, input, password, &mut meter, &clock)
 }
 
 struct PreparationClock<'a> {
@@ -137,7 +133,6 @@ impl Clock for PreparationClock<'_> {
 /// database capacity and retained body memory before entering this helper.
 pub fn prepare_with_meter(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     input: Input<'_>,
     password: &[u8],
@@ -171,55 +166,54 @@ pub fn prepare_with_meter(
         },
     )?;
     let maximum = input.binding.upload_maximum().min(32 * 1024 * 1024);
-    let result =
-        postgres_read::with_snapshot(request, trust, deadline, input.binding, password, |view| {
-            if input
-                .expected
-                .is_some_and(|expected| expected != view.identity().committed_sequence.number())
-            {
-                return Ok(Err(Error::State));
-            }
-            let metadata = view.email(input.email)?.ok_or(postgres_read::Error::Body(
-                crate::postgres_body::Error::Missing,
-            ))?;
-            if metadata.body.length > maximum as u64 {
-                return Ok(Err(Error::Capacity));
-            }
-            // Fund the reader's whole-body integrity pass before it starts.
-            if let Err(error) = charge(
+    let result = postgres_read::with_snapshot(request, deadline, input.binding, password, |view| {
+        if input
+            .expected
+            .is_some_and(|expected| expected != view.identity().committed_sequence.number())
+        {
+            return Ok(Err(Error::State));
+        }
+        let metadata = view.email(input.email)?.ok_or(postgres_read::Error::Body(
+            crate::postgres_body::Error::Missing,
+        ))?;
+        if metadata.body.length > maximum as u64 {
+            return Ok(Err(Error::Capacity));
+        }
+        // Fund the reader's whole-body integrity pass before it starts.
+        if let Err(error) = charge(
+            &clock,
+            meter,
+            Charge {
+                io_bytes: metadata.body.length,
+                records: metadata.body.length.div_ceil(65536),
+                ..Charge::default()
+            },
+        ) {
+            return Ok(Err(error));
+        }
+        view.with_body(input.email, |source, reader| {
+            Ok(freeze(
+                reader,
+                identity,
+                input.binding.header_maximum(),
+                input.binding.recipient_maximum(),
+                maximum,
                 &clock,
                 meter,
-                Charge {
-                    io_bytes: metadata.body.length,
-                    records: metadata.body.length.div_ceil(65536),
-                    ..Charge::default()
-                },
-            ) {
-                return Ok(Err(error));
-            }
-            view.with_body(input.email, |source, reader| {
-                Ok(freeze(
-                    reader,
-                    identity,
-                    input.binding.header_maximum(),
-                    input.binding.recipient_maximum(),
-                    maximum,
-                    &clock,
-                    meter,
-                )
-                .map(|output| {
-                    Prepared(Arc::new(Data {
-                        binding: input.binding.clone(),
-                        device,
-                        identity: input.identity,
-                        expected: input.expected,
-                        source,
-                        output,
-                    }))
+            )
+            .map(|output| {
+                Prepared(Arc::new(Data {
+                    binding: input.binding.clone(),
+                    device,
+                    identity: input.identity,
+                    expected: input.expected,
+                    source,
+                    output,
                 }))
-            })
+            }))
         })
-        .map_err(Error::Read)??;
+    })
+    .map_err(Error::Read)??;
     if Instant::now() >= deadline {
         return Err(Error::Work(ports::Error::Deadline));
     }

@@ -1,6 +1,5 @@
 //! Schema 46: per-Email sender authentication rows.
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::postgres_schema;
 
 const ACCOUNT: &str = "decode(repeat('01',16),'hex')";
@@ -23,9 +22,8 @@ fn refuse(fixture: &Fixture, statement: &str) {
 #[ignore = "real PostgreSQL 17 with pg_trgm 1.6 required"]
 pub(super) fn sender_authentication_upgrade_adds_checked_cascading_rows() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
-    let fresh = postgres_schema::initialize(&request, &trust, deadline()).unwrap();
+    let fresh = postgres_schema::initialize(&request, deadline()).unwrap();
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES({ACCOUNT},decode(repeat('00',7)||'01','hex'),decode(repeat('00',8),'hex'));
         INSERT INTO td_mta.threads SELECT id,id,sequence FROM td_mta.accounts"));
     email(&fixture, "02");
@@ -35,7 +33,7 @@ pub(super) fn sender_authentication_upgrade_adds_checked_cascading_rows() {
         "45|t"
     );
     // An existing direct-MX Email keeps no row; the upgrade invents none.
-    let upgraded = postgres_schema::upgrade(&request, &trust, deadline()).unwrap();
+    let upgraded = postgres_schema::upgrade(&request, deadline()).unwrap();
     assert_eq!(upgraded, fresh);
     assert_eq!(
         sql(&fixture, "SELECT count(*) FROM td_mta.email_authentication"),

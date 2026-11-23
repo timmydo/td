@@ -13,7 +13,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 
 #[path = "postgres_envelope_checks.rs"]
 mod retained;
@@ -48,36 +47,33 @@ fn address(value: &str, empty: bool) -> Result<String, Error> {
 /// Returned values grant no SMTP permission and all locks end with this call.
 pub fn envelope(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
 ) -> Result<Envelope, Error> {
-    read(request, trust, deadline, value, None).map(|(envelope, _)| envelope)
+    read(request, deadline, value, None).map(|(envelope, _)| envelope)
 }
 /// Fresh queue-clock and route-health admission for an untouched Prepared
 /// envelope. The returned local bound is conservative passive evidence; it
 /// cannot reconstruct transport ownership from a historical receipt.
 pub fn observe_envelope(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
 ) -> Result<(Envelope, Instant), Error> {
-    read(request, trust, deadline, value, Some((clock, guard)))
+    read(request, deadline, value, Some((clock, guard)))
 }
 type Observation = (Arc<dyn Clock>, Arc<Mutex<Guard>>);
 fn read(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Dispatch,
     observation: Option<Observation>,
 ) -> Result<(Envelope, Instant), Error> {
     let observed = observation.is_some();
     let value = value.clone();
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mailbox_client(request, deadline, move |client| {
         if !owners::begin(client, &value.claim, true, false).map_err(Error::Owner)? {
             return Err(Error::Policy);
         }

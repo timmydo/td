@@ -47,8 +47,8 @@ pub(super) fn run(
             )?;
         }
     }
-    let (loaded, address, authority) = import::connect(connection, epoch, account)?;
-    let request = loaded.bootstrap.request(address);
+    let (loaded, authority) = import::connect(connection, epoch, account)?;
+    let request = loaded.bootstrap.request();
     let mut output = Vec::new();
     let mut size = 0usize;
     if let Some(operations) = operations {
@@ -62,7 +62,6 @@ pub(super) fn run(
             let status = if let Some(baseline) = baseline {
                 match reconcile::apply(
                     &request,
-                    &loaded.trust,
                     import::deadline(),
                     &authority,
                     value,
@@ -96,15 +95,8 @@ pub(super) fn run(
     }
     for value in &boxes {
         let id = std::str::from_utf8(&value.key.object).map_err(|_| "migration-invalid-id")?;
-        let item = match reconcile::plan(
-            &request,
-            &loaded.trust,
-            import::deadline(),
-            &authority,
-            value,
-            &boxes,
-        )
-        .map_err(import::code)?
+        let item = match reconcile::plan(&request, import::deadline(), &authority, value, &boxes)
+            .map_err(import::code)?
         {
             Plan::New => json!({"id":id,"status":"unmapped"}),
             Plan::Current => json!({"id":id,"status":"matches-at-observation"}),

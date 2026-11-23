@@ -1,5 +1,4 @@
 use super::{attempt_clock, deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AttemptId, BootId, SubmissionId},
     postgres_attempt_phases as phases,
@@ -95,7 +94,6 @@ fn submission(fixture: &Fixture, src: &str, sub: u8, fields: &str, recipient: &s
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     source: SubmissionId,
 ) {
@@ -240,13 +238,12 @@ pub(super) fn exercise(
     );
 
     let claim = owners::prepare(binding, BootId::from_bytes([94; 16])).unwrap();
-    let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    let grant = owners::acquire(request, deadline(), &claim).unwrap();
     let queued = SubmissionId::parse(&hex(QUEUED, 0)).unwrap();
     let publish = || {
         attempt_clock::publish(
             fixture,
             request,
-            trust,
             deadline(),
             &attempts::prepare(&claim, grant.generation, queued).unwrap(),
         )
@@ -274,7 +271,7 @@ pub(super) fn exercise(
     let first = AttemptId::parse(&hex(SEED, 1)).unwrap();
     let body = phases::body(&claim, grant.generation, first, &[(0, "250 ok")]).unwrap();
     assert_eq!(
-        phases::inspect(request, trust, deadline(), &body),
+        phases::inspect(request, deadline(), &body),
         Err(phases::Error::Conflict)
     );
 
@@ -327,9 +324,9 @@ pub(super) fn exercise(
         ),
         1
     );
-    assert_eq!(phases::inspect(request, trust, deadline(), &body), Ok(None));
+    assert_eq!(phases::inspect(request, deadline(), &body), Ok(None));
     assert_eq!(
-        phases::publish(request, trust, deadline(), &body),
+        phases::publish(request, deadline(), &body),
         Err(phases::Error::Missing)
     );
 
@@ -388,7 +385,7 @@ pub(super) fn exercise(
         0
     );
     retire(&outcome);
-    owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+    owners::release(request, deadline(), &claim, grant.generation).unwrap();
 
     // Later fixtures see none of these rows.
     let tagged =

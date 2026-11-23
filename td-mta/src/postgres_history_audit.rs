@@ -8,7 +8,6 @@ use crate::{
     postgres_schema,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -45,13 +44,12 @@ impl Report {
 /// The caller supplies administrative connection access and a total row bound.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
     max_rows: u64,
 ) -> Result<Report, Error> {
-    let result = postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    let result = postgres_probe::with_body_worker(request, deadline, |worker| {
         let identity = worker.run(move |client| {
             let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != epoch { return Err(Error::Epoch); }

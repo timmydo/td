@@ -22,7 +22,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &td_crypto::TrustStore,
     epoch: StoreEpoch,
     shared: &str,
     frontend: &str,
@@ -56,7 +55,6 @@ pub(super) fn exercise(
     let frontend = format!("{frontend}\n[listener \"smtp\"]\nkind = \"direct_smtp\"\nbind = \"{smtp_address}\"\nserver_name = \"localhost\"\ncertificate = \"public\"\nsession_limit = 1\nper_peer_limit = 1\n");
     let candidate = configuration::prepare(
         request,
-        trust,
         deadline(),
         epoch,
         shared.as_bytes(),
@@ -68,10 +66,9 @@ pub(super) fn exercise(
     )
     .unwrap();
     let version = versions::Version::from_bytes([61; 16]);
-    versions::publish(request, trust, deadline(), version, &candidate).unwrap();
+    versions::publish(request, deadline(), version, &candidate).unwrap();
     selection::publish(
         request,
-        trust,
         deadline(),
         selection::prepare(epoch, 1, version, &candidate).unwrap(),
     )
@@ -80,7 +77,6 @@ pub(super) fn exercise(
     assert!(matches!(
         runtime::load(
             request,
-            trust,
             deadline(),
             epoch,
             "multi",
@@ -92,14 +88,12 @@ pub(super) fn exercise(
     ));
     td_mta::postgres_accounts::publish(
         request,
-        trust,
         deadline(),
         td_mta::postgres_accounts::prepare(epoch, b).unwrap(),
     )
     .unwrap();
     let prepared = runtime::load(
         request,
-        trust,
         deadline(),
         epoch,
         "multi",
@@ -133,7 +127,7 @@ pub(super) fn exercise(
     let (published, retired) = prepared.publish(&mut domain).unwrap();
     drop(retired);
     assert_eq!(published.bindings().count(), 2);
-    super::multi_receiving::exercise(fixture, request, trust, &published);
+    super::multi_receiving::exercise(fixture, request, &published);
     // Exercise the complete account ceiling with a small DATA reservation.
     let mut expanded = shared.clone();
     for index in 1..=14u8 {
@@ -141,7 +135,6 @@ pub(super) fn exercise(
         expanded.push_str(&format!("\n[account \"{account}\"]\nusername = \"extra{index}\"\n[alias \"extra{index}@example.test\"]\naccount = \"{account}\"\n"));
         td_mta::postgres_accounts::publish(
             request,
-            trust,
             deadline(),
             td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
         )
@@ -150,7 +143,6 @@ pub(super) fn exercise(
     let frontend = format!("{frontend}\n[limits]\nmessage_bytes = 1048576\n");
     let candidate = configuration::prepare(
         request,
-        trust,
         deadline(),
         epoch,
         expanded.as_bytes(),
@@ -162,10 +154,9 @@ pub(super) fn exercise(
     )
     .unwrap();
     let version = versions::Version::from_bytes([62; 16]);
-    versions::publish(request, trust, deadline(), version, &candidate).unwrap();
+    versions::publish(request, deadline(), version, &candidate).unwrap();
     selection::publish(
         request,
-        trust,
         deadline(),
         selection::prepare(
             epoch,
@@ -178,7 +169,6 @@ pub(super) fn exercise(
     .unwrap();
     let prepared = runtime::load(
         request,
-        trust,
         deadline(),
         epoch,
         "multi",
@@ -197,13 +187,12 @@ pub(super) fn exercise(
             let device =
                 td_mta::postgres_devices::prepare_creation(epoch, account, "multi-account", 1)
                     .unwrap();
-            td_mta::postgres_devices::publish_creation(request, trust, deadline(), &device)
-                .unwrap();
+            td_mta::postgres_devices::publish_creation(request, deadline(), &device).unwrap();
             device
         })
         .collect();
     uncertain_upload(fixture, &published, [(a, &devices[0]), (b, &devices[1])]);
-    let (held, grant) = super::multi_relay::leases(fixture, request, trust, &published);
+    let (held, grant) = super::multi_relay::leases(fixture, request, &published);
     let fill_health = |account: AccountId| {
         sql(fixture, &format!("DELETE FROM td_mta.route_health WHERE account=decode('{account}','hex') AND failure_count=0"));
         sql(fixture, &format!("INSERT INTO td_mta.route_health SELECT decode('{account}','hex'),'held-'||i,decode(repeat('00',32),'hex'),decode('0000000000000001','hex'),1,4,0,300000,decode('0000000000000001','hex') FROM generate_series(1,1024) i"));
@@ -215,16 +204,14 @@ pub(super) fn exercise(
     let relay = super::serving_relay::Relay::accepting(fixture, relay_socket, relay_dns, "multi");
     let local = td_fs::TempDir::new("ma").unwrap();
     fs::set_permissions(local.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = local.join("ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = local.join("connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://mail_runtime:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://mail_runtime:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -310,7 +297,7 @@ pub(super) fn exercise(
                  content_type: &str,
                  body: &str| {
         if held_live.get() {
-            owners::renew(request, trust, deadline(), &held, grant.generation).unwrap();
+            owners::renew(request, deadline(), &held, grant.generation).unwrap();
         }
         let stop = Instant::now() + Duration::from_secs(10);
         loop {
@@ -461,12 +448,12 @@ pub(super) fn exercise(
     let stop = Instant::now() + Duration::from_secs(30);
     while sql(fixture, b_done) != "1" {
         assert!(Instant::now() < stop);
-        owners::renew(request, trust, deadline(), &held, grant.generation).unwrap();
+        owners::renew(request, deadline(), &held, grant.generation).unwrap();
         thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(sql(fixture, a_done), "0");
     assert!(queue_command("queue-route-status").contains("requested"));
-    owners::release(request, trust, deadline(), &held, grant.generation).unwrap();
+    owners::release(request, deadline(), &held, grant.generation).unwrap();
     held_live.set(false);
     wait_for(a_done, "1");
     assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 2);
@@ -607,11 +594,10 @@ pub(super) fn exercise(
         td_mta::ids::BootId::from_bytes([93; 16]),
     )
     .unwrap();
-    let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    let grant = owners::acquire(request, deadline(), &claim).unwrap();
     td_mta::postgres_submission_retention::Step::AbandonedOwners
         .run(
             request,
-            trust,
             deadline(),
             &claim,
             grant.generation,
@@ -694,14 +680,14 @@ fn uncertain_upload(
     let loaded = Loaded {
         bootstrap: Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             "multi",
         )
         .unwrap(),
-        trust: td_crypto::TrustStore::from_pem(&fixture.ca).unwrap(),
     };
     let clock = RuntimeClock::new();
     let slots = ReadSlots::new(1).unwrap();
@@ -719,7 +705,6 @@ fn uncertain_upload(
         );
         uploads::Uploads {
             loaded: &loaded,
-            executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
             binding: profile.binding_for(account).unwrap(),
             slots: &slots,
             clock: &clock,

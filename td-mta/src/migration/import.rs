@@ -24,29 +24,22 @@ pub(super) fn run(
     // immediately before use while the cooperative archive lock remains held.
     let mailboxes = mailboxes(&manifest, instance, source_account)?;
     let messages = messages(&manifest, instance, source_account)?;
-    let (loaded, address, authority) = connect(connection, epoch, account)?;
-    let request = loaded.bootstrap.request(address);
+    let (loaded, authority) = connect(connection, epoch, account)?;
+    let request = loaded.bootstrap.request();
     let mut created_mailboxes = 0usize;
     let mut created_messages = 0usize;
     let mut absent = 0usize;
     for value in &mailboxes {
         let outcome =
-            database::publish_mailbox(&request, &loaded.trust, deadline(), &authority, value)
-                .map_err(code)?;
+            database::publish_mailbox(&request, deadline(), &authority, value).map_err(code)?;
         created_mailboxes += usize::from(outcome.created);
         absent += usize::from(!outcome.present);
     }
     for (value, body, size) in &messages {
         let bytes = archive.read_body(body, *size)?;
-        let outcome = database::publish_email(
-            &request,
-            &loaded.trust,
-            email_deadline(value),
-            &authority,
-            value,
-            &bytes,
-        )
-        .map_err(code)?;
+        let outcome =
+            database::publish_email(&request, email_deadline(value), &authority, value, &bytes)
+                .map_err(code)?;
         created_messages += usize::from(outcome.created);
         absent += usize::from(!outcome.present);
     }
@@ -58,29 +51,14 @@ pub(super) fn connect(
     connection: &str,
     epoch: StoreEpoch,
     account: AccountId,
-) -> Result<(Loaded, crate::postgres_probe::Endpoint, database::Authority)> {
+) -> Result<(Loaded, database::Authority)> {
     let loaded = Loaded::open(connection, "migration").map_err(|_| "migration-connection-file")?;
-    let executable = std::env::current_exe().map_err(|_| "migration-resolver")?;
-    let addresses = crate::postgres_resolver::resolve(
-        &executable,
-        &loaded.bootstrap,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .map_err(|_| "migration-resolver")?;
-    let mut selected = None;
-    for address in addresses {
-        let request = loaded.bootstrap.request(address);
-        match database::prepare(&request, &loaded.trust, deadline(), epoch, account) {
-            Ok(authority) => {
-                selected = Some((address, authority));
-                break;
-            }
-            Err(database::Error::Connection(_)) => {}
-            Err(error) => return Err(code(error)),
-        }
-    }
-    let (address, authority) = selected.ok_or("migration-database-connection")?;
-    Ok((loaded, address, authority))
+    let authority = database::prepare(&loaded.bootstrap.request(), deadline(), epoch, account)
+        .map_err(|error| match error {
+            database::Error::Connection(_) => "migration-database-connection",
+            error => code(error),
+        })?;
+    Ok((loaded, authority))
 }
 pub(super) fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)

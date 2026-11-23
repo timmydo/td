@@ -12,7 +12,6 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::TrustStore;
 
 /// Caller attestation, not a database proof or a substitute for external fencing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,16 +57,11 @@ pub(crate) fn blocked(client: &Client) -> Result<bool, Error> {
 }
 
 /// A historical observation under the migration lock, never serving authority.
-pub fn inspect(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    epoch: StoreEpoch,
-) -> Result<bool, Error> {
+pub fn inspect(request: &Request<'_>, deadline: Instant, epoch: StoreEpoch) -> Result<bool, Error> {
     if request.mode != Mode::Preparation {
         return Err(Error::Owner);
     }
-    let result = postgres_probe::with_schema_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_schema_client(request, deadline, move |client| {
         let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
         if receipt.store_epoch != epoch {
             return Err(Error::Epoch);
@@ -92,7 +86,6 @@ pub fn inspect(
 /// atomically; postgres_recovery owns the explicit release protocol.
 pub fn enter(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     _fence: ExternalFence,
@@ -102,7 +95,7 @@ pub fn enter(
     }
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_schema_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_schema_client(request, deadline, move |client| {
         client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
         let receipt = postgres_schema::lock_exclusive_transaction_and_inspect(client)
             .map_err(Error::Schema)?;

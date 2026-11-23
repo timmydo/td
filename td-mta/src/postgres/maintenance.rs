@@ -1,5 +1,5 @@
 //! Explicit owner maintenance observation and monotone entry.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -76,14 +76,11 @@ pub(super) fn run(
             return Ok(ExitCode::FAILURE);
         }
     };
-    let result = with_addresses(&loaded, |request, deadline| {
+    let result = with_connection(&loaded, |request, deadline| {
         match operation {
-            Operation::Inspect => {
-                maintenance::inspect(request, &loaded.trust, deadline, options.epoch)
-            }
+            Operation::Inspect => maintenance::inspect(request, deadline, options.epoch),
             Operation::Enter => maintenance::enter(
                 request,
-                &loaded.trust,
                 deadline,
                 options.epoch,
                 ExternalFence::InstancesAndSmtpEgressStopped,

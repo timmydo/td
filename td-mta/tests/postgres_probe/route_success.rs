@@ -3,7 +3,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AttemptId, BootId, SubmissionId},
     postgres_attempt_phases as phases, postgres_attempt_recovery as recovery,
@@ -16,12 +15,11 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     submission: SubmissionId,
 ) {
     let claim = owners::prepare(binding, BootId::from_bytes([90; 16])).unwrap();
-    let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    let grant = owners::acquire(request, deadline(), &claim).unwrap();
     let previous = AttemptId::parse(&sql(
         fixture,
         "SELECT encode(attempt_id,'hex') FROM td_mta.submission_attempts WHERE active",
@@ -29,7 +27,6 @@ pub(super) fn exercise(
     .unwrap();
     recovery::publish(
         request,
-        trust,
         deadline(),
         &recovery::prepare(&claim, grant.generation, previous).unwrap(),
     )
@@ -38,7 +35,6 @@ pub(super) fn exercise(
     let attempt = super::attempt_clock::publish(
         fixture,
         request,
-        trust,
         deadline(),
         &attempts::retry(&claim, grant.generation, submission).unwrap(),
     )
@@ -47,7 +43,6 @@ pub(super) fn exercise(
     let abandoned = attempt;
     recovery::publish(
         request,
-        trust,
         deadline(),
         &recovery::interrupted(&claim, grant.generation, abandoned.attempt).unwrap(),
     )
@@ -56,24 +51,19 @@ pub(super) fn exercise(
     let attempt = super::attempt_clock::publish(
         fixture,
         request,
-        trust,
         deadline(),
         &attempts::retry(&claim, grant.generation, submission).unwrap(),
     )
     .unwrap();
 
     let value = success::prepare(&claim, grant.generation, attempt.attempt).unwrap();
+    assert_eq!(success::inspect(request, deadline(), &value).unwrap(), None);
     assert_eq!(
-        success::inspect(request, trust, deadline(), &value).unwrap(),
-        None
-    );
-    assert_eq!(
-        success::publish(request, trust, deadline(), &value),
+        success::publish(request, deadline(), &value),
         Err(Error::Conflict)
     );
     phases::publish(
         request,
-        trust,
         deadline(),
         &phases::body(
             &claim,
@@ -86,18 +76,16 @@ pub(super) fn exercise(
     .unwrap();
     phases::publish(
         request,
-        trust,
         deadline(),
         &phases::acceptance_possible(&claim, grant.generation, attempt.attempt, &[0]).unwrap(),
     )
     .unwrap();
     assert_eq!(
-        success::publish(request, trust, deadline(), &value),
+        success::publish(request, deadline(), &value),
         Err(Error::Conflict)
     );
     phases::publish(
         request,
-        trust,
         deadline(),
         &phases::accepted(
             &claim,
@@ -122,12 +110,12 @@ pub(super) fn exercise(
         "UPDATE td_mta.route_health SET repair_generation=decode('0000000000000001','hex')",
     );
     assert_eq!(
-        success::publish(request, trust, deadline(), &value),
+        success::publish(request, deadline(), &value),
         Err(Error::RepairRequired)
     );
     sql(fixture,"UPDATE td_mta.route_health SET repair_generation=NULL; CREATE FUNCTION public.reject_success() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action=3 THEN RAISE EXCEPTION 'fixture refusal'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_success BEFORE INSERT ON td_mta.route_health_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_success()");
     assert_eq!(
-        success::publish(request, trust, deadline(), &value),
+        success::publish(request, deadline(), &value),
         Err(Error::Database)
     );
     assert_eq!(
@@ -174,14 +162,13 @@ pub(super) fn exercise(
     assert_eq!(
         success::publish(
             request,
-            trust,
             Instant::now() + Duration::from_millis(1500),
             &value
         ),
         Err(Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
-    let outcome = success::publish(request, trust, deadline(), &value).unwrap();
+    let outcome = success::publish(request, deadline(), &value).unwrap();
     let settled = |op: &str| {
         sql(
             fixture,
@@ -220,7 +207,6 @@ pub(super) fn exercise(
     assert_eq!(
         health::publish(
             request,
-            trust,
             deadline(),
             &health::prepare(
                 &claim,
@@ -250,7 +236,6 @@ pub(super) fn exercise(
     assert_eq!(
         health::publish(
             request,
-            trust,
             deadline(),
             &health::prepare(
                 &claim,
@@ -262,9 +247,9 @@ pub(super) fn exercise(
         ),
         Err(Error::Conflict)
     );
-    owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+    owners::release(request, deadline(), &claim, grant.generation).unwrap();
     assert_eq!(
-        success::publish(request, trust, deadline(), &value).unwrap(),
+        success::publish(request, deadline(), &value).unwrap(),
         outcome
     );
     sql(

@@ -749,15 +749,14 @@ struct Jmap {
 
 impl Jmap {
     fn new(fixture: &Fixture, address: SocketAddr) -> Self {
-        let trust = td_crypto::TrustStore::from_pem(&fixture.ca).unwrap();
-        let epoch = td_mta::postgres_schema::inspect(&fixture.request(), &trust, deadline())
+        let epoch = td_mta::postgres_schema::inspect(&fixture.request(), deadline())
             .unwrap()
             .store_epoch;
         let account = td_mta::ids::AccountId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let device =
             td_mta::postgres_devices::prepare_creation(epoch, account, "performance client", 1)
                 .unwrap();
-        td_mta::postgres_devices::publish_creation(&fixture.request(), &trust, deadline(), &device)
+        td_mta::postgres_devices::publish_creation(&fixture.request(), deadline(), &device)
             .unwrap();
         let credentials = [b"user:".as_slice(), device.password()].concat();
         let encoded = certificate::pem("BASIC", &credentials);
@@ -1288,16 +1287,14 @@ pub(super) fn exercise(
     let smtp_address = smtp.local_addr().unwrap();
     let https_address = https.local_addr().unwrap();
     let connection = fixture.root.join("performance-connection");
-    let ca = fixture.root.join("performance-ca.pem");
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(&ca, &fixture.ca).unwrap();
     fs::write(
         &connection,
         format!(
-            "postgresql://mail_runtime:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://mail_runtime:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();

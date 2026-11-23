@@ -1,5 +1,4 @@
 use super::{command_output, deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     compose_text::{Address, Message},
     config::profile::Roles,
@@ -16,7 +15,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &TrustStore,
     epoch: StoreEpoch,
     shared: &str,
     frontend: &str,
@@ -52,14 +50,7 @@ pub(super) fn exercise(
         },
     ];
     let prepare = |source: &str, profiles: &[configuration::Profile<'_>]| {
-        configuration::prepare(
-            request,
-            trust,
-            deadline(),
-            epoch,
-            source.as_bytes(),
-            profiles,
-        )
+        configuration::prepare(request, deadline(), epoch, source.as_bytes(), profiles)
     };
     for target in ["missing", "read-only"] {
         let invalid = shared.replace(
@@ -86,18 +77,11 @@ pub(super) fn exercise(
         candidate.submission_route(b, "front"),
         candidate.route("front")
     );
-    accounts::publish(
-        request,
-        trust,
-        deadline(),
-        accounts::prepare(epoch, b).unwrap(),
-    )
-    .unwrap();
+    accounts::publish(request, deadline(), accounts::prepare(epoch, b).unwrap()).unwrap();
     let version = versions::Version::from_bytes([81; 16]);
-    versions::publish(request, trust, deadline(), version, &candidate).unwrap();
+    versions::publish(request, deadline(), version, &candidate).unwrap();
     selection::publish(
         request,
-        trust,
         deadline(),
         selection::prepare(epoch, 1, version, &candidate).unwrap(),
     )
@@ -105,7 +89,6 @@ pub(super) fn exercise(
     let domain = GenerationSet::<TlsPolicies>::at_startup();
     let front = runtime::load(
         request,
-        trust,
         deadline(),
         epoch,
         "front",
@@ -115,7 +98,6 @@ pub(super) fn exercise(
     let relay_domain = GenerationSet::<TlsPolicies>::at_startup();
     let relay = runtime::load(
         request,
-        trust,
         deadline(),
         epoch,
         "migadu",
@@ -151,10 +133,9 @@ pub(super) fn exercise(
             account == a
         );
         let device = devices::prepare_creation(epoch, account, "routing", 1).unwrap();
-        devices::publish_creation(request, trust, deadline(), &device).unwrap();
+        devices::publish_creation(request, deadline(), &device).unwrap();
         let mailboxes = td_mta::postgres_mailboxes::list(
             request,
-            trust,
             deadline(),
             epoch,
             account,
@@ -198,10 +179,9 @@ pub(super) fn exercise(
             deadline(),
         )
         .unwrap();
-        let draft = drafts::publish(request, trust, deadline(), &draft, device.password()).unwrap();
+        let draft = drafts::publish(request, deadline(), &draft, device.password()).unwrap();
         let prepared = input::prepare(
             request,
-            trust,
             deadline(),
             input::Input {
                 binding,
@@ -214,14 +194,13 @@ pub(super) fn exercise(
         .unwrap();
         let submission = submissions::prepare(prepared, deadline()).unwrap();
         assert_eq!(submission.route(), binding.submission_route());
-        submissions::publish(request, trust, deadline(), &submission, device.password()).unwrap();
+        submissions::publish(request, deadline(), &submission, device.password()).unwrap();
         assert_eq!(sql(fixture, &format!("SELECT route_name FROM td_mta.submission_routes WHERE account=decode('{account}','hex')")), expected_route);
         assert_eq!(sql(fixture, &format!("SELECT encode(destination,'hex') FROM td_mta.submission_routes WHERE account=decode('{account}','hex')")), binding.submission_route().destination().iter().map(|b| format!("{b:02x}")).collect::<String>());
     }
     idle_hints(
         fixture,
         request,
-        trust,
         front.binding_for(a).unwrap(),
         relay.binding_for(a).unwrap(),
     );
@@ -244,7 +223,6 @@ pub(super) fn exercise(
     );
     let fresh = runtime::load(
         request,
-        trust,
         deadline(),
         epoch,
         "front",
@@ -308,7 +286,6 @@ pub(super) fn exercise(
 fn idle_hints(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &TrustStore,
     front: &runtime::Binding,
     relay: &runtime::Binding,
 ) {
@@ -317,10 +294,10 @@ fn idle_hints(
     };
     let front_claim = owners::prepare(front, BootId::from_bytes([91; 16])).unwrap();
     let relay_claim = owners::prepare(relay, BootId::from_bytes([92; 16])).unwrap();
-    let front_grant = owners::acquire(request, trust, deadline(), &front_claim).unwrap();
-    let relay_grant = owners::acquire(request, trust, deadline(), &relay_claim).unwrap();
+    let front_grant = owners::acquire(request, deadline(), &front_claim).unwrap();
+    let relay_grant = owners::acquire(request, deadline(), &relay_claim).unwrap();
     let idle = |claim: &owners::Claim, generation| {
-        hints::idle_observation(request, trust, deadline(), claim, generation)
+        hints::idle_observation(request, deadline(), claim, generation)
             .unwrap()
             .is_some()
     };
@@ -331,7 +308,6 @@ fn idle_hints(
     assert!(matches!(
         hints::idle_observation(
             request,
-            trust,
             deadline(),
             &relay_claim,
             relay_grant.generation + 1
@@ -340,7 +316,6 @@ fn idle_hints(
     ));
     assert!(hints::idle_observation(
         request,
-        trust,
         std::time::Instant::now(),
         &relay_claim,
         relay_grant.generation
@@ -383,37 +358,17 @@ fn idle_hints(
     // A new round observes work added immediately after an empty observation.
     sql(fixture, &format!("UPDATE td_mta.submissions SET completed_at=NULL WHERE account=decode('{account}','hex')"));
     assert!(!idle(&relay_claim, relay_grant.generation));
-    owners::release(
-        request,
-        trust,
-        deadline(),
-        &front_claim,
-        front_grant.generation,
-    )
-    .unwrap();
-    owners::release(
-        request,
-        trust,
-        deadline(),
-        &relay_claim,
-        relay_grant.generation,
-    )
-    .unwrap();
-    assert!(hints::idle_observation(
-        request,
-        trust,
-        deadline(),
-        &relay_claim,
-        relay_grant.generation
-    )
-    .is_err());
-    scoped_qualification(fixture, request, trust, relay);
+    owners::release(request, deadline(), &front_claim, front_grant.generation).unwrap();
+    owners::release(request, deadline(), &relay_claim, relay_grant.generation).unwrap();
+    assert!(
+        hints::idle_observation(request, deadline(), &relay_claim, relay_grant.generation).is_err()
+    );
+    scoped_qualification(fixture, request, relay);
 }
 
 fn scoped_qualification(
     fixture: &Fixture,
     preparation: &td_mta::postgres_probe::Request<'_>,
-    trust: &TrustStore,
     binding: &runtime::Binding,
 ) {
     use td_mta::{
@@ -426,11 +381,9 @@ fn scoped_qualification(
     runtime.user = "mail_runtime";
     runtime.mode = probe::Mode::Runtime;
     let claim = owners::prepare(binding, BootId::from_bytes([93; 16])).unwrap();
-    let grant = owners::acquire(preparation, trust, deadline(), &claim).unwrap();
-    let idle =
-        |request| hints::idle_observation(request, trust, deadline(), &claim, grant.generation);
-    let renew =
-        |request| owners::renew_many(request, trust, deadline(), &[(&claim, grant.generation)]);
+    let grant = owners::acquire(preparation, deadline(), &claim).unwrap();
+    let idle = |request| hints::idle_observation(request, deadline(), &claim, grant.generation);
+    let renew = |request| owners::renew_many(request, deadline(), &[(&claim, grant.generation)]);
 
     // Count executed ledger reads on real sessions, rather than trusting a
     // source pattern or a mock that cannot observe recursive session locks.
@@ -441,9 +394,8 @@ fn scoped_qualification(
         assert!(std::time::Instant::now() < until);
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let inspect_logs = |request| {
-        td_mta::postgres_logs::inspect(request, trust, deadline(), binding.epoch(), None, 1)
-    };
+    let inspect_logs =
+        |request| td_mta::postgres_logs::inspect(request, deadline(), binding.epoch(), None, 1);
     for request in [preparation, &runtime] {
         assert_one_ledger_read(fixture, || {
             idle(request).unwrap();
@@ -455,8 +407,8 @@ fn scoped_qualification(
             inspect_logs(request).unwrap();
         });
     }
-    retained_idle(fixture, &runtime, trust, &claim, grant.generation);
-    retained_renewal(fixture, &runtime, trust, &claim, grant.generation);
+    retained_idle(fixture, &runtime, &claim, grant.generation);
+    retained_renewal(fixture, &runtime, &claim, grant.generation);
     sql(fixture, "ALTER SYSTEM RESET log_statement");
     sql(fixture, "SELECT pg_reload_conf()");
 
@@ -547,7 +499,7 @@ fn scoped_qualification(
         ),
         "t"
     );
-    owners::release_many(&runtime, trust, deadline(), &[(&claim, grant.generation)]).unwrap();
+    owners::release_many(&runtime, deadline(), &[(&claim, grant.generation)]).unwrap();
 }
 
 fn assert_one_ledger_read(fixture: &Fixture, operation: impl FnOnce()) {
@@ -576,7 +528,6 @@ fn assert_one_ledger_read(fixture: &Fixture, operation: impl FnOnce()) {
 fn retained_idle(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &TrustStore,
     claim: &td_mta::postgres_route_owners::Claim,
     generation: u64,
 ) {
@@ -585,8 +536,8 @@ fn retained_idle(
         postgres_read::ReadSlots,
         postgres_route_owners as owners, postgres_schema,
     };
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
-    let expected = hints::idle_observation(request, trust, deadline(), claim, generation)
+    owners::renew(request, deadline(), claim, generation).unwrap();
+    let expected = hints::idle_observation(request, deadline(), claim, generation)
         .unwrap()
         .is_some();
     super::body_checks::quiet(fixture);
@@ -594,7 +545,7 @@ fn retained_idle(
         .unwrap()
         .len() as usize;
     let slots = ReadSlots::new(1).unwrap();
-    let mut reader = IdleReader::new(&slots, request, trust);
+    let mut reader = IdleReader::new(&slots, request);
     assert_eq!(
         reader
             .observe(deadline(), claim, generation)
@@ -621,7 +572,7 @@ fn retained_idle(
         reads, 1,
         "one ledger qualification across 64 idle observations"
     );
-    let mut other = IdleReader::new(&slots, request, trust);
+    let mut other = IdleReader::new(&slots, request);
     assert_eq!(
         other.observe(deadline(), claim, generation),
         Err(hints::Error::Busy)
@@ -670,21 +621,20 @@ fn retained_idle(
     );
     assert!(other.observe(deadline(), claim, generation).is_ok());
     other.close();
-    idle_account_contention(fixture, request, trust, claim, generation);
-    relay_notifications(fixture, request, trust, claim, generation);
+    idle_account_contention(fixture, request, claim, generation);
+    relay_notifications(fixture, request, claim, generation);
 }
 
 fn relay_notifications(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &TrustStore,
     claim: &td_mta::postgres_route_owners::Claim,
     generation: u64,
 ) {
     use td_mta::{postgres_queue_candidates::IdleReader, postgres_read::ReadSlots};
-    td_mta::postgres_route_owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    td_mta::postgres_route_owners::renew(request, deadline(), claim, generation).unwrap();
     let slots = ReadSlots::new(1).unwrap();
-    let mut reader = IdleReader::new(&slots, request, trust);
+    let mut reader = IdleReader::new(&slots, request);
     reader.observe(deadline(), claim, generation).unwrap();
     // A round trip on the subscribed backend drains preceding asynchronous
     // messages. Assertions concern transaction semantics, not elapsed time.
@@ -721,7 +671,6 @@ fn relay_notifications(
 fn retained_renewal(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &TrustStore,
     claim: &td_mta::postgres_route_owners::Claim,
     generation: u64,
 ) {
@@ -733,23 +682,23 @@ fn retained_renewal(
         .len() as usize;
     let mut renewer = owners::Renewer::default();
     let leases = [(claim, generation)];
-    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    renewer.renew(request, deadline(), &leases).unwrap();
     let pid = backend(fixture);
     for _ in 1..15 {
-        renewer.renew(request, trust, deadline(), &leases).unwrap();
+        renewer.renew(request, deadline(), &leases).unwrap();
     }
     assert_eq!(backend(fixture), pid);
     assert_eq!(sql(fixture, &format!("SELECT state||'|'||(xact_start IS NULL)::text FROM pg_catalog.pg_stat_activity WHERE pid={pid}")), "idle|true");
     assert!(sql(fixture, &format!("BEGIN; SELECT pg_catalog.pg_try_advisory_xact_lock({}); SELECT id FROM td_mta.accounts FOR UPDATE NOWAIT; SELECT singleton FROM td_mta.config_selection FOR UPDATE NOWAIT; SELECT account FROM td_mta.route_owners FOR UPDATE NOWAIT; ROLLBACK", postgres_schema::MIGRATION_KEY)).lines().any(|line| line == "f"));
     let log = std::fs::read_to_string(fixture.root.join("server.log")).unwrap();
     assert_eq!(log[offset..].lines().filter(|line| line.contains("execute ") && line.contains("SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version")).count(), 1);
-    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    renewer.renew(request, deadline(), &leases).unwrap();
     closed(fixture, &pid);
-    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    renewer.renew(request, deadline(), &leases).unwrap();
     let pid = backend(fixture);
     sql(fixture, &format!("SELECT pg_terminate_backend({pid})"));
     closed(fixture, &pid);
-    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    renewer.renew(request, deadline(), &leases).unwrap();
     assert_ne!(backend(fixture), pid);
     let selection = sql(
         fixture,
@@ -778,24 +727,21 @@ fn retained_renewal(
             owners::Error::Connection(probe::Error::RuntimeSchema),
         ),
     ] {
-        renewer.renew(request, trust, deadline(), &leases).unwrap();
+        renewer.renew(request, deadline(), &leases).unwrap();
         let pid = backend(fixture);
         sql(fixture, &change);
-        assert_eq!(
-            renewer.renew(request, trust, deadline(), &leases),
-            Err(error)
-        );
+        assert_eq!(renewer.renew(request, deadline(), &leases), Err(error));
         closed(fixture, &pid);
         sql(fixture, &restore);
     }
-    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    renewer.renew(request, deadline(), &leases).unwrap();
     let pid = backend(fixture);
     let baseline = sql(
         fixture,
         "SELECT string_agg(expires_at::text,',' ORDER BY account) FROM td_mta.route_owners",
     );
     assert_eq!(
-        renewer.renew(request, trust, deadline(), &[(claim, generation + 1)]),
+        renewer.renew(request, deadline(), &[(claim, generation + 1)]),
         Err(owners::Error::Stale)
     );
     closed(fixture, &pid);
@@ -806,13 +752,12 @@ fn retained_renewal(
         ),
         baseline
     );
-    renewer.renew(request, trust, deadline(), &leases).unwrap();
+    renewer.renew(request, deadline(), &leases).unwrap();
     let pid = backend(fixture);
     sql(fixture, "CREATE FUNCTION public.delay_retained_renewal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(2); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_retained_renewal AFTER UPDATE ON td_mta.route_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_retained_renewal()");
     assert_eq!(
         renewer.renew(
             request,
-            trust,
             std::time::Instant::now() + std::time::Duration::from_secs(1),
             &leases
         ),
@@ -835,13 +780,12 @@ fn retained_renewal(
         ),
         "t"
     );
-    owners::observe(request, trust, deadline(), claim, generation).unwrap();
+    owners::observe(request, deadline(), claim, generation).unwrap();
 }
 
 fn idle_account_contention(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &TrustStore,
     claim: &td_mta::postgres_route_owners::Claim,
     generation: u64,
 ) {
@@ -851,9 +795,9 @@ fn idle_account_contention(
         time::{Duration, Instant},
     };
     use td_mta::{postgres_queue_candidates as hints, postgres_read::ReadSlots};
-    td_mta::postgres_route_owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    td_mta::postgres_route_owners::renew(request, deadline(), claim, generation).unwrap();
     let slots = ReadSlots::new(1).unwrap();
-    let mut reader = hints::IdleReader::new(&slots, request, trust);
+    let mut reader = hints::IdleReader::new(&slots, request);
     let expected = reader
         .observe(deadline(), claim, generation)
         .unwrap()

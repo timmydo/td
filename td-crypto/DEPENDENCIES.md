@@ -75,5 +75,5 @@ td-mta's PostgreSQL client is the local std-only `td-postgres` crate
 (td-postgres/DESIGN.md), over td-alloc, td-encoding, td-fs and
 td-primitives. It adds no registry package: the mail lock holds the
 crypto lock's packages and local crates only, and mail's selected graph is
-crypto's. Its SCRAM uses td-primitives' SHA-256, HMAC and PBKDF2; TLS stays
-behind td-crypto through a connector td-mta supplies.
+crypto's. Its SCRAM uses td-primitives' SHA-256, HMAC and PBKDF2. It
+reaches the database only over a Unix socket and uses no TLS.

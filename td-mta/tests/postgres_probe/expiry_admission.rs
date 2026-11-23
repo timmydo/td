@@ -4,7 +4,6 @@ use std::{
     thread,
     time::Duration,
 };
-use td_crypto::TrustStore;
 use td_mta::{
     admission::work::{Charge, Meter},
     ids::{AttemptId, SubmissionId},
@@ -21,7 +20,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     submission: SubmissionId,
@@ -34,8 +32,7 @@ pub(super) fn exercise(
     let settlement_slots = ReadSlots::new(1).unwrap();
     let pending = dispatch::Pending::default();
     let request = Request {
-        address: request.address,
-        server_name: request.server_name,
+        socket: request.socket,
         database: request.database,
         user: "mail_runtime",
         password: PASSWORD,
@@ -44,7 +41,6 @@ pub(super) fn exercise(
     let worker = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &request,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -53,7 +49,6 @@ pub(super) fn exercise(
     };
     let settle = dispatch::Connection {
         request: &request,
-        trust,
         slots: &settlement_slots,
         clock: clock.clone(),
     };
@@ -105,7 +100,6 @@ pub(super) fn exercise(
     let forbidden = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &preparation,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -131,7 +125,6 @@ pub(super) fn exercise(
     let unconfirmed = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &request,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -169,10 +162,7 @@ pub(super) fn exercise(
         ),
         before
     );
-    assert_eq!(
-        expiry::inspect(&request, trust, deadline(), value).unwrap(),
-        None
-    );
+    assert_eq!(expiry::inspect(&request, deadline(), value).unwrap(), None);
 
     assert_eq!(
         worker.expire(value.clone(), until(1500), &mut work()),
@@ -226,7 +216,7 @@ pub(super) fn exercise(
     }
     assert_eq!(pending.identity().unwrap(), Some(identity));
     thread::sleep(Duration::from_secs(4));
-    let outcome = expiry::inspect(&request, trust, deadline(), value)
+    let outcome = expiry::inspect(&request, deadline(), value)
         .unwrap()
         .unwrap();
 
@@ -234,7 +224,6 @@ pub(super) fn exercise(
     let holder = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &request,
-            trust,
             slots: &settlement_slots,
             clock: clock.clone(),
         },

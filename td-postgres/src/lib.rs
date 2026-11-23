@@ -14,11 +14,9 @@ mod stream;
 mod types;
 mod wire;
 
-pub use client::{
-    connect_tls, connect_unix, connect_unix_through, start_tls, startup, Client, Notification,
-};
+pub use client::{connect_unix, connect_unix_through, startup, Client, Notification};
 pub use rows::{Row, RowRef, Rows};
-pub use stream::{Socket, Stream, StreamError, TlsConnect};
+pub use stream::{Socket, Stream, StreamError};
 pub use types::{oid, Array, Decode, DecodeError, Element, Encode, Typed};
 
 use std::fmt;
@@ -44,10 +42,6 @@ pub enum Error {
     Io,
     /// The server broke the protocol.
     Protocol,
-    /// The server answered the TLS request with no.
-    TlsRefused,
-    /// The caller's TLS connector failed.
-    Tls,
     /// Authentication was refused: the server offered no SCRAM-SHA-256,
     /// asked for another method, or failed to prove it knows the password.
     Authentication,
@@ -70,8 +64,6 @@ impl fmt::Display for Error {
             Self::Closed => f.write_str("PostgreSQL server closed the connection"),
             Self::Io => f.write_str("PostgreSQL transport failed"),
             Self::Protocol => f.write_str("PostgreSQL protocol violation"),
-            Self::TlsRefused => f.write_str("PostgreSQL server refused TLS"),
-            Self::Tls => f.write_str("PostgreSQL TLS failed"),
             Self::Authentication => f.write_str("PostgreSQL authentication refused"),
             Self::Db(error) => write!(f, "PostgreSQL error {}", error.code()),
             Self::RowCount => f.write_str("unexpected PostgreSQL row count"),

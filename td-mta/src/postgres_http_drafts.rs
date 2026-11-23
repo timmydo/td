@@ -17,7 +17,6 @@ use crate::{
     store_fs::DraftCompletion,
 };
 use std::{
-    path::Path,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -51,14 +50,10 @@ impl Pending {
     pub fn settle(
         &self,
         loaded: &Loaded,
-        executable: &Path,
         settlement_slots: &ReadSlots,
         clock: &RuntimeClock,
         until: Deadline,
     ) -> Result<Option<Settled>, Error> {
-        if !executable.is_absolute() {
-            return Err(Error::Invalid);
-        }
         let mut pending = self.change.try_lock().map_err(|_| Error::Busy)?;
         if pending.is_none() {
             return Ok(None);
@@ -74,7 +69,7 @@ impl Pending {
         settle_held(&mut pending, loaded, settlement_slots, deadline)
     }
 }
-/// Inspect only at the retained endpoint. Absence proves rollback unless another
+/// Inspect only at the retained socket. Absence proves rollback unless another
 /// process swept the expired receipt (POSTGRES.md section 165).
 fn settle_held(
     pending: &mut Option<Retained<Draft>>,
@@ -86,8 +81,8 @@ fn settle_held(
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| Error::Busy)?;
-    let connection = settlement::request(loaded, held.endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
+    let connection = settlement::request(loaded);
+    let settled = changes::inspect(&connection, deadline, &held.change)
         .map_err(map_error)?
         .map(|outcome| Settled {
             operation: held.change.operation(),
@@ -99,7 +94,6 @@ fn settle_held(
 
 pub struct Drafts<'a> {
     pub loaded: &'a Loaded,
-    pub executable: &'a Path,
     pub binding: &'a Binding,
     pub slots: &'a ReadSlots,
     pub clock: &'a RuntimeClock,
@@ -125,8 +119,7 @@ impl Drafts<'_> {
         input: DraftInput<'_>,
         meter: &mut Meter,
     ) -> Result<DraftCompletion, DraftError> {
-        if !self.executable.is_absolute()
-            || !self.binding.roles().jmap()
+        if !self.binding.roles().jmap()
             || self.loaded.bootstrap.profile() != self.binding.profile()
             || input.account != self.binding.account()
             || Presented::parse(self.password).is_none_or(|value| value.id() != input.device)
@@ -167,22 +160,6 @@ impl Drafts<'_> {
         let _slot = self.slots.acquire().map_err(|_| store(Error::Busy))?;
         let parsed = draft_input::parse(input.value, self.maximum_text, self.clock, until, meter)
             .map_err(DraftError::Input)?;
-        let dns_deadline = deadline.min(
-            Instant::now()
-                .checked_add(Duration::from_secs(5))
-                .ok_or_else(|| store(Error::Invalid))?,
-        );
-        let addresses = crate::postgres_resolver::resolve(
-            self.executable,
-            &self.loaded.bootstrap,
-            dns_deadline,
-        )
-        .map_err(|error| {
-            store(match error {
-                crate::postgres_resolver::Error::Deadline => Error::Deadline,
-                _ => Error::Dns,
-            })
-        })?;
         let mut loaded_parts = Vec::new();
         loaded_parts
             .try_reserve_exact(parsed.attachments.len())
@@ -191,78 +168,66 @@ impl Drafts<'_> {
         for attachment in &parsed.attachments {
             // The verified body snapshot and fresh authorization use two slots.
             let _authorization_slot = self.slots.acquire().map_err(|_| store(Error::Busy))?;
-            let mut result = Err(crate::postgres_body::Error::Missing);
-            for address in &addresses {
-                // Prepay verification and replay before opening the body snapshot,
-                // including transport fallback and protocol overhead.
-                meter
-                    .charge(
-                        self.clock.sample().map_err(store)?.monotonic,
-                        Charge {
-                            io_bytes: 192 * 1024 + remaining * 3,
-                            records: 1024 + remaining.div_ceil(4096) * 3,
-                            ..Charge::default()
-                        },
-                    )
-                    .map_err(|stop| {
-                        store(if stop == Stop::Deadline {
-                            Error::Deadline
-                        } else {
-                            Error::Capacity
-                        })
-                    })?;
-                let mut connection = self.loaded.bootstrap.request(*address);
-                connection.mode = Mode::Runtime;
-                result = crate::postgres_body::with_blob(
-                    &connection,
-                    &self.loaded.trust,
-                    deadline,
-                    crate::postgres_body::BlobRequest {
-                        binding: self.binding,
-                        blob: attachment.blob,
-                        maximum: remaining,
+            // Prepay verification and replay before opening the body snapshot,
+            // including protocol overhead.
+            meter
+                .charge(
+                    self.clock.sample().map_err(store)?.monotonic,
+                    Charge {
+                        io_bytes: 192 * 1024 + remaining * 3,
+                        records: 1024 + remaining.div_ceil(4096) * 3,
+                        ..Charge::default()
                     },
-                    self.password,
-                    |metadata, reader| {
-                        let length =
-                            usize::try_from(metadata.body.length).map_err(|_| Error::Capacity)?;
-                        let mut bytes = Vec::new();
-                        bytes
-                            .try_reserve_exact(length)
-                            .map_err(|_| Error::Capacity)?;
-                        bytes.resize(length, 0);
-                        let mut offset = 0;
-                        while offset < length {
-                            if Instant::now() >= deadline {
-                                return Err(Error::Deadline);
-                            }
-                            let end = offset.saturating_add(4096).min(length);
-                            let output = bytes.get_mut(offset..end).ok_or(Error::Invalid)?;
-                            let n = reader.read_at(offset as u64, output)?;
-                            if n == 0 || n > output.len() {
-                                return Err(Error::Corrupt);
-                            }
-                            offset += n;
+                )
+                .map_err(|stop| {
+                    store(if stop == Stop::Deadline {
+                        Error::Deadline
+                    } else {
+                        Error::Capacity
+                    })
+                })?;
+            let mut connection = self.loaded.bootstrap.request();
+            connection.mode = Mode::Runtime;
+            let result = crate::postgres_body::with_blob(
+                &connection,
+                deadline,
+                crate::postgres_body::BlobRequest {
+                    binding: self.binding,
+                    blob: attachment.blob,
+                    maximum: remaining,
+                },
+                self.password,
+                |metadata, reader| {
+                    let length =
+                        usize::try_from(metadata.body.length).map_err(|_| Error::Capacity)?;
+                    let mut bytes = Vec::new();
+                    bytes
+                        .try_reserve_exact(length)
+                        .map_err(|_| Error::Capacity)?;
+                    bytes.resize(length, 0);
+                    let mut offset = 0;
+                    while offset < length {
+                        if Instant::now() >= deadline {
+                            return Err(Error::Deadline);
                         }
-                        Ok((
-                            changes::AttachmentSource {
-                                blob: attachment.blob,
-                                length: metadata.body.length,
-                                digest: metadata.body.digest,
-                            },
-                            bytes,
-                        ))
-                    },
-                );
-                if !matches!(
-                    result,
-                    Err(crate::postgres_body::Error::Connection(
-                        postgres_probe::Error::Transport
+                        let end = offset.saturating_add(4096).min(length);
+                        let output = bytes.get_mut(offset..end).ok_or(Error::Invalid)?;
+                        let n = reader.read_at(offset as u64, output)?;
+                        if n == 0 || n > output.len() {
+                            return Err(Error::Corrupt);
+                        }
+                        offset += n;
+                    }
+                    Ok((
+                        changes::AttachmentSource {
+                            blob: attachment.blob,
+                            length: metadata.body.length,
+                            digest: metadata.body.digest,
+                        },
+                        bytes,
                     ))
-                ) {
-                    break;
-                }
-            }
+                },
+            );
             let (source, bytes) = result.map_err(|error| match error {
                 crate::postgres_body::Error::Missing => {
                     DraftError::Input(draft_input::Error::Property("attachments"))
@@ -332,26 +297,8 @@ impl Drafts<'_> {
         let blob = draft.blob();
         let thread = draft.thread_candidate();
         let size = draft.length();
-        let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-        let mut endpoint = None;
-        for address in addresses {
-            endpoint = Some(address);
-            let connection = settlement::request(self.loaded, address);
-            outcome = changes::publish(
-                &connection,
-                &self.loaded.trust,
-                deadline,
-                &draft,
-                self.password,
-            );
-            if !matches!(
-                outcome,
-                Err(changes::Error::Connection(postgres_probe::Error::Transport))
-            ) {
-                break;
-            }
-        }
-        match outcome {
+        let connection = settlement::request(self.loaded);
+        match changes::publish(&connection, deadline, &draft, self.password) {
             Ok(outcome) => Ok(DraftCompletion {
                 before_epoch,
                 before_sequence: Sequence::from_u64(outcome.old_sequence),
@@ -364,11 +311,7 @@ impl Drafts<'_> {
                 cleanup_error: None,
             }),
             Err(changes::Error::Indeterminate) => {
-                *pending = Some(Retained::new(
-                    draft,
-                    endpoint.ok_or_else(|| store(Error::Invalid))?,
-                    self.binding.account(),
-                ));
+                *pending = Some(Retained::new(draft, self.binding.account()));
                 Ok(DraftCompletion {
                     before_epoch,
                     before_sequence: Sequence::from_u64(0),

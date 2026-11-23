@@ -1,10 +1,9 @@
 //! Same-boot expiry evidence under the serving profile's private directory lock.
 use super::{Error, Guard, RetryFloor, DISCONTINUITY_MS};
 use crate::{
-    bounded::TextBuffer,
     ids::StoreEpoch,
     ports::{Clock, Tick, Time},
-    postgres_probe::{Endpoint, Request},
+    postgres_probe::Request,
 };
 use std::{
     fs,
@@ -125,22 +124,14 @@ fn boot_domain() -> Option<[u8; 32]> {
 }
 
 fn identity(request: &Request<'_>, epoch: StoreEpoch, profile: &str) -> Result<[u8; 32], Error> {
-    let mut address = [0; 100];
-    let mut text = TextBuffer::new(&mut address);
-    let endpoint = match &request.address {
-        Endpoint::Tcp(addr) => {
-            text.format(format_args!("{addr}"))
-                .map_err(|_| Error::Invalid)?;
-            text.as_bytes().map_err(|_| Error::Invalid)?
-        }
-        Endpoint::Unix(path) => path.as_path().as_os_str().as_bytes(),
-    };
     digest(&[
         b"td-mta queue clock v1",
         epoch.as_bytes(),
         profile.as_bytes(),
-        endpoint,
-        request.server_name.as_bytes(),
+        request.socket.as_path().as_os_str().as_bytes(),
+        // v1's server-name field, always empty for a socket: evidence an
+        // earlier process wrote keeps its identity.
+        b"",
         request.database.as_bytes(),
     ])
 }
@@ -369,6 +360,28 @@ mod tests {
             after: Tick(tick),
         }
     }
+    /// Evidence written for a socket keeps its identity: six length-prefixed
+    /// parts, the fifth empty (computed independently with Python's hashlib).
+    #[test]
+    fn socket_identity_is_the_v1_digest() {
+        let request = Request {
+            socket: td_fs::SocketPath::new(Path::new("/run/postgresql/.s.PGSQL.5432")).unwrap(),
+            user: "mail_runtime",
+            database: "mail",
+            password: b"unused",
+            mode: crate::postgres_probe::Mode::Runtime,
+        };
+        let expected: [u8; 32] = [
+            0xc0, 0x8a, 0xbb, 0x7a, 0xaf, 0xb1, 0x6a, 0x2c, 0xdb, 0xa1, 0xd7, 0x4e, 0xa8, 0xe5,
+            0xc4, 0x73, 0x5c, 0x75, 0x8a, 0x64, 0xa3, 0xe7, 0xc6, 0x6b, 0x0d, 0x1a, 0x2b, 0x4a,
+            0x35, 0x3e, 0x89, 0x45,
+        ];
+        assert_eq!(
+            identity(&request, StoreEpoch::from_bytes([7; 16]), "desktop").unwrap(),
+            expected
+        );
+    }
+
     const UTC: i64 = 1_000_000;
     const SCOPE: [u8; 32] = [1; 32];
     const BOOT: Option<[u8; 32]> = Some([3; 32]);

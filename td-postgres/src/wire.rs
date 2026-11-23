@@ -11,8 +11,6 @@ pub(crate) const MAX_MESSAGE_BYTES: usize = 1 << 30;
 /// PostgreSQL's `MAX_STARTUP_PACKET_LENGTH`.
 const MAX_STARTUP_BYTES: usize = 10_000;
 const PROTOCOL_3_0: i32 = 196_608;
-/// The 8-byte SSLRequest: its length, then 1234 and 5679.
-pub(crate) const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
 /// The read buffer's first size, grown to a message's size as needed.
 const FIRST_BUFFER: usize = 8 * 1024;
 

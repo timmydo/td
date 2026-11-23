@@ -8,7 +8,6 @@ use crate::{
     postgres_probe::{self, Request},
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 pub struct Active {
     pub generation: i64,
@@ -61,7 +60,6 @@ pub struct Claim<'a> {
 
 pub fn claim(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     claim: Claim<'_>,
@@ -78,7 +76,7 @@ pub fn claim(
         return Err(Error::Capacity);
     }
     let name = name.to_owned();
-    postgres_probe::with_material_client(request,trust,deadline,move|client| {
+    postgres_probe::with_material_client(request,deadline,move|client| {
         check(client,epoch)?;
         client.batch("BEGIN; SET LOCAL synchronous_commit=on; SET LOCAL lock_timeout=1000; SET LOCAL statement_timeout=5000; SELECT pg_advisory_xact_lock(882015,30)").map_err(|_|Error::Database)?;
         client.execute("INSERT INTO td_mta.acme_profiles(slot,profile,settings_hash,revision,owner,lease_until,state) SELECT s,$1,$2,1,$3,clock_timestamp()+interval '180 seconds',$4 FROM generate_series(0,15) s WHERE NOT EXISTS(SELECT 1 FROM td_mta.acme_profiles WHERE slot=s) ORDER BY s LIMIT 1 ON CONFLICT(profile) DO NOTHING", &[&name,&settings.as_slice(),&owner.as_slice(),&initial]).map_err(|_|Error::Database)?;
@@ -93,7 +91,6 @@ pub fn claim(
 /// The active chain and key are returned from one row in one statement.
 pub fn active(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     name: &str,
@@ -105,7 +102,7 @@ pub fn active(
     } else {
         "SELECT active_generation,chain,key,settings_hash FROM td_mta.acme_profiles WHERE profile=$1 AND active_generation>0"
     };
-    postgres_probe::with_material_client(request, trust, deadline, move |client| {
+    postgres_probe::with_material_client(request, deadline, move |client| {
         check(client, epoch)?;
         let row = client
             .query_opt(query, &[&name])
@@ -135,7 +132,6 @@ pub fn active(
 }
 pub struct Writer<'a, 'r> {
     pub request: &'a Request<'r>,
-    pub trust: &'a TrustStore,
     pub epoch: StoreEpoch,
     pub profile: &'a str,
     pub owner: [u8; 16],
@@ -179,7 +175,7 @@ impl Persistence for Writer<'_, '_> {
         let owner = self.owner;
         let revision = self.revision;
         let epoch = self.epoch;
-        let result=postgres_probe::with_material_client(self.request,self.trust,Instant::now()+std::time::Duration::from_secs(10),move|client|{
+        let result=postgres_probe::with_material_client(self.request,Instant::now()+std::time::Duration::from_secs(10),move|client|{
             check(client,epoch)?;
             client.batch("SET synchronous_commit=on; SET lock_timeout=1000; SET statement_timeout=5000").map_err(|_|Error::Database)?;
             let (chain,mut key)=pair.unwrap_or_default();let publish=!chain.is_empty();
@@ -204,7 +200,6 @@ impl Persistence for Writer<'_, '_> {
             };
             let _ = crate::postgres_logs::append(
                 self.request,
-                self.trust,
                 Instant::now() + std::time::Duration::from_secs(2),
                 self.epoch,
                 "acme",
@@ -221,7 +216,6 @@ impl Persistence for Writer<'_, '_> {
 /// Small revision inventory for service reload observation, never a key export.
 pub fn generations(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
 ) -> Result<Vec<(String, i64)>, Error> {
@@ -230,7 +224,7 @@ pub fn generations(
     } else {
         "SELECT profile,active_generation FROM td_mta.acme_profiles ORDER BY profile LIMIT 17"
     };
-    postgres_probe::with_client(request, trust, deadline, move |client| {
+    postgres_probe::with_client(request, deadline, move |client| {
         check(client, epoch)?;
         let rows = client.query(query, &[]).map_err(|_| Error::Database)?;
         if rows.len() > 16 {
@@ -257,14 +251,13 @@ pub struct Status {
 }
 pub fn status(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     name: &str,
 ) -> Result<Status, Error> {
     profile(name)?;
     let name = name.to_owned();
-    postgres_probe::with_material_client(request,trust,deadline,move|client|{
+    postgres_probe::with_material_client(request,deadline,move|client|{
         check(client,epoch)?;
         let row=client.query_opt("SELECT active_generation,state,lease_until>clock_timestamp() FROM td_mta.acme_profiles WHERE profile=$1",&[&name]).map_err(|_|Error::Database)?.ok_or(Error::Conflict)?;
         let state=State::decode(row.try_get(1).map_err(|_|Error::Database)?)?;

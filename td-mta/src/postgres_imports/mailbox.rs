@@ -4,33 +4,23 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     value: &Mailbox,
 ) -> Result<Outcome, Error> {
-    publish_policy(request, trust, deadline, authority, value, None)
+    publish_policy(request, deadline, authority, value, None)
 }
 pub fn publish_unmapped(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     value: &Mailbox,
     definitions: &[Mailbox],
 ) -> Result<Outcome, Error> {
-    publish_policy(
-        request,
-        trust,
-        deadline,
-        authority,
-        value,
-        Some(definitions),
-    )
+    publish_policy(request, deadline, authority, value, Some(definitions))
 }
 fn publish_policy(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     value: &Mailbox,
@@ -38,7 +28,6 @@ fn publish_policy(
 ) -> Result<Outcome, Error> {
     if let Some(outcome) = inspect_policy(
         request,
-        trust,
         deadline,
         authority,
         &value.key,
@@ -62,7 +51,6 @@ fn publish_policy(
     let marker = attempted.clone();
     let result = postgres_probe::with_import_mailbox_client(
         request,
-        trust,
         deadline,
         guarded,
         move |client| {

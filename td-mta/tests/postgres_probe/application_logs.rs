@@ -1,5 +1,4 @@
 use super::{create_runtime_login, deadline, grant_runtime_mail, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{BootId, StoreEpoch},
     observability::{Context, Event, Kind},
@@ -10,14 +9,13 @@ use td_mta::{
 #[ignore = "real local PostgreSQL 17 tools and private trusted TMPDIR required"]
 pub(super) fn real_postgres_logs_bound_retention_rate_wrap_and_inspection() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     super::rewind_email_order(&fixture);
     sql(&fixture,"ALTER TABLE td_mta.flag_receipts DROP COLUMN created_at; ALTER TABLE td_mta.mailbox_create_receipts DROP COLUMN created_at; ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at; DROP INDEX td_mta.blob_search_candidates; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DROP TABLE td_mta.replica_email_receipts,td_mta.replica_blob_identities,td_mta.replica_accounts,td_mta.replica_progress,td_mta.replica_pending,td_mta.replica_mailbox_receipts,td_mta.replica_source,td_mta.blob_search,td_mta.blob_interpretations,td_mta.blob_summaries,td_mta.acme_profiles,td_mta.application_logs,td_mta.application_log_state; DELETE FROM td_mta.schema_migrations WHERE version>=29");
     sql(&fixture, include_str!("../../src/postgres_receiving.sql"));
-    let upgraded = postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap();
+    let upgraded = postgres_schema::upgrade(&fixture.request(), deadline()).unwrap();
     assert_eq!(upgraded.version, postgres_schema::VERSION);
     assert_eq!(upgraded.store_epoch, epoch);
     create_runtime_login(&fixture);
@@ -37,17 +35,16 @@ pub(super) fn real_postgres_logs_bound_retention_rate_wrap_and_inspection() {
             submission: None,
         },
     };
-    let append =
-        |events: &[Event]| logs::append(&request, &trust, deadline(), epoch, "frontend", events);
-    let page = |before| logs::inspect(&request, &trust, deadline(), epoch, before, 100).unwrap();
+    let append = |events: &[Event]| logs::append(&request, deadline(), epoch, "frontend", events);
+    let page = |before| logs::inspect(&request, deadline(), epoch, before, 100).unwrap();
     let connection = fixture.root.join("log-connection");
     std::fs::write(
         &connection,
         format!(
-            "postgresql://mail_runtime:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://mail_runtime:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(super::PASSWORD).unwrap(),
             fixture.port,
-            fixture.root.join("sql-ca.pem").display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -56,9 +53,8 @@ pub(super) fn real_postgres_logs_bound_retention_rate_wrap_and_inspection() {
     let loaded =
         td_mta::postgres_input::Loaded::open(connection.to_str().unwrap(), "frontend").unwrap();
     assert_eq!(
-        logs::append_resolved(
+        logs::append_loaded(
             &loaded,
-            std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
             std::time::Instant::now() + std::time::Duration::from_secs(2),
             epoch,
             "frontend",
@@ -76,7 +72,6 @@ pub(super) fn real_postgres_logs_bound_retention_rate_wrap_and_inspection() {
     assert_eq!(
         logs::append(
             &request,
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([0; 16]),
             "frontend",
@@ -85,18 +80,11 @@ pub(super) fn real_postgres_logs_bound_retention_rate_wrap_and_inspection() {
         Err(logs::Error::Epoch)
     );
     assert_eq!(
-        logs::append(
-            &request,
-            &trust,
-            deadline(),
-            epoch,
-            "bad\nprofile",
-            &[event]
-        ),
+        logs::append(&request, deadline(), epoch, "bad\nprofile", &[event]),
         Err(logs::Error::Invalid)
     );
     assert_eq!(append(&[event; 17]), Err(logs::Error::Invalid));
-    assert!(logs::inspect(&request, &trust, deadline(), epoch, None, 101).is_err());
+    assert!(logs::inspect(&request, deadline(), epoch, None, 101).is_err());
     sql(&fixture,"UPDATE td_mta.application_log_state SET used=599,window_ms=(extract(epoch FROM clock_timestamp())*1000)::bigint");
     let done = append(&[event; 16]).unwrap();
     assert_eq!((done.stored, done.suppressed), (1, 15));

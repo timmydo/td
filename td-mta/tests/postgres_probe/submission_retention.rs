@@ -1,5 +1,4 @@
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{BootId, SubmissionId},
     postgres_probe::Request,
@@ -101,7 +100,6 @@ pub(super) fn resync(fixture: &Fixture, account: &str) {
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     source: SubmissionId,
 ) {
@@ -334,15 +332,9 @@ pub(super) fn exercise(
     }
     resync(fixture, &account);
     let usage = || {
-        audit::inspect(
-            request,
-            trust,
-            deadline(),
-            binding.epoch(),
-            binding.account(),
-        )
-        .unwrap()
-        .usage
+        audit::inspect(request, deadline(), binding.epoch(), binding.account())
+            .unwrap()
+            .usage
     };
     let before = usage();
     let sequence = || {
@@ -355,24 +347,16 @@ pub(super) fn exercise(
     let now = || -> i64 { sql(fixture, &format!("SELECT {NOW}")).parse().unwrap() };
 
     let claim = owners::prepare(binding, BootId::from_bytes([93; 16])).unwrap();
-    let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    let grant = owners::acquire(request, deadline(), &claim).unwrap();
     let retire =
-        || retention::Step::Retire.run(request, trust, deadline(), &claim, grant.generation, now());
+        || retention::Step::Retire.run(request, deadline(), &claim, grant.generation, now());
     assert_eq!(
-        retention::Step::Retire.run(
-            request,
-            trust,
-            deadline(),
-            &claim,
-            grant.generation + 1,
-            now()
-        ),
+        retention::Step::Retire.run(request, deadline(), &claim, grant.generation + 1, now()),
         Err(retention::Error::Owner(owners::Error::Stale))
     );
     assert_eq!(
         retention::Step::Retire.run(
             request,
-            trust,
             deadline(),
             &claim,
             grant.generation,
@@ -519,31 +503,15 @@ pub(super) fn exercise(
 
     // Lease reclamation is its own transaction under the same claim, fence
     // and clock guard.
-    let reclaim = || {
-        retention::Step::UploadLeases.run(
-            request,
-            trust,
-            deadline(),
-            &claim,
-            grant.generation,
-            now(),
-        )
-    };
+    let reclaim =
+        || retention::Step::UploadLeases.run(request, deadline(), &claim, grant.generation, now());
     assert_eq!(
-        retention::Step::UploadLeases.run(
-            request,
-            trust,
-            deadline(),
-            &claim,
-            grant.generation + 1,
-            now()
-        ),
+        retention::Step::UploadLeases.run(request, deadline(), &claim, grant.generation + 1, now()),
         Err(retention::Error::Owner(owners::Error::Stale))
     );
     assert_eq!(
         retention::Step::UploadLeases.run(
             request,
-            trust,
             deadline(),
             &claim,
             grant.generation,
@@ -611,7 +579,7 @@ pub(super) fn exercise(
         retention::Step::IdleAttempts,
     ] {
         assert!(
-            step.run(request, trust, deadline(), &claim, grant.generation, now())
+            step.run(request, deadline(), &claim, grant.generation, now())
                 .unwrap()
                 > 0
         );
@@ -646,7 +614,7 @@ pub(super) fn exercise(
     );
     assert_eq!(count(fixture, &format!("td_mta.blobs WHERE id={b5}")), "0");
     assert_eq!(upload - usage().upload_bytes, 100);
-    owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+    owners::release(request, deadline(), &claim, grant.generation).unwrap();
     assert!(
         matches!(retire(), Err(retention::Error::Owner(_))),
         "released owner fenced"

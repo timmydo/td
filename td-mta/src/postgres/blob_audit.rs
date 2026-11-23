@@ -1,5 +1,5 @@
 //! Historical single-body verification without download authority.
-use super::{account, report_error, with_addresses, AttemptError};
+use super::{account, report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -51,10 +51,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    let result = with_addresses(&loaded, |request, deadline| {
+    let result = with_connection(&loaded, |request, deadline| {
         postgres_blob_audit::inspect(
             request,
-            &loaded.trust,
             deadline,
             options.account.epoch,
             options.account.account,

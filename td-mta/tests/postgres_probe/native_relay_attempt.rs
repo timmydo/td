@@ -4,7 +4,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_crypto::{Crypto, Digest, Provider};
 use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     admission::work::{Charge, Meter},
@@ -24,7 +24,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -71,7 +70,7 @@ pub(super) fn exercise(
             fixture,
             &format!("SELECT reverse_path FROM td_mta.submissions WHERE id={sub}"),
         );
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         let clock = Arc::new(RuntimeClock::new());
         let guard = Arc::new(Mutex::new(
             Guard::new(Time {
@@ -86,8 +85,7 @@ pub(super) fn exercise(
             .unwrap(),
         ));
         let runtime = Request {
-            address: request.address,
-            server_name: request.server_name,
+            socket: request.socket,
             user: "mail_runtime",
             database: request.database,
             password: PASSWORD,
@@ -98,7 +96,6 @@ pub(super) fn exercise(
         let worker = dispatch::Dispatches {
             connection: dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &slots,
                 clock: clock.clone(),
             },
@@ -327,7 +324,6 @@ pub(super) fn exercise(
             let settlement_slots = ReadSlots::new(1).unwrap();
             let connection = dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &settlement_slots,
                 clock: clock.clone(),
             };
@@ -445,7 +441,6 @@ pub(super) fn exercise(
             let checked = dispatch::Dispatches {
                 connection: dispatch::Connection {
                     request: &runtime,
-                    trust,
                     slots: pool,
                     clock: clock.clone(),
                 },

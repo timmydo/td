@@ -30,7 +30,6 @@ impl Dispatches<'_, '_> {
         };
         match expiry::publish(
             self.connection.request,
-            self.connection.trust,
             limit,
             value,
             self.connection.clock.clone(),

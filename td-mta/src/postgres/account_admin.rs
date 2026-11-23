@@ -1,5 +1,5 @@
 //! Operator account workflow; immutable retained requests replace ad hoc SQL.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
@@ -355,18 +355,18 @@ fn execute(command: Command, o: &Options) -> Result<(), (&'static str, &'static 
             },
             _ => return Err(("arguments", "invalid-operation")),
         };
-        let operation = with_addresses(&loaded, |request, deadline| {
-            admin::prepare(request, &loaded.trust, deadline, epoch, &edit).map_err(classify)
+        let operation = with_connection(&loaded, |request, deadline| {
+            admin::prepare(request, deadline, epoch, &edit).map_err(classify)
         })?;
         save(path, &operation)
             .map_err(|_| ("operation-file", "write-or-sync-failed-no-database-writes"))?;
         operation
     };
-    let receipt = with_addresses(&loaded, |request, deadline| {
+    let receipt = with_connection(&loaded, |request, deadline| {
         if command == Command::Inspect {
-            admin::inspect(request, &loaded.trust, deadline, &operation).map_err(classify)
+            admin::inspect(request, deadline, &operation).map_err(classify)
         } else {
-            admin::apply(request, &loaded.trust, deadline, &operation)
+            admin::apply(request, deadline, &operation)
                 .map(Some)
                 .map_err(classify)
         }
@@ -387,8 +387,8 @@ fn epoch(
     if let Some(epoch) = provided {
         return Ok(epoch);
     }
-    with_addresses(loaded, |request, deadline| {
-        postgres_schema::inspect(request, &loaded.trust, deadline)
+    with_connection(loaded, |request, deadline| {
+        postgres_schema::inspect(request, deadline)
             .map(|r| r.store_epoch)
             .map_err(AttemptError::from)
     })
@@ -399,8 +399,8 @@ fn list(loaded: &Loaded, provided: Option<StoreEpoch>) -> Result<(), (&'static s
         syntax::{Statement, Value},
     };
     let epoch = epoch(loaded, provided)?;
-    let (selection, candidate) = with_addresses(loaded, |request, deadline| {
-        postgres_selection::read(request, &loaded.trust, deadline, epoch)
+    let (selection, candidate) = with_connection(loaded, |request, deadline| {
+        postgres_selection::read(request, deadline, epoch)
             .map_err(|e| classify(admin::Error::Selection(e)))
     })?
     .ok_or(("account-admin", "no-selected-configuration"))?;

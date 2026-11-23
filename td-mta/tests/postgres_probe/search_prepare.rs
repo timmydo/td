@@ -66,9 +66,8 @@ fn large(fixture: &Fixture, id: Key) {
 
 pub(super) fn exercise() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
-    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+    let epoch = postgres_schema::initialize(&request, deadline())
         .unwrap()
         .store_epoch;
     let good = b"Subject: prepared needle\r\n\r\nbody\r\n";
@@ -96,7 +95,6 @@ pub(super) fn exercise() {
     let run = |options| {
         preparation::run(
             &request,
-            &trust,
             Instant::now() + Duration::from_secs(30),
             epoch,
             options,
@@ -210,7 +208,6 @@ pub(super) fn exercise() {
     assert!(matches!(
         preparation::run(
             &runtime,
-            &trust,
             deadline(),
             epoch,
             Options {
@@ -232,7 +229,6 @@ pub(super) fn exercise() {
     assert!(matches!(
         preparation::run(
             &outsider,
-            &trust,
             deadline(),
             epoch,
             Options {
@@ -283,16 +279,14 @@ pub(super) fn exercise() {
 }
 
 fn scheduled(fixture: &Fixture, epoch: td_mta::ids::StoreEpoch, good: &[u8]) {
-    let ca = fixture.root.join("search-ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("search-owner");
     fs::write(
         &connection,
         format!(
-            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://td_probe:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();

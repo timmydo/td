@@ -1,6 +1,5 @@
 use super::{deadline, sql, Fixture};
 use std::collections::BTreeSet;
-use td_crypto::TrustStore;
 use td_mta::{
     ids::SubmissionId,
     postgres_attempts as attempts,
@@ -13,7 +12,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -30,27 +28,18 @@ pub(super) fn exercise(
         sql(fixture, &format!("INSERT INTO td_mta.submissions SELECT account,decode('{submission}','hex'),email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,0,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id=decode('{source}','hex'); INSERT INTO td_mta.submission_routes SELECT account,decode('{submission}','hex'),submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id=decode('{source}','hex'); INSERT INTO td_mta.recipients SELECT account,id,0,'candidate@example.test',1,0,NULL,0,NULL,0,0,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id=decode('{submission}','hex')"));
     }
     sql(fixture, &format!("UPDATE td_mta.submissions SET send_at=expires_at-1 WHERE id=decode('{}','hex'); UPDATE td_mta.submissions SET expires_at=1 WHERE id=decode('{}','hex'); UPDATE td_mta.submission_routes SET destination=decode(repeat('fe',32),'hex') WHERE submission_id=decode('{}','hex'); UPDATE td_mta.recipients SET state=3,attempt_id=decode(repeat('5d',16),'hex'),attempt_count=1,last_attempt_at=0,phase=4,next_attempt_at=300000,reason=3 WHERE submission_id=decode('{}','hex')", id(66),id(67),id(68),id(69)));
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     let sequence = sql(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
     );
-    let first = candidates::scan(
-        request,
-        trust,
-        deadline(),
-        claim,
-        generation,
-        Kind::Fresh,
-        None,
-    )
-    .unwrap();
+    let first =
+        candidates::scan(request, deadline(), claim, generation, Kind::Fresh, None).unwrap();
     assert_eq!(first.candidates.len(), candidates::PAGE_SIZE);
     let cursor = first.next.unwrap();
     assert!(matches!(
         candidates::scan(
             request,
-            trust,
             deadline(),
             claim,
             generation,
@@ -62,7 +51,6 @@ pub(super) fn exercise(
     assert!(matches!(
         candidates::scan(
             request,
-            trust,
             deadline(),
             claim,
             generation + 1,
@@ -89,7 +77,6 @@ pub(super) fn exercise(
         assert!(turn < 31, "candidate pagination did not terminate");
         page = candidates::scan(
             request,
-            trust,
             deadline(),
             claim,
             generation,
@@ -104,16 +91,8 @@ pub(super) fn exercise(
     for n in 66..70 {
         assert!(!seen.contains(&id(n)));
     }
-    let retry = candidates::scan(
-        request,
-        trust,
-        deadline(),
-        claim,
-        generation,
-        Kind::Retry,
-        None,
-    )
-    .unwrap();
+    let retry =
+        candidates::scan(request, deadline(), claim, generation, Kind::Retry, None).unwrap();
     assert!(retry
         .candidates
         .iter()
@@ -122,22 +101,11 @@ pub(super) fn exercise(
         .candidates
         .iter()
         .all(|candidate| !(0..66).any(|n| candidate.submission == id(n))));
-    let expiry = || {
-        candidates::scan(
-            request,
-            trust,
-            deadline(),
-            claim,
-            generation,
-            Kind::Expiry,
-            None,
-        )
-        .unwrap()
-    };
+    let expiry =
+        || candidates::scan(request, deadline(), claim, generation, Kind::Expiry, None).unwrap();
     assert!(matches!(
         candidates::scan(
             request,
-            trust,
             deadline(),
             claim,
             generation,
@@ -198,15 +166,7 @@ pub(super) fn exercise(
     );
     sql(fixture,&format!("INSERT INTO td_mta.route_health SELECT account,route_name,destination,decode('0000000000000001','hex'),1,3,(extract(epoch FROM clock_timestamp())*1000)::bigint,(extract(epoch FROM clock_timestamp())*1000)::bigint+300000,NULL FROM td_mta.submission_routes WHERE submission_id=decode('{source}','hex') ON CONFLICT(account,route_name,destination) DO UPDATE SET failure_count=1,reason=3,failed_at=EXCLUDED.failed_at,next_at=EXCLUDED.next_at,repair_generation=NULL"));
     assert!(matches!(
-        candidates::scan(
-            request,
-            trust,
-            deadline(),
-            claim,
-            generation,
-            Kind::Fresh,
-            None
-        ),
+        candidates::scan(request, deadline(), claim, generation, Kind::Fresh, None),
         Err(candidates::Error::RouteHealth(
             td_mta::postgres_route_health::Error::Backoff
         ))
@@ -214,15 +174,7 @@ pub(super) fn exercise(
     assert!(contains(&expiry(), expired));
     sql(fixture,"UPDATE td_mta.route_health SET reason=5,repair_generation=decode('0000000000000001','hex') WHERE failure_count>0");
     assert!(matches!(
-        candidates::scan(
-            request,
-            trust,
-            deadline(),
-            claim,
-            generation,
-            Kind::Fresh,
-            None
-        ),
+        candidates::scan(request, deadline(), claim, generation, Kind::Fresh, None),
         Err(candidates::Error::RouteHealth(
             td_mta::postgres_route_health::Error::RepairRequired
         ))
@@ -244,17 +196,9 @@ pub(super) fn exercise(
         "0"
     );
     let dispatch = attempts::prepare(claim, generation, id(0)).unwrap();
-    super::attempt_clock::publish(fixture, request, trust, deadline(), &dispatch).unwrap();
+    super::attempt_clock::publish(fixture, request, deadline(), &dispatch).unwrap();
     assert!(matches!(
-        candidates::scan(
-            request,
-            trust,
-            deadline(),
-            claim,
-            generation,
-            Kind::Fresh,
-            None
-        ),
+        candidates::scan(request, deadline(), claim, generation, Kind::Fresh, None),
         Err(candidates::Error::Busy)
     ));
     sql(
@@ -267,42 +211,27 @@ pub(super) fn exercise(
     let page = expiry();
     assert!(contains(&page, id(0)));
     assert!(contains(&page, expired));
-    super::attempt_body::exercise(fixture, request, trust, claim, generation, id(0), &dispatch);
+    super::attempt_body::exercise(fixture, request, claim, generation, id(0), &dispatch);
     let cancellation = cancel::prepare(claim, generation, id(0)).unwrap();
-    cancel::publish(request, trust, deadline(), &cancellation, |_| Ok(())).unwrap();
-    let page = candidates::scan(
-        request,
-        trust,
-        deadline(),
-        claim,
-        generation,
-        Kind::Fresh,
-        None,
-    )
-    .unwrap();
+    cancel::publish(request, deadline(), &cancellation, |_| Ok(())).unwrap();
+    let page = candidates::scan(request, deadline(), claim, generation, Kind::Fresh, None).unwrap();
     assert!(page
         .candidates
         .iter()
         .all(|candidate| candidate.submission != id(0)));
-    super::attempt_envelope::exercise(fixture, request, trust, claim, generation, source);
-    super::native_final_handoff::exercise(
-        fixture, request, trust, claim, generation, source, policies,
-    );
-    super::native_mail_exchange::exercise(
-        fixture, request, trust, claim, generation, source, policies,
-    );
-    super::native_rcpt_exchange::exercise(
-        fixture, request, trust, claim, generation, source, policies,
-    );
+    super::attempt_envelope::exercise(fixture, request, claim, generation, source);
+    super::native_final_handoff::exercise(fixture, request, claim, generation, source, policies);
+    super::native_mail_exchange::exercise(fixture, request, claim, generation, source, policies);
+    super::native_rcpt_exchange::exercise(fixture, request, claim, generation, source, policies);
     super::native_data_exchange::exercise(
-        fixture, request, trust, claim, generation, source, policies, None,
+        fixture, request, claim, generation, source, policies, None,
     );
-    super::prepared_failure::exercise(fixture, request, trust, claim, generation, source, policies);
-    super::dispatch_recovery::exercise(fixture, request, trust, claim, generation, source);
-    super::dispatch_worker::exercise(fixture, request, trust, claim, generation, source);
+    super::prepared_failure::exercise(fixture, request, claim, generation, source, policies);
+    super::dispatch_recovery::exercise(fixture, request, claim, generation, source);
+    super::dispatch_worker::exercise(fixture, request, claim, generation, source);
     for n in 0..70 {
         let submission = id(n);
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex'); DELETE FROM td_mta.submissions WHERE id=decode('{submission}','hex')"));
     }
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
 }

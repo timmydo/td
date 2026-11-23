@@ -4,7 +4,6 @@ use std::{
     thread,
     time::Duration,
 };
-use td_crypto::TrustStore;
 use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     admission::work::{Charge, Meter},
@@ -22,7 +21,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -31,7 +29,7 @@ pub(super) fn exercise(
     let sub = format!("decode('{submission}','hex')");
     let src = format!("decode('{source}','hex')");
     sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,2,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},n,n::text||'@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions CROSS JOIN generate_series(0,1) n WHERE id={sub}"));
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     let clock = Arc::new(RuntimeClock::new());
     let guard = Arc::new(Mutex::new(
         Guard::new(Time {
@@ -46,8 +44,7 @@ pub(super) fn exercise(
         .unwrap(),
     ));
     let runtime = Request {
-        address: request.address,
-        server_name: request.server_name,
+        socket: request.socket,
         user: "mail_runtime",
         database: request.database,
         password: PASSWORD,
@@ -59,7 +56,6 @@ pub(super) fn exercise(
     let worker = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &runtime,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -68,7 +64,6 @@ pub(super) fn exercise(
     };
     let settle = dispatch::Connection {
         request: &runtime,
-        trust,
         slots: &settlement,
         clock: clock.clone(),
     };
@@ -89,8 +84,7 @@ pub(super) fn exercise(
         deadline: until(ms),
     };
     let preparation = Request {
-        address: runtime.address,
-        server_name: runtime.server_name,
+        socket: runtime.socket,
         user: runtime.user,
         database: runtime.database,
         password: runtime.password,
@@ -99,7 +93,6 @@ pub(super) fn exercise(
     let forbidden = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &preparation,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -107,7 +100,7 @@ pub(super) fn exercise(
         pending: &pending,
     };
     candidate_admission(fixture, &worker, &forbidden, claim, generation);
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     assert_eq!(
         forbidden
             .publish_prepared(claim, generation, input(10_000, false), &mut meter())
@@ -413,14 +406,13 @@ pub(super) fn exercise(
     );
     cancel::publish(
         request,
-        trust,
         deadline(),
         &cancel::prepare(claim, generation, submission).unwrap(),
         |_| Ok(()),
     )
     .unwrap();
     sql(fixture,&format!("UPDATE td_mta.submissions SET completed_at=NULL,notification=0 WHERE id={sub}; UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL,diagnostic='' WHERE submission_id={sub}"));
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     // An unknown COMMIT that rolled back: settlement's account share lock
     // waits for it, then proves the receipt absent and releases custody.
     sql(fixture,"CREATE FUNCTION public.rollback_dispatch_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RAISE EXCEPTION 'fixture rollback'; END $$; CREATE CONSTRAINT TRIGGER rollback_dispatch_worker AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.rollback_dispatch_worker()");
@@ -569,7 +561,7 @@ pub(super) fn exercise(
             .unwrap(),
         None
     );
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     let body = phases::body(claim, generation, attempt, &[(0, "250 first")]).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_phase_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_phase_worker AFTER INSERT ON td_mta.attempt_phase_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_phase_worker()");
     assert_eq!(
@@ -663,7 +655,6 @@ pub(super) fn exercise(
     let historical = phases::body(claim, generation, attempt, &[(0, "250 first")]).unwrap();
     assert!(phases::check_current_body(
         &runtime,
-        trust,
         deadline(),
         &historical,
         clock.clone(),
@@ -684,7 +675,7 @@ pub(super) fn exercise(
     );
     super::final_work::exercise(fixture, &worker, claim, generation, attempt);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1 AND state=2 AND phase=1")),"1");
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     let recovery =
         td_mta::postgres_attempt_recovery::interrupted(claim, generation, attempt).unwrap();
     let recovered = worker
@@ -694,7 +685,7 @@ pub(super) fn exercise(
     assert_eq!(recovered.recipients, 1);
     assert_eq!(sql(fixture, &format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
 }
 
 fn candidate_admission(
@@ -724,7 +715,6 @@ fn candidate_admission(
     );
     let expected = candidates::scan(
         worker.connection.request,
-        worker.connection.trust,
         deadline(),
         claim,
         generation,
@@ -853,7 +843,6 @@ fn candidate_admission(
         );
         let expected = candidates::scan(
             worker.connection.request,
-            worker.connection.trust,
             deadline(),
             claim,
             generation,

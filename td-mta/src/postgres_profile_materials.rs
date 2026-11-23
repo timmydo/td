@@ -7,7 +7,6 @@ use crate::{
     tls_policy::{MaterialKind, MaterialRequest},
 };
 use std::{io, time::Instant};
-use td_crypto::TrustStore;
 
 const PREFIX: &str = "/postgres-material/";
 const MAX_REQUESTS: usize = 256;
@@ -56,7 +55,6 @@ fn tls_kind(kind: MaterialKind) -> Kind {
 /// This does not validate a complete configuration generation or activate it.
 pub struct Loader<'a, 'r> {
     request: &'a Request<'r>,
-    trust: &'a TrustStore,
     epoch: StoreEpoch,
     deadline: Instant,
     requests: usize,
@@ -65,15 +63,9 @@ pub struct Loader<'a, 'r> {
     managed: Vec<(String, crate::postgres_acme::Active)>,
 }
 impl<'a, 'r> Loader<'a, 'r> {
-    pub fn new(
-        request: &'a Request<'r>,
-        trust: &'a TrustStore,
-        epoch: StoreEpoch,
-        deadline: Instant,
-    ) -> Self {
+    pub fn new(request: &'a Request<'r>, epoch: StoreEpoch, deadline: Instant) -> Self {
         Self {
             request,
-            trust,
             epoch,
             deadline,
             requests: 0,
@@ -118,14 +110,9 @@ impl<'a, 'r> Loader<'a, 'r> {
             if self.managed.len() >= crate::config::certificate::MAX_PROFILES {
                 return Err(Error::Capacity);
             }
-            let active = crate::postgres_acme::active(
-                self.request,
-                self.trust,
-                self.deadline,
-                self.epoch,
-                profile,
-            )
-            .map_err(|_| Error::ManagedCertificate)?;
+            let active =
+                crate::postgres_acme::active(self.request, self.deadline, self.epoch, profile)
+                    .map_err(|_| Error::ManagedCertificate)?;
             self.managed.push((profile.to_owned(), active));
         }
         let (_, active) = self
@@ -171,15 +158,8 @@ impl<'a, 'r> Loader<'a, 'r> {
 
     fn open(&mut self, reference: Option<&str>, kind: Kind) -> Result<Reader, Error> {
         let id = self.reserve(reference, kind)?;
-        let material = postgres_materials::read(
-            self.request,
-            self.trust,
-            self.deadline,
-            self.epoch,
-            id,
-            kind,
-        )
-        .map_err(Error::Database)?;
+        let material = postgres_materials::read(self.request, self.deadline, self.epoch, id, kind)
+            .map_err(Error::Database)?;
         if Instant::now() >= self.deadline {
             return Err(Error::Deadline);
         }
@@ -236,19 +216,17 @@ mod tests {
     #[test]
     fn bounds_and_refusals_poison_the_loader_without_database_work() {
         let request = Request {
-            address: crate::postgres_probe::Endpoint::Tcp("127.0.0.1:1".parse().unwrap()),
-            server_name: "localhost",
+            socket: td_fs::SocketPath::new(std::path::Path::new("/nonexistent/.s.PGSQL.5432"))
+                .unwrap(),
             mode: crate::postgres_probe::Mode::Preparation,
             user: "fixture",
             database: "fixture",
             password: b"unused",
         };
-        let trust = TrustStore::public_roots().unwrap();
         let reference = format!("{PREFIX}{}", Version::from_bytes([1; 16]));
         let new = || {
             Loader::new(
                 &request,
-                &trust,
                 StoreEpoch::from_bytes([1; 16]),
                 Instant::now() + std::time::Duration::from_secs(10),
             )

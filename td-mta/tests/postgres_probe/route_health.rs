@@ -3,7 +3,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{BootId, SubmissionId},
     postgres_attempt_recovery as recovery, postgres_attempts as attempts,
@@ -14,49 +13,42 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     binding: &td_mta::postgres_runtime_profile::Binding,
     generation: u64,
     submission: SubmissionId,
 ) {
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000,completed_at=NULL,notification=0 WHERE id=decode('{submission}','hex'); UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL,diagnostic='' WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
     let dispatch = attempts::prepare(claim, generation, submission).unwrap();
-    let first =
-        super::attempt_clock::publish(fixture, request, trust, deadline(), &dispatch).unwrap();
+    let first = super::attempt_clock::publish(fixture, request, deadline(), &dispatch).unwrap();
     assert_eq!(first.ordinals, vec![0]);
     // Retire a failure without a route-health report, then start a later attempt.
     let abandoned = first;
     recovery::publish(
         request,
-        trust,
         deadline(),
         &recovery::interrupted(claim, generation, abandoned.attempt).unwrap(),
     )
     .unwrap();
     sql(fixture, &format!("UPDATE td_mta.recipients SET last_attempt_at=last_attempt_at-1200000,next_attempt_at=next_attempt_at-1200000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
     let retry = attempts::retry(claim, generation, submission).unwrap();
-    let first = super::attempt_clock::publish(fixture, request, trust, deadline(), &retry).unwrap();
+    let first = super::attempt_clock::publish(fixture, request, deadline(), &retry).unwrap();
     // That publication reclaimed the retired attempt (POSTGRES.md section
     // 218): a late report for it finds nothing to count.
     let stale =
         health::prepare(claim, generation, abandoned.attempt, health::Failure::Tls).unwrap();
     assert_eq!(
-        health::publish(request, trust, deadline(), &stale),
+        health::publish(request, deadline(), &stale),
         Err(health::Error::Missing)
     );
 
     let value =
         health::prepare(claim, generation, first.attempt, health::Failure::Network).unwrap();
-    assert_eq!(
-        health::inspect(request, trust, deadline(), &value).unwrap(),
-        None
-    );
+    assert_eq!(health::inspect(request, deadline(), &value).unwrap(), None);
     assert_eq!(
         health::publish(
             request,
-            trust,
             deadline(),
             &health::prepare(
                 claim,
@@ -74,7 +66,7 @@ pub(super) fn exercise(
     );
     sql(fixture,"CREATE FUNCTION public.reject_health() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_health BEFORE INSERT ON td_mta.route_health_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_health()");
     assert_eq!(
-        health::publish(request, trust, deadline(), &value),
+        health::publish(request, deadline(), &value),
         Err(health::Error::Database)
     );
     assert_eq!(
@@ -85,14 +77,13 @@ pub(super) fn exercise(
     assert_eq!(
         health::publish(
             request,
-            trust,
             Instant::now() + Duration::from_millis(1500),
             &value
         ),
         Err(health::Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
-    let outcome = health::publish(request, trust, deadline(), &value).unwrap();
+    let outcome = health::publish(request, deadline(), &value).unwrap();
     // The failure publication expired this route's settlement of a missing attempt.
     assert_eq!(
         sql(
@@ -117,7 +108,6 @@ pub(super) fn exercise(
     assert_eq!(
         health::publish(
             request,
-            trust,
             deadline(),
             &health::prepare(claim, generation, first.attempt, health::Failure::Network).unwrap()
         )
@@ -127,7 +117,6 @@ pub(super) fn exercise(
     assert_eq!(
         health::publish(
             request,
-            trust,
             deadline(),
             &health::prepare(claim, generation, first.attempt, health::Failure::Tls).unwrap()
         ),
@@ -138,14 +127,13 @@ pub(super) fn exercise(
         "DROP TRIGGER delay_health ON td_mta.route_health_receipts",
     );
     assert_eq!(
-        super::attempt_clock::publish(fixture, request, trust, deadline(), &retry).unwrap(),
+        super::attempt_clock::publish(fixture, request, deadline(), &retry).unwrap(),
         first
     );
     assert_eq!(
         super::attempt_clock::publish(
             fixture,
             request,
-            trust,
             deadline(),
             &attempts::prepare(claim, generation, submission).unwrap()
         ),
@@ -153,7 +141,6 @@ pub(super) fn exercise(
     );
     recovery::publish(
         request,
-        trust,
         deadline(),
         &recovery::interrupted(claim, generation, first.attempt).unwrap(),
     )
@@ -162,13 +149,12 @@ pub(super) fn exercise(
     let second = super::attempt_clock::publish(
         fixture,
         request,
-        trust,
         deadline(),
         &attempts::retry(claim, generation, submission).unwrap(),
     )
     .unwrap();
     let auth = health::prepare(claim, generation, second.attempt, health::Failure::Auth).unwrap();
-    let second_outcome = health::publish(request, trust, deadline(), &auth).unwrap();
+    let second_outcome = health::publish(request, deadline(), &auth).unwrap();
     assert_eq!(second_outcome.old_revision, 1);
     assert_eq!(second_outcome.state.revision, 2);
     assert_eq!(second_outcome.state.failure_count, 2);
@@ -187,7 +173,6 @@ pub(super) fn exercise(
         super::attempt_clock::publish(
             fixture,
             request,
-            trust,
             deadline(),
             &attempts::retry(claim, generation, submission).unwrap()
         ),
@@ -195,36 +180,32 @@ pub(super) fn exercise(
     );
     // The next publication on the route reclaimed the retired first attempt
     // with its settlement; it still cannot count a second failure.
+    assert_eq!(health::inspect(request, deadline(), &value).unwrap(), None);
     assert_eq!(
-        health::inspect(request, trust, deadline(), &value).unwrap(),
-        None
-    );
-    assert_eq!(
-        health::publish(request, trust, deadline(), &value),
+        health::publish(request, deadline(), &value),
         Err(health::Error::Missing)
     );
     assert_eq!(
-        health::publish(request, trust, deadline(), &auth).unwrap(),
+        health::publish(request, deadline(), &auth).unwrap(),
         second_outcome
     );
     // A real replacement owner inherits the durable repair hold.
-    owners::release(request, trust, deadline(), claim, generation).unwrap();
+    owners::release(request, deadline(), claim, generation).unwrap();
     let replacement = owners::prepare(binding, BootId::from_bytes([77; 16])).unwrap();
-    let grant = owners::acquire(request, trust, deadline(), &replacement).unwrap();
+    let grant = owners::acquire(request, deadline(), &replacement).unwrap();
     assert!(grant.generation > generation);
     assert_eq!(
         super::attempt_clock::publish(
             fixture,
             request,
-            trust,
             deadline(),
             &attempts::retry(&replacement, grant.generation, submission).unwrap()
         ),
         Err(attempts::Error::RouteHealth(health::Error::RepairRequired))
     );
     assert_eq!(
-        health::publish(request, trust, deadline(), &auth).unwrap(),
+        health::publish(request, deadline(), &auth).unwrap(),
         second_outcome
     );
-    owners::release(request, trust, deadline(), &replacement, grant.generation).unwrap();
+    owners::release(request, deadline(), &replacement, grant.generation).unwrap();
 }

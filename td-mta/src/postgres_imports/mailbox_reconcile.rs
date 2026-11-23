@@ -203,7 +203,6 @@ fn candidate(
 }
 pub fn plan(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     value: &Mailbox,
@@ -219,7 +218,7 @@ pub fn plan(
     let authority = authority.clone();
     let value = value.clone();
     let definitions = definitions.to_vec();
-    postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
+    postgres_probe::with_reconcile_client(request, deadline, move |client| {
         let old = begin(client, &authority)?;
         let Some(receipt) = receipt(client, &authority, &value.key, old)? else {
             return Ok(Plan::New);
@@ -271,7 +270,6 @@ pub fn plan(
 }
 pub fn apply(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     authority: &Authority,
     value: &Mailbox,
@@ -305,7 +303,7 @@ pub fn apply(
     let expected = expected.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_reconcile_client(request, deadline, move |client| {
         let old = begin(client, &authority)?;
         let receipt = receipt(client, &authority, &value.key, old)?.ok_or(Error::Conflict)?;
         if receipt.local != expected.local {

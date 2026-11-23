@@ -7,7 +7,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::SubmissionId,
     ports::{Clock, Tick, Time},
@@ -50,14 +49,7 @@ impl Runtime {
             stable_at: sample.monotonic.0 + 300_000,
         }
     }
-    fn confirm(
-        &self,
-        fixture: &Fixture,
-        request: &Request<'_>,
-        trust: &TrustStore,
-        claim: &Claim,
-        generation: u64,
-    ) {
+    fn confirm(&self, fixture: &Fixture, request: &Request<'_>, claim: &Claim, generation: u64) {
         let now = self.clock.sample().unwrap().monotonic.0;
         if now < self.stable_at {
             eprintln!(
@@ -70,7 +62,7 @@ impl Runtime {
             if now >= self.stable_at {
                 break;
             }
-            owners::renew(request, trust, deadline(), claim, generation).unwrap();
+            owners::renew(request, deadline(), claim, generation).unwrap();
             thread::sleep(Duration::from_millis((self.stable_at - now).min(10_000)));
         }
 
@@ -136,7 +128,6 @@ fn confirmed(fixture: &Fixture) -> (Arc<TestClock>, Arc<Mutex<Guard>>) {
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     submission: SubmissionId,
@@ -145,8 +136,8 @@ pub(super) fn exercise(
         .queue_runtime
         .as_ref()
         .unwrap()
-        .confirm(fixture, request, trust, claim, generation);
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        .confirm(fixture, request, claim, generation);
+    owners::renew(request, deadline(), claim, generation).unwrap();
     let value = expiry::prepare(claim, generation, submission).unwrap();
     let (clock, guard) = confirmed(fixture);
     let held = Arc::new(Mutex::new(
@@ -162,13 +153,12 @@ pub(super) fn exercise(
         .unwrap(),
     ));
     assert_eq!(
-        expiry::publish(request, trust, deadline(), &value, clock.clone(), held),
+        expiry::publish(request, deadline(), &value, clock.clone(), held),
         Err(expiry::Error::Clock(td_mta::queue_clock::Error::Unstable))
     );
     assert_eq!(
         expiry::publish(
             request,
-            trust,
             deadline(),
             &expiry::prepare(claim, generation + 1, submission).unwrap(),
             clock.clone(),
@@ -177,14 +167,7 @@ pub(super) fn exercise(
         Err(expiry::Error::Owner(owners::Error::Stale))
     );
     assert_eq!(
-        expiry::publish(
-            request,
-            trust,
-            deadline(),
-            &value,
-            clock.clone(),
-            guard.clone()
-        ),
+        expiry::publish(request, deadline(), &value, clock.clone(), guard.clone()),
         Err(expiry::Error::NotDue)
     );
     // Keep 200 pending rows; the reserved subset straddles ordinary batch boundaries.
@@ -202,14 +185,7 @@ pub(super) fn exercise(
     thread::sleep(Duration::from_millis(1100));
     sql(fixture,"CREATE FUNCTION public.reject_expiry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_expiry BEFORE INSERT ON td_mta.submission_expiry_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_expiry()");
     assert_eq!(
-        expiry::publish(
-            request,
-            trust,
-            deadline(),
-            &value,
-            clock.clone(),
-            guard.clone()
-        ),
+        expiry::publish(request, deadline(), &value, clock.clone(), guard.clone()),
         Err(expiry::Error::Database)
     );
     assert_eq!(
@@ -235,7 +211,7 @@ pub(super) fn exercise(
     let (late_clock, late_guard) = confirmed(fixture);
     late_clock.expire_on_sample.store(2, Ordering::Relaxed);
     assert_eq!(
-        expiry::publish(request, trust, deadline(), &value, late_clock, late_guard),
+        expiry::publish(request, deadline(), &value, late_clock, late_guard),
         Err(expiry::Error::Clock(td_mta::queue_clock::Error::Expired))
     );
     assert_eq!(
@@ -255,9 +231,8 @@ pub(super) fn exercise(
 
     thread::sleep(Duration::from_millis(1100));
     sql(fixture,"CREATE FUNCTION public.delay_expiry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_expiry AFTER INSERT ON td_mta.submission_expiry_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_expiry()");
-    let first = super::expiry_admission::exercise(
-        fixture, request, trust, claim, generation, submission, &value,
-    );
+    let first =
+        super::expiry_admission::exercise(fixture, request, claim, generation, submission, &value);
     assert_eq!(first.recipients, 2);
     assert_eq!(
         sql(
@@ -270,7 +245,7 @@ pub(super) fn exercise(
     assert_eq!(sql(fixture, &format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{previous}','hex')")), "f");
     assert_eq!(first.new_sequence, first.old_sequence + 1);
     assert_eq!(
-        expiry::inspect(request, trust, deadline(), &value).unwrap(),
+        expiry::inspect(request, deadline(), &value).unwrap(),
         Some(first)
     );
     assert_eq!(sql(fixture,&format!("SELECT state,uncertain,phase,reason,next_attempt_at IS NULL,rcpt_reply FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal=0")),"7|1|4|6|t|250 actual RCPT");
@@ -287,7 +262,6 @@ pub(super) fn exercise(
     assert_eq!(
         expiry::publish(
             request,
-            trust,
             deadline(),
             &second,
             other_clock.clone(),
@@ -305,7 +279,6 @@ pub(super) fn exercise(
     thread::sleep(Duration::from_millis(1100));
     let second = expiry::publish(
         request,
-        trust,
         deadline(),
         &second,
         other_clock.clone(),
@@ -319,7 +292,6 @@ pub(super) fn exercise(
     let third = expiry::prepare(claim, generation, submission).unwrap();
     let third = expiry::publish(
         request,
-        trust,
         deadline(),
         &third,
         other_clock.clone(),
@@ -345,28 +317,19 @@ pub(super) fn exercise(
         })
         .unwrap();
     assert_eq!(
-        expiry::publish(
-            request,
-            trust,
-            deadline(),
-            &value,
-            clock.clone(),
-            guard.clone()
-        )
-        .unwrap(),
+        expiry::publish(request, deadline(), &value, clock.clone(), guard.clone()).unwrap(),
         first
     );
     let digest=sql(fixture,&format!("SELECT encode(request_digest,'hex') FROM td_mta.submission_expiry_receipts WHERE operation=decode('{}','hex')",value.operation()));
     sql(fixture,&format!("UPDATE td_mta.submission_expiry_receipts SET request_digest=decode(repeat('00',32),'hex') WHERE operation=decode('{}','hex')",value.operation()));
     assert_eq!(
-        expiry::inspect(request, trust, deadline(), &value),
+        expiry::inspect(request, deadline(), &value),
         Err(expiry::Error::Conflict)
     );
     sql(fixture,&format!("UPDATE td_mta.submission_expiry_receipts SET request_digest=decode('{digest}','hex') WHERE operation=decode('{}','hex')",value.operation()));
     ledger(
         fixture,
         request,
-        trust,
         claim,
         generation,
         submission,
@@ -385,7 +348,6 @@ pub(super) fn exercise(
 fn ledger(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -413,7 +375,6 @@ fn ledger(
         thread::sleep(Duration::from_millis(1100));
         expiry::publish(
             request,
-            trust,
             deadline(),
             &expiry::prepare(claim, generation, SubmissionId::parse(OVERDUE).unwrap()).unwrap(),
             clock.clone(),
@@ -429,7 +390,7 @@ fn ledger(
         "SELECT encode(store_epoch,'hex') FROM td_mta.schema_migrations LIMIT 1",
     ))
     .unwrap();
-    let capacity = td_mta::postgres_capacity::inspect(request, trust, deadline(), epoch).unwrap();
+    let capacity = td_mta::postgres_capacity::inspect(request, deadline(), epoch).unwrap();
     let used = capacity
         .get("metrics")
         .unwrap()
@@ -470,7 +431,7 @@ fn ledger(
     );
     // The held operation's own young receipt still settles.
     assert_eq!(
-        expiry::inspect(request, trust, deadline(), value).unwrap(),
+        expiry::inspect(request, deadline(), value).unwrap(),
         Some(first)
     );
     sql(fixture, &format!("DELETE FROM td_mta.submission_expiry_receipts WHERE request_digest IN (decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex')) OR submission_id={overdue}; DELETE FROM td_mta.account_usage WHERE account={OTHER}; DELETE FROM td_mta.accounts WHERE id={OTHER}; DELETE FROM td_mta.recipients WHERE submission_id={overdue}; DELETE FROM td_mta.submission_routes WHERE submission_id={overdue}; DELETE FROM td_mta.submissions WHERE id={overdue}"));

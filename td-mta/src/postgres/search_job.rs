@@ -1,6 +1,6 @@
 //! Finite scheduled preparation from the last confirmed search cursor.
 use super::{
-    report_error, scrub_state::FileState, search_job_state::State, with_addresses, AttemptError,
+    report_error, scrub_state::FileState, search_job_state::State, with_connection, AttemptError,
 };
 use std::{
     ffi::OsString,
@@ -99,9 +99,9 @@ pub(super) fn run(
                 return Err("search-no-uncertainty");
             }
             // Replaying derived writes is safe, but never claims prior rollback.
-            with_addresses(&loaded, |request, deadline| {
-                let receipt = postgres_schema::inspect(request, &loaded.trust, deadline)
-                    .map_err(AttemptError::from)?;
+            with_connection(&loaded, |request, deadline| {
+                let receipt =
+                    postgres_schema::inspect(request, deadline).map_err(AttemptError::from)?;
                 if receipt.store_epoch != options.epoch {
                     return Err(AttemptError::Failed("search-prepare", "epoch-mismatch"));
                 }
@@ -125,10 +125,9 @@ pub(super) fn run(
         let was_in_flight = state.in_flight;
         state.in_flight = true;
         save(&file, &state)?;
-        let result = with_addresses(&loaded, |request, deadline| {
+        let result = with_connection(&loaded, |request, deadline| {
             postgres_search_prepare::run(
                 request,
-                &loaded.trust,
                 deadline,
                 options.epoch,
                 postgres_search_prepare::Options {

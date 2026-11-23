@@ -543,7 +543,7 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
 - `notices/`: upstream LICENSE/COPYING/COPYRIGHT/NOTICE/AUTHORS files, including nested
   provider attribution, Rust's bundled library notices and musl's COPYRIGHT
   (`notices/musl`) for the linked libc. Every package of
-  the pinned active graph (`crypto_policy.rs`'s ACTIVE and POSTGRES_ACTIVE),
+  the pinned active graph (`crypto_policy.rs`'s ACTIVE and TLS_PROVIDER_ACTIVE),
   build-only packages included, must contribute at least one notice. A
   locked-only package compiles into nothing here: its notices are retained
   when it ships them and not required when it does not. Their presence does

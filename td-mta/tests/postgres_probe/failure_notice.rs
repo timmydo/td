@@ -3,7 +3,6 @@
 //! one that keeps failing never blocks the others.
 use super::submission_retention::{count, id, resync, submission, Group, NOW};
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{BootId, SubmissionId},
     postgres_failure_notice as notice,
@@ -29,7 +28,6 @@ fn notice_text(fixture: &Fixture, sub: u8) -> String {
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     source: SubmissionId,
 ) {
@@ -62,8 +60,8 @@ pub(super) fn exercise(
     };
     let pending = || count(fixture, "td_mta.submissions WHERE notification=1");
     let claim = owners::prepare(binding, BootId::from_bytes([94; 16])).unwrap();
-    let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
-    let publish = || notice::publish_next(request, trust, deadline(), &claim, grant.generation);
+    let grant = owners::acquire(request, deadline(), &claim).unwrap();
+    let publish = || notice::publish_next(request, deadline(), &claim, grant.generation);
     // Retention's fixture leaves one notice pending (0xe7); store it first.
     for _ in 0..8 {
         if publish() != Ok(true) {
@@ -178,7 +176,7 @@ pub(super) fn exercise(
     assert_eq!(publish(), Ok(true));
     assert_eq!(pending(), "0");
     assert_eq!(publish(), Ok(false));
-    owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+    owners::release(request, deadline(), &claim, grant.generation).unwrap();
 
     // Later fixtures see none of these submissions; their notices stay as
     // ordinary Inbox Emails.

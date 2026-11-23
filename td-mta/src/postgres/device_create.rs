@@ -1,5 +1,5 @@
 //! Explicit owner-side credential creation in the preparation database.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -75,9 +75,8 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    match with_addresses(&loaded, |request, deadline| {
-        postgres_devices::publish_creation(request, &loaded.trust, deadline, &operation)
-            .map_err(classify)
+    match with_connection(&loaded, |request, deadline| {
+        postgres_devices::publish_creation(request, deadline, &operation).map_err(classify)
     }) {
         Ok(()) => {
             let mut out = io::stdout().lock();

@@ -14,7 +14,6 @@ use crate::{
     sync::{DataState, DataType},
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -71,7 +70,6 @@ impl Progress {
 
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
@@ -79,7 +77,7 @@ pub fn inspect(
     if request.mode != Mode::Preparation {
         return Err(Error::Owner);
     }
-    let result = postgres_probe::with_reconcile_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_reconcile_client(request, deadline, move |client| {
             let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
             if receipt.store_epoch != epoch {
                 return Err(Error::Epoch);

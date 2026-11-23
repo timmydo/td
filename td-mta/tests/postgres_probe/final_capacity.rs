@@ -1,5 +1,4 @@
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::AttemptId, postgres_attempt_phases as phases, postgres_probe::Request,
     postgres_runtime_profile::Binding,
@@ -8,7 +7,6 @@ use td_mta::{
 pub(super) fn before_possible(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     attempt: AttemptId,
     change: &phases::Change,
 ) {
@@ -21,7 +19,7 @@ pub(super) fn before_possible(
         "UPDATE td_mta.accounts SET sequence=decode('fffffffffffffffe','hex')",
     );
     assert_eq!(
-        phases::publish(request, trust, deadline(), change),
+        phases::publish(request, deadline(), change),
         Err(phases::Error::Capacity)
     );
     assert_eq!(
@@ -56,7 +54,7 @@ pub(super) fn before_possible(
     ] {
         sql(fixture,&format!("INSERT INTO td_mta.{table} SELECT {fields} FROM td_mta.submission_attempts a CROSS JOIN (SELECT decode(lpad(to_hex(n),32,'0'),'hex') id,decode(repeat('fe',32),'hex') digest,decode(repeat('00',8),'hex') old,decode('0000000000000001','hex') new FROM generate_series(1,1024) n) k WHERE a.attempt_id=decode('{attempt}','hex')"));
         assert_eq!(
-            phases::publish(request, trust, deadline(), change),
+            phases::publish(request, deadline(), change),
             Err(phases::Error::Capacity),
             "{table}"
         );
@@ -76,12 +74,7 @@ pub(super) fn before_possible(
     }
 }
 
-pub(super) fn competing_writer(
-    fixture: &Fixture,
-    request: &Request<'_>,
-    trust: &TrustStore,
-    binding: &Binding,
-) {
+pub(super) fn competing_writer(fixture: &Fixture, request: &Request<'_>, binding: &Binding) {
     use td_mta::{
         format::row::{ReceiptRecipients, ReceiptTls, SmtpReceipt},
         postgres_receiving as receiving,
@@ -109,7 +102,7 @@ pub(super) fn competing_writer(
         "UPDATE td_mta.accounts SET sequence=decode('fffffffffffffffe','hex')",
     );
     assert_eq!(
-        receiving::publish(request, trust, deadline(), &delivery),
+        receiving::publish(request, deadline(), &delivery),
         Err(receiving::Error::Capacity)
     );
     assert_eq!(

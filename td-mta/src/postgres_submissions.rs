@@ -18,7 +18,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 pub const MAX_RECEIPTS: i64 = 1024;
 const LIFETIME_MS: i64 = 5 * 24 * 60 * 60 * 1000;
@@ -293,12 +293,11 @@ fn receipt(client: &Client, value: &Submission) -> Result<Option<Outcome>, Error
 
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Submission,
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mailbox_client(request, deadline, move |client| {
         begin(client, &value)?;
         client
             .query_one(
@@ -318,12 +317,11 @@ pub fn inspect(
 /// Known historical success does not require current device authorization.
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Submission,
     password: &[u8],
 ) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, value)? {
+    if let Some(outcome) = inspect(request, deadline, value)? {
         return Ok(outcome);
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
@@ -333,7 +331,7 @@ pub fn publish(
     let value = value.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_upload_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_upload_client(request, deadline, move |client| {
         begin(client, &value)?;
         let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_| Error::Database)?;
         let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;

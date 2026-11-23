@@ -1,5 +1,5 @@
 //! Explicit owner-side account preparation and retained receipt inspection.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -80,19 +80,12 @@ pub(super) fn run(
         },
         Operation::Inspect => None,
     };
-    let result = with_addresses(&loaded, |request, deadline| {
+    let result = with_connection(&loaded, |request, deadline| {
         match creation {
             Some(creation) => {
-                postgres_accounts::publish(request, &loaded.trust, deadline, creation)
-                    .map(|()| creation)
+                postgres_accounts::publish(request, deadline, creation).map(|()| creation)
             }
-            None => postgres_accounts::inspect(
-                request,
-                &loaded.trust,
-                deadline,
-                options.epoch,
-                options.account,
-            ),
+            None => postgres_accounts::inspect(request, deadline, options.epoch, options.account),
         }
         .map_err(classify)
     });

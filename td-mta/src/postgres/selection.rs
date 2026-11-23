@@ -1,5 +1,5 @@
 //! Explicit selection custody and receipt operations; no serving activation.
-use super::{configuration, report_error, with_addresses, AttemptError};
+use super::{configuration, report_error, with_connection, AttemptError};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -144,9 +144,8 @@ pub(super) fn run(
     };
     let change = match options.input {
         Input::Bind(epoch) => {
-            return match with_addresses(&loaded, |request, deadline| {
-                td_mta::postgres_service_materials::bind(request, &loaded.trust, deadline, epoch)
-                    .map_err(classify)
+            return match with_connection(&loaded, |request, deadline| {
+                td_mta::postgres_service_materials::bind(request, deadline, epoch).map_err(classify)
             }) {
                 Ok(selected) => {
                     writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"generation\":{},\"version\":\"{}\"}}",selected.generation,selected.version)?;
@@ -163,9 +162,8 @@ pub(super) fn run(
             version,
             generation,
         } => {
-            let candidate = match with_addresses(&loaded, |request, deadline| {
-                versions::read(request, &loaded.trust, deadline, epoch, version)
-                    .map_err(configuration::classify)
+            let candidate = match with_connection(&loaded, |request, deadline| {
+                versions::read(request, deadline, epoch, version).map_err(configuration::classify)
             }) {
                 Ok(candidate) => candidate,
                 Err((stage, code)) => {
@@ -190,13 +188,11 @@ pub(super) fn run(
         writeln!(io::stdout().lock(),"{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"request\":\"{request}\",\"published\":false}}")?;
         return Ok(ExitCode::SUCCESS);
     }
-    let result = with_addresses(&loaded, |request, deadline| match operation {
-        Operation::Publish => selection::publish(request, &loaded.trust, deadline, change)
+    let result = with_connection(&loaded, |request, deadline| match operation {
+        Operation::Publish => selection::publish(request, deadline, change)
             .map(Some)
             .map_err(classify),
-        Operation::Inspect => {
-            selection::inspect(request, &loaded.trust, deadline, change).map_err(classify)
-        }
+        Operation::Inspect => selection::inspect(request, deadline, change).map_err(classify),
         Operation::Prepare | Operation::Bind => {
             Err(AttemptError::Failed("selection", "invalid-operation"))
         }

@@ -17,7 +17,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 
 pub(crate) const MAX_STEP_EMAILS: usize = 16;
 
@@ -34,7 +33,6 @@ pub enum Error {
 }
 pub struct Local<'a> {
     pub request: &'a Request<'a>,
-    pub trust: &'a TrustStore,
 }
 pub struct Remote<'a> {
     pub client: Client<'a>,
@@ -105,7 +103,6 @@ impl<'a> Worker<'a> {
             self.publisher = Some(
                 Publisher::open(
                     self.local.request,
-                    self.local.trust,
                     job_deadline(deadline, 0)?,
                     self.epoch,
                     source,

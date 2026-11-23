@@ -1,6 +1,5 @@
 use super::{deadline, sql, Fixture};
 use std::sync::Arc;
-use td_crypto::TrustStore;
 use td_json::json;
 use td_mta::{
     format::Sequence,
@@ -94,9 +93,8 @@ fn real_postgres_replica_seed_preserves_ids_and_resumes_without_reset() {
 
 pub(super) fn exercise() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
-    let local = postgres_schema::initialize(&owner, &trust, deadline())
+    let local = postgres_schema::initialize(&owner, deadline())
         .unwrap()
         .store_epoch;
     let binding = Source::new(
@@ -104,7 +102,7 @@ pub(super) fn exercise() {
         StoreEpoch::from_bytes([7; 16]),
     )
     .unwrap();
-    source::initialize(&owner, &trust, deadline(), local, &binding).unwrap();
+    source::initialize(&owner, deadline(), local, &binding).unwrap();
     let limits = Limits {
         body_bytes: 1024 * 1024,
         blobs: 100,
@@ -116,7 +114,7 @@ pub(super) fn exercise() {
         Err(td_mta::replica_seed::Error::Source)
     ));
     let seed = seed(binding.origin(), limits);
-    let publish = || accounts::initialize(&owner, &trust, deadline(), local, seed.clone());
+    let publish = || accounts::initialize(&owner, deadline(), local, seed.clone());
     sql(&fixture,"CREATE FUNCTION public.reject_replica_page() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER reject_replica_page BEFORE INSERT ON td_mta.replica_pending FOR EACH ROW EXECUTE FUNCTION public.reject_replica_page()");
     assert_eq!(publish(), Err(Error::Database));
     for table in [
@@ -141,14 +139,9 @@ pub(super) fn exercise() {
         "DROP TRIGGER reject_replica_page ON td_mta.replica_pending",
     );
     publish().unwrap();
-    let progress = td_mta::postgres_replica_progress::inspect(
-        &owner,
-        &trust,
-        deadline(),
-        local,
-        seed.account(),
-    )
-    .unwrap();
+    let progress =
+        td_mta::postgres_replica_progress::inspect(&owner, deadline(), local, seed.account())
+            .unwrap();
     assert_eq!(progress.seed_digest, seed.digest());
     assert_eq!(progress.email_cursor.sequence.number(), 5);
     assert_eq!(progress.mailbox_checkpoint.sequence.number(), 6);
@@ -158,14 +151,9 @@ pub(super) fn exercise() {
         &fixture,
         "UPDATE td_mta.replica_pending SET done=set_byte(done,0,1)",
     );
-    let progress = td_mta::postgres_replica_progress::inspect(
-        &owner,
-        &trust,
-        deadline(),
-        local,
-        seed.account(),
-    )
-    .unwrap();
+    let progress =
+        td_mta::postgres_replica_progress::inspect(&owner, deadline(), local, seed.account())
+            .unwrap();
     assert_eq!(
         progress.pending.unwrap().unfinished().collect::<Vec<_>>(),
         vec![EmailId::from_bytes([1; 16])]
@@ -175,28 +163,15 @@ pub(super) fn exercise() {
         "UPDATE td_mta.replica_pending SET done=set_byte(done,0,4)",
     );
     assert!(matches!(
-        td_mta::postgres_replica_progress::inspect(
-            &owner,
-            &trust,
-            deadline(),
-            local,
-            seed.account()
-        ),
+        td_mta::postgres_replica_progress::inspect(&owner, deadline(), local, seed.account()),
         Err(td_mta::postgres_replica_progress::Error::Integrity)
     ));
     sql(
         &fixture,
         "UPDATE td_mta.replica_pending SET done=set_byte(done,0,0)",
     );
-    let inspect = || {
-        td_mta::postgres_replica_progress::inspect(
-            &owner,
-            &trust,
-            deadline(),
-            local,
-            seed.account(),
-        )
-    };
+    let inspect =
+        || td_mta::postgres_replica_progress::inspect(&owner, deadline(), local, seed.account());
     sql(
         &fixture,
         "UPDATE td_mta.replica_pending SET observed=decode('0000000000000006','hex')",
@@ -250,7 +225,6 @@ pub(super) fn exercise() {
     assert!(matches!(
         td_mta::postgres_replica_progress::inspect(
             &owner,
-            &trust,
             deadline(),
             local,
             AccountId::from_bytes([8; 16])
@@ -260,7 +234,6 @@ pub(super) fn exercise() {
     assert!(matches!(
         td_mta::postgres_replica_progress::inspect(
             &owner,
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([8; 16]),
             seed.account()
@@ -302,12 +275,12 @@ pub(super) fn exercise() {
     );
     let different = seed_for_different_limits(limits);
     assert_eq!(
-        accounts::initialize(&owner, &trust, deadline(), local, different),
+        accounts::initialize(&owner, deadline(), local, different),
         Err(Error::Conflict)
     );
     let other = seed_for_other_source(limits);
     assert_eq!(
-        accounts::initialize(&owner, &trust, deadline(), local, other),
+        accounts::initialize(&owner, deadline(), local, other),
         Err(Error::Source)
     );
 }

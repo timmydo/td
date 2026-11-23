@@ -6,7 +6,6 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::SubmissionId,
     ports::{Clock, Tick, Time},
@@ -71,27 +70,24 @@ fn setup(
 pub(super) fn publish(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     limit: Instant,
     value: &attempts::Dispatch,
 ) -> Result<attempts::Outcome, attempts::Error> {
     let (clock, guard) = setup(fixture, true, u64::MAX, false);
-    attempts::publish(request, trust, limit, value, clock, guard)
+    attempts::publish(request, limit, value, clock, guard)
 }
 pub(super) fn fresh_publish(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     limit: Instant,
     value: &attempts::Dispatch,
 ) -> Result<attempts::Outcome, attempts::Error> {
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
-    attempts::publish(request, trust, limit, value, clock, guard)
+    attempts::publish(request, limit, value, clock, guard)
 }
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     submission: SubmissionId,
@@ -105,20 +101,13 @@ pub(super) fn exercise(
     let recipients = sql(fixture, "SELECT md5(string_agg(row_to_json(r)::text,',' ORDER BY account,submission_id,ordinal)) FROM td_mta.recipients r");
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &retry, clock, guard),
+        attempts::publish(request, deadline(), &retry, clock, guard),
         Err(attempts::Error::Clock(queue_clock::Error::Unstable))
     );
     for (jump_at, fail) in [(1, false), (2, false), (u64::MAX, true)] {
         let (clock, guard) = setup(fixture, false, jump_at, fail);
         assert_eq!(
-            attempts::publish(
-                request,
-                trust,
-                deadline(),
-                &fresh,
-                clock.clone(),
-                guard.clone()
-            ),
+            attempts::publish(request, deadline(), &fresh, clock.clone(), guard.clone()),
             Err(attempts::Error::Clock(if fail {
                 queue_clock::Error::Invalid
             } else {
@@ -129,7 +118,7 @@ pub(super) fn exercise(
             assert_eq!(clock.samples.load(Ordering::Relaxed), 2);
         }
         assert_eq!(
-            attempts::inspect(request, trust, deadline(), &fresh).unwrap(),
+            attempts::inspect(request, deadline(), &fresh).unwrap(),
             None
         );
         assert_eq!(
@@ -143,7 +132,7 @@ pub(super) fn exercise(
         if !fail {
             // Elapsed stable time alone cannot clear the discontinuity hold.
             assert_eq!(
-                attempts::publish(request, trust, deadline(), &fresh, clock, guard),
+                attempts::publish(request, deadline(), &fresh, clock, guard),
                 Err(attempts::Error::Clock(queue_clock::Error::Unstable))
             );
         }
@@ -170,30 +159,23 @@ pub(super) fn exercise(
         ));
         sql(fixture, &format!("UPDATE td_mta.route_owners SET last_clock={prior},expires_at={} WHERE operation=decode('{}','hex')", prior+30_000, claim.operation()));
         assert_eq!(
-            attempts::publish(
-                request,
-                trust,
-                deadline(),
-                &fresh,
-                clock.clone(),
-                guard.clone()
-            ),
+            attempts::publish(request, deadline(), &fresh, clock.clone(), guard.clone()),
             Err(attempts::Error::Clock(queue_clock::Error::Unstable))
         );
         sql(fixture, &format!("UPDATE td_mta.route_owners SET last_clock={last},expires_at={expires} WHERE operation=decode('{}','hex')", claim.operation()));
         assert_eq!(
-            attempts::publish(request, trust, deadline(), &fresh, clock, guard),
+            attempts::publish(request, deadline(), &fresh, clock, guard),
             Err(attempts::Error::Clock(queue_clock::Error::Unstable))
         );
         assert_eq!(
-            attempts::inspect(request, trust, deadline(), &fresh).unwrap(),
+            attempts::inspect(request, deadline(), &fresh).unwrap(),
             None
         );
     }
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
     let locked = guard.lock().unwrap();
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &fresh, clock, guard.clone()),
+        attempts::publish(request, deadline(), &fresh, clock, guard.clone()),
         Err(attempts::Error::Clock(queue_clock::Error::Invalid))
     );
     drop(locked);
@@ -201,13 +183,12 @@ pub(super) fn exercise(
 pub(super) fn replay(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     value: &attempts::Dispatch,
     expected: &attempts::Outcome,
 ) {
     let (clock, guard) = setup(fixture, false, u64::MAX, true);
     assert_eq!(
-        &attempts::publish(request, trust, deadline(), value, clock.clone(), guard).unwrap(),
+        &attempts::publish(request, deadline(), value, clock.clone(), guard).unwrap(),
         expected
     );
     assert_eq!(clock.samples.load(Ordering::Relaxed), 0);
@@ -218,7 +199,6 @@ pub(super) fn replay(
 pub(super) fn phase(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     value: &td_mta::postgres_attempt_phases::Change,
     body: bool,
@@ -236,14 +216,7 @@ pub(super) fn phase(
     for (jump_at, fail) in [(1, false), (2, false), (u64::MAX, true)] {
         let (clock, guard) = setup(fixture, false, jump_at, fail);
         assert_eq!(
-            publish(
-                request,
-                trust,
-                deadline(),
-                value,
-                clock.clone(),
-                guard.clone()
-            ),
+            publish(request, deadline(), value, clock.clone(), guard.clone()),
             Err(phases::Error::Clock(if fail {
                 queue_clock::Error::Invalid
             } else {
@@ -253,14 +226,11 @@ pub(super) fn phase(
         if jump_at == 2 {
             assert_eq!(clock.samples.load(Ordering::Relaxed), 2);
         }
-        assert_eq!(
-            phases::inspect(request, trust, deadline(), value).unwrap(),
-            None
-        );
+        assert_eq!(phases::inspect(request, deadline(), value).unwrap(), None);
         assert_eq!(snapshot(), before);
         if !fail {
             assert_eq!(
-                publish(request, trust, deadline(), value, clock, guard),
+                publish(request, deadline(), value, clock, guard),
                 Err(phases::Error::Clock(queue_clock::Error::Unstable))
             );
         }
@@ -287,30 +257,20 @@ pub(super) fn phase(
         ));
         sql(fixture, &format!("UPDATE td_mta.route_owners SET last_clock={prior},expires_at={} WHERE operation=decode('{}','hex')", prior+30_000, claim.operation()));
         assert_eq!(
-            publish(
-                request,
-                trust,
-                deadline(),
-                value,
-                clock.clone(),
-                guard.clone()
-            ),
+            publish(request, deadline(), value, clock.clone(), guard.clone()),
             Err(phases::Error::Clock(queue_clock::Error::Unstable))
         );
         sql(fixture, &format!("UPDATE td_mta.route_owners SET last_clock={last},expires_at={expires} WHERE operation=decode('{}','hex')", claim.operation()));
         assert_eq!(
-            publish(request, trust, deadline(), value, clock, guard),
+            publish(request, deadline(), value, clock, guard),
             Err(phases::Error::Clock(queue_clock::Error::Unstable))
         );
-        assert_eq!(
-            phases::inspect(request, trust, deadline(), value).unwrap(),
-            None
-        );
+        assert_eq!(phases::inspect(request, deadline(), value).unwrap(), None);
     }
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
     let locked = guard.lock().unwrap();
     assert_eq!(
-        publish(request, trust, deadline(), value, clock, guard.clone()),
+        publish(request, deadline(), value, clock, guard.clone()),
         Err(phases::Error::Clock(queue_clock::Error::Invalid))
     );
     drop(locked);
@@ -319,7 +279,6 @@ pub(super) fn phase(
 pub(super) fn publish_phase(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     limit: Instant,
     value: &td_mta::postgres_attempt_phases::Change,
     body: bool,
@@ -330,13 +289,12 @@ pub(super) fn publish_phase(
     } else {
         td_mta::postgres_attempt_phases::publish_new_possible_observed
     };
-    publish(request, trust, limit, value, clock, guard)
+    publish(request, limit, value, clock, guard)
 }
 
 pub(super) fn current(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     value: &td_mta::postgres_attempt_phases::Change,
     body: bool,
 ) -> Result<Instant, td_mta::postgres_attempt_phases::Error> {
@@ -349,14 +307,7 @@ pub(super) fn current(
     for (jump_at, fail) in [(1, false), (2, false), (u64::MAX, true)] {
         let (clock, guard) = setup(fixture, false, jump_at, fail);
         assert_eq!(
-            check(
-                request,
-                trust,
-                deadline(),
-                value,
-                clock.clone(),
-                guard.clone()
-            ),
+            check(request, deadline(), value, clock.clone(), guard.clone()),
             Err(phases::Error::Clock(if fail {
                 queue_clock::Error::Invalid
             } else {
@@ -368,32 +319,24 @@ pub(super) fn current(
         }
         if !fail {
             assert_eq!(
-                check(request, trust, deadline(), value, clock, guard),
+                check(request, deadline(), value, clock, guard),
                 Err(phases::Error::Clock(queue_clock::Error::Unstable))
             );
         }
     }
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
-    check(request, trust, deadline(), value, clock, guard)
+    check(request, deadline(), value, clock, guard)
 }
 
 pub(super) fn observed_envelope(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     value: &attempts::Dispatch,
 ) -> (attempts::Envelope, Instant) {
     for (jump_at, fail) in [(1, false), (2, false), (u64::MAX, true)] {
         let (clock, guard) = setup(fixture, false, jump_at, fail);
         assert_eq!(
-            attempts::observe_envelope(
-                request,
-                trust,
-                deadline(),
-                value,
-                clock.clone(),
-                guard.clone()
-            ),
+            attempts::observe_envelope(request, deadline(), value, clock.clone(), guard.clone()),
             Err(attempts::Error::Clock(if fail {
                 queue_clock::Error::Invalid
             } else {
@@ -405,7 +348,7 @@ pub(super) fn observed_envelope(
         }
         if !fail {
             assert_eq!(
-                attempts::observe_envelope(request, trust, deadline(), value, clock, guard),
+                attempts::observe_envelope(request, deadline(), value, clock, guard),
                 Err(attempts::Error::Clock(queue_clock::Error::Unstable))
             );
         }
@@ -413,22 +356,21 @@ pub(super) fn observed_envelope(
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
     let locked = guard.lock().unwrap();
     assert_eq!(
-        attempts::observe_envelope(request, trust, deadline(), value, clock, guard.clone()),
+        attempts::observe_envelope(request, deadline(), value, clock, guard.clone()),
         Err(attempts::Error::Clock(queue_clock::Error::Invalid))
     );
     drop(locked);
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
     let short = Instant::now() + std::time::Duration::from_secs(2);
-    let (_, cap) = attempts::observe_envelope(request, trust, short, value, clock, guard).unwrap();
+    let (_, cap) = attempts::observe_envelope(request, short, value, clock, guard).unwrap();
     assert_eq!(cap, short);
-    fresh_envelope(fixture, request, trust, value).unwrap()
+    fresh_envelope(fixture, request, value).unwrap()
 }
 pub(super) fn fresh_envelope(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     value: &attempts::Dispatch,
 ) -> Result<(attempts::Envelope, Instant), attempts::Error> {
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
-    attempts::observe_envelope(request, trust, deadline(), value, clock, guard)
+    attempts::observe_envelope(request, deadline(), value, clock, guard)
 }

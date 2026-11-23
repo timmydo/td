@@ -3,7 +3,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     outbound_http::Client,
     postgres_replica_source::{self, Source},
@@ -37,12 +36,11 @@ pub(super) fn exercise(
     let folders = reader.mailboxes().unwrap();
     drop(reader);
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
-    let epoch = postgres_schema::initialize(&owner, &trust, deadline())
+    let epoch = postgres_schema::initialize(&owner, deadline())
         .unwrap()
         .store_epoch;
-    postgres_replica_source::initialize(&owner, &trust, deadline(), epoch, &source()).unwrap();
+    postgres_replica_source::initialize(&owner, deadline(), epoch, &source()).unwrap();
     let seed = Arc::new(
         Seed::prepare(
             source(),
@@ -57,7 +55,7 @@ pub(super) fn exercise(
         )
         .unwrap(),
     );
-    td_mta::postgres_replica_accounts::initialize(&owner, &trust, deadline(), epoch, seed).unwrap();
+    td_mta::postgres_replica_accounts::initialize(&owner, deadline(), epoch, seed).unwrap();
     create_runtime_login(&fixture);
     grant_runtime_mail(&fixture);
     sql(&fixture, "GRANT INSERT,UPDATE,DELETE ON td_mta.replica_progress,td_mta.replica_pending,td_mta.replica_mailbox_receipts,td_mta.replica_email_receipts,td_mta.replica_blob_identities TO mail_runtime");
@@ -66,10 +64,7 @@ pub(super) fn exercise(
         mode: td_mta::postgres_probe::Mode::Runtime,
         ..fixture.request()
     };
-    let local = || Local {
-        request: &request,
-        trust: &trust,
-    };
+    let local = || Local { request: &request };
     let mut worker = Worker::new(source(), binding.account, epoch, local()).unwrap();
     assert!(matches!(
         Worker::new(source(), binding.account, binding.epoch, local()),
@@ -136,7 +131,6 @@ pub(super) fn exercise(
         epoch,
         Local {
             request: &rejected_request,
-            trust: &trust,
         },
     )
     .unwrap();
@@ -153,14 +147,9 @@ pub(super) fn exercise(
         assert_eq!(caught_up.local_sequence, copied.local_sequence);
     }
     worker.retire();
-    let progress = td_mta::postgres_replica_progress::inspect(
-        &owner,
-        &trust,
-        deadline(),
-        epoch,
-        binding.account,
-    )
-    .unwrap();
+    let progress =
+        td_mta::postgres_replica_progress::inspect(&owner, deadline(), epoch, binding.account)
+            .unwrap();
     assert!(progress.inventory_complete);
     assert_eq!(progress.email_count, 1);
     assert!(progress.pending.unwrap().complete());

@@ -3,7 +3,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, StoreEpoch},
     postgres_accounts,
@@ -16,23 +15,20 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_maintenance_entry_is_owner_only_epoch_bound_and_monotone() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
-    let receipt = postgres_schema::initialize(&owner, &trust, deadline()).unwrap();
+    let receipt = postgres_schema::initialize(&owner, deadline()).unwrap();
     let epoch = receipt.store_epoch;
     let account = AccountId::from_bytes([1; 16]);
     postgres_accounts::publish(
         &owner,
-        &trust,
         deadline(),
         postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
-    let inspect = || maintenance::inspect(&owner, &trust, deadline(), epoch);
+    let inspect = || maintenance::inspect(&owner, deadline(), epoch);
     let enter = || {
         maintenance::enter(
             &owner,
-            &trust,
             deadline(),
             epoch,
             ExternalFence::InstancesAndSmtpEgressStopped,
@@ -42,7 +38,6 @@ fn real_postgres_maintenance_entry_is_owner_only_epoch_bound_and_monotone() {
     assert_eq!(
         maintenance::enter(
             &owner,
-            &trust,
             Instant::now(),
             epoch,
             ExternalFence::InstancesAndSmtpEgressStopped
@@ -52,7 +47,6 @@ fn real_postgres_maintenance_entry_is_owner_only_epoch_bound_and_monotone() {
     assert_eq!(
         maintenance::enter(
             &owner,
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([2; 16]),
             ExternalFence::InstancesAndSmtpEgressStopped
@@ -75,7 +69,7 @@ fn real_postgres_maintenance_entry_is_owner_only_epoch_bound_and_monotone() {
     let mut runtime = fixture.request();
     runtime.user = "mail_runtime";
     assert_eq!(
-        maintenance::inspect(&runtime, &trust, deadline(), epoch),
+        maintenance::inspect(&runtime, deadline(), epoch),
         Err(Error::Owner)
     );
     sql(
@@ -85,7 +79,6 @@ fn real_postgres_maintenance_entry_is_owner_only_epoch_bound_and_monotone() {
     assert_eq!(
         maintenance::enter(
             &runtime,
-            &trust,
             deadline(),
             epoch,
             ExternalFence::InstancesAndSmtpEgressStopped
@@ -100,24 +93,23 @@ fn real_postgres_maintenance_entry_is_owner_only_epoch_bound_and_monotone() {
     assert_eq!(
         maintenance::enter(
             &runtime,
-            &trust,
             deadline(),
             epoch,
             ExternalFence::InstancesAndSmtpEgressStopped
         ),
         Err(Error::Owner)
     );
-    assert!(postgres_probe::probe(&runtime, &trust, deadline()).is_ok());
+    assert!(postgres_probe::probe(&runtime, deadline()).is_ok());
     sql(&fixture,"ALTER ROLE td_probe SET default_transaction_isolation='repeatable read'; CREATE FUNCTION public.require_barrier_settings() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('synchronous_commit') <> 'on' OR current_setting('idle_in_transaction_session_timeout') <> '10s' OR current_setting('transaction_isolation') <> 'read committed' THEN RAISE EXCEPTION 'barrier settings'; END IF; RETURN NEW; END $$; CREATE TRIGGER require_barrier_settings BEFORE UPDATE ON td_mta.runtime_barrier FOR EACH ROW EXECUTE FUNCTION public.require_barrier_settings()");
     assert_eq!(enter(), Ok(()));
     assert_eq!(inspect(), Ok(true));
     assert_eq!(enter(), Ok(()));
     assert_eq!(
-        postgres_probe::probe(&runtime, &trust, deadline()),
+        postgres_probe::probe(&runtime, deadline()),
         Err(postgres_probe::Error::RuntimeMaintenance)
     );
     assert_eq!(
-        postgres_schema::inspect(&owner, &trust, deadline()).unwrap(),
+        postgres_schema::inspect(&owner, deadline()).unwrap(),
         receipt
     );
     assert_eq!(
@@ -132,19 +124,15 @@ fn real_postgres_maintenance_entry_is_owner_only_epoch_bound_and_monotone() {
     sql(&fixture,"DROP TRIGGER require_barrier_settings ON td_mta.runtime_barrier; BEGIN; UPDATE td_mta.schema_migrations SET store_epoch=decode(repeat('22',16),'hex'); UPDATE td_mta.runtime_barrier SET blocked=false; COMMIT");
     assert_eq!(enter(), Err(Error::Epoch));
     let renewed = StoreEpoch::from_bytes([0x22; 16]);
-    assert_eq!(
-        maintenance::inspect(&owner, &trust, deadline(), renewed),
-        Ok(false)
-    );
+    assert_eq!(maintenance::inspect(&owner, deadline(), renewed), Ok(false));
     sql(&fixture, "DELETE FROM td_mta.runtime_barrier");
     assert_eq!(
-        maintenance::inspect(&owner, &trust, deadline(), renewed),
+        maintenance::inspect(&owner, deadline(), renewed),
         Err(Error::Integrity)
     );
     assert_eq!(
         maintenance::enter(
             &owner,
-            &trust,
             deadline(),
             renewed,
             ExternalFence::InstancesAndSmtpEgressStopped
@@ -161,16 +149,14 @@ fn real_postgres_maintenance_entry_is_owner_only_epoch_bound_and_monotone() {
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_maintenance_entry_resolves_uncertain_commit_at_same_epoch() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
-    let epoch = postgres_schema::initialize(&owner, &trust, deadline())
+    let epoch = postgres_schema::initialize(&owner, deadline())
         .unwrap()
         .store_epoch;
     sql(&fixture,"CREATE FUNCTION public.delay_barrier_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_barrier_commit AFTER UPDATE ON td_mta.runtime_barrier DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_barrier_commit()");
     assert_eq!(
         maintenance::enter(
             &owner,
-            &trust,
             Instant::now() + Duration::from_secs(2),
             epoch,
             ExternalFence::InstancesAndSmtpEgressStopped
@@ -178,7 +164,7 @@ fn real_postgres_maintenance_entry_resolves_uncertain_commit_at_same_epoch() {
         Err(Error::Indeterminate)
     );
     assert_eq!(
-        maintenance::inspect(&owner, &trust, deadline(), epoch),
+        maintenance::inspect(&owner, deadline(), epoch),
         Err(Error::Schema(postgres_schema::Error::Busy))
     );
     let stop = Instant::now() + Duration::from_secs(8);
@@ -190,15 +176,11 @@ fn real_postgres_maintenance_entry_resolves_uncertain_commit_at_same_epoch() {
         assert!(Instant::now() < stop);
         thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(
-        maintenance::inspect(&owner, &trust, deadline(), epoch),
-        Ok(true)
-    );
+    assert_eq!(maintenance::inspect(&owner, deadline(), epoch), Ok(true));
     // A retry observes true without issuing UPDATE or firing the delay again.
     assert_eq!(
         maintenance::enter(
             &owner,
-            &trust,
             Instant::now() + Duration::from_secs(2),
             epoch,
             ExternalFence::InstancesAndSmtpEgressStopped

@@ -1,5 +1,5 @@
 //! Explicit restored-store release; callers retain both epochs before mutation.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -83,10 +83,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
         utc_ms,
         maximum_rows: options.rows,
     };
-    let result = with_addresses(&loaded, |request, deadline| {
+    let result = with_connection(&loaded, |request, deadline| {
         postgres_recovery::release(
             request,
-            &loaded.trust,
             deadline,
             plan,
             ExternalChecks::InstancesAndSmtpFencedAndConfigurationReviewed,

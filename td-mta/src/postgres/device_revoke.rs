@@ -1,5 +1,5 @@
 //! Explicit owner-side revocation in the preparation database.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -75,9 +75,8 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    match with_addresses(&loaded, |request, deadline| {
-        postgres_devices::publish_revocation(request, &loaded.trust, deadline, &operation)
-            .map_err(classify)
+    match with_connection(&loaded, |request, deadline| {
+        postgres_devices::publish_revocation(request, deadline, &operation).map_err(classify)
     }) {
         Ok(outcome) => {
             let outcome = match outcome {

@@ -1,30 +1,17 @@
 //! PostgreSQL connection qualification and bounded worker-owned I/O.
-use crate::{
-    clock::{RuntimeClock, TlsClockSource},
-    ports::{Clock, Deadline},
-};
 use std::{
-    net::{SocketAddr, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
-use td_crypto::{ClientConfig, ClockHandle, TlsProtocol, TlsSession, TrustStore};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Endpoint {
-    Tcp(SocketAddr),
-    Unix(td_fs::SocketPath),
-}
-
-/// The caller resolves and admits the address; TCP TLS authenticates server_name.
-/// Borrowed credentials never enter diagnostics. DNS and bootstrap parsing are
-/// separate cold operations, not hidden work on this connection worker.
+/// The server's Unix socket, which every connect admits afresh, and the
+/// login. Borrowed credentials never enter diagnostics. Bootstrap parsing is
+/// a separate cold operation, not hidden work on this connection worker.
 pub struct Request<'a> {
-    pub address: Endpoint,
-    pub server_name: &'a str,
+    pub socket: td_fs::SocketPath,
     pub user: &'a str,
     pub database: &'a str,
     pub password: &'a [u8],
@@ -45,7 +32,6 @@ pub enum Error {
     Invalid,
     Deadline,
     Transport,
-    Tls,
     Database,
     Settings,
     RuntimeSchema,
@@ -87,12 +73,8 @@ const BODY_CHECK_TURNS: usize = 8;
 /// Connect, authenticate, inspect primary/durability settings, and close.
 /// One bounded worker owns the connection; no background thread or task.
 /// This proves neither schema compatibility nor replication durability.
-pub fn probe(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-) -> Result<Status, Error> {
-    let status = with_client(request, trust, deadline, qualify)??;
+pub fn probe(request: &Request<'_>, deadline: Instant) -> Result<Status, Error> {
+    let status = with_client(request, deadline, qualify)??;
     remaining(deadline)?;
     Ok(status)
 }
@@ -101,92 +83,57 @@ pub fn probe(
 // mutation outcome survives a deadline crossed after its last call returned.
 pub(crate) fn with_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    with_output_limit(request, trust, deadline, 64 * 1024, Input::new(), operation)
+    with_output_limit(request, deadline, 64 * 1024, Input::new(), operation)
 }
 
 // Capacity observation: schema ledger plus at most 16 accounts, each with
 // twenty-four bounded count queries, and global counters. No body contents.
 pub(crate) fn with_capacity_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    with_output_limit(
-        request,
-        trust,
-        deadline,
-        256 * 1024,
-        Input::capacity(),
-        operation,
-    )
+    with_output_limit(request, deadline, 256 * 1024, Input::capacity(), operation)
 }
 
 // One bounded configuration-material operation, at most 128 KiB in two chunks.
 pub(crate) fn with_material_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    with_output_limit(
-        request,
-        trust,
-        deadline,
-        256 * 1024,
-        Input::new(),
-        operation,
-    )
+    with_output_limit(request, deadline, 256 * 1024, Input::new(), operation)
 }
 
 // A complete mailbox listing has at most 257 result rows, including overflow.
 pub(crate) fn with_mailbox_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    with_output_limit(
-        request,
-        trust,
-        deadline,
-        64 * 1024,
-        Input::mailboxes(),
-        operation,
-    )
+    with_output_limit(request, deadline, 64 * 1024, Input::mailboxes(), operation)
 }
 
 // At most 256 Email rows and 257 distinct mailbox rows, with protocol overhead.
 pub(crate) fn with_mutation_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    with_output_limit(
-        request,
-        trust,
-        deadline,
-        128 * 1024,
-        Input::mutations(),
-        operation,
-    )
+    with_output_limit(request, deadline, 128 * 1024, Input::mutations(), operation)
 }
 
 // Whole-submission cancellation: 1000 recipients and schema/protocol overhead.
 pub(crate) fn with_cancellation_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
-        trust,
         deadline,
         128 * 1024,
         Input::cancellation(),
@@ -197,13 +144,11 @@ pub(crate) fn with_cancellation_client<T>(
 // Folder names or 100 maximum-length RCPT replies, plus protocol overhead.
 pub(crate) fn with_batch_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
-        trust,
         deadline,
         1024 * 1024,
         Input::mutations(),
@@ -214,13 +159,11 @@ pub(crate) fn with_batch_client<T>(
 // One immutable upload: at most 512 chunks in batches of eight.
 pub(crate) fn with_upload_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
-        trust,
         deadline,
         40 * 1024 * 1024,
         Input::mutations(),
@@ -231,7 +174,6 @@ pub(crate) fn with_upload_client<T>(
 // Owner import adds bounded source-mapping rows to a full-size body write.
 pub(crate) fn with_import_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     body_length: u64,
     guarded: bool,
@@ -239,7 +181,6 @@ pub(crate) fn with_import_client<T>(
 ) -> Result<T, Error> {
     let mut worker = connect_worker_bounded(
         request,
-        trust,
         deadline,
         72 * 1024 * 1024,
         Input::imports(guarded),
@@ -251,14 +192,12 @@ pub(crate) fn with_import_client<T>(
 // New-only mailbox creation also checks bounded parent/ancestor metadata.
 pub(crate) fn with_import_mailbox_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     guarded: bool,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
-        trust,
         deadline,
         if guarded { 2 * 1024 * 1024 } else { 128 * 1024 },
         if guarded {
@@ -273,13 +212,11 @@ pub(crate) fn with_import_mailbox_client<T>(
 // Reconciliation reads complete bounded source and local folder metadata.
 pub(crate) fn with_reconcile_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
-        trust,
         deadline,
         2 * 1024 * 1024,
         Input::reconciliation(),
@@ -290,7 +227,6 @@ pub(crate) fn with_reconcile_client<T>(
 // One SMTP transaction publishes a separate blob and receipt per local account.
 pub(crate) fn with_fanout_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     accounts: usize,
     operation: impl FnOnce(&Client) -> T,
@@ -300,7 +236,6 @@ pub(crate) fn with_fanout_client<T>(
     }
     with_output_limit(
         request,
-        trust,
         deadline,
         40 * 1024 * 1024 * accounts,
         Input::fanout(accounts),
@@ -311,13 +246,11 @@ pub(crate) fn with_fanout_client<T>(
 // At most 1000 retained recipient replies and one local notice, no remote body.
 pub(crate) fn with_notice_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
-        trust,
         deadline,
         20 * 1024 * 1024,
         Input::notices(),
@@ -328,41 +261,31 @@ pub(crate) fn with_notice_client<T>(
 // Explicit owner DDL needs more command completions than a probe.
 pub(crate) fn with_schema_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    with_migration_client(request, trust, deadline, MAX_DURATION, operation)
+    with_migration_client(request, deadline, MAX_DURATION, operation)
 }
 
 pub(crate) fn with_migration_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     maximum: Duration,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    let mut worker = connect_worker_bounded(
-        request,
-        trust,
-        deadline,
-        128 * 1024,
-        Input::schema(),
-        maximum,
-    )?;
+    let mut worker =
+        connect_worker_bounded(request, deadline, 128 * 1024, Input::schema(), maximum)?;
     worker.run(operation)
 }
 
 // One complete source candidate, bounded independently of material/probe work.
 pub(crate) fn with_configuration_client<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
     with_output_limit(
         request,
-        trust,
         deadline,
         4 * 1024 * 1024,
         Input::configuration(),
@@ -372,13 +295,12 @@ pub(crate) fn with_configuration_client<T>(
 
 fn with_output_limit<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     output_limit: usize,
     input: Input,
     operation: impl FnOnce(&Client) -> T,
 ) -> Result<T, Error> {
-    let mut worker = connect_worker(request, trust, deadline, output_limit, input)?;
+    let mut worker = connect_worker(request, deadline, output_limit, input)?;
     worker.run(operation)
 }
 
@@ -386,17 +308,15 @@ fn with_output_limit<T>(
 // Budgets and deadlines belong to the connection and are never replenished.
 pub(crate) fn with_body_worker<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&mut Worker) -> T,
 ) -> Result<T, Error> {
-    let mut worker = body_worker(request, trust, deadline)?;
+    let mut worker = body_worker(request, deadline)?;
     Ok(operation(&mut worker))
 }
 
 pub(crate) fn with_audit_worker<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     budget: AuditBudget,
     operation: impl FnOnce(&mut Worker) -> T,
@@ -406,7 +326,6 @@ pub(crate) fn with_audit_worker<T>(
     }
     let mut worker = connect_authenticated_bounded(
         request,
-        trust,
         deadline,
         budget.output,
         Input::audit(budget),
@@ -418,7 +337,6 @@ pub(crate) fn with_audit_worker<T>(
 
 pub(crate) fn with_search_backfill_worker<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     operation: impl FnOnce(&mut Worker) -> T,
 ) -> Result<T, Error> {
@@ -427,7 +345,6 @@ pub(crate) fn with_search_backfill_worker<T>(
     }
     let mut worker = connect_worker_bounded(
         request,
-        trust,
         deadline,
         24 * 1024 * 1024,
         Input::body(),
@@ -436,14 +353,9 @@ pub(crate) fn with_search_backfill_worker<T>(
     Ok(operation(&mut worker))
 }
 
-pub(crate) fn body_worker(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-) -> Result<Worker, Error> {
+pub(crate) fn body_worker(request: &Request<'_>, deadline: Instant) -> Result<Worker, Error> {
     connect_worker_bounded(
         request,
-        trust,
         deadline,
         512 * 1024,
         Input::body(),
@@ -455,7 +367,6 @@ pub(crate) fn body_worker(
 // and Runtime access under its own transaction-scoped migration lock.
 pub(crate) fn validation_worker(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     budget: Option<ValidationBudget>,
 ) -> Result<Worker, Error> {
@@ -466,29 +377,27 @@ pub(crate) fn validation_worker(
         Some(budget) => (budget.output(), Input::validation_checks(budget)),
         None => (64 * 1024, Input::mutations()),
     };
-    connect_authenticated(request, trust, deadline, output, input)
+    connect_authenticated(request, deadline, output, input)
 }
 
 fn connect_worker(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     output_limit: usize,
     input: Input,
 ) -> Result<Worker, Error> {
-    connect_worker_bounded(request, trust, deadline, output_limit, input, MAX_DURATION)
+    connect_worker_bounded(request, deadline, output_limit, input, MAX_DURATION)
 }
 
 fn connect_worker_bounded(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     output_limit: usize,
     input: Input,
     maximum: Duration,
 ) -> Result<Worker, Error> {
     let mut worker =
-        connect_authenticated_bounded(request, trust, deadline, output_limit, input, maximum)?;
+        connect_authenticated_bounded(request, deadline, output_limit, input, maximum)?;
     let mode = request.mode;
     if mode != Mode::Preparation {
         let schema = worker.run(|client| {
@@ -538,31 +447,21 @@ pub(crate) fn qualify_runtime_mode(
 
 fn connect_authenticated(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     output_limit: usize,
     input: Input,
 ) -> Result<Worker, Error> {
-    connect_authenticated_bounded(request, trust, deadline, output_limit, input, MAX_DURATION)
+    connect_authenticated_bounded(request, deadline, output_limit, input, MAX_DURATION)
 }
 
 fn connect_authenticated_bounded(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     output_limit: usize,
     input: Input,
     maximum: Duration,
 ) -> Result<Worker, Error> {
-    connect_authenticated_until(
-        request,
-        trust,
-        deadline,
-        deadline,
-        output_limit,
-        input,
-        maximum,
-    )
+    connect_authenticated_until(request, deadline, deadline, output_limit, input, maximum)
 }
 
 /// The session settings every connection starts with.
@@ -595,12 +494,33 @@ fn limits(output_limit: usize, input: &Input) -> td_postgres::Limits {
 
 fn connect_authenticated_until(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     connect_deadline: Instant,
     output_limit: usize,
     input: Input,
     maximum: Duration,
+) -> Result<Worker, Error> {
+    connect_admitted_until(
+        request,
+        deadline,
+        connect_deadline,
+        output_limit,
+        input,
+        maximum,
+        td_fs::check_server_socket,
+    )
+}
+
+/// `admit` is `td_fs::check_server_socket` outside unit tests, whose user
+/// namespace leaves every root-owned ancestor unmapped and so inadmissible.
+fn connect_admitted_until(
+    request: &Request<'_>,
+    deadline: Instant,
+    connect_deadline: Instant,
+    output_limit: usize,
+    input: Input,
+    maximum: Duration,
+    admit: fn(&std::path::Path) -> std::io::Result<()>,
 ) -> Result<Worker, Error> {
     let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbConnect);
     let allowance = remaining(deadline)?;
@@ -608,8 +528,6 @@ fn connect_authenticated_until(
         .min(deadline)
         .min(Instant::now() + MAX_DURATION);
     if allowance > maximum
-        || (matches!(request.address, Endpoint::Tcp(_)) && request.server_name.is_empty())
-        || request.server_name.len() > 253
         || request.user.is_empty()
         || request.user.len() > 256
         || request.database.is_empty()
@@ -638,63 +556,28 @@ fn connect_authenticated_until(
         parameters: &[("options", OPTIONS)],
     };
     let abort = Arc::new(AtomicBool::new(false));
-    // A dial that fails before any byte moves is a transport refusal,
-    // which lets the caller try another address.
+    // A dial that fails before any byte moves is a transport refusal.
     let dialed = AtomicBool::new(false);
-    let session = match request.address {
-        Endpoint::Tcp(address) => {
-            let connector = tls_connector(
-                trust,
-                request.server_name,
-                deadline,
-                connect_deadline,
-                output_limit,
-                input,
-                Arc::clone(&abort),
-            )?;
-            // Transitional, with the TCP endpoint: td-mta connects, so a
-            // failed connect stays a transport refusal.
-            let mut tcp = crate::performance::Timer::start(crate::performance::Phase::DbTcp);
-            let socket = TcpStream::connect_timeout(&address, remaining(connect_deadline)?)
-                .map_err(|_| Error::Transport)?;
-            tcp.succeeded();
+    // Socket admission precedes and stays apart from the dial.
+    admit(request.socket.as_path()).map_err(|_| Error::Transport)?;
+    let mut handshake = crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
+    let session = td_postgres::connect_unix_through(
+        request.socket.as_path(),
+        |socket| {
             dialed.store(true, Ordering::Relaxed);
-            let mut handshake =
-                crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
-            let session =
-                td_postgres::start_tls(socket, connector, &config, limits, connect_deadline);
-            if session.is_ok() {
-                handshake.succeeded();
-            }
-            session
-        }
-        Endpoint::Unix(path) => {
-            // Socket admission precedes and stays apart from the dial.
-            td_fs::check_server_socket(path.as_path()).map_err(|_| Error::Transport)?;
-            let mut handshake =
-                crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
-            let session = td_postgres::connect_unix_through(
-                path.as_path(),
-                |socket| {
-                    dialed.store(true, Ordering::Relaxed);
-                    Wire::plain(socket, input, output_limit, Arc::clone(&abort))
-                },
-                &config,
-                limits,
-                connect_deadline,
-            );
-            if session.is_ok() {
-                handshake.succeeded();
-            }
-            session
-        }
-    }
+            Wire::new(socket, input, output_limit, Arc::clone(&abort))
+        },
+        &config,
+        limits,
+        connect_deadline,
+    )
     .map_err(|error| match error {
         DbError::Deadline => Error::Deadline,
         DbError::Io | DbError::Closed if !dialed.load(Ordering::Relaxed) => Error::Transport,
         DbError::Invalid => Error::Invalid,
         _ => Error::Database,
     })?;
+    handshake.succeeded();
     timing.succeeded();
     Ok(Worker {
         client: Some(Box::new(Client::new(session, deadline))),
@@ -704,40 +587,6 @@ fn connect_authenticated_until(
         validation_window,
         audit_windows: false,
         relay_wake: false,
-    })
-}
-
-/// td-crypto's verified session for `server_name`, as td-postgres's TLS
-/// connector. Transitional, with the TCP endpoint.
-fn tls_connector(
-    trust: &TrustStore,
-    server_name: &str,
-    deadline: Instant,
-    connect_deadline: Instant,
-    output_limit: usize,
-    input: Input,
-    abort: Arc<AtomicBool>,
-) -> Result<wire::Connector, Error> {
-    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
-    let now = clock.sample().map_err(|_| Error::Deadline)?.monotonic;
-    let cap = Deadline::after(now, transport_milliseconds(remaining(deadline)?)?)
-        .map_err(|_| Error::Invalid)?;
-    let handshake_cap = Deadline::after(now, transport_milliseconds(remaining(connect_deadline)?)?)
-        .map_err(|_| Error::Invalid)?
-        .min(cap);
-    let tls_clock = Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone())));
-    let policy = Arc::new(
-        ClientConfig::new(trust, tls_clock, TlsProtocol::Postgres).map_err(|_| Error::Tls)?,
-    );
-    let session = TlsSession::client(policy, server_name).map_err(|_| Error::Tls)?;
-    Ok(wire::Connector {
-        session,
-        clock,
-        cap,
-        handshake_cap,
-        output: output_limit,
-        input,
-        abort,
     })
 }
 
@@ -883,13 +732,6 @@ pub(crate) fn qualify(client: &Client) -> Result<Status, Error> {
     Ok(Status { server_version })
 }
 
-// TLS uses whole ticks; the worker's exact Instant remains authoritative.
-// Rounding down can turn sub-millisecond expiry into a generic TLS failure
-// before the worker sees its own deadline.
-fn transport_milliseconds(allowance: Duration) -> Result<u64, Error> {
-    u64::try_from(allowance.as_nanos().div_ceil(1_000_000)).map_err(|_| Error::Invalid)
-}
-
 fn remaining(deadline: Instant) -> Result<Duration, Error> {
     deadline
         .checked_duration_since(Instant::now())
@@ -922,29 +764,11 @@ mod windows;
 use framing::Input;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::{io, net::TcpListener, thread};
+    use std::{io, os::unix::net::UnixListener};
 
-    #[test]
-    fn transport_tick_never_expires_before_exact_worker_allowance() {
-        for nanos in [
-            1,
-            999_999,
-            1_000_000,
-            1_000_001,
-            499_999_999,
-            500_000_000,
-            9_999_999_999,
-        ] {
-            let exact = Duration::from_nanos(nanos);
-            let rounded = Duration::from_millis(transport_milliseconds(exact).unwrap());
-            assert!(rounded >= exact);
-            assert!(rounded - exact < Duration::from_millis(1));
-        }
-        assert_eq!(transport_milliseconds(Duration::MAX), Err(Error::Invalid));
-    }
     #[test]
     fn email_import_allowance_scales_with_body_to_the_body_ceiling() {
         let ceiling = crate::postgres_body::MAX_BODY_BYTES;
@@ -961,21 +785,27 @@ mod tests {
         }
     }
 
+    /// A listener nothing may reach, and the request naming it.
+    fn listener(root: &td_fs::TempDir) -> (UnixListener, td_fs::SocketPath) {
+        let path = root.path().join(".s.PGSQL.5432");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (listener, td_fs::SocketPath::new(&path).unwrap())
+    }
+
     #[test]
     fn replica_reader_cannot_open_outbound_validation_worker() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let root = td_fs::TempDir::new("pg-replica-reader").unwrap();
+        let (listener, socket) = listener(&root);
         let request = Request {
-            address: Endpoint::Tcp(listener.local_addr().unwrap()),
-            server_name: "localhost",
+            socket,
             mode: Mode::ReplicaRead,
             user: "reader",
             database: "probe",
             password: b"fixture",
         };
-        let trust = TrustStore::public_roots().unwrap();
         assert!(matches!(
-            validation_worker(&request, &trust, Instant::now() + MAX_DURATION, None),
+            validation_worker(&request, Instant::now() + MAX_DURATION, None),
             Err(Error::Invalid)
         ));
         assert!(
@@ -983,62 +813,68 @@ mod tests {
         );
     }
 
+    /// A peer that accepts and then says nothing holds the startup only to
+    /// the worker's original deadline. Admission is waived: the gate's user
+    /// namespace maps no root-owned ancestor, so none is admissible there.
     #[test]
-    fn stalled_ssl_upgrade_obeys_original_worker_deadline() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let address = listener.local_addr().unwrap();
-        let peer = thread::spawn(move || {
+    fn a_stalled_startup_obeys_the_original_worker_deadline() {
+        let root = td_fs::TempDir::new("pg-stalled").unwrap();
+        let (listener, socket) = listener(&root);
+        let peer = std::thread::spawn(move || {
             let stop = Instant::now() + Duration::from_secs(2);
             while Instant::now() < stop {
                 match listener.accept() {
                     Ok((socket, _)) => {
-                        thread::sleep(Duration::from_millis(200));
+                        std::thread::sleep(Duration::from_millis(200));
                         drop(socket);
-                        return;
+                        return Ok(());
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(1));
+                        std::thread::sleep(Duration::from_millis(1));
                     }
-                    Err(error) => panic!("accept failed: {error}"),
+                    Err(error) => return Err(error),
                 }
             }
             // A scheduler delay can exhaust the deadline before dialing.
+            Ok(())
         });
         let request = Request {
-            address: Endpoint::Tcp(address),
-            server_name: "localhost",
+            socket,
             mode: Mode::Preparation,
             user: "probe",
             database: "probe",
             password: b"fixture",
         };
-        let trust = TrustStore::public_roots().unwrap();
-        assert_eq!(
-            probe(&request, &trust, Instant::now() + Duration::from_millis(50)),
-            Err(Error::Deadline)
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let worker = connect_admitted_until(
+            &request,
+            deadline,
+            deadline,
+            64 * 1024,
+            Input::new(),
+            MAX_DURATION,
+            |_| Ok(()),
         );
-        peer.join().unwrap();
+        assert_eq!(worker.err(), Some(Error::Deadline));
+        peer.join().unwrap().unwrap();
     }
 
     /// td-postgres does no SASLprep: a password it cannot log in with is
     /// refused before anything is dialed.
     #[test]
     fn a_non_ascii_or_nul_password_is_refused_before_dialing() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let trust = TrustStore::public_roots().unwrap();
+        let root = td_fs::TempDir::new("pg-password").unwrap();
+        let (listener, socket) = listener(&root);
         for password in [&b"p\xc3\xa9"[..], b"\x80", b"pass\0word"] {
             let request = Request {
-                address: Endpoint::Tcp(listener.local_addr().unwrap()),
-                server_name: "localhost",
+                socket,
                 mode: Mode::Preparation,
                 user: "probe",
                 database: "probe",
                 password,
             };
             assert_eq!(
-                probe(&request, &trust, Instant::now() + MAX_DURATION),
+                probe(&request, Instant::now() + MAX_DURATION),
                 Err(Error::Invalid)
             );
         }

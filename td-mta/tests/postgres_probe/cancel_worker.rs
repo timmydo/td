@@ -7,7 +7,6 @@ use std::{
     thread,
     time::Duration,
 };
-use td_crypto::TrustStore;
 use td_mta::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -28,7 +27,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     claim: &owners::Claim,
     generation: u64,
@@ -37,7 +35,6 @@ pub(super) fn exercise(
     let domain = GenerationSet::<TlsPolicies>::at_startup();
     let jmap = runtime::load(
         request,
-        trust,
         deadline(),
         binding.epoch(),
         "desktop",
@@ -47,18 +44,18 @@ pub(super) fn exercise(
     let binding = jmap.binding();
     let device =
         devices::prepare_creation(binding.epoch(), binding.account(), "cancel-worker", 0).unwrap();
-    devices::publish_creation(request, trust, deadline(), &device).unwrap();
+    devices::publish_creation(request, deadline(), &device).unwrap();
     let loaded = Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
     let clock = RuntimeClock::new();
     let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
@@ -71,10 +68,8 @@ pub(super) fn exercise(
     let pending = http::Pending::default();
     let slots = ReadSlots::new(1).unwrap();
     let settlement = ReadSlots::new(1).unwrap();
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let worker = http::Cancellations {
         loaded: &loaded,
-        executable,
         binding,
         slots: &slots,
         clock: &clock,
@@ -152,7 +147,7 @@ pub(super) fn exercise(
     assert_eq!(pending.operation().unwrap(), None);
     let reset = || {
         sql(fixture, &format!("UPDATE td_mta.recipients SET state=1,reason=0,next_attempt_at=0 WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.submissions SET completed_at=NULL WHERE id=decode('{submission}','hex')"));
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
     };
     reset();
     // A route-owner COMMIT that outlives its deadline and then rolls back:
@@ -170,7 +165,7 @@ pub(super) fn exercise(
     assert_eq!(pending.operation().unwrap(), Some(absent));
     thread::sleep(Duration::from_secs(6));
     sql(fixture, "DROP TRIGGER rollback_worker_cancel ON td_mta.submission_cancel_receipts; DROP FUNCTION public.rollback_worker_cancel()");
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     let proceeded = worker
         .cancel(input(10_000), claim, generation, &mut meter(), |_| Ok(()))
         .unwrap();
@@ -193,32 +188,22 @@ pub(super) fn exercise(
         fixture,
         "DROP TRIGGER delay_http_cancel ON td_mta.submission_cancel_receipts; DROP FUNCTION public.delay_worker_cancel()",
     );
-    let mut connection = loaded
-        .bootstrap
-        .request(td_mta::postgres_probe::Endpoint::Tcp(
-            ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
-        ));
+    let mut connection = loaded.bootstrap.request();
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
-    let foreground = Snapshot::open_runtime(
-        &slots,
-        &connection,
-        &loaded.trust,
-        deadline(),
-        binding,
-        device.password(),
-    )
-    .unwrap();
+    let foreground =
+        Snapshot::open_runtime(&slots, &connection, deadline(), binding, device.password())
+            .unwrap();
     let revoke =
         devices::prepare_revocation(binding.epoch(), binding.account(), device.device_id(), 1)
             .unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert!(matches!(
-        pending.settle(&loaded, executable, &settlement, &clock, until(0)),
+        pending.settle(&loaded, &settlement, &clock, until(0)),
         Err(Error::Admission(ports::Error::Deadline))
     ));
     assert_eq!(pending.operation().unwrap(), Some(operation));
     let settled = pending
-        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .settle(&loaded, &settlement, &clock, until(10_000))
         .unwrap()
         .unwrap();
     assert_eq!(settled.operation, operation);
@@ -227,7 +212,7 @@ pub(super) fn exercise(
     assert_eq!(pending.operation().unwrap(), None);
     drop(foreground);
     assert!(pending
-        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .settle(&loaded, &settlement, &clock, until(10_000))
         .unwrap()
         .is_none());
     sql(

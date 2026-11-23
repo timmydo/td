@@ -3,12 +3,11 @@
 //! notifications.
 use crate::rows::{Row, Rows};
 use crate::scram::{self, Exchange};
-use crate::stream::{remaining, Socket, Stream, StreamError, TlsConnect};
+use crate::stream::{remaining, Socket, Stream, StreamError};
 use crate::types::Encode;
 use crate::wire::{self, Authentication, Backend, Inbox};
 use crate::{CommitError, Config, DbError, Error, Limits, Severity, TransactionStatus};
 use std::collections::VecDeque;
-use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -127,62 +126,7 @@ pub fn connect_unix_through<W: Stream>(
     check(config, &limits)?;
     remaining(deadline).ok_or(Error::Deadline)?;
     let socket = td_fs::unix_connect_until(path, deadline).map_err(io)?;
-    startup(wrap(Socket::unix(socket)), config, limits, deadline)
-}
-
-/// Connect over TCP, require TLS through `tls`, and start a session.
-/// There is no plaintext fallback: a server that declines TLS is
-/// `TlsRefused`.
-pub fn connect_tls<C: TlsConnect>(
-    address: SocketAddr,
-    tls: C,
-    config: &Config<'_>,
-    limits: Limits,
-    deadline: Instant,
-) -> Result<Client<C::Stream>, Error> {
-    check(config, &limits)?;
-    let wait = remaining(deadline).ok_or(Error::Deadline)?;
-    let socket = TcpStream::connect_timeout(&address, wait).map_err(io)?;
-    start_tls(socket, tls, config, limits, deadline)
-}
-
-/// `connect_tls` over a TCP stream the caller connected, so a caller can
-/// tell a failed connect from a failed negotiation. The stream is made
-/// blocking, as the connector expects, and is closed on any failure.
-pub fn start_tls<C: TlsConnect>(
-    socket: TcpStream,
-    tls: C,
-    config: &Config<'_>,
-    limits: Limits,
-    deadline: Instant,
-) -> Result<Client<C::Stream>, Error> {
-    check(config, &limits)?;
-    remaining(deadline).ok_or(Error::Deadline)?;
-    socket.set_nonblocking(false).map_err(|_| Error::Io)?;
-    socket.set_nodelay(true).map_err(|_| Error::Io)?;
-    let mut plain = Socket::tcp(socket);
-    plain
-        .write_all(&wire::SSL_REQUEST, deadline)
-        .map_err(stream_error)?;
-    // One byte and no more, so nothing the server sends ahead of its
-    // handshake can be taken for TLS-protected data.
-    let mut answer = [0u8; 1];
-    match plain.read(&mut answer, deadline).map_err(stream_error)? {
-        1 => {}
-        0 => return Err(Error::Closed),
-        _ => return Err(Error::Io),
-    }
-    match answer {
-        [b'S'] => {}
-        [b'N'] => return Err(Error::TlsRefused),
-        _ => return Err(Error::Protocol),
-    }
-    let socket = plain.into_tcp().ok_or(Error::Io)?;
-    let secure = tls.connect(socket, deadline).map_err(|error| match error {
-        StreamError::TimedOut => Error::Deadline,
-        StreamError::Failed => Error::Tls,
-    })?;
-    startup(secure, config, limits, deadline)
+    startup(wrap(Socket::new(socket)), config, limits, deadline)
 }
 
 /// Start a session over a stream the caller connected: the startup
@@ -1770,107 +1714,5 @@ mod tests {
             let startup = server.join().unwrap();
             assert_eq!(written, startup);
         }
-    }
-
-    /// Records the call, then refuses: the handshake is the caller's.
-    struct Refusing(std::rc::Rc<std::cell::Cell<bool>>);
-
-    impl TlsConnect for Refusing {
-        type Stream = Socket;
-
-        fn connect(self, _: TcpStream, _: Instant) -> Result<Socket, StreamError> {
-            self.0.set(true);
-            Err(StreamError::Failed)
-        }
-    }
-
-    /// Times one read with a 30 ms receive timeout, then refuses.
-    struct Timed(std::rc::Rc<std::cell::Cell<Option<std::time::Duration>>>);
-
-    impl TlsConnect for Timed {
-        type Stream = Socket;
-
-        fn connect(self, mut socket: TcpStream, _: Instant) -> Result<Socket, StreamError> {
-            use std::io::Read;
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_millis(30)))
-                .unwrap();
-            let start = Instant::now();
-            assert!(socket.read(&mut [0u8; 1]).is_err());
-            self.0.set(Some(start.elapsed()));
-            Err(StreamError::Failed)
-        }
-    }
-
-    #[test]
-    fn tls_starts_over_a_tcp_stream_the_caller_connected() {
-        for (answer, expected, asked) in [
-            (b'N', Error::TlsRefused, false),
-            (b'S', Error::Tls, true),
-            (b'E', Error::Protocol, false),
-        ] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                use std::io::{Read, Write};
-                let (mut peer, _) = listener.accept().unwrap();
-                let mut request = [0u8; 8];
-                peer.read_exact(&mut request).unwrap();
-                peer.write_all(&[answer]).unwrap();
-                // The client closes on every answer here: nothing follows.
-                let mut rest = Vec::new();
-                peer.read_to_end(&mut rest).unwrap();
-                (request, rest)
-            });
-            let socket = TcpStream::connect(address).unwrap();
-            let called = std::rc::Rc::new(std::cell::Cell::new(false));
-            let result = start_tls(
-                socket,
-                Refusing(called.clone()),
-                &config(),
-                limits(),
-                later(),
-            );
-            assert_eq!(result.err(), Some(expected));
-            let (request, rest) = server.join().unwrap();
-            assert_eq!(request, wire::SSL_REQUEST);
-            assert_eq!(rest, b"");
-            assert_eq!(called.get(), asked);
-        }
-        // A nonblocking stream reaches the connector blocking: its read
-        // waits out the receive timeout instead of returning at once.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (done, finished) = std::sync::mpsc::channel::<()>();
-        let server = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            let (mut peer, _) = listener.accept().unwrap();
-            let mut request = [0u8; 8];
-            peer.read_exact(&mut request).unwrap();
-            peer.write_all(b"S").unwrap();
-            // Hold the stream open, sending nothing, until the client is done.
-            let _ = finished.recv();
-        });
-        let socket = TcpStream::connect(address).unwrap();
-        socket.set_nonblocking(true).unwrap();
-        let waited = std::rc::Rc::new(std::cell::Cell::new(None));
-        let result = start_tls(socket, Timed(waited.clone()), &config(), limits(), later());
-        done.send(()).unwrap();
-        server.join().unwrap();
-        assert_eq!(result.err(), Some(Error::Tls));
-        let waited = waited.get().unwrap();
-        assert!(waited >= std::time::Duration::from_millis(25), "{waited:?}");
-        // A deadline already past closes the stream with nothing sent.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let called = std::rc::Rc::new(std::cell::Cell::new(false));
-        let past = Instant::now();
-        let result = start_tls(socket, Refusing(called.clone()), &config(), limits(), past);
-        assert_eq!(result.err(), Some(Error::Deadline));
-        assert!(!called.get());
-        let (mut peer, _) = listener.accept().unwrap();
-        let mut sent = Vec::new();
-        std::io::Read::read_to_end(&mut peer, &mut sent).unwrap();
-        assert!(sent.is_empty());
     }
 }

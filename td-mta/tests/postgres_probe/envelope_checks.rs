@@ -11,7 +11,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     clock::RuntimeClock,
     ports::{Clock, Time},
@@ -20,15 +19,9 @@ use td_mta::{
     queue_clock::Guard,
 };
 
-pub(super) fn exercise(
-    fixture: &Fixture,
-    request: &Request<'_>,
-    trust: &TrustStore,
-    value: &Dispatch,
-) {
+pub(super) fn exercise(fixture: &Fixture, request: &Request<'_>, value: &Dispatch) {
     let runtime = Request {
-        address: request.address,
-        server_name: request.server_name,
+        socket: request.socket,
         user: "mail_runtime",
         database: request.database,
         password: super::PASSWORD,
@@ -50,15 +43,7 @@ pub(super) fn exercise(
     ));
     let open = || {
         quiet(fixture);
-        EnvelopeChecks::open(
-            request,
-            trust,
-            deadline(),
-            value,
-            clock.clone(),
-            guard.clone(),
-        )
-        .unwrap()
+        EnvelopeChecks::open(request, deadline(), value, clock.clone(), guard.clone()).unwrap()
     };
     let mut checks = open();
     let (first, limit) = checks.check().unwrap();
@@ -182,7 +167,7 @@ pub(super) fn exercise(
     quiet(fixture);
     let cap = Instant::now() + Duration::from_secs(1);
     let mut checks =
-        EnvelopeChecks::open(request, trust, cap, value, clock.clone(), guard.clone()).unwrap();
+        EnvelopeChecks::open(request, cap, value, clock.clone(), guard.clone()).unwrap();
     assert!(checks.check().unwrap().1 <= cap);
     thread::sleep(cap.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
     let failure = checks.check().unwrap_err();
@@ -202,7 +187,7 @@ pub(super) fn exercise(
         proceed: Mutex::new(resume),
     });
     let mut checks =
-        EnvelopeChecks::open(request, trust, deadline(), value, clock.clone(), guard).unwrap();
+        EnvelopeChecks::open(request, deadline(), value, clock.clone(), guard).unwrap();
     let pid = backend(fixture);
     thread::scope(|scope| {
         let kill_pid = pid.clone();

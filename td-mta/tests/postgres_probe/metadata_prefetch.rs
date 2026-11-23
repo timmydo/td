@@ -1,5 +1,4 @@
 use super::{body_checks, deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::EmailId, postgres_probe::Request, postgres_read as read, postgres_runtime_profile::Binding,
 };
@@ -7,7 +6,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     password: &[u8],
     emails: [EmailId; 2],
@@ -22,7 +20,7 @@ pub(super) fn exercise(
     let offset = std::fs::metadata(fixture.root.join("server.log"))
         .unwrap()
         .len() as usize;
-    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    read::with_snapshot(request, deadline(), binding, password, |view| {
         let mut ids = vec![emails[1], emails[0], emails[1]];
         for n in 0..13 {
             let mut bytes = [0xed; 16];
@@ -99,7 +97,7 @@ pub(super) fn exercise(
     sql(fixture, "SELECT pg_reload_conf()");
 
     sql(fixture, &format!("INSERT INTO td_mta.keywords(account,email_id,keyword,changed) SELECT account,id,'prefetch-' || n,changed FROM td_mta.emails CROSS JOIN generate_series(1,9) n WHERE id=decode('{}','hex')", emails[0]));
-    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    read::with_snapshot(request, deadline(), binding, password, |view| {
         let expected = view.keywords(emails[0], None, 256)?.values;
         assert!(expected.len() > 8);
         view.prefetch_values(&emails, true, true)?;
@@ -128,9 +126,9 @@ pub(super) fn exercise(
     .unwrap();
     sql(fixture, &format!("DELETE FROM td_mta.keywords WHERE email_id=decode('{}','hex') AND keyword LIKE 'prefetch-%'", emails[0]));
 
-    maximum_prefix_request(fixture, request, trust, binding, password, emails[0]);
+    maximum_prefix_request(fixture, request, binding, password, emails[0]);
 
-    let failure = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    let failure = read::with_snapshot(request, deadline(), binding, password, |view| {
         assert_eq!(
             view.prefetch_metadata(&[emails[0]; 17]),
             Err(read::Error::Capacity)
@@ -144,7 +142,6 @@ pub(super) fn exercise(
 fn maximum_prefix_request(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     password: &[u8],
     source: EmailId,
@@ -157,7 +154,7 @@ fn maximum_prefix_request(
             EmailId::from_bytes(bytes)
         })
         .collect();
-    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    read::with_snapshot(request, deadline(), binding, password, |view| {
         for ids in ids.chunks(td_mta::postgres_body::MAX_METADATA_IDS) {
             view.prefetch_metadata(ids)?;
             view.prefetch_values(ids, true, true)?;

@@ -12,7 +12,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &td_mta::postgres_probe::Request<'_>,
-    trust: &td_crypto::TrustStore,
     profile: &PublishedProfile,
 ) {
     let a = AccountId::from_bytes([0xaa; 16]);
@@ -64,7 +63,7 @@ pub(super) fn exercise(
     };
     let first = prepare();
     assert_eq!(first.count(), 2);
-    let left = receiving::publish_fanout(request, trust, deadline(), &first).unwrap();
+    let left = receiving::publish_fanout(request, deadline(), &first).unwrap();
     assert_eq!(
         left.accounts
             .iter()
@@ -89,7 +88,7 @@ pub(super) fn exercise(
     let fresh = prepare();
     sql(fixture, "UPDATE td_mta.mailboxes SET role=NULL WHERE account=decode(repeat('cc',16),'hex') AND role='inbox'");
     assert_eq!(
-        receiving::publish_fanout(request, trust, deadline(), &fresh),
+        receiving::publish_fanout(request, deadline(), &fresh),
         Err(receiving::Error::MissingMailbox)
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
@@ -116,7 +115,7 @@ pub(super) fn exercise(
     let real_a = fill("aa");
     let real_b = fill("cc");
     assert_eq!(
-        receiving::publish_fanout(request, trust, deadline(), &fresh),
+        receiving::publish_fanout(request, deadline(), &fresh),
         Err(receiving::Error::Quota)
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
@@ -124,7 +123,7 @@ pub(super) fn exercise(
     unfill("aa", real_a);
     // One full account takes a compact local notice; the other the message.
     let partial = prepare();
-    let outcome = receiving::publish_fanout(request, trust, deadline(), &partial).unwrap();
+    let outcome = receiving::publish_fanout(request, deadline(), &partial).unwrap();
     assert_eq!(
         outcome
             .accounts
@@ -157,7 +156,6 @@ pub(super) fn exercise(
     assert_eq!(
         receiving::publish_fanout(
             request,
-            trust,
             std::time::Instant::now() + std::time::Duration::from_secs(3),
             &fresh
         ),
@@ -201,7 +199,6 @@ pub(super) fn exercise(
     assert_eq!(
         receiving::publish_fanout(
             request,
-            trust,
             std::time::Instant::now() + std::time::Duration::from_secs(10),
             &large
         )

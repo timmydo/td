@@ -1,5 +1,5 @@
 //! Bounded historical diagnostics; never delivery or repair authority.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -56,10 +56,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    let result = with_addresses(&loaded, |request, deadline| {
+    let result = with_connection(&loaded, |request, deadline| {
         postgres_logs::inspect(
             request,
-            &loaded.trust,
             deadline,
             options.epoch,
             options.before,
@@ -101,7 +100,6 @@ fn classify(error: postgres_logs::Error) -> AttemptError {
             return AttemptError::from(postgres_schema::Error::Connection(error))
         }
         Error::Schema(error) => return AttemptError::from(error),
-        Error::Resolution => "resolution-failed",
         Error::Epoch => "epoch-mismatch",
         Error::Invalid => "invalid-request",
         Error::Database => "query-failed",

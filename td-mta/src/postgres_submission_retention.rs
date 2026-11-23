@@ -8,7 +8,6 @@ use crate::{
     queue_clock::RetentionTime,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 /// QUEUE.md: completed records stay 30 days after completion.
 pub const RETENTION_MS: i64 = 30 * 86_400_000;
@@ -47,7 +46,6 @@ impl Step {
     pub fn run(
         self,
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         claim: &Claim,
         generation: u64,
@@ -55,7 +53,7 @@ impl Step {
     ) -> Result<u64, Error> {
         let stable_at = stable_at.into();
         let claim = claim.clone();
-        postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+        postgres_probe::with_mutation_client(request, deadline, move |client| {
             let now = lock(client, &claim, generation, stable_at)?;
             let account = claim.binding().account();
             let account = account.as_bytes().as_slice();

@@ -5,13 +5,11 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{ids::AttemptId, postgres_attempt_phases as phases, postgres_probe::Request};
 
 pub(super) fn receipt_race(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     attempt: AttemptId,
     change: &phases::Change,
 ) {
@@ -40,8 +38,7 @@ pub(super) fn receipt_race(
         thread::sleep(Duration::from_millis(10));
     }
     thread::scope(|scope| {
-        let writer =
-            scope.spawn(|| phases::publish_new_possible(request, trust, deadline(), change));
+        let writer = scope.spawn(|| phases::publish_new_possible(request, deadline(), change));
         let stop = deadline();
         while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock' AND query LIKE 'SELECT generation,version_id FROM td_mta.config_selection%'") != "1" {
             assert!(Instant::now() < stop, "new publication did not reach policy barrier");
@@ -72,7 +69,6 @@ pub(super) fn receipt_race(
 pub(super) fn live_state(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     attempt: AttemptId,
     change: &phases::Change,
     body: bool,
@@ -107,58 +103,26 @@ pub(super) fn live_state(
         phases::check_current_body
     };
     assert_eq!(
-        wrong(
-            request,
-            trust,
-            deadline(),
-            change,
-            clock.clone(),
-            guard.clone()
-        ),
+        wrong(request, deadline(), change, clock.clone(), guard.clone()),
         Err(phases::Error::Integrity)
     );
-    let check = || {
-        current(
-            request,
-            trust,
-            deadline(),
-            change,
-            clock.clone(),
-            guard.clone(),
-        )
-    };
+    let check = || current(request, deadline(), change, clock.clone(), guard.clone());
     let sequence = sql(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
     );
-    super::attempt_clock::current(fixture, request, trust, change, body).unwrap();
+    super::attempt_clock::current(fixture, request, change, body).unwrap();
     let limit = check().unwrap();
     if body {
         let runtime = Request {
-            address: request.address,
-            server_name: request.server_name,
+            socket: request.socket,
             user: "mail_runtime",
             database: request.database,
             password: super::PASSWORD,
             mode: td_mta::postgres_probe::Mode::Runtime,
         };
-        current(
-            &runtime,
-            trust,
-            deadline(),
-            change,
-            clock.clone(),
-            guard.clone(),
-        )
-        .unwrap();
-        super::body_checks::exercise(
-            fixture,
-            &runtime,
-            trust,
-            change,
-            clock.clone(),
-            guard.clone(),
-        );
+        current(&runtime, deadline(), change, clock.clone(), guard.clone()).unwrap();
+        super::body_checks::exercise(fixture, &runtime, change, clock.clone(), guard.clone());
     }
     assert!(limit > Instant::now());
     assert!(limit <= deadline());

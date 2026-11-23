@@ -1,6 +1,5 @@
 use super::{deadline, sql, Fixture};
 use std::sync::Arc;
-use td_crypto::TrustStore;
 use td_json::json;
 use td_mta::{
     format::Sequence,
@@ -52,7 +51,6 @@ pub(super) fn exercise(
     page: &MetadataPage,
     email: EmailId,
 ) {
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let runtime = Request {
         user: "mail_runtime",
         mode: Mode::Runtime,
@@ -61,7 +59,6 @@ pub(super) fn exercise(
     let open = || {
         Publisher::open(
             &runtime,
-            &trust,
             deadline(),
             local,
             Source::new(source.origin(), source.epoch()).unwrap(),

@@ -10,16 +10,15 @@
     clippy::indexing_slicing
 )]
 
-use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use td_postgres::{
-    connect_tls, connect_unix, connect_unix_through, Array, Client, CommitError, Config, Error,
-    Limits, Severity, Socket, SqlState, Stream, StreamError, TlsConnect, TransactionStatus,
+    connect_unix, connect_unix_through, Array, Client, CommitError, Config, Error, Limits,
+    Severity, Socket, SqlState, Stream, StreamError, TransactionStatus,
 };
 
 const PASSWORD: &str = "td-postgres-fixture-0123456789abcdef";
@@ -77,16 +76,12 @@ impl Server {
             data.join("pg_hba.conf"),
             "local all td scram-sha-256\n\
              local all cleartext password\n\
-             local all trusted trust\n\
-             host all td 127.0.0.1/32 scram-sha-256\n",
+             local all trusted trust\n",
         )
         .unwrap();
-        // A port free now; the race with another process is accepted.
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // The server listens on no TCP address, so the port only names
+        // the socket in the cluster's own directory.
+        let port = 5432;
         // sun_path holds 107 bytes and a NUL; the postmaster refuses more.
         let socket = sockets.join(format!(".s.PGSQL.{port}"));
         assert!(
@@ -101,7 +96,7 @@ impl Server {
             .arg("-k")
             .arg(&sockets)
             .args(["-p", &port.to_string()])
-            .args(["-c", "listen_addresses=127.0.0.1", "-c", "ssl=off"])
+            .args(["-c", "listen_addresses=", "-c", "ssl=off"])
             .args(["-c", "fsync=off", "-c", "unix_socket_permissions=0700"])
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
@@ -118,7 +113,7 @@ impl Server {
         };
         let until = Instant::now() + Duration::from_secs(30);
         loop {
-            if server.socket().exists() && TcpStream::connect(server.address()).is_ok() {
+            if server.socket().exists() {
                 if let Ok(client) = server.connect(&config("td")) {
                     drop(client);
                     break;
@@ -141,10 +136,6 @@ impl Server {
 
     fn socket(&self) -> PathBuf {
         self.sockets.join(format!(".s.PGSQL.{}", self.port))
-    }
-
-    fn address(&self) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], self.port))
     }
 
     fn connect(&self, config: &Config<'_>) -> Result<Client<Socket>, Error> {
@@ -232,7 +223,6 @@ fn code(error: Error) -> String {
 fn real_postgres() {
     let server = Server::start();
     authentication(&server);
-    tls_request(&server);
     wrapped(&server);
     types(&server);
     statements(&server);
@@ -319,33 +309,6 @@ fn authentication(server: &Server) {
         code(server.connect(&config("nobody")).err().unwrap()),
         "28000"
     );
-}
-
-/// A connector that only records that it was asked.
-struct Never(Arc<AtomicBool>);
-
-impl TlsConnect for Never {
-    type Stream = Socket;
-
-    fn connect(self, _: TcpStream, _: Instant) -> Result<Socket, StreamError> {
-        self.0.store(true, Ordering::SeqCst);
-        Err(StreamError::Failed)
-    }
-}
-
-fn tls_request(server: &Server) {
-    // The fixture runs with ssl=off: the server answers N, and there is no
-    // plaintext fallback.
-    let asked = Arc::new(AtomicBool::new(false));
-    let result = connect_tls(
-        server.address(),
-        Never(Arc::clone(&asked)),
-        &config("td"),
-        limits(),
-        soon(),
-    );
-    assert_eq!(result.err(), Some(Error::TlsRefused));
-    assert!(!asked.load(Ordering::SeqCst));
 }
 
 /// A caller's stream around the socket, counting both directions.

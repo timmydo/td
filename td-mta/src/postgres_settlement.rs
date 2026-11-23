@@ -5,12 +5,12 @@ use crate::{
     ids::AccountId,
     ports::{Clock, Error},
     postgres_input::Loaded,
-    postgres_probe::{Endpoint, Mode, Request},
+    postgres_probe::{Mode, Request},
 };
 use std::time::{Duration, Instant};
 
-/// An unreachable pinned endpoint must not hold a write's owner, foreground
-/// slot and worker for its whole deadline before the busy refusal.
+/// An unreachable database must not hold a write's owner, foreground slot
+/// and worker for its whole deadline before the busy refusal.
 const INLINE: Duration = Duration::from_secs(3);
 
 /// Historical evidence can be inspected on a later request, but only during
@@ -20,16 +20,14 @@ const HTTP_INSPECTION_WINDOW: Duration =
 
 pub(crate) struct Retained<T> {
     pub(crate) change: T,
-    pub(crate) endpoint: Endpoint,
     account: AccountId,
     since: Instant,
 }
 
 impl<T> Retained<T> {
-    pub(crate) fn new(change: T, endpoint: Endpoint, account: AccountId) -> Self {
+    pub(crate) fn new(change: T, account: AccountId) -> Self {
         Self {
             change,
-            endpoint,
             account,
             since: Instant::now(),
         }
@@ -83,12 +81,12 @@ pub(crate) fn inline_deadline(write: Instant) -> Result<Instant, Error> {
     Ok(write.min(Instant::now().checked_add(INLINE).ok_or(Error::Invalid)?))
 }
 
-/// A runtime connection request for one endpoint, for publication or for
-/// settlement. An uncertain operation is settled only where its COMMIT went:
-/// POSTGRES.md section 165's absence proof holds on that server alone, so
-/// settlement never resolves again or falls back.
-pub(crate) fn request(loaded: &Loaded, endpoint: Endpoint) -> Request<'_> {
-    let mut connection = loaded.bootstrap.request(endpoint);
+/// A runtime connection request over the bootstrap's socket, for publication
+/// or for settlement. Retained operations live no longer than the bootstrap
+/// they were published through, so settlement inspects the server their
+/// COMMIT went to.
+pub(crate) fn request(loaded: &Loaded) -> Request<'_> {
+    let mut connection = loaded.bootstrap.request();
     connection.mode = Mode::Runtime;
     connection
 }
@@ -101,8 +99,7 @@ mod tests {
     fn fresh_requests_can_release_unresolved_history() {
         let account = AccountId::from_bytes([1; 16]);
         let other = AccountId::from_bytes([2; 16]);
-        let endpoint = Endpoint::Tcp(([127, 0, 0, 1], 5432).into());
-        let new = || Retained::new((), endpoint, account);
+        let new = || Retained::new((), account);
         let held = new();
         let since = held.since;
         let mut slot = Some(held);

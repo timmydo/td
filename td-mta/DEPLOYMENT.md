@@ -426,8 +426,7 @@ privileges](POSTGRES.md#shared-runtime-login-privileges);
 process the schema-owner connection file.
 
 Run the service as a dedicated unprivileged identity. Provision its protected
-connection file, and the database CA for a TLS endpoint, as POSTGRES.md
-specifies. Provision separate private
+connection file as POSTGRES.md specifies. Provision separate private
 mode-0700 runtime and scratch directories owned by that identity, under
 trusted physical ancestors. Each instance owns its own runtime and scratch;
 the shared database owns durable mail, configuration and device credentials.
@@ -677,8 +676,7 @@ password file uses PostgreSQL's `host:port:database:user:password` format,
 escaping colons and backslashes. For a socket connection libpq matches the
 `host` field against the socket directory exactly as `host` names it, and
 also against `localhost` only when that directory is libpq's compiled-in
-default; write the directory there. A network database instead needs
-`sslmode=verify-full` and `sslrootcert`.
+default; write the directory there.
 Do not put the password or the full connection URI in command arguments or
 shell history. Clear conflicting ambient `PG*` variables before using these
 examples; retain only the explicit service selection for the dump:
@@ -703,8 +701,8 @@ release/schema version alongside the archive. `--list` alone checks the
 archive directory, not whether its data can be restored.
 
 Retain protected bootstrap material separately: database login credentials
-for the owner and each service, role/grant provisioning, database TLS trust
-for a network database, the mail listeners' local CA key if used, profile
+for the owner and each service, role/grant provisioning, the mail
+listeners' local CA key if used, profile
 source files, current selection receipts, the td-mail device
 password and its per-account CA configuration, and the matching executable
 release. `pg_dump` does not include cluster roles, server configuration,
@@ -729,8 +727,7 @@ A retained host builder can run the same operation without compiling:
 `/absolute/td-builder install-td-mta --backup ...`. This is host control-plane
 backup orchestration, not a target distribution executable or a database
 restore command. The operator's service selection controls which database is
-backed up; use the owner login over the private socket (or verified TLS for
-a network database).
+backed up; use the owner login over the private socket.
 
 Defaults retain at most 30 completed archives, cap each archive at 1 GiB and
 cap total directory bytes at 8 GiB. Override these with `--retain`,
@@ -988,8 +985,9 @@ loopback TCP with a private TLS leaf, and may run the generated
 that renewal mode, so disable the job in its supervisor and delete its
 generated `td-mta-maint-postgres-tls-renew.service`, `.timer` and `.scm`
 under `PREFIX/share/td-mta/services` before installing a new operations
-helper; the retained older helper still serves it until then. Migrate deliberately, retaining credentials, epochs and mail
-data:
+helper; the retained older helper still serves it until then. td-mta
+refuses a TCP connection file, so migrate before running it, retaining
+credentials, epochs and mail data:
 
 1. Stop the MTA services, scheduled jobs that use the database, then
    PostgreSQL.

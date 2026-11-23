@@ -1,6 +1,5 @@
 use super::{command_output, deadline, sql, Fixture, PASSWORD};
 use std::{fs, os::unix::fs::PermissionsExt};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, StoreEpoch},
     postgres_accounts, postgres_devices as devices,
@@ -12,8 +11,7 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
@@ -21,13 +19,12 @@ fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
     for selected in [account, other] {
         postgres_accounts::publish(
             &fixture.request(),
-            &trust,
             deadline(),
             postgres_accounts::prepare(epoch, selected).unwrap(),
         )
         .unwrap();
     }
-    let list = |selected| devices::list(&fixture.request(), &trust, deadline(), epoch, selected);
+    let list = |selected| devices::list(&fixture.request(), deadline(), epoch, selected);
     assert!(list(account).unwrap().is_empty());
     assert_eq!(
         list(AccountId::from_bytes([3; 16])),
@@ -35,7 +32,7 @@ fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
     );
     let label = "laptop α \"quoted\" \\ path";
     let creation = devices::prepare_creation(epoch, account, label, 10).unwrap();
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &creation).unwrap();
     let expected = devices::DeviceSummary {
         id: creation.device_id(),
         label: label.to_owned(),
@@ -47,7 +44,6 @@ fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
     assert_eq!(
         devices::list(
             &fixture.request(),
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([0; 16]),
             account
@@ -56,7 +52,6 @@ fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
     );
     assert!(devices::list(
         &fixture.request(),
-        &trust,
         std::time::Instant::now(),
         epoch,
         account
@@ -73,21 +68,19 @@ fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
         ..fixture.request()
     };
     assert_eq!(
-        devices::list(&reader, &trust, deadline(), epoch, account).unwrap(),
+        devices::list(&reader, deadline(), epoch, account).unwrap(),
         vec![expected.clone()]
     );
 
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://device_metadata:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://device_metadata:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -148,7 +141,7 @@ fn real_postgres_device_listing_excludes_verifiers_and_refuses_overflow() {
     assert!(refused.contains("invalid-arguments"));
     assert!(!refused.contains("not-for-output"));
     let revoked = devices::prepare_revocation(epoch, account, creation.device_id(), 20).unwrap();
-    devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoked).unwrap();
+    devices::publish_revocation(&fixture.request(), deadline(), &revoked).unwrap();
     // The database dates the revocation; the requested 20 stays in its digest.
     let listed = list(account).unwrap();
     let revoked_at = listed[0].revoked_at.unwrap();

@@ -3,7 +3,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     generations::GenerationSet,
     ids::{BootId, SubmissionId},
@@ -18,25 +17,23 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     submission: SubmissionId,
 ) {
     let old = owners::prepare(binding, BootId::from_bytes([88; 16])).unwrap();
-    let owner = owners::acquire(request, trust, deadline(), &old).unwrap();
+    let owner = owners::acquire(request, deadline(), &old).unwrap();
     assert_eq!(
         repair::publish(
             request,
-            trust,
             deadline(),
             &repair::prepare(&old, owner.generation).unwrap()
         ),
         Err(Error::RepairRequired)
     );
-    owners::release(request, trust, deadline(), &old, owner.generation).unwrap();
+    owners::release(request, deadline(), &old, owner.generation).unwrap();
     // Explicitly reselect validated configuration, then resolve a fresh profile.
     let admin = fixture.request();
-    let (selected, candidate) = selection::read(&admin, trust, deadline(), binding.epoch())
+    let (selected, candidate) = selection::read(&admin, deadline(), binding.epoch())
         .unwrap()
         .unwrap();
     let change = selection::prepare(
@@ -46,12 +43,11 @@ pub(super) fn exercise(
         &candidate,
     )
     .unwrap();
-    let new = selection::publish(&admin, trust, deadline(), change).unwrap();
+    let new = selection::publish(&admin, deadline(), change).unwrap();
     assert!(new.generation > selected.generation);
     let domain = GenerationSet::<TlsPolicies>::at_startup();
     let loaded = runtime::load(
         request,
-        trust,
         deadline(),
         binding.epoch(),
         binding.profile(),
@@ -59,16 +55,12 @@ pub(super) fn exercise(
     )
     .unwrap();
     let claim = owners::prepare(loaded.binding(), BootId::from_bytes([89; 16])).unwrap();
-    let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    let grant = owners::acquire(request, deadline(), &claim).unwrap();
     let value = repair::prepare(&claim, grant.generation).unwrap();
-    assert_eq!(
-        repair::inspect(request, trust, deadline(), &value).unwrap(),
-        None
-    );
+    assert_eq!(repair::inspect(request, deadline(), &value).unwrap(), None);
     assert_eq!(
         repair::publish(
             request,
-            trust,
             deadline(),
             &repair::prepare(&claim, grant.generation + 1).unwrap()
         ),
@@ -78,7 +70,6 @@ pub(super) fn exercise(
         super::attempt_clock::publish(
             fixture,
             request,
-            trust,
             deadline(),
             &attempts::retry(&claim, grant.generation, submission).unwrap()
         ),
@@ -99,7 +90,7 @@ pub(super) fn exercise(
         "UPDATE td_mta.route_health SET revision=decode(repeat('ff',8),'hex')",
     );
     assert_eq!(
-        repair::publish(request, trust, deadline(), &value),
+        repair::publish(request, deadline(), &value),
         Err(Error::Capacity)
     );
     sql(
@@ -118,7 +109,7 @@ pub(super) fn exercise(
     sql(fixture, "INSERT INTO td_mta.route_health_receipts SELECT h.account,decode(md5(h.route_name||':'||i),'hex'),h.destination,h.route_name,h.destination,2,int8send(i::bigint),int8send(i::bigint+1),h.failure_count,h.reason,h.failed_at,h.next_at,NULL FROM td_mta.route_health h CROSS JOIN generate_series(1,4) i WHERE h.route_name LIKE 'reserved-%' AND NOT(h.route_name='reserved-255' AND i=4)");
     sql(fixture,"CREATE FUNCTION public.reject_repair() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action=2 THEN RAISE EXCEPTION 'fixture refusal'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_repair BEFORE INSERT ON td_mta.route_health_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_repair()");
     assert_eq!(
-        repair::publish(request, trust, deadline(), &value),
+        repair::publish(request, deadline(), &value),
         Err(Error::Capacity)
     );
     sql(fixture, &format!("UPDATE td_mta.submission_attempts a SET active=false,owner_boot=f.owner_boot,owner_operation=f.owner_operation,generation=f.generation FROM public.saved_fence f WHERE a.attempt_id=f.attempt_id AND a.attempt_id=decode('{active}','hex'); DROP TABLE public.saved_fence"));
@@ -126,7 +117,7 @@ pub(super) fn exercise(
     // its retired receipt cannot require capacity from the current owner.
     sql(fixture, &format!("INSERT INTO td_mta.attempt_acceptance_receipts SELECT account,attempt_id,4,request_digest,1,old_sequence,new_sequence FROM td_mta.submission_attempts WHERE attempt_id=decode('{active}','hex')"));
     assert_eq!(
-        repair::publish(request, trust, deadline(), &value),
+        repair::publish(request, deadline(), &value),
         Err(Error::Database)
     );
     // A still-owned acceptance on a different route occupies the last slot.
@@ -145,18 +136,18 @@ pub(super) fn exercise(
         int8send(1::bigint),int8send(2::bigint),0,0,NULL,NULL,NULL FROM td_mta.submission_attempts WHERE route_name='sibling'";
     sql(fixture, reset);
     assert_eq!(
-        repair::publish(request, trust, deadline(), &value),
+        repair::publish(request, deadline(), &value),
         Err(Error::Capacity)
     );
     sql(fixture, "UPDATE td_mta.submission_attempts SET prepared_at=prepared_at-3600000 WHERE route_name='sibling';
         DELETE FROM td_mta.route_health_receipts WHERE route_name='sibling'");
     assert_eq!(
-        repair::publish(request, trust, deadline(), &value),
+        repair::publish(request, deadline(), &value),
         Err(Error::Capacity)
     );
     sql(fixture, reset);
     assert_eq!(
-        repair::publish(request, trust, deadline(), &value),
+        repair::publish(request, deadline(), &value),
         Err(Error::Database)
     );
     // The injected repair refusal rolled back its reclaim. Maintenance commits it independently.
@@ -174,7 +165,7 @@ pub(super) fn exercise(
     .parse()
     .unwrap();
     let reclaimed = td_mta::postgres_submission_retention::Step::IdleAttempts
-        .run(request, trust, deadline(), &claim, grant.generation, now)
+        .run(request, deadline(), &claim, grant.generation, now)
         .unwrap();
     assert!(
         reclaimed > 0,
@@ -206,14 +197,13 @@ pub(super) fn exercise(
     assert_eq!(
         repair::publish(
             request,
-            trust,
             Instant::now() + Duration::from_millis(1500),
             &value
         ),
         Err(Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
-    let outcome = repair::publish(request, trust, deadline(), &value).unwrap();
+    let outcome = repair::publish(request, deadline(), &value).unwrap();
     // Six older repairs of this destination were seeded: the sweep keeps the
     // newest four of them, and this repair adds its own.
     assert_eq!(
@@ -242,7 +232,6 @@ pub(super) fn exercise(
         super::attempt_clock::publish(
             fixture,
             request,
-            trust,
             deadline(),
             &attempts::retry(&claim, grant.generation, submission).unwrap()
         ),
@@ -251,19 +240,18 @@ pub(super) fn exercise(
     assert_eq!(
         repair::publish(
             request,
-            trust,
             deadline(),
             &repair::prepare(&claim, grant.generation).unwrap()
         ),
         Err(Error::Conflict)
     );
     assert_eq!(
-        repair::inspect(request, trust, deadline(), &value).unwrap(),
+        repair::inspect(request, deadline(), &value).unwrap(),
         Some(outcome)
     );
-    owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+    owners::release(request, deadline(), &claim, grant.generation).unwrap();
     assert_eq!(
-        repair::publish(request, trust, deadline(), &value).unwrap(),
+        repair::publish(request, deadline(), &value).unwrap(),
         outcome
     );
     sql(
@@ -281,15 +269,15 @@ pub(super) fn exercise(
             change.operation(), selected.generation
         ),
     );
-    selection_retention(fixture, trust, binding);
+    selection_retention(fixture, binding);
 }
 
 /// Publication keeps the receipts of the latest RETAINED_GENERATIONS
 /// selections; an older retained request reports Expired, never absence.
-fn selection_retention(fixture: &Fixture, trust: &TrustStore, binding: &Binding) {
+fn selection_retention(fixture: &Fixture, binding: &Binding) {
     sql(fixture, "CREATE TABLE public.retain_selection AS TABLE td_mta.config_selection; CREATE TABLE public.retain_receipts AS TABLE td_mta.config_selection_receipts");
     let admin = fixture.request();
-    let (selected, candidate) = selection::read(&admin, trust, deadline(), binding.epoch())
+    let (selected, candidate) = selection::read(&admin, deadline(), binding.epoch())
         .unwrap()
         .unwrap();
     let mut changes = Vec::new();
@@ -297,7 +285,7 @@ fn selection_retention(fixture: &Fixture, trust: &TrustStore, binding: &Binding)
     for _ in 0..=selection::RETAINED_GENERATIONS {
         let change =
             selection::prepare(binding.epoch(), generation, selected.version, &candidate).unwrap();
-        generation = selection::publish(&admin, trust, deadline(), change)
+        generation = selection::publish(&admin, deadline(), change)
             .unwrap()
             .generation;
         changes.push(change);
@@ -311,16 +299,16 @@ fn selection_retention(fixture: &Fixture, trust: &TrustStore, binding: &Binding)
     );
     let oldest = *changes.first().unwrap();
     assert_eq!(
-        selection::inspect(&admin, trust, deadline(), oldest),
+        selection::inspect(&admin, deadline(), oldest),
         Err(selection::Error::Expired)
     );
     assert_eq!(
-        selection::publish(&admin, trust, deadline(), oldest),
+        selection::publish(&admin, deadline(), oldest),
         Err(selection::Error::Expired)
     );
     // The latest RETAINED_GENERATIONS selections still resolve.
     let kept = *changes.get(1).unwrap();
-    assert!(selection::inspect(&admin, trust, deadline(), kept)
+    assert!(selection::inspect(&admin, deadline(), kept)
         .unwrap()
         .is_some());
     sql(fixture, "DELETE FROM td_mta.config_selection_receipts; INSERT INTO td_mta.config_selection_receipts SELECT * FROM public.retain_receipts; DELETE FROM td_mta.config_selection; INSERT INTO td_mta.config_selection SELECT * FROM public.retain_selection; DROP TABLE public.retain_selection, public.retain_receipts");

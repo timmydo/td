@@ -3,7 +3,6 @@
 //! and the next publication of that family deletes only its own account's
 //! expired ones. Ages are literals, so a longer retention fails here.
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{ids::StoreEpoch, postgres_probe::Request};
 
 const NOW: &str = "(extract(epoch FROM clock_timestamp())*1000)::bigint";
@@ -69,14 +68,13 @@ pub(super) fn fill(fixture: &Fixture, table: &str, account: &str) {
 pub(super) fn expire(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     epoch: StoreEpoch,
     table: &str,
     account: &str,
 ) {
     let stamp = stamp(table);
     sql(fixture, &format!("UPDATE td_mta.{table} SET {stamp}={stamp}-61000 WHERE request_digest=decode(repeat('00',32),'hex'); INSERT INTO td_mta.accounts VALUES({OTHER},decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex')); INSERT INTO td_mta.account_usage VALUES({OTHER},0,0,0,0,0); CREATE TEMP TABLE kept AS SELECT * FROM td_mta.{table} WHERE request_digest=decode(repeat('00',32),'hex') LIMIT 2; UPDATE kept SET operation=decode(repeat('11',16),'hex'),request_digest=decode(repeat('11',32),'hex'),{stamp}={NOW}-30000 WHERE operation=(SELECT operation FROM kept ORDER BY operation LIMIT 1); UPDATE kept SET account={OTHER},request_digest=decode(repeat('22',32),'hex') WHERE request_digest=decode(repeat('00',32),'hex'); INSERT INTO td_mta.{table} SELECT * FROM kept"));
-    let capacity = td_mta::postgres_capacity::inspect(request, trust, deadline(), epoch).unwrap();
+    let capacity = td_mta::postgres_capacity::inspect(request, deadline(), epoch).unwrap();
     let used = capacity
         .get("metrics")
         .unwrap()

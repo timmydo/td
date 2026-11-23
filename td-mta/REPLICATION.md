@@ -553,7 +553,7 @@ reset and completeness qualification remain subsequent work.
 ### Bounded copy steps
 
 The copy worker binds one source, account, distinct local epoch and immutable
-local connection/trust references at construction. Changing the local endpoint
+local connection reference at construction. Changing the local socket
 or credentials requires a new worker; a cached publisher cannot outlive that
 configuration binding. Each step
 reloads durable progress through the restricted runtime publisher, authenticates
@@ -659,9 +659,9 @@ to 60 seconds and the existing per-job limits. JSON lines report successful
 steps; the publisher is retired before each potentially blocking output write.
 The timeout bounds copy work, not a blocked host stdout consumer. A later error
 exits nonzero and leaves earlier committed progress intact.
-Read-only inspection and initial owner preflights may try the next resolved
-local address on connection failure. Copy errors and post-publication errors
-never replay against another address. The bounded command has no background loop, automatic
+Each operation connects once over the local socket; a connection failure
+ends the command, and no copy or post-publication error is replayed. The
+bounded command has no background loop, automatic
 history reset or binding replacement; supervised copying is described below. The runtime login must have the restricted
 replica grants; the ordinary primary login remains ineligible. The fresh local installer provisions separate publisher and reader roles.
 

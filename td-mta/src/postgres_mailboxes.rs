@@ -13,7 +13,6 @@ use crate::{
     postgres_schema,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 pub const MAX_MAILBOXES: usize = 256;
 
@@ -95,14 +94,13 @@ FROM selected b LEFT JOIN counts c ON c.mailbox_id=b.id ORDER BY b.id";
 /// expiry. Callers must separately admit the selected configuration and role.
 pub fn list(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
     password: &[u8],
 ) -> Result<Listing, Error> {
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mailbox_client(request, deadline, move |client| {
             let schema = client.inspect_schema().map_err(Error::Schema)?;
             if schema.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;

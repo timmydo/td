@@ -1,5 +1,5 @@
 //! Explicit historical canonical metadata inspection with caller bounds.
-use super::{account, audit::unsigned, report_error, with_addresses_timeout, AttemptError};
+use super::{account, audit::unsigned, report_error, with_connection_timeout, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -73,10 +73,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
         report_error(COMMAND, "clock", "invalid-time")?;
         return Ok(ExitCode::FAILURE);
     };
-    let result = with_addresses_timeout(&loaded, options.timeout, |request, deadline| {
+    let result = with_connection_timeout(&loaded, options.timeout, |request, deadline| {
         audit::inspect(
             request,
-            &loaded.trust,
             deadline,
             options.account.epoch,
             options.account.account,

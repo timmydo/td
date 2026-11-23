@@ -3,7 +3,7 @@ use std::{
     sync::RwLock,
     time::{Duration, Instant},
 };
-use td_crypto::{Crypto, Provider, TrustStore};
+use td_crypto::{Crypto, Provider};
 use td_mta::{
     acme::{
         challenge::Current,
@@ -18,8 +18,7 @@ use td_mta::{
 #[ignore = "real PostgreSQL 17 tools and private trusted TMPDIR required"]
 pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     super::rewind_email_order(&fixture);
@@ -28,7 +27,7 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
         "ALTER TABLE td_mta.flag_receipts DROP COLUMN created_at; ALTER TABLE td_mta.mailbox_create_receipts DROP COLUMN created_at; ALTER TABLE td_mta.submission_cancel_receipts DROP COLUMN created_at; DROP INDEX td_mta.blob_search_candidates; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DROP TABLE td_mta.replica_email_receipts,td_mta.replica_blob_identities,td_mta.replica_accounts,td_mta.replica_progress,td_mta.replica_pending,td_mta.replica_mailbox_receipts,td_mta.replica_source,td_mta.blob_search,td_mta.blob_interpretations,td_mta.blob_summaries,td_mta.acme_profiles; DELETE FROM td_mta.schema_migrations WHERE version>=30",
     );
     sql(&fixture, include_str!("../../src/postgres_receiving.sql"));
-    let upgraded = postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap();
+    let upgraded = postgres_schema::upgrade(&fixture.request(), deadline()).unwrap();
     assert_eq!(upgraded.version, postgres_schema::VERSION);
     assert_eq!(upgraded.store_epoch, epoch);
     create_runtime_login(&fixture);
@@ -41,7 +40,6 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     let claim = |owner, settings| {
         acme::claim(
             &request,
-            &trust,
             deadline(),
             epoch,
             Claim {
@@ -63,7 +61,6 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     });
     let mut writer = Writer {
         request: &request,
-        trust: &trust,
         epoch,
         profile: "public",
         owner: [1; 16],
@@ -80,7 +77,7 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     writer
         .save(&state, Some((&chain, state.certificate_key.as_bytes())))
         .unwrap();
-    let pair = acme::active(&request, &trust, deadline(), epoch, "public").unwrap();
+    let pair = acme::active(&request, deadline(), epoch, "public").unwrap();
     assert_eq!(pair.generation, 1);
     assert_eq!(pair.chain, chain);
     assert_eq!(pair.key, state.certificate_key.as_bytes());
@@ -91,7 +88,7 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
         )
         .is_err());
     assert_eq!(
-        acme::active(&request, &trust, deadline(), epoch, "public")
+        acme::active(&request, deadline(), epoch, "public")
             .unwrap()
             .generation,
         1
@@ -105,12 +102,11 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     );
     let next = claim([3; 16], [2; 32]).unwrap();
     assert!(next.revision > newer.revision);
-    let old = acme::active(&request, &trust, deadline(), epoch, "public").unwrap();
+    let old = acme::active(&request, deadline(), epoch, "public").unwrap();
     assert_eq!(old.key, pair.key);
     for index in 1..16 {
         acme::claim(
             &request,
-            &trust,
             deadline(),
             epoch,
             Claim {
@@ -124,7 +120,6 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
     }
     assert!(acme::claim(
         &request,
-        &trust,
         deadline(),
         epoch,
         Claim {
@@ -163,7 +158,6 @@ pub(super) fn renew_fixture_pair(fixture: &Fixture) -> Vec<u8> {
     let key = Provider.load_p256(&raw[..size]).unwrap();
     let (chain, ca) = issue(&key);
     publish_pair(
-        fixture,
         fixture.request(),
         &chain,
         &certificate::pem("PRIVATE KEY", &raw[..size]),
@@ -181,17 +175,11 @@ pub(super) fn publish_fixture_pair_as(
 ) {
     let chain = std::fs::read(fixture.root.join("server.crt")).unwrap();
     let key = std::fs::read(fixture.root.join("server.key")).unwrap();
-    publish_pair(fixture, request, &chain, &key);
+    publish_pair(request, &chain, &key);
 }
 
-fn publish_pair(
-    fixture: &Fixture,
-    request: td_mta::postgres_probe::Request<'_>,
-    chain: &[u8],
-    key: &[u8],
-) {
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::inspect(&request, &trust, deadline())
+fn publish_pair(request: td_mta::postgres_probe::Request<'_>, chain: &[u8], key: &[u8]) {
+    let epoch = postgres_schema::inspect(&request, deadline())
         .unwrap()
         .store_epoch;
     let settings = td_mta::acme::order::Settings {
@@ -201,7 +189,6 @@ fn publish_pair(
     };
     let lease = acme::claim(
         &request,
-        &trust,
         deadline(),
         epoch,
         Claim {
@@ -220,7 +207,6 @@ fn publish_pair(
     });
     let mut writer = Writer {
         request: &request,
-        trust: &trust,
         epoch,
         profile: "public",
         owner: [90; 16],

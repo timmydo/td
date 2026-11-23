@@ -1,7 +1,7 @@
 use super::imports::{email, folder, write};
 use super::{deadline, sql, Fixture};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
-use td_crypto::{Digest, Sha256, TrustStore};
+use td_crypto::{Digest, Sha256};
 use td_json::{json, Json};
 use td_mta::{
     ids::{AccountId, StoreEpoch},
@@ -15,22 +15,16 @@ fn state(fixture: &Fixture) -> String {
         "SELECT encode(sequence,'hex'),body_bytes,blob_count,(SELECT count(*) FROM td_mta.imports),(SELECT count(*) FROM td_mta.changes) FROM td_mta.accounts JOIN td_mta.account_usage ON account=id",
     )
 }
-pub fn exercise(
-    fixture: &Fixture,
-    request: &Request<'_>,
-    trust: &TrustStore,
-    epoch: StoreEpoch,
-    connection: &Path,
-) {
+pub fn exercise(fixture: &Fixture, request: &Request<'_>, epoch: StoreEpoch, connection: &Path) {
     let account = AccountId::from_bytes([0xaa; 16]);
-    let authority = db::prepare(request, trust, deadline(), epoch, account).unwrap();
+    let authority = db::prepare(request, deadline(), epoch, account).unwrap();
     let folders = vec![
         folder("inbox", "Inbox", None, Some("inbox")),
         folder("child", "Nested", Some(b"inbox"), None),
     ];
     for value in &folders {
         assert!(
-            db::publish_unmapped_mailbox(request, trust, deadline(), &authority, value, &folders)
+            db::publish_unmapped_mailbox(request, deadline(), &authority, value, &folders)
                 .unwrap()
                 .recorded
         );
@@ -39,24 +33,17 @@ pub fn exercise(
     let old = email("old", body, &["$seen"]);
     let gone = email("gone", body, &["$seen"]);
     for value in [&old, &gone] {
-        db::publish_email(request, trust, deadline(), &authority, value, body).unwrap();
+        db::publish_email(request, deadline(), &authority, value, body).unwrap();
     }
     let changed = email("old", body, &["$flagged"]);
     assert_eq!(
-        db::publish_email(request, trust, deadline(), &authority, &changed, body),
+        db::publish_email(request, deadline(), &authority, &changed, body),
         Err(db::Error::SourceChanged)
     );
     let before = state(fixture);
-    let skipped = db::publish_unmapped_email(
-        request,
-        trust,
-        deadline(),
-        &authority,
-        &changed,
-        b"",
-        &folders,
-    )
-    .unwrap();
+    let skipped =
+        db::publish_unmapped_email(request, deadline(), &authority, &changed, b"", &folders)
+            .unwrap();
     assert!(!skipped.recorded && !skipped.created && skipped.present);
     assert_eq!(before, state(fixture));
     sql(
@@ -67,7 +54,6 @@ pub fn exercise(
     let before = state(fixture);
     let skipped = db::publish_unmapped_email(
         request,
-        trust,
         deadline(),
         &authority,
         &changed_gone,
@@ -85,26 +71,19 @@ pub fn exercise(
     );
     let before = state(fixture);
     assert_eq!(
-        db::publish_unmapped_email(request, trust, deadline(), &authority, &new, body, &folders),
+        db::publish_unmapped_email(request, deadline(), &authority, &new, body, &folders),
         Err(db::Error::Conflict)
     );
     assert_eq!(
-        db::publish_unmapped_mailbox(request, trust, deadline(), &authority, &child, &folders),
+        db::publish_unmapped_mailbox(request, deadline(), &authority, &child, &folders),
         Err(db::Error::Conflict)
     );
     assert_eq!(before, state(fixture));
     // Mapped folders are skips, but they cannot authorize dependent creation.
     assert!(
-        !db::publish_unmapped_mailbox(
-            request,
-            trust,
-            deadline(),
-            &authority,
-            &folders[1],
-            &folders
-        )
-        .unwrap()
-        .recorded
+        !db::publish_unmapped_mailbox(request, deadline(), &authority, &folders[1], &folders)
+            .unwrap()
+            .recorded
     );
     sql(
         fixture,
@@ -113,7 +92,6 @@ pub fn exercise(
     assert!(
         !db::publish_unmapped_mailbox(
             request,
-            trust,
             deadline(),
             &authority,
             &folder("child", "Source rename", Some(b"inbox"), None),
@@ -127,11 +105,11 @@ pub fn exercise(
         "UPDATE td_mta.imports SET source_object=convert_to('missing-child','UTF8') WHERE source_object=convert_to('child','UTF8')",
     );
     assert_eq!(
-        db::publish_unmapped_email(request, trust, deadline(), &authority, &new, body, &folders),
+        db::publish_unmapped_email(request, deadline(), &authority, &new, body, &folders),
         Err(db::Error::MissingMailbox)
     );
     assert_eq!(
-        db::publish_unmapped_mailbox(request, trust, deadline(), &authority, &child, &folders),
+        db::publish_unmapped_mailbox(request, deadline(), &authority, &child, &folders),
         Err(db::Error::MissingMailbox)
     );
     sql(
@@ -144,11 +122,11 @@ pub fn exercise(
     );
     let aliased = state(fixture);
     assert_eq!(
-        db::publish_unmapped_email(request, trust, deadline(), &authority, &new, body, &folders),
+        db::publish_unmapped_email(request, deadline(), &authority, &new, body, &folders),
         Err(db::Error::Conflict)
     );
     assert_eq!(
-        db::publish_unmapped_mailbox(request, trust, deadline(), &authority, &child, &folders),
+        db::publish_unmapped_mailbox(request, deadline(), &authority, &child, &folders),
         Err(db::Error::Conflict)
     );
     assert_eq!(aliased, state(fixture));
@@ -161,22 +139,22 @@ pub fn exercise(
         folders[1].clone(),
     ];
     assert_eq!(
-        db::publish_unmapped_email(request, trust, deadline(), &authority, &new, body, &drifted),
+        db::publish_unmapped_email(request, deadline(), &authority, &new, body, &drifted),
         Err(db::Error::Conflict)
     );
     assert_eq!(
-        db::publish_unmapped_mailbox(request, trust, deadline(), &authority, &child, &drifted),
+        db::publish_unmapped_mailbox(request, deadline(), &authority, &child, &drifted),
         Err(db::Error::Conflict)
     );
     assert_eq!(before, state(fixture));
     assert!(
-        db::publish_unmapped_email(request, trust, deadline(), &authority, &new, body, &folders)
+        db::publish_unmapped_email(request, deadline(), &authority, &new, body, &folders)
             .unwrap()
             .recorded
     );
     let after = state(fixture);
     assert!(
-        !db::publish_unmapped_email(request, trust, deadline(), &authority, &new, body, &folders)
+        !db::publish_unmapped_email(request, deadline(), &authority, &new, body, &folders)
             .unwrap()
             .recorded
     );
@@ -184,27 +162,12 @@ pub fn exercise(
     let race = email("race", body, &[]);
     std::thread::scope(|scope| {
         let first = scope.spawn(|| {
-            db::publish_unmapped_email(
-                request,
-                trust,
-                deadline(),
-                &authority,
-                &race,
-                body,
-                &folders,
-            )
-            .unwrap()
+            db::publish_unmapped_email(request, deadline(), &authority, &race, body, &folders)
+                .unwrap()
         });
-        let second = db::publish_unmapped_email(
-            request,
-            trust,
-            deadline(),
-            &authority,
-            &race,
-            body,
-            &folders,
-        )
-        .unwrap();
+        let second =
+            db::publish_unmapped_email(request, deadline(), &authority, &race, body, &folders)
+                .unwrap();
         let first = first.join().unwrap();
         assert_eq!(first.local_object, second.local_object);
         assert_ne!(first.recorded, second.recorded);
@@ -217,19 +180,18 @@ pub fn exercise(
         key("not-mapped", SourceKind::Email),
         key("old", SourceKind::Email),
     ];
-    let outcomes = db::inspect_mappings(request, trust, deadline(), &authority, &keys).unwrap();
+    let outcomes = db::inspect_mappings(request, deadline(), &authority, &keys).unwrap();
     assert!(outcomes[0].unwrap().present);
     assert!(!outcomes[1].unwrap().present);
     assert!(outcomes[2].is_none());
     assert_eq!(outcomes[0], outcomes[3]);
     assert_eq!(
-        db::inspect_mappings(request, trust, deadline(), &authority, &[]),
+        db::inspect_mappings(request, deadline(), &authority, &[]),
         Err(db::Error::Invalid)
     );
     assert_eq!(
         db::inspect_mappings(
             request,
-            trust,
             deadline(),
             &authority,
             &vec![keys[0].clone(); db::MAX_MAPPING_BATCH + 1]
@@ -239,7 +201,6 @@ pub fn exercise(
     assert_eq!(
         db::inspect_mappings(
             request,
-            trust,
             deadline(),
             &authority,
             &[keys[0].clone(), key("inbox", SourceKind::Mailbox)]
@@ -251,7 +212,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_unmapped_email(
             request,
-            trust,
             deadline(),
             &authority,
             &email("blocked", body, &[]),
@@ -267,7 +227,6 @@ pub fn exercise(
     assert_eq!(
         db::publish_unmapped_email(
             request,
-            trust,
             deadline(),
             &authority,
             &email("stale", body, &[]),

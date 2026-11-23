@@ -13,7 +13,6 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::TrustStore;
 
 pub const VERSION: u32 = postgres_search::VERSION as u32;
 pub const MAXIMUM: usize = 16;
@@ -56,7 +55,6 @@ fn key(row: &crate::postgres_probe::Row, account: usize, blob: usize) -> Result<
 /// The continuation follows known COMMIT. Compatible evidence is not audited.
 pub fn run(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     options: Options,
@@ -73,7 +71,7 @@ pub fn run(
     }
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_search_backfill_worker(request, trust, deadline, |worker| {
+    let result = postgres_probe::with_search_backfill_worker(request, deadline, |worker| {
         let (rows, through) = worker.run(move |client| {
             crate::postgres_maintenance::owner(client).map_err(|_| Error::Owner)?;
             let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;

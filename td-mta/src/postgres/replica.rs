@@ -1,5 +1,5 @@
 //! Explicit bounded replica setup, copy and historical status; no listeners.
-use super::{report_error, with_addresses, with_addresses_timeout, AttemptError};
+use super::{report_error, with_connection, with_connection_timeout, AttemptError};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -181,15 +181,9 @@ pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Re
         }
     };
     if op == Operation::Inspect {
-        let result = with_addresses(&loaded, |request, end| {
-            postgres_replica_progress::inspect(
-                request,
-                &loaded.trust,
-                end,
-                options.epoch,
-                options.account,
-            )
-            .map_err(progress_error)
+        let result = with_connection(&loaded, |request, end| {
+            postgres_replica_progress::inspect(request, end, options.epoch, options.account)
+                .map_err(progress_error)
         });
         return match result {
             Ok(progress) => {
@@ -218,14 +212,13 @@ pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Re
         }
     };
     let executable = std::env::current_exe()?;
-    let result = with_addresses_timeout(
+    let result = with_connection_timeout(
         &loaded,
         Duration::from_secs(options.timeout),
         |request, end| {
             if op == Operation::Seed {
                 let bound = postgres_replica_source::inspect(
                     request,
-                    &loaded.trust,
                     end.min(Instant::now() + Duration::from_secs(10)),
                     options.epoch,
                 )
@@ -236,7 +229,6 @@ pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Re
                 // Existing persisted state is reported, never reseeded from a new observation.
                 match postgres_replica_progress::inspect(
                     request,
-                    &loaded.trust,
                     end.min(Instant::now() + Duration::from_secs(10)),
                     options.epoch,
                     options.account,
@@ -281,7 +273,6 @@ pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Re
                 .map_err(|_| fail("seed-invalid"))?;
                 postgres_replica_accounts::initialize(
                     request,
-                    &loaded.trust,
                     end.min(Instant::now() + Duration::from_secs(10)),
                     options.epoch,
                     Arc::new(seed),
@@ -294,13 +285,12 @@ pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Re
                 })?;
                 return postgres_replica_progress::inspect(
                     request,
-                    &loaded.trust,
                     end.min(Instant::now() + Duration::from_secs(10)),
                     options.epoch,
                     options.account,
                 )
                 .map(Some)
-                .map_err(|error| no_retry(progress_error(error)));
+                .map_err(progress_error);
             }
             let runtime = Request {
                 mode: Mode::Runtime,
@@ -310,10 +300,7 @@ pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Re
                 Source::new(source.origin(), source.epoch()).map_err(|_| fail("source-invalid"))?,
                 options.account,
                 options.epoch,
-                Local {
-                    request: &runtime,
-                    trust: &loaded.trust,
-                },
+                Local { request: &runtime },
             )
             .map_err(|_| fail("invalid-binding"))?;
             for index in 0..options.steps {
@@ -428,12 +415,6 @@ fn discover(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
             report_error(name, "source", code)?;
             Ok(ExitCode::FAILURE)
         }
-    }
-}
-fn no_retry(error: AttemptError) -> AttemptError {
-    match error {
-        AttemptError::Transport => fail("connection-failed"),
-        other => other,
     }
 }
 fn source_error(error: postgres_replica_source::Error) -> AttemptError {
@@ -557,7 +538,7 @@ mod tests {
         .is_none());
     }
     #[test]
-    fn address_retry_is_limited_to_read_only_preflights() {
+    fn connection_refusals_report_as_transport_and_copy_failures_do_not() {
         let transport = td_mta::postgres_probe::Error::Transport;
         assert!(matches!(
             source_error(postgres_replica_source::Error::Connection(transport)),
@@ -566,12 +547,6 @@ mod tests {
         assert!(matches!(
             progress_error(postgres_replica_progress::Error::Connection(transport)),
             AttemptError::Transport
-        ));
-        assert!(matches!(
-            no_retry(progress_error(
-                postgres_replica_progress::Error::Connection(transport)
-            )),
-            AttemptError::Failed(_, "connection-failed")
         ));
         assert!(matches!(
             copy_error(td_mta::replica_copy::Error::Storage(

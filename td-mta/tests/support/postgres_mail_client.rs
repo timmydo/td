@@ -144,7 +144,6 @@ pub(super) enum Mode {
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     configuration: &ResolvedProfile,
     policies: &GenerationLease<TlsPolicies>,
@@ -161,11 +160,10 @@ pub(super) fn exercise(
     let device =
         postgres_devices::prepare_creation(binding.epoch(), binding.account(), "real client", 1)
             .unwrap();
-    postgres_devices::publish_creation(request, trust, deadline(), &device).unwrap();
+    postgres_devices::publish_creation(request, deadline(), &device).unwrap();
     let domain = GenerationSet::<TlsPolicies>::at_startup();
     let cloud = postgres_runtime_profile::load(
         request,
-        trust,
         deadline(),
         binding.epoch(),
         "cloud",
@@ -207,7 +205,7 @@ pub(super) fn exercise(
         deadline(),
     )
     .unwrap();
-    postgres_receiving::publish(request, trust, deadline(), &delivery).unwrap();
+    postgres_receiving::publish(request, deadline(), &delivery).unwrap();
     let cloud_binding = cloud.binding().clone();
     drop(cloud);
     let runtime = fixture.root.join("real-client");
@@ -257,30 +255,24 @@ pub(super) fn exercise(
     let loaded = td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let slots = td_mta::postgres_read::ReadSlots::new(resources.limits().storage_views).unwrap();
     let authentication_accounts = [("user", binding)];
-    let authentication = td_mta::postgres_http_auth::Authentication::new(
-        &loaded,
-        executable,
-        &authentication_accounts,
-        &clock,
-    )
-    .unwrap();
+    let authentication =
+        td_mta::postgres_http_auth::Authentication::new(&loaded, &authentication_accounts, &clock)
+            .unwrap();
     let pending = td_mta::postgres_http_updates::Pending::default();
     let backend = td_mta::postgres_http_api::Service {
         memory: &td_mta::https_api_storage::RequestMemory::new(resources).unwrap(),
         loaded: &loaded,
-        executable,
         binding,
         slots: &slots,
         pending: &pending,
@@ -424,7 +416,7 @@ pub(super) fn exercise(
             let listing = client.ask(json!({"command":"list_mailboxes"}));
             assert!(listing["ok"].is_true(), "{listing}");
             assert!(!listing["mailboxes"].as_array().unwrap().iter().any(|folder| folder["id"].as_str()==Some(archive_wire)));
-            exercise_queries(&mut client, fixture, request, trust, &cloud_binding, (&backend, device.device_id(), device.password()), (inbox_wire,
+            exercise_queries(&mut client, fixture, request, &cloud_binding, (&backend, device.device_id(), device.password()), (inbox_wire,
                 listing["mailboxes"].as_array().unwrap().iter().find(|folder| folder["name"].as_str()==Some("Child")).unwrap()["id"].as_str().unwrap(), email["id"].as_str().unwrap()));
             exercise_header_rules(fixture, &config, &runtime, inbox_wire, email["id"].as_str().unwrap());
             let usage_before = sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage");
@@ -439,7 +431,7 @@ pub(super) fn exercise(
                 receipt: SmtpReceipt { peer: "192.0.2.1".parse().unwrap(), tls: ReceiptTls::Tls13, gateway: None,
                     ehlo: "sender.example.test", reverse_path: "sender@example.test", recipients },
             }, deadline()).unwrap();
-            postgres_receiving::publish(request, trust, deadline(), &extra).unwrap();
+            postgres_receiving::publish(request, deadline(), &extra).unwrap();
             let mut extra_wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
             let extra_wire = td_mta::wire::encode_id(extra.email(), &mut extra_wire).unwrap();
             let listing = client.ask(json!({"command":"query_emails", "mailbox_id":inbox_wire, "limit":50}));
@@ -493,7 +485,7 @@ pub(super) fn exercise(
             let connected = client.ask(json!({"command":"connect", "account":"test"}));
             assert!(connected["ok"].is_true(), "{connected}");
             let settlement_slots = td_mta::postgres_read::ReadSlots::new(1).unwrap();
-            assert!(pending.settle(&loaded, executable, &settlement_slots, &clock,
+            assert!(pending.settle(&loaded, &settlement_slots, &clock,
                 Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap()).unwrap().is_none());
             assert_eq!(pending.operation().unwrap(), None);
 
@@ -532,7 +524,6 @@ pub(super) fn exercise(
     let confirmed = td_mta::postgres_http_updates::Pending::default();
     let updates = td_mta::postgres_http_updates::Updates {
         loaded: &loaded,
-        executable,
         binding,
         slots: &slots,
         clock: &clock,
@@ -611,19 +602,17 @@ pub(super) fn exercise(
     let operation = confirmed.operation().unwrap().unwrap();
     thread::sleep(Duration::from_secs(5));
     sql(fixture, "DROP TRIGGER delay_client_commit ON td_mta.flag_receipts; DROP FUNCTION public.delay_client_commit()");
-    let first = td_mta::postgres_read::Snapshot::open_resolved(
+    let first = td_mta::postgres_read::Snapshot::open_loaded(
         &slots,
         &loaded,
-        executable,
         deadline(),
         binding,
         device.password(),
     )
     .unwrap();
-    let second = td_mta::postgres_read::Snapshot::open_resolved(
+    let second = td_mta::postgres_read::Snapshot::open_loaded(
         &slots,
         &loaded,
-        executable,
         deadline(),
         binding,
         device.password(),
@@ -633,7 +622,6 @@ pub(super) fn exercise(
     let settled = confirmed
         .settle(
             &loaded,
-            executable,
             &settlement_slots,
             &clock,
             Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
@@ -684,7 +672,6 @@ pub(super) fn exercise(
     let settled = confirmed
         .settle(
             &loaded,
-            executable,
             &settlement_slots,
             &clock,
             Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
@@ -710,7 +697,6 @@ pub(super) fn exercise(
     assert!(!responses.admission_stopped());
     let folders = td_mta::postgres_http_mailboxes::Mailboxes {
         loaded: &loaded,
-        executable,
         binding,
         slots: &slots,
         clock: &clock,
@@ -751,7 +737,6 @@ pub(super) fn exercise(
         .mailboxes
         .settle(
             &loaded,
-            executable,
             &settlement_slots,
             &clock,
             Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
@@ -812,7 +797,6 @@ pub(super) fn exercise(
         .mailboxes
         .settle(
             &loaded,
-            executable,
             &settlement_slots,
             &clock,
             Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
@@ -1100,7 +1084,6 @@ fn exercise_queries(
     client: &mut Client,
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     context: (
         &td_mta::postgres_http_api::Service<'_, '_, '_>,
@@ -1157,7 +1140,7 @@ fn exercise_queries(
             deadline(),
         )
         .unwrap();
-        postgres_receiving::publish(request, trust, deadline(), &delivery).unwrap();
+        postgres_receiving::publish(request, deadline(), &delivery).unwrap();
         let mut wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
         let wire = td_mta::wire::encode_id(delivery.email(), &mut wire)
             .unwrap()
@@ -1285,7 +1268,7 @@ fn exercise_queries(
         receipt: SmtpReceipt { peer: "192.0.2.1".parse().unwrap(), tls: ReceiptTls::Tls13,
             gateway: None, ehlo: "sender.example.test", reverse_path: "sender@example.test", recipients },
     }, deadline()).unwrap();
-    postgres_receiving::publish(request, trust, deadline(), &nested).unwrap();
+    postgres_receiving::publish(request, deadline(), &nested).unwrap();
     let mut wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let wire = td_mta::wire::encode_id(nested.email(), &mut wire).unwrap();
     for search in ["inner@example.test orchard", "nested content"] {
@@ -1333,7 +1316,7 @@ fn exercise_queries(
         deadline(),
     )
     .unwrap();
-    postgres_receiving::publish(request, trust, deadline(), &delivery).unwrap();
+    postgres_receiving::publish(request, deadline(), &delivery).unwrap();
     let mut wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let wire = td_mta::wire::encode_id(delivery.email(), &mut wire).unwrap();
     let query = |text: &str| {
@@ -1356,7 +1339,6 @@ fn exercise_queries(
     loop {
         let report = td_mta::postgres_summary_backfill::run_with_options(
             &fixture.request(),
-            trust,
             deadline(),
             binding.epoch(),
             binding.account(),
@@ -1442,7 +1424,7 @@ fn exercise_queries(
         deadline(),
     )
     .unwrap();
-    postgres_receiving::publish(request, trust, deadline(), &broken).unwrap();
+    postgres_receiving::publish(request, deadline(), &broken).unwrap();
     let partial = client.ask(query("tailneedle"));
     check(partial.clone(), 0, &[wire]);
     assert_eq!(partial["search_skipped"].as_u64(), Some(1), "{partial}");
@@ -1570,7 +1552,7 @@ fn exercise_queries(
             deadline(),
         )
         .unwrap();
-        postgres_receiving::publish(request, trust, deadline(), &item).unwrap();
+        postgres_receiving::publish(request, deadline(), &item).unwrap();
         let mut bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
         batch_ids.push(
             td_mta::wire::encode_id(item.email(), &mut bytes)
@@ -1582,7 +1564,6 @@ fn exercise_queries(
     loop {
         let page = td_mta::postgres_summary_backfill::run_with_options(
             &fixture.request(),
-            trust,
             deadline(),
             binding.epoch(),
             binding.account(),
@@ -1803,7 +1784,6 @@ fn exercise_send(
         )
         .unwrap()
     };
-    let trust = td_crypto::TrustStore::from_pem(&fixture.ca).unwrap();
     let other = td_mta::postgres_devices::prepare_creation(
         binding.epoch(),
         binding.account(),
@@ -1811,13 +1791,11 @@ fn exercise_send(
         2,
     )
     .unwrap();
-    td_mta::postgres_devices::publish_creation(&fixture.request(), &trust, deadline(), &other)
-        .unwrap();
+    td_mta::postgres_devices::publish_creation(&fixture.request(), deadline(), &other).unwrap();
     let before = sql(fixture, "SELECT count(*) FROM td_mta.emails");
     assert_eq!(
         drafts_api::publish(
             &fixture.request(),
-            &trust,
             deadline(),
             &make(other.device_id()),
             other.password()
@@ -1830,7 +1808,7 @@ fn exercise_send(
         &format!("UPDATE td_mta.leases SET expires_at=1 WHERE blob_id=decode('{source}','hex')"),
     );
     assert_eq!(
-        drafts_api::publish(&fixture.request(), &trust, deadline(), &prepared, password),
+        drafts_api::publish(&fixture.request(), deadline(), &prepared, password),
         Err(drafts_api::Error::MissingAttachment)
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), before);

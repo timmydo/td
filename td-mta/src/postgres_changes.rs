@@ -11,7 +11,6 @@ use crate::{
     sync::{DataState, DataType},
 };
 use std::{collections::VecDeque, io::ErrorKind, time::Instant};
-use td_crypto::TrustStore;
 
 // Leave room below the finite wire-frame ceiling for setup and batch replies.
 const MAX_HISTORY_POLLS: usize = 4096;
@@ -33,7 +32,6 @@ pub enum Error {
 /// completes. A state token is not authorization; authenticate each request.
 pub fn read(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     binding: &Binding,
     password: &[u8],
@@ -48,7 +46,7 @@ pub fn read(
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
     let binding = binding.clone();
-    postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    postgres_probe::with_body_worker(request, deadline, |worker| {
         let identity = worker
             .run(|client| {
                 postgres_snapshot::begin(client, &binding, presented).map_err(snapshot_error)

@@ -326,13 +326,10 @@ can shorten the retained history; at the global maximum the ring retains about
 109 minutes. Suppression and eviction are intentional and visible.
 
 Writers flush at most 16 records per transaction with a two-second overall
-DNS/connection/operation deadline, a 50 ms row-lock wait, and one-second
-statement timeouts. The writer uses the bootstrap address policy in
-POSTGRES.md, [Writer endpoint
-resolution](POSTGRES.md#writer-endpoint-resolution). Only a transport
-failure before entering the append operation can try another address within
-that same deadline. Logging uses asynchronous commit and never retries an
-uncertain commit. Mail acceptance never depends on diagnostic persistence.
+connection/operation deadline, a 50 ms row-lock wait, and one-second
+statement timeouts. The writer connects once over the bootstrap socket
+(POSTGRES.md, [Unix socket transport](POSTGRES.md#unix-socket-transport)).
+Logging uses asynchronous commit and never retries an uncertain commit. Mail acceptance never depends on diagnostic persistence.
 Each idle writer runs incremental age cleanup at least once per minute while
 operational, deleting at most 1,024 expired rows per pass. Inspection hides
 all expired rows immediately even when physical cleanup is behind or no
@@ -530,11 +527,8 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `response_ledger_lock` | Response admission mutex acquisition, including worker waiting; poison counts as failure. No filesystem or database work is included. |
 | `response_ledger_quota` | Response-byte reservation; busy means actual byte quota or ledger-cell exhaustion. It excludes mutex waiting and file creation, and success grants no method/publication authority. |
 | `http_auth` | One authentication worker attempt, including credential parsing and database authorization |
-| `db_resolve` | The owned resolver helper and its complete reply |
-| `db_connect` | One attempted PostgreSQL connection, including local TLS setup, TCP and startup; excludes DNS and runtime qualification |
-| `db_tcp` | Numeric TCP connection attempt |
-| `db_handshake` | PostgreSQL SSL negotiation, TLS and startup/SCRAM together |
-| `db_tls` | TLS construction and handshake within `db_handshake` |
+| `db_connect` | One attempted PostgreSQL connection: argument checks, socket admission, the Unix socket connect and startup; excludes runtime qualification |
+| `db_handshake` | The Unix socket connect and startup/SCRAM within `db_connect` |
 | `db_schema` | Version, migration-lock and schema-ledger qualification |
 | `db_runtime` | Runtime role, privileges and maintenance qualification |
 | `db_work` | One driver-run operation, possibly containing multiple SQL statements and qualification; success means the driver returned its operation result, not that an inner SQL/application result succeeded |
@@ -565,7 +559,7 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `structure_reuse` | Qualified persisted MIME tables reused after manifest qualification and verified entity-header rechecks; zero-duration count. Included work remains inside `jmap_structure`. |
 | `jmap_work_io`, `jmap_work_records`, `jmap_work_output`, `jmap_work_deadline`, `jmap_work_other` | Email/get projections whose shared MIME work meter stopped, split by its sticky reason; duration is the whole projection. Other storage capacity failures do not increment these counters. No message IDs or content are retained. |
 | `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
-| `smtp_publish` | Inbound SMTP database publication; one-shot paths include connection setup and pre-effect address fallback, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure and receives SMTP 451 |
+| `smtp_publish` | Inbound SMTP database publication; one-shot paths include connection setup, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure and receives SMTP 451 |
 | `smtp_commit` | One storage-worker preparation/publication attempt; known durable success remains success even when ancillary cleanup stops service |
 | `smtp_rate_refused` | Zero-duration accepted-mail rate decisions: busy counts a MAIL refused with 421 4.7.0, unavailable counts a full rate table forgetting another key's debt |
 

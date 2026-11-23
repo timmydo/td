@@ -1,6 +1,6 @@
 //! Supervised bounded copy rounds; status is historical operational evidence.
 use super::{arguments, copy_error, read_limits, Operation, Options};
-use crate::postgres::{report_error, scrub_state::FileState, with_addresses_timeout};
+use crate::postgres::{report_error, scrub_state::FileState, with_connection_timeout};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -259,7 +259,7 @@ fn round(options: &Options) -> Result<Outcome, Failure> {
         .as_ref()
         .ok_or(("arguments", "source-required"))?;
     let executable = std::env::current_exe().map_err(|_| ("resolver", "executable"))?;
-    with_addresses_timeout(&loaded, Duration::from_secs(60), |request, end| {
+    with_connection_timeout(&loaded, Duration::from_secs(60), |request, end| {
         let request = Request {
             mode: Mode::Runtime,
             ..*request
@@ -269,10 +269,7 @@ fn round(options: &Options) -> Result<Outcome, Failure> {
                 .map_err(|_| super::fail("source-invalid"))?,
             options.account,
             options.epoch,
-            Local {
-                request: &request,
-                trust: &loaded.trust,
-            },
+            Local { request: &request },
         )
         .map_err(|_| super::fail("invalid-binding"))?;
         let result = worker

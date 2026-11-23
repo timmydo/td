@@ -13,7 +13,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 #[path = "postgres_selection_retained.rs"]
 mod retained;
@@ -179,11 +179,10 @@ fn receipt(
 /// uncertainty unresolved. Absence never authorizes a different operation ID.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     change: Change,
 ) -> Result<Option<Selection>, Error> {
-    postgres_probe::with_client(request, trust, deadline, move |client| {
+    postgres_probe::with_client(request, deadline, move |client| {
             let schema = client.inspect_schema()
                 .map_err(Error::Schema)?;
             if schema.store_epoch != change.epoch {
@@ -209,14 +208,13 @@ pub fn inspect(
 /// No service listener, runtime generation or role is activated here.
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     change: Change,
 ) -> Result<Selection, Error> {
-    if let Some(selected) = inspect(request, trust, deadline, change)? {
+    if let Some(selected) = inspect(request, deadline, change)? {
         return Ok(selected);
     }
-    let candidate = versions::read(request, trust, deadline, change.epoch, change.version)
+    let candidate = versions::read(request, deadline, change.epoch, change.version)
         .map_err(Error::Configuration)?;
     if candidate.digest() != &change.source_digest {
         return Err(Error::Conflict);
@@ -224,7 +222,7 @@ pub fn publish(
     let bindings = candidate.bindings;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         let schema = client.inspect_schema().map_err(Error::Schema)?;
         if schema.store_epoch != change.epoch {
             return Err(Error::Epoch);
@@ -301,27 +299,25 @@ pub fn publish(
 /// the returned passive generation; runtime publication must fence it afresh.
 pub fn read(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
 ) -> Result<Option<(Selection, Candidate)>, Error> {
-    let selected = observe(request, trust, deadline, epoch)?;
+    let selected = observe(request, deadline, epoch)?;
     let Some(selected) = selected else {
         return Ok(None);
     };
-    let candidate = versions::read(request, trust, deadline, epoch, selected.version)
-        .map_err(Error::Configuration)?;
+    let candidate =
+        versions::read(request, deadline, epoch, selected.version).map_err(Error::Configuration)?;
     Ok(Some((selected, candidate)))
 }
 
 /// One passive primary observation; never a runtime policy guard.
 pub fn observe(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
 ) -> Result<Option<Selection>, Error> {
-    postgres_probe::with_client(request, trust, deadline, move |client| {
+    postgres_probe::with_client(request, deadline, move |client| {
         let schema = client.inspect_schema().map_err(Error::Schema)?;
         if schema.store_epoch != epoch {
             return Err(Error::Epoch);

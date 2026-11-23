@@ -50,13 +50,11 @@ impl Relay {
         let accepted = Arc::new(AtomicUsize::new(0));
         let interrupted = Arc::new(AtomicBool::new(false));
         let mut domain = td_mta::generations::GenerationSet::at_startup();
-        let trust = td_crypto::TrustStore::from_pem(&fixture.ca).unwrap();
-        let epoch = td_mta::postgres_schema::inspect(&fixture.request(), &trust, deadline())
+        let epoch = td_mta::postgres_schema::inspect(&fixture.request(), deadline())
             .unwrap()
             .store_epoch;
         let profile = td_mta::postgres_runtime_profile::load(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             profile,

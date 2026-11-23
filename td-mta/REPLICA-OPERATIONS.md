@@ -376,7 +376,7 @@ For exact restore evidence, follow the
 [isolated logical restore drill](DEPLOYMENT.md#local-logical-backup-and-an-isolated-restore-drill).
 For the Unix setup, libpq uses the private socket directory as `host`, the
 socket filename's port, and `sslmode=disable`; retain SCRAM authentication
-through a protected password file. Do not apply that setting to a TCP host.
+through a protected password file.
 A consistent exported PostgreSQL snapshot can bind both `pg_dump --snapshot`
 and the source row inventory while live services continue. Keep its exporting
 transaction open until both finish, with a finite timeout. Compare the restored

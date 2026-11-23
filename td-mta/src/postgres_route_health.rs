@@ -12,7 +12,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Provider, SystemEntropy};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
@@ -339,12 +339,11 @@ fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
 }
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
         receipt(client, &value)
     })
@@ -354,20 +353,15 @@ pub fn inspect(
 /// route health before the attempt is retired; settle recipient responsibility
 /// afterward through the attempt API. A receipt replays while its attempt is
 /// active; after retirement it expires at the route's next publication.
-pub fn publish(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    value: &Change,
-) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, value)? {
+pub fn publish(request: &Request<'_>, deadline: Instant, value: &Change) -> Result<Outcome, Error> {
+    if let Some(outcome) = inspect(request, deadline, value)? {
         return Ok(outcome);
     }
     let value = value.clone();
     let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
         if let Some(outcome) = receipt(client, &value)? {
             return Ok(outcome);

@@ -6,7 +6,6 @@ use crate::{
     postgres_schema,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Key {
@@ -57,7 +56,6 @@ fn corrupt(error: postgres_body::Error) -> bool {
 /// the next cycle. A returned cursor follows a known completed ROLLBACK.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     options: Options,
@@ -72,7 +70,7 @@ pub fn inspect(
     {
         return Err(Error::Invalid);
     }
-    let result = postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    let result = postgres_probe::with_body_worker(request, deadline, |worker| {
         let (rows, through) = worker.run(move |client| {
             crate::postgres_maintenance::owner(client).map_err(|_| Error::Owner)?;
             let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;

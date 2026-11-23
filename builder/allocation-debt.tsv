@@ -2806,9 +2806,7 @@ td-mta/src/postgres_final_capacity.rs	unchecked-growth-or-clone	2
 td-mta/src/postgres_header_cache.rs	direct-reservation	3
 td-mta/src/postgres_header_cache.rs	unchecked-growth-or-clone	7
 td-mta/src/postgres_http_api.rs	heap-owner	1
-td-mta/src/postgres_http_api.rs	unchecked-growth-or-clone	2
-td-mta/src/postgres_http_cancellations.rs	heap-owner	1
-td-mta/src/postgres_http_cancellations.rs	unchecked-growth-or-clone	1
+td-mta/src/postgres_http_api.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_http_drafts.rs	direct-reservation	3
 td-mta/src/postgres_http_drafts.rs	unchecked-growth-or-clone	3
 td-mta/src/postgres_http_mailboxes.rs	direct-reservation	2
@@ -2865,15 +2863,13 @@ td-mta/src/postgres_mime_evidence.rs	unchecked-growth-or-clone	12
 td-mta/src/postgres_phase_current.rs	unchecked-growth-or-clone	5
 td-mta/src/postgres_prepared_failure.rs	heap-owner	3
 td-mta/src/postgres_prepared_failure.rs	unchecked-growth-or-clone	5
-td-mta/src/postgres_probe.rs	heap-owner	5
-td-mta/src/postgres_probe.rs	unchecked-growth-or-clone	1
+td-mta/src/postgres_probe.rs	heap-owner	2
 td-mta/src/postgres_probe/framing.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_probe/mutation.rs	heap-owner	2
 td-mta/src/postgres_probe/mutation.rs	unchecked-growth-or-clone	3
 td-mta/src/postgres_probe/replica.rs	heap-owner	2
 td-mta/src/postgres_probe/replica.rs	unchecked-growth-or-clone	1
 td-mta/src/postgres_probe/windows.rs	heap-owner	1
-td-mta/src/postgres_probe/wire.rs	heap-owner	3
 td-mta/src/postgres_profile_materials.rs	allocating-conversion	1
 td-mta/src/postgres_profile_materials.rs	unchecked-growth-or-clone	4
 td-mta/src/postgres_publication.rs	direct-reservation	2
@@ -2931,9 +2927,6 @@ td-mta/src/postgres_replica_source.rs	heap-owner	1
 td-mta/src/postgres_replica_source.rs	unchecked-growth-or-clone	2
 td-mta/src/postgres_replica_transition.rs	direct-reservation	1
 td-mta/src/postgres_replica_transition.rs	unchecked-growth-or-clone	1
-td-mta/src/postgres_resolver.rs	allocating-constructor	4
-td-mta/src/postgres_resolver.rs	allocation-macro	2
-td-mta/src/postgres_resolver.rs	unchecked-growth-or-clone	2
 td-mta/src/postgres_route_health.rs	heap-owner	1
 td-mta/src/postgres_route_health.rs	unchecked-growth-or-clone	4
 td-mta/src/postgres_route_owners.rs	direct-reservation	2
@@ -3002,6 +2995,9 @@ td-mta/src/replica_source/reader.rs	direct-reservation	5
 td-mta/src/replica_source/reader.rs	unchecked-growth-or-clone	14
 td-mta/src/replica_source/state.rs	direct-reservation	2
 td-mta/src/replica_source/state.rs	unchecked-growth-or-clone	2
+td-mta/src/resolver.rs	allocating-constructor	4
+td-mta/src/resolver.rs	allocation-macro	1
+td-mta/src/resolver.rs	unchecked-growth-or-clone	2
 td-mta/src/root_headers_tests.rs	allocating-conversion	6
 td-mta/src/root_headers_tests.rs	allocation-macro	15
 td-mta/src/root_headers_tests.rs	unchecked-growth-or-clone	17

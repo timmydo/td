@@ -13,7 +13,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_crypto::{Crypto, Digest, Provider};
 #[derive(Clone)]
 pub struct Change {
     claim: Claim,
@@ -81,12 +81,11 @@ fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
 }
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
         receipt(client, &value)
     })
@@ -94,19 +93,14 @@ pub fn inspect(
 }
 /// The exact attempt must already have a retained acceptance receipt and be
 /// retired. This never changes recipient results or clears a repair hold.
-pub fn publish(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    value: &Change,
-) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, value)? {
+pub fn publish(request: &Request<'_>, deadline: Instant, value: &Change) -> Result<Outcome, Error> {
+    if let Some(outcome) = inspect(request, deadline, value)? {
         return Ok(outcome);
     }
     let value = value.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
         if let Some(outcome) = receipt(client, &value)? {
             return Ok(outcome);

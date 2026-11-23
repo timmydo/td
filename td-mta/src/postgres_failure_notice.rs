@@ -17,7 +17,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 const MAX_TEXT: usize = 10 * 1024 * 1024;
 const RECIPIENT_PAGE: &str = "SELECT ordinal,address,state,uncertain,next_attempt_at,rcpt_reply,data_reply,reason,diagnostic,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND ordinal >= $3 ORDER BY ordinal LIMIT 100";
@@ -165,7 +165,6 @@ fn render_recipient(text: &mut String, row: Recipient<'_>) -> Result<(), Error> 
 /// selecting work and changing its marker occur in the same locked transaction.
 pub fn publish_next(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
@@ -194,7 +193,7 @@ pub fn publish_next(
     let claim = claim.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_notice_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_notice_client(request, deadline, move |client| {
         if !owners::begin(client, &claim, true, true).map_err(Error::Owner)? {
             return Err(Error::Policy);
         }

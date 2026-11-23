@@ -10,7 +10,7 @@ use std::{
     thread,
     time::Duration,
 };
-use td_crypto::{SystemEntropy, TrustStore};
+use td_crypto::SystemEntropy;
 use td_mta::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -286,11 +286,10 @@ fn call_with_work<'w, 'a, 'r>(
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     epoch: StoreEpoch,
     source: SubmissionId,
 ) {
-    let (original, candidate) = selection::read(request, trust, deadline(), epoch)
+    let (original, candidate) = selection::read(request, deadline(), epoch)
         .unwrap()
         .unwrap();
     // Private fixture has no concurrent configuration writer. Restore exact
@@ -330,24 +329,16 @@ pub(super) fn exercise(
                 ..candidate.profile(i).unwrap()
             })
             .collect();
-        let new = configuration::prepare(
-            request,
-            trust,
-            deadline(),
-            epoch,
-            candidate.shared(),
-            &profiles,
-        )
-        .unwrap();
+        let new = configuration::prepare(request, deadline(), epoch, candidate.shared(), &profiles)
+            .unwrap();
         let version = versions::Version::from_bytes([if starttls { 172 } else { 171 }; 16]);
-        versions::publish(request, trust, deadline(), version, &new).unwrap();
-        let selected = selection::read(request, trust, deadline(), epoch)
+        versions::publish(request, deadline(), version, &new).unwrap();
+        let selected = selection::read(request, deadline(), epoch)
             .unwrap()
             .unwrap()
             .0;
         selection::publish(
             request,
-            trust,
             deadline(),
             selection::prepare(epoch, selected.generation, version, &new).unwrap(),
         )
@@ -355,7 +346,6 @@ pub(super) fn exercise(
         let mut domain = GenerationSet::at_startup();
         let prepared = runtime::load(
             request,
-            trust,
             deadline(),
             epoch,
             "cloud",
@@ -389,11 +379,10 @@ pub(super) fn exercise(
             BootId::from_bytes([if starttls { 172 } else { 171 }; 16]),
         )
         .unwrap();
-        let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
+        let grant = owners::acquire(request, deadline(), &claim).unwrap();
         super::native_final_handoff::connected(
             fixture,
             request,
-            trust,
             &claim,
             grant.generation,
             source,
@@ -403,7 +392,6 @@ pub(super) fn exercise(
         super::native_data_exchange::exercise(
             fixture,
             request,
-            trust,
             &claim,
             grant.generation,
             source,
@@ -413,22 +401,13 @@ pub(super) fn exercise(
         super::native_relay_attempt::exercise(
             fixture,
             request,
-            trust,
             &claim,
             grant.generation,
             source,
             &setup,
         );
-        failures(
-            fixture,
-            request,
-            trust,
-            &claim,
-            grant.generation,
-            source,
-            &setup,
-        );
-        owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+        failures(fixture, request, &claim, grant.generation, source, &setup);
+        owners::release(request, deadline(), &claim, grant.generation).unwrap();
         sql(
             fixture,
             &format!("DELETE FROM td_mta.route_health WHERE destination=decode('{route}','hex')"),
@@ -436,7 +415,7 @@ pub(super) fn exercise(
     }
     sql(fixture, &format!("UPDATE td_mta.submission_routes SET destination=decode('{source_route}','hex') WHERE submission_id=decode('{source}','hex'); DELETE FROM td_mta.config_selection_receipts; INSERT INTO td_mta.config_selection_receipts SELECT * FROM public.connect_receipts; DELETE FROM td_mta.config_selection; INSERT INTO td_mta.config_selection SELECT * FROM public.connect_selection; DROP TABLE public.connect_selection, public.connect_receipts"));
     assert_eq!(
-        selection::read(request, trust, deadline(), epoch)
+        selection::read(request, deadline(), epoch)
             .unwrap()
             .map(|(selected, _)| selected),
         Some(original)
@@ -445,7 +424,6 @@ pub(super) fn exercise(
 fn failures(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &owners::Claim,
     generation: u64,
     source: SubmissionId,
@@ -456,7 +434,7 @@ fn failures(
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
         sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},0,'0@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         let clock = Arc::new(RuntimeClock::new());
         let guard = Arc::new(Mutex::new(
             Guard::new(Time {
@@ -471,8 +449,7 @@ fn failures(
             .unwrap(),
         ));
         let runtime = Request {
-            address: request.address,
-            server_name: request.server_name,
+            socket: request.socket,
             user: "mail_runtime",
             database: request.database,
             password: PASSWORD,
@@ -483,7 +460,6 @@ fn failures(
         let worker = dispatch::Dispatches {
             connection: dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &slots,
                 clock: clock.clone(),
             },
@@ -666,7 +642,6 @@ fn failures(
             let other_domain = GenerationSet::at_startup();
             let other = runtime::load(
                 request,
-                trust,
                 deadline(),
                 setup.profile.binding().epoch(),
                 "cloud",

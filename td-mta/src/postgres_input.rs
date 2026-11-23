@@ -5,10 +5,8 @@ use crate::{
     store_fs::PrivateRoot,
 };
 use std::{fmt, io::Read, path::Path};
-use td_crypto::TrustStore;
 
 const MAX_SPECIFICATION_FILE: usize = 16 * 1024 + 2;
-const MAX_TRUST_FILE: usize = 128 * 1024;
 
 /// Fixed categories never carry paths, credentials or provider diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,7 +16,6 @@ pub enum Error {
     Read,
     Capacity,
     Specification(crate::postgres_bootstrap::Error),
-    Trust,
     Inventory,
 }
 impl Error {
@@ -29,7 +26,6 @@ impl Error {
             Self::Read => "postgres-bootstrap-read",
             Self::Capacity => "postgres-bootstrap-capacity",
             Self::Specification(_) => "postgres-bootstrap-specification",
-            Self::Trust => "postgres-bootstrap-trust",
             Self::Inventory => "postgres-configuration-inventory",
         }
     }
@@ -44,7 +40,6 @@ impl std::error::Error for Error {}
 /// Credentials intentionally have no Debug representation.
 pub struct Loaded {
     pub bootstrap: Bootstrap,
-    pub trust: TrustStore,
 }
 impl Loaded {
     /// The connection file's parent must be a checked mode-0700 non-root
@@ -66,16 +61,7 @@ impl Loaded {
             .map_err(Error::Input)?;
         let bytes = read(file, MAX_SPECIFICATION_FILE)?;
         let bootstrap = decode(&bytes, profile)?;
-        let trust = match bootstrap.root_certificate() {
-            Some(path) => {
-                let path = path.to_str().ok_or(Error::Trust)?;
-                let file = inputs.open(path, Role::Public).map_err(Error::Input)?;
-                let bytes = read(file, MAX_TRUST_FILE)?;
-                TrustStore::from_pem(&bytes).map_err(|_| Error::Trust)?
-            }
-            None => TrustStore::public_roots().map_err(|_| Error::Trust)?,
-        };
-        Ok((Self { bootstrap, trust }, inputs))
+        Ok((Self { bootstrap }, inputs))
     }
 }
 
@@ -85,7 +71,7 @@ pub struct MaterialInput {
     bytes: Vec<u8>,
 }
 impl MaterialInput {
-    /// Bind connection, explicit trust and material to one owner/inode inventory.
+    /// Bind connection and material to one owner/inode inventory.
     /// Content validation and generation activation are separate operations.
     pub fn open(
         connection_file: &str,
@@ -261,7 +247,7 @@ fn read(mut input: impl Read, maximum: usize) -> Result<Vec<u8>, Error> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    const URI: &str = "postgresql://user:secret@localhost/mail";
+    const URI: &str = "postgresql://user:secret@/mail?host=/run/postgresql";
 
     #[test]
     fn small_sources_do_not_retain_the_unconsumed_source_allowance() {
@@ -312,7 +298,10 @@ mod tests {
         for suffix in ["", "\n", "\r\n"] {
             let value = format!("{URI}{suffix}");
             let loaded = decode(value.as_bytes(), "desktop").unwrap();
-            assert_eq!(loaded.host(), Some("localhost"));
+            assert_eq!(
+                loaded.socket().as_path(),
+                Path::new("/run/postgresql/.s.PGSQL.5432")
+            );
             assert_eq!(loaded.profile(), "desktop");
         }
         for suffix in ["\r", "\n\n", "\r\n\r\n", " ", "\0", "\nother"] {

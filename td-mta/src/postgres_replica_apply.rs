@@ -575,7 +575,6 @@ pub struct Publisher {
 impl Publisher {
     pub fn open(
         request: &postgres_probe::Request<'_>,
-        trust: &td_crypto::TrustStore,
         deadline: Instant,
         epoch: crate::ids::StoreEpoch,
         source: Source,
@@ -583,7 +582,7 @@ impl Publisher {
     ) -> Result<Self, Error> {
         Ok(Self {
             session: postgres_probe::ReplicaSession::open(
-                request, trust, deadline, epoch, source, account,
+                request, deadline, epoch, source, account,
             )
             .map_err(Error::Connection)?,
         })

@@ -66,8 +66,8 @@ pub(super) fn run(
     };
     let remote = deletions::source_proof(current, previous, options, &now, &ids, "Mailbox")?;
     let fence = || deletions::source_fence(&remote, &now);
-    let (loaded, address, authority) = import::connect(get("--connection-file")?, epoch, account)?;
-    let request = loaded.bootstrap.request(address);
+    let (loaded, authority) = import::connect(get("--connection-file")?, epoch, account)?;
+    let request = loaded.bootstrap.request();
     let mut output = Vec::new();
     let mut size = 0;
     // Reserve the largest apply report before any database write.
@@ -92,7 +92,6 @@ pub(super) fn run(
                     )?;
                     let status = match deletion::apply(
                         &request,
-                        &loaded.trust,
                         import::deadline(),
                         &authority,
                         value,
@@ -110,14 +109,8 @@ pub(super) fn run(
                 }
             }
         } else {
-            match deletion::plan(
-                &request,
-                &loaded.trust,
-                import::deadline(),
-                &authority,
-                value,
-            )
-            .map_err(import::code)?
+            match deletion::plan(&request, import::deadline(), &authority, value)
+                .map_err(import::code)?
             {
                 Plan::Unmapped => json!({"id":id,"status":"unmapped"}),
                 Plan::Absent => json!({"id":id,"status":"historical-object-absent"}),

@@ -4,7 +4,6 @@ use std::{
     thread,
     time::Duration,
 };
-use td_crypto::TrustStore;
 use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     admission::work::{Charge, Meter},
@@ -21,7 +20,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -44,8 +42,7 @@ pub(super) fn exercise(
         .unwrap(),
     ));
     let runtime = Request {
-        address: request.address,
-        server_name: request.server_name,
+        socket: request.socket,
         user: "mail_runtime",
         database: request.database,
         password: PASSWORD,
@@ -61,7 +58,6 @@ pub(super) fn exercise(
     let worker = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &runtime,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -71,7 +67,6 @@ pub(super) fn exercise(
     let forbidden = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &preparation,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -80,7 +75,6 @@ pub(super) fn exercise(
     };
     let settle = dispatch::Connection {
         request: &runtime,
-        trust,
         slots: &settlement,
         clock: clock.clone(),
     };
@@ -88,7 +82,6 @@ pub(super) fn exercise(
     let ordinary_capacity = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &runtime,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -98,7 +91,6 @@ pub(super) fn exercise(
     let settlement_capacity = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &runtime,
-            trust,
             slots: &settlement,
             clock: clock.clone(),
         },
@@ -122,7 +114,7 @@ pub(super) fn exercise(
         deadline: until(10_000),
     };
     for delayed in [false, true] {
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         sql(fixture,&format!("UPDATE td_mta.recipients SET state=1,phase=0,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL WHERE submission_id={sub}; UPDATE td_mta.submissions SET completed_at=NULL,notification=0,expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id={sub}"));
         let published = worker
             .publish_prepared(claim, generation, input(), &mut meter())

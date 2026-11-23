@@ -136,41 +136,17 @@ impl Backend<'_> {
         let reused = state.connection.is_some();
         if state.connection.is_none() {
             let permit = self.owner.slots.acquire().map_err(|_| Error::Busy)?;
-            let addresses = crate::postgres_resolver::resolve(
-                self.owner.executable,
-                &self.owner.loaded.bootstrap,
-                deadline.min(
-                    now.checked_add(Duration::from_secs(5))
-                        .ok_or(Error::Invalid)?,
-                ),
+            let mut request = self.owner.loaded.bootstrap.request();
+            request.mode = crate::postgres_probe::Mode::Runtime;
+            let session = crate::postgres_probe::MutationSession::open_smtp(
+                &request,
+                deadline,
+                1 + self.owner.additional.len(),
             )
-            .map_err(|error| match error {
-                crate::postgres_resolver::Error::Deadline => Error::Deadline,
-                _ => Error::Dns,
+            .map_err(|error| {
+                owner::Error::Publication(postgres_receiving::Error::Connection(error))
             })?;
-            let mut connection = None;
-            for address in addresses {
-                let mut request = self.owner.loaded.bootstrap.request(address);
-                request.mode = crate::postgres_probe::Mode::Runtime;
-                match crate::postgres_probe::MutationSession::open_smtp(
-                    &request,
-                    &self.owner.loaded.trust,
-                    deadline,
-                    1 + self.owner.additional.len(),
-                ) {
-                    Ok(session) => {
-                        connection = Some(session);
-                        break;
-                    }
-                    Err(crate::postgres_probe::Error::Transport) => (),
-                    Err(error) => {
-                        return Err(owner::Error::Publication(
-                            postgres_receiving::Error::Connection(error),
-                        ))
-                    }
-                }
-            }
-            state.connection = Some((connection.ok_or(Error::Dns)?, permit));
+            state.connection = Some((session, permit));
         }
         let cap = self.clock.deadline_before(deadline)?;
         let result = operation(

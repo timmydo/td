@@ -1,6 +1,5 @@
 use super::{create_runtime_login, deadline, grant_runtime_mail, sql, Fixture};
 use std::sync::Arc;
-use td_crypto::TrustStore;
 use td_mta::{
     ids::EmailId,
     postgres_replica_apply::{Error, Publisher},
@@ -22,12 +21,11 @@ pub(super) fn exercise(
     mut body_again: impl FnMut() -> VerifiedBody,
 ) {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
-    let local = postgres_schema::initialize(&owner, &trust, deadline())
+    let local = postgres_schema::initialize(&owner, deadline())
         .unwrap()
         .store_epoch;
-    postgres_replica_source::initialize(&owner, &trust, deadline(), local, &source).unwrap();
+    postgres_replica_source::initialize(&owner, deadline(), local, &source).unwrap();
     let metadata = page.view().unwrap();
     let email = metadata.emails.first().unwrap();
     let id = email.id;
@@ -47,7 +45,7 @@ pub(super) fn exercise(
         )
         .unwrap(),
     );
-    td_mta::postgres_replica_accounts::initialize(&owner, &trust, deadline(), local, seed).unwrap();
+    td_mta::postgres_replica_accounts::initialize(&owner, deadline(), local, seed).unwrap();
     create_runtime_login(&fixture);
     grant_runtime_mail(&fixture);
     sql(&fixture,"GRANT INSERT,UPDATE,DELETE ON td_mta.replica_progress,td_mta.replica_pending,td_mta.replica_mailbox_receipts,td_mta.replica_email_receipts,td_mta.replica_blob_identities TO mail_runtime");
@@ -59,7 +57,6 @@ pub(super) fn exercise(
     let open = || {
         Publisher::open(
             &runtime,
-            &trust,
             deadline(),
             local,
             Source::new(source.origin(), source.epoch()).unwrap(),
@@ -232,7 +229,7 @@ pub(super) fn exercise(
         "CREATE TABLE td_mta.replica_absent_by_observation(obstruction bigint)",
     );
     assert_eq!(
-        postgres_schema::upgrade(&owner, &trust, deadline()),
+        postgres_schema::upgrade(&owner, deadline()),
         Err(postgres_schema::Error::Database)
     );
     assert_eq!(sql(&fixture, "SELECT max(version), (SELECT count(*) FROM td_mta.replica_email_receipts WHERE NOT present AND digest IS NOT NULL) FROM td_mta.schema_migrations"), "43|2");
@@ -244,7 +241,6 @@ pub(super) fn exercise(
     assert_eq!(
         postgres_schema::upgrade(
             &owner,
-            &trust,
             std::time::Instant::now() + std::time::Duration::from_secs(120)
         )
         .unwrap()
@@ -431,8 +427,7 @@ pub(super) fn exercise(
         }
     );
     let progress =
-        td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
-            .unwrap();
+        td_mta::postgres_replica_progress::inspect(&owner, deadline(), local, account).unwrap();
     assert!(progress.inventory_complete);
     assert_eq!(progress.email_cursor, base);
     assert_eq!(
@@ -493,8 +488,7 @@ pub(super) fn exercise(
     );
     drop(publisher);
     let progress =
-        td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
-            .unwrap();
+        td_mta::postgres_replica_progress::inspect(&owner, deadline(), local, account).unwrap();
     assert_eq!(progress.email_cursor, base);
     let pending = progress.pending.unwrap();
     assert_eq!(
@@ -526,8 +520,7 @@ pub(super) fn exercise(
         }
     );
     let progress =
-        td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
-            .unwrap();
+        td_mta::postgres_replica_progress::inspect(&owner, deadline(), local, account).unwrap();
     assert_eq!(
         sql(
             &fixture,
@@ -643,8 +636,7 @@ pub(super) fn exercise(
     drop(publisher);
     let mut publisher = open();
     let progress =
-        td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
-            .unwrap();
+        td_mta::postgres_replica_progress::inspect(&owner, deadline(), local, account).unwrap();
     assert!(!progress.inventory_complete);
     assert_eq!(progress.inventory_cursor, Some(cursor));
     assert!(progress.pending.unwrap().complete());

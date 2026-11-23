@@ -294,7 +294,6 @@ impl Writer {
         self,
         producer: &Producer,
         loaded: &Loaded,
-        executable: &std::path::Path,
         epoch: StoreEpoch,
         profile: &str,
         finished: &AtomicBool,
@@ -345,9 +344,8 @@ impl Writer {
                 || last_maintenance
                     .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(60))
             {
-                let result = postgres_logs::append_resolved_mode(
+                let result = postgres_logs::append_loaded_mode(
                     loaded,
-                    executable,
                     Instant::now() + Duration::from_secs(2),
                     epoch,
                     profile,

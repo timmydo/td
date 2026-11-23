@@ -1,6 +1,5 @@
 use super::{deadline, relay_wire as wire, sql, Fixture, PASSWORD};
 use std::sync::{Arc, Mutex};
-use td_crypto::TrustStore;
 use td_mta::{
     clock::RuntimeClock,
     ids::SubmissionId,
@@ -18,7 +17,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -29,7 +27,7 @@ pub(super) fn exercise(
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
         sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},0,'0@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         let clock = Arc::new(RuntimeClock::new());
         let guard = Arc::new(Mutex::new(
             Guard::new(Time {
@@ -44,8 +42,7 @@ pub(super) fn exercise(
             .unwrap(),
         ));
         let runtime = Request {
-            address: request.address,
-            server_name: request.server_name,
+            socket: request.socket,
             user: "mail_runtime",
             database: request.database,
             password: PASSWORD,
@@ -56,7 +53,6 @@ pub(super) fn exercise(
         let worker = dispatch::Dispatches {
             connection: dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &slots,
                 clock: clock.clone(),
             },
@@ -206,7 +202,7 @@ pub(super) fn exercise(
                         )
                         .unwrap();
                         assert_eq!(
-                            phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                            phases::inspect(&runtime, deadline(), &value).unwrap(),
                             Some(rejected.outcome)
                         );
                         drop(rejected.buffers.unwrap());
@@ -239,7 +235,7 @@ pub(super) fn exercise(
                             )
                             .unwrap();
                             assert_eq!(
-                                phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                                phases::inspect(&runtime, deadline(), &value).unwrap(),
                                 Some(outcome)
                             );
                             terminal = true;

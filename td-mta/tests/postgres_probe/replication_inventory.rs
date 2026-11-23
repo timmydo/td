@@ -3,13 +3,12 @@ use super::*;
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     password: &[u8],
 ) {
     use td_mta::{ids::EmailId, postgres_read as read};
     let inventory = |cursor, maximum| {
-        read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        read::with_snapshot(request, deadline(), binding, password, |view| {
             view.replica_inventory(cursor, maximum)
         })
     };
@@ -33,7 +32,7 @@ pub(super) fn exercise(
     let shifted = sql(fixture, &format!("SELECT encode(id,'hex') FROM td_mta.emails WHERE account=decode('{account}','hex') ORDER BY id OFFSET 1"));
     assert_eq!(shifted, original.ids[2].to_string());
     assert_eq!(inventory(Some(cursor), 256).unwrap().ids, original.ids[2..]);
-    let changed = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    let changed = read::with_snapshot(request, deadline(), binding, password, |view| {
         view.changes(td_mta::sync::DataType::Email, first.base, 256, &mut || {
             Ok(())
         })
@@ -84,7 +83,7 @@ pub(super) fn exercise(
         .unwrap()
         .ids
         .contains(&transient));
-    let created = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    let created = read::with_snapshot(request, deadline(), binding, password, |view| {
         view.changes(td_mta::sync::DataType::Email, fresh.base, 256, &mut || {
             Ok(())
         })
@@ -95,7 +94,7 @@ pub(super) fn exercise(
     sql(fixture, &format!(
         "BEGIN; DELETE FROM td_mta.emails WHERE account=decode('{account}','hex') AND id=decode('{transient}','hex'); UPDATE td_mta.accounts SET sequence=decode('0000000000000008','hex') WHERE id=decode('{account}','hex'); INSERT INTO td_mta.changes VALUES (decode('{account}','hex'),decode('0000000000000008','hex'),1,3,3,decode('{transient}','hex')); COMMIT;"
     ));
-    let coalesced = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    let coalesced = read::with_snapshot(request, deadline(), binding, password, |view| {
         view.changes(td_mta::sync::DataType::Email, fresh.base, 256, &mut || {
             Ok(())
         })
@@ -103,16 +102,15 @@ pub(super) fn exercise(
     .unwrap();
     assert!(coalesced.changes.is_empty());
     assert_eq!(coalesced.new_state.sequence.number(), 8);
-    let after_creation =
-        read::with_snapshot(request, trust, deadline(), binding, password, |view| {
-            view.changes(
-                td_mta::sync::DataType::Email,
-                created.new_state,
-                256,
-                &mut || Ok(()),
-            )
-        })
-        .unwrap();
+    let after_creation = read::with_snapshot(request, deadline(), binding, password, |view| {
+        view.changes(
+            td_mta::sync::DataType::Email,
+            created.new_state,
+            256,
+            &mut || Ok(()),
+        )
+    })
+    .unwrap();
     assert_eq!(after_creation.changes.len(), 1);
     assert_eq!(
         after_creation.changes.first().unwrap().action,

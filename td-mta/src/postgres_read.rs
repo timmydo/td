@@ -11,7 +11,6 @@ use crate::{
     postgres_schema, postgres_snapshot,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[path = "postgres_read_search.rs"]
 mod search_reads;
@@ -35,7 +34,6 @@ pub use crate::email_response::{EmailValues as Values, MAX_EMAIL_VALUES as MAX_V
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
-    Resolution(crate::postgres_resolver::Error),
     Schema(postgres_schema::Error),
     Credential(postgres_devices::Error),
     Epoch,
@@ -386,7 +384,6 @@ fn authentication(
 
 pub fn with_snapshot<T>(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     binding: &Binding,
     password: &[u8],
@@ -394,7 +391,7 @@ pub fn with_snapshot<T>(
 ) -> Result<T, Error> {
     // Existing preparation callers already reserve their worker externally.
     let slots = ReadSlots::new(1)?;
-    let mut view = Snapshot::open(&slots, request, trust, deadline, binding, password)?;
+    let mut view = Snapshot::open(&slots, request, deadline, binding, password)?;
     view.check()?;
     let result = read(&mut view);
     view.check()?;
@@ -406,7 +403,6 @@ impl<'a> Snapshot<'a> {
     pub fn open_runtime(
         slots: &'a ReadSlots,
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         binding: &Binding,
         password: &[u8],
@@ -414,20 +410,19 @@ impl<'a> Snapshot<'a> {
         if request.mode != binding.runtime_mode() {
             return Err(Error::Invalid);
         }
-        Self::open(slots, request, trust, deadline, binding, password)
+        Self::open(slots, request, deadline, binding, password)
     }
-    /// Endpoint resolution and primary snapshot admission share one reserved slot and
-    /// original allowance. Only transport connection failures try another
-    /// resolved address; policy, authentication and database failures refuse.
-    pub fn open_resolved(
+    /// Primary snapshot admission over the bootstrap's socket, in one reserved
+    /// slot and the original allowance; policy, authentication and database
+    /// failures refuse.
+    pub fn open_loaded(
         slots: &'a ReadSlots,
         loaded: &crate::postgres_input::Loaded,
-        executable: &std::path::Path,
         deadline: Instant,
         binding: &Binding,
         password: &[u8],
     ) -> Result<Self, Error> {
-        if !executable.is_absolute() || loaded.bootstrap.profile() != binding.profile() {
+        if loaded.bootstrap.profile() != binding.profile() {
             return Err(Error::Invalid);
         }
         if !binding.roles().jmap() {
@@ -448,12 +443,11 @@ impl<'a> Snapshot<'a> {
             device: presented.id(),
             deadline,
         }
-        .reopen(loaded, executable, password)
+        .reopen(loaded, password)
     }
     fn open(
         slots: &'a ReadSlots,
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         binding: &Binding,
         password: &[u8],
@@ -469,8 +463,7 @@ impl<'a> Snapshot<'a> {
                 .ok_or(Error::Invalid)?,
         );
         let permit = slots.acquire()?;
-        let (worker, identity) =
-            connect_authenticated(request, trust, deadline, binding, presented)?;
+        let (worker, identity) = connect_authenticated(request, deadline, binding, presented)?;
         Self::from_worker(permit, worker, identity, deadline, binding, device)
     }
     fn from_worker(
@@ -537,14 +530,12 @@ impl<'a> Snapshot<'a> {
 }
 fn connect_authenticated(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     binding: &Binding,
     presented: Presented,
 ) -> Result<(Worker, ViewIdentity), Error> {
     let binding = binding.clone();
-    let mut worker =
-        postgres_probe::body_worker(request, trust, deadline).map_err(Error::Connection)?;
+    let mut worker = postgres_probe::body_worker(request, deadline).map_err(Error::Connection)?;
     let identity = worker
         .run(|client| postgres_snapshot::begin(client, &binding, presented).map_err(snapshot_error))
         .map_err(Error::Connection)??;
@@ -583,15 +574,14 @@ impl<'a> Snapshot<'a> {
     }
 }
 impl<'a> BetweenMethods<'a> {
-    /// Endpoint resolution, runtime-role qualification and full credential authentication
-    /// on the original profile/account binding and reserved capacity.
+    /// Runtime-role qualification and full credential authentication on the
+    /// original profile/account binding and reserved capacity.
     pub fn reopen(
         self,
         loaded: &crate::postgres_input::Loaded,
-        executable: &std::path::Path,
         password: &[u8],
     ) -> Result<Snapshot<'a>, Error> {
-        if !executable.is_absolute() || loaded.bootstrap.profile() != self.binding.profile() {
+        if loaded.bootstrap.profile() != self.binding.profile() {
             return Err(Error::Invalid);
         }
         let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
@@ -602,48 +592,21 @@ impl<'a> BetweenMethods<'a> {
         if now >= self.deadline {
             return Err(Error::Connection(postgres_probe::Error::Deadline));
         }
-        let dns_deadline = self.deadline.min(
-            now.checked_add(std::time::Duration::from_secs(5))
-                .ok_or(Error::Invalid)?,
-        );
-        let addresses =
-            crate::postgres_resolver::resolve(executable, &loaded.bootstrap, dns_deadline)
-                .map_err(|error| match error {
-                    crate::postgres_resolver::Error::Deadline => {
-                        Error::Connection(postgres_probe::Error::Deadline)
-                    }
-                    error => Error::Resolution(error),
-                })?;
-        for address in addresses {
-            let mut request = loaded.bootstrap.request(address);
-            request.mode = self.binding.runtime_mode();
-            let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
-            let result = connect_authenticated(
-                &request,
-                &loaded.trust,
-                self.deadline,
-                &self.binding,
-                presented,
-            );
-            if Instant::now() >= self.deadline {
-                return Err(Error::Connection(postgres_probe::Error::Deadline));
-            }
-            match result {
-                Ok((worker, identity)) => {
-                    return Snapshot::from_worker(
-                        self.permit,
-                        worker,
-                        identity,
-                        self.deadline,
-                        &self.binding,
-                        self.device,
-                    )
-                }
-                Err(Error::Connection(postgres_probe::Error::Transport)) => (),
-                Err(error) => return Err(error),
-            }
+        let mut request = loaded.bootstrap.request();
+        request.mode = self.binding.runtime_mode();
+        let result = connect_authenticated(&request, self.deadline, &self.binding, presented);
+        if Instant::now() >= self.deadline {
+            return Err(Error::Connection(postgres_probe::Error::Deadline));
         }
-        Err(Error::Connection(postgres_probe::Error::Transport))
+        let (worker, identity) = result?;
+        Snapshot::from_worker(
+            self.permit,
+            worker,
+            identity,
+            self.deadline,
+            &self.binding,
+            self.device,
+        )
     }
 }
 

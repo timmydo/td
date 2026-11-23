@@ -1,5 +1,5 @@
 //! Explicit immutable material preparation; no configuration activation.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -108,11 +108,10 @@ pub(super) fn run(
         }
     };
     let connection = loaded.connection();
-    let result = with_addresses(connection, |request, deadline| {
+    let result = with_connection(connection, |request, deadline| {
         match operation {
             Operation::Import => postgres_materials::insert(
                 request,
-                &connection.trust,
                 deadline,
                 options.epoch,
                 options.version,
@@ -121,7 +120,6 @@ pub(super) fn run(
             ),
             Operation::Check => postgres_materials::read(
                 request,
-                &connection.trust,
                 deadline,
                 options.epoch,
                 options.version,

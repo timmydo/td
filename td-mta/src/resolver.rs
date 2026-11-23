@@ -1,19 +1,15 @@
-//! Deadline-bounded system resolution in an owned, self-expiring helper.
-use crate::postgres_bootstrap::{valid_host, Bootstrap};
-use crate::postgres_probe::Endpoint;
+//! Deadline-bounded system resolution of an outbound HTTPS host in an
+//! owned, self-expiring helper.
 use std::{
     io::{self, Read, Write},
     net::{IpAddr, ToSocketAddrs},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
 const MAX_DURATION: Duration = Duration::from_secs(5);
-// getaddrinfo supplies no authoritative DNS TTL.
-const REUSE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_ADDRESSES: usize = 16;
 const MAX_REPLY: usize = 1024;
 const HEADER: &str = "td-mta-dns-1";
@@ -25,84 +21,11 @@ pub enum Error {
     Spawn,
     Resolver,
     Protocol,
-    Capacity,
-}
-
-/// executable is the caller's trusted td-mta binary, not a shell or command.
-/// A parsed TCP bootstrap owns one short-lived positive answer.
-pub fn resolve(
-    executable: &Path,
-    bootstrap: &Bootstrap,
-    deadline: Instant,
-) -> Result<Vec<Endpoint>, Error> {
-    if let Some(path) = bootstrap.socket() {
-        remaining_time(deadline)?;
-        return Ok(vec![Endpoint::Unix(*path)]);
-    }
-    if !executable.is_absolute() || remaining(deadline)? > MAX_DURATION {
-        return Err(Error::Invalid);
-    }
-    let host = bootstrap.host().ok_or(Error::Invalid)?;
-    let endpoints = bootstrap
-        .addresses
-        .resolve(Instant::now, bootstrap.port(), || {
-            resolve_host(executable, host, deadline)
-        })?;
-    remaining_time(deadline)?;
-    Ok(endpoints)
-}
-
-struct Answer {
-    started: Instant,
-    addresses: Vec<IpAddr>,
-}
-
-#[derive(Default)]
-pub(crate) struct Cache(Mutex<Option<Answer>>);
-
-impl Cache {
-    fn resolve(
-        &self,
-        clock: impl Fn() -> Instant,
-        port: u16,
-        lookup: impl FnOnce() -> Result<Vec<IpAddr>, Error>,
-    ) -> Result<Vec<Endpoint>, Error> {
-        if let Ok(current) = self.0.try_lock() {
-            if let Some(answer) = current.as_ref() {
-                if clock()
-                    .checked_duration_since(answer.started)
-                    .is_some_and(|age| age < REUSE_WINDOW)
-                {
-                    return endpoints(&answer.addresses, port);
-                }
-            }
-        }
-        // Resolve outside the lock. Callers keep independent deadlines on a miss.
-        let started = clock();
-        let addresses = lookup()?;
-        let endpoints = endpoints(&addresses, port)?;
-        if let Ok(mut current) = self.0.try_lock() {
-            if current
-                .as_ref()
-                .is_none_or(|answer| answer.started <= started)
-            {
-                *current = Some(Answer { started, addresses });
-            }
-        }
-        Ok(endpoints)
-    }
-}
-
-fn endpoints(addresses: &[IpAddr], port: u16) -> Result<Vec<Endpoint>, Error> {
-    let mut endpoints = td_alloc::with_capacity(addresses.len()).map_err(|_| Error::Capacity)?;
-    for &address in addresses {
-        td_alloc::push(&mut endpoints, Endpoint::Tcp((address, port).into()))
-            .map_err(|_| Error::Capacity)?;
-    }
-    Ok(endpoints)
 }
 
 /// Bounded resolution for one already-authorized service endpoint.
+/// `executable` is the caller's trusted td-mta binary, not a shell or
+/// command.
 pub fn resolve_host(
     executable: &Path,
     host: &str,
@@ -111,14 +34,9 @@ pub fn resolve_host(
     if !executable.is_absolute() {
         return Err(Error::Invalid);
     }
-    let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbResolve);
     let mut command = Command::new(executable);
-    command.arg("--internal-postgres-resolve");
-    let result = resolve_command(command, host, deadline);
-    if result.is_ok() {
-        timing.succeeded();
-    }
-    result
+    command.arg("--internal-resolve");
+    resolve_command(command, host, deadline)
 }
 
 fn resolve_command(
@@ -290,122 +208,74 @@ fn helper_reply(input: &mut impl Read, output: &mut impl Write) -> Result<(), Er
     output.flush().map_err(|_| Error::Protocol)
 }
 
+/// A DNS name the helper may resolve: never an IP literal, numeric
+/// shorthand or encoded host.
+fn valid_host(host: &str) -> bool {
+    !(host.is_empty()
+        || host.len() > 253
+        || host.parse::<IpAddr>().is_ok()
+        || host
+            .rsplit('.')
+            .next()
+            .is_some_and(|label| label.bytes().all(|b| b.is_ascii_digit()))
+        || host.split('.').all(numeric_label)
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && label
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+                && label
+                    .bytes()
+                    .last()
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+        }))
+}
+
+// Refuse decimal/octal/hex IPv4 shorthand independently of resolver behavior.
+fn numeric_label(label: &str) -> bool {
+    if label.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
-    fn positive_answers_expire_from_lookup_start_and_errors_are_not_retained() {
-        let cache = Cache::default();
-        let first = IpAddr::from([192, 0, 2, 1]);
-        let next = IpAddr::from([192, 0, 2, 2]);
-        let now = Instant::now();
-        let deadline = now + REUSE_WINDOW;
-        let cold = cache
-            .resolve(|| now, 1234, || Ok(vec![next, first]))
-            .unwrap();
-        assert_eq!(cold, endpoints(&[next, first], 1234).unwrap());
-        assert_eq!(
-            td_alloc::with_reservation_limit(0, || cache.resolve(
-                || now,
-                1234,
-                || Err(Error::Spawn)
-            )),
-            Err(Error::Capacity)
-        );
-        assert_eq!(
-            cache.resolve(
-                || deadline - Duration::from_nanos(1),
-                1234,
-                || Err(Error::Spawn)
-            ),
-            Ok(cold),
-        );
-        assert_eq!(
-            cache.resolve(|| deadline, 1234, || Err(Error::Resolver)),
-            Err(Error::Resolver)
-        );
-        assert_eq!(
-            cache
-                .resolve(|| deadline, 1234, || Ok(vec![first]))
-                .unwrap(),
-            endpoints(&[first], 1234).unwrap()
-        );
-        let other = Cache::default();
-        assert_eq!(
-            other.resolve(|| deadline, 1234, || Err(Error::Spawn)),
-            Err(Error::Spawn)
-        );
-    }
-
-    #[test]
-    fn slow_lookup_does_not_get_another_window_on_completion() {
-        let cache = Cache::default();
-        let now = std::cell::Cell::new(Instant::now());
-        let first = IpAddr::from([192, 0, 2, 1]);
-        cache
-            .resolve(
-                || now.get(),
-                5432,
-                || {
-                    now.set(now.get() + REUSE_WINDOW);
-                    Ok(vec![first])
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            cache.resolve(|| now.get(), 5432, || Err(Error::Spawn)),
-            Err(Error::Spawn)
-        );
-    }
-
-    #[test]
-    fn a_warm_bootstrap_still_enforces_the_callers_limits() {
-        let bootstrap = Bootstrap::parse("postgresql://u:p@localhost/db", "frontend").unwrap();
-        let first = IpAddr::from([192, 0, 2, 1]);
-        let now = Instant::now();
-        let expected = bootstrap
-            .addresses
-            .resolve(|| now, 5432, || Ok(vec![first]))
-            .unwrap();
-        let absent_helper = Path::new("/unused-helper");
-        assert_eq!(
-            resolve(absent_helper, &bootstrap, now),
-            Err(Error::Deadline)
-        );
-        let too_long = now + MAX_DURATION + Duration::from_secs(5);
-        assert_eq!(
-            resolve(absent_helper, &bootstrap, too_long),
-            Err(Error::Invalid)
-        );
-        let allowed = now + MAX_DURATION;
-        assert_eq!(
-            resolve(Path::new("td-mta"), &bootstrap, allowed),
-            Err(Error::Invalid)
-        );
-        assert_eq!(resolve(absent_helper, &bootstrap, allowed), Ok(expected));
-    }
-
-    #[test]
-    fn overlapping_lookups_keep_the_newer_answer() {
-        let cache = Cache::default();
-        let first = IpAddr::from([192, 0, 2, 1]);
-        let next = IpAddr::from([192, 0, 2, 2]);
-        let now = Instant::now();
-        let later = now + Duration::from_millis(10);
-        cache
-            .resolve(
-                || now,
-                5432,
-                || {
-                    cache.resolve(|| later, 5432, || Ok(vec![next]))?;
-                    Ok(vec![first])
-                },
-            )
-            .unwrap();
-        let cached = cache.resolve(|| later, 5432, || Err(Error::Spawn)).unwrap();
-        assert_eq!(cached, endpoints(&[next], 5432).unwrap());
+    fn only_dns_names_are_resolved() {
+        for host in ["localhost", "db.example", "acme-v02.api.letsencrypt.org"] {
+            assert!(valid_host(host), "{host}");
+        }
+        for host in [
+            "",
+            "127.0.0.1",
+            "127.1",
+            "2130706433",
+            "1.0x1",
+            "0X7F000001",
+            "name.123",
+            "::1",
+            "[::1]",
+            "a,b",
+            "-host",
+            "host-",
+            "a..b",
+        ] {
+            assert!(!valid_host(host), "{host}");
+        }
+        assert!(!valid_host(&format!("{}.example", "a".repeat(64))));
+        assert!(!valid_host(&"a.".repeat(127)));
     }
 
     #[test]
@@ -446,11 +316,7 @@ mod tests {
     #[test]
     fn parent_deadline_kills_and_reaps_stalled_helper() {
         let mut command = Command::new(std::env::current_exe().unwrap());
-        command.args([
-            "--exact",
-            "postgres_resolver::tests::stalled_helper",
-            "--ignored",
-        ]);
+        command.args(["--exact", "resolver::tests::stalled_helper", "--ignored"]);
         let start = Instant::now();
         assert_eq!(
             resolve_command(command, "localhost", start + Duration::from_millis(50)),
@@ -468,11 +334,7 @@ mod tests {
     #[test]
     fn child_watchdog_exits_without_parent_cancellation() {
         let child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "postgres_resolver::tests::expiring_helper",
-                "--ignored",
-            ])
+            .args(["--exact", "resolver::tests::expiring_helper", "--ignored"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

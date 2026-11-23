@@ -8,11 +8,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub enum Phase {
-    DbResolve,
     DbConnect,
-    DbTcp,
     DbHandshake,
-    DbTls,
     DbSchema,
     DbRuntime,
     DbWork,
@@ -64,11 +61,8 @@ pub enum Phase {
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
-        Self::DbResolve,
         Self::DbConnect,
-        Self::DbTcp,
         Self::DbHandshake,
-        Self::DbTls,
         Self::DbSchema,
         Self::DbRuntime,
         Self::DbWork,
@@ -120,11 +114,8 @@ impl Phase {
     ];
     pub const fn code(self) -> &'static str {
         match self {
-            Self::DbResolve => "db_resolve",
             Self::DbConnect => "db_connect",
-            Self::DbTcp => "db_tcp",
             Self::DbHandshake => "db_handshake",
-            Self::DbTls => "db_tls",
             Self::DbSchema => "db_schema",
             Self::DbRuntime => "db_runtime",
             Self::DbWork => "db_work",

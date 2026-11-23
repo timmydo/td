@@ -6,7 +6,6 @@ use crate::{
     postgres_route_owners::{self as owners, Claim},
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 pub const PAGE_SIZE: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,13 +50,12 @@ pub struct Page {
 /// recovery belong to the selected route. A positive hint proves no eligibility.
 pub fn idle_observation(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
 ) -> Result<Option<i64>, Error> {
     let claim = claim.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         let current_policy = owners::begin(client, &claim, true, false).map_err(Error::Owner)?;
         if !current_policy {
             return Err(Error::Policy);
@@ -87,7 +85,6 @@ fn idle_query(
 pub struct IdleReader<'a, 'r> {
     slots: &'a crate::postgres_read::ReadSlots,
     request: &'a Request<'r>,
-    trust: &'a TrustStore,
     subscription: u64,
     session: Option<(
         postgres_probe::ReadSession,
@@ -95,15 +92,10 @@ pub struct IdleReader<'a, 'r> {
     )>,
 }
 impl<'a, 'r> IdleReader<'a, 'r> {
-    pub fn new(
-        slots: &'a crate::postgres_read::ReadSlots,
-        request: &'a Request<'r>,
-        trust: &'a TrustStore,
-    ) -> Self {
+    pub fn new(slots: &'a crate::postgres_read::ReadSlots, request: &'a Request<'r>) -> Self {
         Self {
             slots,
             request,
-            trust,
             subscription: 0,
             session: None,
         }
@@ -192,7 +184,7 @@ impl<'a, 'r> IdleReader<'a, 'r> {
         let reused = self.session.is_some();
         if self.session.is_none() {
             let permit = self.slots.acquire().map_err(|_| Error::Busy)?;
-            let mut session = postgres_probe::ReadSession::open(self.request, self.trust, deadline)
+            let mut session = postgres_probe::ReadSession::open(self.request, deadline)
                 .map_err(Error::Connection)?;
             session.listen_relay(deadline).map_err(Error::Connection)?;
             self.subscription = self.subscription.checked_add(1).ok_or(Error::Capacity)?;
@@ -254,7 +246,6 @@ impl Drop for IdleReader<'_, '_> {
 /// still requires confirmed clock admission and a closed/fenced transport.
 pub fn scan(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
@@ -269,7 +260,7 @@ pub fn scan(
         return Err(Error::Cursor);
     }
     let claim = claim.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
             if !owners::begin(client, &claim, true, false).map_err(Error::Owner)? {
                 return Err(Error::Policy);
             }

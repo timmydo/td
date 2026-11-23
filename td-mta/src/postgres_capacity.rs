@@ -19,17 +19,16 @@ fn metric(scope: &str, name: &str, used: Option<u64>, limit: u64, kind: &str) ->
 /// policy must remain unchanged through the observation. This is not an audit.
 pub fn inspect(
     request: &postgres_probe::Request<'_>,
-    trust: &td_crypto::TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
 ) -> Result<Json, Error> {
-    let selected = postgres_selection::observe(request, trust, deadline, epoch)
+    let selected = postgres_selection::observe(request, deadline, epoch)
         .map_err(|_| Error)?
         .ok_or_else(failed)?;
-    let sources = versions::read_sources(request, trust, deadline, epoch, selected.version)
-        .map_err(|_| Error)?;
+    let sources =
+        versions::read_sources(request, deadline, epoch, selected.version).map_err(|_| Error)?;
     let (mut rows, quotas) = configured(&sources)?;
-    let db = postgres_probe::with_capacity_client(request,trust,deadline, |client| {
+    let db = postgres_probe::with_capacity_client(request,deadline, |client| {
             let schema = client.inspect_schema().map_err(|_| ())?;
             if schema.store_epoch != epoch { return Err(()); }
             client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout=5000; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| ())?;
@@ -39,9 +38,7 @@ pub fn inspect(
         }).map_err(|_| failed())?.map_err(|_| failed())?;
     rows.extend(db);
     // A selection change cannot silently pair new counters with old policy.
-    if postgres_selection::observe(request, trust, deadline, epoch).map_err(|_| Error)?
-        != Some(selected)
-    {
+    if postgres_selection::observe(request, deadline, epoch).map_err(|_| Error)? != Some(selected) {
         return Err(failed());
     }
     Ok(

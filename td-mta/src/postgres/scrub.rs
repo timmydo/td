@@ -1,5 +1,5 @@
 //! Scheduled scrub step and freshness check; each invocation is finite.
-use super::{report_error, scrub_state::FileState, with_addresses};
+use super::{report_error, scrub_state::FileState, with_connection};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -80,10 +80,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>, status: bool) -> io::Res
                 "blob-scrub",
             )
             .map_err(|_| "scrub-connection")?;
-            with_addresses(&loaded, |request, deadline| {
+            with_connection(&loaded, |request, deadline| {
                 postgres_blob_scrub::inspect(
                     request,
-                    &loaded.trust,
                     deadline,
                     options.epoch,
                     postgres_blob_scrub::Options {

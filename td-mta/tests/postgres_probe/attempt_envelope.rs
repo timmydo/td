@@ -1,5 +1,4 @@
 use super::{deadline, sql, Fixture};
-use td_crypto::TrustStore;
 use td_mta::{
     ids::SubmissionId,
     postgres_attempt_phases as phases, postgres_attempts as attempts,
@@ -11,7 +10,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -20,15 +18,14 @@ pub(super) fn exercise(
     let sub = format!("decode('{submission}','hex')");
     let src = format!("decode('{source}','hex')");
     sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,105,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},n,n::text||'@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions CROSS JOIN generate_series(0,104) n WHERE id={sub}"));
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     let dispatch = attempts::prepare(claim, generation, submission).unwrap();
     assert_eq!(
-        attempts::envelope(request, trust, deadline(), &dispatch),
+        attempts::envelope(request, deadline(), &dispatch),
         Err(attempts::Error::Missing)
     );
     let outcome =
-        super::attempt_clock::fresh_publish(fixture, request, trust, deadline(), &dispatch)
-            .unwrap();
+        super::attempt_clock::fresh_publish(fixture, request, deadline(), &dispatch).unwrap();
     assert_eq!(outcome.ordinals.len(), 100);
     let clock = std::sync::Arc::new(td_mta::clock::RuntimeClock::new());
     let guard = std::sync::Arc::new(std::sync::Mutex::new(
@@ -46,12 +43,11 @@ pub(super) fn exercise(
         .unwrap(),
     ));
     assert_eq!(
-        attempts::publish_new(request, trust, deadline(), &dispatch, clock, guard),
+        attempts::publish_new(request, deadline(), &dispatch, clock, guard),
         Err(attempts::Error::Conflict)
     );
     assert_eq!(
-        super::attempt_clock::fresh_publish(fixture, request, trust, deadline(), &dispatch)
-            .unwrap(),
+        super::attempt_clock::fresh_publish(fixture, request, deadline(), &dispatch).unwrap(),
         outcome
     );
 
@@ -59,9 +55,8 @@ pub(super) fn exercise(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
     );
-    let envelope = attempts::envelope(request, trust, deadline(), &dispatch).unwrap();
-    let (observed, limit) =
-        super::attempt_clock::observed_envelope(fixture, request, trust, &dispatch);
+    let envelope = attempts::envelope(request, deadline(), &dispatch).unwrap();
+    let (observed, limit) = super::attempt_clock::observed_envelope(fixture, request, &dispatch);
     assert_eq!(observed, envelope);
     assert!(limit > std::time::Instant::now());
     assert!(limit <= deadline());
@@ -89,14 +84,14 @@ pub(super) fn exercise(
     );
     sql(fixture,"CREATE TABLE public.envelope_health AS SELECT * FROM td_mta.route_health; DELETE FROM td_mta.route_health; INSERT INTO td_mta.route_health SELECT account,route_name,destination,decode('0000000000000001','hex'),1,3,t,t+300000,NULL FROM td_mta.route_owners CROSS JOIN (SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint t) x");
     assert_eq!(
-        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        super::attempt_clock::fresh_envelope(fixture, request, &dispatch),
         Err(attempts::Error::RouteHealth(
             td_mta::postgres_route_health::Error::Backoff
         ))
     );
     sql(fixture,"UPDATE td_mta.route_health SET reason=4,repair_generation=decode('0000000000000001','hex')");
     assert_eq!(
-        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        super::attempt_clock::fresh_envelope(fixture, request, &dispatch),
         Err(attempts::Error::RouteHealth(
             td_mta::postgres_route_health::Error::RepairRequired
         ))
@@ -108,8 +103,7 @@ pub(super) fn exercise(
     );
     sql(fixture, &format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+5000 WHERE id={sub}"));
     let ceiling = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let (_, cap) =
-        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch).unwrap();
+    let (_, cap) = super::attempt_clock::fresh_envelope(fixture, request, &dispatch).unwrap();
     assert!(cap <= ceiling);
     assert!(cap > std::time::Instant::now());
     sql(
@@ -117,7 +111,7 @@ pub(super) fn exercise(
         &format!("UPDATE td_mta.submissions SET expires_at=send_at WHERE id={sub}"),
     );
     assert_eq!(
-        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        super::attempt_clock::fresh_envelope(fixture, request, &dispatch),
         Err(attempts::Error::NotDue)
     );
     sql(
@@ -137,11 +131,11 @@ pub(super) fn exercise(
             ),
         );
         assert_eq!(
-            attempts::envelope(request, trust, deadline(), &dispatch),
+            attempts::envelope(request, deadline(), &dispatch),
             Err(attempts::Error::Integrity)
         );
         assert_eq!(
-            super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+            super::attempt_clock::fresh_envelope(fixture, request, &dispatch),
             Err(attempts::Error::Integrity)
         );
         sql(fixture,&format!("UPDATE td_mta.recipients SET address='0@example.test',next_attempt_at=NULL,reason=0 WHERE submission_id={sub} AND ordinal=0"));
@@ -150,7 +144,7 @@ pub(super) fn exercise(
         fixture,
         &format!("UPDATE td_mta.submissions SET reverse_path='' WHERE id={sub}"),
     );
-    assert!(attempts::envelope(request, trust, deadline(), &dispatch)
+    assert!(attempts::envelope(request, deadline(), &dispatch)
         .unwrap()
         .reverse_path
         .is_empty());
@@ -159,43 +153,43 @@ pub(super) fn exercise(
         &format!("UPDATE td_mta.submissions SET reverse_path='invalid' WHERE id={sub}"),
     );
     assert_eq!(
-        attempts::envelope(request, trust, deadline(), &dispatch),
+        attempts::envelope(request, deadline(), &dispatch),
         Err(attempts::Error::Integrity)
     );
     sql(fixture,&format!("UPDATE td_mta.submissions SET reverse_path=convert_from(decode('{reverse}','hex'),'UTF8') WHERE id={sub}"));
     let refusal =
         phases::refused_rcpt(claim, generation, dispatch.attempt(), &[(0, "450 later")]).unwrap();
-    phases::publish(request, trust, deadline(), &refusal).unwrap();
+    phases::publish(request, deadline(), &refusal).unwrap();
     assert_eq!(
-        attempts::envelope(request, trust, deadline(), &dispatch),
+        attempts::envelope(request, deadline(), &dispatch),
         Err(attempts::Error::Conflict)
     );
     assert_eq!(
-        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        super::attempt_clock::fresh_envelope(fixture, request, &dispatch),
         Err(attempts::Error::Conflict)
     );
     let cancellation = cancel::prepare(claim, generation, submission).unwrap();
-    cancel::publish(request, trust, deadline(), &cancellation, |_| Ok(())).unwrap();
+    cancel::publish(request, deadline(), &cancellation, |_| Ok(())).unwrap();
     assert_eq!(
-        attempts::envelope(request, trust, deadline(), &dispatch),
+        attempts::envelope(request, deadline(), &dispatch),
         Err(attempts::Error::Missing)
     );
     sql(fixture,&format!("UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,rcpt_reply=NULL,data_reply=NULL,reason=0,diagnostic='' WHERE submission_id={sub}; UPDATE td_mta.submissions SET completed_at=NULL WHERE id={sub}"));
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
     let dispatch = attempts::prepare(claim, generation, submission).unwrap();
-    super::attempt_clock::fresh_publish(fixture, request, trust, deadline(), &dispatch).unwrap();
+    super::attempt_clock::fresh_publish(fixture, request, deadline(), &dispatch).unwrap();
     let body = phases::body(claim, generation, dispatch.attempt(), &[(0, "250 ok")]).unwrap();
-    phases::publish(request, trust, deadline(), &body).unwrap();
+    phases::publish(request, deadline(), &body).unwrap();
     assert_eq!(
-        attempts::envelope(request, trust, deadline(), &dispatch),
+        attempts::envelope(request, deadline(), &dispatch),
         Err(attempts::Error::Conflict)
     );
     assert_eq!(
-        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        super::attempt_clock::fresh_envelope(fixture, request, &dispatch),
         Err(attempts::Error::Conflict)
     );
     let cancellation = cancel::prepare(claim, generation, submission).unwrap();
-    cancel::publish(request, trust, deadline(), &cancellation, |_| Ok(())).unwrap();
+    cancel::publish(request, deadline(), &cancellation, |_| Ok(())).unwrap();
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
 }

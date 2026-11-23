@@ -19,7 +19,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RECEIPTS: i64 = 1024;
@@ -277,12 +277,11 @@ fn receipt(client: &Client, upload: &Upload) -> Result<Option<Outcome>, Error> {
 /// A known receipt remains success after revocation, expiry or policy changes.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     upload: &Upload,
 ) -> Result<Option<Outcome>, Error> {
     let upload = upload.clone();
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mailbox_client(request, deadline, move |client| {
         begin(client, &upload)?;
         client
             .query_one(
@@ -303,12 +302,11 @@ pub fn inspect(
 /// together. On uncertainty retain Upload and resolve this same operation.
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     upload: &Upload,
     password: &[u8],
 ) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, upload)? {
+    if let Some(outcome) = inspect(request, deadline, upload)? {
         return Ok(outcome);
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
@@ -318,7 +316,7 @@ pub fn publish(
     let upload = upload.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_upload_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_upload_client(request, deadline, move |client| {
         begin(client, &upload)?;
         let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).map_err(|_| Error::Database)?;
         let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;

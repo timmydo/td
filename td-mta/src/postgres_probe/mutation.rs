@@ -19,7 +19,6 @@ use std::{
     thread,
     time::Instant,
 };
-use td_crypto::TrustStore;
 
 pub(super) const TURNS: usize = 16;
 
@@ -35,25 +34,19 @@ pub(crate) struct MutationSession {
 impl MutationSession {
     pub(crate) fn open_smtp(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         accounts: usize,
     ) -> Result<Self, Error> {
         if !(1..=crate::config::identities::MAX_ACCOUNTS).contains(&accounts) {
             return Err(Error::Invalid);
         }
-        Self::open_kind(request, trust, deadline, Some(accounts))
+        Self::open_kind(request, deadline, Some(accounts))
     }
-    pub(crate) fn open_renewal(
-        request: &Request<'_>,
-        trust: &TrustStore,
-        deadline: Instant,
-    ) -> Result<Self, Error> {
-        Self::open_kind(request, trust, deadline, None)
+    pub(crate) fn open_renewal(request: &Request<'_>, deadline: Instant) -> Result<Self, Error> {
+        Self::open_kind(request, deadline, None)
     }
     fn open_kind(
         request: &Request<'_>,
-        trust: &TrustStore,
         deadline: Instant,
         accounts: Option<usize>,
     ) -> Result<Self, Error> {
@@ -63,7 +56,6 @@ impl MutationSession {
         let bounds = Bounds::with_turns(Instant::now(), TURNS)?;
         let mut worker = connect_authenticated_until(
             request,
-            trust,
             bounds.expires,
             deadline,
             TURNS * accounts.map_or(128 * 1024, |count| 40 * 1024 * 1024 * count),

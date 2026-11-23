@@ -5,7 +5,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::AccountId, metadata_sweep, postgres_account_audit as audit, postgres_accounts,
     postgres_schema,
@@ -15,8 +14,7 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_account_audit_keeps_metadata_counters_and_bodies_in_one_snapshot() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
@@ -28,20 +26,9 @@ fn real_postgres_account_audit_keeps_metadata_counters_and_bodies_in_one_snapsho
         blobs: 2,
         bytes: 3,
     };
-    let inspect = || {
-        audit::inspect(
-            &fixture.request(),
-            &trust,
-            deadline(),
-            epoch,
-            account,
-            0,
-            limits,
-        )
-    };
+    let inspect = || audit::inspect(&fixture.request(), deadline(), epoch, account, 0, limits);
     postgres_accounts::publish(
         &fixture.request(),
-        &trust,
         deadline(),
         postgres_accounts::prepare(epoch, account).unwrap(),
     )
@@ -49,7 +36,6 @@ fn real_postgres_account_audit_keeps_metadata_counters_and_bodies_in_one_snapsho
     let other = AccountId::from_bytes([2; 16]);
     postgres_accounts::publish(
         &fixture.request(),
-        &trust,
         deadline(),
         postgres_accounts::prepare(epoch, other).unwrap(),
     )
@@ -84,15 +70,7 @@ fn real_postgres_account_audit_keeps_metadata_counters_and_bodies_in_one_snapsho
         audit::Limits { bytes: 2, ..limits },
     ] {
         assert_eq!(
-            audit::inspect(
-                &fixture.request(),
-                &trust,
-                deadline(),
-                epoch,
-                account,
-                0,
-                bounded
-            ),
+            audit::inspect(&fixture.request(), deadline(), epoch, account, 0, bounded),
             Err(audit::Error::Capacity)
         );
     }
@@ -141,7 +119,7 @@ fn real_postgres_account_audit_keeps_metadata_counters_and_bodies_in_one_snapsho
     let request = fixture.request();
     let historical = thread::scope(|scope| {
         let running =
-            scope.spawn(|| audit::inspect(&request, &trust, deadline(), epoch, account, 0, limits));
+            scope.spawn(|| audit::inspect(&request, deadline(), epoch, account, 0, limits));
         wait("SELECT count(*) FROM pg_locks WHERE relation='td_mta.mailboxes'::regclass AND mode='AccessShareLock' AND NOT granted");
         sql(&fixture,"UPDATE td_mta.blob_chunks SET bytes=decode('78797a','hex'); UPDATE td_mta.account_usage SET body_bytes=99 WHERE account=decode(repeat('01',16),'hex'); UPDATE td_mta.accounts SET sequence=decode('0000000000000002','hex') WHERE id=decode(repeat('01',16),'hex')");
         writeln!(locker.0.stdin.as_mut().unwrap(), "INSERT INTO td_mta.mailboxes SELECT account,decode(repeat('09',16),'hex'),'Concurrent duplicate',NULL,role,0,1,decode('0000000000000002','hex') FROM td_mta.mailboxes WHERE account=decode(repeat('01',16),'hex') AND role='inbox'; COMMIT;\n\\q").unwrap();

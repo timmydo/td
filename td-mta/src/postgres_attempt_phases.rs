@@ -14,7 +14,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Provider, SystemEntropy};
 
 #[path = "postgres_phase_current.rs"]
 mod current;
@@ -699,12 +699,11 @@ fn receipt(client: &Client, value: &Fields) -> Result<Option<Outcome>, Error> {
 }
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
 ) -> Result<Option<Outcome>, Error> {
     let value = value.inner.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
         receipt(client, &value)
     })
@@ -712,33 +711,26 @@ pub fn inspect(
 }
 /// Publishes the retained phase or final outcome. Unknown COMMIT requires the
 /// caller to close transport; receipt settlement is historical evidence only.
-pub fn publish(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    value: &Change,
-) -> Result<Outcome, Error> {
-    publish_inner(request, trust, deadline, value, false, None)
+pub fn publish(request: &Request<'_>, deadline: Instant, value: &Change) -> Result<Outcome, Error> {
+    publish_inner(request, deadline, value, false, None)
 }
 /// Publish only a new AcceptancePossible transition. An existing receipt,
 /// including an identical one, refuses; inspect/ordinary publish remain the
 /// historical settlement path. Novelty alone does not authorize SMTP output.
 pub fn publish_new_possible(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
 ) -> Result<Outcome, Error> {
     if value.inner.phase != 3 {
         return Err(Error::Integrity);
     }
-    publish_inner(request, trust, deadline, value, true, None)
+    publish_inner(request, deadline, value, true, None)
 }
 /// New publication with persistent queue-clock observation at admission and
 /// before COMMIT. Neither its receipt nor its clock samples authorize SMTP.
 pub fn publish_new_possible_observed(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
     clock: Arc<dyn Clock>,
@@ -749,7 +741,6 @@ pub fn publish_new_possible_observed(
     }
     publish_inner(
         request,
-        trust,
         deadline,
         value,
         true,
@@ -761,7 +752,6 @@ pub fn publish_new_possible_observed(
 /// live transport admission remain the trusted caller's responsibility.
 pub fn publish_new_body_observed(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
     clock: Arc<dyn Clock>,
@@ -772,7 +762,6 @@ pub fn publish_new_body_observed(
     }
     publish_inner(
         request,
-        trust,
         deadline,
         value,
         true,
@@ -798,13 +787,12 @@ impl From<owners::Error> for Error {
 }
 fn publish_inner(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Change,
     new_only: bool,
     observation: Option<Observation>,
 ) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, value)? {
+    if let Some(outcome) = inspect(request, deadline, value)? {
         return if new_only {
             Err(Error::Conflict)
         } else {
@@ -814,7 +802,7 @@ fn publish_inner(
     let value = value.inner.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_batch_client(request, deadline, move |client| {
         let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
         if let Some(outcome) = receipt(client, &value)? {
             return if new_only {

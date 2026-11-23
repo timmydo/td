@@ -6,7 +6,6 @@ use crate::{
     ids::{AccountId, DeviceId, StoreEpoch, SubmissionCancelId, SubmissionId},
     ports::{self, Clock, Deadline},
     postgres_input::Loaded,
-    postgres_probe,
     postgres_read::ReadSlots,
     postgres_route_owners::Claim,
     postgres_runtime_profile::Binding,
@@ -14,8 +13,7 @@ use crate::{
     postgres_submission_cancel::{self as changes, Cancellation},
 };
 use std::{
-    path::Path,
-    sync::{Arc, Mutex},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -56,14 +54,10 @@ impl Pending {
     pub fn settle(
         &self,
         loaded: &Loaded,
-        executable: &Path,
         slots: &ReadSlots,
         clock: &RuntimeClock,
         until: Deadline,
     ) -> Result<Option<Settled>, Error> {
-        if !executable.is_absolute() {
-            return Err(ports::Error::Invalid.into());
-        }
         let mut pending = self.change.try_lock().map_err(|_| ports::Error::Busy)?;
         if pending.is_none() {
             return Ok(None);
@@ -72,7 +66,7 @@ impl Pending {
         settle_held(&mut pending, loaded, slots, deadline)
     }
 }
-/// Inspect only at the retained endpoint. Frontend and route-owner inspection
+/// Inspect only at the retained socket. Frontend and route-owner inspection
 /// both take the account lock behind the unknown COMMIT, so absence proves
 /// rollback unless another process swept the expired receipt (POSTGRES.md
 /// section 165).
@@ -86,8 +80,8 @@ fn settle_held(
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
-    let connection = settlement::request(loaded, held.endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
+    let connection = settlement::request(loaded);
+    let settled = changes::inspect(&connection, deadline, &held.change)
         .map_err(Error::Publication)?
         .map(|outcome| Settled {
             operation: held.change.operation(),
@@ -105,7 +99,6 @@ pub struct Input {
 }
 pub struct Cancellations<'a> {
     pub loaded: &'a Loaded,
-    pub executable: &'a Path,
     pub binding: &'a Binding,
     pub slots: &'a ReadSlots,
     pub clock: &'a RuntimeClock,
@@ -113,16 +106,15 @@ pub struct Cancellations<'a> {
     pub password: &'a [u8],
 }
 impl Cancellations<'_> {
-    /// The trusted relay owner supplies its claim and an idempotent local abort.
-    /// The callback must obey the publisher's no-SQL/no-SMTP-round-trip contract;
-    /// a connection retry may invoke it again after an aborted transaction.
+    /// The trusted relay owner supplies its claim and a local abort. The
+    /// callback must obey the publisher's no-SQL/no-SMTP-round-trip contract.
     pub fn cancel(
         &self,
         input: Input,
         claim: &Claim,
         generation: u64,
         meter: &mut Meter,
-        close: impl Fn(Instant) -> Result<(), changes::Error> + Send + Sync + 'static,
+        close: impl FnOnce(Instant) -> Result<(), changes::Error> + 'static,
     ) -> Result<changes::Outcome, Error> {
         self.publish(input, Some((claim, generation)), meter, close)
     }
@@ -138,10 +130,9 @@ impl Cancellations<'_> {
         input: Input,
         owner: Option<(&Claim, u64)>,
         meter: &mut Meter,
-        close: impl Fn(Instant) -> Result<(), changes::Error> + Send + Sync + 'static,
+        close: impl FnOnce(Instant) -> Result<(), changes::Error> + 'static,
     ) -> Result<changes::Outcome, Error> {
-        if !self.executable.is_absolute()
-            || !self.binding.roles().jmap()
+        if !self.binding.roles().jmap()
             || self.loaded.bootstrap.profile() != self.binding.profile()
             || input.account != self.binding.account()
             || Presented::parse(self.password).is_none_or(|value| value.id() != input.device)
@@ -190,34 +181,11 @@ impl Cancellations<'_> {
             None => changes::prepare_frontend(input.submission, authorization),
         }
         .map_err(Error::Publication)?;
-        let addresses = addresses(self.loaded, self.executable, deadline)?;
-        let close = Arc::new(close);
-        let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-        let mut endpoint = None;
-        for (index, address) in addresses.into_iter().enumerate() {
-            if index != 0 {
-                charge(meter, self.clock)?;
-            }
-            endpoint = Some(address);
-            let connection = settlement::request(self.loaded, address);
-            let close = close.clone();
-            outcome = changes::publish_authenticated(
-                &connection,
-                &self.loaded.trust,
-                deadline,
-                &change,
-                self.password,
-                move |until| close(until),
-            );
-            if !matches!(
-                outcome,
-                Err(changes::Error::Connection(postgres_probe::Error::Transport))
-            ) {
-                break;
-            }
-        }
-        if let (Err(changes::Error::Indeterminate), Some(endpoint)) = (&outcome, endpoint) {
-            *pending = Some(Retained::new(change, endpoint, self.binding.account()));
+        let connection = settlement::request(self.loaded);
+        let outcome =
+            changes::publish_authenticated(&connection, deadline, &change, self.password, close);
+        if let Err(changes::Error::Indeterminate) = &outcome {
+            *pending = Some(Retained::new(change, self.binding.account()));
         }
         outcome.map_err(Error::Publication)
     }
@@ -253,24 +221,6 @@ fn phase(clock: &RuntimeClock, until: Deadline) -> Result<Instant, ports::Error>
     }
     Ok(deadline)
 }
-fn addresses(
-    loaded: &Loaded,
-    executable: &Path,
-    deadline: Instant,
-) -> Result<Vec<crate::postgres_probe::Endpoint>, ports::Error> {
-    let deadline = deadline.min(
-        Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .ok_or(ports::Error::Invalid)?,
-    );
-    crate::postgres_resolver::resolve(executable, &loaded.bootstrap, deadline).map_err(|error| {
-        match error {
-            crate::postgres_resolver::Error::Deadline => ports::Error::Deadline,
-            _ => ports::Error::Dns,
-        }
-    })
-}
-
 impl crate::jmap_request::dispatch::SubmissionCanceler for Cancellations<'_> {
     fn cancel(&self, input: Input, meter: &mut Meter) -> Result<changes::Outcome, Error> {
         self.cancel_frontend(input, meter)

@@ -12,7 +12,6 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExternalChecks {
@@ -53,7 +52,6 @@ pub struct Report {
 /// no automatic resend or evidence of acceptance is invented.
 pub fn release(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     plan: Plan,
     _checks: ExternalChecks,
@@ -68,7 +66,7 @@ pub fn release(
     }
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_schema_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_schema_client(request, deadline, move |client| {
         client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
         let schema = postgres_schema::lock_exclusive_transaction_and_inspect(client)
             .map_err(Error::Schema)?;

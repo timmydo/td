@@ -7,7 +7,6 @@ use crate::{
     postgres_schema,
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 pub const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub const MAX_ROWS: i64 = 65_536;
@@ -20,7 +19,6 @@ const PER_MINUTE: i32 = 600;
 pub enum Error {
     Connection(postgres_probe::Error),
     Connect(postgres_probe::Error),
-    Resolution,
     Schema(postgres_schema::Error),
     Epoch,
     Invalid,
@@ -59,7 +57,6 @@ fn profile_valid(value: &str) -> bool {
 /// Empty batches perform incremental age retention even on quiet services.
 pub fn append(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     profile: &str,
@@ -77,7 +74,7 @@ pub fn append(
     }
     let profile = profile.to_owned();
     let entered = std::cell::Cell::new(false);
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, |client| {
+    let result = postgres_probe::with_mailbox_client(request, deadline, |client| {
         entered.set(true);
         write(client, epoch, profile, records)
     });
@@ -92,7 +89,6 @@ pub fn append(
 /// background reclamation has not visited them yet. No peer text is accepted.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     before: Option<i64>,
@@ -103,7 +99,7 @@ pub fn inspect(
     }
     let limit = i64::try_from(limit).map_err(|_| Error::Invalid)?;
     let before = before.unwrap_or(i64::MAX);
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         read(client, epoch, before, limit)
     })
     .map_err(Error::Connection)?
@@ -235,45 +231,27 @@ fn read(
     })
 }
 
-/// Resolve on every reconnect. Only a transport failure before the operation
-/// was entered can advance to another address; never replay an uncertain batch.
-pub fn append_resolved(
+/// Append over a fresh runtime connection to the bootstrap's socket; never
+/// replay an uncertain batch.
+pub fn append_loaded(
     loaded: &crate::postgres_input::Loaded,
-    executable: &std::path::Path,
     deadline: Instant,
     epoch: StoreEpoch,
     profile: &str,
     events: &[Event],
 ) -> Result<Written, Error> {
-    append_resolved_mode(
-        loaded,
-        executable,
-        deadline,
-        epoch,
-        profile,
-        events,
-        Mode::Runtime,
-    )
+    append_loaded_mode(loaded, deadline, epoch, profile, events, Mode::Runtime)
 }
 
-pub(crate) fn append_resolved_mode(
+pub(crate) fn append_loaded_mode(
     loaded: &crate::postgres_input::Loaded,
-    executable: &std::path::Path,
     deadline: Instant,
     epoch: StoreEpoch,
     profile: &str,
     events: &[Event],
     mode: Mode,
 ) -> Result<Written, Error> {
-    let addresses = crate::postgres_resolver::resolve(executable, &loaded.bootstrap, deadline)
-        .map_err(|_| Error::Resolution)?;
-    for address in addresses {
-        let mut request = loaded.bootstrap.request(address);
-        request.mode = mode;
-        match append(&request, &loaded.trust, deadline, epoch, profile, events) {
-            Err(Error::Connect(postgres_probe::Error::Transport)) => continue,
-            result => return result,
-        }
-    }
-    Err(Error::Connect(postgres_probe::Error::Transport))
+    let mut request = loaded.bootstrap.request();
+    request.mode = mode;
+    append(&request, deadline, epoch, profile, events)
 }

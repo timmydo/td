@@ -1185,11 +1185,14 @@ socket and refuses any other operation on a host still using loopback
 TLS, saying so. Move a host once with the fenced transport cutover.
 
 The live release must admit a group-shared PostgreSQL socket
-(`td_fs::check_server_socket`, which td-mta's Unix endpoint calls). An
-older release refuses the socket, and the cutover's rehearsal fails
-before anything in production changes. If the live release is older,
-first deploy a current release with a controller from before this change,
-then run the cutover from the current checkout:
+(`td_fs::check_server_socket`, which td-mta's connection worker calls)
+and still reach PostgreSQL over loopback TLS. An older release refuses
+the socket, and the cutover's rehearsal fails before anything in
+production changes; a release that reaches PostgreSQL only over the
+socket refuses the host's TCP connection files and cannot start there.
+If the live release is older, first deploy, with a controller from before
+this change, a release that admits the group-shared socket and still
+speaks loopback TLS, then run the cutover from the current checkout:
 
 ```text
 ./td-mta/deploy --postgres-socket
@@ -1314,7 +1317,9 @@ directories back, copy the files in `postgres-socket/retired/units/`
 back to the paths `renewal_units_retired` records, run `systemctl
 daemon-reload`, start PostgreSQL, `systemctl link` the service and
 `systemctl enable --now` the timer by those paths, and use a controller
-from before this change.
+from before this change. td-mta refuses a TCP connection file, so the
+live release must also be one that still reaches PostgreSQL over
+loopback TLS.
 Check the certificates' validity first: nothing renews them meanwhile.
 
 If the receipt's `renewal_units_left` is not empty, remove those files

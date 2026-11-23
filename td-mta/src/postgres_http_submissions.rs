@@ -6,15 +6,14 @@ use crate::{
     ids::{AccountId, DeviceId, EmailId, IdentityId, StoreEpoch, SubmissionOperationId},
     ports::{self, Clock, Deadline},
     postgres_input::Loaded,
-    postgres_probe::{self, Mode},
-    postgres_read::{self, ReadSlots},
+    postgres_probe::Mode,
+    postgres_read::ReadSlots,
     postgres_runtime_profile::Binding,
     postgres_settlement::{self as settlement, Retained},
     postgres_submission_input as inputs,
     postgres_submissions::{self as changes, Submission},
 };
 use std::{
-    path::Path,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -59,14 +58,10 @@ impl Pending {
     pub fn settle(
         &self,
         loaded: &Loaded,
-        executable: &Path,
         slots: &ReadSlots,
         clock: &RuntimeClock,
         until: Deadline,
     ) -> Result<Option<Settled>, Error> {
-        if !executable.is_absolute() {
-            return Err(ports::Error::Invalid.into());
-        }
         let mut pending = self.change.try_lock().map_err(|_| ports::Error::Busy)?;
         if pending.is_none() {
             return Ok(None);
@@ -75,7 +70,7 @@ impl Pending {
         settle_held(&mut pending, loaded, slots, deadline)
     }
 }
-/// Inspect only at the retained endpoint. Absence proves rollback unless another
+/// Inspect only at the retained socket. Absence proves rollback unless another
 /// process swept the expired receipt (POSTGRES.md section 165).
 fn settle_held(
     pending: &mut Option<Retained<Submission>>,
@@ -87,8 +82,8 @@ fn settle_held(
         return Ok(None);
     };
     let _slot = slots.acquire().map_err(|_| ports::Error::Busy)?;
-    let connection = settlement::request(loaded, held.endpoint);
-    let settled = changes::inspect(&connection, &loaded.trust, deadline, &held.change)
+    let connection = settlement::request(loaded);
+    let settled = changes::inspect(&connection, deadline, &held.change)
         .map_err(Error::Publication)?
         .map(|outcome| Settled {
             operation: held.change.operation(),
@@ -108,7 +103,6 @@ pub struct Input {
 }
 pub struct Submissions<'a> {
     pub loaded: &'a Loaded,
-    pub executable: &'a Path,
     pub binding: &'a Binding,
     pub slots: &'a ReadSlots,
     pub clock: &'a RuntimeClock,
@@ -119,8 +113,7 @@ impl Submissions<'_> {
     /// Resolve and freeze one source, then publish exactly one operation. A
     /// transport retry never substitutes another profile's route or identity.
     pub fn create(&self, input: Input, meter: &mut Meter) -> Result<changes::Outcome, Error> {
-        if !self.executable.is_absolute()
-            || !self.binding.roles().jmap()
+        if !self.binding.roles().jmap()
             || self.loaded.bootstrap.profile() != self.binding.profile()
             || input.account != self.binding.account()
             || Presented::parse(self.password).is_none_or(|value| value.id() != input.device)
@@ -164,38 +157,22 @@ impl Submissions<'_> {
         // One outgoing body, capped at 32 MiB by input preparation, plus its
         // temporary verified source. No second request can prepare alongside it.
         let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
-        let addresses = addresses(self.loaded, self.executable, deadline)?;
-        let mut prepared = None;
-        for address in &addresses {
-            let mut connection = self.loaded.bootstrap.request(*address);
-            connection.mode = Mode::Runtime;
-            match inputs::prepare_with_meter(
-                &connection,
-                &self.loaded.trust,
-                deadline,
-                inputs::Input {
-                    binding: self.binding,
-                    email: input.email,
-                    identity: input.identity,
-                    expected: input.expected.map(|(_, sequence)| sequence),
-                },
-                self.password,
-                meter,
-                self.clock,
-            ) {
-                Ok(value) => {
-                    prepared = Some(value);
-                    break;
-                }
-                Err(inputs::Error::Read(postgres_read::Error::Connection(
-                    postgres_probe::Error::Transport,
-                ))) => (),
-                Err(error) => return Err(Error::Input(error)),
-            }
-        }
-        let prepared = prepared.ok_or(Error::Input(inputs::Error::Read(
-            postgres_read::Error::Connection(postgres_probe::Error::Transport),
-        )))?;
+        let mut connection = self.loaded.bootstrap.request();
+        connection.mode = Mode::Runtime;
+        let prepared = inputs::prepare_with_meter(
+            &connection,
+            deadline,
+            inputs::Input {
+                binding: self.binding,
+                email: input.email,
+                identity: input.identity,
+                expected: input.expected.map(|(_, sequence)| sequence),
+            },
+            self.password,
+            meter,
+            self.clock,
+        )
+        .map_err(Error::Input)?;
         let length = prepared.bytes().len() as u64;
         let recipients = prepared.recipients().len() as u64;
         let change = changes::prepare_with_meter(prepared, deadline, meter, self.clock)
@@ -210,27 +187,10 @@ impl Submissions<'_> {
                 },
             )
             .map_err(stop)?;
-        let mut outcome = Err(changes::Error::Connection(postgres_probe::Error::Transport));
-        let mut endpoint = None;
-        for address in addresses {
-            endpoint = Some(address);
-            let connection = settlement::request(self.loaded, address);
-            outcome = changes::publish(
-                &connection,
-                &self.loaded.trust,
-                deadline,
-                &change,
-                self.password,
-            );
-            if !matches!(
-                outcome,
-                Err(changes::Error::Connection(postgres_probe::Error::Transport))
-            ) {
-                break;
-            }
-        }
-        if let (Err(changes::Error::Indeterminate), Some(endpoint)) = (&outcome, endpoint) {
-            *pending = Some(Retained::new(change, endpoint, self.binding.account()));
+        let connection = settlement::request(self.loaded);
+        let outcome = changes::publish(&connection, deadline, &change, self.password);
+        if let Err(changes::Error::Indeterminate) = &outcome {
+            *pending = Some(Retained::new(change, self.binding.account()));
         }
         outcome.map_err(Error::Publication)
     }
@@ -252,21 +212,4 @@ fn phase(clock: &RuntimeClock, until: Deadline) -> Result<Instant, ports::Error>
         return Err(ports::Error::Deadline);
     }
     Ok(deadline)
-}
-fn addresses(
-    loaded: &Loaded,
-    executable: &Path,
-    deadline: Instant,
-) -> Result<Vec<crate::postgres_probe::Endpoint>, ports::Error> {
-    let deadline = deadline.min(
-        Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .ok_or(ports::Error::Invalid)?,
-    );
-    crate::postgres_resolver::resolve(executable, &loaded.bootstrap, deadline).map_err(|error| {
-        match error {
-            crate::postgres_resolver::Error::Deadline => ports::Error::Deadline,
-            _ => ports::Error::Dns,
-        }
-    })
 }

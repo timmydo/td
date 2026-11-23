@@ -1,5 +1,4 @@
 use super::{deadline, sql, sql_commands_bounded, Fixture};
-use td_crypto::TrustStore;
 
 #[test]
 #[ignore = "real PostgreSQL 17 required"]
@@ -7,9 +6,8 @@ pub(super) fn received_order_upgrade_preserves_pages_and_indexes_the_first_page(
     use td_mta::postgres_schema;
 
     let fixture = populated();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
-    let fresh = postgres_schema::inspect(&request, &trust, deadline()).unwrap();
+    let fresh = postgres_schema::inspect(&request, deadline()).unwrap();
     super::rewind_email_order(&fixture);
     assert_eq!(
         sql(
@@ -38,7 +36,7 @@ pub(super) fn received_order_upgrade_preserves_pages_and_indexes_the_first_page(
         })
     };
     let before = pages();
-    let upgraded = postgres_schema::upgrade(&request, &trust, deadline()).unwrap();
+    let upgraded = postgres_schema::upgrade(&request, deadline()).unwrap();
     assert_eq!(upgraded, fresh);
     assert_eq!(pages(), before, "tied dates retain both ordered pages");
     assert_eq!(
@@ -56,8 +54,7 @@ pub(super) fn received_order_upgrade_preserves_pages_and_indexes_the_first_page(
 
 fn populated() -> Fixture {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    td_mta::postgres_schema::initialize(&fixture.request(), &trust, deadline()).unwrap();
+    td_mta::postgres_schema::initialize(&fixture.request(), deadline()).unwrap();
     // The production schema and indexes; thousands of unrelated messages make
     // account-wide candidate materialization visible without a timing bound.
     sql(&fixture, "INSERT INTO td_mta.accounts VALUES(decode(repeat('01',16),'hex'),decode(repeat('00',7)||'01','hex'),decode(repeat('00',8),'hex'));

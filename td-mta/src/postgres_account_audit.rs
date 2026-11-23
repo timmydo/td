@@ -8,7 +8,6 @@ use crate::{
     postgres_usage_audit::{self, Usage},
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
@@ -54,7 +53,6 @@ impl Report {
 /// read-only primary snapshot. This is not restore or service admission.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
@@ -63,7 +61,7 @@ pub fn inspect(
 ) -> Result<Report, Error> {
     let budget = postgres_probe::AuditBudget::new(limits.metadata, limits.blobs, limits.bytes)
         .map_err(Error::Connection)?;
-    let result = postgres_probe::with_audit_worker(request, trust, deadline, budget, |worker| {
+    let result = postgres_probe::with_audit_worker(request, deadline, budget, |worker| {
         let metadata =
             postgres_metadata_audit::audit(worker, epoch, account, utc_ms, limits.metadata)
                 .map_err(Error::Metadata)?;

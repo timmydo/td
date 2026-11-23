@@ -1,6 +1,6 @@
 use super::{deadline, relay_wire as wire, sql, Fixture, PASSWORD};
 use std::sync::{Arc, Mutex};
-use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_crypto::{Crypto, Digest, Provider};
 use td_mta::postgres_dispatch::Identity;
 use td_mta::{
     clock::RuntimeClock,
@@ -19,7 +19,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -28,7 +27,6 @@ pub(super) fn exercise(
     run(
         fixture,
         request,
-        trust,
         claim,
         generation,
         source,
@@ -76,7 +74,6 @@ pub(super) fn exercise(
 pub(super) fn connected(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -86,7 +83,6 @@ pub(super) fn connected(
     run(
         fixture,
         request,
-        trust,
         claim,
         generation,
         source,
@@ -99,7 +95,6 @@ pub(super) fn connected(
 fn run(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
@@ -137,7 +132,7 @@ fn run(
         if data_case >= 4 {
             sql(fixture,&format!("UPDATE td_mta.submissions SET recipient_count=2 WHERE id={sub}; INSERT INTO td_mta.recipients SELECT account,{sub},1,'1@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
         }
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         let clock = Arc::new(RuntimeClock::new());
         let guard = Arc::new(Mutex::new(
             Guard::new(Time {
@@ -152,8 +147,7 @@ fn run(
             .unwrap(),
         ));
         let runtime = Request {
-            address: request.address,
-            server_name: request.server_name,
+            socket: request.socket,
             user: "mail_runtime",
             database: request.database,
             password: PASSWORD,
@@ -164,7 +158,6 @@ fn run(
         let worker = dispatch::Dispatches {
             connection: dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &slots,
                 clock: clock.clone(),
             },
@@ -297,7 +290,7 @@ fn run(
                     let expected =
                         phases::refused_mail(claim, generation, attempt, &[0], &mail).unwrap();
                     assert_eq!(
-                        phases::inspect(&runtime, trust, deadline(), &expected).unwrap(),
+                        phases::inspect(&runtime, deadline(), &expected).unwrap(),
                         Some(outcome)
                     );
                     assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply IS NULL,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|t|550 sender refused");
@@ -333,7 +326,7 @@ fn run(
                     let value =
                         phases::refused_mail(claim, generation, attempt, &[0], &mail).unwrap();
                     assert_eq!(
-                        phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                        phases::inspect(&runtime, deadline(), &value).unwrap(),
                         Some(outcome)
                     );
                     assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply IS NULL,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|t|550 sender refused");
@@ -368,7 +361,6 @@ fn run(
                         .unwrap();
                 td_mta::postgres_submission_cancel::publish(
                     &runtime,
-                    trust,
                     deadline(),
                     &cancellation,
                     |_| Ok(()),
@@ -487,7 +479,6 @@ fn run(
                     let slots = ReadSlots::new(1).unwrap();
                     let connection = dispatch::Connection {
                         request: &runtime,
-                        trust,
                         slots: &slots,
                         clock: clock.clone(),
                     };
@@ -513,7 +504,7 @@ fn run(
                     )
                     .unwrap();
                     assert_eq!(
-                        phases::inspect(&runtime, trust, deadline(), &expected).unwrap(),
+                        phases::inspect(&runtime, deadline(), &expected).unwrap(),
                         Some(outcome)
                     );
                     assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
@@ -592,7 +583,7 @@ fn run(
                 )
                 .unwrap();
                 assert_eq!(
-                    phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                    phases::inspect(&runtime, deadline(), &value).unwrap(),
                     Some(outcome)
                 );
                 assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
@@ -675,7 +666,6 @@ fn run(
                         let slots = ReadSlots::new(1).unwrap();
                         let connection = dispatch::Connection {
                             request: &runtime,
-                            trust,
                             slots: &slots,
                             clock: clock.clone(),
                         };
@@ -687,7 +677,7 @@ fn run(
                         let expected =
                             phases::body(claim, generation, attempt, &[(ordinal, &rcpt)]).unwrap();
                         assert_eq!(
-                            phases::inspect(&runtime, trust, deadline(), &expected).unwrap(),
+                            phases::inspect(&runtime, deadline(), &expected).unwrap(),
                             Some(historical)
                         );
                         assert_eq!(sql(fixture,&format!("SELECT state,phase,rcpt_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "2|2|250 recipient");
@@ -763,7 +753,7 @@ fn run(
                     )
                     .unwrap();
                     assert_eq!(
-                        phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                        phases::inspect(&runtime, deadline(), &value).unwrap(),
                         Some(outcome)
                     );
                     assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|250 recipient|550 data refused");
@@ -785,7 +775,6 @@ fn run(
                             .unwrap();
                     td_mta::postgres_submission_cancel::publish(
                         &runtime,
-                        trust,
                         deadline(),
                         &cancellation,
                         |_| Ok(()),
@@ -1044,7 +1033,6 @@ fn run(
                 BodyStart::Trusted(plan, session) => Some(
                     attempts::with_body(
                         &runtime,
-                        trust,
                         prepared_limit,
                         &body_request,
                         postgres_body::MAX_BODY_BYTES,
@@ -1065,7 +1053,6 @@ fn run(
         let source_worker = dispatch::Dispatches {
             connection: dispatch::Connection {
                 request: &runtime,
-                trust,
                 slots: &source_slots,
                 clock: clock.clone(),
             },
@@ -1121,13 +1108,9 @@ fn run(
                 let cancel =
                     td_mta::postgres_submission_cancel::prepare(claim, generation, submission)
                         .unwrap();
-                td_mta::postgres_submission_cancel::publish(
-                    &runtime,
-                    trust,
-                    deadline(),
-                    &cancel,
-                    |_| Ok(()),
-                )
+                td_mta::postgres_submission_cancel::publish(&runtime, deadline(), &cancel, |_| {
+                    Ok(())
+                })
                 .unwrap();
             }
             drop(peer.into_buffers().unwrap());
@@ -1184,7 +1167,6 @@ fn run(
         assert_eq!(
             phases::check_current_body(
                 &runtime,
-                trust,
                 prepared_limit,
                 &phases::body(claim, generation, attempt, &[(ordinal, &rcpt)]).unwrap(),
                 clock.clone(),
@@ -1335,7 +1317,6 @@ fn run(
                         let slots = ReadSlots::new(1).unwrap();
                         let connection = dispatch::Connection {
                             request: &runtime,
-                            trust,
                             slots: &slots,
                             clock: clock.clone(),
                         };
@@ -1384,7 +1365,7 @@ fn run(
         let final_value =
             phases::accepted(claim, generation, attempt, &[ordinal], "250 queued").unwrap();
         assert_eq!(
-            phases::inspect(&runtime, trust, deadline(), &final_value).unwrap(),
+            phases::inspect(&runtime, deadline(), &final_value).unwrap(),
             Some(outcome)
         );
         assert_eq!(pending.identity().unwrap(), None);
@@ -1394,7 +1375,7 @@ fn run(
             sql(fixture, &format!("DELETE FROM td_mta.blobs WHERE id={sub}; DELETE FROM td_mta.blob_ids WHERE id={sub}"));
         }
     }
-    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    owners::renew(request, deadline(), claim, generation).unwrap();
 }
 
 // Focused legacy interruption cases keep their explicit trusted input seam;

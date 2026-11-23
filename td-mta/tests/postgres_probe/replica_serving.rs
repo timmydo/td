@@ -30,7 +30,6 @@ pub(super) fn exercise(
     size: u64,
     digest: [u8; 32],
 ) {
-    let trust = td_crypto::TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
     let chain = fs::read(fixture.root.join("server.crt")).unwrap();
     let key = fs::read(fixture.root.join("server.key")).unwrap();
@@ -42,7 +41,6 @@ pub(super) fn exercise(
     ] {
         materials::insert(
             &owner,
-            &trust,
             deadline(),
             epoch,
             Version::from_bytes([n; 16]),
@@ -130,38 +128,28 @@ certificate = "public"
             source: relay.as_bytes(),
         },
     ];
-    let candidate = configuration::prepare(
-        &owner,
-        &trust,
-        deadline(),
-        epoch,
-        shared.as_bytes(),
-        &profiles,
-    )
-    .unwrap();
+    let candidate =
+        configuration::prepare(&owner, deadline(), epoch, shared.as_bytes(), &profiles).unwrap();
     let version = versions::Version::from_bytes([9; 16]);
-    versions::publish(&owner, &trust, deadline(), version, &candidate).unwrap();
+    versions::publish(&owner, deadline(), version, &candidate).unwrap();
     selection::publish(
         &owner,
-        &trust,
         deadline(),
         selection::prepare(epoch, 0, version, &candidate).unwrap(),
     )
     .unwrap();
     let device =
         td_mta::postgres_devices::prepare_creation(epoch, account, "local fixture", 1).unwrap();
-    td_mta::postgres_devices::publish_creation(&owner, &trust, deadline(), &device).unwrap();
+    td_mta::postgres_devices::publish_creation(&owner, deadline(), &device).unwrap();
     sql(fixture,"CREATE ROLE mail_reader LOGIN PASSWORD 'disposable-postgres-fixture-password'; GRANT USAGE ON SCHEMA td_mta TO mail_reader; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO mail_reader; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_reader; GRANT UPDATE(id) ON td_mta.accounts TO mail_reader; GRANT INSERT ON td_mta.leases TO mail_reader; GRANT INSERT,UPDATE,DELETE ON td_mta.application_logs,td_mta.application_log_state TO mail_reader");
-    let ca = fixture.root.join("local-read-ca");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("local-read-connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://mail_reader:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://mail_reader:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();

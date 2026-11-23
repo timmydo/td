@@ -402,13 +402,12 @@ fn creation_method_error(error: sending::Error) -> Option<Error> {
         sending::Error::Input(Input::Read(
             Read::Busy
             | Read::Body(crate::postgres_body::Error::Connection(
-                Connection::Transport | Connection::Tls | Connection::Database,
+                Connection::Transport | Connection::Database,
             ))
-            | Read::Resolution(_)
-            | Read::Connection(Connection::Transport | Connection::Tls | Connection::Database),
+            | Read::Connection(Connection::Transport | Connection::Database),
         ))
         | sending::Error::Publication(submissions::Error::Connection(
-            Connection::Transport | Connection::Tls | Connection::Database,
+            Connection::Transport | Connection::Database,
         )) => Some(Error::StorageBusy),
         sending::Error::Input(
             Input::Capacity

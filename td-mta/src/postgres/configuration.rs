@@ -1,5 +1,5 @@
 //! Explicit source-version preparation; never activates a configuration.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -186,38 +186,18 @@ fn import(options: &Options) -> Result<Candidate, (&'static str, &'static str)> 
     for index in 0..loaded.profile_count() {
         profiles.push(loaded.profile(index).ok_or(("input", "inventory"))?);
     }
-    with_addresses(connection, |request, deadline| {
-        let candidate = configuration::prepare(
-            request,
-            &connection.trust,
-            deadline,
-            options.epoch,
-            loaded.shared(),
-            &profiles,
-        )
-        .map_err(|error| classify(Error::Validation(error)))?;
-        versions::publish(
-            request,
-            &connection.trust,
-            deadline,
-            options.version,
-            &candidate,
-        )
-        .map_err(classify)?;
+    with_connection(connection, |request, deadline| {
+        let candidate =
+            configuration::prepare(request, deadline, options.epoch, loaded.shared(), &profiles)
+                .map_err(|error| classify(Error::Validation(error)))?;
+        versions::publish(request, deadline, options.version, &candidate).map_err(classify)?;
         Ok(candidate)
     })
 }
 fn check(options: &Options) -> Result<Candidate, (&'static str, &'static str)> {
     let loaded = Loaded::open(&options.connection, "configuration").map_err(input_error)?;
-    with_addresses(&loaded, |request, deadline| {
-        versions::read(
-            request,
-            &loaded.trust,
-            deadline,
-            options.epoch,
-            options.version,
-        )
-        .map_err(classify)
+    with_connection(&loaded, |request, deadline| {
+        versions::read(request, deadline, options.epoch, options.version).map_err(classify)
     })
 }
 pub(super) fn classify(error: Error) -> AttemptError {

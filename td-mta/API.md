@@ -70,11 +70,11 @@ sets fail Capacity; no partial successful address list or allocating NSS
 fallback. Implementations must stop at the deadline and validate DNS source,
 question, name/compression limits and CNAME chains (M09). This port resolves
 configured A/AAAA endpoints only; MX/TXT/policy resolution is outside v1.
-This port excludes the PostgreSQL bootstrap/writer endpoint: POSTGRES.md,
-[Writer endpoint resolution](POSTGRES.md#writer-endpoint-resolution), owns
-its disposable system-resolver process, five-second cap,
-bounded address result and lack of application TTL caching. It is not an
-NSS fallback for the mail-routing port.
+This port excludes outbound HTTPS origins: DESIGN.md,
+[System-resolver helper](DESIGN.md#system-resolver-helper), owns their
+disposable system-resolver process, five-second cap, bounded address result
+and lack of application TTL caching. It is not an NSS fallback for the
+mail-routing port.
 
 ### 1.1 Crypto provider boundary
 

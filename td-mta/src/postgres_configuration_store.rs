@@ -13,7 +13,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 
 pub use crate::ids::ConfigurationVersion as Version;
 const CHUNK: usize = 65536;
@@ -48,7 +48,6 @@ pub fn fresh_version() -> Result<Version, Error> {
 /// a version for runtime use. Keep the same ID after an uncertain commit.
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     version: Version,
     candidate: &Candidate,
@@ -83,42 +82,42 @@ pub fn publish(
     let count = i16::try_from(bytes.len().div_ceil(CHUNK)).map_err(|_| Error::Capacity)?;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_configuration_client(
-        request,
-        trust,
-        deadline,
-        move |client| {
-            let receipt = client.inspect_schema().map_err(Error::Schema)?;
-            if receipt.store_epoch != epoch {
-                return Err(Error::Epoch);
+    let result = postgres_probe::with_configuration_client(request, deadline, move |client| {
+        let receipt = client.inspect_schema().map_err(Error::Schema)?;
+        if receipt.store_epoch != epoch {
+            return Err(Error::Epoch);
+        }
+        client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit = on; SET LOCAL idle_in_transaction_session_timeout = 10000").map_err(|_| Error::Database)?;
+        let inserted = client.execute("INSERT INTO td_mta.config_versions (id,length,checksum,chunk_count) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING", &[&version.as_bytes().as_slice(), &length, &digest.as_slice(), &count]).map_err(|_| Error::Database)?;
+        if inserted == 0 {
+            let row = client
+                .query_one(
+                    "SELECT length,checksum,chunk_count FROM td_mta.config_versions WHERE id=$1",
+                    &[&version.as_bytes().as_slice()],
+                )
+                .map_err(|_| Error::Database)?;
+            let stored_length: i32 = row.try_get(0).map_err(|_| Error::Integrity)?;
+            let stored_digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+            let stored_count: i16 = row.try_get(2).map_err(|_| Error::Integrity)?;
+            if stored_length != length || stored_digest != digest || stored_count != count {
+                return Err(Error::Conflict);
             }
-            client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit = on; SET LOCAL idle_in_transaction_session_timeout = 10000").map_err(|_| Error::Database)?;
-            let inserted = client.execute("INSERT INTO td_mta.config_versions (id,length,checksum,chunk_count) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING", &[&version.as_bytes().as_slice(), &length, &digest.as_slice(), &count]).map_err(|_| Error::Database)?;
-            if inserted == 0 {
-                let row = client.query_one("SELECT length,checksum,chunk_count FROM td_mta.config_versions WHERE id=$1", &[&version.as_bytes().as_slice()]).map_err(|_| Error::Database)?;
-                let stored_length: i32 = row.try_get(0).map_err(|_| Error::Integrity)?;
-                let stored_digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-                let stored_count: i16 = row.try_get(2).map_err(|_| Error::Integrity)?;
-                if stored_length != length || stored_digest != digest || stored_count != count {
-                    return Err(Error::Conflict);
-                }
-                return Ok(());
-            }
-            if inserted != 1 {
+            return Ok(());
+        }
+        if inserted != 1 {
+            return Err(Error::Integrity);
+        }
+        for (ordinal, chunk) in bytes.chunks(CHUNK).enumerate() {
+            let ordinal = i16::try_from(ordinal).map_err(|_| Error::Capacity)?;
+            let changed = client.execute("INSERT INTO td_mta.config_version_chunks (version_id,ordinal,bytes) VALUES ($1,$2,$3)", &[&version.as_bytes().as_slice(), &ordinal, &chunk]).map_err(|_| Error::Database)?;
+            if changed != 1 {
                 return Err(Error::Integrity);
             }
-            for (ordinal, chunk) in bytes.chunks(CHUNK).enumerate() {
-                let ordinal = i16::try_from(ordinal).map_err(|_| Error::Capacity)?;
-                let changed = client.execute("INSERT INTO td_mta.config_version_chunks (version_id,ordinal,bytes) VALUES ($1,$2,$3)", &[&version.as_bytes().as_slice(), &ordinal, &chunk]).map_err(|_| Error::Database)?;
-                if changed != 1 {
-                    return Err(Error::Integrity);
-                }
-            }
-            marker.store(true, Ordering::Relaxed);
-            client.commit().map_err(|_| Error::Indeterminate)?;
-            Ok(())
-        },
-    );
+        }
+        marker.store(true, Ordering::Relaxed);
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(())
+    });
     match result {
         Ok(result) => result,
         Err(_) if attempted.load(Ordering::Relaxed) => Err(Error::Indeterminate),
@@ -130,15 +129,13 @@ pub fn publish(
 /// under the original deadline. Raw or stale configuration never escapes.
 pub fn read(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     version: Version,
 ) -> Result<Candidate, Error> {
-    let sources = read_sources(request, trust, deadline, epoch, version)?;
+    let sources = read_sources(request, deadline, epoch, version)?;
     let (shared, profiles) = sources.parts()?;
-    configuration::prepare(request, trust, deadline, epoch, shared, &profiles)
-        .map_err(Error::Validation)
+    configuration::prepare(request, deadline, epoch, shared, &profiles).map_err(Error::Validation)
 }
 
 /// Integrity-checked source bytes, not validated material or runtime authority.
@@ -157,12 +154,11 @@ impl Sources {
 /// Callers must prepare and validate a new candidate before selecting it.
 pub fn read_sources(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     version: Version,
 ) -> Result<Sources, Error> {
-    let bytes = postgres_probe::with_configuration_client(request, trust, deadline, move |client| {
+    let bytes = postgres_probe::with_configuration_client(request, deadline, move |client| {
             let receipt = client.inspect_schema().map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout = 10000").map_err(|_| Error::Database)?;

@@ -1,5 +1,5 @@
 //! One finite owner-side summary rebuild page, with an explicit resume cursor.
-use super::{report_error, with_addresses, AttemptError};
+use super::{report_error, with_connection, AttemptError};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -80,10 +80,9 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
             return Ok(ExitCode::FAILURE);
         }
     };
-    let result = with_addresses(&loaded, |request, deadline| {
+    let result = with_connection(&loaded, |request, deadline| {
         postgres_summary_backfill::run_with_options(
             request,
-            &loaded.trust,
             deadline,
             options.epoch,
             options.account,

@@ -4,7 +4,6 @@ use std::{
     thread,
     time::Duration,
 };
-use td_crypto::TrustStore;
 use td_mta::{
     admission::work::{Charge, Meter},
     clock::RuntimeClock,
@@ -22,7 +21,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &Binding,
     historical: &Claim,
     uncertain: &Claim,
@@ -34,8 +32,7 @@ pub(super) fn exercise(
     let settlement_slots = ReadSlots::new(1).unwrap();
     let pending = dispatch::Pending::default();
     let runtime = Request {
-        address: request.address,
-        server_name: request.server_name,
+        socket: request.socket,
         database: request.database,
         user: "mail_runtime",
         password: PASSWORD,
@@ -44,7 +41,6 @@ pub(super) fn exercise(
     let worker = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &runtime,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -53,7 +49,6 @@ pub(super) fn exercise(
     };
     let settle = dispatch::Connection {
         request: &runtime,
-        trust,
         slots: &settlement_slots,
         clock: clock.clone(),
     };
@@ -109,7 +104,6 @@ pub(super) fn exercise(
     let forbidden = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &preparation,
-            trust,
             slots: &slots,
             clock: clock.clone(),
         },
@@ -134,11 +128,11 @@ pub(super) fn exercise(
     drop(held);
     assert_eq!(pending.identity().unwrap(), None);
     assert_eq!(
-        owners::inspect(request, trust, deadline(), uncertain).unwrap(),
+        owners::inspect(request, deadline(), uncertain).unwrap(),
         None
     );
 
-    let previous = owners::inspect(request, trust, deadline(), historical)
+    let previous = owners::inspect(request, deadline(), historical)
         .unwrap()
         .unwrap();
     let mut exact = work();
@@ -153,7 +147,7 @@ pub(super) fn exercise(
         Err(Error::Admission(ports::Error::Capacity))
     );
     assert_eq!(
-        owners::observe(request, trust, deadline(), historical, previous.generation),
+        owners::observe(request, deadline(), historical, previous.generation),
         Err(owners::Error::Stale)
     );
     assert_eq!(pending.identity().unwrap(), None);
@@ -217,7 +211,7 @@ pub(super) fn exercise(
     );
     assert_eq!(pending.identity().unwrap(), Some(identity));
     thread::sleep(Duration::from_secs(4));
-    let recovered = owners::inspect(request, trust, deadline(), uncertain)
+    let recovered = owners::inspect(request, deadline(), uncertain)
         .unwrap()
         .unwrap();
     assert_eq!(recovered.generation, 4);
@@ -226,7 +220,6 @@ pub(super) fn exercise(
     let holder = dispatch::Dispatches {
         connection: dispatch::Connection {
             request: &runtime,
-            trust,
             slots: &settlement_slots,
             clock: clock.clone(),
         },

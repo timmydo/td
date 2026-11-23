@@ -1,6 +1,5 @@
 use super::{deadline, sql, Fixture};
 use std::time::Instant;
-use td_crypto::TrustStore;
 use td_mta::{
     ids::{AccountId, BlobId, StoreEpoch},
     postgres_accounts, postgres_blob_audit as audit, postgres_schema,
@@ -10,17 +9,15 @@ use td_mta::{
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
 fn real_postgres_blob_audit_verifies_snapshot_bytes_without_device_authority() {
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
     let blob = BlobId::from_bytes([3; 16]);
-    let inspect = || audit::inspect(&fixture.request(), &trust, deadline(), epoch, account, blob);
+    let inspect = || audit::inspect(&fixture.request(), deadline(), epoch, account, blob);
     assert_eq!(inspect(), Err(audit::Error::Missing));
     postgres_accounts::publish(
         &fixture.request(),
-        &trust,
         deadline(),
         postgres_accounts::prepare(epoch, account).unwrap(),
     )
@@ -38,7 +35,6 @@ fn real_postgres_blob_audit_verifies_snapshot_bytes_without_device_authority() {
     assert_eq!(
         audit::inspect(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             AccountId::from_bytes([2; 16]),
@@ -49,7 +45,6 @@ fn real_postgres_blob_audit_verifies_snapshot_bytes_without_device_authority() {
     assert_eq!(
         audit::inspect(
             &fixture.request(),
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([0; 16]),
             account,
@@ -58,14 +53,7 @@ fn real_postgres_blob_audit_verifies_snapshot_bytes_without_device_authority() {
         Err(audit::Error::Epoch)
     );
     assert_eq!(
-        audit::inspect(
-            &fixture.request(),
-            &trust,
-            Instant::now(),
-            epoch,
-            account,
-            blob
-        ),
+        audit::inspect(&fixture.request(), Instant::now(), epoch, account, blob),
         Err(audit::Error::Connection(
             td_mta::postgres_probe::Error::Deadline
         ))

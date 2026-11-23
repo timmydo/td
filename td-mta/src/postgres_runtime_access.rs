@@ -8,7 +8,6 @@ use crate::{
     postgres_schema::{self, Receipt},
 };
 use std::time::Instant;
-use td_crypto::TrustStore;
 
 // Dedicated runtime logins have no role memberships. Owner-side configuration
 // and schema commands use a separate connection specification.
@@ -171,12 +170,8 @@ pub enum Error {
 
 /// Observe one dedicated login's privileges on a qualified primary. This
 /// receipt closes with its connection and authorizes no later operation.
-pub fn inspect(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-) -> Result<Receipt, Error> {
-    let result = postgres_probe::with_mailbox_client(request, trust, deadline, |client| {
+pub fn inspect(request: &Request<'_>, deadline: Instant) -> Result<Receipt, Error> {
+    let result = postgres_probe::with_mailbox_client(request, deadline, |client| {
         let receipt = client.inspect_schema().map_err(Error::Schema)?;
         qualify(client)?;
         Ok(receipt)

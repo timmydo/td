@@ -55,21 +55,19 @@ impl Filing {
 
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     filing: &Filing,
 ) -> Result<Option<BatchOutcome>, Error> {
-    inspect_record(request, trust, deadline, &filing.0)
+    inspect_record(request, deadline, &filing.0)
 }
 
 pub fn publish(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     filing: &Filing,
     password: &[u8],
 ) -> Result<BatchOutcome, Error> {
-    publish_record(request, trust, deadline, &filing.0, password)
+    publish_record(request, deadline, &filing.0, password)
 }
 
 pub(super) fn apply(

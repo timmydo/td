@@ -13,7 +13,7 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
+use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy};
 #[derive(Clone)]
 pub struct Repair {
     claim: Claim,
@@ -96,12 +96,11 @@ fn receipt(client: &Client, value: &Repair) -> Result<Option<Outcome>, Error> {
 }
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     value: &Repair,
 ) -> Result<Option<Outcome>, Error> {
     let value = value.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         owners::begin(client, &value.claim, false, false).map_err(Error::Owner)?;
         receipt(client, &value)
     })
@@ -111,13 +110,12 @@ pub fn inspect(
 /// without a hold needs no mutation; this observation grants no delivery rights.
 pub fn needed(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     claim: &Claim,
     generation: u64,
 ) -> Result<bool, Error> {
     let claim = claim.clone();
-    postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+    postgres_probe::with_mailbox_client(request, deadline, move |client| {
         if !owners::begin(client, &claim, true, false).map_err(Error::Owner)? {
             return Err(Error::Policy);
         }
@@ -126,19 +124,14 @@ pub fn needed(
     })
     .map_err(Error::Connection)?
 }
-pub fn publish(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    value: &Repair,
-) -> Result<Outcome, Error> {
-    if let Some(outcome) = inspect(request, trust, deadline, value)? {
+pub fn publish(request: &Request<'_>, deadline: Instant, value: &Repair) -> Result<Outcome, Error> {
+    if let Some(outcome) = inspect(request, deadline, value)? {
         return Ok(outcome);
     }
     let value = value.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, deadline, move |client| {
         let policy = owners::begin(client, &value.claim, true, true).map_err(Error::Owner)?;
         if let Some(outcome) = receipt(client, &value)? {
             return Ok(outcome);

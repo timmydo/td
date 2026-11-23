@@ -1,6 +1,6 @@
 use super::{deadline, sql, Fixture};
 use std::time::Instant;
-use td_crypto::{Crypto, Digest, Provider, TrustStore};
+use td_crypto::{Crypto, Digest, Provider};
 use td_mta::{
     ids::SubmissionId,
     postgres_attempts::{self as attempts, Dispatch, ReadError},
@@ -13,7 +13,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     submission: SubmissionId,
@@ -26,7 +25,6 @@ pub(super) fn exercise(
     assert!(matches!(
         attempts::with_body(
             request,
-            trust,
             deadline(),
             &stale,
             postgres_body::MAX_BODY_BYTES,
@@ -40,7 +38,6 @@ pub(super) fn exercise(
     assert!(matches!(
         attempts::with_body(
             request,
-            trust,
             deadline(),
             &uncommitted,
             postgres_body::MAX_BODY_BYTES,
@@ -51,7 +48,6 @@ pub(super) fn exercise(
     assert!(matches!(
         attempts::with_body(
             request,
-            trust,
             Instant::now(),
             dispatch,
             postgres_body::MAX_BODY_BYTES,
@@ -60,13 +56,12 @@ pub(super) fn exercise(
         Err(ReadError::Attempt(attempts::Error::Connection(_)))
     ));
     assert!(matches!(
-        attempts::with_body(request, trust, deadline(), dispatch, 0, refuse),
+        attempts::with_body(request, deadline(), dispatch, 0, refuse),
         Err(ReadError::Body(postgres_body::Error::Capacity))
     ));
     assert!(matches!(
         attempts::with_body(
             request,
-            trust,
             deadline(),
             dispatch,
             postgres_body::MAX_BODY_BYTES + 1,
@@ -83,7 +78,6 @@ pub(super) fn exercise(
     assert!(matches!(
         attempts::with_body(
             request,
-            trust,
             deadline(),
             dispatch,
             postgres_body::MAX_BODY_BYTES,
@@ -97,7 +91,6 @@ pub(super) fn exercise(
     let until = deadline();
     attempts::with_body(
         request,
-        trust,
         until,
         dispatch,
         postgres_body::MAX_BODY_BYTES,
@@ -119,7 +112,7 @@ pub(super) fn exercise(
             let mut first = [0; 17];
             let count = body.read_at(0, &mut first)?;
             let operation = cancel::prepare(claim, generation, submission).unwrap();
-            let result = cancel::publish(request, trust, until, &operation, |_| Ok(())).unwrap();
+            let result = cancel::publish(request, until, &operation, |_| Ok(())).unwrap();
             assert_eq!(result.changed, 1);
             // Independent publication proves the callback holds no account lock.
             // The immutable admitted snapshot remains readable after cancellation.
@@ -133,7 +126,6 @@ pub(super) fn exercise(
     assert!(matches!(
         attempts::with_body(
             request,
-            trust,
             deadline(),
             dispatch,
             postgres_body::MAX_BODY_BYTES,

@@ -9,9 +9,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::{Crypto, Provider, TrustStore, P256_PKCS8_CAPACITY};
+use td_crypto::{Crypto, Provider, P256_PKCS8_CAPACITY};
 use td_fs::TempDir;
-use td_mta::postgres_probe::{probe, Endpoint, Error, Request};
+use td_mta::postgres_probe::{probe, Error, Request};
 
 #[path = "support/dkim_vectors.rs"]
 mod dkim_vectors;
@@ -101,16 +101,12 @@ impl Fixture {
     fn new() -> Self {
         let bin = postgres_bin();
         let root = TempDir::new("td-postgres-probe").unwrap();
-        let port = TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let mut fixture = Self {
             root,
             bin,
             server: None,
-            port,
+            // Names the socket in this fixture's private directory only.
+            port: 5432,
             ca: Vec::new(),
             queue_runtime: None,
         };
@@ -158,12 +154,7 @@ impl Fixture {
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        fs::write(
-            fixture.data().join("pg_hba.conf"),
-            "host all all 127.0.0.1/32 scram-sha-256\n",
-        )
-        .unwrap();
-        fixture.start(true, false);
+        fixture.start(false);
         fixture
     }
 
@@ -208,19 +199,25 @@ impl Fixture {
         }
     }
 
-    fn start(&mut self, tls: bool, read_only: bool) {
+    fn start(&mut self, read_only: bool) {
+        self.start_authenticated("scram-sha-256", read_only);
+    }
+
+    fn start_authenticated(&mut self, authentication: &str, read_only: bool) {
         assert!(self.server.is_none());
+        fs::write(
+            self.data().join("pg_hba.conf"),
+            format!("local all all {authentication}\n"),
+        )
+        .unwrap();
         fs::write(
             self.data().join("postgresql.conf"),
             format!(
-                "listen_addresses='127.0.0.1'\nport={}\n\
-                 unix_socket_directories=''\nssl={}\n\
-                 ssl_cert_file='{}'\nssl_key_file='{}'\n\
-                 default_transaction_read_only={}\n",
+                "listen_addresses=''\nport={}\n\
+                 unix_socket_directories='{}'\nunix_socket_permissions=0600\n\
+                 ssl=off\ndefault_transaction_read_only={}\n",
                 self.port,
-                if tls { "on" } else { "off" },
-                self.root.join("server.crt").display(),
-                self.root.join("server.key").display(),
+                self.root.display(),
                 if read_only { "on" } else { "off" },
             ),
         )
@@ -228,18 +225,8 @@ impl Fixture {
         self.start_server();
     }
 
-    fn start_unix(&mut self, authentication: &str) {
-        assert!(self.server.is_none());
-        fs::write(
-            self.data().join("pg_hba.conf"),
-            format!("local all all {authentication}\n"),
-        )
-        .unwrap();
-        fs::write(self.data().join("postgresql.conf"), format!(
-            "listen_addresses=''\nport={}\nunix_socket_directories='{}'\nunix_socket_permissions=0600\nssl=off\n",
-            self.port, self.root.display()
-        )).unwrap();
-        self.start_server();
+    fn socket(&self) -> td_fs::SocketPath {
+        td_fs::SocketPath::new(&self.root.join(format!(".s.PGSQL.{}", self.port))).unwrap()
     }
 
     fn start_server(&mut self) {
@@ -294,8 +281,7 @@ impl Fixture {
 
     fn request(&self) -> Request<'_> {
         Request {
-            address: Endpoint::Tcp(([127, 0, 0, 1], self.port).into()),
-            server_name: "localhost",
+            socket: self.socket(),
             mode: td_mta::postgres_probe::Mode::Preparation,
             user: "td_probe",
             database: "postgres",
@@ -322,15 +308,9 @@ impl Drop for ProbeChild {
 }
 
 fn sql_command(fixture: &Fixture) -> Command {
-    let ca = fixture.root.join("sql-ca.pem");
-    if !ca.exists() {
-        fs::write(&ca, &fixture.ca).unwrap();
-    }
     let mut command = fixture.command("psql");
     command
         .env("PGPASSWORD", std::str::from_utf8(PASSWORD).unwrap())
-        .env("PGSSLMODE", "verify-full")
-        .env("PGSSLROOTCERT", ca)
         .env("PGAPPNAME", "td-mta-schema-fixture")
         .args([
             "-X",
@@ -338,15 +318,15 @@ fn sql_command(fixture: &Fixture) -> Command {
             "-t",
             "-v",
             "ON_ERROR_STOP=1",
-            "-h",
-            "localhost",
             "-U",
             "td_probe",
             "-d",
             "postgres",
             "-p",
         ])
-        .arg(fixture.port.to_string());
+        .arg(fixture.port.to_string())
+        .arg("-h")
+        .arg(fixture.root.path());
     command
 }
 
@@ -444,15 +424,14 @@ fn hold_schema_lock(fixture: &Fixture, shared: bool) -> ProbeChild {
 fn real_postgres_schema_initialization_is_atomic_and_locked() {
     use td_mta::postgres_schema::{initialize, inspect, Error as SchemaError};
     let mut fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     sql(&fixture, "CREATE SCHEMA td_mta");
     assert_eq!(
-        initialize(&fixture.request(), &trust, deadline()),
+        initialize(&fixture.request(), deadline()),
         Err(SchemaError::Exists)
     );
     sql(&fixture, "DROP SCHEMA td_mta; CREATE ROLE outsider; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO outsider");
     assert_eq!(
-        initialize(&fixture.request(), &trust, deadline()),
+        initialize(&fixture.request(), deadline()),
         Err(SchemaError::Invalid)
     );
     assert_eq!(
@@ -468,49 +447,40 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     let mut shared = hold_schema_lock(&fixture, true);
     assert_eq!(
-        initialize(&fixture.request(), &trust, deadline()),
+        initialize(&fixture.request(), deadline()),
         Err(SchemaError::Busy)
     );
     wait_command(&mut shared);
-    let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
+    let receipt = initialize(&fixture.request(), deadline()).unwrap();
     assert_eq!(receipt.version, td_mta::postgres_schema::VERSION);
+    assert_eq!(inspect(&fixture.request(), deadline()).unwrap(), receipt);
     assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()).unwrap(),
-        receipt
-    );
-    assert_eq!(
-        initialize(&fixture.request(), &trust, deadline()),
+        initialize(&fixture.request(), deadline()),
         Err(SchemaError::Exists)
     );
     let mut shared = hold_schema_lock(&fixture, true);
-    assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()).unwrap(),
-        receipt
-    );
+    assert_eq!(inspect(&fixture.request(), deadline()).unwrap(), receipt);
     wait_command(&mut shared);
     let mut exclusive = hold_schema_lock(&fixture, false);
     assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()),
+        inspect(&fixture.request(), deadline()),
         Err(SchemaError::Busy)
     );
     wait_command(&mut exclusive);
     fixture.stop();
-    fixture.start(true, false);
-    assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()).unwrap(),
-        receipt
-    );
+    fixture.start(false);
+    assert_eq!(inspect(&fixture.request(), deadline()).unwrap(), receipt);
     sql(
         &fixture,
         "UPDATE td_mta.schema_migrations SET version = 99 WHERE version = 2",
     );
     assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()),
+        inspect(&fixture.request(), deadline()),
         Err(SchemaError::Version)
     );
     sql(&fixture, "UPDATE td_mta.schema_migrations SET version = 2, checksum = pg_catalog.decode(pg_catalog.repeat('00',32), 'hex') WHERE version = 99");
     assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()),
+        inspect(&fixture.request(), deadline()),
         Err(SchemaError::Version)
     );
 }
@@ -520,16 +490,11 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
 fn real_postgres_schema_commit_timeout_reports_uncertainty() {
     use td_mta::postgres_schema::{initialize, inspect, Error as SchemaError};
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     sql(&fixture, "CREATE FUNCTION public.delay_schema_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version = 1 THEN PERFORM pg_catalog.pg_sleep(6); END IF; RETURN NEW; END $$;
 CREATE FUNCTION public.install_schema_delay() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgname = 'td_delay') THEN EXECUTE 'CREATE CONSTRAINT TRIGGER td_delay AFTER INSERT ON td_mta.schema_migrations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_schema_commit()'; END IF; END $$;
 CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.install_schema_delay()");
     assert_eq!(
-        initialize(
-            &fixture.request(),
-            &trust,
-            Instant::now() + Duration::from_secs(2)
-        ),
+        initialize(&fixture.request(), Instant::now() + Duration::from_secs(2)),
         Err(SchemaError::Indeterminate)
     );
     // COMMIT can finish after the client deadline/disconnect. Wait for the
@@ -547,13 +512,11 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         "1"
     );
     assert_eq!(
-        inspect(&fixture.request(), &trust, deadline())
-            .unwrap()
-            .version,
+        inspect(&fixture.request(), deadline()).unwrap().version,
         td_mta::postgres_schema::VERSION
     );
     assert_eq!(
-        initialize(&fixture.request(), &trust, deadline()),
+        initialize(&fixture.request(), deadline()),
         Err(SchemaError::Exists)
     );
 }
@@ -630,17 +593,15 @@ fn command_refusals_have_fixed_output_without_argument_contents() {
 
 #[test]
 #[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
-fn real_postgres_probe_command_loads_resolves_and_authenticates() {
+fn real_postgres_probe_command_loads_and_authenticates() {
     let mut fixture = Fixture::new();
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let path = fixture.root.join("connection");
     let uri = format!(
-        "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+        "postgresql://td_probe:{}@:{}/postgres?host={}\n",
         std::str::from_utf8(PASSWORD).unwrap(),
         fixture.port,
-        ca.display()
+        fixture.root.display()
     );
     fs::write(&path, &uri).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -652,10 +613,10 @@ fn real_postgres_probe_command_loads_resolves_and_authenticates() {
     assert!(command_probe(&fixture, false).contains("connection-or-authentication"));
     fs::write(&path, &uri).unwrap();
     fixture.stop();
-    fixture.start(true, true);
+    fixture.start(true);
     assert!(command_probe(&fixture, false).contains("primary-or-durability-settings"));
     fixture.stop();
-    fixture.start(true, false);
+    fixture.start(false);
     assert!(command_probe(&fixture, true).contains("\"status\":\"ok\""));
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(command_probe(&fixture, false).contains("input-private-mode"));
@@ -666,14 +627,12 @@ fn real_postgres_probe_command_loads_resolves_and_authenticates() {
 fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     let fixture = Fixture::new();
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("connection");
     let uri = format!(
-        "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+        "postgresql://td_probe:{}@:{}/postgres?host={}\n",
         std::str::from_utf8(PASSWORD).unwrap(),
         fixture.port,
-        ca.display()
+        fixture.root.display()
     );
     fs::write(&connection, uri).unwrap();
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
@@ -770,25 +729,21 @@ fn deadline() -> Instant {
 fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority() {
     use td_mta::{postgres_runtime_access as access, postgres_schema as schema};
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let owner = fixture.request();
-    let receipt = schema::initialize(&owner, &trust, deadline()).unwrap();
+    let receipt = schema::initialize(&owner, deadline()).unwrap();
     assert_eq!(
-        access::inspect(&owner, &trust, deadline()),
+        access::inspect(&owner, deadline()),
         Err(access::Error::Role)
     );
     create_runtime_login(&fixture);
     let mut runtime = fixture.request();
     runtime.user = "mail_runtime";
     assert_eq!(
-        access::inspect(&runtime, &trust, deadline()),
+        access::inspect(&runtime, deadline()),
         Err(access::Error::Privileges)
     );
     grant_runtime_mail(&fixture);
-    assert_eq!(
-        access::inspect(&runtime, &trust, deadline()).unwrap(),
-        receipt
-    );
+    assert_eq!(access::inspect(&runtime, deadline()).unwrap(), receipt);
     sql(&fixture, "ALTER DATABASE postgres OWNER TO mail_runtime; REVOKE CREATE ON DATABASE postgres FROM mail_runtime");
     assert_eq!(
         sql(
@@ -798,22 +753,16 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
         "f"
     );
     assert_eq!(
-        access::inspect(&runtime, &trust, deadline()),
+        access::inspect(&runtime, deadline()),
         Err(access::Error::Role)
     );
     sql(&fixture, "ALTER DATABASE postgres OWNER TO td_probe");
-    assert_eq!(
-        access::inspect(&runtime, &trust, deadline()).unwrap(),
-        receipt
-    );
+    assert_eq!(access::inspect(&runtime, deadline()).unwrap(), receipt);
     let mut serving = fixture.request();
     serving.mode = td_mta::postgres_probe::Mode::Runtime;
-    assert_eq!(probe(&serving, &trust, deadline()), Err(Error::RuntimeRole));
+    assert_eq!(probe(&serving, deadline()), Err(Error::RuntimeRole));
     serving.user = "mail_runtime";
-    assert_eq!(
-        schema::inspect(&serving, &trust, deadline()).unwrap(),
-        receipt
-    );
+    assert_eq!(schema::inspect(&serving, deadline()).unwrap(), receipt);
     for (grant, revoke, error) in [
         (
             "GRANT CREATE ON SCHEMA td_mta TO mail_runtime",
@@ -932,31 +881,17 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
         } else {
             Error::RuntimePrivileges
         };
-        assert_eq!(
-            probe(&serving, &trust, deadline()),
-            Err(expected),
-            "{grant}"
-        );
-        assert_eq!(
-            access::inspect(&runtime, &trust, deadline()),
-            Err(error),
-            "{grant}"
-        );
+        assert_eq!(probe(&serving, deadline()), Err(expected), "{grant}");
+        assert_eq!(access::inspect(&runtime, deadline()), Err(error), "{grant}");
         sql(&fixture, revoke);
-        assert!(probe(&serving, &trust, deadline()).is_ok());
-        assert_eq!(
-            access::inspect(&runtime, &trust, deadline()).unwrap(),
-            receipt
-        );
+        assert!(probe(&serving, deadline()).is_ok());
+        assert_eq!(access::inspect(&runtime, deadline()).unwrap(), receipt);
     }
     sql(
         &fixture,
         "UPDATE td_mta.schema_migrations SET version=99 WHERE version=(SELECT max(version) FROM td_mta.schema_migrations)",
     );
-    assert_eq!(
-        probe(&serving, &trust, deadline()),
-        Err(Error::RuntimeSchema)
-    );
+    assert_eq!(probe(&serving, deadline()), Err(Error::RuntimeSchema));
     sql(
         &fixture,
         &format!(
@@ -964,10 +899,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
             td_mta::postgres_schema::VERSION
         ),
     );
-    assert_eq!(
-        schema::inspect(&serving, &trust, deadline()).unwrap(),
-        receipt
-    );
+    assert_eq!(schema::inspect(&serving, deadline()).unwrap(), receipt);
     // Column-only UPDATE permits policy locking without pointer mutation.
     let execute = |statement: &str, expected: bool| {
         let mut child = ProbeChild(
@@ -1000,16 +932,14 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
         execute(statement, false);
     }
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("runtime-ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("runtime-connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://mail_runtime:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://mail_runtime:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -1035,71 +965,31 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
 
 #[test]
 #[ignore = "requires PostgreSQL 17's initdb, postgres, pg_ctl and psql on PATH"]
-fn real_postgres_requires_tls_scram_primary_settings_and_reconnects() {
+fn real_postgres_requires_scram_primary_settings_and_reconnects() {
     let mut fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let status = probe(&fixture.request(), &trust, deadline()).unwrap();
+    let status = probe(&fixture.request(), deadline()).unwrap();
     assert!(status.server_version >= 170000);
 
     let mut wrong = fixture.request();
-    wrong.server_name = "wrong.invalid";
-    assert_eq!(probe(&wrong, &trust, deadline()), Err(Error::Database));
-    wrong = fixture.request();
     wrong.password = b"wrong";
-    assert_eq!(probe(&wrong, &trust, deadline()), Err(Error::Database));
+    assert_eq!(probe(&wrong, deadline()), Err(Error::Database));
     assert_eq!(
-        probe(
-            &fixture.request(),
-            &TrustStore::public_roots().unwrap(),
-            deadline()
-        ),
-        Err(Error::Database)
-    );
-    assert_eq!(
-        probe(&fixture.request(), &trust, Instant::now()),
+        probe(&fixture.request(), Instant::now()),
         Err(Error::Deadline)
     );
 
     fixture.stop();
-    assert_eq!(
-        probe(&fixture.request(), &trust, deadline()),
-        Err(Error::Transport)
-    );
-    fixture.start(false, false);
-    assert_eq!(
-        probe(&fixture.request(), &trust, deadline()),
-        Err(Error::Database)
-    );
-    fixture.stop();
-    fixture.start(true, true);
-    assert_eq!(
-        probe(&fixture.request(), &trust, deadline()),
-        Err(Error::Settings)
-    );
+    assert_eq!(probe(&fixture.request(), deadline()), Err(Error::Transport));
+    fixture.start(true);
+    assert_eq!(probe(&fixture.request(), deadline()), Err(Error::Settings));
     fixture.stop();
     for method in ["trust", "password"] {
-        fs::write(
-            fixture.data().join("pg_hba.conf"),
-            format!("host all all 127.0.0.1/32 {method}\n"),
-        )
-        .unwrap();
-        fixture.start(true, false);
-        assert_eq!(
-            probe(&fixture.request(), &trust, deadline()),
-            Err(Error::Database)
-        );
+        fixture.start_authenticated(method, false);
+        assert_eq!(probe(&fixture.request(), deadline()), Err(Error::Database));
         fixture.stop();
     }
-    fs::write(
-        fixture.data().join("pg_hba.conf"),
-        "host all all 127.0.0.1/32 scram-sha-256\n",
-    )
-    .unwrap();
-    fixture.start(true, false);
-    assert_eq!(
-        probe(&fixture.request(), &trust, deadline()).unwrap(),
-        status
-    );
+    fixture.start(false);
+    assert_eq!(probe(&fixture.request(), deadline()).unwrap(), status);
     fixture.stop();
 }
 
@@ -1109,7 +999,6 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let ddl = include_str!("../src/postgres_schema.sql");
     let mut hash = Provider.sha256().unwrap();
     hash.update(ddl.as_bytes()).unwrap();
@@ -1121,12 +1010,12 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
         .collect();
     sql(&fixture, &format!("{ddl} INSERT INTO td_mta.schema_migrations VALUES (1, pg_catalog.decode('{digest}','hex'), pg_catalog.decode(pg_catalog.repeat('01',16),'hex'))"));
     assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()),
+        inspect(&fixture.request(), deadline()),
         Err(SchemaError::Version)
     );
     sql(&fixture, "CREATE ROLE material_outsider; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO material_outsider");
     assert_eq!(
-        upgrade(&fixture.request(), &trust, deadline()),
+        upgrade(&fixture.request(), deadline()),
         Err(SchemaError::Invalid)
     );
     assert_eq!(
@@ -1140,24 +1029,18 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     let mut held = hold_schema_lock(&fixture, true);
     assert_eq!(
-        upgrade(&fixture.request(), &trust, deadline()),
+        upgrade(&fixture.request(), deadline()),
         Err(SchemaError::Busy)
     );
     wait_command(&mut held);
-    let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
+    let receipt = upgrade(&fixture.request(), deadline()).unwrap();
     assert_eq!(receipt.version, td_mta::postgres_schema::VERSION);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
-    assert_eq!(
-        upgrade(&fixture.request(), &trust, deadline()).unwrap(),
-        receipt
-    );
-    assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()).unwrap(),
-        receipt
-    );
+    assert_eq!(upgrade(&fixture.request(), deadline()).unwrap(), receipt);
+    assert_eq!(inspect(&fixture.request(), deadline()).unwrap(), receipt);
     sql(&fixture, "UPDATE td_mta.schema_migrations SET store_epoch = pg_catalog.decode(pg_catalog.repeat('02',16),'hex') WHERE version = 2");
     assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()),
+        inspect(&fixture.request(), deadline()),
         Err(SchemaError::Version)
     );
 }
@@ -1171,8 +1054,7 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
         postgres_schema,
     };
     let mut fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     // This administrative writer relies on the common startup setting.
@@ -1187,24 +1069,13 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     ] {
         let bytes: Vec<u8> = (0..kind.max_bytes()).map(|i| (i % 251) as u8).collect();
         let version = Version::from_bytes([kind as u8; 16]);
-        materials::insert(
-            &fixture.request(),
-            &trust,
-            deadline(),
-            epoch,
-            version,
-            kind,
-            &bytes,
-        )
-        .unwrap();
-        let value =
-            materials::read(&fixture.request(), &trust, deadline(), epoch, version, kind).unwrap();
+        materials::insert(&fixture.request(), deadline(), epoch, version, kind, &bytes).unwrap();
+        let value = materials::read(&fixture.request(), deadline(), epoch, version, kind).unwrap();
         assert_eq!(value.kind(), kind);
         assert_eq!(value.bytes(), bytes);
         assert_eq!(
             materials::insert(
                 &fixture.request(),
-                &trust,
                 deadline(),
                 epoch,
                 version,
@@ -1216,7 +1087,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
         assert!(matches!(
             materials::read(
                 &fixture.request(),
-                &trust,
                 deadline(),
                 epoch,
                 version,
@@ -1229,7 +1099,7 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
             Err(materials::Error::Kind)
         ));
         assert_eq!(
-            materials::read(&fixture.request(), &trust, deadline(), epoch, version, kind)
+            materials::read(&fixture.request(), deadline(), epoch, version, kind)
                 .unwrap()
                 .bytes(),
             bytes
@@ -1238,7 +1108,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     let empty = materials::fresh_version().unwrap();
     materials::insert(
         &fixture.request(),
-        &trust,
         deadline(),
         epoch,
         empty,
@@ -1248,7 +1117,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     .unwrap();
     assert!(materials::read(
         &fixture.request(),
-        &trust,
         deadline(),
         epoch,
         empty,
@@ -1260,7 +1128,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     assert_eq!(
         materials::insert(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             empty,
@@ -1273,7 +1140,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     assert!(matches!(
         materials::read(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             absent,
@@ -1285,7 +1151,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     assert_eq!(
         materials::insert(
             &fixture.request(),
-            &trust,
             deadline(),
             stale,
             absent,
@@ -1297,7 +1162,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     assert!(matches!(
         materials::read(
             &fixture.request(),
-            &trust,
             deadline(),
             stale,
             empty,
@@ -1306,12 +1170,11 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
         Err(materials::Error::Epoch)
     ));
     fixture.stop();
-    fixture.start(true, false);
+    fixture.start(false);
     let trust_version = Version::from_bytes([Kind::TrustBundle as u8; 16]);
     assert_eq!(
         materials::read(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             trust_version,
@@ -1326,7 +1189,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     assert!(matches!(
         materials::read(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             trust_version,
@@ -1338,7 +1200,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     assert!(matches!(
         materials::read(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             Version::from_bytes([2; 16]),
@@ -1350,7 +1211,6 @@ fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
     assert_eq!(
         materials::insert(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             absent,
@@ -1370,8 +1230,7 @@ fn real_postgres_materials_roll_back_chunks_and_preserve_uncertain_version() {
         postgres_schema,
     };
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     sql(&fixture, "CREATE FUNCTION public.reject_second_chunk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.ordinal = 1 THEN RAISE EXCEPTION 'fixture'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_chunk BEFORE INSERT ON td_mta.config_material_chunks FOR EACH ROW EXECUTE FUNCTION public.reject_second_chunk()");
@@ -1379,7 +1238,6 @@ fn real_postgres_materials_roll_back_chunks_and_preserve_uncertain_version() {
     assert_eq!(
         materials::insert(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             failed,
@@ -1404,7 +1262,6 @@ fn real_postgres_materials_roll_back_chunks_and_preserve_uncertain_version() {
     assert_eq!(
         materials::insert(
             &fixture.request(),
-            &trust,
             Instant::now() + Duration::from_secs(2),
             epoch,
             uncertain,
@@ -1421,7 +1278,6 @@ fn real_postgres_materials_roll_back_chunks_and_preserve_uncertain_version() {
     assert_eq!(
         materials::read(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             uncertain,
@@ -1434,7 +1290,6 @@ fn real_postgres_materials_roll_back_chunks_and_preserve_uncertain_version() {
     assert_eq!(
         materials::insert(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             uncertain,
@@ -1479,22 +1334,19 @@ fn real_postgres_material_commands_import_verify_and_resolve_retained_version() 
     use td_mta::{ids::StoreEpoch, postgres_schema};
     let fixture = Fixture::new();
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://td_probe:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display(),
+            fixture.root.display(),
         ),
     )
     .unwrap();
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let input = fixture.root.join("material");
@@ -1632,13 +1484,12 @@ fn real_postgres_material_commands_import_verify_and_resolve_retained_version() 
 fn real_postgres_mail_schema_bounds_references_and_rollback() {
     use td_mta::postgres_schema;
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    postgres_schema::initialize(&fixture.request(), &trust, deadline()).unwrap();
+    postgres_schema::initialize(&fixture.request(), deadline()).unwrap();
     sql(&fixture, "CREATE DATABASE non_utf8 TEMPLATE template0 ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C'");
     let mut non_utf8 = fixture.request();
     non_utf8.database = "non_utf8";
     assert_eq!(
-        postgres_schema::initialize(&non_utf8, &trust, deadline()),
+        postgres_schema::initialize(&non_utf8, deadline()),
         Err(postgres_schema::Error::Version)
     );
     let a = "decode(repeat('01',16),'hex')";
@@ -1931,7 +1782,6 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
     ] {
         let fixture = Fixture::new();
-        let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
             include_str!("../src/postgres_schema.sql"),
             include_str!("../src/postgres_materials.sql"),
@@ -1991,7 +1841,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         // Owner-inserted raw material remains byte-identical through migration.
         sql(&fixture, "INSERT INTO td_mta.config_materials VALUES (decode(repeat('01',16),'hex'),5,0,decode(repeat('00',32),'hex'),0)");
         assert_eq!(
-            inspect(&fixture.request(), &trust, deadline()),
+            inspect(&fixture.request(), deadline()),
             Err(SchemaError::Version)
         );
         if matches!(previous_version, 9 | 26) {
@@ -2048,7 +1898,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
         }
         assert_eq!(
-            upgrade(&fixture.request(), &trust, deadline()),
+            upgrade(&fixture.request(), deadline()),
             Err(SchemaError::Database)
         );
         assert_eq!(
@@ -2087,7 +1937,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         if previous_version == 26 {
             sql(&fixture,"UPDATE td_mta.recipients SET state=2,attempt_count=1,attempt_id=decode(repeat('03',16),'hex'),last_attempt_at=0,phase=3,rcpt_reply='250 accepted'");
             assert_eq!(
-                upgrade(&fixture.request(), &trust, deadline()),
+                upgrade(&fixture.request(), deadline()),
                 Err(SchemaError::Database)
             );
             assert_eq!(
@@ -2103,7 +1953,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
-        let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
+        let receipt = upgrade(&fixture.request(), deadline()).unwrap();
         assert_eq!(receipt.version, td_mta::postgres_schema::VERSION);
         assert_eq!(
             sql(
@@ -2173,10 +2023,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         ),
         format!("5|0|0|{}", "00".repeat(32))
     );
-        assert_eq!(
-            inspect(&fixture.request(), &trust, deadline()).unwrap(),
-            receipt
-        );
+        assert_eq!(inspect(&fixture.request(), deadline()).unwrap(), receipt);
     }
 }
 
@@ -2207,8 +2054,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
         user: "search_owner",
         ..fixture.request()
     };
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let receipt = td_mta::postgres_schema::initialize(&owner, &trust, deadline()).unwrap();
+    let receipt = td_mta::postgres_schema::initialize(&owner, deadline()).unwrap();
     assert_eq!(receipt.version, td_mta::postgres_schema::VERSION);
     assert_eq!(sql(&fixture,
         "SELECT e.extversion||':'||r.rolname||':'||n.nspname FROM pg_extension e JOIN pg_roles r ON r.oid=e.extowner JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'"),
@@ -2216,12 +2062,12 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
     assert_eq!(sql(&fixture,
         "SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication FROM pg_roles WHERE rolname='search_owner'"), "f");
     assert_eq!(
-        td_mta::postgres_schema::inspect(&owner, &trust, deadline()).unwrap(),
+        td_mta::postgres_schema::inspect(&owner, deadline()).unwrap(),
         receipt
     );
     // Even a superuser using a different identity is not the explicit owner.
     assert_eq!(
-        td_mta::postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
+        td_mta::postgres_schema::upgrade(&fixture.request(), deadline()),
         Err(td_mta::postgres_schema::Error::Owner)
     );
     rewind_replica_retention(&fixture);
@@ -2239,7 +2085,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
         "f"
     );
     assert_eq!(
-        td_mta::postgres_schema::upgrade(&owner, &trust, deadline()).unwrap(),
+        td_mta::postgres_schema::upgrade(&owner, deadline()).unwrap(),
         receipt
     );
 }
@@ -2249,8 +2095,7 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
 fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     use td_mta::postgres_schema::{self, Error};
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let receipt = postgres_schema::initialize(&fixture.request(), &trust, deadline()).unwrap();
+    let receipt = postgres_schema::initialize(&fixture.request(), deadline()).unwrap();
     sql(&fixture, "CREATE ROLE service_reader; GRANT USAGE ON SCHEMA td_mta TO service_reader; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO service_reader; GRANT UPDATE (store_epoch) ON td_mta.schema_migrations TO service_reader; REVOKE TEMP ON DATABASE postgres FROM PUBLIC");
     let grants = sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' AND c.relname NOT IN ('email_authentication','email_dkim_signatures') ORDER BY 1,2,3,4,5", 65536);
     // Exercise the deployed table with its runtime grants and a retained
@@ -2263,7 +2108,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     sql(&fixture, include_str!("../src/postgres_receiving.sql"));
     sql(&fixture, "GRANT SELECT,INSERT,DELETE ON td_mta.receiving_receipts TO service_reader; INSERT INTO td_mta.accounts VALUES(decode(repeat('12',16),'hex'),decode('0000000000000001','hex'),decode(repeat('00',8),'hex')); INSERT INTO td_mta.receiving_receipts SELECT id,id,decode(repeat('01',32),'hex'),id,id,id,id,0,0,floor,sequence FROM td_mta.accounts");
     assert_eq!(
-        postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap(),
+        postgres_schema::upgrade(&fixture.request(), deadline()).unwrap(),
         receipt
     );
     assert_eq!(sql(&fixture, "SELECT to_regclass('td_mta.receiving_receipts') IS NULL, encode(sequence,'hex') FROM td_mta.accounts"), "t|0000000000000001");
@@ -2273,7 +2118,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     sql(&fixture, include_str!("../src/postgres_receiving.sql"));
     sql(&fixture, "GRANT USAGE ON SCHEMA td_mta TO PUBLIC");
     assert_eq!(
-        postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
+        postgres_schema::upgrade(&fixture.request(), deadline()),
         Err(Error::Invalid)
     );
     assert_eq!(
@@ -2285,7 +2130,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     );
     sql(&fixture, "REVOKE USAGE ON SCHEMA td_mta FROM PUBLIC; ALTER DEFAULT PRIVILEGES GRANT USAGE ON SCHEMAS TO service_reader");
     assert_eq!(
-        postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
+        postgres_schema::upgrade(&fixture.request(), deadline()),
         Err(Error::Invalid)
     );
     assert_eq!(
@@ -2301,7 +2146,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     );
     sql(&fixture, "DO $$ DECLARE i integer; columns text; names text; BEGIN SELECT string_agg('c'||n||' integer',','),string_agg('c'||n,',') INTO columns,names FROM generate_series(1,1400) n; FOR i IN 1..3 LOOP EXECUTE 'CREATE TABLE td_mta.acl_overflow_'||i||' ('||columns||')'; EXECUTE 'GRANT SELECT ('||names||') ON td_mta.acl_overflow_'||i||' TO service_reader'; END LOOP; END $$");
     assert_eq!(
-        postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
+        postgres_schema::upgrade(&fixture.request(), deadline()),
         Err(Error::Invalid)
     );
     assert_eq!(
@@ -2314,7 +2159,7 @@ fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
     // Keep 3,900 column grants to exercise both inventories near their bound.
     sql(&fixture, "DO $$ DECLARE i integer; names text; BEGIN SELECT string_agg('c'||n,',') INTO names FROM generate_series(1301,1400) n; FOR i IN 1..3 LOOP EXECUTE 'REVOKE SELECT ('||names||') ON td_mta.acl_overflow_'||i||' FROM service_reader'; END LOOP; END $$");
     assert_eq!(
-        postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap(),
+        postgres_schema::upgrade(&fixture.request(), deadline()).unwrap(),
         receipt
     );
     sql(
@@ -2341,8 +2186,7 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
         postgres_devices as devices, postgres_schema,
     };
     let mut fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
@@ -2358,7 +2202,6 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -2366,12 +2209,11 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
         ),
         Ok(None)
     );
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &creation).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &creation).unwrap();
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -2382,7 +2224,6 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             other,
@@ -2393,7 +2234,6 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([0; 16]),
             account,
@@ -2404,45 +2244,30 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
     let mut wrong = creation.password().to_vec();
     wrong[96] = if wrong[96] == b'0' { b'1' } else { b'0' };
     assert_eq!(
-        devices::check(
-            &fixture.request(),
-            &trust,
-            deadline(),
-            epoch,
-            account,
-            &wrong
-        ),
+        devices::check(&fixture.request(), deadline(), epoch, account, &wrong),
         Ok(None)
     );
     assert_eq!(
-        devices::check(
-            &fixture.request(),
-            &trust,
-            deadline(),
-            epoch,
-            account,
-            b"bad"
-        ),
+        devices::check(&fixture.request(), deadline(), epoch, account, b"bad"),
         Ok(None)
     );
     let revoke = devices::prepare_revocation(epoch, account, creation.device_id(), 20).unwrap();
     assert_eq!(
-        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        devices::publish_revocation(&fixture.request(), deadline(), &revoke),
         Ok(devices::RevocationOutcome::Recorded)
     );
     assert_eq!(
-        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        devices::publish_revocation(&fixture.request(), deadline(), &revoke),
         Ok(devices::RevocationOutcome::Recorded)
     );
     let second = devices::prepare_revocation(epoch, account, creation.device_id(), 30).unwrap();
     assert_eq!(
-        devices::publish_revocation(&fixture.request(), &trust, deadline(), &second),
+        devices::publish_revocation(&fixture.request(), deadline(), &second),
         Ok(devices::RevocationOutcome::AlreadyRevoked)
     );
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -2450,7 +2275,7 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
         ),
         Ok(None)
     );
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &creation).unwrap();
     assert_eq!(
         sql(
             &fixture,
@@ -2461,18 +2286,16 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
     fixture.stop();
     assert!(devices::check(
         &fixture.request(),
-        &trust,
         deadline(),
         epoch,
         account,
         creation.password()
     )
     .is_err());
-    fixture.start(true, false);
+    fixture.start(false);
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -2489,7 +2312,7 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
         "UPDATE td_mta.devices SET creation_digest=decode(repeat('00',32),'hex')",
     );
     assert_eq!(
-        devices::publish_creation(&fixture.request(), &trust, deadline(), &creation),
+        devices::publish_creation(&fixture.request(), deadline(), &creation),
         Err(devices::Error::Conflict)
     );
     sql(
@@ -2497,13 +2320,13 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
         "UPDATE td_mta.devices SET revocation_digest=decode(repeat('00',32),'hex')",
     );
     assert_eq!(
-        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        devices::publish_revocation(&fixture.request(), deadline(), &revoke),
         Err(devices::Error::Conflict)
     );
     let missing =
         devices::prepare_creation(epoch, AccountId::from_bytes([3; 16]), "missing", 1).unwrap();
     assert_eq!(
-        devices::publish_creation(&fixture.request(), &trust, deadline(), &missing),
+        devices::publish_creation(&fixture.request(), deadline(), &missing),
         Err(devices::Error::Missing)
     );
     for label in ["", "bad\nlabel", &"é".repeat(65)] {
@@ -2524,11 +2347,11 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
     let results = thread::scope(|scope| {
         let one = scope.spawn(|| {
             barrier.wait();
-            devices::publish_creation(&fixture.request(), &trust, deadline(), &first)
+            devices::publish_creation(&fixture.request(), deadline(), &first)
         });
         let two = scope.spawn(|| {
             barrier.wait();
-            devices::publish_creation(&fixture.request(), &trust, deadline(), &second)
+            devices::publish_creation(&fixture.request(), deadline(), &second)
         });
         [one.join().unwrap(), two.join().unwrap()]
     });
@@ -2539,7 +2362,7 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
         .zip([&first, &second])
         .map(|(result, creation)| {
             if result == Err(devices::Error::Database) {
-                devices::publish_creation(&fixture.request(), &trust, deadline(), creation)
+                devices::publish_creation(&fixture.request(), deadline(), creation)
             } else {
                 result
             }
@@ -2567,8 +2390,7 @@ fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
 fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevocation() {
     use td_mta::{ids::AccountId, postgres_devices as devices, postgres_schema};
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+    let epoch = postgres_schema::initialize(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
@@ -2578,14 +2400,13 @@ fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevoc
     assert_eq!(
         devices::publish_creation(
             &fixture.request(),
-            &trust,
             Instant::now() + Duration::from_secs(2),
             &creation
         ),
         Err(devices::Error::Indeterminate)
     );
     // A retry either waits behind the original fence or finds its receipt.
-    let retry = devices::publish_creation(&fixture.request(), &trust, deadline(), &creation);
+    let retry = devices::publish_creation(&fixture.request(), deadline(), &creation);
     assert!(matches!(retry, Ok(()) | Err(devices::Error::Database)));
     let settled = || {
         let stop = Instant::now() + Duration::from_secs(8);
@@ -2595,12 +2416,11 @@ fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevoc
         }
     };
     settled();
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &creation).unwrap();
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.devices"), "1");
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -2612,7 +2432,6 @@ fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevoc
     assert_eq!(
         devices::publish_revocation(
             &fixture.request(),
-            &trust,
             Instant::now() + Duration::from_secs(2),
             &revoke
         ),
@@ -2620,14 +2439,13 @@ fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevoc
     );
     settled();
     assert_eq!(
-        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        devices::publish_revocation(&fixture.request(), deadline(), &revoke),
         Ok(devices::RevocationOutcome::Recorded)
     );
-    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    devices::publish_creation(&fixture.request(), deadline(), &creation).unwrap();
     assert_eq!(
         devices::check(
             &fixture.request(),
-            &trust,
             deadline(),
             epoch,
             account,
@@ -2645,7 +2463,7 @@ fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevoc
     sql(&fixture, "DROP TRIGGER delay_device ON td_mta.devices; CREATE FUNCTION public.reject_device() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER reject_device BEFORE INSERT ON td_mta.devices FOR EACH ROW EXECUTE FUNCTION public.reject_device()");
     let rejected = devices::prepare_creation(epoch, account, "rejected", 3).unwrap();
     assert_eq!(
-        devices::publish_creation(&fixture.request(), &trust, deadline(), &rejected),
+        devices::publish_creation(&fixture.request(), deadline(), &rejected),
         Err(devices::Error::Database)
     );
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.devices"), "1");
@@ -2665,9 +2483,8 @@ fn real_postgres_profile_materials_decode_text_and_compile_tls_without_files() {
         tls_policy::TlsPolicies,
     };
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
-    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+    let epoch = postgres_schema::initialize(&request, deadline())
         .unwrap()
         .store_epoch;
     let chain = fs::read(fixture.root.join("server.crt")).unwrap();
@@ -2681,7 +2498,6 @@ fn real_postgres_profile_materials_decode_text_and_compile_tls_without_files() {
     ] {
         materials::insert(
             &request,
-            &trust,
             deadline(),
             epoch,
             Version::from_bytes([n; 16]),
@@ -2740,7 +2556,7 @@ certificate = "public"
         .unwrap()
     };
     let profile = parse(&source, &mut scratch);
-    let mut loader = Loader::new(&request, &trust, epoch, deadline());
+    let mut loader = Loader::new(&request, epoch, deadline());
     let resolved = materialize::read_profile_text(profile, &mut scratch, |reference| {
         loader.open_input(reference)
     })
@@ -2768,7 +2584,7 @@ certificate = "public"
         &Version::from_bytes([2; 16]).to_string(),
     );
     let profile = parse(&wrong, &mut scratch);
-    let mut loader = Loader::new(&request, &trust, epoch, deadline());
+    let mut loader = Loader::new(&request, epoch, deadline());
     let failure = materialize::read_profile_text(profile, &mut scratch, |reference| {
         loader.open_input(reference)
     })
@@ -2791,7 +2607,7 @@ certificate = "public"
         fixture.root.join("password").to_str().unwrap(),
     );
     let profile = parse(&local, &mut scratch);
-    let mut loader = Loader::new(&request, &trust, epoch, deadline());
+    let mut loader = Loader::new(&request, epoch, deadline());
     assert!(
         materialize::read_profile_text(profile, &mut scratch, |reference| loader
             .open_input(reference))
@@ -3141,9 +2957,8 @@ fn exercise_configuration(exercise: ConfigurationExercise) {
     if matches!(exercise, ConfigurationExercise::Submissions) {
         fixture.queue_runtime = Some(queue_expiry::Runtime::new(&fixture));
     }
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
-    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+    let epoch = postgres_schema::initialize(&request, deadline())
         .unwrap()
         .store_epoch;
     let chain = fs::read(fixture.root.join("server.crt")).unwrap();
@@ -3158,7 +2973,6 @@ fn exercise_configuration(exercise: ConfigurationExercise) {
     ] {
         materials::insert(
             &request,
-            &trust,
             deadline(),
             epoch,
             Version::from_bytes([n; 16]),
@@ -3218,7 +3032,7 @@ certificate = "public"
         ca = Version::from_bytes([4; 16])
     );
     if matches!(exercise, ConfigurationExercise::ServiceMaterials) {
-        service_materials::exercise(&fixture, &trust, epoch, &shared, &desktop);
+        service_materials::exercise(&fixture, epoch, &shared, &desktop);
         return;
     }
     let desktop = if let (Some(relay), Some(dns)) = (&relay_socket, &relay_dns) {
@@ -3358,14 +3172,7 @@ per_peer_limit = 1
         source: desktop.as_bytes(),
     };
     let prepare = |profiles: &[Profile<'_>]| {
-        configuration::prepare(
-            &request,
-            &trust,
-            deadline(),
-            epoch,
-            shared.as_bytes(),
-            profiles,
-        )
+        configuration::prepare(&request, deadline(), epoch, shared.as_bytes(), profiles)
     };
     let candidate = prepare(&[two, one]).unwrap();
     assert_eq!(candidate.epoch(), epoch);
@@ -3511,17 +3318,17 @@ per_peer_limit = 1
     use td_mta::postgres_configuration_store as versions;
     let version = versions::Version::from_bytes([11; 16]);
     assert_eq!(
-        versions::read(&request, &trust, deadline(), epoch, version).err(),
+        versions::read(&request, deadline(), epoch, version).err(),
         Some(versions::Error::Missing)
     );
     sql(&fixture, "ALTER ROLE td_probe SET default_transaction_isolation = 'repeatable read'; CREATE FUNCTION public.require_config_settings() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('synchronous_commit') <> 'on' OR current_setting('idle_in_transaction_session_timeout') <> '10s' OR current_setting('transaction_isolation') <> 'read committed' THEN RAISE EXCEPTION 'config settings'; END IF; RETURN NEW; END $$; CREATE TRIGGER require_config_settings BEFORE INSERT ON td_mta.config_versions FOR EACH ROW EXECUTE FUNCTION public.require_config_settings()");
-    versions::publish(&request, &trust, deadline(), version, &candidate).unwrap();
-    versions::publish(&request, &trust, deadline(), version, &candidate).unwrap();
+    versions::publish(&request, deadline(), version, &candidate).unwrap();
+    versions::publish(&request, deadline(), version, &candidate).unwrap();
     assert_eq!(
-        versions::publish(&request, &trust, deadline(), version, &changed),
+        versions::publish(&request, deadline(), version, &changed),
         Err(versions::Error::Conflict)
     );
-    let loaded = versions::read(&request, &trust, deadline(), epoch, version).unwrap();
+    let loaded = versions::read(&request, deadline(), epoch, version).unwrap();
     assert_eq!(loaded.digest(), candidate.digest());
     assert_eq!(loaded.shared(), candidate.shared());
     assert_eq!(loaded.quotas(), candidate.quotas());
@@ -3552,7 +3359,7 @@ per_peer_limit = 1
     }])
     .unwrap();
     let large_id = versions::Version::from_bytes([12; 16]);
-    versions::publish(&request, &trust, deadline(), large_id, &large).unwrap();
+    versions::publish(&request, deadline(), large_id, &large).unwrap();
     assert_eq!(
         sql(
             &fixture,
@@ -3561,7 +3368,7 @@ per_peer_limit = 1
         "33"
     );
     assert_eq!(
-        versions::read(&request, &trust, deadline(), epoch, large_id)
+        versions::read(&request, deadline(), epoch, large_id)
             .unwrap()
             .digest(),
         large.digest()
@@ -3570,7 +3377,7 @@ per_peer_limit = 1
     sql(&fixture, "CREATE FUNCTION public.reject_config_chunk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.ordinal = 1 THEN RAISE EXCEPTION 'fixture'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_config_chunk BEFORE INSERT ON td_mta.config_version_chunks FOR EACH ROW EXECUTE FUNCTION public.reject_config_chunk()");
     let failed = versions::Version::from_bytes([13; 16]);
     assert_eq!(
-        versions::publish(&request, &trust, deadline(), failed, &large),
+        versions::publish(&request, deadline(), failed, &large),
         Err(versions::Error::Database)
     );
     assert_eq!(
@@ -3586,7 +3393,6 @@ per_peer_limit = 1
     assert_eq!(
         versions::publish(
             &request,
-            &trust,
             Instant::now() + Duration::from_secs(2),
             uncertain,
             &candidate
@@ -3602,9 +3408,9 @@ per_peer_limit = 1
         assert!(Instant::now() < stop);
         thread::sleep(Duration::from_millis(50));
     }
-    versions::publish(&request, &trust, deadline(), uncertain, &candidate).unwrap();
+    versions::publish(&request, deadline(), uncertain, &candidate).unwrap();
     assert_eq!(
-        versions::read(&request, &trust, deadline(), epoch, uncertain)
+        versions::read(&request, deadline(), epoch, uncertain)
             .unwrap()
             .digest(),
         candidate.digest()
@@ -3621,10 +3427,8 @@ per_peer_limit = 1
     // with the database role's default isolation set to REPEATABLE READ.
     let raced = versions::Version::from_bytes([15; 16]);
     let (first, second) = thread::scope(|scope| {
-        let first =
-            scope.spawn(|| versions::publish(&request, &trust, deadline(), raced, &candidate));
-        let second =
-            scope.spawn(|| versions::publish(&request, &trust, deadline(), raced, &changed));
+        let first = scope.spawn(|| versions::publish(&request, deadline(), raced, &candidate));
+        let second = scope.spawn(|| versions::publish(&request, deadline(), raced, &changed));
         (first.join().unwrap(), second.join().unwrap())
     });
     assert_ne!(first.is_ok(), second.is_ok());
@@ -3637,13 +3441,13 @@ per_peer_limit = 1
         refused,
         Err(versions::Error::Conflict | versions::Error::Database)
     ));
-    versions::publish(&request, &trust, deadline(), raced, winner).unwrap();
+    versions::publish(&request, deadline(), raced, winner).unwrap();
     assert_eq!(
-        versions::publish(&request, &trust, deadline(), raced, loser),
+        versions::publish(&request, deadline(), raced, loser),
         Err(versions::Error::Conflict)
     );
     assert_eq!(
-        versions::read(&request, &trust, deadline(), epoch, raced)
+        versions::read(&request, deadline(), epoch, raced)
             .unwrap()
             .digest(),
         winner.digest()
@@ -3654,16 +3458,14 @@ per_peer_limit = 1
     );
     // Exercise the real owner commands through protected bootstrap/source files.
     fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let ca = fixture.root.join("config-ca.pem");
-    fs::write(&ca, &fixture.ca).unwrap();
     let connection = fixture.root.join("config-connection");
     fs::write(
         &connection,
         format!(
-            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://td_probe:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -3743,7 +3545,7 @@ per_peer_limit = 1
     assert!(invoke("config-check", &shared_file, 1).contains("input-private-mode"));
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
     use td_mta::postgres_selection as selection;
-    assert!(selection::read(&request, &trust, deadline(), epoch)
+    assert!(selection::read(&request, deadline(), epoch)
         .unwrap()
         .is_none());
     use td_mta::{
@@ -3753,7 +3555,6 @@ per_peer_limit = 1
     assert_eq!(
         runtime::load(
             &request,
-            &trust,
             deadline(),
             epoch,
             "desktop",
@@ -3771,7 +3572,7 @@ per_peer_limit = 1
         selection::prepare(epoch, 0, version, &candidate).unwrap()
     };
     assert_eq!(
-        selection::inspect(&request, &trust, deadline(), first).unwrap(),
+        selection::inspect(&request, deadline(), first).unwrap(),
         None
     );
     // Receipt resolution must wait for a publication holding the policy row.
@@ -3796,13 +3597,13 @@ per_peer_limit = 1
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        selection::inspect(&request, &trust, deadline(), first),
+        selection::inspect(&request, deadline(), first),
         Err(selection::Error::Database)
     );
     writeln!(input, "COMMIT;").unwrap();
     drop(input);
     wait_command(&mut blocker);
-    let selected = selection::publish(&request, &trust, deadline(), first).unwrap();
+    let selected = selection::publish(&request, deadline(), first).unwrap();
     if matches!(exercise, ConfigurationExercise::Flags) {
         selection_commands::recorded(&fixture, &connection, first, 1);
     }
@@ -3811,7 +3612,6 @@ per_peer_limit = 1
     assert_eq!(
         runtime::load(
             &request,
-            &trust,
             deadline(),
             epoch,
             "desktop",
@@ -3826,57 +3626,40 @@ per_peer_limit = 1
     let account = td_mta::ids::AccountId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     td_mta::postgres_accounts::publish(
         &request,
-        &trust,
         deadline(),
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
     if matches!(exercise, ConfigurationExercise::ServiceIsolation) {
-        isolated_services::exercise(
-            &fixture,
-            &request,
-            &trust,
-            epoch,
-            &shared,
-            &desktop,
-            &connection,
-        );
+        isolated_services::exercise(&fixture, &request, epoch, &shared, &desktop, &connection);
         return;
     }
     if matches!(exercise, ConfigurationExercise::FolderReconcile) {
-        folder_reconcile::exercise(&fixture, &request, &trust, epoch, &connection);
+        folder_reconcile::exercise(&fixture, &request, epoch, &connection);
         return;
     }
     if matches!(exercise, ConfigurationExercise::Unmapped) {
-        unmapped::exercise(&fixture, &request, &trust, epoch, &connection);
+        unmapped::exercise(&fixture, &request, epoch, &connection);
         return;
     }
     if matches!(exercise, ConfigurationExercise::Reconcile) {
-        reconciliation::exercise(&fixture, &request, &trust, epoch, &connection);
+        reconciliation::exercise(&fixture, &request, epoch, &connection);
         return;
     }
     if matches!(exercise, ConfigurationExercise::Imports) {
-        imports::exercise(&fixture, &request, &trust, epoch, &connection);
+        imports::exercise(&fixture, &request, epoch, &connection);
         return;
     }
     if matches!(exercise, ConfigurationExercise::AccountAdmin) {
-        account_workflow::exercise(&fixture, &request, &trust, epoch, &connection);
+        account_workflow::exercise(&fixture, &request, epoch, &connection);
         return;
     }
     if matches!(exercise, ConfigurationExercise::AccountRoutes) {
-        account_routes::exercise(
-            &fixture,
-            &request,
-            &trust,
-            epoch,
-            &shared,
-            &desktop,
-            &connection,
-        );
+        account_routes::exercise(&fixture, &request, epoch, &shared, &desktop, &connection);
         return;
     }
     if matches!(exercise, ConfigurationExercise::MultiAccount) {
-        multi_account::exercise(&fixture, &request, &trust, epoch, &shared, &desktop);
+        multi_account::exercise(&fixture, &request, epoch, &shared, &desktop);
         return;
     }
     let mut serving = fixture.request();
@@ -3925,9 +3708,9 @@ per_peer_limit = 1
         ])
         .unwrap();
         let version = versions::Version::from_bytes([24; 16]);
-        versions::publish(&request, &trust, deadline(), version, &managed).unwrap();
+        versions::publish(&request, deadline(), version, &managed).unwrap();
         let change = selection::prepare(epoch, 1, version, &managed).unwrap();
-        selection::publish(&request, &trust, deadline(), change).unwrap();
+        selection::publish(&request, deadline(), change).unwrap();
         let sockets = (
             smtp_socket.take().unwrap(),
             https_socket.take().unwrap(),
@@ -3953,7 +3736,6 @@ per_peer_limit = 1
         let mut domain = GenerationSet::<TlsPolicies>::at_startup();
         let prepared = runtime::load(
             profile_request,
-            &trust,
             deadline(),
             epoch,
             name,
@@ -4020,10 +3802,10 @@ per_peer_limit = 1
                 | ConfigurationExercise::ReplicaPublication
                 | ConfigurationExercise::Performance => {}
                 ConfigurationExercise::Submissions => {
-                    exercise_submission_input(&fixture, &request, &trust, prepared.binding(), true)
+                    exercise_submission_input(&fixture, &request, prepared.binding(), true)
                 }
                 ConfigurationExercise::SubmissionInput => {
-                    exercise_submission_input(&fixture, &request, &trust, prepared.binding(), false)
+                    exercise_submission_input(&fixture, &request, prepared.binding(), false)
                 }
                 ConfigurationExercise::Receiving
                 | ConfigurationExercise::ReceivingOwner
@@ -4032,34 +3814,34 @@ per_peer_limit = 1
                 | ConfigurationExercise::ReceivingRate
                 | ConfigurationExercise::ReceivingFairness => {}
                 ConfigurationExercise::Deletion => {
-                    exercise_deletion(&fixture, &request, &trust, prepared.binding())
+                    exercise_deletion(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::Moves => {
-                    exercise_moves(&fixture, &request, &trust, prepared.binding())
+                    exercise_moves(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::Flags => {
-                    exercise_flags(&fixture, profile_request, &trust, prepared.binding())
+                    exercise_flags(&fixture, profile_request, prepared.binding())
                 }
                 ConfigurationExercise::HttpUploads => {
-                    exercise_http_upload_owner(&fixture, &request, &trust, prepared.binding())
+                    exercise_http_upload_owner(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::Uploads => {
-                    exercise_uploads(&fixture, &request, &trust, prepared.binding())
+                    exercise_uploads(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::Folders => {
-                    exercise_folders(&fixture, &request, &trust, prepared.binding())
+                    exercise_folders(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::Threads => {
-                    exercise_threads(&fixture, &request, &trust, prepared.binding())
+                    exercise_threads(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::Query => {
-                    exercise_query(&fixture, &request, &trust, prepared.binding())
+                    exercise_query(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::HttpDrafts => {
-                    exercise_read(&fixture, profile_request, &trust, prepared.binding(), true)
+                    exercise_read(&fixture, profile_request, prepared.binding(), true)
                 }
                 ConfigurationExercise::Read => {
-                    exercise_read(&fixture, profile_request, &trust, prepared.binding(), false)
+                    exercise_read(&fixture, profile_request, prepared.binding(), false)
                 }
                 ConfigurationExercise::HttpAuthentication => {
                     let creation = td_mta::postgres_devices::prepare_creation(
@@ -4069,13 +3851,8 @@ per_peer_limit = 1
                         1,
                     )
                     .unwrap();
-                    td_mta::postgres_devices::publish_creation(
-                        &request,
-                        &trust,
-                        deadline(),
-                        &creation,
-                    )
-                    .unwrap();
+                    td_mta::postgres_devices::publish_creation(&request, deadline(), &creation)
+                        .unwrap();
                     exercise_http_auth(
                         &fixture,
                         prepared.binding(),
@@ -4084,18 +3861,18 @@ per_peer_limit = 1
                     );
                 }
                 ConfigurationExercise::Changes => {
-                    exercise_changes(&fixture, &request, &trust, prepared.binding())
+                    exercise_changes(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::Drafts => {
-                    exercise_drafts(&fixture, &request, &trust, prepared.binding())
+                    exercise_drafts(&fixture, &request, prepared.binding())
                 }
                 ConfigurationExercise::Downloads => {
-                    exercise_downloads(&fixture, &request, &trust, prepared.binding())
+                    exercise_downloads(&fixture, &request, prepared.binding())
                 }
             }
         }
         if name == "cloud" && matches!(exercise, ConfigurationExercise::Receiving) {
-            exercise_receiving(&fixture, &request, &trust, prepared.binding());
+            exercise_receiving(&fixture, &request, prepared.binding());
         }
         if name == "cloud" && matches!(exercise, ConfigurationExercise::ReceivingOwner) {
             exercise_smtp_receiving_owner(&fixture, prepared.binding());
@@ -4123,7 +3900,6 @@ per_peer_limit = 1
             mail_client::exercise(
                 &fixture,
                 profile_request,
-                &trust,
                 &binding,
                 &configuration,
                 &active,
@@ -4186,7 +3962,6 @@ per_peer_limit = 1
     assert_eq!(
         runtime::load(
             &request,
-            &trust,
             deadline(),
             epoch,
             "missing",
@@ -4198,7 +3973,6 @@ per_peer_limit = 1
     assert_eq!(
         runtime::load(
             &request,
-            &trust,
             Instant::now(),
             epoch,
             "desktop",
@@ -4210,7 +3984,6 @@ per_peer_limit = 1
     assert_eq!(
         runtime::load(
             &request,
-            &trust,
             deadline(),
             epoch,
             "Desktop",
@@ -4222,17 +3995,17 @@ per_peer_limit = 1
     assert_eq!(empty_domain.available(), 2);
 
     assert_eq!(
-        selection::publish(&request, &trust, deadline(), first).unwrap(),
+        selection::publish(&request, deadline(), first).unwrap(),
         selected
     );
-    let (observed, loaded) = selection::read(&request, &trust, deadline(), epoch)
+    let (observed, loaded) = selection::read(&request, deadline(), epoch)
         .unwrap()
         .unwrap();
     assert_eq!(observed, selected);
     assert_eq!(loaded.digest(), candidate.digest());
     let stale = selection::prepare(epoch, 0, version, &candidate).unwrap();
     assert_eq!(
-        selection::publish(&request, &trust, deadline(), stale),
+        selection::publish(&request, deadline(), stale),
         Err(selection::Error::Conflict)
     );
     let next = selection::prepare(epoch, 1, version, &candidate).unwrap();
@@ -4240,8 +4013,8 @@ per_peer_limit = 1
     // Revalidation opens several material connections under this one budget.
     let race_deadline = || Instant::now() + Duration::from_secs(10);
     let results = thread::scope(|scope| {
-        let a = scope.spawn(|| selection::publish(&request, &trust, race_deadline(), next));
-        let b = scope.spawn(|| selection::publish(&request, &trust, race_deadline(), contender));
+        let a = scope.spawn(|| selection::publish(&request, race_deadline(), next));
+        let b = scope.spawn(|| selection::publish(&request, race_deadline(), contender));
         (a.join().unwrap(), b.join().unwrap())
     });
     assert_ne!(results.0.is_ok(), results.1.is_ok(), "{results:?}");
@@ -4257,7 +4030,7 @@ per_peer_limit = 1
             // Global text-owner or generation-ID contention can refuse preparation.
             // Revalidate once after the winner; this operation must stay stale.
             assert_eq!(
-                selection::publish(&request, &trust, race_deadline(), change),
+                selection::publish(&request, race_deadline(), change),
                 Err(selection::Error::Conflict),
                 "initial race: {results:?}"
             );
@@ -4272,7 +4045,7 @@ per_peer_limit = 1
         }
     }
     assert_eq!(
-        selection::read(&request, &trust, deadline(), epoch)
+        selection::read(&request, deadline(), epoch)
             .unwrap()
             .unwrap()
             .0
@@ -4286,7 +4059,7 @@ per_peer_limit = 1
         selection_commands::recorded(&fixture, &connection, first, 1);
     }
     assert_eq!(
-        selection::publish(&request, &trust, deadline(), first).unwrap(),
+        selection::publish(&request, deadline(), first).unwrap(),
         selected
     );
     let delay = if matches!(exercise, ConfigurationExercise::Flags) {
@@ -4301,12 +4074,7 @@ per_peer_limit = 1
         selection_commands::uncertain(&fixture, &connection, uncertain);
     } else {
         assert_eq!(
-            selection::publish(
-                &request,
-                &trust,
-                Instant::now() + Duration::from_secs(2),
-                uncertain
-            ),
+            selection::publish(&request, Instant::now() + Duration::from_secs(2), uncertain),
             Err(selection::Error::Indeterminate)
         );
     }
@@ -4316,7 +4084,7 @@ per_peer_limit = 1
         "DROP TRIGGER delay_selection ON td_mta.config_selection_receipts",
     );
     let uncertain = selection::Change::decode(&retained_uncertain).unwrap();
-    let landed = selection::inspect(&request, &trust, deadline(), uncertain)
+    let landed = selection::inspect(&request, deadline(), uncertain)
         .unwrap()
         .unwrap();
     assert_eq!(landed.generation, 3);
@@ -4327,14 +4095,14 @@ per_peer_limit = 1
     altered[57] ^= 1;
     let altered = selection::Change::decode(&altered).unwrap();
     assert_eq!(
-        selection::inspect(&request, &trust, deadline(), altered),
+        selection::inspect(&request, deadline(), altered),
         Err(selection::Error::Conflict)
     );
     assert_eq!(
-        selection::publish(&request, &trust, deadline(), altered),
+        selection::publish(&request, deadline(), altered),
         Err(selection::Error::Conflict)
     );
-    let settled = selection::publish(&request, &trust, deadline(), uncertain).unwrap();
+    let settled = selection::publish(&request, deadline(), uncertain).unwrap();
     assert_eq!(settled, landed);
     assert_eq!(settled.generation, 3);
     assert_eq!(
@@ -4348,11 +4116,11 @@ per_peer_limit = 1
     sql(&fixture, "CREATE FUNCTION public.reject_selection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_selection BEFORE INSERT ON td_mta.config_selection_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_selection()");
     let refused = selection::prepare(epoch, 3, version, &candidate).unwrap();
     assert_eq!(
-        selection::publish(&request, &trust, deadline(), refused),
+        selection::publish(&request, deadline(), refused),
         Err(selection::Error::Database)
     );
     assert_eq!(
-        selection::read(&request, &trust, deadline(), epoch)
+        selection::read(&request, deadline(), epoch)
             .unwrap()
             .unwrap()
             .0,
@@ -4368,16 +4136,16 @@ per_peer_limit = 1
     );
     let mismatched = selection::prepare(epoch, 3, version, &changed).unwrap();
     assert_eq!(
-        selection::publish(&request, &trust, deadline(), mismatched),
+        selection::publish(&request, deadline(), mismatched),
         Err(selection::Error::Conflict)
     );
     sql(&fixture, &format!("INSERT INTO td_mta.config_selection_receipts SELECT decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),pg_catalog.int8send(n),decode('{version}','hex') FROM generate_series(4::bigint,1024::bigint) n"));
     assert_eq!(
-        selection::publish(&request, &trust, deadline(), refused),
+        selection::publish(&request, deadline(), refused),
         Err(selection::Error::Capacity)
     );
     assert_eq!(
-        selection::read(&request, &trust, deadline(), epoch)
+        selection::read(&request, deadline(), epoch)
             .unwrap()
             .unwrap()
             .0,
@@ -4390,7 +4158,6 @@ per_peer_limit = 1
     assert!(matches!(
         runtime::load(
             &request,
-            &trust,
             deadline(),
             epoch,
             "desktop",
@@ -4401,7 +4168,7 @@ per_peer_limit = 1
     assert_eq!(empty_domain.available(), 2);
 
     assert!(matches!(
-        selection::publish(&request, &trust, deadline(), refused),
+        selection::publish(&request, deadline(), refused),
         Err(selection::Error::Configuration(_))
     ));
     let first = selection::Change::decode(&retained_first).unwrap();
@@ -4409,22 +4176,22 @@ per_peer_limit = 1
         selection_commands::recorded(&fixture, &connection, first, 1);
     }
     assert_eq!(
-        selection::inspect(&request, &trust, deadline(), first).unwrap(),
+        selection::inspect(&request, deadline(), first).unwrap(),
         Some(selected)
     );
     assert_eq!(
-        selection::publish(&request, &trust, deadline(), first).unwrap(),
+        selection::publish(&request, deadline(), first).unwrap(),
         selected
     );
 
     assert!(matches!(
-        versions::read(&request, &trust, deadline(), epoch, version),
+        versions::read(&request, deadline(), epoch, version),
         Err(versions::Error::Validation(configuration::Error::Material(
             _
         )))
     ));
     // Passive repair export survives missing materials, but still checks sources.
-    let sources = versions::read_sources(&request, &trust, deadline(), epoch, version).unwrap();
+    let sources = versions::read_sources(&request, deadline(), epoch, version).unwrap();
     let (stored_shared, stored_profiles) = sources.parts().unwrap();
     assert!(!stored_shared.is_empty());
     assert!(!stored_profiles.is_empty());
@@ -4457,11 +4224,11 @@ per_peer_limit = 1
         .is_some_and(|p| !p.is_empty()));
     sql(&fixture, "UPDATE td_mta.config_version_chunks SET bytes=pg_catalog.set_byte(bytes,0,0) WHERE version_id=decode(repeat('0b',16),'hex') AND ordinal=0");
     assert_eq!(
-        versions::read(&request, &trust, deadline(), epoch, version).err(),
+        versions::read(&request, deadline(), epoch, version).err(),
         Some(versions::Error::Integrity)
     );
     assert_eq!(
-        versions::read_sources(&request, &trust, deadline(), epoch, version).err(),
+        versions::read_sources(&request, deadline(), epoch, version).err(),
         Some(versions::Error::Integrity)
     );
 }
@@ -4503,9 +4270,8 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
         postgres_accounts as accounts, postgres_schema,
     };
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
-    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+    let epoch = postgres_schema::initialize(&request, deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
@@ -4513,14 +4279,14 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
     assert_eq!(creation.epoch(), epoch);
     assert_eq!(creation.account(), account);
     assert_eq!(
-        accounts::inspect(&request, &trust, deadline(), epoch, account),
+        accounts::inspect(&request, deadline(), epoch, account),
         Err(accounts::Error::Missing)
     );
     sql(&fixture, "ALTER ROLE td_probe SET default_transaction_isolation='repeatable read'; CREATE FUNCTION public.require_bootstrap_settings() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('synchronous_commit') <> 'on' OR current_setting('idle_in_transaction_session_timeout') <> '10s' OR current_setting('transaction_isolation') <> 'read committed' THEN RAISE EXCEPTION 'bootstrap settings'; END IF; RETURN NEW; END $$; CREATE TRIGGER require_bootstrap_settings BEFORE INSERT ON td_mta.accounts FOR EACH ROW EXECUTE FUNCTION public.require_bootstrap_settings()");
-    accounts::publish(&request, &trust, deadline(), creation).unwrap();
-    accounts::publish(&request, &trust, deadline(), creation).unwrap();
+    accounts::publish(&request, deadline(), creation).unwrap();
+    accounts::publish(&request, deadline(), creation).unwrap();
     assert_eq!(
-        accounts::inspect(&request, &trust, deadline(), epoch, account).unwrap(),
+        accounts::inspect(&request, deadline(), epoch, account).unwrap(),
         creation
     );
     assert_eq!(
@@ -4535,11 +4301,11 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
     let other = accounts::prepare(epoch, account).unwrap();
     assert_ne!(creation.inbox(), other.inbox());
     assert_eq!(
-        accounts::publish(&request, &trust, deadline(), other),
+        accounts::publish(&request, deadline(), other),
         Err(accounts::Error::Conflict)
     );
     sql(&fixture, "UPDATE td_mta.accounts SET sequence=decode(repeat('ff',8),'hex'); UPDATE td_mta.mailboxes SET name='Renamed Inbox'");
-    accounts::publish(&request, &trust, deadline(), creation).unwrap();
+    accounts::publish(&request, deadline(), creation).unwrap();
     assert_eq!(
         sql(
             &fixture,
@@ -4558,21 +4324,21 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
     )
     .unwrap();
     assert_eq!(
-        accounts::publish(&request, &trust, deadline(), wrong_epoch),
+        accounts::publish(&request, deadline(), wrong_epoch),
         Err(accounts::Error::Epoch)
     );
     // An unreceipted owner-created account is not silently reset or repaired.
     sql(&fixture, "DROP TRIGGER require_bootstrap_settings ON td_mta.accounts; INSERT INTO td_mta.accounts VALUES (decode(repeat('02',16),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex'))");
     let existing = accounts::prepare(epoch, AccountId::from_bytes([2; 16])).unwrap();
     assert_eq!(
-        accounts::publish(&request, &trust, deadline(), existing),
+        accounts::publish(&request, deadline(), existing),
         Err(accounts::Error::Exists)
     );
     // Failure after account and Inbox inserts must remove every provisional row.
     sql(&fixture, "CREATE FUNCTION public.reject_bootstrap_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER reject_bootstrap_receipt BEFORE INSERT ON td_mta.account_bootstraps FOR EACH ROW EXECUTE FUNCTION public.reject_bootstrap_receipt()");
     let failed = accounts::prepare(epoch, AccountId::from_bytes([3; 16])).unwrap();
     assert_eq!(
-        accounts::publish(&request, &trust, deadline(), failed),
+        accounts::publish(&request, deadline(), failed),
         Err(accounts::Error::Database)
     );
     for table in ["accounts", "mailboxes", "changes", "account_bootstraps"] {
@@ -4582,12 +4348,7 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
     sql(&fixture, "DROP TRIGGER reject_bootstrap_receipt ON td_mta.account_bootstraps; CREATE FUNCTION public.delay_bootstrap_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_bootstrap AFTER INSERT ON td_mta.account_bootstraps DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_bootstrap_commit()");
     let uncertain = accounts::prepare(epoch, AccountId::from_bytes([4; 16])).unwrap();
     assert_eq!(
-        accounts::publish(
-            &request,
-            &trust,
-            Instant::now() + Duration::from_secs(2),
-            uncertain
-        ),
+        accounts::publish(&request, Instant::now() + Duration::from_secs(2), uncertain),
         Err(accounts::Error::Indeterminate)
     );
     let stop = Instant::now() + Duration::from_secs(8);
@@ -4600,10 +4361,10 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
         thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(
-        accounts::inspect(&request, &trust, deadline(), epoch, uncertain.account()).unwrap(),
+        accounts::inspect(&request, deadline(), epoch, uncertain.account()).unwrap(),
         uncertain
     );
-    accounts::publish(&request, &trust, deadline(), uncertain).unwrap();
+    accounts::publish(&request, deadline(), uncertain).unwrap();
     sql(
         &fixture,
         "DROP TRIGGER delay_bootstrap ON td_mta.account_bootstraps",
@@ -4612,8 +4373,8 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
     let first = accounts::prepare(epoch, raced_account).unwrap();
     let second = accounts::prepare(epoch, raced_account).unwrap();
     let (one, two) = thread::scope(|scope| {
-        let one = scope.spawn(|| accounts::publish(&request, &trust, deadline(), first));
-        let two = scope.spawn(|| accounts::publish(&request, &trust, deadline(), second));
+        let one = scope.spawn(|| accounts::publish(&request, deadline(), first));
+        let two = scope.spawn(|| accounts::publish(&request, deadline(), second));
         (one.join().unwrap(), two.join().unwrap())
     });
     assert_ne!(one.is_ok(), two.is_ok());
@@ -4627,12 +4388,12 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
         Err(accounts::Error::Conflict | accounts::Error::Database)
     ));
     assert_eq!(
-        accounts::inspect(&request, &trust, deadline(), epoch, raced_account).unwrap(),
+        accounts::inspect(&request, deadline(), epoch, raced_account).unwrap(),
         winner
     );
-    accounts::publish(&request, &trust, deadline(), winner).unwrap();
+    accounts::publish(&request, deadline(), winner).unwrap();
     assert_eq!(
-        accounts::publish(&request, &trust, deadline(), loser),
+        accounts::publish(&request, deadline(), loser),
         Err(accounts::Error::Conflict)
     );
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.accounts"), "4");
@@ -4653,26 +4414,16 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
         postgres_mailboxes as mailboxes, postgres_schema,
     };
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
-    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+    let epoch = postgres_schema::initialize(&request, deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
     let creation = accounts::prepare(epoch, account).unwrap();
-    accounts::publish(&request, &trust, deadline(), creation).unwrap();
+    accounts::publish(&request, deadline(), creation).unwrap();
     let device = devices::prepare_creation(epoch, account, "mailbox reader", 1).unwrap();
-    devices::publish_creation(&request, &trust, deadline(), &device).unwrap();
-    let read = || {
-        mailboxes::list(
-            &request,
-            &trust,
-            deadline(),
-            epoch,
-            account,
-            device.password(),
-        )
-    };
+    devices::publish_creation(&request, deadline(), &device).unwrap();
+    let read = || mailboxes::list(&request, deadline(), epoch, account, device.password());
     let first = read().unwrap();
     assert_eq!(first.identity.committed_sequence.number(), 1);
     assert_eq!(first.identity.history_floor.number(), 0);
@@ -4682,13 +4433,12 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
     assert_eq!(first.mailboxes[0].name, "Inbox");
     assert_eq!(first.mailboxes[0].counts.total_emails, 0);
     assert_eq!(
-        mailboxes::list(&request, &trust, deadline(), epoch, account, b"bad"),
+        mailboxes::list(&request, deadline(), epoch, account, b"bad"),
         Err(mailboxes::Error::Unauthenticated)
     );
     assert_eq!(
         mailboxes::list(
             &request,
-            &trust,
             deadline(),
             StoreEpoch::from_bytes([8; 16]),
             account,
@@ -4699,20 +4449,12 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
     let other = AccountId::from_bytes([2; 16]);
     accounts::publish(
         &request,
-        &trust,
         deadline(),
         accounts::prepare(epoch, other).unwrap(),
     )
     .unwrap();
     assert_eq!(
-        mailboxes::list(
-            &request,
-            &trust,
-            deadline(),
-            epoch,
-            other,
-            device.password()
-        ),
+        mailboxes::list(&request, deadline(), epoch, other, device.password()),
         Err(mailboxes::Error::Unauthenticated)
     );
     sql(&fixture, &format!("BEGIN;
@@ -4801,17 +4543,10 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
     sql(&fixture, &format!("UPDATE td_mta.mailboxes SET parent_id=NULL WHERE account=decode('{account}','hex') AND id=decode('{}','hex')", creation.inbox()));
     assert_eq!(read().unwrap().mailboxes.len(), 2);
     let revoked = devices::prepare_revocation(epoch, account, device.device_id(), 2).unwrap();
-    devices::publish_revocation(&request, &trust, deadline(), &revoked).unwrap();
+    devices::publish_revocation(&request, deadline(), &revoked).unwrap();
     assert_eq!(read(), Err(mailboxes::Error::Unauthenticated));
     assert_eq!(
-        mailboxes::list(
-            &request,
-            &trust,
-            Instant::now(),
-            epoch,
-            account,
-            device.password()
-        ),
+        mailboxes::list(&request, Instant::now(), epoch, account, device.password()),
         Err(mailboxes::Error::Connection(Error::Deadline))
     );
 
@@ -4819,7 +4554,7 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
     // Release it after committing a revocation and a new state in that same writer.
     use std::io::Write;
     let admitted = devices::prepare_creation(epoch, account, "snapshot race", 3).unwrap();
-    devices::publish_creation(&request, &trust, deadline(), &admitted).unwrap();
+    devices::publish_creation(&request, deadline(), &admitted).unwrap();
     let mut blocker = ProbeChild(
         sql_command(&fixture)
             .stdin(Stdio::piped())
@@ -4840,16 +4575,8 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
         thread::sleep(Duration::from_millis(5));
     }
     thread::scope(|scope| {
-        let pending = scope.spawn(|| {
-            mailboxes::list(
-                &request,
-                &trust,
-                deadline(),
-                epoch,
-                account,
-                admitted.password(),
-            )
-        });
+        let pending = scope
+            .spawn(|| mailboxes::list(&request, deadline(), epoch, account, admitted.password()));
         let stop = deadline();
         while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock' AND query LIKE 'WITH selected%'") != "1" {
             assert!(Instant::now() < stop, "mailbox observation did not reach barrier");
@@ -4866,27 +4593,12 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
             .all(|mailbox| mailbox.changed == 1 && mailbox.name != "After snapshot"));
     });
     assert_eq!(
-        mailboxes::list(
-            &request,
-            &trust,
-            deadline(),
-            epoch,
-            account,
-            admitted.password()
-        ),
+        mailboxes::list(&request, deadline(), epoch, account, admitted.password()),
         Err(mailboxes::Error::Unauthenticated)
     );
     let fresh = devices::prepare_creation(epoch, account, "after snapshot", 5).unwrap();
-    devices::publish_creation(&request, &trust, deadline(), &fresh).unwrap();
-    let new = mailboxes::list(
-        &request,
-        &trust,
-        deadline(),
-        epoch,
-        account,
-        fresh.password(),
-    )
-    .unwrap();
+    devices::publish_creation(&request, deadline(), &fresh).unwrap();
+    let new = mailboxes::list(&request, deadline(), epoch, account, fresh.password()).unwrap();
     assert_eq!(new.identity.committed_sequence.number(), 2);
     assert!(new
         .mailboxes
@@ -4905,21 +4617,19 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         postgres_schema,
     };
     let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let request = fixture.request();
-    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+    let epoch = postgres_schema::initialize(&request, deadline())
         .unwrap()
         .store_epoch;
     let account = AccountId::from_bytes([1; 16]);
     accounts::publish(
         &request,
-        &trust,
         deadline(),
         accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
     let device = devices::prepare_creation(epoch, account, "body reader", 1).unwrap();
-    devices::publish_creation(&request, &trust, deadline(), &device).unwrap();
+    devices::publish_creation(&request, deadline(), &device).unwrap();
     let email = EmailId::from_bytes([2; 16]);
     let selected = body::ReadRequest {
         epoch,
@@ -4948,7 +4658,6 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         let started = Instant::now();
         let result = body::with_email(
             &request,
-            &trust,
             Instant::now() + Duration::from_secs(30),
             selected,
             device.password(),
@@ -5009,14 +4718,7 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     let mut runtime = fixture.request();
     runtime.mode = td_mta::postgres_probe::Mode::Runtime;
     assert_eq!(
-        body::with_email(
-            &runtime,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            unused
-        ),
+        body::with_email(&runtime, deadline(), selected, device.password(), unused),
         Err(body::Error::Connection(Error::RuntimeRole))
     );
     create_runtime_login(&fixture);
@@ -5024,37 +4726,22 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     runtime.user = "mail_runtime";
     sql(&fixture, "UPDATE td_mta.runtime_barrier SET blocked=true");
     assert_eq!(
-        body::with_email(
-            &runtime,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            unused
-        ),
+        body::with_email(&runtime, deadline(), selected, device.password(), unused),
         Err(body::Error::Connection(Error::RuntimeMaintenance))
     );
     sql(&fixture, "UPDATE td_mta.runtime_barrier SET blocked=false; REVOKE SELECT ON td_mta.emails FROM mail_runtime");
     assert_eq!(
-        body::with_email(
-            &runtime,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            unused
-        ),
+        body::with_email(&runtime, deadline(), selected, device.password(), unused),
         Err(body::Error::Connection(Error::RuntimePrivileges))
     );
     grant_runtime_mail(&fixture);
     assert_eq!(
-        body::with_email(&request, &trust, deadline(), selected, b"bad", unused),
+        body::with_email(&request, deadline(), selected, b"bad", unused),
         Err(body::Error::Unauthenticated)
     );
     assert_eq!(
         body::with_email(
             &request,
-            &trust,
             deadline(),
             body::ReadRequest {
                 epoch: StoreEpoch::from_bytes([9; 16]),
@@ -5068,7 +4755,6 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     assert_eq!(
         body::with_email(
             &request,
-            &trust,
             deadline(),
             body::ReadRequest {
                 email: EmailId::from_bytes([9; 16]),
@@ -5082,7 +4768,6 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     assert_eq!(
         body::with_email(
             &request,
-            &trust,
             deadline(),
             body::ReadRequest {
                 maximum: 1,
@@ -5096,17 +4781,15 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     let other = AccountId::from_bytes([8; 16]);
     accounts::publish(
         &request,
-        &trust,
         deadline(),
         accounts::prepare(epoch, other).unwrap(),
     )
     .unwrap();
     let other_device = devices::prepare_creation(epoch, other, "other body reader", 1).unwrap();
-    devices::publish_creation(&request, &trust, deadline(), &other_device).unwrap();
+    devices::publish_creation(&request, deadline(), &other_device).unwrap();
     assert_eq!(
         body::with_email(
             &request,
-            &trust,
             deadline(),
             body::ReadRequest {
                 account: other,
@@ -5120,7 +4803,6 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     assert_eq!(
         body::with_email(
             &request,
-            &trust,
             deadline(),
             body::ReadRequest {
                 account: other,
@@ -5136,14 +4818,7 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         "UPDATE td_mta.blobs SET changed=decode('0000000000000002','hex')",
     );
     assert_eq!(
-        body::with_email(
-            &request,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            unused
-        ),
+        body::with_email(&request, deadline(), selected, device.password(), unused),
         Err(body::Error::Integrity)
     );
     sql(
@@ -5155,26 +4830,12 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         "UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('Z',65536),'UTF8') WHERE ordinal=0",
     );
     assert_eq!(
-        body::with_email(
-            &request,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            unused
-        ),
+        body::with_email(&request, deadline(), selected, device.password(), unused),
         Err(body::Error::Read(ports::Error::Corrupt))
     );
     sql(&fixture, "UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('A',65536),'UTF8') WHERE ordinal=0; DELETE FROM td_mta.blob_chunks WHERE ordinal=1");
     assert_eq!(
-        body::with_email(
-            &request,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            unused
-        ),
+        body::with_email(&request, deadline(), selected, device.password(), unused),
         Err(body::Error::Integrity)
     );
     check(17 * 65536 + 13);
@@ -5183,14 +4844,7 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         "UPDATE td_mta.blob_chunks SET ordinal=100 WHERE ordinal=1",
     );
     assert_eq!(
-        body::with_email(
-            &request,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            unused
-        ),
+        body::with_email(&request, deadline(), selected, device.password(), unused),
         Err(body::Error::Read(ports::Error::Corrupt))
     );
     sql(
@@ -5211,7 +4865,6 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     };
     let broken = body::with_email(
         &request,
-        &trust,
         deadline(),
         selected,
         device.password(),
@@ -5229,7 +4882,6 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     assert_eq!(
         body::with_email(
             &request,
-            &trust,
             deadline(),
             selected,
             device.password(),
@@ -5244,24 +4896,16 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         Err(body::Error::Read(disconnected))
     );
     assert_eq!(
-        body::with_email(
-            &request,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            |_, _| {
-                terminate();
-                Ok(())
-            }
-        ),
+        body::with_email(&request, deadline(), selected, device.password(), |_, _| {
+            terminate();
+            Ok(())
+        }),
         Err(body::Error::Read(disconnected))
     );
     check(17 * 65536 + 13);
     assert_eq!(
         body::with_email(
             &request,
-            &trust,
             deadline(),
             selected,
             device.password(),
@@ -5279,22 +4923,15 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
     );
     let end = Instant::now() + Duration::from_secs(3);
     assert_eq!(
-        body::with_email(
-            &request,
-            &trust,
-            end,
-            selected,
-            device.password(),
-            |_, _| {
-                thread::sleep(
-                    end.saturating_duration_since(Instant::now()) + Duration::from_millis(20),
-                );
-                Ok(())
-            }
-        ),
+        body::with_email(&request, end, selected, device.password(), |_, _| {
+            thread::sleep(
+                end.saturating_duration_since(Instant::now()) + Duration::from_millis(20),
+            );
+            Ok(())
+        }),
         Err(body::Error::Read(ports::Error::Deadline))
     );
-    body::with_email(&request, &trust, deadline(), selected, device.password(), |_, reader| {
+    body::with_email(&request, deadline(), selected, device.password(), |_, reader| {
         assert_eq!(sql(&fixture, &format!("SELECT pg_try_advisory_lock({}::bigint)", postgres_schema::MIGRATION_KEY)), "f");
         sql(&fixture, &format!("UPDATE td_mta.devices SET revoked_at=(extract(epoch FROM clock_timestamp())*1000)::bigint,revocation_id=decode(repeat('dd',16),'hex'),revocation_digest=decode(repeat('00',32),'hex') WHERE account=decode('{account}','hex'); UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('Z',65536),'UTF8') WHERE ordinal=0"));
         let mut bytes = [0;100];
@@ -5303,14 +4940,7 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         Ok(())
     }).unwrap();
     assert_eq!(
-        body::with_email(
-            &request,
-            &trust,
-            deadline(),
-            selected,
-            device.password(),
-            unused
-        ),
+        body::with_email(&request, deadline(), selected, device.password(), unused),
         Err(body::Error::Unauthenticated)
     );
 }
@@ -5318,27 +4948,22 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
 fn exercise_flags(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{ids::EmailId, postgres_devices as devices, postgres_email_set as flags};
     let account = binding.account();
     let email = EmailId::from_bytes([0xe1; 16]);
     let creation = devices::prepare_creation(binding.epoch(), account, "flag fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let device = creation.device_id();
     let password = creation.password();
     sql(fixture, &format!("BEGIN; INSERT INTO td_mta.blob_ids VALUES(decode('{account}','hex'),decode('{email}','hex')); INSERT INTO td_mta.blobs VALUES(decode('{account}','hex'),decode('{email}','hex'),0,decode('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','hex'),0,decode('0000000000000001','hex'),0); INSERT INTO td_mta.threads VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('0000000000000001','hex')); INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('{email}','hex'),decode('{email}','hex'),0,2,decode('0000000000000001','hex')); INSERT INTO td_mta.memberships SELECT account,decode('{email}','hex'),id,changed FROM td_mta.mailboxes WHERE account=decode('{account}','hex'); COMMIT"));
     let prepare = |expected, seen, starred| {
         flags::prepare(binding, device, email, expected, seen, starred).unwrap()
     };
-    let publish =
-        |change: &flags::Change| flags::publish(request, trust, deadline(), change, password);
+    let publish = |change: &flags::Change| flags::publish(request, deadline(), change, password);
     let first = prepare(Some(1), Some(true), Some(true));
-    assert_eq!(
-        flags::inspect(request, trust, deadline(), &first).unwrap(),
-        None
-    );
+    assert_eq!(flags::inspect(request, deadline(), &first).unwrap(), None);
     let first_result = publish(&first).unwrap();
     assert_eq!(
         first_result,
@@ -5350,15 +4975,9 @@ fn exercise_flags(
     assert_eq!(publish(&first).unwrap(), first_result);
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords"), "2");
     assert_eq!(sql(fixture, "SELECT kind FROM td_mta.changes WHERE sequence=decode('0000000000000002','hex') ORDER BY operation"), "3\n1");
-    let listing = td_mta::postgres_mailboxes::list(
-        request,
-        trust,
-        deadline(),
-        binding.epoch(),
-        account,
-        password,
-    )
-    .unwrap();
+    let listing =
+        td_mta::postgres_mailboxes::list(request, deadline(), binding.epoch(), account, password)
+            .unwrap();
     assert_eq!(listing.mailboxes[0].counts.unread_emails, 0);
     let noop = prepare(Some(2), Some(true), Some(true));
     assert_eq!(
@@ -5381,15 +5000,9 @@ fn exercise_flags(
     );
     let unread = prepare(Some(3), Some(false), None);
     assert_eq!(publish(&unread).unwrap().new_sequence, 4);
-    let listing = td_mta::postgres_mailboxes::list(
-        request,
-        trust,
-        deadline(),
-        binding.epoch(),
-        account,
-        password,
-    )
-    .unwrap();
+    let listing =
+        td_mta::postgres_mailboxes::list(request, deadline(), binding.epoch(), account, password)
+            .unwrap();
     assert_eq!(listing.mailboxes[0].counts.unread_emails, 1);
     let missing = flags::prepare(
         binding,
@@ -5403,7 +5016,7 @@ fn exercise_flags(
     assert_eq!(publish(&missing), Err(flags::Error::Missing));
     let fresh = prepare(None, Some(true), None);
     assert_eq!(
-        flags::publish(request, trust, deadline(), &fresh, b"invalid"),
+        flags::publish(request, deadline(), &fresh, b"invalid"),
         Err(flags::Error::Unauthenticated)
     );
     sql(
@@ -5431,7 +5044,6 @@ fn exercise_flags(
     assert_eq!(
         flags::publish(
             request,
-            trust,
             Instant::now() + Duration::from_secs(2),
             &fresh,
             password
@@ -5441,7 +5053,7 @@ fn exercise_flags(
     thread::sleep(Duration::from_secs(4));
     sql(fixture, "DROP TRIGGER delay_flags ON td_mta.flag_receipts");
     assert_eq!(
-        flags::inspect(request, trust, deadline(), &fresh)
+        flags::inspect(request, deadline(), &fresh)
             .unwrap()
             .unwrap()
             .new_sequence,
@@ -5480,7 +5092,6 @@ fn exercise_flags(
     receipt_expiry::expire(
         fixture,
         request,
-        trust,
         binding.epoch(),
         "flag_receipts",
         &account.to_string(),
@@ -5502,7 +5113,7 @@ fn exercise_flags(
         Err(flags::Error::Capacity)
     );
     sql(fixture, "DELETE FROM td_mta.memberships WHERE mailbox_id IN (SELECT id FROM td_mta.mailboxes WHERE name='extra'); DELETE FROM td_mta.mailboxes WHERE name='extra'");
-    exercise_flag_batches(fixture, request, trust, binding, device, password, email);
+    exercise_flag_batches(fixture, request, binding, device, password, email);
     sql(
         fixture,
         "UPDATE td_mta.accounts SET sequence=decode('fffffffffffffffe','hex')",
@@ -5522,7 +5133,7 @@ fn exercise_flags(
         u64::MAX
     );
     let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert_eq!(
         publish(&prepare(None, Some(false), None)),
         Err(flags::Error::Unauthenticated)
@@ -5533,7 +5144,6 @@ fn exercise_flags(
 fn exercise_flag_batches(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     device: td_mta::ids::DeviceId,
     password: &[u8],
@@ -5541,7 +5151,7 @@ fn exercise_flag_batches(
 ) {
     use td_mta::{ids::EmailId, postgres_email_set as flags};
     let publish =
-        |change: &flags::Change| flags::publish_batch(request, trust, deadline(), change, password);
+        |change: &flags::Change| flags::publish_batch(request, deadline(), change, password);
     let account = binding.account();
     let update = flags::Update {
         mailbox: None,
@@ -5569,7 +5179,7 @@ fn exercise_flag_batches(
     assert!(empty_result.results.is_empty());
     assert_eq!(publish(&empty).unwrap(), empty_result);
     assert_eq!(
-        flags::publish(request, trust, deadline(), &empty, password),
+        flags::publish(request, deadline(), &empty, password),
         Err(flags::Error::Invalid)
     );
     let mixed = flags::prepare_batch(
@@ -5592,7 +5202,7 @@ fn exercise_flag_batches(
     );
     assert_eq!(mixed_result.state.new_sequence, 6);
     assert_eq!(
-        flags::inspect_batch(request, trust, deadline(), &mixed).unwrap(),
+        flags::inspect_batch(request, deadline(), &mixed).unwrap(),
         Some(mixed_result)
     );
     // `empty` and `mixed` are inspected after sweeping publications.
@@ -5611,7 +5221,7 @@ fn exercise_flag_batches(
     sql(fixture, &format!("INSERT INTO td_mta.mailboxes VALUES(decode('{account}','hex'),decode(repeat('ab',16),'hex'),'overflow',NULL,NULL,0,1,decode('0000000000000001','hex')); INSERT INTO td_mta.memberships VALUES(decode('{account}','hex'),decode(lpad(to_hex(1025),32,'0'),'hex'),decode(repeat('ab',16),'hex'),decode('0000000000000001','hex'))"));
     assert_eq!(publish(&full), Err(flags::Error::Capacity));
     assert_eq!(
-        flags::inspect_batch(request, trust, deadline(), &full).unwrap(),
+        flags::inspect_batch(request, deadline(), &full).unwrap(),
         None
     );
     assert_eq!(
@@ -5667,7 +5277,6 @@ fn exercise_flag_batches(
     assert_eq!(
         flags::publish_batch(
             request,
-            trust,
             Instant::now() + Duration::from_secs(2),
             &uncertain,
             password
@@ -5676,7 +5285,7 @@ fn exercise_flag_batches(
     );
     thread::sleep(Duration::from_secs(4));
     sql(fixture, "DROP TRIGGER delay_flags ON td_mta.flag_receipts");
-    let recovered = flags::inspect_batch(request, trust, deadline(), &uncertain)
+    let recovered = flags::inspect_batch(request, deadline(), &uncertain)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -5716,14 +5325,14 @@ fn exercise_flag_batches(
     assert_eq!(publish(&partial).unwrap(), partial_result);
     sql(fixture, &format!("UPDATE td_mta.flag_receipts SET results=decode('0103','hex') WHERE operation=decode('{}','hex')", mixed.operation()));
     assert_eq!(
-        flags::inspect_batch(request, trust, deadline(), &mixed),
+        flags::inspect_batch(request, deadline(), &mixed),
         Err(flags::Error::Integrity)
     );
 
     let corrupt = format!("UPDATE td_mta.flag_receipts SET results=decode('03','hex') WHERE operation=decode('{}','hex')", empty.operation());
     sql(fixture, &corrupt);
     assert_eq!(
-        flags::inspect_batch(request, trust, deadline(), &empty),
+        flags::inspect_batch(request, deadline(), &empty),
         Err(flags::Error::Integrity)
     );
 }
@@ -5731,7 +5340,6 @@ fn exercise_flag_batches(
 fn exercise_downloads(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -5741,18 +5349,17 @@ fn exercise_downloads(
     let account = binding.account();
     let owner = devices::prepare_creation(binding.epoch(), account, "download owner", 1).unwrap();
     let other = devices::prepare_creation(binding.epoch(), account, "other device", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &owner).unwrap();
-    devices::publish_creation(request, trust, deadline(), &other).unwrap();
+    devices::publish_creation(request, deadline(), &owner).unwrap();
+    devices::publish_creation(request, deadline(), &other).unwrap();
     let upload = |bytes: &[u8]| {
         let prepared = uploads::prepare(binding, owner.device_id(), bytes, deadline()).unwrap();
-        uploads::publish(request, trust, deadline(), &prepared, owner.password()).unwrap()
+        uploads::publish(request, deadline(), &prepared, owner.password()).unwrap()
     };
     // Verification and replay share the same ten-second maximum as Email reads.
     let read_deadline = || Instant::now() + Duration::from_secs(10);
     let verify = |blob, maximum, password: &[u8]| {
         bodies::with_pinned_blob(
             request,
-            trust,
             read_deadline(),
             bodies::BlobRequest {
                 binding,
@@ -5860,7 +5467,6 @@ fn exercise_downloads(
     assert_eq!(
         bodies::with_blob(
             request,
-            trust,
             read_deadline(),
             bodies::BlobRequest {
                 binding,
@@ -5874,7 +5480,7 @@ fn exercise_downloads(
     );
     sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=decode(repeat('42',octet_length(bytes)),'hex') WHERE blob_id=decode('{}','hex') AND ordinal=0",small.blob));
     // An admitted callback keeps its snapshot across physical row retirement.
-    bodies::with_blob(request,trust,read_deadline(),bodies::BlobRequest { binding,blob:small.blob,maximum:bodies::MAX_BODY_BYTES },owner.password(),|_,body| {
+    bodies::with_blob(request,read_deadline(),bodies::BlobRequest { binding,blob:small.blob,maximum:bodies::MAX_BODY_BYTES },owner.password(),|_,body| {
         sql(fixture,&format!("BEGIN; DELETE FROM td_mta.submissions; DELETE FROM td_mta.leases WHERE blob_id=decode('{}','hex'); DELETE FROM td_mta.blobs WHERE id=decode('{}','hex'); COMMIT",small.blob,small.blob));
         let mut bytes=[0;32];
         assert_eq!(body.read_at(0,&mut bytes)?,32);
@@ -5913,7 +5519,6 @@ fn exercise_downloads(
         let reader = scope.spawn(|| {
             bodies::with_blob(
                 request,
-                trust,
                 read_deadline(),
                 bodies::BlobRequest {
                     binding,
@@ -5929,7 +5534,7 @@ fn exercise_downloads(
             assert!(Instant::now()<until);
             thread::sleep(Duration::from_millis(10));
         }
-        devices::publish_revocation(request, trust, deadline(), &revoked).unwrap();
+        devices::publish_revocation(request, deadline(), &revoked).unwrap();
         input.write_all(b"COMMIT;\n\\q\n").unwrap();
         input.flush().unwrap();
         eprintln!(
@@ -5952,7 +5557,6 @@ fn exercise_downloads(
 fn exercise_uploads(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_crypto::Digest;
@@ -5960,7 +5564,7 @@ fn exercise_uploads(
     let account = binding.account();
     let creation =
         devices::prepare_creation(binding.epoch(), account, "upload fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let device = creation.device_id();
     let password = creation.password();
     use td_mta::{
@@ -6050,7 +5654,7 @@ fn exercise_uploads(
     ));
 
     let publish =
-        |upload: &uploads::Upload| uploads::publish(request, trust, deadline(), upload, password);
+        |upload: &uploads::Upload| uploads::publish(request, deadline(), upload, password);
     assert_eq!(binding.upload_maximum(), uploads::MAX_BYTES);
     assert_eq!(binding.upload_expiry_seconds(), 86400);
     assert!(matches!(
@@ -6069,12 +5673,9 @@ fn exercise_uploads(
         ))
     ));
     let first = prepare(b"");
+    assert_eq!(uploads::inspect(request, deadline(), &first).unwrap(), None);
     assert_eq!(
-        uploads::inspect(request, trust, deadline(), &first).unwrap(),
-        None
-    );
-    assert_eq!(
-        uploads::publish(request, trust, deadline(), &first, b"invalid"),
+        uploads::publish(request, deadline(), &first, b"invalid"),
         Err(uploads::Error::Unauthenticated)
     );
     let first_outcome = publish(&first).unwrap();
@@ -6125,10 +5726,7 @@ fn exercise_uploads(
             &format!("UPDATE td_mta.account_usage SET {assignments}"),
         );
         assert_eq!(publish(&tiny), Err(uploads::Error::Quota));
-        assert_eq!(
-            uploads::inspect(request, trust, deadline(), &tiny).unwrap(),
-            None
-        );
+        assert_eq!(uploads::inspect(request, deadline(), &tiny).unwrap(), None);
         assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blobs"), "5");
         sql(fixture, &restore);
     }
@@ -6160,7 +5758,6 @@ fn exercise_uploads(
     assert_eq!(
         uploads::publish(
             request,
-            trust,
             Instant::now() + Duration::from_secs(2),
             &tiny,
             password
@@ -6172,7 +5769,7 @@ fn exercise_uploads(
         fixture,
         "DROP TRIGGER delay_upload ON td_mta.upload_receipts",
     );
-    let recovered = uploads::inspect(request, trust, deadline(), &tiny)
+    let recovered = uploads::inspect(request, deadline(), &tiny)
         .unwrap()
         .unwrap();
     assert_eq!(recovered.old_sequence, sequence);
@@ -6257,7 +5854,6 @@ fn exercise_uploads(
     receipt_expiry::expire(
         fixture,
         request,
-        trust,
         binding.epoch(),
         "upload_receipts",
         &account.to_string(),
@@ -6280,7 +5876,7 @@ fn exercise_uploads(
         &format!("UPDATE td_mta.accounts SET sequence=decode('{sequence:016x}','hex')"),
     );
     let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert_eq!(publish(&capacity), Err(uploads::Error::Unauthenticated));
     assert_eq!(publish(&first).unwrap(), first_outcome);
     sql(
@@ -6291,10 +5887,10 @@ fn exercise_uploads(
         ),
     );
     assert_eq!(
-        uploads::inspect(request, trust, deadline(), &first),
+        uploads::inspect(request, deadline(), &first),
         Err(uploads::Error::Integrity)
     );
-    upload_reclamation::exercise(fixture, request, trust, binding);
+    upload_reclamation::exercise(fixture, request, binding);
 }
 
 #[path = "postgres_probe/upload_reclamation.rs"]
@@ -6303,7 +5899,6 @@ mod upload_reclamation;
 fn exercise_drafts(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -6313,7 +5908,7 @@ fn exercise_drafts(
     };
     let account = binding.account();
     let creation = devices::prepare_creation(binding.epoch(), account, "draft fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let device = creation.device_id();
     let password = creation.password();
     let mailbox = MailboxId::from_bytes([0x21; 16]);
@@ -6347,8 +5942,7 @@ fn exercise_drafts(
         )
         .unwrap()
     };
-    let publish =
-        |draft: &drafts::Draft| drafts::publish(request, trust, deadline(), draft, password);
+    let publish = |draft: &drafts::Draft| drafts::publish(request, deadline(), draft, password);
     use td_mta::{
         admission::work::{Charge, Meter},
         clock::RuntimeClock,
@@ -6425,12 +6019,9 @@ fn exercise_drafts(
             && after.output_bytes < before.output_bytes
     );
 
+    assert_eq!(drafts::inspect(request, deadline(), &first).unwrap(), None);
     assert_eq!(
-        drafts::inspect(request, trust, deadline(), &first).unwrap(),
-        None
-    );
-    assert_eq!(
-        drafts::publish(request, trust, deadline(), &first, b"invalid"),
+        drafts::publish(request, deadline(), &first, b"invalid"),
         Err(drafts::Error::Unauthenticated)
     );
     let outcome = publish(&first).unwrap();
@@ -6451,7 +6042,6 @@ fn exercise_drafts(
     assert_eq!(sql(fixture,"SELECT string_agg(kind::text || ':' || action::text,',' ORDER BY operation) FROM td_mta.changes WHERE sequence=decode('0000000000000002','hex')"),"3:1,2:1,1:2");
     let bytes = body::with_email(
         request,
-        trust,
         deadline(),
         body::ReadRequest {
             epoch: binding.epoch(),
@@ -6536,7 +6126,7 @@ fn exercise_drafts(
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blob_ids"), "5");
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "5");
     assert_eq!(
-        drafts::inspect(request, trust, deadline(), &pending).unwrap(),
+        drafts::inspect(request, deadline(), &pending).unwrap(),
         None
     );
     sql(fixture,"DROP TRIGGER reject_draft ON td_mta.draft_receipts; UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')");
@@ -6546,7 +6136,6 @@ fn exercise_drafts(
     assert_eq!(
         drafts::publish(
             request,
-            trust,
             Instant::now() + Duration::from_secs(2),
             &pending,
             password
@@ -6555,7 +6144,7 @@ fn exercise_drafts(
     );
     thread::sleep(Duration::from_secs(4));
     sql(fixture, "DROP TRIGGER delay_draft ON td_mta.draft_receipts");
-    let recovered = drafts::inspect(request, trust, deadline(), &pending)
+    let recovered = drafts::inspect(request, deadline(), &pending)
         .unwrap()
         .unwrap();
     assert_eq!(recovered.new_sequence, 7);
@@ -6581,7 +6170,6 @@ fn exercise_drafts(
     receipt_expiry::expire(
         fixture,
         request,
-        trust,
         binding.epoch(),
         "draft_receipts",
         &account.to_string(),
@@ -6590,7 +6178,7 @@ fn exercise_drafts(
     receipt_expiry::swept(fixture, "draft_receipts");
     receipt_expiry::release(fixture, "draft_receipts", &account.to_string());
     let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert_eq!(publish(&capacity), Err(drafts::Error::Unauthenticated));
     assert_eq!(publish(&first).unwrap(), outcome);
     sql(
@@ -6606,7 +6194,6 @@ fn exercise_drafts(
 fn exercise_changes(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -6619,7 +6206,7 @@ fn exercise_changes(
     let account = binding.account();
     let creation =
         devices::prepare_creation(binding.epoch(), account, "change fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let password = creation.password();
     let state = |kind, sequence| DataState {
         account,
@@ -6630,7 +6217,6 @@ fn exercise_changes(
     let read = |kind, since, maximum| {
         changes::read(
             request,
-            trust,
             deadline(),
             binding,
             password,
@@ -6667,7 +6253,7 @@ fn exercise_changes(
     let mut wrong = state(DataType::Email, 1);
     wrong.epoch = td_mta::ids::StoreEpoch::from_bytes([0x99; 16]);
     assert!(matches!(
-        changes::read(request, trust, deadline(), binding, password, wrong, 10),
+        changes::read(request, deadline(), binding, password, wrong, 10),
         Err(changes::Error::Page(
             jmap_changes::Error::CannotCalculateChanges
         ))
@@ -6733,7 +6319,7 @@ fn exercise_changes(
     );
     let revoke =
         devices::prepare_revocation(binding.epoch(), account, creation.device_id(), 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert!(matches!(
         read(DataType::Email, u64::MAX - 2, 10),
         Err(changes::Error::Unauthenticated)
@@ -6756,26 +6342,24 @@ fn exercise_http_auth(
     let loaded = |user| td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://{user}:{}@localhost:{}/postgres",
+                "postgresql://{user}:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
     let connection = loaded("mail_runtime");
     let clock = td_mta::clock::RuntimeClock::new();
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let accounts = [("reader", binding)];
     let principal = td_mta::http_auth::Principal {
         account: binding.account(),
         device,
     };
     let auth =
-        td_mta::postgres_http_auth::Authentication::new(&connection, executable, &accounts, &clock)
-            .unwrap();
+        td_mta::postgres_http_auth::Authentication::new(&connection, &accounts, &clock).unwrap();
     let until = || Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
     assert_eq!(
         auth.authenticate("reader", password, until()),
@@ -6805,13 +6389,9 @@ fn exercise_http_auth(
     }
     {
         // The production adapter belongs to one fixed authentication thread.
-        let concurrent = td_mta::postgres_http_auth::Authentication::new(
-            &connection,
-            executable,
-            &accounts,
-            &clock,
-        )
-        .unwrap();
+        let concurrent =
+            td_mta::postgres_http_auth::Authentication::new(&connection, &accounts, &clock)
+                .unwrap();
         thread::scope(|scope| {
             let worker = scope.spawn(|| concurrent.authenticate("reader", password, until()));
             let stop = deadline();
@@ -6862,8 +6442,7 @@ fn exercise_http_auth(
     );
     let owner = loaded("td_probe");
     let unqualified =
-        td_mta::postgres_http_auth::Authentication::new(&owner, executable, &accounts, &clock)
-            .unwrap();
+        td_mta::postgres_http_auth::Authentication::new(&owner, &accounts, &clock).unwrap();
     assert_eq!(
         unqualified.authenticate("reader", password, until()),
         Err(Error::Invalid)
@@ -6875,13 +6454,7 @@ fn exercise_http_auth(
         1,
     )
     .unwrap();
-    td_mta::postgres_devices::publish_creation(
-        &fixture.request(),
-        &connection.trust,
-        deadline(),
-        &revoked,
-    )
-    .unwrap();
+    td_mta::postgres_devices::publish_creation(&fixture.request(), deadline(), &revoked).unwrap();
     assert_eq!(
         auth.authenticate("reader", revoked.password(), until()),
         Ok(Some(td_mta::http_auth::Principal {
@@ -6896,13 +6469,7 @@ fn exercise_http_auth(
         2,
     )
     .unwrap();
-    td_mta::postgres_devices::publish_revocation(
-        &fixture.request(),
-        &connection.trust,
-        deadline(),
-        &revoke,
-    )
-    .unwrap();
+    td_mta::postgres_devices::publish_revocation(&fixture.request(), deadline(), &revoke).unwrap();
     assert_eq!(
         auth.authenticate("reader", revoked.password(), until()),
         Ok(None)
@@ -6913,8 +6480,7 @@ fn exercise_http_auth(
     );
     drop(auth);
     let auth =
-        td_mta::postgres_http_auth::Authentication::new(&connection, executable, &accounts, &clock)
-            .unwrap();
+        td_mta::postgres_http_auth::Authentication::new(&connection, &accounts, &clock).unwrap();
     authentication_reuse::exercise(fixture, &auth, password, principal, |ms| {
         Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap()
     });
@@ -7334,14 +6900,14 @@ fn exercise_http_read(
     let loaded = td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
     let resources = td_mta::limits::Limits::default().plan().unwrap();
     let disk = DiskLimits::default()
@@ -7391,7 +6957,6 @@ fn exercise_http_read(
     let service = td_mta::postgres_http_api::Service {
         memory: &td_mta::https_api_storage::RequestMemory::new(&resources).unwrap(),
         loaded: &loaded,
-        executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
         binding,
         slots: &slots,
         pending: &pending,
@@ -7439,10 +7004,9 @@ fn exercise_http_read(
                         thread::sleep(Duration::from_millis(5));
                     }
                     let open = || {
-                        td_mta::postgres_read::Snapshot::open_resolved(
+                        td_mta::postgres_read::Snapshot::open_loaded(
                             &slots,
                             &loaded,
-                            service.executable,
                             deadline(),
                             binding,
                             password,
@@ -7548,13 +7112,11 @@ fn exercise_http_read(
         r##"{{"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{{"accountId":"{account}"}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"properties":["id","subject","keywords","mailboxIds"]}},"g"]]}}"##
     );
     td_json::parse(&header_body).unwrap();
-    let summary_trust = TrustStore::from_pem(&fixture.ca).unwrap();
     let mut summary_runtime = fixture.request();
     summary_runtime.user = "mail_runtime";
     assert_eq!(
         td_mta::postgres_summary_backfill::run(
             &summary_runtime,
-            &summary_trust,
             deadline(),
             binding.epoch(),
             binding.account(),
@@ -7575,7 +7137,6 @@ fn exercise_http_read(
     loop {
         let page = td_mta::postgres_summary_backfill::run(
             &fixture.request(),
-            &summary_trust,
             deadline(),
             binding.epoch(),
             binding.account(),
@@ -7635,7 +7196,6 @@ fn exercise_http_read(
     sql(fixture, "DELETE FROM td_mta.blob_interpretations");
     let page = td_mta::postgres_summary_backfill::run_with_options(
         &fixture.request(),
-        &summary_trust,
         deadline(),
         binding.epoch(),
         binding.account(),
@@ -7700,7 +7260,6 @@ fn exercise_http_read(
     sql(fixture, "UPDATE td_mta.blob_summaries SET version=2");
     td_mta::postgres_summary_backfill::run(
         &fixture.request(),
-        &summary_trust,
         deadline(),
         binding.epoch(),
         binding.account(),
@@ -7732,9 +7291,7 @@ fn exercise_http_read(
         1,
     )
     .unwrap();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    td_mta::postgres_devices::publish_creation(&fixture.request(), &trust, deadline(), &fresh)
-        .unwrap();
+    td_mta::postgres_devices::publish_creation(&fixture.request(), deadline(), &fresh).unwrap();
     call(
         &header_body,
         fresh.password(),
@@ -7752,13 +7309,8 @@ fn exercise_http_read(
         2,
     )
     .unwrap();
-    td_mta::postgres_devices::publish_revocation(
-        &fixture.request(),
-        &trust,
-        deadline(),
-        &revocation,
-    )
-    .unwrap();
+    td_mta::postgres_devices::publish_revocation(&fixture.request(), deadline(), &revocation)
+        .unwrap();
     assert!(matches!(
         call(
             &header_body,
@@ -7866,10 +7418,9 @@ fn exercise_http_read(
         Some("cannotCalculateChanges")
     );
     assert!(replies[4][1]["after"].is_true());
-    let mut exhausted = td_mta::postgres_read::Snapshot::open_resolved(
+    let mut exhausted = td_mta::postgres_read::Snapshot::open_loaded(
         &slots,
         &loaded,
-        service.executable,
         deadline(),
         binding,
         password,
@@ -8066,15 +7617,8 @@ fn exercise_http_read(
     // partial reservation when a new worker cannot reserve its pair.
     *api_worker.borrow_mut() = None;
     let hold_view = || {
-        td_mta::postgres_read::Snapshot::open_resolved(
-            &slots,
-            &loaded,
-            service.executable,
-            deadline(),
-            binding,
-            password,
-        )
-        .unwrap()
+        td_mta::postgres_read::Snapshot::open_loaded(&slots, &loaded, deadline(), binding, password)
+            .unwrap()
     };
     let held = [hold_view(), hold_view()];
     let (result, wire) = download(raw, password, false);
@@ -8135,7 +7679,7 @@ fn exercise_http_read(
         let settlement = td_mta::postgres_read::ReadSlots::new(1).unwrap();
         let settled = pending
             .drafts
-            .settle(&loaded, service.executable, &settlement, &clock, until())
+            .settle(&loaded, &settlement, &clock, until())
             .unwrap()
             .unwrap();
         assert_eq!(settled.operation, operation);
@@ -8326,7 +7870,7 @@ fn exercise_http_read(
         );
         let settled = pending
             .uploads
-            .settle(&loaded, service.executable, &settlement, &clock, until())
+            .settle(&loaded, &settlement, &clock, until())
             .unwrap()
             .unwrap();
         assert_eq!(settled.operation, operation);
@@ -8365,14 +7909,9 @@ fn exercise_http_read(
         let attachment = vec![b'x'; 256 * 1024];
         let upload =
             td_mta::postgres_uploads::prepare(binding, device, &attachment, deadline()).unwrap();
-        let uploaded = td_mta::postgres_uploads::publish(
-            &fixture.request(),
-            &trust,
-            deadline(),
-            &upload,
-            password,
-        )
-        .unwrap();
+        let uploaded =
+            td_mta::postgres_uploads::publish(&fixture.request(), deadline(), &upload, password)
+                .unwrap();
         let attachment_body = td_mta::compose_text::Attachment {
             name: "large.bin",
             content_type: "application/octet-stream",
@@ -8428,14 +7967,9 @@ fn exercise_http_read(
             clock.as_ref(),
         )
         .unwrap();
-        let created = td_mta::postgres_drafts::publish(
-            &fixture.request(),
-            &trust,
-            deadline(),
-            &prepared,
-            password,
-        )
-        .unwrap();
+        let created =
+            td_mta::postgres_drafts::publish(&fixture.request(), deadline(), &prepared, password)
+                .unwrap();
         let mut email_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
         let email = td_mta::wire::encode_id(created.email, &mut email_bytes).unwrap();
         let get = td_json::json!({"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/get",{"accountId":account,"ids":[email],"properties":["id","textBody","bodyValues"],"fetchTextBodyValues":true},"selective"]]}).to_string();
@@ -8506,14 +8040,14 @@ fn receiving_input(fixture: &Fixture, profile: &str) -> td_mta::postgres_input::
     td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             profile,
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     }
 }
 
@@ -8554,7 +8088,6 @@ fn commit_beside_idle_download(
     let generations = GenerationSet::<TlsPolicies>::at_startup();
     let profile = td_mta::postgres_runtime_profile::load(
         &fixture.request(),
-        &service.loaded.trust,
         deadline(),
         service.binding.epoch(),
         "cloud",
@@ -8564,7 +8097,6 @@ fn commit_beside_idle_download(
     let loaded = receiving_input(fixture, "cloud");
     let receiving = Receiving {
         loaded: &loaded,
-        executable: service.executable,
         binding: profile.binding(),
         additional: &[],
         slots: service.slots,
@@ -8604,96 +8136,51 @@ fn exercise_resolved_read(
     let loaded = |user| td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://{user}:{}@localhost:{}/postgres",
+                "postgresql://{user}:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
     let loaded_runtime = loaded("mail_runtime");
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
-    let missing = fixture.root.join("missing-td-mta");
     let slots = ReadSlots::new(1).unwrap();
-    let mut view = Snapshot::open_resolved(
-        &slots,
-        &loaded_runtime,
-        executable,
-        deadline(),
-        binding,
-        password,
-    )
-    .unwrap();
+    let mut view =
+        Snapshot::open_loaded(&slots, &loaded_runtime, deadline(), binding, password).unwrap();
     assert_eq!(view.identity().account, binding.account());
     assert!(!view.mailbox_listing().unwrap().is_empty());
-    // A cold bootstrap makes helper launch observable even just after a read.
-    let cold = loaded("mail_runtime");
+    // The open read holds the only slot.
     assert_eq!(
-        Snapshot::open_resolved(&slots, &cold, &missing, deadline(), binding, password).err(),
+        Snapshot::open_loaded(&slots, &loaded_runtime, deadline(), binding, password).err(),
         Some(Error::Busy)
     );
     drop(view);
     assert_eq!(
-        Snapshot::open_resolved(&slots, &cold, &missing, deadline(), binding, password).err(),
-        Some(Error::Resolution(td_mta::postgres_resolver::Error::Spawn))
-    );
-    assert_eq!(
-        Snapshot::open_resolved(
-            &slots,
-            &loaded_runtime,
-            executable,
-            Instant::now(),
-            binding,
-            password
-        )
-        .err(),
+        Snapshot::open_loaded(&slots, &loaded_runtime, Instant::now(), binding, password).err(),
         Some(Error::Connection(td_mta::postgres_probe::Error::Deadline))
     );
     assert_eq!(
-        Snapshot::open_resolved(
-            &slots,
-            &loaded_runtime,
-            &missing,
-            deadline(),
-            binding,
-            b"bad"
-        )
-        .err(),
+        Snapshot::open_loaded(&slots, &loaded_runtime, deadline(), binding, b"bad").err(),
         Some(Error::Unauthenticated)
     );
     let mut wrong = password.to_vec();
     let last = wrong.last_mut().unwrap();
     *last = if *last == b'0' { b'1' } else { b'0' };
     assert_eq!(
-        Snapshot::open_resolved(
-            &slots,
-            &loaded_runtime,
-            executable,
-            deadline(),
-            binding,
-            &wrong
-        )
-        .err(),
+        Snapshot::open_loaded(&slots, &loaded_runtime, deadline(), binding, &wrong).err(),
         Some(Error::Unauthenticated)
     );
     let owner = loaded("td_probe");
     assert_eq!(
-        Snapshot::open_resolved(&slots, &owner, executable, deadline(), binding, password).err(),
+        Snapshot::open_loaded(&slots, &owner, deadline(), binding, password).err(),
         Some(Error::Connection(
             td_mta::postgres_probe::Error::RuntimeRole
         ))
     );
-    let replacement = Snapshot::open_resolved(
-        &slots,
-        &loaded_runtime,
-        executable,
-        deadline(),
-        binding,
-        password,
-    )
-    .unwrap();
+    let replacement =
+        Snapshot::open_loaded(&slots, &loaded_runtime, deadline(), binding, password).unwrap();
     drop(replacement);
 }
 
@@ -8703,7 +8190,6 @@ mod metadata_prefetch;
 fn exercise_read(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     http_drafts: bool,
 ) {
@@ -8716,23 +8202,17 @@ fn exercise_read(
     };
     let account = binding.account();
     let creation = devices::prepare_creation(binding.epoch(), account, "read fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let password = creation.password();
     // Healthy one-shot operations and dropped read snapshots must send
     // Terminate rather than reset sockets with open transactions.
     let log_offset = fs::metadata(fixture.root.join("server.log")).unwrap().len() as usize;
     let shutdown_slots = read::ReadSlots::new(1).unwrap();
     for _ in 0..4 {
-        probe(request, trust, deadline()).unwrap();
-        let snapshot = read::Snapshot::open_runtime(
-            &shutdown_slots,
-            request,
-            trust,
-            deadline(),
-            binding,
-            password,
-        )
-        .unwrap();
+        probe(request, deadline()).unwrap();
+        let snapshot =
+            read::Snapshot::open_runtime(&shutdown_slots, request, deadline(), binding, password)
+                .unwrap();
         drop(snapshot);
     }
     let closed_by = Instant::now() + Duration::from_secs(2);
@@ -8783,7 +8263,7 @@ fn exercise_read(
             deadline(),
         )
         .unwrap();
-        drafts::publish(request, trust, deadline(), &draft, password).unwrap()
+        drafts::publish(request, deadline(), &draft, password).unwrap()
     };
     let first = create("first@example.test");
     let second = create("second@example.test");
@@ -8805,15 +8285,13 @@ fn exercise_read(
     metadata_prefetch::exercise(
         fixture,
         request,
-        trust,
         binding,
         password,
         [first.email, second.email],
     );
     let slots = read::ReadSlots::new(1).unwrap();
     let mut owned =
-        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
-            .unwrap();
+        read::Snapshot::open_runtime(&slots, request, deadline(), binding, password).unwrap();
     exercise_read_dispatch(
         fixture,
         &mut owned,
@@ -8824,14 +8302,13 @@ fn exercise_read(
     assert_eq!(owned.identity().committed_sequence.number(), 3);
     assert!(owned.email(first.email).unwrap().is_some());
     assert_eq!(
-        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password).err(),
+        read::Snapshot::open_runtime(&slots, request, deadline(), binding, password).err(),
         Some(read::Error::Busy)
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'"), "1");
     drop(owned);
     let mut blocked =
-        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
-            .unwrap();
+        read::Snapshot::open_runtime(&slots, request, deadline(), binding, password).unwrap();
     exercise_read_dispatch(
         fixture,
         &mut blocked,
@@ -8856,31 +8333,23 @@ fn exercise_read(
     let last = wrong.last_mut().unwrap();
     *last = if *last == b'0' { b'1' } else { b'0' };
     assert_eq!(
-        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, &wrong).err(),
+        read::Snapshot::open_runtime(&slots, request, deadline(), binding, &wrong).err(),
         Some(read::Error::Unauthenticated)
     );
     // Authentication failure after connection setup must return its slot too.
     let replacement =
-        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
-            .unwrap();
+        read::Snapshot::open_runtime(&slots, request, deadline(), binding, password).unwrap();
     drop(replacement);
     assert_eq!(
-        read::Snapshot::open_runtime(
-            &slots,
-            &fixture.request(),
-            trust,
-            deadline(),
-            binding,
-            password
-        )
-        .err(),
+        read::Snapshot::open_runtime(&slots, &fixture.request(), deadline(), binding, password)
+            .err(),
         Some(read::Error::Invalid)
     );
     let snapshot = |callback: fn(&mut read::Snapshot<'_>) -> Result<(), read::Error>| {
-        read::with_snapshot(request, trust, deadline(), binding, password, callback)
+        read::with_snapshot(request, deadline(), binding, password, callback)
     };
     assert!(matches!(
-        read::with_snapshot(request, trust, deadline(), binding, b"bad", |_| Ok(())),
+        read::with_snapshot(request, deadline(), binding, b"bad", |_| Ok(())),
         Err(read::Error::Unauthenticated)
     ));
     let stored = |view: &mut read::Snapshot<'_>, email| -> Result<Option<String>, read::Error> {
@@ -8963,7 +8432,7 @@ fn exercise_read(
         }
         view.check()
     };
-    read::with_snapshot(request,trust,deadline(),binding,password,|view| {
+    read::with_snapshot(request,deadline(),binding,password,|view| {
         assert_eq!(view.identity().committed_sequence.number(),3);
         view.prefetch_metadata(&[first.email, second.email])?;
         view.prefetch_values(&[first.email, second.email], true, true)?;
@@ -9060,7 +8529,7 @@ fn exercise_read(
         check_mailbox(view, 2)?;
         Ok(())
     }).unwrap();
-    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    read::with_snapshot(request, deadline(), binding, password, |view| {
         assert_eq!(view.identity().committed_sequence.number(), 4);
         check_mailbox(view, 1)?;
         assert_eq!(stored(view, first.email)?, None);
@@ -9080,7 +8549,7 @@ fn exercise_read(
     })
     .unwrap();
     sql(fixture,&format!("INSERT INTO td_mta.keywords SELECT decode('{account}','hex'),decode('{}','hex'),'k'||lpad(n::text,3,'0'),decode('0000000000000004','hex') FROM generate_series(0,256) n",second.email));
-    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    read::with_snapshot(request, deadline(), binding, password, |view| {
         let encoded = stored(view, second.email)?.unwrap();
         assert!(encoded.contains("\"k000\":true"));
         assert!(encoded.contains("\"k256\":true"));
@@ -9094,7 +8563,7 @@ fn exercise_read(
         Ok(())
     })
     .unwrap();
-    let invalid = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    let invalid = read::with_snapshot(request, deadline(), binding, password, |view| {
         assert_eq!(
             view.keywords(second.email, Some(""), 1).unwrap_err(),
             read::Error::Invalid
@@ -9104,7 +8573,7 @@ fn exercise_read(
     assert_eq!(invalid, Err(read::Error::Invalid));
     for interpreted in [false, true] {
         let expires = Instant::now() + Duration::from_secs(3);
-        let expired_pin = read::with_snapshot(request, trust, expires, binding, password, |view| {
+        let expired_pin = read::with_snapshot(request, expires, binding, password, |view| {
             let read_pin =
                 |_: postgres_body::Metadata, pin: &mut td_mta::store_fs::PinnedBlob<'_, '_>| {
                     pin.check_deadline()?;
@@ -9130,14 +8599,8 @@ fn exercise_read(
             )))
         );
     }
-    let disconnected_pin = read::with_snapshot(
-        request,
-        trust,
-        deadline(),
-        binding,
-        password,
-        |view| {
-            view.with_interpreted_body(second.email, |_, pin| {
+    let disconnected_pin = read::with_snapshot(request, deadline(), binding, password, |view| {
+        view.with_interpreted_body(second.email, |_, pin| {
             pin.check_deadline()?;
             sql(fixture,"SELECT pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND pid<>pg_backend_pid()");
             thread::sleep(Duration::from_millis(100));
@@ -9153,12 +8616,10 @@ fn exercise_read(
             assert_eq!(pin.check_deadline().err(), failure);
             Ok(())
         })
-        },
-    );
+    });
     assert!(disconnected_pin.is_err());
     let disconnected_at_completion = read::with_snapshot(
         request,
-        trust,
         deadline(),
         binding,
         password,
@@ -9179,7 +8640,7 @@ fn exercise_read(
         "callback completion must always poll connection health"
     );
     sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,0) WHERE blob_id=decode('{}','hex')",second.blob));
-    let corrupt = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    let corrupt = read::with_snapshot(request, deadline(), binding, password, |view| {
         let error = view
             .with_pinned_body::<()>(second.email, |_, _| -> Result<(), td_mta::ports::Error> {
                 panic!("corrupt body admitted")
@@ -9195,7 +8656,7 @@ fn exercise_read(
         corrupt,
         Err(read::Error::Body(postgres_body::Error::Read(_)))
     ));
-    let killed = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    let killed = read::with_snapshot(request, deadline(), binding, password, |view| {
         assert!(view.email(second.email)?.is_some());
         sql(fixture,"SELECT pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND pid<>pg_backend_pid()");
         thread::sleep(Duration::from_millis(100));
@@ -9205,7 +8666,6 @@ fn exercise_read(
     assert!(killed.is_err());
     let late = read::with_snapshot(
         request,
-        trust,
         Instant::now() + Duration::from_secs(2),
         binding,
         password,
@@ -9231,15 +8691,14 @@ fn exercise_read(
     );
     let revoke =
         devices::prepare_revocation(binding.epoch(), account, creation.device_id(), 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert_eq!(snapshot(|_| Ok(())), Err(read::Error::Unauthenticated));
-    exercise_read_boundaries(fixture, request, trust, binding, second.email);
+    exercise_read_boundaries(fixture, request, binding, second.email);
 }
 
 fn exercise_read_boundaries(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     email: td_mta::ids::EmailId,
 ) {
@@ -9250,24 +8709,22 @@ fn exercise_read_boundaries(
     let creation =
         devices::prepare_creation(binding.epoch(), binding.account(), "method boundary", 1)
             .unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let password = creation.password();
     let loaded = td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let slots = ReadSlots::new(1).unwrap();
-    let open =
-        || Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password).unwrap();
+    let open = || Snapshot::open_runtime(&slots, request, deadline(), binding, password).unwrap();
     let mut view = open();
     assert_eq!(
         view.keywords(email, Some("$draft"), 1).unwrap().values,
@@ -9276,7 +8733,7 @@ fn exercise_read_boundaries(
     let next = view.identity().committed_sequence.number() + 1;
     let between = view.finish_method().unwrap();
     assert!(matches!(
-        Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password),
+        Snapshot::open_runtime(&slots, request, deadline(), binding, password),
         Err(Error::Busy)
     ));
     let stop_at = Instant::now() + Duration::from_secs(5);
@@ -9293,7 +8750,7 @@ fn exercise_read_boundaries(
     }
     let account = binding.account();
     sql(fixture, &format!("BEGIN; INSERT INTO td_mta.keywords VALUES(decode('{account}','hex'),decode('{email}','hex'),'$flagged',decode('{next:016x}','hex')); UPDATE td_mta.accounts SET sequence=decode('{next:016x}','hex'); COMMIT"));
-    let mut view = between.reopen(&loaded, executable, password).unwrap();
+    let mut view = between.reopen(&loaded, password).unwrap();
     assert_eq!(view.identity().committed_sequence.number(), next);
     assert_eq!(
         view.keywords(email, Some("$draft"), 1).unwrap().values,
@@ -9304,19 +8761,12 @@ fn exercise_read_boundaries(
     let last = wrong.last_mut().unwrap();
     *last = if *last == b'0' { b'1' } else { b'0' };
     assert!(matches!(
-        between.reopen(&loaded, executable, &wrong),
+        between.reopen(&loaded, &wrong),
         Err(Error::Unauthenticated)
     ));
-    let between = open().finish_method().unwrap();
-    // A reopen resolves through its helper once the bootstrap's one-second
-    // address reuse (POSTGRES.md, "Writer endpoint resolution") has passed.
-    thread::sleep(Duration::from_millis(1100));
-    let failed = between.reopen(&loaded, &fixture.root.join("missing-helper"), password);
-    assert!(matches!(failed, Err(Error::Resolution(_))));
     let view = Snapshot::open_runtime(
         &slots,
         request,
-        trust,
         Instant::now() + Duration::from_secs(2),
         binding,
         password,
@@ -9325,19 +8775,19 @@ fn exercise_read_boundaries(
     let between = view.finish_method().unwrap();
     thread::sleep(Duration::from_secs(2));
     assert!(matches!(
-        between.reopen(&loaded, executable, password),
+        between.reopen(&loaded, password),
         Err(Error::Connection(td_mta::postgres_probe::Error::Deadline))
     ));
     let between = open().finish_method().unwrap();
     let revoke =
         devices::prepare_revocation(binding.epoch(), account, creation.device_id(), 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert!(matches!(
-        between.reopen(&loaded, executable, password),
+        between.reopen(&loaded, password),
         Err(Error::Unauthenticated)
     ));
     assert!(matches!(
-        Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password),
+        Snapshot::open_runtime(&slots, request, deadline(), binding, password),
         Err(Error::Unauthenticated)
     ));
 }
@@ -9345,7 +8795,6 @@ fn exercise_read_boundaries(
 fn exercise_query(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -9355,7 +8804,7 @@ fn exercise_query(
     };
     let account = binding.account();
     let creation = devices::prepare_creation(binding.epoch(), account, "query fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let password = creation.password();
     let mailbox = MailboxId::from_bytes([0x33; 16]);
     sql(fixture,&format!("INSERT INTO td_mta.mailboxes SELECT id,decode('{mailbox}','hex'),'Drafts',NULL,NULL,0,1,sequence FROM td_mta.accounts"));
@@ -9387,7 +8836,7 @@ fn exercise_query(
             deadline(),
         )
         .unwrap();
-        drafts::publish(request, trust, deadline(), &draft, password).unwrap()
+        drafts::publish(request, deadline(), &draft, password).unwrap()
     };
     let first = create("first@example.test");
     let second = create("second@example.test");
@@ -9406,7 +8855,7 @@ fn exercise_query(
         limit: 2,
         calculate_total: true,
     };
-    read::with_snapshot(request,trust,deadline(),binding,password,|view| {
+    read::with_snapshot(request,deadline(),binding,password,|view| {
         let page=view.query_emails(query)?;
         assert_eq!(page.ids,ties);assert_eq!(page.total,Some(3));assert!(page.has_more);
         assert_eq!(page.state.sequence.number(),4);
@@ -9438,7 +8887,7 @@ fn exercise_query(
         assert_eq!(view.email(first.email)?.unwrap().identity.committed_sequence.number(),4);
         Ok(())
     }).unwrap();
-    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    read::with_snapshot(request, deadline(), binding, password, |view| {
         let page = view.query_emails(query)?;
         assert_eq!(page.ids.first(), Some(&first.email));
         assert_eq!(page.state.sequence.number(), 5);
@@ -9446,7 +8895,7 @@ fn exercise_query(
     })
     .unwrap();
     assert_eq!(
-        read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        read::with_snapshot(request, deadline(), binding, password, |view| {
             let _ = view.query_emails(read::EmailQuery {
                 limit: 1025,
                 ..query
@@ -9457,7 +8906,7 @@ fn exercise_query(
     );
     sql(fixture,&format!("UPDATE td_mta.emails SET changed=decode('0000000000000006','hex') WHERE id=decode('{}','hex')",first.email));
     assert_eq!(
-        read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        read::with_snapshot(request, deadline(), binding, password, |view| {
             let _ = view.query_emails(query);
             Ok(())
         }),
@@ -9467,13 +8916,12 @@ fn exercise_query(
         fixture,
         "UPDATE td_mta.emails SET changed=decode('0000000000000005','hex')",
     );
-    replication_inventory::exercise(fixture, request, trust, binding, password);
+    replication_inventory::exercise(fixture, request, binding, password);
 }
 
 fn exercise_threads(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -9483,14 +8931,14 @@ fn exercise_threads(
     let account = binding.account();
     let creation =
         devices::prepare_creation(binding.epoch(), account, "thread fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let password = creation.password();
     let thread = ThreadId::from_bytes([0x44; 16]);
     let empty = ThreadId::from_bytes([0x55; 16]);
     // Empty blobs suffice: this fixture exercises member ordering, not bodies.
     sql(fixture,&format!("BEGIN; INSERT INTO td_mta.threads SELECT id,decode('{thread}','hex'),sequence FROM td_mta.accounts; INSERT INTO td_mta.threads SELECT id,decode('{empty}','hex'),sequence FROM td_mta.accounts; INSERT INTO td_mta.blob_ids SELECT id,decode(repeat('66',16),'hex') FROM td_mta.accounts; INSERT INTO td_mta.blobs SELECT id,decode(repeat('66',16),'hex'),0,decode('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','hex'),0,sequence,0 FROM td_mta.accounts; INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) SELECT a.id,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('66',16),'hex'),decode('{thread}','hex'),CASE WHEN n=0 THEN -9223372036854775808 WHEN n=257 THEN 9223372036854775807 ELSE 0 END,2,a.sequence FROM td_mta.accounts a CROSS JOIN generate_series(0,257) n; COMMIT"));
     let unknown = ThreadId::from_bytes([0xee; 16]);
-    read::with_snapshot(request,trust,deadline(),binding,password,|view| {
+    read::with_snapshot(request,deadline(),binding,password,|view| {
         assert!(view.thread_emails(unknown,None,1)?.is_none());
         let empty=view.thread_emails(empty,None,1)?.unwrap();assert!(empty.emails.is_empty());assert!(!empty.has_more);
         let page=view.thread_emails(thread,None,256)?.unwrap();
@@ -9506,7 +8954,7 @@ fn exercise_threads(
         assert_eq!(again.emails,page.emails);assert_eq!(again.identity,page.identity);
         Ok(())
     }).unwrap();
-    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    read::with_snapshot(request, deadline(), binding, password, |view| {
         assert!(view.thread_emails(thread, None, 1)?.is_none());
         assert_eq!(view.identity().committed_sequence.number(), 2);
         Ok(())
@@ -9514,7 +8962,7 @@ fn exercise_threads(
     .unwrap();
     for (maximum, error) in [(0, read::Error::Invalid), (257, read::Error::Capacity)] {
         assert_eq!(
-            read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+            read::with_snapshot(request, deadline(), binding, password, |view| {
                 let _ = view.thread_emails(empty, None, maximum);
                 Ok(())
             }),
@@ -9523,7 +8971,7 @@ fn exercise_threads(
     }
     sql(fixture,&format!("UPDATE td_mta.threads SET changed=decode('0000000000000003','hex') WHERE id=decode('{empty}','hex')"));
     assert_eq!(
-        read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        read::with_snapshot(request, deadline(), binding, password, |view| {
             let _ = view.thread_emails(empty, None, 1);
             Ok(())
         }),
@@ -9534,14 +8982,13 @@ fn exercise_threads(
 fn exercise_folders(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use folders::{Error, ResultEntry};
     use td_mta::{postgres_devices as devices, postgres_mailbox_set as folders};
     let account = binding.account();
     let device = devices::prepare_creation(binding.epoch(), account, "folder fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &device).unwrap();
+    devices::publish_creation(request, deadline(), &device).unwrap();
     let password = device.password();
     let prepare = |names: &[&str], expected| {
         folders::prepare(binding, device.device_id(), expected, names, deadline()).unwrap()
@@ -9580,15 +9027,12 @@ fn exercise_folders(
         ],
         Some(1),
     );
+    assert_eq!(folders::inspect(request, deadline(), &mixed).unwrap(), None);
     assert_eq!(
-        folders::inspect(request, trust, deadline(), &mixed).unwrap(),
-        None
-    );
-    assert_eq!(
-        folders::publish(request, trust, deadline(), &mixed, b"bad"),
+        folders::publish(request, deadline(), &mixed, b"bad"),
         Err(Error::Unauthenticated)
     );
-    let result = folders::publish(request, trust, deadline(), &mixed, password).unwrap();
+    let result = folders::publish(request, deadline(), &mixed, password).unwrap();
     assert_eq!((result.old_sequence, result.new_sequence), (1, 2));
     assert!(matches!(
         result.results.as_slice(),
@@ -9603,29 +9047,23 @@ fn exercise_folders(
         ]
     ));
     assert_eq!(
-        folders::publish(request, trust, deadline(), &mixed, b"bad").unwrap(),
+        folders::publish(request, deadline(), &mixed, b"bad").unwrap(),
         result
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.mailboxes"), "3");
     assert_eq!(sql(fixture,"SELECT count(*) FROM td_mta.changes WHERE sequence=decode('0000000000000002','hex') AND kind=1 AND action=1"),"2");
     let noop = prepare(&["Projects", ""], Some(2));
-    let noop = folders::publish(request, trust, deadline(), &noop, password).unwrap();
+    let noop = folders::publish(request, deadline(), &noop, password).unwrap();
     assert_eq!((noop.old_sequence, noop.new_sequence), (2, 2));
     assert_eq!(
-        folders::publish(
-            request,
-            trust,
-            deadline(),
-            &prepare(&["stale"], Some(1)),
-            password
-        ),
+        folders::publish(request, deadline(), &prepare(&["stale"], Some(1)), password),
         Err(Error::State)
     );
     let left = prepare(&["Concurrent"], None);
     let right = prepare(&["Concurrent"], None);
     let (left, right) = thread::scope(|scope| {
-        let a = scope.spawn(|| folders::publish(request, trust, deadline(), &left, password));
-        let b = scope.spawn(|| folders::publish(request, trust, deadline(), &right, password));
+        let a = scope.spawn(|| folders::publish(request, deadline(), &left, password));
+        let b = scope.spawn(|| folders::publish(request, deadline(), &right, password));
         (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
     });
     let created =
@@ -9647,13 +9085,13 @@ fn exercise_folders(
         .collect();
     let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
     let oversized = prepare(&borrowed, None);
-    let overflow = folders::publish(request, trust, deadline(), &oversized, password);
+    let overflow = folders::publish(request, deadline(), &oversized, password);
     assert!(
         matches!(overflow, Err(Error::Capacity)),
         "oversized folder publication: {overflow:?}"
     );
     assert_eq!(
-        folders::inspect(request, trust, deadline(), &oversized).unwrap(),
+        folders::inspect(request, deadline(), &oversized).unwrap(),
         None
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.mailboxes"), "4");
@@ -9670,11 +9108,11 @@ fn exercise_folders(
     let rejected = prepare(&["rollback"], None);
     sql(fixture,"CREATE FUNCTION public.reject_folder() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject folder'; END $$; CREATE TRIGGER reject_folder BEFORE INSERT ON td_mta.mailbox_create_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_folder()");
     assert_eq!(
-        folders::publish(request, trust, deadline(), &rejected, password),
+        folders::publish(request, deadline(), &rejected, password),
         Err(Error::Database)
     );
     assert_eq!(
-        folders::inspect(request, trust, deadline(), &rejected).unwrap(),
+        folders::inspect(request, deadline(), &rejected).unwrap(),
         None
     );
     assert_eq!(
@@ -9689,7 +9127,6 @@ fn exercise_folders(
     assert_eq!(
         folders::publish(
             request,
-            trust,
             Instant::now() + Duration::from_secs(1),
             &uncertain,
             password
@@ -9697,7 +9134,7 @@ fn exercise_folders(
         Err(Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(3));
-    let retained = folders::inspect(request, trust, deadline(), &uncertain)
+    let retained = folders::inspect(request, deadline(), &uncertain)
         .unwrap()
         .unwrap();
     sql(
@@ -9705,7 +9142,7 @@ fn exercise_folders(
         "DROP TRIGGER delay_folder ON td_mta.mailbox_create_receipts",
     );
     assert_eq!(
-        folders::publish(request, trust, deadline(), &uncertain, password).unwrap(),
+        folders::publish(request, deadline(), &uncertain, password).unwrap(),
         retained
     );
     assert_eq!(
@@ -9722,13 +9159,12 @@ fn exercise_folders(
     .unwrap();
     let deletion = prepare_delete(Some(target), None);
     assert_eq!(
-        folders::publish(request, trust, deadline(), &deletion, b"bad"),
+        folders::publish(request, deadline(), &deletion, b"bad"),
         Err(Error::Unauthenticated)
     );
     assert_eq!(
         folders::publish(
             request,
-            trust,
             deadline(),
             &prepare_delete(Some(target), Some(1)),
             password
@@ -9737,11 +9173,11 @@ fn exercise_folders(
     );
     sql(fixture, "CREATE TRIGGER reject_folder_delete BEFORE INSERT ON td_mta.mailbox_create_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_folder()");
     assert_eq!(
-        folders::publish(request, trust, deadline(), &deletion, password),
+        folders::publish(request, deadline(), &deletion, password),
         Err(Error::Database)
     );
     assert_eq!(
-        folders::inspect(request, trust, deadline(), &deletion).unwrap(),
+        folders::inspect(request, deadline(), &deletion).unwrap(),
         None
     );
     assert_eq!(
@@ -9755,20 +9191,19 @@ fn exercise_folders(
         fixture,
         "DROP TRIGGER reject_folder_delete ON td_mta.mailbox_create_receipts",
     );
-    let deleted = folders::publish(request, trust, deadline(), &deletion, password).unwrap();
+    let deleted = folders::publish(request, deadline(), &deletion, password).unwrap();
     assert_eq!(deleted.results, [ResultEntry::Destroyed(target)]);
     assert_eq!(deleted.new_sequence, deleted.old_sequence + 1);
     assert_eq!(
-        folders::publish(request, trust, deadline(), &deletion, b"bad").unwrap(),
+        folders::publish(request, deadline(), &deletion, b"bad").unwrap(),
         deleted
     );
     assert_eq!(
-        folders::inspect(request, trust, deadline(), &deletion).unwrap(),
+        folders::inspect(request, deadline(), &deletion).unwrap(),
         Some(deleted.clone())
     );
     let absent = folders::publish(
         request,
-        trust,
         deadline(),
         &prepare_delete(Some(target), None),
         password,
@@ -9786,7 +9221,7 @@ fn exercise_folders(
         .collect();
     let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
     let maximum = prepare(&borrowed, None);
-    let maximum = folders::publish(request, trust, deadline(), &maximum, password).unwrap();
+    let maximum = folders::publish(request, deadline(), &maximum, password).unwrap();
     assert_eq!(maximum.results.len(), 256);
     assert_eq!(
         maximum
@@ -9797,32 +9232,19 @@ fn exercise_folders(
         available
     );
     assert_eq!(
-        td_mta::postgres_mailboxes::list(
-            request,
-            trust,
-            deadline(),
-            binding.epoch(),
-            account,
-            password
-        )
-        .unwrap()
-        .mailboxes
-        .len(),
+        td_mta::postgres_mailboxes::list(request, deadline(), binding.epoch(), account, password)
+            .unwrap()
+            .mailboxes
+            .len(),
         256
     );
     assert_eq!(
-        folders::publish(
-            request,
-            trust,
-            deadline(),
-            &prepare(&["one more"], None),
-            password
-        ),
+        folders::publish(request, deadline(), &prepare(&["one more"], None), password),
         Err(Error::Capacity)
     );
     receipt_expiry::fill(fixture, "mailbox_create_receipts", &account.to_string());
     assert_eq!(
-        folders::publish(request, trust, deadline(), &prepare(&[], None), password),
+        folders::publish(request, deadline(), &prepare(&[], None), password),
         Err(Error::Capacity)
     );
     // Hold receipts this fixture replays later past every sweep that
@@ -9831,61 +9253,48 @@ fn exercise_folders(
     receipt_expiry::expire(
         fixture,
         request,
-        trust,
         binding.epoch(),
         "mailbox_create_receipts",
         &account.to_string(),
     );
-    folders::publish(request, trust, deadline(), &prepare(&[], None), password).unwrap();
+    folders::publish(request, deadline(), &prepare(&[], None), password).unwrap();
     receipt_expiry::swept(fixture, "mailbox_create_receipts");
     sql(
         fixture,
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",
     );
     assert_eq!(
-        folders::publish(request, trust, deadline(), &prepare(&[], None), password),
+        folders::publish(request, deadline(), &prepare(&[], None), password),
         Err(Error::Policy)
     );
     sql(fixture,"UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex'); UPDATE td_mta.accounts SET sequence=decode('ffffffffffffffff','hex')");
     assert_eq!(
-        folders::publish(request, trust, deadline(), &prepare(&[], None), password)
+        folders::publish(request, deadline(), &prepare(&[], None), password)
             .unwrap()
             .new_sequence,
         u64::MAX
     );
     assert_eq!(
-        folders::publish(
-            request,
-            trust,
-            deadline(),
-            &prepare(&["overflow"], None),
-            password
-        ),
+        folders::publish(request, deadline(), &prepare(&["overflow"], None), password),
         Err(Error::Capacity)
     );
     let revoke =
         devices::prepare_revocation(binding.epoch(), account, device.device_id(), 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert_eq!(
-        folders::publish(request, trust, deadline(), &prepare(&[], None), password),
+        folders::publish(request, deadline(), &prepare(&[], None), password),
         Err(Error::Unauthenticated)
     );
     assert_eq!(
-        folders::publish(
-            request,
-            trust,
-            deadline(),
-            &prepare_delete(None, None),
-            password
-        ),
+        folders::publish(request, deadline(), &prepare_delete(None, None), password),
         Err(Error::Unauthenticated)
     );
     assert_eq!(
-        folders::publish(request, trust, deadline(), &deletion, password).unwrap(),
+        folders::publish(request, deadline(), &deletion, password).unwrap(),
         deleted
     );
     assert_eq!(
-        folders::publish(request, trust, deadline(), &mixed, password).unwrap(),
+        folders::publish(request, deadline(), &mixed, password).unwrap(),
         result
     );
 }
@@ -9893,7 +9302,6 @@ fn exercise_folders(
 fn exercise_moves(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -9903,7 +9311,7 @@ fn exercise_moves(
     let account = binding.account();
     let email = EmailId::from_bytes([0xe1; 16]);
     let creation = devices::prepare_creation(binding.epoch(), account, "move fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let device = creation.device_id();
     let password = creation.password();
     sql(fixture, &format!("BEGIN; INSERT INTO td_mta.blob_ids VALUES(decode('{account}','hex'),decode('{email}','hex')); INSERT INTO td_mta.blobs VALUES(decode('{account}','hex'),decode('{email}','hex'),0,decode('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','hex'),0,decode('0000000000000001','hex'),0); INSERT INTO td_mta.threads VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('0000000000000001','hex')); INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('{email}','hex'),decode('{email}','hex'),0,2,decode('0000000000000001','hex')); INSERT INTO td_mta.memberships SELECT account,decode('{email}','hex'),id,changed FROM td_mta.mailboxes WHERE account=decode('{account}','hex'); COMMIT"));
@@ -9925,14 +9333,14 @@ fn exercise_moves(
         flags::prepare_batch(binding, device, updates, expected).unwrap()
     };
     let publish =
-        |change: &flags::Change| flags::publish_batch(request, trust, deadline(), change, password);
+        |change: &flags::Change| flags::publish_batch(request, deadline(), change, password);
     let first = prepare(&[update], Some(1));
     assert_eq!(
-        flags::inspect_batch(request, trust, deadline(), &first).unwrap(),
+        flags::inspect_batch(request, deadline(), &first).unwrap(),
         None
     );
     assert_eq!(
-        flags::publish_batch(request, trust, deadline(), &first, b"bad"),
+        flags::publish_batch(request, deadline(), &first, b"bad"),
         Err(flags::Error::Unauthenticated)
     );
     let result = publish(&first).unwrap();
@@ -9961,15 +9369,9 @@ fn exercise_moves(
         ),
         "3\n1\n1"
     );
-    let listed = td_mta::postgres_mailboxes::list(
-        request,
-        trust,
-        deadline(),
-        binding.epoch(),
-        account,
-        password,
-    )
-    .unwrap();
+    let listed =
+        td_mta::postgres_mailboxes::list(request, deadline(), binding.epoch(), account, password)
+            .unwrap();
     assert_eq!(
         listed
             .mailboxes
@@ -10051,7 +9453,7 @@ fn exercise_moves(
     sql(fixture, "CREATE FUNCTION public.reject_moves() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_moves BEFORE INSERT ON td_mta.flag_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_moves()");
     assert_eq!(publish(&back), Err(flags::Error::Database));
     assert_eq!(
-        flags::inspect_batch(request, trust, deadline(), &back).unwrap(),
+        flags::inspect_batch(request, deadline(), &back).unwrap(),
         None
     );
     assert_eq!(
@@ -10066,7 +9468,6 @@ fn exercise_moves(
     assert_eq!(
         flags::publish_batch(
             request,
-            trust,
             Instant::now() + Duration::from_secs(1),
             &back,
             password
@@ -10076,7 +9477,7 @@ fn exercise_moves(
     thread::sleep(Duration::from_secs(4));
     sql(fixture, "DROP TRIGGER delay_moves ON td_mta.flag_receipts");
     assert_eq!(
-        flags::inspect_batch(request, trust, deadline(), &back)
+        flags::inspect_batch(request, deadline(), &back)
             .unwrap()
             .unwrap()
             .state
@@ -10123,7 +9524,7 @@ fn exercise_moves(
     sql(fixture, &format!("INSERT INTO td_mta.mailboxes VALUES(decode('{account}','hex'),decode(repeat('ab',16),'hex'),'overflow',NULL,NULL,0,1,decode('0000000000000001','hex')); INSERT INTO td_mta.memberships VALUES(decode('{account}','hex'),decode(lpad(to_hex(1025),32,'0'),'hex'),decode(repeat('ab',16),'hex'),decode('0000000000000001','hex'))"));
     assert_eq!(publish(&bulk), Err(flags::Error::Capacity));
     assert_eq!(
-        flags::inspect_batch(request, trust, deadline(), &bulk).unwrap(),
+        flags::inspect_batch(request, deadline(), &bulk).unwrap(),
         None
     );
     assert_eq!(
@@ -10133,7 +9534,6 @@ fn exercise_moves(
     sql(fixture, "DELETE FROM td_mta.memberships WHERE mailbox_id=decode(repeat('ab',16),'hex'); DELETE FROM td_mta.mailboxes WHERE id=decode(repeat('ab',16),'hex')");
     let outcome = flags::publish_batch(
         request,
-        trust,
         Instant::now() + Duration::from_secs(10),
         &bulk,
         password,
@@ -10169,13 +9569,13 @@ fn exercise_moves(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
     );
     let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert_eq!(
         publish(&prepare(&[update], None)),
         Err(flags::Error::Unauthenticated)
     );
     assert_eq!(
-        flags::publish_batch(request, trust, deadline(), &first, b"bad").unwrap(),
+        flags::publish_batch(request, deadline(), &first, b"bad").unwrap(),
         result
     );
 }
@@ -10183,7 +9583,6 @@ fn exercise_moves(
 fn exercise_deletion(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -10195,7 +9594,7 @@ fn exercise_deletion(
     let account = binding.account();
     let creation =
         devices::prepare_creation(binding.epoch(), account, "delete fixture", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let device = creation.device_id();
     let password = creation.password();
     let id = |n| EmailId::parse(&format!("{:032x}", n + 1024)).unwrap();
@@ -10215,9 +9614,8 @@ fn exercise_deletion(
     let prepare = |emails: &[EmailId], expected| {
         deletion::prepare(binding, device, emails, expected).unwrap()
     };
-    let publish = |change: &deletion::Deletion| {
-        deletion::publish(request, trust, deadline(), change, password)
-    };
+    let publish =
+        |change: &deletion::Deletion| deletion::publish(request, deadline(), change, password);
     assert!(matches!(
         deletion::prepare(binding, device, &[id(1); 2], None),
         Err(mutations::Error::Invalid)
@@ -10230,11 +9628,11 @@ fn exercise_deletion(
     assert_eq!(empty.state.new_sequence, 1);
     let first = prepare(&[id(1), id(99)], Some(1));
     assert_eq!(
-        deletion::inspect(request, trust, deadline(), &first).unwrap(),
+        deletion::inspect(request, deadline(), &first).unwrap(),
         None
     );
     assert_eq!(
-        deletion::publish(request, trust, deadline(), &first, b"bad"),
+        deletion::publish(request, deadline(), &first, b"bad"),
         Err(mutations::Error::Unauthenticated)
     );
     let result = publish(&first).unwrap();
@@ -10278,7 +9676,7 @@ fn exercise_deletion(
     sql(fixture, "UPDATE td_mta.account_usage SET body_bytes=5");
     assert_eq!(publish(&second), Err(mutations::Error::Integrity));
     assert_eq!(
-        deletion::inspect(request, trust, deadline(), &second).unwrap(),
+        deletion::inspect(request, deadline(), &second).unwrap(),
         None
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "3");
@@ -10294,7 +9692,7 @@ fn exercise_deletion(
         fixture,
         "DROP TRIGGER reject_deletion ON td_mta.flag_receipts",
     );
-    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+    read::with_snapshot(request, deadline(), binding, password, |view| {
         assert!(view.email(id(2))?.is_some());
         assert_eq!(publish(&second).unwrap().state.new_sequence, 3);
         let bytes = view.with_body(id(2), |_, body| {
@@ -10322,7 +9720,6 @@ fn exercise_deletion(
     assert_eq!(
         deletion::publish(
             request,
-            trust,
             Instant::now() + Duration::from_secs(1),
             &retained,
             password
@@ -10335,7 +9732,7 @@ fn exercise_deletion(
         "DROP TRIGGER delay_deletion ON td_mta.flag_receipts",
     );
     assert_eq!(
-        deletion::inspect(request, trust, deadline(), &retained)
+        deletion::inspect(request, deadline(), &retained)
             .unwrap()
             .unwrap()
             .state
@@ -10372,10 +9769,7 @@ fn exercise_deletion(
     let bulk = prepare(&ids, Some(4));
     sql(fixture,&format!("INSERT INTO td_mta.mailboxes VALUES(decode('{account}','hex'),decode(repeat('ab',16),'hex'),'overflow',NULL,NULL,0,1,decode('0000000000000001','hex')); INSERT INTO td_mta.memberships VALUES(decode('{account}','hex'),decode(lpad(to_hex(12001),32,'0'),'hex'),decode(repeat('ab',16),'hex'),decode('0000000000000001','hex'))"));
     assert_eq!(publish(&bulk), Err(mutations::Error::Capacity));
-    assert_eq!(
-        deletion::inspect(request, trust, deadline(), &bulk).unwrap(),
-        None
-    );
+    assert_eq!(deletion::inspect(request, deadline(), &bulk).unwrap(), None);
     assert_eq!(
         sql(fixture, "SELECT count(*) FROM td_mta.memberships"),
         "65537"
@@ -10383,7 +9777,6 @@ fn exercise_deletion(
     sql(fixture,"DELETE FROM td_mta.memberships WHERE mailbox_id=decode(repeat('ab',16),'hex'); DELETE FROM td_mta.mailboxes WHERE id=decode(repeat('ab',16),'hex')");
     let outcome = deletion::publish(
         request,
-        trust,
         Instant::now() + Duration::from_secs(10),
         &bulk,
         password,
@@ -10411,7 +9804,7 @@ fn exercise_deletion(
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
     sql(fixture,&format!("UPDATE td_mta.flag_receipts SET results=decode('0102','hex') WHERE operation=decode('{}','hex')",first.operation()));
     assert_eq!(
-        deletion::inspect(request, trust, deadline(), &first),
+        deletion::inspect(request, deadline(), &first),
         Err(mutations::Error::Integrity)
     );
     sql(fixture,&format!("UPDATE td_mta.flag_receipts SET results=decode('0402','hex') WHERE operation=decode('{}','hex'); UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",first.operation()));
@@ -10422,13 +9815,13 @@ fn exercise_deletion(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
     );
     let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert_eq!(
         publish(&prepare(&[], None)),
         Err(mutations::Error::Unauthenticated)
     );
     assert_eq!(
-        deletion::publish(request, trust, deadline(), &first, b"bad").unwrap(),
+        deletion::publish(request, deadline(), &first, b"bad").unwrap(),
         result
     );
 }
@@ -10442,7 +9835,6 @@ fn real_postgres_receiving_publishes_inbox_provenance_atomically() {
 fn exercise_receiving(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -10580,7 +9972,7 @@ fn exercise_receiving(
     assert!(prepare(b"broken\n").is_err());
     assert!(prepare(&[b'x'; 1001]).is_err());
     let first = prepare(b"Return-Path: <forged@example.test>\r\nMessage-ID: <root@example.test>\r\nSubject: Inbox\r\n\r\nhello\r\n").unwrap();
-    let outcome = receiving::publish(request, trust, deadline(), &first).unwrap();
+    let outcome = receiving::publish(request, deadline(), &first).unwrap();
     assert_eq!((outcome.old_sequence, outcome.new_sequence), (1, 2));
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords"), "0");
@@ -10597,10 +9989,9 @@ fn exercise_receiving(
     let credential =
         devices::prepare_creation(binding.epoch(), binding.account(), "receiving reader", 1)
             .unwrap();
-    devices::publish_creation(request, trust, deadline(), &credential).unwrap();
+    devices::publish_creation(request, deadline(), &credential).unwrap();
     let text = body::with_email(
         request,
-        trust,
         deadline(),
         body::ReadRequest {
             epoch: binding.epoch(),
@@ -10632,7 +10023,7 @@ fn exercise_receiving(
         b"Message-ID: <reply@example.test>\r\nReferences: <root@example.test>\r\n\r\nreply\r\n",
     )
     .unwrap();
-    let reply_outcome = receiving::publish(request, trust, deadline(), &reply).unwrap();
+    let reply_outcome = receiving::publish(request, deadline(), &reply).unwrap();
     assert_eq!(reply_outcome.thread, outcome.thread);
     assert_eq!(reply_outcome.new_sequence, 3);
     let pending = prepare(b"\r\nnew\r\n").unwrap();
@@ -10641,7 +10032,7 @@ fn exercise_receiving(
         "UPDATE td_mta.mailboxes SET role=NULL WHERE role='inbox'",
     );
     assert_eq!(
-        receiving::publish(request, trust, deadline(), &pending),
+        receiving::publish(request, deadline(), &pending),
         Err(receiving::Error::MissingMailbox)
     );
     sql(fixture, "UPDATE td_mta.mailboxes SET role='inbox'");
@@ -10654,7 +10045,7 @@ fn exercise_receiving(
         ),
     );
     assert_eq!(
-        receiving::publish(request, trust, deadline(), &pending),
+        receiving::publish(request, deadline(), &pending),
         Err(receiving::Error::Quota)
     );
     sql(
@@ -10663,7 +10054,7 @@ fn exercise_receiving(
     );
     sql(fixture,"CREATE FUNCTION public.reject_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refuse'; END $$; CREATE TRIGGER reject_receiving BEFORE INSERT ON td_mta.emails FOR EACH ROW EXECUTE FUNCTION public.reject_receiving()");
     assert_eq!(
-        receiving::publish(request, trust, deadline(), &pending),
+        receiving::publish(request, deadline(), &pending),
         Err(receiving::Error::Database)
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "2");
@@ -10673,12 +10064,7 @@ fn exercise_receiving(
     );
     sql(fixture,"DROP TRIGGER reject_receiving ON td_mta.emails; CREATE FUNCTION public.delay_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_receiving AFTER INSERT ON td_mta.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_receiving()");
     assert_eq!(
-        receiving::publish(
-            request,
-            trust,
-            Instant::now() + Duration::from_secs(1),
-            &pending
-        ),
+        receiving::publish(request, Instant::now() + Duration::from_secs(1), &pending),
         Err(receiving::Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
@@ -10690,7 +10076,7 @@ fn exercise_receiving(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",
     );
     assert_eq!(
-        receiving::publish(request, trust, deadline(), &fresh),
+        receiving::publish(request, deadline(), &fresh),
         Err(receiving::Error::Policy)
     );
     sql(
@@ -10725,18 +10111,13 @@ fn exercise_receiving(
         Instant::now() + Duration::from_secs(10),
     )
     .unwrap();
-    let bulk_outcome = receiving::publish(
-        request,
-        trust,
-        Instant::now() + Duration::from_secs(10),
-        &bulk,
-    )
-    .unwrap();
+    let bulk_outcome =
+        receiving::publish(request, Instant::now() + Duration::from_secs(10), &bulk).unwrap();
     assert!(bulk_outcome.length > large.len() as u64);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.smtp_receipt_recipients WHERE email_id=decode('{}','hex')",bulk_outcome.email)),"1000");
     assert_eq!(sql(fixture,&format!("SELECT sum(octet_length(bytes)) FROM td_mta.blob_chunks WHERE blob_id=decode('{}','hex')",bulk_outcome.blob)),bulk_outcome.length.to_string());
     let capacity =
-        td_mta::postgres_capacity::inspect(request, trust, deadline(), binding.epoch()).unwrap();
+        td_mta::postgres_capacity::inspect(request, deadline(), binding.epoch()).unwrap();
     let metrics = capacity.get("metrics").unwrap().as_arr().unwrap();
     assert!(metrics
         .iter()
@@ -10765,8 +10146,7 @@ fn exercise_receiving(
     );
     // Exercise all sixteen account query groups under one bounded connection.
     sql(fixture,"INSERT INTO td_mta.accounts SELECT decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex') FROM generate_series(1001,1015) n; INSERT INTO td_mta.account_usage SELECT id,0,0,0,0,0 FROM td_mta.accounts WHERE id IN (SELECT decode(lpad(to_hex(n),32,'0'),'hex') FROM generate_series(1001,1015) n)");
-    let maximum =
-        td_mta::postgres_capacity::inspect(request, trust, deadline(), binding.epoch()).unwrap();
+    let maximum = td_mta::postgres_capacity::inspect(request, deadline(), binding.epoch()).unwrap();
     assert_eq!(
         maximum
             .get("metrics")
@@ -10793,7 +10173,6 @@ fn real_postgres_submission_input_freezes_verified_bytes_and_identity_envelope()
 fn exercise_submission_input(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     publish: bool,
 ) {
@@ -10809,7 +10188,7 @@ fn exercise_submission_input(
         1,
     )
     .unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let password = creation.password();
     let mailbox = MailboxId::parse(&sql(
         fixture,
@@ -10853,11 +10232,10 @@ text",
         deadline(),
     )
     .unwrap();
-    let published = drafts::publish(request, trust, deadline(), &draft, password).unwrap();
+    let published = drafts::publish(request, deadline(), &draft, password).unwrap();
     let prepare = |identity, expected, password| {
         input::prepare(
             request,
-            trust,
             deadline(),
             input::Input {
                 binding,
@@ -10897,7 +10275,6 @@ text",
     assert!(matches!(
         input::prepare_with_meter(
             request,
-            trust,
             deadline(),
             selection(),
             password,
@@ -10920,7 +10297,6 @@ text",
     assert!(matches!(
         input::prepare_with_meter(
             request,
-            trust,
             deadline(),
             selection(),
             password,
@@ -10943,7 +10319,6 @@ text",
     assert!(matches!(
         input::prepare_with_meter(
             request,
-            trust,
             Instant::now(),
             selection(),
             password,
@@ -10954,7 +10329,6 @@ text",
     ));
     let prepared = input::prepare_with_meter(
         request,
-        trust,
         deadline(),
         selection(),
         password,
@@ -10984,7 +10358,6 @@ text",
     assert!(!format!("{prepared:?}").contains("main@example.test"));
     let original = td_mta::postgres_body::with_email(
         request,
-        trust,
         deadline(),
         td_mta::postgres_body::ReadRequest {
             epoch: binding.epoch(),
@@ -11036,14 +10409,7 @@ text",
     drop(prepared);
     assert_eq!(retained.recipients().len(), 2);
     if publish {
-        exercise_submission_publication(
-            fixture,
-            request,
-            trust,
-            binding,
-            retained.clone(),
-            password,
-        );
+        exercise_submission_publication(fixture, request, binding, retained.clone(), password);
     }
     sql(
         fixture,
@@ -11063,7 +10429,7 @@ text",
     let revoke =
         devices::prepare_revocation(binding.epoch(), binding.account(), creation.device_id(), 1)
             .unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    devices::publish_revocation(request, deadline(), &revoke).unwrap();
     assert_eq!(
         prepare(identity, None, password).err(),
         Some(input::Error::Read(
@@ -11084,7 +10450,6 @@ fn real_postgres_submissions_publish_queue_and_retained_outcomes() {
 fn exercise_submission_publication(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     input: td_mta::postgres_submission_input::Prepared,
     password: &[u8],
@@ -11097,7 +10462,6 @@ fn exercise_submission_publication(
     let make = || {
         let prepared = inputs::prepare(
             request,
-            trust,
             deadline(),
             inputs::Input {
                 binding,
@@ -11171,16 +10535,16 @@ fn exercise_submission_publication(
     assert!(after.io_bytes < before.io_bytes && after.records < before.records);
     assert_eq!(after.output_bytes, before.output_bytes);
     assert_eq!(
-        submissions::inspect(request, trust, deadline(), &first).unwrap(),
+        submissions::inspect(request, deadline(), &first).unwrap(),
         None
     );
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &first, b"bad"),
+        submissions::publish(request, deadline(), &first, b"bad"),
         Err(submissions::Error::Unauthenticated)
     );
     let (a, b) = thread::scope(|scope| {
-        let a = scope.spawn(|| submissions::publish(request, trust, deadline(), &first, password));
-        let b = scope.spawn(|| submissions::publish(request, trust, deadline(), &first, password));
+        let a = scope.spawn(|| submissions::publish(request, deadline(), &first, password));
+        let b = scope.spawn(|| submissions::publish(request, deadline(), &first, password));
         (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
     });
     assert_eq!(a, b);
@@ -11226,7 +10590,6 @@ fn exercise_submission_publication(
     let mut domain = GenerationSet::<TlsPolicies>::at_startup();
     let relay = runtime::load(
         request,
-        trust,
         deadline(),
         binding.epoch(),
         "cloud",
@@ -11237,11 +10600,10 @@ fn exercise_submission_publication(
     drop(domain.publish(relay_prepared).unwrap());
     let relay_policies = domain.current().unwrap();
     assert!(relay_binding.serves_route(first.route()));
-    exercise_route_owners(fixture, request, trust, &relay_binding, binding);
+    exercise_route_owners(fixture, request, &relay_binding, binding);
     assert_eq!(
         delivery_body::with_submission(
             request,
-            trust,
             deadline(),
             delivery_body::ReadRequest {
                 binding,
@@ -11255,7 +10617,6 @@ fn exercise_submission_publication(
     let read_outgoing = || {
         delivery_body::with_submission(
             request,
-            trust,
             deadline(),
             delivery_body::ReadRequest {
                 binding: &relay_binding,
@@ -11276,7 +10637,6 @@ fn exercise_submission_publication(
     assert_eq!(
         delivery_body::with_submission(
             request,
-            trust,
             deadline(),
             delivery_body::ReadRequest {
                 binding: &relay_binding,
@@ -11315,7 +10675,6 @@ fn exercise_submission_publication(
     sql(fixture, &format!("INSERT INTO td_mta.submission_routes VALUES(decode('{}','hex'),decode('{}','hex'),'desktop','personal-smarthost',decode('{route_digest}','hex'))", binding.account(), a.submission));
     delivery_body::with_submission(
         request,
-        trust,
         deadline(),
         delivery_body::ReadRequest {
             binding: &relay_binding,
@@ -11344,7 +10703,6 @@ fn exercise_submission_publication(
     assert!(matches!(
         delivery_body::with_submission(
             request,
-            trust,
             deadline(),
             delivery_body::ReadRequest {
                 binding: &relay_binding,
@@ -11380,23 +10738,23 @@ fn exercise_submission_publication(
         format!("{},2,{},1", input.source().body.length + a.length, a.length)
     );
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &first, b"bad").unwrap(),
+        submissions::publish(request, deadline(), &first, b"bad").unwrap(),
         held
     );
     let stale = submissions::prepare(input.clone(), deadline()).unwrap();
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &stale, password),
+        submissions::publish(request, deadline(), &stale, password),
         Err(submissions::Error::State)
     );
 
     let refused = make();
     sql(fixture, "CREATE FUNCTION public.reject_submission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refuse'; END $$; CREATE TRIGGER reject_submission BEFORE INSERT ON td_mta.submission_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_submission()");
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &refused, password),
+        submissions::publish(request, deadline(), &refused, password),
         Err(submissions::Error::Database)
     );
     assert_eq!(
-        submissions::inspect(request, trust, deadline(), &refused).unwrap(),
+        submissions::inspect(request, deadline(), &refused).unwrap(),
         None
     );
     assert_eq!(sql(fixture, "SELECT body_bytes||','||blob_count||','||queue_bytes||','||queue_submissions FROM td_mta.account_usage"), usage);
@@ -11412,11 +10770,11 @@ fn exercise_submission_publication(
     );
     sql(fixture, "CREATE TRIGGER reject_route BEFORE INSERT ON td_mta.submission_routes FOR EACH ROW EXECUTE FUNCTION public.reject_submission()");
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &refused, password),
+        submissions::publish(request, deadline(), &refused, password),
         Err(submissions::Error::Database)
     );
     assert_eq!(
-        submissions::inspect(request, trust, deadline(), &refused).unwrap(),
+        submissions::inspect(request, deadline(), &refused).unwrap(),
         None
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "1");
@@ -11451,11 +10809,11 @@ fn exercise_submission_publication(
             &format!("UPDATE td_mta.account_usage SET {column}={cap}"),
         );
         assert_eq!(
-            submissions::publish(request, trust, deadline(), &refused, password),
+            submissions::publish(request, deadline(), &refused, password),
             Err(submissions::Error::Quota)
         );
         assert_eq!(
-            submissions::inspect(request, trust, deadline(), &refused).unwrap(),
+            submissions::inspect(request, deadline(), &refused).unwrap(),
             None
         );
         sql(
@@ -11474,12 +10832,12 @@ fn exercise_submission_publication(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
     );
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &refused, password),
+        submissions::publish(request, deadline(), &refused, password),
         Err(submissions::Error::Policy)
     );
     assert_eq!(read_outgoing(), Err(delivery_body::Error::Policy));
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &first, b"bad").unwrap(),
+        submissions::publish(request, deadline(), &first, b"bad").unwrap(),
         held
     );
     sql(
@@ -11492,10 +10850,9 @@ fn exercise_submission_publication(
 
     let second_device =
         devices::prepare_creation(binding.epoch(), account, "revoked queue", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &second_device).unwrap();
+    devices::publish_creation(request, deadline(), &second_device).unwrap();
     let revoked = inputs::prepare(
         request,
-        trust,
         deadline(),
         inputs::Input {
             binding,
@@ -11510,15 +10867,9 @@ fn exercise_submission_publication(
     let revocation =
         devices::prepare_revocation(binding.epoch(), account, second_device.device_id(), 1)
             .unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revocation).unwrap();
+    devices::publish_revocation(request, deadline(), &revocation).unwrap();
     assert_eq!(
-        submissions::publish(
-            request,
-            trust,
-            deadline(),
-            &revoked,
-            second_device.password()
-        ),
+        submissions::publish(request, deadline(), &revoked, second_device.password()),
         Err(submissions::Error::Unauthenticated)
     );
 
@@ -11526,7 +10877,6 @@ fn exercise_submission_publication(
     assert_eq!(
         submissions::publish(
             request,
-            trust,
             Instant::now() + Duration::from_millis(1500),
             &refused,
             password
@@ -11534,7 +10884,7 @@ fn exercise_submission_publication(
         Err(submissions::Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
-    let recovered = submissions::inspect(request, trust, deadline(), &refused)
+    let recovered = submissions::inspect(request, deadline(), &refused)
         .unwrap()
         .unwrap();
     assert_eq!(recovered.new_sequence, 4);
@@ -11544,7 +10894,7 @@ fn exercise_submission_publication(
     );
 
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &refused, password).unwrap(),
+        submissions::publish(request, deadline(), &refused, password).unwrap(),
         recovered
     );
     sql(
@@ -11555,7 +10905,7 @@ fn exercise_submission_publication(
     let digest = sql(fixture,&format!("SELECT encode(request_digest,'hex') FROM td_mta.submission_receipts WHERE operation=decode('{}','hex')",first.operation()));
     sql(fixture,&format!("UPDATE td_mta.submission_receipts SET request_digest=decode(repeat('00',32),'hex') WHERE operation=decode('{}','hex')",first.operation()));
     assert_eq!(
-        submissions::inspect(request, trust, deadline(), &first),
+        submissions::inspect(request, deadline(), &first),
         Err(submissions::Error::Conflict)
     );
     sql(fixture,&format!("UPDATE td_mta.submission_receipts SET request_digest=decode('{digest}','hex') WHERE operation=decode('{}','hex')",first.operation()));
@@ -11602,10 +10952,9 @@ fn exercise_submission_publication(
         deadline(),
     )
     .unwrap();
-    let draft = drafts::publish(request, trust, deadline(), &draft, password).unwrap();
+    let draft = drafts::publish(request, deadline(), &draft, password).unwrap();
     let full = inputs::prepare(
         request,
-        trust,
         deadline(),
         inputs::Input {
             binding,
@@ -11618,7 +10967,7 @@ fn exercise_submission_publication(
     .unwrap();
     assert_eq!(full.recipients().len(), 1000);
     let full = submissions::prepare(full, deadline()).unwrap();
-    let full_outcome = submissions::publish(request, trust, deadline(), &full, password).unwrap();
+    let full_outcome = submissions::publish(request, deadline(), &full, password).unwrap();
     assert_eq!(
         sql(
             fixture,
@@ -11630,15 +10979,7 @@ fn exercise_submission_publication(
         "1000"
     );
 
-    exercise_success_filing(
-        fixture,
-        request,
-        trust,
-        binding,
-        &input,
-        draft.email,
-        password,
-    );
+    exercise_success_filing(fixture, request, binding, &input, draft.email, password);
     exercise_http_submission_owner(fixture, binding, &input, password);
     let capacity = make();
     receipt_expiry::fill(
@@ -11647,7 +10988,7 @@ fn exercise_submission_publication(
         &binding.account().to_string(),
     );
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &capacity, password),
+        submissions::publish(request, deadline(), &capacity, password),
         Err(submissions::Error::Capacity)
     );
     // About 1,000 sends per 30-day submission retention no longer stop
@@ -11655,24 +10996,23 @@ fn exercise_submission_publication(
     receipt_expiry::expire(
         fixture,
         request,
-        trust,
         binding.epoch(),
         "submission_receipts",
         &binding.account().to_string(),
     );
-    submissions::publish(request, trust, deadline(), &make(), password).unwrap();
+    submissions::publish(request, deadline(), &make(), password).unwrap();
     receipt_expiry::swept(fixture, "submission_receipts");
 
     use td_mta::postgres_email_set::deletion;
     let destroy =
         deletion::prepare(binding, input.device(), &[input.source().email], None).unwrap();
-    deletion::publish(request, trust, deadline(), &destroy, password).unwrap();
+    deletion::publish(request, deadline(), &destroy, password).unwrap();
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &capacity, password),
+        submissions::publish(request, deadline(), &capacity, password),
         Err(submissions::Error::Source)
     );
     assert_eq!(
-        submissions::publish(request, trust, deadline(), &first, b"bad").unwrap(),
+        submissions::publish(request, deadline(), &first, b"bad").unwrap(),
         held
     );
     assert_eq!(
@@ -11701,12 +11041,11 @@ fn exercise_submission_publication(
     exercise_dispatch(
         fixture,
         request,
-        trust,
         &relay_binding,
         a.submission,
         &relay_policies,
     );
-    native_relay_connect::exercise(fixture, request, trust, binding.epoch(), a.submission);
+    native_relay_connect::exercise(fixture, request, binding.epoch(), a.submission);
 }
 
 fn exercise_http_submission_owner(
@@ -11728,14 +11067,14 @@ fn exercise_http_submission_owner(
     let loaded = td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
     let clock = RuntimeClock::new();
     let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
@@ -11753,10 +11092,8 @@ fn exercise_http_submission_owner(
     let pending = http::Pending::default();
     let slots = ReadSlots::new(1).unwrap();
     let settlement = ReadSlots::new(1).unwrap();
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let worker = http::Submissions {
         loaded: &loaded,
-        executable,
         binding,
         slots: &slots,
         clock: &clock,
@@ -11822,14 +11159,11 @@ fn exercise_http_submission_owner(
         fixture,
         "DROP TRIGGER delay_http_submission ON td_mta.submission_receipts",
     );
-    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
-        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
-    ));
+    let mut connection = loaded.bootstrap.request();
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let foreground = td_mta::postgres_read::Snapshot::open_runtime(
         &slots,
         &connection,
-        &loaded.trust,
         deadline(),
         binding,
         password,
@@ -11846,7 +11180,7 @@ fn exercise_http_submission_owner(
     );
     assert_eq!(count(), before + 2);
     let settled = pending
-        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .settle(&loaded, &settlement, &clock, until(10_000))
         .unwrap()
         .unwrap();
     assert_eq!(settled.operation, operation);
@@ -11856,7 +11190,7 @@ fn exercise_http_submission_owner(
     assert_eq!(sql(fixture,&format!("SELECT encode(submission_id,'hex') FROM td_mta.submission_receipts WHERE operation=decode('{operation}','hex')")), settled.outcome.submission.to_string());
     drop(foreground);
     assert!(pending
-        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .settle(&loaded, &settlement, &clock, until(10_000))
         .unwrap()
         .is_none());
     // A COMMIT that outlives its deadline and then rolls back: the next
@@ -11898,19 +11232,10 @@ fn exercise_submission_reads(
         sync::QueryType,
     };
     let slots = ReadSlots::new(1).unwrap();
-    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
-        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
-    ));
+    let mut connection = loaded.bootstrap.request();
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
-    let mut view = Snapshot::open_runtime(
-        &slots,
-        &connection,
-        &loaded.trust,
-        deadline(),
-        binding,
-        password,
-    )
-    .unwrap();
+    let mut view =
+        Snapshot::open_runtime(&slots, &connection, deadline(), binding, password).unwrap();
     let query = SubmissionQuery {
         identity: input.identity(),
         after: i64::MIN,
@@ -12251,10 +11576,8 @@ fn exercise_http_filing_owner(
     let slots = ReadSlots::new(1).unwrap();
     let settlement = ReadSlots::new(1).unwrap();
     let pending = Pending::default();
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let worker = Updates {
         loaded,
-        executable,
         binding,
         slots: &slots,
         clock: &clock,
@@ -12313,21 +11636,12 @@ fn exercise_http_filing_owner(
         fixture,
         "DROP TRIGGER delay_http_filing ON td_mta.flag_receipts",
     );
-    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
-        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
-    ));
+    let mut connection = loaded.bootstrap.request();
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
-    let foreground = Snapshot::open_runtime(
-        &slots,
-        &connection,
-        &loaded.trust,
-        deadline(),
-        binding,
-        password,
-    )
-    .unwrap();
+    let foreground =
+        Snapshot::open_runtime(&slots, &connection, deadline(), binding, password).unwrap();
     let settled = pending
-        .settle(loaded, executable, &settlement, &clock, until(10_000))
+        .settle(loaded, &settlement, &clock, until(10_000))
         .unwrap()
         .unwrap();
     assert_eq!(settled.operation, operation);
@@ -12351,7 +11665,6 @@ fn exercise_http_filing_owner(
 fn exercise_success_filing(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     input: &td_mta::postgres_submission_input::Prepared,
     email: td_mta::ids::EmailId,
@@ -12370,7 +11683,7 @@ fn exercise_success_filing(
         deadline(),
     )
     .unwrap();
-    let created = folders::publish(request, trust, deadline(), &creation, password).unwrap();
+    let created = folders::publish(request, deadline(), &creation, password).unwrap();
     let [folders::ResultEntry::Created(sent), folders::ResultEntry::Created(other)] =
         created.results.as_slice()
     else {
@@ -12389,7 +11702,7 @@ fn exercise_success_filing(
         Err(Error::Invalid)
     ));
     assert_eq!(
-        filing::publish(request, trust, deadline(), &patch, b"bad"),
+        filing::publish(request, deadline(), &patch, b"bad"),
         Err(Error::Unauthenticated)
     );
     let state = || {
@@ -12403,13 +11716,10 @@ fn exercise_success_filing(
     let before = state();
     sql(fixture, "CREATE FUNCTION public.reject_filing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refuse filing'; END $$; CREATE TRIGGER reject_filing BEFORE INSERT ON td_mta.flag_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_filing()");
     assert_eq!(
-        filing::publish(request, trust, deadline(), &patch, password),
+        filing::publish(request, deadline(), &patch, password),
         Err(Error::Database)
     );
-    assert_eq!(
-        filing::inspect(request, trust, deadline(), &patch).unwrap(),
-        None
-    );
+    assert_eq!(filing::inspect(request, deadline(), &patch).unwrap(), None);
     assert_eq!(state(), before);
     assert_eq!(memberships(), source.to_string());
     assert_eq!(
@@ -12421,7 +11731,7 @@ fn exercise_success_filing(
         "DROP TRIGGER reject_filing ON td_mta.flag_receipts",
     );
     let missing = make(Some((source, MailboxId::from_bytes([0xee; 16]))));
-    let refused = filing::publish(request, trust, deadline(), &missing, password).unwrap();
+    let refused = filing::publish(request, deadline(), &missing, password).unwrap();
     assert_eq!(refused.results, [UpdateResult::InvalidMailbox]);
     assert_eq!(refused.state.old_sequence, refused.state.new_sequence);
     assert_eq!(state(), before);
@@ -12431,7 +11741,6 @@ fn exercise_success_filing(
     assert_eq!(
         filing::publish(
             request,
-            trust,
             Instant::now() + Duration::from_millis(1500),
             &patch,
             password
@@ -12440,7 +11749,7 @@ fn exercise_success_filing(
     );
     thread::sleep(Duration::from_secs(4));
     sql(fixture, "DROP TRIGGER delay_filing ON td_mta.flag_receipts");
-    let recovered = filing::inspect(request, trust, deadline(), &patch)
+    let recovered = filing::inspect(request, deadline(), &patch)
         .unwrap()
         .unwrap();
     assert_eq!(recovered.results, [UpdateResult::Updated]);
@@ -12453,7 +11762,7 @@ fn exercise_success_filing(
     expected.sort();
     assert_eq!(memberships(), expected.join(","));
     assert_eq!(
-        filing::publish(request, trust, deadline(), &patch, b"bad").unwrap(),
+        filing::publish(request, deadline(), &patch, b"bad").unwrap(),
         recovered
     );
     assert_eq!(
@@ -12466,7 +11775,7 @@ fn exercise_success_filing(
     let before = state();
     let moved = make(Some((source, *sent)));
     assert_eq!(
-        filing::publish(request, trust, deadline(), &moved, password)
+        filing::publish(request, deadline(), &moved, password)
             .unwrap()
             .results,
         [UpdateResult::InvalidMailbox]
@@ -12474,27 +11783,21 @@ fn exercise_success_filing(
     assert_eq!(state(), before);
     assert_eq!(memberships(), expected.join(","));
     let clear = make(None);
-    let cleared = filing::publish(request, trust, deadline(), &clear, password).unwrap();
+    let cleared = filing::publish(request, deadline(), &clear, password).unwrap();
     assert_eq!(cleared.state.new_sequence, cleared.state.old_sequence + 1);
     assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE sequence=decode('{:016x}','hex') AND kind=1", cleared.state.new_sequence)), "2");
-    let no_op = filing::publish(request, trust, deadline(), &make(None), password).unwrap();
+    let no_op = filing::publish(request, deadline(), &make(None), password).unwrap();
     assert_eq!(no_op.state.old_sequence, no_op.state.new_sequence);
     assert_eq!(memberships(), expected.join(","));
     // An existing destination still changes unread counts when draft clears.
     sql(fixture, &format!("INSERT INTO td_mta.memberships SELECT id,decode('{email}','hex'),decode('{source}','hex'),sequence FROM td_mta.accounts WHERE id=decode('{account}','hex'); INSERT INTO td_mta.keywords SELECT id,decode('{email}','hex'),'$draft',sequence FROM td_mta.accounts WHERE id=decode('{account}','hex')"));
-    let existing = filing::publish(
-        request,
-        trust,
-        deadline(),
-        &make(Some((source, *sent))),
-        password,
-    )
-    .unwrap();
+    let existing =
+        filing::publish(request, deadline(), &make(Some((source, *sent))), password).unwrap();
     assert_eq!(memberships(), expected.join(","));
     assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE sequence=decode('{:016x}','hex') AND kind=1", existing.state.new_sequence)), "3");
     // Seen clear-only filing changes Email history but no mailbox counts.
     sql(fixture, &format!("INSERT INTO td_mta.keywords SELECT id,decode('{email}','hex'),keyword,sequence FROM td_mta.accounts CROSS JOIN (VALUES ('$seen'),('$draft')) k(keyword) WHERE id=decode('{account}','hex')"));
-    let seen = filing::publish(request, trust, deadline(), &make(None), password).unwrap();
+    let seen = filing::publish(request, deadline(), &make(None), password).unwrap();
     assert_eq!(seen.state.new_sequence, seen.state.old_sequence + 1);
     assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE sequence=decode('{:016x}','hex') AND kind=1", seen.state.new_sequence)), "0");
     let absent = filing::prepare(
@@ -12505,14 +11808,14 @@ fn exercise_success_filing(
     )
     .unwrap();
     assert_eq!(
-        filing::publish(request, trust, deadline(), &absent, password)
+        filing::publish(request, deadline(), &absent, password)
             .unwrap()
             .results,
         [UpdateResult::NotFound]
     );
     sql(fixture, &format!("UPDATE td_mta.flag_receipts SET request_digest=decode(repeat('00',32),'hex') WHERE operation=decode('{}','hex')", patch.operation()));
     assert_eq!(
-        filing::inspect(request, trust, deadline(), &patch),
+        filing::inspect(request, deadline(), &patch),
         Err(Error::Conflict)
     );
 }
@@ -12520,7 +11823,6 @@ fn exercise_success_filing(
 fn exercise_route_owners(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     relay: &td_mta::postgres_runtime_profile::Binding,
     jmap: &td_mta::postgres_runtime_profile::Binding,
 ) {
@@ -12531,13 +11833,10 @@ fn exercise_route_owners(
         Err(owners::Error::Policy)
     ));
     let first = owners::prepare(relay, boot).unwrap();
-    assert_eq!(
-        owners::inspect(request, trust, deadline(), &first).unwrap(),
-        None
-    );
+    assert_eq!(owners::inspect(request, deadline(), &first).unwrap(), None);
     let (one, two) = thread::scope(|scope| {
-        let one = scope.spawn(|| owners::acquire(request, trust, deadline(), &first));
-        let two = scope.spawn(|| owners::acquire(request, trust, deadline(), &first));
+        let one = scope.spawn(|| owners::acquire(request, deadline(), &first));
+        let two = scope.spawn(|| owners::acquire(request, deadline(), &first));
         (one.join().unwrap().unwrap(), two.join().unwrap().unwrap())
     });
     assert_eq!(one, two);
@@ -12565,7 +11864,7 @@ fn exercise_route_owners(
         thread::sleep(Duration::from_millis(5));
     }
     thread::scope(|scope| {
-        let pending = scope.spawn(|| owners::acquire(request, trust, deadline(), &first));
+        let pending = scope.spawn(|| owners::acquire(request, deadline(), &first));
         let stop = deadline();
         while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock' AND query LIKE 'SELECT generation,version_id FROM td_mta.config_selection%'") != "1" {
             assert!(Instant::now() < stop, "owner replay did not reach barrier");
@@ -12585,17 +11884,17 @@ fn exercise_route_owners(
     );
     let second = owners::prepare(relay, BootId::from_bytes([2; 16])).unwrap();
     assert_eq!(
-        owners::acquire(request, trust, deadline(), &second),
+        owners::acquire(request, deadline(), &second),
         Err(owners::Error::Busy)
     );
     assert_eq!(
-        owners::observe(request, trust, deadline(), &first, one.generation).unwrap(),
+        owners::observe(request, deadline(), &first, one.generation).unwrap(),
         one.expires_at
     );
-    let renewed = owners::renew(request, trust, deadline(), &first, one.generation).unwrap();
+    let renewed = owners::renew(request, deadline(), &first, one.generation).unwrap();
     assert!(renewed >= one.expires_at);
     assert_eq!(
-        owners::observe(request, trust, deadline(), &first, one.generation).unwrap(),
+        owners::observe(request, deadline(), &first, one.generation).unwrap(),
         renewed
     );
     sql(
@@ -12603,14 +11902,11 @@ fn exercise_route_owners(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
     );
     assert_eq!(
-        owners::renew(request, trust, deadline(), &first, one.generation),
+        owners::renew(request, deadline(), &first, one.generation),
         Err(owners::Error::Policy)
     );
-    assert_eq!(
-        owners::acquire(request, trust, deadline(), &first).unwrap(),
-        one
-    );
-    owners::release(request, trust, deadline(), &first, one.generation).unwrap();
+    assert_eq!(owners::acquire(request, deadline(), &first).unwrap(), one);
+    owners::release(request, deadline(), &first, one.generation).unwrap();
     sql(
         fixture,
         &format!(
@@ -12619,17 +11915,17 @@ fn exercise_route_owners(
         ),
     );
     assert_eq!(
-        owners::observe(request, trust, deadline(), &first, one.generation),
+        owners::observe(request, deadline(), &first, one.generation),
         Err(owners::Error::Stale)
     );
-    let next = owners::acquire(request, trust, deadline(), &second).unwrap();
+    let next = owners::acquire(request, deadline(), &second).unwrap();
     assert_eq!(next.generation, 2);
     assert_eq!(
-        owners::renew(request, trust, deadline(), &first, one.generation),
+        owners::renew(request, deadline(), &first, one.generation),
         Err(owners::Error::Stale)
     );
     assert_eq!(
-        owners::release(request, trust, deadline(), &first, one.generation),
+        owners::release(request, deadline(), &first, one.generation),
         Err(owners::Error::Stale)
     );
     let clock = sql(fixture, "SELECT last_clock FROM td_mta.route_owners");
@@ -12638,31 +11934,31 @@ fn exercise_route_owners(
         "UPDATE td_mta.route_owners SET last_clock=last_clock+60000,expires_at=expires_at+60000",
     );
     assert_eq!(
-        owners::renew(request, trust, deadline(), &second, next.generation),
+        owners::renew(request, deadline(), &second, next.generation),
         Err(owners::Error::Clock)
     );
     sql(fixture,&format!("UPDATE td_mta.route_owners SET last_clock={clock},expires_at={clock}+1; SELECT pg_sleep(0.02)"));
     assert_eq!(
-        owners::renew(request, trust, deadline(), &second, next.generation),
+        owners::renew(request, deadline(), &second, next.generation),
         Err(owners::Error::Stale)
     );
     let third = owners::prepare(relay, BootId::from_bytes([3; 16])).unwrap();
-    let takeover = owners::acquire(request, trust, deadline(), &third).unwrap();
+    let takeover = owners::acquire(request, deadline(), &third).unwrap();
     assert_eq!(takeover.generation, 3);
     assert_eq!(
-        owners::release(request, trust, deadline(), &second, next.generation),
+        owners::release(request, deadline(), &second, next.generation),
         Err(owners::Error::Stale)
     );
-    owners::release(request, trust, deadline(), &third, takeover.generation).unwrap();
+    owners::release(request, deadline(), &third, takeover.generation).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_owner() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owner AFTER INSERT ON td_mta.route_owner_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owner()");
     let uncertain = owners::prepare(relay, boot).unwrap();
-    let recovered = route_acquisition::exercise(fixture, request, trust, relay, &first, &uncertain);
+    let recovered = route_acquisition::exercise(fixture, request, relay, &first, &uncertain);
     assert_eq!(recovered.generation, 4);
     assert_eq!(
-        owners::acquire(request, trust, deadline(), &uncertain).unwrap(),
+        owners::acquire(request, deadline(), &uncertain).unwrap(),
         recovered
     );
-    owners::release(request, trust, deadline(), &uncertain, recovered.generation).unwrap();
+    owners::release(request, deadline(), &uncertain, recovered.generation).unwrap();
     sql(
         fixture,
         "DROP TRIGGER delay_owner ON td_mta.route_owner_receipts",
@@ -12673,7 +11969,7 @@ fn exercise_route_owners(
         "UPDATE td_mta.route_owners SET generation=decode(repeat('ff',8),'hex')",
     );
     assert_eq!(
-        owners::acquire(request, trust, deadline(), &pending),
+        owners::acquire(request, deadline(), &pending),
         Err(owners::Error::Capacity)
     );
     sql(
@@ -12682,7 +11978,7 @@ fn exercise_route_owners(
     );
     sql(fixture,"INSERT INTO td_mta.route_owner_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),generation,claimed_at,expires_at FROM (SELECT * FROM td_mta.route_owner_receipts LIMIT 1) r CROSS JOIN generate_series(1,1024) n");
     assert_eq!(
-        owners::acquire(request, trust, deadline(), &pending),
+        owners::acquire(request, deadline(), &pending),
         Err(owners::Error::Capacity)
     );
     // Not a lifetime cap: receipts whose first lease ended over the retention
@@ -12696,8 +11992,7 @@ fn exercise_route_owners(
     sql(fixture,&format!("UPDATE td_mta.route_owner_receipts SET expires_at=t.v,claimed_at=t.v-600000 FROM (SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint-{inside} v) t WHERE request_digest=decode(repeat('00',32),'hex') AND operation=decode(lpad(to_hex(1),32,'0'),'hex')"));
     sql(fixture,&format!("UPDATE td_mta.route_owner_receipts SET claimed_at=claimed_at-{age},expires_at=expires_at-{age} WHERE request_digest=decode(repeat('00',32),'hex') AND operation<>decode(lpad(to_hex(1),32,'0'),'hex'); INSERT INTO td_mta.accounts VALUES(decode(lpad(to_hex(2002),32,'0'),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex')); INSERT INTO td_mta.account_usage VALUES(decode(lpad(to_hex(2002),32,'0'),'hex'),0,0,0,0,0); INSERT INTO td_mta.route_owner_receipts SELECT decode(lpad(to_hex(2002),32,'0'),'hex'),operation,decode(repeat('22',32),'hex'),generation,claimed_at,expires_at FROM td_mta.route_owner_receipts WHERE request_digest=decode(repeat('00',32),'hex') AND operation=decode(lpad(to_hex(2),32,'0'),'hex')"));
     // capacity-inspect already reports only the live receipts.
-    let capacity =
-        td_mta::postgres_capacity::inspect(request, trust, deadline(), relay.epoch()).unwrap();
+    let capacity = td_mta::postgres_capacity::inspect(request, deadline(), relay.epoch()).unwrap();
     let used = capacity
         .get("metrics")
         .unwrap()
@@ -12720,14 +12015,14 @@ fn exercise_route_owners(
             &format!("SELECT count(*) FROM td_mta.route_owner_receipts WHERE account=decode('{}','hex') AND (request_digest<>decode(repeat('00',32),'hex') OR operation=decode(lpad(to_hex(1),32,'0'),'hex'))", relay.account())
         )
     );
-    let last = owners::acquire(request, trust, deadline(), &pending).unwrap();
+    let last = owners::acquire(request, deadline(), &pending).unwrap();
     assert_eq!(
         sql(fixture, "SELECT count(*) FILTER (WHERE request_digest=decode(repeat('00',32),'hex')),count(*) FILTER (WHERE request_digest=decode(repeat('22',32),'hex')) FROM td_mta.route_owner_receipts"),
         "1|1"
     );
     sql(fixture,"DELETE FROM td_mta.route_owner_receipts WHERE request_digest IN (decode(repeat('00',32),'hex'),decode(repeat('22',32),'hex')); DELETE FROM td_mta.account_usage WHERE account=decode(lpad(to_hex(2002),32,'0'),'hex'); DELETE FROM td_mta.accounts WHERE id=decode(lpad(to_hex(2002),32,'0'),'hex')");
     assert_eq!(last.generation, 5);
-    owners::release(request, trust, deadline(), &pending, last.generation).unwrap();
+    owners::release(request, deadline(), &pending, last.generation).unwrap();
     assert_eq!(
         sql(fixture, "SELECT count(*) FROM td_mta.route_owners"),
         "1"
@@ -12770,30 +12065,22 @@ mod submission_retention;
 fn exercise_dispatch(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     submission: td_mta::ids::SubmissionId,
     policies: &relay_wire::Policies,
 ) {
     use td_mta::{ids::BootId, postgres_attempts as attempts, postgres_route_owners as owners};
     let claim = owners::prepare(binding, BootId::from_bytes([9; 16])).unwrap();
-    let owner = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    let owner = owners::acquire(request, deadline(), &claim).unwrap();
     let value = attempts::prepare(&claim, owner.generation, submission).unwrap();
-    attempt_clock::exercise(
-        fixture,
-        request,
-        trust,
-        &claim,
-        owner.generation,
-        submission,
-    );
+    attempt_clock::exercise(fixture, request, &claim, owner.generation, submission);
     let bad = attempts::prepare(&claim, owner.generation + 1, submission).unwrap();
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &bad),
+        attempt_clock::publish(fixture, request, deadline(), &bad),
         Err(attempts::Error::Owner(owners::Error::Stale))
     );
     assert_eq!(
-        attempts::inspect(request, trust, deadline(), &value).unwrap(),
+        attempts::inspect(request, deadline(), &value).unwrap(),
         None
     );
     let before = sql(
@@ -12805,7 +12092,7 @@ fn exercise_dispatch(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
     );
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, deadline(), &value),
         Err(attempts::Error::Policy)
     );
     sql(
@@ -12818,17 +12105,17 @@ fn exercise_dispatch(
     let destination = sql(fixture, &format!("SELECT encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{submission}','hex')"));
     sql(fixture, &format!("UPDATE td_mta.submission_routes SET destination=decode(repeat('00',32),'hex') WHERE submission_id=decode('{submission}','hex')"));
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, deadline(), &value),
         Err(attempts::Error::Missing)
     );
     sql(fixture, &format!("UPDATE td_mta.submission_routes SET destination=decode('{destination}','hex') WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.recipients SET next_attempt_at=next_attempt_at+86400000 WHERE submission_id=decode('{submission}','hex')"));
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, deadline(), &value),
         Err(attempts::Error::NotDue)
     );
     sql(fixture, &format!("UPDATE td_mta.recipients SET next_attempt_at=next_attempt_at-86400000,uncertain=1 WHERE submission_id=decode('{submission}','hex')"));
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, deadline(), &value),
         Err(attempts::Error::Integrity)
     );
     sql(fixture, &format!("UPDATE td_mta.recipients SET uncertain=0 WHERE submission_id=decode('{submission}','hex')"));
@@ -12836,7 +12123,7 @@ fn exercise_dispatch(
     sql(fixture, &format!("INSERT INTO td_mta.recipients(account,submission_id,ordinal,address,state,uncertain,attempt_count,phase,next_attempt_at,reason,diagnostic,changed) SELECT account,submission_id,n,'recipient'||n||'@example.test',state,uncertain,attempt_count,phase,next_attempt_at,reason,diagnostic,changed FROM td_mta.recipients CROSS JOIN generate_series(2,999) n WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.submissions SET recipient_count=1000 WHERE id=decode('{submission}','hex')"));
     sql(fixture, "CREATE FUNCTION public.reject_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_attempt BEFORE INSERT ON td_mta.submission_attempts FOR EACH ROW EXECUTE FUNCTION public.reject_attempt()");
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, deadline(), &value),
         Err(attempts::Error::Database)
     );
     assert_eq!(
@@ -12856,19 +12143,18 @@ fn exercise_dispatch(
         attempt_clock::publish(
             fixture,
             request,
-            trust,
             Instant::now() + Duration::from_millis(1500),
             &value
         ),
         Err(attempts::Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
-    let outcome = attempts::inspect(request, trust, deadline(), &value)
+    let outcome = attempts::inspect(request, deadline(), &value)
         .unwrap()
         .unwrap();
     assert_eq!(outcome.ordinals, (0..100).collect::<Vec<_>>());
     assert_eq!(outcome.new_sequence, outcome.old_sequence + 1);
-    attempt_clock::replay(fixture, request, trust, &value, &outcome);
+    attempt_clock::replay(fixture, request, &value, &outcome);
     assert_eq!(outcome.attempt, value.attempt());
     assert_eq!(outcome.submission, submission);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND state=2 AND phase=1 AND attempt_count=1 AND next_attempt_at IS NULL AND attempt_id=decode('{}','hex')",value.attempt())),"100");
@@ -12878,15 +12164,14 @@ fn exercise_dispatch(
         td_mta::postgres_attempt_recovery::prepare(&claim, owner.generation, value.attempt())
             .unwrap();
     assert_eq!(
-        td_mta::postgres_attempt_recovery::publish(request, trust, deadline(), &current_recovery),
+        td_mta::postgres_attempt_recovery::publish(request, deadline(), &current_recovery),
         Err(td_mta::postgres_attempt_recovery::Error::CurrentOwner)
     );
-    owners::renew(request, trust, deadline(), &claim, owner.generation).unwrap();
-    envelope_checks::exercise(fixture, request, trust, &value);
+    owners::renew(request, deadline(), &claim, owner.generation).unwrap();
+    envelope_checks::exercise(fixture, request, &value);
     attempt_phases::exercise(
         fixture,
         request,
-        trust,
         binding,
         &claim,
         owner.generation,
@@ -12894,21 +12179,20 @@ fn exercise_dispatch(
     );
     let other = attempts::prepare(&claim, owner.generation, submission).unwrap();
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &other),
+        attempt_clock::publish(fixture, request, deadline(), &other),
         Err(attempts::Error::Busy)
     );
-    owners::release(request, trust, deadline(), &claim, owner.generation).unwrap();
+    owners::release(request, deadline(), &claim, owner.generation).unwrap();
     let replacement = owners::prepare(binding, BootId::from_bytes([10; 16])).unwrap();
-    let replacement_owner = owners::acquire(request, trust, deadline(), &replacement).unwrap();
+    let replacement_owner = owners::acquire(request, deadline(), &replacement).unwrap();
     let replacement_attempt =
         attempts::prepare(&replacement, replacement_owner.generation, submission).unwrap();
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &replacement_attempt),
+        attempt_clock::publish(fixture, request, deadline(), &replacement_attempt),
         Err(attempts::Error::Busy)
     );
     owners::release(
         request,
-        trust,
         deadline(),
         &replacement,
         replacement_owner.generation,
@@ -12919,14 +12203,13 @@ fn exercise_dispatch(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
     );
     assert_eq!(
-        attempt_clock::publish(fixture, request, trust, deadline(), &value).unwrap(),
+        attempt_clock::publish(fixture, request, deadline(), &value).unwrap(),
         outcome
     );
     sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex'); DROP TRIGGER delay_attempt ON td_mta.submission_attempts",binding.selection().generation));
     exercise_attempt_recovery(
         fixture,
         request,
-        trust,
         binding,
         submission,
         value.attempt(),
@@ -12937,7 +12220,6 @@ fn exercise_dispatch(
 fn exercise_attempt_recovery(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     submission: td_mta::ids::SubmissionId,
     attempt: td_mta::ids::AttemptId,
@@ -12947,19 +12229,18 @@ fn exercise_attempt_recovery(
         ids::BootId, postgres_attempt_recovery as recovery, postgres_route_owners as owners,
     };
     let claim = owners::prepare(binding, BootId::from_bytes([11; 16])).unwrap();
-    let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    let grant = owners::acquire(request, deadline(), &claim).unwrap();
     let value = recovery::prepare(&claim, grant.generation, attempt).unwrap();
     assert_eq!(
         recovery::publish(
             request,
-            trust,
             deadline(),
             &recovery::interrupted(&claim, grant.generation, attempt).unwrap()
         ),
         Err(recovery::Error::StaleAttempt)
     );
     assert_eq!(
-        recovery::inspect(request, trust, deadline(), &value).unwrap(),
+        recovery::inspect(request, deadline(), &value).unwrap(),
         None
     );
     // Independently seed all recovery phase cases after phase-publication checks.
@@ -12972,7 +12253,7 @@ fn exercise_attempt_recovery(
     );
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+1000 WHERE id=decode('{submission}','hex')"));
     expiry_wait_snapshot(fixture, || {
-        recovery::publish(request, trust, deadline(), &value).unwrap();
+        recovery::publish(request, deadline(), &value).unwrap();
     });
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at={expiry} WHERE id=decode('{submission}','hex')"));
     let before = sql(
@@ -12981,7 +12262,7 @@ fn exercise_attempt_recovery(
     );
     sql(fixture,"CREATE FUNCTION public.reject_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_recovery BEFORE INSERT ON td_mta.attempt_recovery_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_recovery()");
     assert_eq!(
-        recovery::publish(request, trust, deadline(), &value),
+        recovery::publish(request, deadline(), &value),
         Err(recovery::Error::Database)
     );
     assert_eq!(
@@ -13016,14 +12297,13 @@ fn exercise_attempt_recovery(
     assert_eq!(
         recovery::publish(
             request,
-            trust,
             Instant::now() + Duration::from_millis(1500),
             &value
         ),
         Err(recovery::Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
-    let outcome = recovery::inspect(request, trust, deadline(), &value)
+    let outcome = recovery::inspect(request, deadline(), &value)
         .unwrap()
         .unwrap();
     let clock_after: i64 = sql(
@@ -13058,17 +12338,16 @@ fn exercise_attempt_recovery(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
     );
     assert_eq!(
-        recovery::publish(request, trust, deadline(), &value).unwrap(),
+        recovery::publish(request, deadline(), &value).unwrap(),
         outcome
     );
     sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex'); DROP TRIGGER delay_recovery ON td_mta.attempt_recovery_receipts",binding.selection().generation));
     let next = td_mta::postgres_attempts::prepare(&claim, grant.generation, submission).unwrap();
-    let next = attempt_clock::publish(fixture, request, trust, deadline(), &next).unwrap();
+    let next = attempt_clock::publish(fixture, request, deadline(), &next).unwrap();
     assert_eq!(next.ordinals, (100..200).collect::<Vec<_>>());
     attempt_acceptance::exercise(
         fixture,
         request,
-        trust,
         &claim,
         grant.generation,
         submission,
@@ -13077,19 +12356,18 @@ fn exercise_attempt_recovery(
     route_health::exercise(
         fixture,
         request,
-        trust,
         &claim,
         binding,
         grant.generation,
         submission,
     );
-    route_repair::exercise(fixture, request, trust, binding, submission);
-    route_success::exercise(fixture, request, trust, binding, submission);
-    submission_cancel::exercise(fixture, request, trust, binding, submission, policies);
-    submission_retention::exercise(fixture, request, trust, binding, submission);
-    attempt_reclamation::exercise(fixture, request, trust, binding, submission);
-    failure_notice::exercise(fixture, request, trust, binding, submission);
-    route_retirement::exercise(fixture, request, trust, binding, submission);
+    route_repair::exercise(fixture, request, binding, submission);
+    route_success::exercise(fixture, request, binding, submission);
+    submission_cancel::exercise(fixture, request, binding, submission, policies);
+    submission_retention::exercise(fixture, request, binding, submission);
+    attempt_reclamation::exercise(fixture, request, binding, submission);
+    failure_notice::exercise(fixture, request, binding, submission);
+    route_retirement::exercise(fixture, request, binding, submission);
 }
 
 fn exercise_submission_query_dispatch(
@@ -13306,10 +12584,7 @@ fn exercise_submission_set_dispatch(
     let pending = sending::Pending::default();
     let draft_pending = td_mta::postgres_http_drafts::Pending::default();
     let filing_pending = filing::Pending::default();
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
-    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
-        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
-    ));
+    let mut connection = loaded.bootstrap.request();
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let mut buffer = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let account = td_mta::wire::encode_id(binding.account(), &mut buffer)
@@ -13322,15 +12597,8 @@ fn exercise_submission_set_dispatch(
         .unwrap()
         .to_owned();
     for (refused, batch) in [(false, false), (true, false), (false, true), (true, true)] {
-        let snapshot = Snapshot::open_runtime(
-            &slots,
-            &connection,
-            &loaded.trust,
-            deadline(),
-            binding,
-            password,
-        )
-        .unwrap();
+        let snapshot =
+            Snapshot::open_runtime(&slots, &connection, deadline(), binding, password).unwrap();
         let view = snapshot.identity();
         let state = DataState {
             account: view.account,
@@ -13444,7 +12712,6 @@ fn exercise_submission_set_dispatch(
         while !preflight.step(&mut [0; 4096]).unwrap() {}
         let creator = sending::Submissions {
             loaded,
-            executable,
             binding,
             slots: &slots,
             clock: &clock,
@@ -13453,7 +12720,6 @@ fn exercise_submission_set_dispatch(
         };
         let filer = filing::Updates {
             loaded,
-            executable,
             binding,
             slots: &slots,
             clock: &clock,
@@ -13470,7 +12736,6 @@ fn exercise_submission_set_dispatch(
         };
         let drafts = td_mta::postgres_http_drafts::Drafts {
             loaded,
-            executable,
             binding,
             slots: &slots,
             clock: &clock,
@@ -13546,7 +12811,6 @@ fn exercise_submission_set_dispatch(
 fn exercise_http_upload_owner(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
@@ -13559,20 +12823,19 @@ fn exercise_http_upload_owner(
     };
     let creation =
         devices::prepare_creation(binding.epoch(), binding.account(), "upload owner", 1).unwrap();
-    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    devices::publish_creation(request, deadline(), &creation).unwrap();
     let loaded = td_mta::postgres_input::Loaded {
         bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
             &format!(
-                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                "postgresql://mail_runtime:{}@:{}/postgres?host={}",
                 std::str::from_utf8(PASSWORD).unwrap(),
-                fixture.port
+                fixture.port,
+                fixture.root.display()
             ),
             binding.profile(),
         )
         .unwrap(),
-        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
     };
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let clock = RuntimeClock::new();
     let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
     let meter = || {
@@ -13591,7 +12854,6 @@ fn exercise_http_upload_owner(
     let pending = owner::Pending::default();
     let worker = owner::Uploads {
         loaded: &loaded,
-        executable,
         binding,
         slots: &slots,
         clock: &clock,
@@ -13640,21 +12902,18 @@ fn exercise_http_upload_owner(
         fixture,
         "DROP TRIGGER delay_owned_upload ON td_mta.upload_receipts",
     );
-    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
-        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
-    ));
+    let mut connection = loaded.bootstrap.request();
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let foreground = Snapshot::open_runtime(
         &slots,
         &connection,
-        &loaded.trust,
         deadline(),
         binding,
         creation.password(),
     )
     .unwrap();
     let settled = pending
-        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .settle(&loaded, &settlement, &clock, until(10_000))
         .unwrap()
         .unwrap();
     assert_eq!(settled.operation, operation);
@@ -13697,7 +12956,7 @@ fn exercise_http_upload_owner(
     let absent = pending.operation().unwrap().unwrap();
     // The COMMIT ended in rollback: absence at its endpoint releases the owner.
     assert!(pending
-        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .settle(&loaded, &settlement, &clock, until(10_000))
         .unwrap()
         .is_none());
     assert_eq!(pending.operation().unwrap(), None);
@@ -13722,7 +12981,7 @@ fn exercise_http_upload_owner(
     let revoked =
         devices::prepare_revocation(binding.epoch(), binding.account(), creation.device_id(), 2)
             .unwrap();
-    devices::publish_revocation(request, trust, deadline(), &revoked).unwrap();
+    devices::publish_revocation(request, deadline(), &revoked).unwrap();
     let fresh = owner::Pending::default();
     let worker = owner::Uploads {
         pending: &fresh,
@@ -13759,11 +13018,9 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
     let clock = Arc::new(RuntimeClock::new());
     let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
     let slots = ReadSlots::new(1).unwrap();
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let storage = Backend::new(
         Receiving {
             loaded: &loaded,
-            executable,
             binding,
             additional: &[],
             slots: &slots,
@@ -14045,7 +13302,6 @@ fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_p
     storage.close().unwrap();
     Receiving {
         loaded: &loaded,
-        executable,
         binding,
         additional: &[],
         slots: &slots,
@@ -14067,7 +13323,6 @@ fn exercise_smtp_receiving_owner(
         postgres_receiving as changes, postgres_smtp_receiving as owner,
     };
     let loaded = receiving_input(fixture, binding.profile());
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let clock = RuntimeClock::new();
     let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
     let meter = || {
@@ -14084,7 +13339,6 @@ fn exercise_smtp_receiving_owner(
     let slots = ReadSlots::new(1).unwrap();
     let worker = owner::Receiving {
         loaded: &loaded,
-        executable,
         binding,
         additional: &[],
         slots: &slots,

@@ -51,8 +51,8 @@ gate must reject other direct or transitive consumers; the engine workspace
 and other std-only roster crates cannot inherit its external closure.
 
 td-mta's PostgreSQL client is the local `td-postgres`, whose SCRAM uses
-td-primitives and which carries no TLS: td-mta hands it a connector over
-this crate's session. It does not widen this crate's API or TLS provider.
+td-primitives. It reaches the database only over a Unix socket, carries
+no TLS and uses nothing from this crate.
 No other roster consumer is admitted.
 
 The common offline vendor uses the mail lock, checking every archive
@@ -746,9 +746,8 @@ never load keys through with_single_cert or equivalent APIs.
 ### Outbound configuration and shared clock
 
 `ClientConfig::new` constructs one immutable outbound configuration from an
-admitted TrustStore, shared ClockHandle and TlsProtocol (Http1, Smtp or
-client-only Postgres). Its
-public API contains no backend types. Construction checks time once, copies
+admitted TrustStore, shared ClockHandle and TlsProtocol (Http1 or Smtp).
+Its public API contains no backend types. Construction checks time once, copies
 exactly the supplied anchors into the private verifier, and publishes no
 configuration on failure. An explicit private store completely replaces the
 public roots. There is no client identity, OS trust read, system-clock read,
@@ -757,8 +756,7 @@ alone authenticates no peer and exposes no session operations.
 
 The configuration uses the explicit algorithm provider, TLS 1.3 followed by
 1.2, mandatory TLS 1.2 EMS, outbound SNI and selected-ALPN checking. Http1
-supplies only http/1.1; Smtp and Postgres supply no ALPN. Postgres follows
-the classic SSLRequest upgrade, not direct TLS. Client resumption, early data,
+supplies only http/1.1; Smtp supplies no ALPN. Client resumption, early data,
 key logging, secret extraction, ticket requests and both certificate
 compression lists/cache are explicitly disabled. The non-ECH builder path
 is used. The pinned fragmenter subtracts five header bytes from its explicit
@@ -889,8 +887,7 @@ Set the explicit TLS versions/provider, server cipher-order preference, TLS
 1.2 EMS and 16384-byte plaintext fragment limit. Disable session storage,
 stateless tickets, initial and requested TLS 1.3 tickets, early and half-RTT
 data, key logging, secret extraction, certificate compression lists/cache.
-Http1 selects only http/1.1, accepting absence; Smtp selects no ALPN.
-ServerConfig refuses the client-only Postgres selector. Native
+Http1 selects only http/1.1, accepting absence; Smtp selects no ALPN. Native
 configuration/verifier/ticket/routing types remain private and their Debug
 output discloses no keys, certificate bytes, names or callback state.
 

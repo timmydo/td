@@ -27,7 +27,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use td_crypto::{Entropy, SystemEntropy, TrustStore};
+use td_crypto::{Entropy, SystemEntropy};
 
 mod multi;
 
@@ -193,7 +193,6 @@ impl QueueControl {
 pub struct Worker<'a, 'r> {
     pub queue: &'a QueueControl,
     pub request: &'a Request<'r>,
-    pub trust: &'a TrustStore,
     pub profile: &'a PublishedProfile,
     pub clock: Arc<RuntimeClock>,
     pub handshakes: &'a HandshakePool,
@@ -272,7 +271,6 @@ impl Worker<'_, '_> {
             let _slot = database(worker.connection.slots.acquire())?;
             let notice = crate::postgres_failure_notice::publish_next(
                 self.request,
-                self.trust,
                 Instant::now() + Duration::from_secs(5),
                 claim,
                 generation,
@@ -288,7 +286,6 @@ impl Worker<'_, '_> {
                 // Serialize behind COMMIT or rollback before short-lock reads.
                 database(owners::renew(
                     self.request,
-                    self.trust,
                     Instant::now() + Duration::from_secs(10),
                     claim,
                     generation,
@@ -300,7 +297,6 @@ impl Worker<'_, '_> {
             state.active = true;
             let needed = database(crate::postgres_route_repair::needed(
                 self.request,
-                self.trust,
                 Instant::now() + Duration::from_secs(10),
                 claim,
                 generation,
@@ -311,7 +307,6 @@ impl Worker<'_, '_> {
                     control,
                     || match crate::postgres_route_repair::publish(
                         self.request,
-                        self.trust,
                         Instant::now() + Duration::from_secs(10),
                         &value,
                     ) {
@@ -324,7 +319,6 @@ impl Worker<'_, '_> {
                     || {
                         crate::postgres_route_repair::inspect(
                             self.request,
-                            self.trust,
                             Instant::now() + Duration::from_secs(10),
                             &value,
                         )
@@ -377,7 +371,6 @@ impl Worker<'_, '_> {
         // Includes a Prepared commit whose response/deadline was lost locally.
         if let Some((id, prior)) = database(recovery::active(
             self.request,
-            self.trust,
             Instant::now() + Duration::from_secs(10),
             claim,
             generation,
@@ -488,15 +481,8 @@ impl Worker<'_, '_> {
         let (wait, failed) = match worker.connection.slots.acquire() {
             Ok(_slot) => state.retention.run(
                 |step| {
-                    step.run(
-                        self.request,
-                        self.trust,
-                        deadline,
-                        claim,
-                        generation,
-                        observed_at,
-                    )
-                    .ok()
+                    step.run(self.request, deadline, claim, generation, observed_at)
+                        .ok()
                 },
                 || deadline.saturating_duration_since(Instant::now()) >= RETENTION_STEP_MINIMUM,
             ),
@@ -513,7 +499,6 @@ impl Worker<'_, '_> {
             // Serialize behind COMMIT or rollback before short-lock reads.
             database(owners::renew(
                 self.request,
-                self.trust,
                 Instant::now() + Duration::from_secs(10),
                 claim,
                 generation,
@@ -550,7 +535,6 @@ impl Worker<'_, '_> {
             || {
                 crate::postgres_route_success::publish(
                     self.request,
-                    self.trust,
                     Instant::now() + Duration::from_secs(10),
                     &value,
                 )
@@ -558,7 +542,6 @@ impl Worker<'_, '_> {
             || {
                 crate::postgres_route_success::inspect(
                     self.request,
-                    self.trust,
                     Instant::now() + Duration::from_secs(10),
                     &value,
                 )
@@ -764,7 +747,6 @@ fn settle(worker: &Dispatches<'_, '_>, slots: &ReadSlots, control: &Control) -> 
         slots,
         ..Connection {
             request: worker.connection.request,
-            trust: worker.connection.trust,
             slots: worker.connection.slots,
             clock: worker.connection.clock.clone(),
         }

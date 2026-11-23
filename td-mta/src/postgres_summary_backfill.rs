@@ -12,7 +12,6 @@ use std::{
     },
     time::Instant,
 };
-use td_crypto::TrustStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -44,7 +43,6 @@ pub struct Report {
 /// publishable only after known COMMIT; replay replaces identical derived data.
 pub fn run(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
@@ -53,7 +51,6 @@ pub fn run(
 ) -> Result<Report, Error> {
     run_with_options(
         request,
-        trust,
         deadline,
         epoch,
         account,
@@ -76,7 +73,6 @@ pub struct Options {
 
 pub fn run_with_options(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
@@ -249,9 +245,9 @@ pub fn run_with_options(
         Ok(report)
     };
     let result = if search {
-        postgres_probe::with_search_backfill_worker(request, trust, deadline, operation)
+        postgres_probe::with_search_backfill_worker(request, deadline, operation)
     } else {
-        postgres_probe::with_body_worker(request, trust, deadline, operation)
+        postgres_probe::with_body_worker(request, deadline, operation)
     };
     match result {
         Ok(result) => result,

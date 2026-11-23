@@ -8,7 +8,6 @@ use crate::{
     postgres_schema,
 };
 use std::{sync::Mutex, time::Instant};
-use td_crypto::TrustStore;
 
 #[path = "postgres_metadata_view.rs"]
 mod view;
@@ -29,7 +28,6 @@ pub enum Error {
 /// body bytes nor grants device, serving, delivery or restore authority.
 pub fn inspect(
     request: &Request<'_>,
-    trust: &TrustStore,
     deadline: Instant,
     epoch: StoreEpoch,
     account: AccountId,
@@ -37,7 +35,7 @@ pub fn inspect(
     limits: Limits,
 ) -> Result<CompleteMetadata, Error> {
     let budget = postgres_probe::AuditBudget::new(limits, 0, 0).map_err(Error::Connection)?;
-    let result = postgres_probe::with_audit_worker(request, trust, deadline, budget, |worker| {
+    let result = postgres_probe::with_audit_worker(request, deadline, budget, |worker| {
         let report = audit(worker, epoch, account, utc_ms, limits)?;
         worker
             .run(|client| client.rollback())

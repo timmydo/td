@@ -277,8 +277,8 @@ root's bison, flex and perl write its parser, scanner and catalog files
 during the build, as they do the kernel's; what they write is source the
 root's GCC compiles, never a runtime input. It links td zlib and no TLS
 library, since td builds none in C: a td-built server offers td-mta its
-Unix socket alone, as td-mta refuses a network connection without
-verified TLS (`td-mta/POSTGRES.md` §1). No image holds it yet; the
+Unix socket alone, the only transport td-mta uses for its database
+(`td-mta/POSTGRES.md` §1). No image holds it yet; the
 production mail host runs it from a td store of its own (next section).
 
 Changing the root's packages is a reviewed lock change.

@@ -42,10 +42,10 @@ pub(super) fn exercise(
     fs::write(
         &connection,
         format!(
-            "postgresql://mail_runtime:{}@localhost:{}/postgres?sslrootcert={}\n",
+            "postgresql://mail_runtime:{}@:{}/postgres?host={}\n",
             std::str::from_utf8(PASSWORD).unwrap(),
             fixture.port,
-            ca.display()
+            fixture.root.display()
         ),
     )
     .unwrap();
@@ -226,15 +226,13 @@ pub(super) fn exercise(
         "0|0"
     );
     assert_eq!(relay.accepted.load(std::sync::atomic::Ordering::Acquire), 0);
-    let trust = td_crypto::TrustStore::from_pem(&fixture.ca).unwrap();
-    let epoch = td_mta::postgres_schema::inspect(&fixture.request(), &trust, deadline())
+    let epoch = td_mta::postgres_schema::inspect(&fixture.request(), deadline())
         .unwrap()
         .store_epoch;
     let account = td_mta::ids::AccountId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     let device =
         td_mta::postgres_devices::prepare_creation(epoch, account, "process client", 1).unwrap();
-    td_mta::postgres_devices::publish_creation(&fixture.request(), &trust, deadline(), &device)
-        .unwrap();
+    td_mta::postgres_devices::publish_creation(&fixture.request(), deadline(), &device).unwrap();
     let credentials = [b"user:".as_slice(), device.password()].concat();
     let encoded = certificate::pem("BASIC", &credentials);
     let encoded = std::str::from_utf8(&encoded)
@@ -788,10 +786,9 @@ pub(super) fn exercise(
     // A repaired configuration alone leaves the TLS latch; the named local
     // operation must explicitly release it under the new selected generation.
     let request = fixture.request();
-    let (selected, candidate) =
-        td_mta::postgres_selection::read(&request, &trust, deadline(), epoch)
-            .unwrap()
-            .unwrap();
+    let (selected, candidate) = td_mta::postgres_selection::read(&request, deadline(), epoch)
+        .unwrap()
+        .unwrap();
     let generation = selected
         .generation
         .to_be_bytes()
@@ -814,17 +811,10 @@ pub(super) fn exercise(
     };
     let desktop_before = desktop_generations();
     let version = td_mta::postgres_configuration_store::Version::from_bytes([240; 16]);
-    td_mta::postgres_configuration_store::publish(
-        &request,
-        &trust,
-        deadline(),
-        version,
-        &candidate,
-    )
-    .unwrap();
+    td_mta::postgres_configuration_store::publish(&request, deadline(), version, &candidate)
+        .unwrap();
     td_mta::postgres_selection::publish(
         &request,
-        &trust,
         deadline(),
         td_mta::postgres_selection::prepare(epoch, selected.generation, version, &candidate)
             .unwrap(),
@@ -999,8 +989,7 @@ pub(super) fn exercise(
     let revoke =
         td_mta::postgres_devices::prepare_revocation(epoch, account, device.device_id(), 2)
             .unwrap();
-    td_mta::postgres_devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke)
-        .unwrap();
+    td_mta::postgres_devices::publish_revocation(&fixture.request(), deadline(), &revoke).unwrap();
     assert!(query(https_address, &renewed_ca).starts_with("HTTP/1.1 401"));
     let mut tail = Vec::new();
     if let Err(error) = events.read_to_end(&mut tail) {
@@ -1039,7 +1028,6 @@ pub(super) fn exercise(
     .unwrap();
     td_mta::postgres_account_audit::inspect(
         &fixture.request(),
-        &trust,
         deadline(),
         epoch,
         account,
@@ -1114,8 +1102,8 @@ fn replica_source_reads(
         },
     };
     let client = || td_mta::outbound_http::Client {
-        executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
         origin: &origin,
+        executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
         trust: &trust,
         deadline: std::time::Instant::now() + Duration::from_secs(60),
     };

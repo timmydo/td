@@ -2,7 +2,6 @@ use super::{deadline, sql, Fixture};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -110,21 +109,9 @@ fn exercise_mode(fixture: &Fixture, context: &Context<'_>, frontend: bool) {
     );
     assert_eq!(pending.operation().unwrap(), None);
     reset();
-    let mut connection = context
-        .loaded
-        .bootstrap
-        .request(td_mta::postgres_probe::Endpoint::Tcp(
-            ([127, 0, 0, 1], context.loaded.bootstrap.port()).into(),
-        ));
+    let mut connection = context.loaded.bootstrap.request();
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
-    owners::renew(
-        &connection,
-        &context.loaded.trust,
-        deadline(),
-        context.claim,
-        context.generation,
-    )
-    .unwrap();
+    owners::renew(&connection, deadline(), context.claim, context.generation).unwrap();
     sql(fixture, "CREATE CONSTRAINT TRIGGER delay_jmap_cancel AFTER INSERT ON td_mta.submission_cancel_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_cancel()");
     let lost = run(context, &pending, Patch::Valid, 2000, frontend);
     assert_eq!(lost.json["methodResponses"][0][0].as_str(), Some("error"));
@@ -142,13 +129,7 @@ fn exercise_mode(fixture: &Fixture, context: &Context<'_>, frontend: bool) {
     let clock = RuntimeClock::new();
     let until = Deadline::after(clock.sample().unwrap().monotonic, 5000).unwrap();
     let settled = pending
-        .settle(
-            context.loaded,
-            Path::new(env!("CARGO_BIN_EXE_td-mta")),
-            &ReadSlots::new(1).unwrap(),
-            &clock,
-            until,
-        )
+        .settle(context.loaded, &ReadSlots::new(1).unwrap(), &clock, until)
         .unwrap()
         .unwrap();
     assert_eq!(settled.operation, operation);
@@ -160,14 +141,7 @@ fn exercise_mode(fixture: &Fixture, context: &Context<'_>, frontend: bool) {
     assert_eq!(settled.outcome.changed, 1000);
     assert_eq!(pending.operation().unwrap(), None);
     reset();
-    owners::renew(
-        &connection,
-        &context.loaded.trust,
-        deadline(),
-        context.claim,
-        context.generation,
-    )
-    .unwrap();
+    owners::renew(&connection, deadline(), context.claim, context.generation).unwrap();
 }
 fn assert_updated(response: &Response, submission: SubmissionId, advance: u64) {
     let methods = response.json["methodResponses"].as_array().unwrap();
@@ -206,17 +180,11 @@ fn run(
     frontend: bool,
 ) -> Response {
     let slots = ReadSlots::new(1).unwrap();
-    let mut connection = context
-        .loaded
-        .bootstrap
-        .request(td_mta::postgres_probe::Endpoint::Tcp(
-            ([127, 0, 0, 1], context.loaded.bootstrap.port()).into(),
-        ));
+    let mut connection = context.loaded.bootstrap.request();
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let snapshot = Snapshot::open_runtime(
         &slots,
         &connection,
-        &context.loaded.trust,
         deadline(),
         context.binding,
         context.password,
@@ -300,11 +268,9 @@ fn run(
     let retention = owner.retain_response(until).unwrap();
     let mut preflight = response::Preflight::new(request, "session", retention.maximum()).unwrap();
     while !preflight.step(&mut [0; 4096]).unwrap() {}
-    let executable = Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let other = filing::Pending::default();
     let creator = sending::Submissions {
         loaded: context.loaded,
-        executable,
         binding: context.binding,
         slots: &slots,
         clock: &clock,
@@ -313,7 +279,6 @@ fn run(
     };
     let filer = filing::Updates {
         loaded: context.loaded,
-        executable,
         binding: context.binding,
         slots: &slots,
         clock: &clock,
@@ -322,7 +287,6 @@ fn run(
     };
     let worker = canceling::Cancellations {
         loaded: context.loaded,
-        executable,
         binding: context.binding,
         slots: &slots,
         clock: &clock,

@@ -3,7 +3,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
 use td_mta::{
     ids::SubmissionId,
     postgres_attempt_phases as phases, postgres_attempts as attempts,
@@ -14,7 +13,6 @@ use td_mta::{
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
-    trust: &TrustStore,
     claim: &Claim,
     generation: u64,
     submission: SubmissionId,
@@ -22,11 +20,10 @@ pub(super) fn exercise(
     for case in 0..4 {
         // Seed independent fresh attempts for both command stages and classes.
         sql(fixture,&format!("UPDATE td_mta.recipients SET state=1,phase=0,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.submissions SET completed_at=NULL,notification=0,expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex')"));
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         let attempt = super::attempt_clock::publish(
             fixture,
             request,
-            trust,
             deadline(),
             &attempts::prepare(claim, generation, submission).unwrap(),
         )
@@ -84,20 +81,20 @@ pub(super) fn exercise(
         let value = prepare(generation, &reply).unwrap();
         let stale = prepare(generation + 1, &reply).unwrap();
         assert_eq!(
-            phases::publish(request, trust, deadline(), &stale),
+            phases::publish(request, deadline(), &stale),
             Err(phases::Error::Owner(owners::Error::Stale))
         );
         let partial =
             phases::refused_mail(claim, generation, attempt.attempt, &[0], &reply).unwrap();
         assert_eq!(
-            phases::publish(request, trust, deadline(), &partial),
+            phases::publish(request, deadline(), &partial),
             Err(phases::Error::Conflict)
         );
         sql(fixture,&format!("UPDATE td_mta.recipients SET uncertain=1 WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.recipients SET rcpt_reply='250 old',data_reply='450 old' WHERE submission_id=decode('{submission}','hex') AND state=2"));
         if temporary {
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+1000 WHERE id=decode('{submission}','hex')"));
             super::expiry_wait_snapshot(fixture, || {
-                phases::publish(request, trust, deadline(), &value).unwrap();
+                phases::publish(request, deadline(), &value).unwrap();
             });
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex')"));
         }
@@ -105,7 +102,6 @@ pub(super) fn exercise(
             let rejected: Vec<_> = (50..100).map(|n| (n, "550 RCPT refused")).collect();
             phases::publish(
                 request,
-                trust,
                 deadline(),
                 &phases::refused_rcpt(claim, generation, attempt.attempt, &rejected).unwrap(),
             )
@@ -115,7 +111,7 @@ pub(super) fn exercise(
                 phases::refused_mail(claim, generation, attempt.attempt, &ordinals, &reply)
                     .unwrap();
             assert_eq!(
-                phases::publish(request, trust, deadline(), &remaining),
+                phases::publish(request, deadline(), &remaining),
                 Err(phases::Error::Conflict)
             );
         }
@@ -126,7 +122,7 @@ pub(super) fn exercise(
             );
             sql(fixture,"CREATE FUNCTION public.reject_command() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_command BEFORE INSERT ON td_mta.attempt_command_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_command()");
             assert_eq!(
-                phases::publish(request, trust, deadline(), &value),
+                phases::publish(request, deadline(), &value),
                 Err(phases::Error::Database)
             );
             assert_eq!(
@@ -147,13 +143,12 @@ pub(super) fn exercise(
         if !temporary {
             sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint-1 WHERE id=decode('{submission}','hex')"));
         }
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         if case == 3 {
             sql(fixture,"CREATE FUNCTION public.delay_command() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_command AFTER INSERT ON td_mta.attempt_command_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_command()");
             assert_eq!(
                 phases::publish(
                     request,
-                    trust,
                     Instant::now() + Duration::from_millis(1500),
                     &value
                 ),
@@ -161,15 +156,15 @@ pub(super) fn exercise(
             );
             thread::sleep(Duration::from_secs(4));
         }
-        let outcome = phases::publish(request, trust, deadline(), &value).unwrap();
+        let outcome = phases::publish(request, deadline(), &value).unwrap();
         assert_eq!(outcome.recipients, end);
         assert_eq!(outcome.new_sequence, outcome.old_sequence + 1);
         assert_eq!(
-            phases::inspect(request, trust, deadline(), &value).unwrap(),
+            phases::inspect(request, deadline(), &value).unwrap(),
             Some(outcome)
         );
         assert_eq!(
-            phases::publish(request, trust, deadline(), &value).unwrap(),
+            phases::publish(request, deadline(), &value).unwrap(),
             outcome
         );
         let legacy = if data {
@@ -179,12 +174,12 @@ pub(super) fn exercise(
         }
         .unwrap();
         assert_eq!(
-            phases::inspect(request, trust, deadline(), &legacy).unwrap(),
+            phases::inspect(request, deadline(), &legacy).unwrap(),
             Some(outcome)
         );
         let different = prepare(generation, "550 different").unwrap();
         assert_eq!(
-            phases::publish(request, trust, deadline(), &different),
+            phases::publish(request, deadline(), &different),
             Err(phases::Error::Conflict)
         );
         if data {
@@ -210,7 +205,7 @@ pub(super) fn exercise(
             )
             .unwrap();
             assert_eq!(
-                phases::inspect(request, trust, deadline(), &different_rcpt),
+                phases::inspect(request, deadline(), &different_rcpt),
                 Err(phases::Error::Conflict)
             );
         }
@@ -227,11 +222,10 @@ pub(super) fn exercise(
     }
     for body_first in [false, true] {
         sql(fixture,&format!("UPDATE td_mta.recipients SET state=1,phase=0,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.submissions SET completed_at=NULL,notification=0,expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex')"));
-        owners::renew(request, trust, deadline(), claim, generation).unwrap();
+        owners::renew(request, deadline(), claim, generation).unwrap();
         let attempt = super::attempt_clock::publish(
             fixture,
             request,
-            trust,
             deadline(),
             &attempts::prepare(claim, generation, submission).unwrap(),
         )
@@ -241,7 +235,6 @@ pub(super) fn exercise(
         if body_first {
             phases::publish(
                 request,
-                trust,
                 deadline(),
                 &phases::body(claim, generation, attempt.attempt, &first).unwrap(),
             )
@@ -249,7 +242,6 @@ pub(super) fn exercise(
             let ordinals: Vec<_> = (0..50).collect();
             phases::publish(
                 request,
-                trust,
                 deadline(),
                 &phases::acceptance_possible(claim, generation, attempt.attempt, &ordinals)
                     .unwrap(),
@@ -257,7 +249,6 @@ pub(super) fn exercise(
             .unwrap();
             phases::publish(
                 request,
-                trust,
                 deadline(),
                 &phases::accepted(claim, generation, attempt.attempt, &ordinals, "250 queued")
                     .unwrap(),
@@ -266,7 +257,6 @@ pub(super) fn exercise(
         } else {
             phases::publish(
                 request,
-                trust,
                 deadline(),
                 &phases::refused_data_command(
                     claim,
@@ -290,7 +280,7 @@ pub(super) fn exercise(
             "SELECT encode(sequence,'hex') FROM td_mta.accounts",
         );
         assert_eq!(
-            phases::publish(request, trust, deadline(), &conflicting),
+            phases::publish(request, deadline(), &conflicting),
             Err(phases::Error::Conflict)
         );
         assert_eq!(
@@ -303,7 +293,6 @@ pub(super) fn exercise(
         let refused: Vec<_> = (50..100).map(|n| (n, "550 RCPT refused")).collect();
         phases::publish(
             request,
-            trust,
             deadline(),
             &phases::refused_rcpt(claim, generation, attempt.attempt, &refused).unwrap(),
         )
