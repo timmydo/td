@@ -6,9 +6,15 @@
 //! `key value`, with free text last on its line, for scripts and the bar.
 //! Exit codes: 0 success, 1 the daemon refused or could not be reached, 2 a
 //! usage error.
+//!
+//! `play` is the one that is no controller: it plays the fixture tone as a
+//! stream, as any application would, so a test can hear the daemon's whole
+//! path, switches included, from a client's side.
 
 use crate::proto::{self, error, subscription};
-use crate::session::shown;
+use crate::session::{shown, CHANNEL_MAP};
+use crate::sink::Spec;
+use crate::tone::{Generator, Tone};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
@@ -23,7 +29,7 @@ use td_pulse::tag;
 
 /// The personalities this module answers for.
 pub const PERSONALITIES: &[&str] = &[
-    "status", "outputs", "output", "volume", "mute", "apps", "app", "watch",
+    "status", "outputs", "output", "volume", "mute", "apps", "app", "watch", "play",
 ];
 
 const SUCCESS: u8 = 0;
@@ -37,6 +43,13 @@ const DEADLINE: Duration = Duration::from_secs(5);
 
 /// What the daemon is told this client is called.
 const CLIENT_NAME: &str = "td-audio";
+
+/// The longest tone `play` plays: a test fixture, not a music player.
+const MAX_PLAY_MS: u64 = 60_000;
+
+/// The frames `play` generates and sends at a time: one of the daemon's
+/// periods.
+const PLAY_CHUNK_FRAMES: usize = 1024;
 
 /// Run one control personality and return its exit code.
 pub fn main(
@@ -73,6 +86,13 @@ fn run(
         }
         return USAGE_ERROR;
     };
+    let deadline = match command {
+        // Played in real time, then drained: twice the tone bounds both.
+        Command::Play(milliseconds) => {
+            deadline.saturating_add(Duration::from_millis(milliseconds.saturating_mul(2)))
+        }
+        _ => deadline,
+    };
     let outcome = connect(socket, deadline)
         .and_then(|mut client| execute(&mut client, &command, out, subscribed));
     match outcome {
@@ -94,6 +114,7 @@ enum Command<'a> {
     AppVolume(&'a str, Level),
     AppMute(&'a str, Switch),
     Watch,
+    Play(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +154,13 @@ fn parse<'a>(personality: &str, words: &'a [OsString]) -> Option<Command<'a>> {
             }
         }
         ("watch", []) => Command::Watch,
+        ("play", [milliseconds]) => Command::Play(
+            text(milliseconds)
+                .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))?
+                .parse()
+                .ok()
+                .filter(|milliseconds| (1..=MAX_PLAY_MS).contains(milliseconds))?,
+        ),
         _ => return None,
     })
 }
@@ -204,6 +232,7 @@ enum Failure<'a> {
     Daemon(client::Error<io::Error>),
     NoApp(&'a str),
     Output(io::Error),
+    Memory,
 }
 
 impl From<client::Error<io::Error>> for Failure<'_> {
@@ -258,8 +287,15 @@ impl fmt::Display for Failure<'_> {
                 f.write_str("the daemon kept sending without answering")
             }
             Self::Daemon(client::Error::Broken) => f.write_str("the connection is broken"),
+            Self::Daemon(client::Error::AlreadyPlaying | client::Error::NotPlaying) => {
+                f.write_str("td-audio asked for a stream its connection does not play")
+            }
+            Self::Daemon(client::Error::Killed) => {
+                f.write_str("the daemon ended the stream: no output is left to play it")
+            }
             Self::NoApp(name) => write!(f, "no stream of app {}", Token(name)),
             Self::Output(error) => write!(f, "write: {error}"),
+            Self::Memory => f.write_str("out of memory"),
         }
     }
 }
@@ -584,6 +620,41 @@ fn execute<'a>(
             })?;
             writeln!(out, "app {} mute {}", Token(name), on_off(muted)).map_err(output)?;
         }
+        Command::Play(milliseconds) => {
+            let spec = Spec::fixed();
+            let frames = spec.usec_to_frames(milliseconds.saturating_mul(1000));
+            let playback = client.create_playback(
+                tag::SampleSpec {
+                    format: proto::format::SAMPLE_S16LE,
+                    channels: u8::try_from(spec.channels).unwrap_or(2),
+                    rate: spec.rate,
+                },
+                &CHANNEL_MAP,
+                &[tag::text_property("media.name", "tone")],
+            )?;
+            let mut generator = Generator::new(spec, Tone::fixture());
+            // Reserved once: `fill` then never grows it.
+            let mut pcm = crate::allocation::with_capacity(
+                PLAY_CHUNK_FRAMES.saturating_mul(spec.frame_bytes),
+            )
+            .map_err(|_| Failure::Memory)?;
+            while generator.frames_produced() < frames {
+                let left = frames.saturating_sub(generator.frames_produced());
+                let chunk = usize::try_from(left)
+                    .map_or(PLAY_CHUNK_FRAMES, |left| left.min(PLAY_CHUNK_FRAMES));
+                generator.fill(&mut pcm, chunk);
+                client.write_all(&playback, &pcm)?;
+            }
+            client.drain(&playback)?;
+            let report = client.playback_report();
+            let stream = playback.index();
+            client.delete_playback(playback)?;
+            writeln!(out, "stream {stream}").map_err(output)?;
+            writeln!(out, "frames {frames}").map_err(output)?;
+            writeln!(out, "started {}", report.started).map_err(output)?;
+            writeln!(out, "underflows {}", report.underflows).map_err(output)?;
+            writeln!(out, "overflows {}", report.overflows).map_err(output)?;
+        }
         Command::Watch => {
             client.subscribe(subscription::MASK_SINK | subscription::MASK_SINK_INPUT)?;
             // Events come when something changes, which may be never.
@@ -682,6 +753,17 @@ mod tests {
     /// A daemon whose browser account is `BROWSER_UID`, set up by `setup`
     /// before it starts serving on its own thread.
     fn daemon(name: &str, setup: impl FnOnce(&mut Server<MemorySink>, &Path)) -> Running {
+        playing_daemon(name, 0, setup)
+    }
+
+    /// `daemon`, whose device plays `frames` after each pass and a pause, so
+    /// a stream's audio drains at about the rate the device's clock would
+    /// drain it.
+    fn playing_daemon(
+        name: &str,
+        frames: u64,
+        setup: impl FnOnce(&mut Server<MemorySink>, &Path),
+    ) -> Running {
         let dir = TempDir::new(name).unwrap();
         let path = dir.path().join("native");
         let mut sink = MemorySink::new(Spec::fixed(), 8_192, 1_024);
@@ -693,6 +775,10 @@ mod tests {
         let thread = thread::spawn(move || {
             while !stopping.load(Ordering::SeqCst) {
                 server.pass().unwrap();
+                if frames > 0 {
+                    server.device_mut().advance(frames);
+                    thread::sleep(Duration::from_millis(20));
+                }
             }
             server
         });
@@ -886,6 +972,115 @@ mod tests {
                 "{personality} has no usage form"
             );
         }
+    }
+
+    /// The tone's left channel, with the zeros a device plays while a
+    /// stream is short taken out: what is left must be the whole tone, in
+    /// order, with nothing lost and nothing played twice.
+    fn heard(samples: &[i16]) -> Vec<i16> {
+        samples
+            .iter()
+            .step_by(2)
+            .copied()
+            .filter(|sample| *sample != 0)
+            .collect()
+    }
+
+    /// `play` plays the tone through the daemon as a stream: every frame
+    /// reaches the device, in order, and the stream starts once.
+    #[test]
+    fn play_plays_the_tone_as_a_stream() {
+        let daemon = playing_daemon("cli-play", 1024, |_, _| {});
+        let socket = daemon.path.clone();
+        let out = ok(&socket, "play", &["200"]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5, "{out}");
+        assert!(lines[0].starts_with("stream "), "{out}");
+        assert_eq!(lines[1], "frames 9600");
+        assert_eq!(lines[2], "started 1");
+        assert!(lines[3].starts_with("underflows "), "{out}");
+        assert_eq!(lines[4], "overflows 0");
+        let server = daemon.stop();
+        let expected: Vec<i16> = (0..9600)
+            .map(|frame| Generator::sample_at(Spec::fixed(), Tone::fixture(), frame))
+            .filter(|sample| *sample != 0)
+            .collect();
+        assert_eq!(heard(&server_samples(server)), expected);
+    }
+
+    fn server_samples(mut server: Server<MemorySink>) -> Vec<i16> {
+        server.device_mut().samples()
+    }
+
+    /// A switch while `play` plays moves its stream to the new output, and
+    /// the tone plays on there to its end: the client sees no seam.
+    #[test]
+    fn play_plays_on_across_a_switch() {
+        let daemon = playing_daemon("cli-play-switch", 1024, |server, _| {
+            offer_outputs(
+                server,
+                &[(0, "pch-0", "ALC892 Analog"), (1, "device-0", "USB Audio")],
+            );
+        });
+        let socket = daemon.path.clone();
+        let player = {
+            let socket = socket.clone();
+            thread::spawn(move || cli(&socket, "play", &["1000"]))
+        };
+        let begun = Instant::now();
+        while !ok(&socket, "status", &[]).contains("streams 1") {
+            assert!(begun.elapsed() < DEADLINE, "the stream never appeared");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ok(&socket, "output", &["device-0"]), "output device-0\n");
+        let (code, out, err) = player.join().unwrap();
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert!(out.contains("frames 48000\n"), "{out}");
+        let server = daemon.stop();
+        let tail = heard(&server_samples(server));
+        assert!(!tail.is_empty(), "the new output played nothing");
+        // What the new output played is the tone's end, whole: no frame of
+        // it lost to the switch or sent once where it was owed twice.
+        let tone: Vec<i16> = (0..48_000)
+            .map(|frame| Generator::sample_at(Spec::fixed(), Tone::fixture(), frame))
+            .filter(|sample| *sample != 0)
+            .collect();
+        assert!(
+            tone.ends_with(&tail),
+            "the new output played {} samples that are not the tone's last",
+            tail.len()
+        );
+    }
+
+    /// `play` takes one length, 1 ms to a minute; anything else is a usage
+    /// error that never reaches the daemon.
+    #[test]
+    fn play_takes_one_length_in_bounds() {
+        let socket = Path::new("/nonexistent/td-audio-play");
+        for words in [
+            &[][..],
+            &["0"],
+            &["60001"],
+            &["-5"],
+            &["+5"],
+            &["1.5"],
+            &["abc"],
+            &["1", "2"],
+        ] {
+            let (code, out, err) = cli(socket, "play", words);
+            assert_eq!(
+                (code, out.as_str(), err.as_str()),
+                (
+                    2,
+                    "",
+                    "td-audio: usage:\n  td-audio play [--socket PATH] MILLISECONDS\n"
+                ),
+                "{words:?}"
+            );
+        }
+        let (code, _, err) = cli(socket, "play", &["60000"]);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.starts_with("td-audio: connect "), "{err}");
     }
 
     /// Lines in an order-free form: a session's streams are not ordered.

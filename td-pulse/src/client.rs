@@ -1,4 +1,5 @@
-//! A blocking control client: connect, list, set and subscribe.
+//! A blocking control client: connect, list, set and subscribe; and one
+//! playback stream, which `td-audio play` plays a tone through.
 //!
 //! td's controllers — the `td-audio` CLI personalities, the compositor's
 //! volume keys and bar, the mixer panel — are ordinary Pulse clients of the
@@ -59,6 +60,14 @@ pub enum Error<E> {
     /// An earlier failure left the connection's framing or tags unknown;
     /// reconnect.
     Broken,
+    /// The server killed the playback stream: its last output went away.
+    Killed,
+    /// A second playback stream on a connection that plays one: the
+    /// caller's mistake, refused unsent.
+    AlreadyPlaying,
+    /// A stream this connection does not play, or no longer: the caller's
+    /// mistake, refused unsent.
+    NotPlaying,
 }
 
 impl<E> From<tag::Error> for Error<E> {
@@ -93,6 +102,47 @@ const EVENT_TAG: u32 = tag::INVALID_INDEX;
 
 /// The default sink, as the server resolves it.
 pub const DEFAULT_SINK: &str = "@DEFAULT_SINK@";
+
+/// The most audio one data frame carries: td-audio's period of S16 stereo,
+/// so a write never waits on more grant than one period frees.
+const DATA_CHUNK: usize = 4096;
+
+/// `PA_CHANNELS_MAX`: the most channels a stream's volume can carry.
+const MAX_CHANNELS: usize = 32;
+
+/// A playback stream this connection created. Not `Copy`: deleting it
+/// takes it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Playback {
+    channel: u32,
+    index: u32,
+}
+
+impl Playback {
+    /// Its sink-input index, which a controller addresses it by.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+/// What the server said about the playback stream unasked.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackReport {
+    /// `STARTED`: the device began playing the stream's audio.
+    pub started: u32,
+    /// `UNDERFLOW`: the device ran past the stream's last frame.
+    pub underflows: u32,
+    /// `OVERFLOW`: the server dropped audio sent past its grant, which this
+    /// client does not send.
+    pub overflows: u32,
+}
+
+/// The stream a connection plays: its channel and its frame's bytes.
+#[derive(Debug, Clone, Copy)]
+struct Stream {
+    channel: u32,
+    frame_bytes: usize,
+}
 
 /// The server's own description.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +311,11 @@ pub struct Client<T: Transport> {
     subscribed: bool,
     missed_events: bool,
     broken: bool,
+    /// The playback stream, once one is created.
+    playing: Option<Stream>,
+    /// Bytes the server has asked for and not been sent.
+    owed: u64,
+    report: PlaybackReport,
 }
 
 impl<T: Transport> Client<T> {
@@ -274,6 +329,9 @@ impl<T: Transport> Client<T> {
             subscribed: false,
             missed_events: false,
             broken: false,
+            playing: None,
+            owed: 0,
+            report: PlaybackReport::default(),
         };
         let reply = client.call(command::AUTH, |writer| {
             writer.u32(proto::VERSION).arbitrary(&[0; COOKIE_LEN]);
@@ -417,14 +475,262 @@ impl<T: Transport> Client<T> {
         if self.broken {
             return Err(Error::Broken);
         }
-        let packet = self.next_packet()?;
-        let mut reader = Reader::new(&packet);
-        let command = reader.u32()?;
-        let tag = reader.u32()?;
-        if command != command::SUBSCRIBE_EVENT || tag != EVENT_TAG {
-            return Err(Error::Unexpected { command, tag });
+        // What a playing stream is told meanwhile is taken, within one
+        // flood bound for the whole wait.
+        let mut waited = 0;
+        loop {
+            let packet = self.next_packet_within(&mut waited)?;
+            let mut reader = Reader::new(&packet);
+            let command = reader.u32()?;
+            let tag = reader.u32()?;
+            if command == command::SUBSCRIBE_EVENT && tag == EVENT_TAG {
+                return Ok(parse_event(&mut reader)?);
+            }
+            if !self.absorb(command, tag, &mut reader)? {
+                return Err(Error::Unexpected { command, tag });
+            }
         }
-        Ok(parse_event(&mut reader)?)
+    }
+
+    /// Create this connection's one playback stream in `spec`, at unity,
+    /// uncorked, with the server's buffering, named by `properties`: the
+    /// packet libpulse sends for `pa_stream_connect_playback` with no flags.
+    /// `spec` is S16LE or FLOAT32LE, the formats td speaks (§K.3).
+    pub fn create_playback(
+        &mut self,
+        spec: tag::SampleSpec,
+        positions: &[u8],
+        properties: &[Property],
+    ) -> Result<Playback, T::Error> {
+        if self.playing.is_some() {
+            return Err(Error::AlreadyPlaying);
+        }
+        // The reply's parse too: a stream the server made and this client
+        // could not read leaves the connection unknown.
+        let outcome = self.create(spec, positions, properties);
+        self.note(&outcome);
+        outcome
+    }
+
+    fn create(
+        &mut self,
+        spec: tag::SampleSpec,
+        positions: &[u8],
+        properties: &[Property],
+    ) -> Result<Playback, T::Error> {
+        let unity = [VOLUME_NORM; MAX_CHANNELS];
+        let volume = unity.get(..usize::from(spec.channels)).unwrap_or(&unity);
+        let reply = self.exchange(command::CREATE_PLAYBACK_STREAM, |writer| {
+            writer
+                .sample_spec(spec)
+                .channel_map(positions)
+                .u32(tag::INVALID_INDEX)
+                .null_string()
+                .u32(tag::INVALID_INDEX)
+                .boolean(false)
+                .u32(tag::INVALID_INDEX)
+                .u32(tag::INVALID_INDEX)
+                .u32(tag::INVALID_INDEX)
+                .u32(0)
+                .cvolume(volume);
+            for _ in 0..9 {
+                writer.boolean(false);
+            }
+            writer.proplist(properties);
+            for _ in 0..7 {
+                writer.boolean(false);
+            }
+            writer.u8(0);
+        })?;
+        let mut reader = body(&reply)?;
+        let channel = reader.u32()?;
+        let index = reader.u32()?;
+        let missing = reader.u32()?;
+        // The buffer attributes, the stream's spec and map, its sink and
+        // whether that is suspended, the sink's latency and the format: the
+        // version-35 reply, read to its end and kept from none of it.
+        for _ in 0..4 {
+            reader.u32()?;
+        }
+        reader.sample_spec()?;
+        reader.channel_map()?;
+        reader.u32()?;
+        reader.string()?;
+        reader.boolean()?;
+        reader.usec()?;
+        reader.format_info()?;
+        reader.finish()?;
+        let sample_bytes = if spec.format == tag::SAMPLE_FLOAT32LE {
+            4
+        } else {
+            2
+        };
+        self.playing = Some(Stream {
+            channel,
+            frame_bytes: usize::from(spec.channels.max(1)).saturating_mul(sample_bytes),
+        });
+        self.owed = u64::from(missing);
+        self.report = PlaybackReport::default();
+        Ok(Playback { channel, index })
+    }
+
+    /// The stream `playback` names, if this connection plays it.
+    fn stream(&self, playback: &Playback) -> Result<Stream, T::Error> {
+        self.playing
+            .filter(|stream| stream.channel == playback.channel)
+            .ok_or(Error::NotPlaying)
+    }
+
+    /// Send what the server has asked for of `pcm`, in whole frames,
+    /// waiting for it to ask if it has not; the bytes sent, which may be
+    /// fewer than `pcm` holds but are none only when it holds none.
+    pub fn write(&mut self, playback: &Playback, pcm: &[u8]) -> Result<usize, T::Error> {
+        let outcome = self.write_some(playback, pcm);
+        self.note(&outcome);
+        outcome
+    }
+
+    /// Send all of `pcm`, as the server asks for each part of it.
+    pub fn write_all(&mut self, playback: &Playback, pcm: &[u8]) -> Result<(), T::Error> {
+        let mut sent = 0;
+        while let Some(rest) = pcm.get(sent..).filter(|rest| !rest.is_empty()) {
+            sent += self.write(playback, rest)?;
+        }
+        Ok(())
+    }
+
+    fn write_some(&mut self, playback: &Playback, pcm: &[u8]) -> Result<usize, T::Error> {
+        if self.broken {
+            return Err(Error::Broken);
+        }
+        let stream = self.stream(playback)?;
+        if pcm.is_empty() {
+            return Ok(0);
+        }
+        // A whole frame, unless less than one is left to send.
+        let least = pcm.len().min(stream.frame_bytes) as u64;
+        let mut waited = 0;
+        while self.owed < least {
+            let packet = self.next_packet_within(&mut waited)?;
+            let mut reader = Reader::new(&packet);
+            let (command, tag) = (reader.u32()?, reader.u32()?);
+            if !self.absorb(command, tag, &mut reader)? {
+                return Err(Error::Unexpected { command, tag });
+            }
+        }
+        let owed = usize::try_from(self.owed).unwrap_or(usize::MAX);
+        let count = pcm.len().min(owed).min(DATA_CHUNK);
+        let count = match count.saturating_sub(count.checked_rem(stream.frame_bytes).unwrap_or(0)) {
+            0 => count,
+            whole => whole,
+        };
+        let Some(chunk) = pcm.get(..count) else {
+            return Ok(0);
+        };
+        let length = u32::try_from(count).unwrap_or(u32::MAX);
+        self.send_or_killed(&wire::Descriptor::encode(length, stream.channel, 0, 0))?;
+        self.send_or_killed(chunk)?;
+        self.owed = self.owed.saturating_sub(count as u64);
+        Ok(count)
+    }
+
+    /// Send, and if the server hung up, say whether it killed the stream
+    /// first: a daemon that lost its last output sends KILLED and closes,
+    /// and a client with grant left learns of it as a failed send. What it
+    /// sent before closing is read for that, as any wait reads, within the
+    /// flood bound and the transport's deadline.
+    fn send_or_killed(&mut self, bytes: &[u8]) -> Result<(), T::Error> {
+        let Err(error) = self.transport.send(bytes) else {
+            return Ok(());
+        };
+        let mut waited = 0;
+        while let Ok(packet) = self.next_packet_within(&mut waited) {
+            let mut reader = Reader::new(&packet);
+            let (Ok(command), Ok(tag)) = (reader.u32(), reader.u32()) else {
+                break;
+            };
+            if let Err(Error::Killed) = self.absorb(command, tag, &mut reader) {
+                return Err(Error::Killed);
+            }
+        }
+        Err(Error::Transport(error))
+    }
+
+    /// Wait until the server has played everything written.
+    pub fn drain(&mut self, playback: &Playback) -> Result<(), T::Error> {
+        let stream = self.stream(playback)?;
+        self.acknowledged(command::DRAIN_PLAYBACK_STREAM, |writer| {
+            writer.u32(stream.channel);
+        })
+    }
+
+    /// End the stream.
+    pub fn delete_playback(&mut self, playback: Playback) -> Result<(), T::Error> {
+        let stream = self.stream(&playback)?;
+        let outcome = self.acknowledged(command::DELETE_PLAYBACK_STREAM, |writer| {
+            writer.u32(stream.channel);
+        });
+        // A refusal ends it too: the handle is spent either way, and a
+        // stream no handle names could be neither deleted nor replaced.
+        if matches!(outcome, Ok(()) | Err(Error::Refused(_))) {
+            self.playing = None;
+        }
+        outcome
+    }
+
+    /// What the server has said about the playback stream so far.
+    pub fn playback_report(&self) -> PlaybackReport {
+        self.report
+    }
+
+    /// Take a packet the server sends unasked, if this connection expects
+    /// it: an event once subscribed, or what a playback stream is told. An
+    /// unasked packet for a channel this connection does not play is not.
+    fn absorb(
+        &mut self,
+        command: u32,
+        tag: u32,
+        reader: &mut Reader<'_>,
+    ) -> Result<bool, T::Error> {
+        if tag != EVENT_TAG {
+            return Ok(false);
+        }
+        if command == command::SUBSCRIBE_EVENT && self.subscribed {
+            parse_event(reader)?;
+            self.missed_events = true;
+            return Ok(true);
+        }
+        let Some(playing) = self.playing.map(|stream| stream.channel) else {
+            return Ok(false);
+        };
+        let channel = reader.u32()?;
+        if channel != playing {
+            return Ok(false);
+        }
+        match command {
+            command::REQUEST => {
+                let bytes = reader.u32()?;
+                reader.finish()?;
+                self.owed = self.owed.saturating_add(u64::from(bytes));
+            }
+            command::STARTED => {
+                reader.finish()?;
+                self.report.started = self.report.started.saturating_add(1);
+            }
+            command::UNDERFLOW => {
+                // Version 23 added the read index, which nothing here reads.
+                reader.s64()?;
+                reader.finish()?;
+                self.report.underflows = self.report.underflows.saturating_add(1);
+            }
+            command::OVERFLOW => {
+                reader.finish()?;
+                self.report.overflows = self.report.overflows.saturating_add(1);
+            }
+            command::PLAYBACK_STREAM_KILLED => return Err(Error::Killed),
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// Whether events arrived while a request waited for its reply, and were
@@ -463,7 +769,10 @@ impl<T: Transport> Client<T> {
 
     fn note<V>(&mut self, outcome: &Result<V, T::Error>) {
         if let Err(error) = outcome {
-            self.broken |= !matches!(error, Error::Refused(_));
+            self.broken |= !matches!(
+                error,
+                Error::Refused(_) | Error::AlreadyPlaying | Error::NotPlaying
+            );
         }
     }
 
@@ -491,11 +800,10 @@ impl<T: Transport> Client<T> {
             let packet = self.next_packet_within(&mut waited)?;
             let mut reader = Reader::new(&packet);
             let (answer, answered) = (reader.u32()?, reader.u32()?);
+            if self.absorb(answer, answered, &mut reader)? {
+                continue;
+            }
             match answer {
-                command::SUBSCRIBE_EVENT if answered == EVENT_TAG && self.subscribed => {
-                    parse_event(&mut reader)?;
-                    self.missed_events = true;
-                }
                 command::REPLY if answered == tag => return Ok(packet),
                 command::ERROR if answered == tag => {
                     let code = reader.u32()?;
@@ -510,10 +818,6 @@ impl<T: Transport> Client<T> {
                 }
             }
         }
-    }
-
-    fn next_packet(&mut self) -> Result<Vec<u8>, T::Error> {
-        self.next_packet_within(&mut 0)
     }
 
     /// The next control packet, counting what it took into `waited`.
@@ -680,6 +984,8 @@ mod tests {
         /// The most one `receive` returns, so frames arrive in pieces.
         chunk: usize,
         sent: Vec<u8>,
+        /// Sends that succeed before every later one fails: a hung-up peer.
+        sends_left: usize,
     }
 
     impl Scripted {
@@ -689,6 +995,7 @@ mod tests {
                 at: 0,
                 chunk: usize::MAX,
                 sent: Vec::new(),
+                sends_left: usize::MAX,
             }
         }
     }
@@ -696,6 +1003,7 @@ mod tests {
     impl Transport for Scripted {
         type Error = ();
         fn send(&mut self, bytes: &[u8]) -> std::result::Result<(), ()> {
+            self.sends_left = self.sends_left.checked_sub(1).ok_or(())?;
             self.sent.extend_from_slice(bytes);
             Ok(())
         }
@@ -1254,5 +1562,369 @@ mod tests {
             Client::connect(Scripted::new(incoming), "td-audio"),
             Err(Error::Unsupported(34))
         ));
+    }
+
+    /// What td-audio's server answers a create with: the version-35 reply.
+    fn created(tag: u32, channel: u32, missing: u32) -> Vec<u8> {
+        reply(tag, |writer| {
+            writer
+                .u32(channel)
+                .u32(9)
+                .u32(missing)
+                .u32(65536)
+                .u32(16384)
+                .u32(16384)
+                .u32(4096)
+                .sample_spec(stereo())
+                .channel_map(&[1, 2])
+                .u32(0)
+                .string("td-audio")
+                .boolean(false)
+                .usec(0)
+                .format_info(proto::format::ENCODING_PCM, &[]);
+        })
+    }
+
+    /// A frame the server sends a stream unasked.
+    fn told(command: u32, channel: u32, body: impl FnOnce(&mut Writer)) -> Vec<u8> {
+        packet(command, EVENT_TAG, |writer| {
+            writer.u32(channel);
+            body(writer);
+        })
+    }
+
+    /// Every frame the client sent after the handshake, audio included.
+    fn frames_after_handshake(client: &Client<Scripted>) -> Vec<Frame> {
+        let mut decoder = Decoder::new();
+        decoder.push(&client.transport.sent);
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.next_frame() {
+            frames.push(frame.unwrap());
+        }
+        frames.split_off(2)
+    }
+
+    fn data_lengths(client: &Client<Scripted>) -> Vec<usize> {
+        frames_after_handshake(client)
+            .into_iter()
+            .filter_map(|frame| match frame {
+                Frame::Data { pcm, .. } => Some(pcm.len()),
+                Frame::Control(_) => None,
+            })
+            .collect()
+    }
+
+    fn paplay_properties() -> Vec<Property> {
+        vec![
+            tag::text_property("media.format", "WAV (Microsoft)"),
+            tag::text_property("application.name", "paplay"),
+            tag::text_property("media.name", "t.wav"),
+        ]
+    }
+
+    /// Create, write, drain and delete are the packets paplay sent through
+    /// libpulse 16.1, byte for byte, and the audio is one relative frame on
+    /// the stream's channel.
+    #[test]
+    fn a_playback_lifecycle_is_the_packets_paplay_sends() {
+        let mut script = created(2, 0, 8);
+        script.extend(reply(3, |_| {}));
+        script.extend(reply(4, |_| {}));
+        let mut client = connected(script);
+        let playback = client
+            .create_playback(stereo(), &[1, 2], &paplay_properties())
+            .unwrap();
+        assert_eq!(playback.index(), 9);
+        assert_eq!(
+            client.write(&playback, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap(),
+            8
+        );
+        client.drain(&playback).unwrap();
+        client.delete_playback(playback).unwrap();
+        assert_eq!(
+            frames_after_handshake(&client),
+            [
+                Frame::Control(unhex(captured_session::CREATE_PLAYBACK_STREAM)),
+                Frame::Data {
+                    channel: 0,
+                    seek: wire::Seek::Relative,
+                    offset: 0,
+                    pcm: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                },
+                Frame::Control(unhex(captured_session::DRAIN_PLAYBACK_STREAM)),
+                Frame::Control(unhex(captured_session::DELETE_PLAYBACK_STREAM)),
+            ]
+        );
+    }
+
+    /// A write sends no more than the server asked for, nor more than one
+    /// chunk; with nothing owed it waits for a grant, and what the stream is
+    /// told on the way is counted.
+    #[test]
+    fn a_write_sends_what_was_asked_and_waits_for_more() {
+        let mut script = created(2, 3, 4);
+        script.extend(told(command::STARTED, 3, |_| {}));
+        script.extend(told(command::UNDERFLOW, 3, |writer| {
+            writer.s64(0);
+        }));
+        script.extend(told(command::REQUEST, 3, |writer| {
+            writer.u32(8192);
+        }));
+        let mut client = connected(script);
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert_eq!(client.write(&playback, &[0; 10]).unwrap(), 4);
+        assert_eq!(client.write(&playback, &[0; 8]).unwrap(), 8);
+        assert_eq!(client.write(&playback, &[0; 10_000]).unwrap(), DATA_CHUNK);
+        assert_eq!(client.write(&playback, &[]).unwrap(), 0);
+        assert_eq!(data_lengths(&client), [4, 8, DATA_CHUNK]);
+        assert_eq!(
+            client.playback_report(),
+            PlaybackReport {
+                started: 1,
+                underflows: 1,
+                overflows: 0,
+            }
+        );
+    }
+
+    /// `write_all` sends a buffer the server asks for in parts, each part
+    /// as it is asked for.
+    #[test]
+    fn write_all_sends_each_part_as_it_is_asked_for() {
+        let mut script = created(2, 0, 4);
+        script.extend(told(command::REQUEST, 0, |writer| {
+            writer.u32(8);
+        }));
+        let mut client = connected(script);
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        client.write_all(&playback, &[0; 12]).unwrap();
+        assert_eq!(data_lengths(&client), [4, 8]);
+    }
+
+    /// Grants that arrive while a request waits are kept, not dropped: a
+    /// drain's wait does not cost the stream its next write.
+    #[test]
+    fn a_grant_during_a_drain_is_kept() {
+        let mut script = created(2, 0, 0);
+        script.extend(told(command::REQUEST, 0, |writer| {
+            writer.u32(8);
+        }));
+        script.extend(reply(3, |_| {}));
+        let mut client = connected(script);
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        client.drain(&playback).unwrap();
+        // The script is spent: a write that waited would read a close.
+        assert_eq!(client.write(&playback, &[0; 8]).unwrap(), 8);
+    }
+
+    /// The stream's last output went away: the write fails as killed and
+    /// the connection is done.
+    #[test]
+    fn a_killed_stream_ends_the_playback() {
+        let mut script = created(2, 0, 0);
+        script.extend(told(command::PLAYBACK_STREAM_KILLED, 0, |_| {}));
+        let mut client = connected(script);
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert!(matches!(
+            client.write(&playback, &[0; 4]),
+            Err(Error::Killed)
+        ));
+        assert!(matches!(
+            client.write(&playback, &[0; 4]),
+            Err(Error::Broken)
+        ));
+    }
+
+    /// What a stream is told about a channel this connection does not play,
+    /// or before it plays any, is no grant.
+    #[test]
+    fn a_grant_for_another_channel_is_unexpected() {
+        let mut script = created(2, 0, 0);
+        script.extend(told(command::REQUEST, 5, |writer| {
+            writer.u32(100);
+        }));
+        let mut client = connected(script);
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert!(matches!(
+            client.write(&playback, &[0; 4]),
+            Err(Error::Unexpected {
+                command: command::REQUEST,
+                tag: EVENT_TAG
+            })
+        ));
+
+        let mut client = connected(told(command::REQUEST, 0, |writer| {
+            writer.u32(100);
+        }));
+        assert!(matches!(
+            client.server_info(),
+            Err(Error::Unexpected {
+                command: command::REQUEST,
+                tag: EVENT_TAG
+            })
+        ));
+    }
+
+    /// One stream per connection: a second create is refused before it is
+    /// sent, and the first plays on.
+    #[test]
+    fn a_second_stream_is_refused_unsent() {
+        let mut client = connected(created(2, 0, 4));
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert!(matches!(
+            client.create_playback(stereo(), &[1, 2], &[]),
+            Err(Error::AlreadyPlaying)
+        ));
+        assert_eq!(client.write(&playback, &[0; 4]).unwrap(), 4);
+        assert_eq!(frames_after_handshake(&client).len(), 2);
+    }
+
+    /// A grant is whole frames: what is left of one waits for the rest,
+    /// unless the audio itself ends inside a frame.
+    #[test]
+    fn a_write_sends_whole_frames() {
+        let mut script = created(2, 0, 6);
+        for _ in 0..2 {
+            script.extend(told(command::REQUEST, 0, |writer| {
+                writer.u32(2);
+            }));
+        }
+        let mut client = connected(script);
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert_eq!(client.write(&playback, &[0; 10]).unwrap(), 4);
+        // Two bytes owed are half a frame: it waits for the other half.
+        assert_eq!(client.write(&playback, &[0; 6]).unwrap(), 4);
+        assert_eq!(client.write(&playback, &[0; 2]).unwrap(), 2);
+        assert_eq!(data_lengths(&client), [4, 4, 2]);
+    }
+
+    /// A server that tells a waiting stream everything but a grant cannot
+    /// hold the wait: it is a flood, as a request's wait is.
+    #[test]
+    fn a_flood_cannot_hold_a_grant_wait() {
+        let mut script = created(2, 0, 0);
+        while script.len() < 3 * wire::CONTROL_MAX {
+            script.extend(told(command::STARTED, 0, |_| {}));
+        }
+        let mut client = connected(script);
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert!(matches!(
+            client.write(&playback, &[0; 4]),
+            Err(Error::Flooded)
+        ));
+    }
+
+    /// An overflow is counted, not fatal: the stream plays on.
+    #[test]
+    fn an_overflow_is_counted() {
+        let mut script = created(2, 0, 0);
+        script.extend(told(command::OVERFLOW, 0, |_| {}));
+        script.extend(told(command::REQUEST, 0, |writer| {
+            writer.u32(4);
+        }));
+        let mut client = connected(script);
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert_eq!(client.write(&playback, &[0; 4]).unwrap(), 4);
+        assert_eq!(client.playback_report().overflows, 1);
+    }
+
+    /// A connection that plays and waits for events takes its stream's
+    /// grants on the way to the event.
+    #[test]
+    fn an_event_wait_takes_the_streams_grants() {
+        let mut script = reply(2, |_| {});
+        script.extend(created(3, 0, 0));
+        script.extend(told(command::REQUEST, 0, |writer| {
+            writer.u32(4);
+        }));
+        script.extend(event(
+            subscription::EVENT_SINK | subscription::EVENT_CHANGE,
+            1,
+        ));
+        let mut client = connected(script);
+        client.subscribe(subscription::MASK_ALL).unwrap();
+        let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert_eq!(client.next_event().unwrap().index, 1);
+        // The script is spent: a write that waited would read a close.
+        assert_eq!(client.write(&playback, &[0; 4]).unwrap(), 4);
+    }
+
+    /// A daemon that lost its last output sends KILLED and hangs up; a
+    /// client with grant left finds out as a failed send, and reports the
+    /// kill, not the send. A hang-up with no kill is the send's failure.
+    #[test]
+    fn a_kill_before_a_hang_up_is_the_kill() {
+        for (killed, expected) in [(true, "Killed"), (false, "Transport(())")] {
+            let mut script = created(2, 0, 8);
+            if killed {
+                script.extend(told(command::PLAYBACK_STREAM_KILLED, 0, |_| {}));
+            }
+            let mut client = connected(script);
+            let playback = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+            client.transport.sends_left = 0;
+            let error = client.write(&playback, &[0; 8]).unwrap_err();
+            assert_eq!(format!("{error:?}"), expected);
+        }
+    }
+
+    /// A stream is the one this connection plays now: another's handle is
+    /// refused unsent and breaks nothing, and a stream made after a delete
+    /// starts from its own grant and its own report.
+    #[test]
+    fn a_stream_is_the_one_this_connection_plays() {
+        let mut script = created(2, 0, 4);
+        script.extend(told(command::STARTED, 0, |_| {}));
+        script.extend(reply(3, |_| {}));
+        script.extend(created(4, 1, 8));
+        let mut client = connected(script);
+        let first = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        let stranger = Playback {
+            channel: 9,
+            index: 0,
+        };
+        assert!(matches!(
+            client.write(&stranger, &[0; 4]),
+            Err(Error::NotPlaying)
+        ));
+        assert!(matches!(client.drain(&stranger), Err(Error::NotPlaying)));
+        client.delete_playback(first).unwrap();
+        assert_eq!(client.playback_report().started, 1);
+        let second = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert_eq!(client.playback_report(), PlaybackReport::default());
+        assert_eq!(client.write(&second, &[0; 100]).unwrap(), 8);
+        assert_eq!(data_lengths(&client), [8]);
+    }
+
+    /// A refused delete still ends the stream on this side: the handle is
+    /// spent, so a new stream may be made.
+    #[test]
+    fn a_refused_delete_frees_the_connection_for_a_new_stream() {
+        let mut script = created(2, 0, 4);
+        script.extend(packet(command::ERROR, 3, |writer| {
+            writer.u32(error::NOENTITY);
+        }));
+        script.extend(created(4, 1, 4));
+        let mut client = connected(script);
+        let first = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert!(matches!(
+            client.delete_playback(first),
+            Err(Error::Refused(error::NOENTITY))
+        ));
+        let second = client.create_playback(stereo(), &[1, 2], &[]).unwrap();
+        assert_eq!(client.write(&second, &[0; 4]).unwrap(), 4);
+    }
+
+    /// A create whose reply breaks its schema leaves the connection broken:
+    /// the server holds a stream this client could not read.
+    #[test]
+    fn a_malformed_create_reply_breaks_the_connection() {
+        let mut client = connected(reply(2, |writer| {
+            writer.u32(0).u32(9);
+        }));
+        assert!(matches!(
+            client.create_playback(stereo(), &[1, 2], &[]),
+            Err(Error::Malformed(_))
+        ));
+        assert!(matches!(client.server_info(), Err(Error::Broken)));
     }
 }

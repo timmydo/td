@@ -96,6 +96,7 @@ usage: td-audio devices [--proc PATH]
        td-audio app [--socket PATH] NAME volume LEVEL
        td-audio app [--socket PATH] NAME mute on|off|toggle
        td-audio watch [--socket PATH]
+       td-audio play [--socket PATH] MILLISECONDS
 
   devices      list the playback PCMs /proc/asound/pcm reports
   tone         play a deterministic tone through the ALSA back end, or render
@@ -114,6 +115,8 @@ usage: td-audio devices [--proc PATH]
   app          set one application's level or mute; it cannot undo either
   watch        print one line per output or stream change, until the daemon
                goes away
+  play         play the tone through the daemon as an application's stream,
+               then drain it; no controller needed
 ";
 
 fn run(arguments: &[OsString]) -> io::Result<()> {

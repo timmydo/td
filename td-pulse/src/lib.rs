@@ -1,8 +1,8 @@
 //! The PulseAudio native protocol as td speaks it: the pstream framing
 //! (`wire`), the tagstruct codec (`tag`), the captured command table, error
 //! codes and version negotiation (`proto`), the blocking control client td's
-//! controllers share (`client`), and td-audio's socket as its transport
-//! (`socket`).
+//! controllers share, which also plays one stream for `td-audio play`
+//! (`client`), and td-audio's socket as its transport (`socket`).
 //!
 //! The normative design is `APPLICATIONS.md` §K.3. `td-audio` serves this
 //! protocol on its socket; a control client speaks the same bytes, so the

@@ -500,6 +500,12 @@ impl<S: AudioSink> Server<S> {
         self.open = Some(open);
     }
 
+    /// The device that plays now, for a test to play it.
+    #[cfg(test)]
+    pub(crate) fn device_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
     /// The most any one client is owed and has not taken.
     #[cfg(test)]
     fn owed_to_clients(&self) -> usize {
