@@ -6119,12 +6119,6 @@ fn exercise_uploads(
             "body_bytes={},upload_bytes={}",
             caps.upload_bytes, caps.upload_bytes
         ),
-        format!(
-            "body_bytes={},queue_bytes={}",
-            caps.queue_bytes + 1,
-            caps.queue_bytes + 1
-        ),
-        format!("queue_submissions={}", caps.queue_submissions + 1),
     ] {
         sql(
             fixture,
@@ -6216,6 +6210,42 @@ fn exercise_uploads(
             "SELECT body_bytes,blob_count,upload_bytes FROM td_mta.account_usage"
         ),
         format!("{total}|{}|{total}", caps.blob_count)
+    );
+    sql(fixture, &restore);
+    // A charge refuses only a column it grows past its cap. An upload grows
+    // no queue column, so queue usage past its caps does not refuse it and
+    // stays as it was. Queued bytes are also body bytes.
+    let (queue_bytes, queue_submissions) = (caps.queue_bytes + 1, caps.queue_submissions + 1);
+    let usage = || {
+        sql(
+            fixture,
+            "SELECT body_bytes,blob_count,upload_bytes FROM td_mta.account_usage",
+        )
+        .split('|')
+        .map(|value| value.parse::<u64>().unwrap())
+        .collect::<Vec<_>>()
+    };
+    let before = usage();
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.account_usage SET body_bytes=body_bytes+{queue_bytes},queue_bytes={queue_bytes},queue_submissions={queue_submissions}"),
+    );
+    let queued = publish(&prepare(b"queue")).unwrap();
+    assert_eq!(
+        (queued.old_sequence, queued.new_sequence),
+        (sequence, sequence + 1)
+    );
+    sequence += 1;
+    assert_eq!(
+        usage(),
+        [before[0] + queue_bytes + 5, before[1] + 1, before[2] + 5]
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT queue_bytes,queue_submissions FROM td_mta.account_usage"
+        ),
+        format!("{queue_bytes}|{queue_submissions}")
     );
     sql(fixture, &restore);
     let capacity = prepare(b"capacity");

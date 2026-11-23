@@ -3674,9 +3674,11 @@ so neither the version encoding nor the schema changes. A historical selection
 receipt remains historical success; it does not bypass revalidation for new
 runtime preparation. Lowering limits is configuration policy, not deletion or
 capacity reclamation. Every publication compares durable usage against the
-selected limits under its account lock before accepting more work; lowered
-limits refuse additional publication when any current usage exceeds its
-cap. Logical counters do not reserve server disk.
+selected limits under its account lock before accepting more work; usage
+above a lowered limit refuses only the writes that grow that column
+([Compact failure notices and the quota
+margin](#compact-failure-notices-and-the-quota-margin)). Logical counters
+do not reserve server disk.
 
 ### Account usage counters (schema 10)
 
