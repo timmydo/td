@@ -3410,7 +3410,7 @@ APPLICATIONS.md §L.1, "The v1 operations", says what
 and its "Elevation increments" which commit lands each part;
 `td-compositor/DESIGN.md`, "Elevation consent", says which presses
 confirm. At `10` and above the private channel routes requests `10` to
-`21`, `25`, `26`, `28` to `2b`, `2d` and `2e` to the secret session, and
+`21`, `25`, `26`, `28` to `2b` and `2d` to `2f` to the secret session, and
 `22` to `24`, `27` and `2c` to their own handlers, and refuses the rest;
 ENCRYPTION.md increment 8e's storage commit first routed `20` there
 ("Login keys and session lock", amendment 10).
@@ -3511,7 +3511,19 @@ polls a running submission, so its deadline holds while nobody asks; a
 finished one nobody asked after is dropped at the next `2e 00`, and
 generation teardown reaps one still running. Root cannot observe the
 `U` press: it trusts the paired compositor for it, as for Enter.
-Request `2f` is unassigned.
+
+`2f`, which takes no operand and holds no slot, answers `af` and a flag
+byte for the attention menu's conditional rows: bit 0 while an
+acknowledged installation waits for `I`, its requester alive; bit 1
+while an acknowledged, complete credential write waits for `W`; bit 2
+while the selectors name two deployments, read as rollback's admission
+reads them. No bit consults the principal table, the login state or a
+setup in progress, so a row can show for a request its key will see
+refused. Like `1f` it runs the session's tick first, then reads the
+intakes without changing them, and it selects, captures and grants
+nothing: each selection checks again. The compositor asks it
+after `1f` on each turn of its authority worker. Request `30` is
+unassigned.
 
 **Principal table.** `elevation.rs` reads it at each `1d`, `1e` and
 `2e 00`, at each request 19 on an installed system, and at each hostname

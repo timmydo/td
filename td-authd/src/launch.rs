@@ -917,7 +917,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x21 | 0x25 | 0x26 | 0x28..=0x2b | 0x2d | 0x2e, ..] => {
+        [0x10..=0x21 | 0x25 | 0x26 | 0x28..=0x2b | 0x2d..=0x2f, ..] => {
             Ok(Request::Secret(crate::session::Request::decode(bytes)?))
         }
         [0x24, operands @ ..] => Ok(Request::Software(crate::software::Request::decode(
@@ -1339,7 +1339,11 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         request(&[0x2e, 1])?,
         Request::Secret(crate::session::Request::UpdateStatus)
     );
-    for bad in [&[0x2e][..], &[0x2e, 2], &[0x2e, 0, 0], &[0x2f]] {
+    assert_eq!(
+        request(&[0x2f])?,
+        Request::Secret(crate::session::Request::MenuState)
+    );
+    for bad in [&[0x2e][..], &[0x2e, 2], &[0x2e, 0, 0], &[0x2f, 0], &[0x30]] {
         assert!(request(bad).is_err(), "{bad:?}");
     }
     // `2c` reaches the grant decoder, which takes nothing malformed.

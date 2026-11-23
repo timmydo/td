@@ -446,6 +446,16 @@ impl Intake {
         self.in_flight = true;
         Ok(captured)
     }
+    /// Whether an acknowledged update waits for `I`, its requester alive:
+    /// the menu's `I` row (`2f`), after the session's tick. Changes nothing.
+    pub fn waiting(&self) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            pending.acknowledged
+                && !pending.selected
+                && pending.ready.is_some()
+                && pending.live().is_ok()
+        })
+    }
     /// The description of `ready`; the backoff counted it at admission.
     pub fn describe(&self, owner: u32, ready: Ready) -> Result<Installation, String> {
         Installation::start(owner, ready, self.backoff.clone())

@@ -624,10 +624,9 @@ fn draw_rows(
 }
 
 /// Every screen's rows are padded to the title and six more, and its last
-/// row is drawn below them: where the menu's was before `L`. The menu,
-/// three rows longer since `B` and `H`, draws its last row three lower
-/// (td-compositor/DESIGN.md, "Session lock and login-key entry", item 5,
-/// and "Elevation consent").
+/// row is drawn below them: at 528 on 1280x800, where the menu's is when
+/// only its fixed rows show. Each conditional row the menu draws moves
+/// its last row one lower (td-compositor/DESIGN.md, "The menu's rows").
 const MENU_ROWS: usize = 7;
 
 /// The first row's top for rows `block` pixels tall, the last row's foot
@@ -690,9 +689,31 @@ fn hostname_row(intake: HostnameIntake) -> String {
     }
 }
 
-/// A notice's rows below the title. The menu's rows are fixed in place, `K`
-/// comes below `I`, `L` below `K`, `B` below `L` and `H` below `B`, so the
-/// boot oracles' rows do not move.
+/// The menu's rows from `V` to `B`, in their order, each conditional one
+/// only where root's last answers say it applies (td-compositor/DESIGN.md,
+/// "The menu's rows"). Only the drawing follows them: a hidden row's key
+/// still asks root, which says when nothing waits, so an answer a turn
+/// behind never refuses a request that just arrived.
+fn menu_rows(intake: HostnameIntake) -> impl Iterator<Item = &'static str> {
+    [
+        Some("V: CREDENTIAL STORE"),
+        intake
+            .write()
+            .then_some("W: REVIEW PENDING CREDENTIAL WRITE"),
+        intake
+            .install()
+            .then_some("I: REVIEW PENDING SYSTEM INSTALLATION"),
+        Some("K: LOGIN KEYS"),
+        Some("L: LOCK SCREEN"),
+        intake
+            .previous()
+            .then_some("B: ROLL BACK TO THE PREVIOUS SYSTEM"),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// A notice's rows below the title: the menu's only those that apply.
 fn notice_rows(notice: Notice) -> Vec<String> {
     let first = match notice {
         Notice::Menu(_) => "U: UPDATE FROM TRUSTED MAIN",
@@ -767,14 +788,6 @@ fn notice_rows(notice: Notice) -> Vec<String> {
     let rest: &[&str] = match notice {
         Notice::SleepConfirm => &["ENTER TO CONFIRM", "ENROLLED SESSIONS LOCK BEFORE SLEEP"],
         Notice::PowerConfirm(_) => &["ENTER TO CONFIRM", "UNSAVED WORK MAY BE LOST"],
-        Notice::Menu(_) => &[
-            "V: CREDENTIAL STORE",
-            "W: REVIEW PENDING CREDENTIAL WRITE",
-            "I: REVIEW PENDING SYSTEM INSTALLATION",
-            "K: LOGIN KEYS",
-            "L: LOCK SCREEN",
-            "B: ROLL BACK TO THE PREVIOUS SYSTEM",
-        ],
         Notice::CredentialStore => &[
             "U: UNLOCK  T: RECOVERY TOKEN",
             "E: ENROLL TWO TOKENS - HAVE BOTH READY",
@@ -841,12 +854,19 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::Uncertain(rows) => rows,
         _ => &[],
     };
+    let menu = match notice {
+        Notice::Menu(intake) => Some(intake),
+        _ => None,
+    };
     let mut rows: Vec<String> = std::iter::once(first)
         .chain(rest.iter().copied())
+        .chain(menu.into_iter().flat_map(menu_rows))
         .map(String::from)
         .collect();
-    if let Notice::Menu(intake) = notice {
-        rows.push(hostname_row(intake));
+    if let Some(intake) = menu {
+        if intake.settings() {
+            rows.push(hostname_row(intake));
+        }
         rows.push("S: DISK ENCRYPTION".into());
         rows.push("R: REBOOT  P: POWER OFF  Z: SLEEP".into());
     }
@@ -1181,12 +1201,13 @@ mod tests {
         }
     }
 
-    /// The menu's rows where the update and setup oracles read them on a
-    /// 1280x800 output: the title at 276, the selections from 312, 36
-    /// apart, `U` first, then `V`, `W`, `I` at 420, `K`, `L`, `B` at 528,
-    /// `H` at 564, `S` at 600, power at 636 and Escape at 672. On 800x600
-    /// the twelve rows start at 176; on 320x200 they close to a 17-pixel
-    /// pitch.
+    /// The menu before root's first `af` answer, every row shown but `H`,
+    /// which the default answer (nothing waits) hides: on 1280x800 the
+    /// title at 276, the selections from 312, 36 apart, `I` at 420, `B` at
+    /// 528, `S` at 564, power at 600 and Escape at 636; on 800x600 from
+    /// 176; on 320x200 an 18-pixel pitch. A waiting change adds `H` below
+    /// `B`, the fullest menu, which keeps those places and closes to a
+    /// 17-pixel pitch on 320x200.
     #[test]
     fn the_menu_keeps_its_large_output_rows_and_fits_power_choices() {
         const MENU: &[&str] = &[
@@ -1198,15 +1219,20 @@ mod tests {
             "K: LOGIN KEYS",
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
-            "H: NO SETTINGS WAITING",
             "S: DISK ENCRYPTION",
             "R: REBOOT  P: POWER OFF  Z: SLEEP",
             "ESC TO RETURN",
         ];
-        for (width, height, top, scale, pitch) in [
-            (1280, 800, 276, 2, 36),
-            (800, 600, 176, 2, 36),
-            (320, 200, 0, 1, 17),
+        let mut fullest = MENU.to_vec();
+        fullest.insert(8, "H: REVIEW SETTINGS");
+        let waiting = Notice::Menu(HostnameIntake::decode(&[0x9f, 1, 0]).unwrap());
+        for (notice, rows, width, height, top, scale, pitch) in [
+            (Notice::default(), MENU, 1280, 800, 276, 2, 36),
+            (Notice::default(), MENU, 800, 600, 176, 2, 36),
+            (Notice::default(), MENU, 320, 200, 0, 1, 18),
+            (waiting, &fullest[..], 1280, 800, 276, 2, 36),
+            (waiting, &fullest[..], 800, 600, 176, 2, 36),
+            (waiting, &fullest[..], 320, 200, 0, 1, 17),
         ] {
             let stride = width * 4;
             let mut painted = vec![0; stride * height];
@@ -1217,7 +1243,7 @@ mod tests {
                 stride,
                 false,
                 false,
-                Notice::default(),
+                notice,
                 None,
             );
             let mut expected = vec![0; stride * height];
@@ -1230,7 +1256,7 @@ mod tests {
                 bounds,
                 [0x28, 0x20, 0x18, 0],
             );
-            for (index, text) in MENU.iter().enumerate() {
+            for (index, text) in rows.iter().enumerate() {
                 ui::draw_text_clipped(
                     &mut expected,
                     width,
@@ -1244,14 +1270,69 @@ mod tests {
                     bounds,
                 );
             }
-            assert!(painted == expected, "{width}x{height}");
+            assert!(painted == expected, "{width}x{height} {}", rows.len());
         }
-        // Twelve doubled rows, the last row's foot included, are 410
-        // tall and keep their top on 800 and 600 lines; on 200 twelve
-        // single rows, 194 tall at their closed-up pitch, start at the top.
+        // The fullest menu's twelve doubled rows, the last row's foot
+        // included, are 410 tall and keep their top on 800 and 600 lines;
+        // on 200 twelve single rows, 194 tall at their closed-up pitch,
+        // start at the top.
         assert_eq!(rows_top(800, 11 * 36 + 14), 276);
         assert_eq!(rows_top(600, 11 * 36 + 14), 176);
         assert_eq!(rows_top(200, 11 * 17 + 7), 0);
+    }
+
+    /// `W`, `I` and `B` show as root's `af` flags say, every one before
+    /// its first answer; `H` while a change waits, the intake refuses or a
+    /// request went unapproved. The rest always show, in one order.
+    #[test]
+    fn the_menu_draws_only_the_rows_that_apply() {
+        let rows = |queue: &[u8], flags: Option<u8>| {
+            let intake = HostnameIntake::decode(queue).unwrap();
+            let intake = match flags {
+                Some(flags) => intake.with_rows(&[0xaf, flags]).unwrap(),
+                None => intake,
+            };
+            notice_rows(Notice::Menu(intake))
+        };
+        let fixed = [
+            "U: UPDATE FROM TRUSTED MAIN",
+            "V: CREDENTIAL STORE",
+            "K: LOGIN KEYS",
+            "L: LOCK SCREEN",
+            "S: DISK ENCRYPTION",
+            "R: REBOOT  P: POWER OFF  Z: SLEEP",
+        ];
+        assert_eq!(rows(&[0x9f, 0, 0], Some(0)), fixed);
+        assert_eq!(
+            rows(&[0x9f, 1, 2], Some(7)),
+            [
+                "U: UPDATE FROM TRUSTED MAIN",
+                "V: CREDENTIAL STORE",
+                "W: REVIEW PENDING CREDENTIAL WRITE",
+                "I: REVIEW PENDING SYSTEM INSTALLATION",
+                "K: LOGIN KEYS",
+                "L: LOCK SCREEN",
+                "B: ROLL BACK TO THE PREVIOUS SYSTEM",
+                "H: REVIEW SETTINGS - 2 DENIED",
+                "S: DISK ENCRYPTION",
+                "R: REBOOT  P: POWER OFF  Z: SLEEP",
+            ]
+        );
+        for (flags, shown) in [
+            (1, "I: REVIEW PENDING SYSTEM INSTALLATION"),
+            (2, "W: REVIEW PENDING CREDENTIAL WRITE"),
+            (4, "B: ROLL BACK TO THE PREVIOUS SYSTEM"),
+        ] {
+            let drawn = rows(&[0x9f, 0, 0], Some(flags));
+            assert_eq!(drawn.len(), fixed.len() + 1);
+            assert!(drawn.iter().any(|row| row == shown), "{shown}");
+        }
+        for queue in [&[0x9f, 0, 1][..], &[0x9f, 2, 0]] {
+            assert!(rows(queue, Some(0))
+                .iter()
+                .any(|row| row.starts_with("H: ")));
+        }
+        assert_eq!(rows(&[0x9f, 0, 0], None).len(), fixed.len() + 3);
     }
 
     /// The `H` row says what root's last `9f` answer said: nothing waits,
@@ -1272,14 +1353,16 @@ mod tests {
             assert_eq!(row(answer), text);
             assert!(text.len() <= layout(320, 200).1, "{text}");
             assert!(text.bytes().all(ui::is_mapped), "{text}");
-            assert_eq!(
-                notice_rows(Notice::Menu(HostnameIntake::decode(answer).unwrap()))
-                    .iter()
-                    .rev()
-                    .nth(2)
-                    .map(String::as_str),
-                Some(text)
-            );
+            // Shown, above `S` and power, unless nothing waits, nothing was
+            // denied and the intake works.
+            let shown = notice_rows(Notice::Menu(HostnameIntake::decode(answer).unwrap()));
+            let h = shown.iter().rev().nth(2).map(String::as_str);
+            if answer == [0x9f, 0, 0] {
+                assert_eq!(h, Some("B: ROLL BACK TO THE PREVIOUS SYSTEM"));
+                assert!(!shown.iter().any(|row| row.starts_with("H:")));
+            } else {
+                assert_eq!(h, Some(text));
+            }
         }
         assert_eq!(
             notice_rows(Notice::HostnameSaved),
@@ -1918,8 +2001,9 @@ mod tests {
                 .enumerate()
                 .collect();
             assert_eq!(rows[4], (4, "I: REVIEW PENDING SYSTEM INSTALLATION".into()));
-            rows.push((11, text.into()));
-            rows.push((12, "ESC TO RETURN".into()));
+            let below = rows.len();
+            rows.push((below, text.into()));
+            rows.push((below + 1, "ESC TO RETURN".into()));
             let rows: Vec<(usize, &str)> =
                 rows.iter().map(|(at, row)| (*at, row.as_str())).collect();
             assert!(painted == expected(&rows), "menu {text}");
@@ -1964,7 +2048,7 @@ mod tests {
             Some(RESTARTING_NOTICE),
         );
         let inked = |y: usize| (0..width).any(|x| small[y * stride + x * 4] == 0xff);
-        // Fourteen rows at a 14-pixel pitch: the last foot ends at 189.
+        // Thirteen rows at a 16-pixel pitch: the last foot ends at 199.
         assert!(inked(0) && (180..200).any(inked) && !inked(199));
     }
 

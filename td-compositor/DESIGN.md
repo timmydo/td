@@ -6117,12 +6117,24 @@ client directory. A bare readiness filename without a directory is refused.
 
 ## Physical secure attention
 
-**The menu's rows.** Below the title, 36 pixels apart on 1280x800 (title
-at 276): `U: UPDATE FROM TRUSTED MAIN` at 312, `V: CREDENTIAL STORE` at
-348, `W` at 384, `I` at 420, `K` at 456, `L` at 492, `B` at 528, `H` at
-564, `S` at 600, the power row at 636 and `ESC TO RETURN` at 672. The
-twelve rows are 410 pixels tall at double scale and start at 176 on
-800x600; on 320x200 they close to a 17-pixel pitch from 0.
+**The menu's rows.** Below the title, in this order: `U: UPDATE FROM
+TRUSTED MAIN`, `V: CREDENTIAL STORE`, `W`, `I`, `K`, `L`, `B`, `H`, `S`,
+the power row and `ESC TO RETURN`. The menu draws only rows that apply,
+packed 36 pixels apart from 312 on 1280x800 (title at 276): `W` while a
+credential write waits, `I` while an installation waits, `B` while the
+selectors name a previous system, and `H` while a settings change waits,
+a request went unapproved or the intake refuses. The others always
+show. The first three come from root's `2f` answer (td-authd/DESIGN.md,
+"Elevation operations"), which the authority worker asks after `1f` on
+each turn and keeps beside it; until its first answer, and in the
+direct profile, `W`, `I` and `B` show. The menu reads both as it opens
+and keeps them for that lifetime. Only the drawing follows them: a
+hidden row's key still asks root, which says when nothing waits, so an
+answer a turn behind hides a row but never refuses a request that just
+arrived. With every row shown the twelve are 410 pixels tall at double
+scale, start at 176 on 800x600 and close to a 17-pixel pitch from 0 on
+320x200; any `af` answer other than `af` and a flag byte of bits 0 to 2
+ends the paired generation.
 
 **The update key.** A fresh physical `U` on the menu, under the menu's
 rules, selects trusted main's update with no prompt and no Enter
@@ -6961,21 +6973,21 @@ attention lifetime, never from a held key or a repeat. Both letters are
 modhex, so the exclusion of a security key's own keyboard above extends
 to them. On the lock surface neither selects, as no menu letter does.
 The menu shows `B: ROLL BACK TO THE PREVIOUS SYSTEM` below `L`'s row and
-the `H` row below that, so every row above keeps its place and only `ESC
-TO RETURN` moves down (item 5 of "Session lock and login-key entry"
-gives the places). The `H` row is root's last `1f` answer
+the `H` row below that, each only where it applies ("The menu's rows"
+gives the order and the rule). The `H` row is root's last `1f` answer
 (td-authd/DESIGN.md, "Elevation operations"), which the authority worker
 asks for on each turn of its loop and the menu reads as it opens,
-keeping it for that lifetime: `H: NO SETTINGS WAITING` or `H: REVIEW
-SETTINGS`, each followed by ` - N DENIED` while the count `1f` carries
-is not zero (td-authd/DESIGN.md, "Elevation operations", says which
+keeping it for that lifetime: `H: REVIEW SETTINGS`, or `H: NO SETTINGS
+WAITING` only while the count `1f` carries is not zero, each followed by
+` - N DENIED` while it is not (td-authd/DESIGN.md, "Elevation operations", says which
 requests it counts), or `H: REFUSED - SETTINGS BACKOFF UNUSABLE` while
-root cannot read or write the backoff. The settings intake queues a
+root cannot read or write the backoff; with nothing waiting, nothing
+denied and a working intake there is no row. The settings intake queues a
 hostname, time, extra-volume, admin-key, publisher or local
 admin-update request; the prompt's first line names which. Any other `1f`
 answer ends the paired generation; the direct profile, which has no
-authority, shows nothing waiting. The row is a notice: `H` asks root
-whatever it says, and root decides. Root's description must be the
+authority, shows no `H` row. The row is a notice: `H` asks root
+whatever it says, or whether it shows, and root decides. Root's description must be the
 selected operation for owner 1000; another elevation, another operation
 or another owner ends the paired generation, as a changed secret request
 does.
@@ -7196,7 +7208,7 @@ doubled only on an output of at least 800x600 as a prompt's Unifont
 is, and 18 scaled pixels apart. The first row keeps its long-standing
 place, `(height - 248) / 2`, wherever the whole block, the last row's
 foot included, fits below it, so the boot oracles' rows do not move (on
-1280x800 the title at 276, the notice at 312 and `I` at 420); only an
+1280x800 the title at 276 and the notice at 312); only an
 output too short for that moves the block up, as little as makes it
 fit. Rows that cannot all fit at that pitch even from the top close up
 to the output's height, never closer than the glyph's height and one

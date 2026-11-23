@@ -1026,11 +1026,15 @@ pub(crate) enum Queue {
 }
 
 /// Root's `9f` answer, which the attention menu's `H` row shows: the queue
-/// and the intake's consecutive unapproved requests.
+/// and the intake's consecutive unapproved requests; and its `af`, which of
+/// the menu's other conditional rows apply (td-authd/DESIGN.md, `2f`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct HostnameIntake {
     queue: Queue,
     denied: u8,
+    /// `af`'s flag byte; unknown, before an answer or in the direct
+    /// profile, every row shows.
+    rows: Option<u8>,
 }
 
 impl HostnameIntake {
@@ -1043,7 +1047,48 @@ impl HostnameIntake {
             [0x9f, 2, 0] => (Queue::Refusing, 0),
             _ => return Err("invalid hostname intake answer".into()),
         };
-        Ok(Self { queue, denied })
+        Ok(Self {
+            queue,
+            denied,
+            rows: None,
+        })
+    }
+
+    /// With root's `af` answer: exactly `af` and a flag byte of bits 0 to
+    /// 2; anything else ends the paired generation.
+    pub(crate) fn with_rows(self, answer: &[u8]) -> Result<Self, String> {
+        match answer {
+            [0xaf, flags] if flags & !7 == 0 => Ok(Self {
+                rows: Some(*flags),
+                ..self
+            }),
+            _ => Err("invalid menu state answer".into()),
+        }
+    }
+
+    fn row(self, bit: u8) -> bool {
+        self.rows.is_none_or(|flags| flags & bit != 0)
+    }
+
+    /// `I`: an installation waits.
+    pub(crate) fn install(self) -> bool {
+        self.row(1)
+    }
+
+    /// `W`: a credential write waits.
+    pub(crate) fn write(self) -> bool {
+        self.row(2)
+    }
+
+    /// `B`: there is a previous system to roll back to.
+    pub(crate) fn previous(self) -> bool {
+        self.row(4)
+    }
+
+    /// `H`: a change waits, the intake refuses, or requests went
+    /// unapproved, whose count must stay in sight.
+    pub(crate) fn settings(self) -> bool {
+        self.queue != Queue::Empty || self.denied != 0
     }
 
     pub(crate) fn queue(self) -> Queue {
@@ -1078,9 +1123,10 @@ impl Hostnames {
         Ok(())
     }
 
-    /// Asks root's `1f` and keeps the answer.
+    /// Asks root's `1f` and `2f` and keeps the answers.
     fn follow(&self, wire: &mut impl Exchange) -> Result<(), String> {
-        self.set(HostnameIntake::decode(&wire.exchange(&[0x1f])?)?);
+        let intake = HostnameIntake::decode(&wire.exchange(&[0x1f])?)?;
+        self.set(intake.with_rows(&wire.exchange(&[0x2f])?)?);
         Ok(())
     }
 }
@@ -2629,6 +2675,7 @@ mod tests {
             vec![0x83],
             vec![0xad],
             vec![0x9f, 0, 0],
+            vec![0xaf, 0],
             vec![0x85, 2],
         ])));
         let application = Application::default();
@@ -2657,6 +2704,7 @@ mod tests {
                 vec![3],
                 vec![0x2d, 1],
                 vec![0x1f],
+                vec![0x2f],
                 b"\x0ffirefox".to_vec()
             ]
         );
@@ -2765,11 +2813,23 @@ mod tests {
         ] {
             let intake = HostnameIntake::decode(&answer).unwrap();
             assert_eq!((intake.queue(), intake.denied()), (queue, denied));
+            // Unknown rows show; root's answer gives them.
+            assert!(intake.install() && intake.write() && intake.previous());
+            assert_eq!(intake.settings(), queue != Queue::Empty || denied != 0);
             let hostnames = Hostnames::default();
-            let mut wire = wire(vec![answer]);
+            let mut wire = wire(vec![answer, vec![0xaf, 5]]);
             hostnames.follow(&mut wire).unwrap();
-            assert_eq!(wire.requests, [vec![0x1f]]);
-            assert_eq!(hostnames.current(), intake);
+            assert_eq!(wire.requests, [vec![0x1f], vec![0x2f]]);
+            let followed = hostnames.current();
+            assert_eq!(followed, intake.with_rows(&[0xaf, 5]).unwrap());
+            assert!(followed.install() && !followed.write() && followed.previous());
+        }
+        for answer in [vec![0xaf], vec![0xaf, 8], vec![0xaf, 0, 0], vec![0x9f, 0]] {
+            assert!(HostnameIntake::default().with_rows(&answer).is_err());
+            let hostnames = Hostnames::default();
+            assert!(hostnames
+                .follow(&mut wire(vec![vec![0x9f, 0, 0], answer]))
+                .is_err());
         }
         for answer in [
             vec![],
@@ -2935,6 +2995,7 @@ mod tests {
             vec![0x83],
             vec![0xad],
             vec![0x9f, 0, 0],
+            vec![0xaf, 0],
             b"\x88\x00".to_vec(),
         ]);
         assert!(worker(
@@ -3163,6 +3224,7 @@ checked=never\nrefused=none\nprogress=none\n";
             vec![0x83],
             vec![0xad],
             vec![0x9f, 0, 0],
+            vec![0xaf, 0],
         ]);
         assert!(worker(
             &mut script,
@@ -3184,7 +3246,8 @@ checked=never\nrefused=none\nprogress=none\n";
                 b"\x24\x01firefox".to_vec(),
                 vec![3],
                 vec![0x2d, 1],
-                vec![0x1f]
+                vec![0x1f],
+                vec![0x2f]
             ]
         );
         // A malformed answer ends the generation.
@@ -3583,6 +3646,7 @@ checked=never\nrefused=none\nprogress=none\n";
             vec![0x8a, 3],
             vec![0x83],
             vec![0x9f, 0, 0],
+            vec![0xaf, 0],
         ]);
         assert!(worker(
             &mut script,

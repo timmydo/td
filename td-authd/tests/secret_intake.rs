@@ -223,6 +223,7 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
     let mut intake = Intake::bind(1000).unwrap();
+    assert!(!intake.waiting());
     assert!(intake.select().is_err());
     let metadata = fs::symlink_metadata(SOCKET).unwrap();
     assert_eq!(
@@ -274,7 +275,9 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
                     .is_some_and(|pending| pending.acknowledged));
                 assert_eq!(uid, 1000, "nonhuman requester reached admission");
                 assert!(!captured);
+                assert!(intake.waiting());
                 let (operation, credential) = intake.select().unwrap();
+                assert!(!intake.waiting());
                 assert_eq!(credential.0, b"exact credential\nbytes\0");
                 let role = if recovery {
                     Role::Recovery

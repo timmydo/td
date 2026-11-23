@@ -14,22 +14,21 @@ use super::*;
 const RECORD: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "RECORD DAMAGED"];
 const UNREADABLE: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT BE READ"];
 /// The attention menu, as the update oracle reads it from 276: its
-/// selections 36 apart, and its last row five lower than other screens'.
-/// No settings change waits on this guest.
+/// selections 36 apart. Nothing waits on this guest, so `W`, `I` and `H`
+/// are not drawn; `B` is where the selectors name a previous system
+/// (`ROLLBACK`).
 const MENU: &[&str] = &[
     "TD SECURE ATTENTION",
     "U: UPDATE FROM TRUSTED MAIN",
     "V: CREDENTIAL STORE",
-    "W: REVIEW PENDING CREDENTIAL WRITE",
-    "I: REVIEW PENDING SYSTEM INSTALLATION",
     "K: LOGIN KEYS",
     "L: LOCK SCREEN",
-    "B: ROLL BACK TO THE PREVIOUS SYSTEM",
-    "H: NO SETTINGS WAITING",
     "S: DISK ENCRYPTION",
     "R: REBOOT  P: POWER OFF  Z: SLEEP",
     "ESC TO RETURN",
 ];
+/// `B`, below `L`, when a previous system exists.
+const ROLLBACK: &str = "B: ROLL BACK TO THE PREVIOUS SYSTEM";
 /// Every phase boots within this, its locked phase's steps included.
 const PHASE_TIMEOUT: Duration = Duration::from_secs(1800);
 
@@ -67,17 +66,25 @@ fn unreadable(pixels: &[u8], arguments: &[&str]) -> Result<bool, String> {
     chrome(pixels, &attention(UNREADABLE))
 }
 
-fn menu_rows() -> Vec<(usize, String)> {
-    MENU.iter()
+fn menu_rows(rollback: bool) -> Vec<(usize, String)> {
+    let (above, below) = MENU.split_at(5);
+    above
+        .iter()
+        .copied()
+        .chain(rollback.then_some(ROLLBACK))
+        .chain(below.iter().copied())
         .enumerate()
         .map(|(index, row)| (CHROME_TOP + index * CHROME_PITCH, row.to_string()))
         .collect()
 }
 
-/// Exactly the menu's rows on the ground.
+/// Exactly the menu's rows on the ground, `B` among them or not.
 fn menu(pixels: &[u8], arguments: &[&str]) -> Result<bool, String> {
     bare(arguments)?;
-    let rows = menu_rows();
+    Ok(menu_drawn(pixels, &menu_rows(false))? || menu_drawn(pixels, &menu_rows(true))?)
+}
+
+fn menu_drawn(pixels: &[u8], rows: &[(usize, String)]) -> Result<bool, String> {
     for (y, row) in rows_of(pixels)?.enumerate() {
         if rows
             .iter()
@@ -89,7 +96,7 @@ fn menu(pixels: &[u8], arguments: &[&str]) -> Result<bool, String> {
             return Ok(false);
         }
     }
-    for (top, text) in &rows {
+    for (top, text) in rows {
         if !super::super::update::menu_row_matches(pixels, *top, text)? {
             return Ok(false);
         }
@@ -888,12 +895,25 @@ mod tests {
             assert_eq!(locked(&surface, &[]), Ok(false));
             assert!(blank_or_lock(&surface).unwrap() && blank_or_lock(&notice).unwrap());
         }
-        let drawable = menu_rows();
+        let drawable = menu_rows(false);
         let menu_frame = frame(&drawable);
         assert_eq!(menu(&menu_frame, &[]), Ok(true));
+        // `B` below `L`, the rows under it one lower.
+        let rollback = menu_rows(true);
+        assert_eq!(rollback.len(), drawable.len() + 1);
+        assert_eq!(menu(&frame(&rollback), &[]), Ok(true));
         let mut without_l = drawable.clone();
         without_l.retain(|(_, text)| !text.starts_with("L:"));
         assert_eq!(menu(&frame(&without_l), &[]), Ok(false));
+        // `B` drawn where `S` belongs, in neither layout.
+        let mut misplaced = drawable.clone();
+        if let Some(row) = misplaced
+            .iter_mut()
+            .find(|(_, text)| text.starts_with("S:"))
+        {
+            row.1 = ROLLBACK.into();
+        }
+        assert_eq!(menu(&frame(&misplaced), &[]), Ok(false));
         assert_eq!(menu(&enrolled, &[]), Ok(false));
         assert!(menu(&menu_frame, &["extra"]).is_err());
         let refused = frame(&attention(&["UPDATE CANNOT READ LOGIN KEYS"]));

@@ -2621,6 +2621,34 @@ fn the_menus_update_admits_by_table_and_reports_its_submission() {
     session.close_with(|_| fixture("cleanup_child")).unwrap();
 }
 
+/// Request `2f`: which of the menu's conditional rows apply, beside any
+/// operation. With no intake bound nothing waits; bit 2 follows the
+/// selectors, which must name two deployments.
+#[test]
+fn the_menu_state_names_what_waits_and_a_previous_system() {
+    use crate::rollback::tests::volume;
+    assert_eq!(Request::decode(&[0x2f]).unwrap(), Request::MenuState);
+    assert!(Request::decode(&[0x2f, 0]).is_err());
+    assert!(!Request::MenuState.takes_slot());
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    let pair = volume(&a, &b);
+    let one = volume(&a, &a);
+    let mut session = quiet();
+    assert_eq!(session.menu_state(pair.path()), [0xaf, 4]);
+    assert_eq!(session.menu_state(one.path()), [0xaf, 0]);
+    let absent = pair.path().join("absent");
+    assert_eq!(session.menu_state(&absent), [0xaf, 0]);
+    // Bit 0: a queued installation, until it lapses.
+    use crate::deployment::tests::{expire, queued, Fixture};
+    let update = Fixture::new();
+    let (intake, _requester) = queued(&update);
+    session.installations = Some(intake);
+    assert_eq!(session.menu_state(&absent), [0xaf, 1]);
+    assert_eq!(session.menu_state(pair.path()), [0xaf, 5]);
+    expire(session.installations.as_mut().unwrap());
+    assert_eq!(session.menu_state(&absent), [0xaf, 0]);
+}
+
 #[test]
 fn notebook_lock_is_idempotent_and_takes_no_operation_slot() {
     let mut session = quiet();

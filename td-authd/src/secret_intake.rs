@@ -353,6 +353,19 @@ impl Intake {
         Ok(captured)
     }
 
+    /// Whether an acknowledged, complete write waits for `W`, its
+    /// requester alive: the menu's `W` row (`2f`), after the session's
+    /// tick. Changes nothing.
+    pub fn waiting(&self) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            pending.acknowledged
+                && !pending.selected
+                && pending.operation.is_some()
+                && pending.descriptor.is_some()
+                && pending.live().is_ok()
+        })
+    }
+
     pub fn selected_alive(&self) -> bool {
         self.pending
             .as_ref()

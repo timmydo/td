@@ -560,7 +560,9 @@ impl Guest {
     }
 
     /// Ctrl+Alt+Esc until the menu's `H` row reads `row`, which follows
-    /// root's intake within a heartbeat; the menu is left open.
+    /// root's intake within a heartbeat; the menu is left open. `H` sits
+    /// just above `S`; `HOSTNAME_EMPTY` with nothing denied is no row, so
+    /// `L` or `B` is there instead.
     fn hostname_menu(&mut self, path: &Path, row: &str) -> Result<()> {
         for _ in 0..10 {
             // A chord while a screen still closes would close it again.
@@ -583,16 +585,28 @@ impl Guest {
                 Duration::from_secs(20),
                 "secure-attention menu",
                 |pixels| {
-                    shown = menu_row_matches(pixels, HOSTNAME_ROW, row)?;
+                    let Some(disk) = menu_slot(pixels, "S: DISK ENCRYPTION")? else {
+                        return Ok(false);
+                    };
+                    let above = menu_top(disk.saturating_sub(1));
+                    shown = disk > 0
+                        && if row == HOSTNAME_EMPTY {
+                            menu_row_matches(pixels, above, "L: LOCK SCREEN")?
+                                || menu_row_matches(
+                                    pixels,
+                                    above,
+                                    "B: ROLL BACK TO THE PREVIOUS SYSTEM",
+                                )?
+                        } else {
+                            menu_row_matches(pixels, above, row)?
+                        };
                     Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
-                        && menu_row_matches(pixels, 528, "B: ROLL BACK TO THE PREVIOUS SYSTEM")?
-                        && menu_row_matches(pixels, HOSTNAME_ROW + 36, "S: DISK ENCRYPTION")?
                         && menu_row_matches(
                             pixels,
-                            HOSTNAME_ROW + 72,
+                            menu_top(disk + 1),
                             "R: REBOOT  P: POWER OFF  Z: SLEEP",
                         )?
-                        && menu_row_matches(pixels, HOSTNAME_ROW + 108, "ESC TO RETURN")?)
+                        && menu_row_matches(pixels, menu_top(disk + 2), "ESC TO RETURN")?)
                 },
             )?;
             if shown {
@@ -733,7 +747,9 @@ impl Guest {
     }
 
     /// Ctrl+Alt+Esc, the menu, and `I`: the installation prompt for
-    /// exactly deployment `id`, asking for Enter.
+    /// exactly deployment `id`, asking for Enter. `I` goes whether or not
+    /// its row is drawn yet: the row follows root a worker turn behind, and
+    /// the key asks root either way.
     fn prompt(&mut self, id: &str, path: &Path) -> Result<()> {
         self.key(&["ctrl", "alt", "esc"])?;
         let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
@@ -1055,9 +1071,8 @@ const APPROVAL_WAIT: Duration = Duration::from_millis(700);
 const OTHER_KEY: &str = "q";
 const BUSY_NOTICE: &str = "PREVIOUS REQUEST IS STILL FINISHING";
 const ROLLED_BACK_NOTICE: &str = "ROLLED BACK - RESTART TO BOOT IT";
-/// The menu's `H` row, below `B` (td-compositor/DESIGN.md, "Elevation
-/// consent"), and its two queue states.
-const HOSTNAME_ROW: usize = 564;
+/// The menu's `H` row's two queue states (td-compositor/DESIGN.md, "The
+/// menu's rows"): the empty one is drawn only with a denial count.
 const HOSTNAME_EMPTY: &str = "H: NO SETTINGS WAITING";
 const HOSTNAME_WAITING: &str = "H: REVIEW SETTINGS";
 const NO_HOSTNAME_NOTICE: &str = "NO SETTINGS CHANGE IS READY";
@@ -1912,6 +1927,26 @@ fn chrome_glyph(character: u8) -> Result<&'static [u8; 7]> {
         .ok_or_else(|| "missing chrome glyph".to_string())
 }
 
+/// The menu's selections: the first at 312, 36 apart, as many as the
+/// fullest menu has with its Escape row. Rows that do not apply are not
+/// drawn, so those below them move up (td-compositor/DESIGN.md, "The
+/// menu's rows").
+const MENU_SLOTS: usize = 12;
+
+fn menu_top(slot: usize) -> usize {
+    312 + slot * 36
+}
+
+/// The selection slot showing exactly `text`, if any.
+pub(super) fn menu_slot(pixels: &[u8], text: &str) -> Result<Option<usize>> {
+    for slot in 0..MENU_SLOTS {
+        if menu_row_matches(pixels, menu_top(slot), text)? {
+            return Ok(Some(slot));
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
     if text.len() > 102 || top > 800 - 14 {
         return Err("menu row does not fit the display".into());
@@ -2092,11 +2127,14 @@ fn menu_matches(bytes: &[u8]) -> Result<bool> {
     menu_pixels_match(ppm(bytes)?)
 }
 
-/// Whether a capture's pixels are the attention menu offering a pending
-/// installation.
+/// Whether a capture's pixels are the attention menu: its title and its
+/// first row, which every menu draws. The conditional rows below it are
+/// a worker turn behind root, and their keys ask root whether or not
+/// they are drawn (td-compositor/DESIGN.md, "The menu's rows"), so no
+/// caller waits on one.
 pub(super) fn menu_pixels_match(pixels: &[u8]) -> Result<bool> {
     Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
-        && menu_row_matches(pixels, 420, "I: REVIEW PENDING SYSTEM INSTALLATION")?)
+        && menu_row_matches(pixels, menu_top(0), "U: UPDATE FROM TRUSTED MAIN")?)
 }
 
 /// Whether a capture's pixels are the trusted installation prompt for
@@ -2286,12 +2324,14 @@ mod tests {
             (
                 276,
                 "TD SECURE ATTENTION",
-                "397854906d2ca6aee82037ec663f1339a0a2b29569e813eab7252652b6063bed",
+                Some("397854906d2ca6aee82037ec663f1339a0a2b29569e813eab7252652b6063bed"),
             ),
+            // The menu's first row, which every menu draws.
+            (312, "U: UPDATE FROM TRUSTED MAIN", None),
             (
                 420,
                 "I: REVIEW PENDING SYSTEM INSTALLATION",
-                "aa378e2216f5d66058da6da5b203f0e4c3da804f3bd82dec032dbe542ab9ecf9",
+                Some("aa378e2216f5d66058da6da5b203f0e4c3da804f3bd82dec032dbe542ab9ecf9"),
             ),
         ] {
             for (column, character) in text.chars().enumerate() {
@@ -2319,16 +2359,27 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(
-                td_engine::sha256::hex_digest(&pixels[top * 3840..(top + 14) * 3840]),
-                captured
-            );
+            if let Some(captured) = captured {
+                assert_eq!(
+                    td_engine::sha256::hex_digest(&pixels[top * 3840..(top + 14) * 3840]),
+                    captured
+                );
+            }
         }
         let mut bytes = b"P6\n1280 800\n255\n".to_vec();
         bytes.extend_from_slice(&pixels);
         assert!(menu_matches(&bytes).unwrap());
-        let entry = b"P6\n1280 800\n255\n".len() + 420 * 3840;
-        bytes[entry..entry + 14 * 3840].fill(0);
+        assert_eq!(
+            menu_slot(&pixels, "I: REVIEW PENDING SYSTEM INSTALLATION").unwrap(),
+            Some(3)
+        );
+        assert_eq!(menu_slot(&pixels, "K: LOGIN KEYS").unwrap(), None);
+        // The menu is up with no `I` row, as on a guest where nothing
+        // waits to install; not without its first row.
+        let header = b"P6\n1280 800\n255\n".len();
+        bytes[header + 420 * 3840..header + 434 * 3840].fill(0);
+        assert!(menu_matches(&bytes).unwrap());
+        bytes[header + 312 * 3840..header + 326 * 3840].fill(0);
         assert!(!menu_matches(&bytes).unwrap());
     }
 

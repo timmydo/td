@@ -50,9 +50,9 @@ const CLEANUP_TIME: Duration = Duration::from_secs(2);
 /// as for the settings intake's approved update.
 const UPDATE_SUBMIT: Duration = Duration::from_secs(15);
 
-/// Root's `ae` answer to `2e`: one reply, so one allocation site.
-fn update_reply(byte: u8) -> Vec<u8> {
-    vec![0xae, byte]
+/// A two-byte answer, `2e`'s `ae` and `2f`'s `af`: one allocation site.
+fn short_reply(code: u8, byte: u8) -> Vec<u8> {
+    vec![code, byte]
 }
 
 /// The attention menu's `U`: trusted main built and installed with no
@@ -103,6 +103,8 @@ pub(crate) enum Request {
     Update,
     /// `2e 01`: whether that update's submission finished.
     UpdateStatus,
+    /// `2f`: which of the menu's conditional rows apply.
+    MenuState,
 }
 
 impl Request {
@@ -146,6 +148,7 @@ impl Request {
             [0x26] => Ok(Self::SuspendStatus),
             [0x2e, 0] => Ok(Self::Update),
             [0x2e, 1] => Ok(Self::UpdateStatus),
+            [0x2f] => Ok(Self::MenuState),
             [0x21, choice] => Ok(Self::Power(crate::consent::Power::decode(*choice)?)),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
@@ -579,6 +582,11 @@ impl Session {
                 self.tick()?;
                 self.update_status()
             }
+            // Beside any operation: the menu's rows read it.
+            Request::MenuState => {
+                self.tick()?;
+                Ok(self.menu_state(Path::new(crate::login_tier::VOLUME)))
+            }
             // Beside any operation: the menu's row reads it.
             Request::HostnameState => {
                 self.tick()?;
@@ -796,7 +804,7 @@ impl Session {
             || self.inspection.is_some()
             || self.updating.is_some()
         {
-            return Ok(update_reply(1));
+            return Ok(short_reply(0xae, 1));
         }
         // A live boot has no installed system to update.
         if self.setup.is_some()
@@ -804,15 +812,35 @@ impl Session {
                 table.grants(self.owner, crate::elevation::Operation::AdminUpdate)
             })
         {
-            return Ok(update_reply(2));
+            return Ok(short_reply(0xae, 2));
         }
         match start() {
             Ok(helper) => {
                 self.updating = Some(helper);
-                Ok(update_reply(0))
+                Ok(short_reply(0xae, 0))
             }
-            Err(_) => Ok(update_reply(3)),
+            Err(_) => Ok(short_reply(0xae, 3)),
         }
+    }
+
+    /// `2f`: `af` and a flag byte, bit 0 an installation waits for `I`,
+    /// bit 1 a credential write waits for `W`, bit 2 the selectors name a
+    /// previous system for `B`. It grants nothing: each selection checks
+    /// again. The caller ticks first; reading the intakes changes neither.
+    fn menu_state(&self, volume: &Path) -> Vec<u8> {
+        let install = self
+            .installations
+            .as_ref()
+            .is_some_and(crate::deployment::Intake::waiting);
+        let write = self
+            .intake
+            .as_ref()
+            .is_some_and(crate::secret_intake::Intake::waiting);
+        let previous = crate::rollback::Selectors::read(volume).is_ok();
+        short_reply(
+            0xaf,
+            u8::from(install) | u8::from(write) << 1 | u8::from(previous) << 2,
+        )
     }
 
     /// `2e 01`: `ae 00` while `td-admin submit` runs, `ae 04` once it
@@ -820,13 +848,13 @@ impl Session {
     /// when none was started.
     fn update_status(&mut self) -> Result<Vec<u8>, String> {
         let Some(helper) = &mut self.updating else {
-            return Ok(update_reply(3));
+            return Ok(short_reply(0xae, 3));
         };
         let Some(result) = helper.finished()? else {
-            return Ok(update_reply(0));
+            return Ok(short_reply(0xae, 0));
         };
         self.updating = None;
-        Ok(update_reply(if result.is_some() { 4 } else { 3 }))
+        Ok(short_reply(0xae, if result.is_some() { 4 } else { 3 }))
     }
 
     fn power(

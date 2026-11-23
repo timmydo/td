@@ -200,6 +200,13 @@ pub(crate) fn hurry(intake: &mut Intake, give_up: Duration) {
     pending.ready.as_mut().unwrap().give_up = give_up;
 }
 
+/// Ends `intake`'s queued update by its deadline. A dropped requester is
+/// no substitute in this binary: a helper another test forks meanwhile
+/// can hold the socket's other end, so its close is not seen in time.
+pub(crate) fn expire(intake: &mut Intake) {
+    intake.pending.as_mut().unwrap().deadline = Some(Instant::now());
+}
+
 #[test]
 fn a_queued_update_reads_its_marker_through_the_held_directory() {
     use crate::login_tier::tests::{bundle, fifo, initramfs, marker};
@@ -325,6 +332,33 @@ fn real_transport_admits_only_one_bounded_descriptor_free_frame() {
     assert!(pending.poll(unasked).is_err());
     let mut greeting = [0; 8];
     client.read_exact(&mut greeting).unwrap();
+}
+
+/// The menu's `I` row (`2f`): an acknowledged update waits until it is
+/// selected or its requester leaves, and asking selects nothing.
+#[test]
+fn a_queued_update_waits_until_selected_or_its_requester_leaves() {
+    let fixture = Fixture::new();
+    let (mut intake, _client) = queued(&fixture);
+    assert!(intake.waiting());
+    assert!(intake.waiting());
+    let _ready = intake.select().unwrap();
+    assert!(!intake.waiting());
+    intake.finish(false);
+    assert!(!intake.waiting());
+    // A requester that breaks the protocol: the intake's tick, which the
+    // session runs before `2f`, drops it.
+    let fixture = Fixture::new();
+    let (mut intake, mut client) = queued(&fixture);
+    client.write_all(&[0]).unwrap();
+    assert!(intake.waiting());
+    intake.tick();
+    assert!(!intake.waiting());
+    // One past its deadline no longer waits, tick or not.
+    let fixture = Fixture::new();
+    let (mut intake, _client) = queued(&fixture);
+    expire(&mut intake);
+    assert!(!intake.waiting());
 }
 
 #[test]
