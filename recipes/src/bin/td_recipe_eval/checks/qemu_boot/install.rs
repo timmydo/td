@@ -2029,6 +2029,7 @@ pub(super) fn session_steps(
         ),
         report: SESSION_IDENTITY.into(),
         accepts: Box::new(move |payload| payload == identity),
+        qmp: None,
     }];
     // From the home itself, which a bare `cd` reaches from / only through
     // the session's HOME (td-sh takes an unset one as `.`); the image has
@@ -2045,6 +2046,7 @@ pub(super) fn session_steps(
             ),
             report: SESSION_HOME.into(),
             accepts: Box::new(move |payload| session_home(payload, &nonce).is_some()),
+            qmp: None,
         }),
         Some(kept) => {
             let kept = kept.to_string();
@@ -2054,6 +2056,7 @@ pub(super) fn session_steps(
                 accepts: Box::new(move |payload| {
                     session_home(payload, &nonce).is_some_and(|inode| inode == kept)
                 }),
+                qmp: None,
             });
         }
     }

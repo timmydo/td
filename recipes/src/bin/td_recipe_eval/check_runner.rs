@@ -783,6 +783,10 @@ const ORACLES: &[(&str, &[&str])] = &[
         "qemu-boot-audio",
         &["system-x86-64", "td-btrfs", "td-jail-seccomp-probe"],
     ),
+    (
+        "qemu-boot-audio-hotplug",
+        &["system-x86-64", "td-btrfs", "td-jail-seccomp-probe"],
+    ),
     ("qemu-deploy-rollback", &["system-x86-64", "td-btrfs"]),
     (
         "qemu-admin-update",
@@ -925,6 +929,20 @@ pub fn qemu_boot_audio_cli(args: &[String]) -> Result<(), String> {
     }
     oracle_host(false)?;
     system_oracle("qemu-boot-audio", crate::checks::qemu_boot::run_audio)
+}
+
+/// `qemu-boot-audio-hotplug`: td-audio follows a USB output plugged in,
+/// out and back in while it runs. Host-side only, like every QEMU oracle.
+pub fn qemu_boot_audio_hotplug_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    if args.len() > 1 || args.first().is_some_and(|value| value != STEM) {
+        return Err("usage: qemu-boot-audio-hotplug [system-x86-64]".into());
+    }
+    oracle_host(false)?;
+    system_oracle(
+        "qemu-boot-audio-hotplug",
+        crate::checks::qemu_boot::run_audio_hotplug,
+    )
 }
 
 /// `deploy-rollback` approved by Enter (td-authd/DESIGN.md, "Elevation
@@ -11637,6 +11655,7 @@ chmod 755 '{}'
             "qemu_deploy_rollback_cli",
             "qemu_admin_update_cli",
             "qemu_boot_audio_cli",
+            "qemu_boot_audio_hotplug_cli",
             "qemu_install_cli",
             "qemu_install_encrypted_cli",
             "qemu_install_system_cli",

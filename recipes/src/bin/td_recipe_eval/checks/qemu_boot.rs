@@ -3072,6 +3072,11 @@ const SWITCH_USB_SINK: &str = "audio-0";
 const SWITCH_OUTPUTS_REPORT: &str = "TD-AUDIO-OUTPUTS";
 const SWITCH_PLAYED_REPORT: &str = "TD-AUDIO-SWITCHED";
 
+/// Where in `dir` the two outputs' captures go.
+fn switch_captures(dir: &Path) -> (PathBuf, PathBuf) {
+    (dir.join(SWITCH_HDA_WAV), dir.join(SWITCH_USB_WAV))
+}
+
 /// The guest's half of `qemu-boot-audio`, typed on ttyS0 as the primary
 /// account, which td-audio admits as a controller. First, once the daemon
 /// answers, it must list both outputs, HDA as output 0 (the default,
@@ -3092,6 +3097,7 @@ fn audio_switch_steps() -> Vec<serial_shell::ShellStep> {
             ),
             report: SWITCH_OUTPUTS_REPORT.into(),
             accepts: Box::new(|payload| switch_outputs_listed(payload).is_ok()),
+            qmp: None,
         },
         serial_shell::ShellStep {
             command: format!(
@@ -3103,6 +3109,7 @@ fn audio_switch_steps() -> Vec<serial_shell::ShellStep> {
             ),
             report: SWITCH_PLAYED_REPORT.into(),
             accepts: Box::new(|payload| switch_played(payload).is_ok()),
+            qmp: None,
         },
     ]
 }
@@ -3144,10 +3151,23 @@ fn switch_played(payload: &str) -> Result<(), String> {
     let Some((switch, play)) = payload.split_once("| ") else {
         return Err(format!("the switch report has no `| `: {payload:?}"));
     };
-    let frames = SWITCH_TONE_MS * u64::from(FIREFOX_AUDIO_RATE) / 1_000;
     let switched = switch
         .split_whitespace()
         .eq(["output", SWITCH_USB_SINK, "exit", "0"]);
+    if switched && played_whole(play, SWITCH_TONE_MS) {
+        Ok(())
+    } else {
+        Err(format!(
+            "td-audio output printed {switch:?} and td-audio play printed {play:?}"
+        ))
+    }
+}
+
+/// What `td-audio play` printed, with its exit status: the stream sent all
+/// `tone_ms` of the tone and drained it with nothing dropped, and saw no
+/// seam: one `STARTED` and no `UNDERFLOW` (§K.4).
+fn played_whole(play: &str, tone_ms: u64) -> bool {
+    let frames = tone_ms * u64::from(FIREFOX_AUDIO_RATE) / 1_000;
     // From the end: no seam and a clean exit, then the whole tone sent.
     let mut tail = play.split_whitespace().rev();
     let seamless = [
@@ -3170,14 +3190,7 @@ fn switch_played(payload: &str) -> Result<(), String> {
         .and_then(|count| count.parse::<u64>().ok())
         == Some(frames)
         && tail.next() == Some("frames");
-    let played = play.split_whitespace().next() == Some("stream") && seamless && whole;
-    if switched && played {
-        Ok(())
-    } else {
-        Err(format!(
-            "td-audio output printed {switch:?} and td-audio play printed {play:?}"
-        ))
-    }
+    play.split_whitespace().next() == Some("stream") && seamless && whole
 }
 
 /// `qemu-boot-audio`: the system's audio daemon switches a playing stream
@@ -3195,10 +3208,7 @@ pub(crate) fn run_audio(runner: &RecipeCheckRunner) -> Result<(), String> {
     let captures = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
     };
-    let (hda_wav, usb_wav) = (
-        captures.dir.join(SWITCH_HDA_WAV),
-        captures.dir.join(SWITCH_USB_WAV),
-    );
+    let (hda_wav, usb_wav) = switch_captures(&captures.dir);
     let steps = audio_switch_steps();
     println!(
         "   [qemu-boot-audio] {qemu} boots the system with HDA and USB audio outputs, plays a \
@@ -3225,7 +3235,11 @@ pub(crate) fn run_audio(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: true,
             physical_input: false,
             capture_firefox_audio: false,
-            audio_switch: Some((&hda_wav, &usb_wav)),
+            audio_switch: Some(AudioSwitch {
+                hda: &hda_wav,
+                usb: &usb_wav,
+                usb_at_boot: true,
+            }),
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -3298,6 +3312,332 @@ pub(crate) fn run_audio(runner: &RecipeCheckRunner) -> Result<(), String> {
     println!(
         "PASS: td-audio switched a playing stream from the HDA output to the USB output \
          mid-tone: {} ms then {} ms of the tone, and the player sent and drained all of it",
+        hda.evidence.active_ms, usb.evidence.active_ms
+    );
+    Ok(())
+}
+
+/// `qemu-boot-audio-hotplug`'s USB audio device, plugged in and out over
+/// QMP on the switch machine's own xHCI bus, under the one id.
+macro_rules! hotplug_usb_id {
+    () => {
+        "hotplug-audio"
+    };
+}
+/// QMP's `device_add` of that device, on the switch machine's USB bus and
+/// capture, and its `device_del`.
+const HOTPLUG_ADD: &str = concat!(
+    r#"{"execute":"device_add","arguments":{"driver":"usb-audio","id":""#,
+    hotplug_usb_id!(),
+    r#"","bus":"audio-xhci.0","audiodev":"audio1"}}"#
+);
+const HOTPLUG_DEL: &str = concat!(
+    r#"{"execute":"device_del","arguments":{"id":""#,
+    hotplug_usb_id!(),
+    r#""}}"#
+);
+
+/// The level the human sets on the USB output before it is unplugged, and
+/// the amplitude it stands for: the cube of its fraction on the protocol's
+/// taper (td-audio's `mixer::gain`), times QEMU's USB audio device's own
+/// level, 240 of its linear 255 at reset, which it calls 0 dB. HDA plays
+/// at full level through no such stage, so the USB capture's peak must be
+/// the HDA capture's times that, within `HOTPLUG_GAIN_SLACK`: the level
+/// came back in the audio, not only in what `td-audio volume` says.
+/// Measured on QEMU 10.2.1: 4819 of 10000, 0.4819 for 0.4819. 80% keeps
+/// the USB tone above the tone checks' peak floor; 40%, the first choice,
+/// put it at 602 of their 1000.
+const HOTPLUG_LEVEL: &str = "80%";
+const HOTPLUG_GAIN: f64 = 0.512 * 240.0 / 255.0;
+const HOTPLUG_GAIN_SLACK: f64 = 0.03;
+/// The tone played on the HDA output once the USB one is gone, and on the
+/// USB one once it is back, and the span each capture must hold. A tone
+/// played whole on one output is never longer than the tone; measured on
+/// QEMU 10.2.1 each capture is 17 to 29 ms short of it, and the floors
+/// allow 150 ms.
+const HOTPLUG_FALLBACK_TONE_MS: u64 = 1_500;
+const HOTPLUG_FALLBACK_MS: (u64, u64) = (1_350, HOTPLUG_FALLBACK_TONE_MS);
+const HOTPLUG_RETURN_TONE_MS: u64 = 2_000;
+const HOTPLUG_RETURN_MS: (u64, u64) = (1_850, HOTPLUG_RETURN_TONE_MS);
+/// How long a step waits, in tenths of a second, for the outputs to show
+/// the machine's change: the guest's USB enumeration, `td-seatd watch`
+/// handing the node to audio, and the daemon's rescan about a second
+/// later.
+const HOTPLUG_WAIT_TENTHS: u32 = 300;
+/// How long, in tenths of a second, the human's choice of the new output
+/// is tried again: listed from `/proc/asound/pcm`, it can be named before
+/// `td-seatd watch`'s next tick hands its node to audio, and until then a
+/// choice is refused as `ACCESS` (§K.4, "Hotplug"). The choice after the
+/// tries is the one reported.
+const HOTPLUG_CHOOSE_TENTHS: u32 = 50;
+/// The serial shell's reports.
+const HOTPLUG_BOOT_REPORT: &str = "TD-AUDIO-HOTPLUG-BOOT";
+const HOTPLUG_ADDED_REPORT: &str = "TD-AUDIO-HOTPLUG-ADDED";
+const HOTPLUG_CHOSEN_REPORT: &str = "TD-AUDIO-HOTPLUG-CHOSEN";
+const HOTPLUG_REMOVED_REPORT: &str = "TD-AUDIO-HOTPLUG-REMOVED";
+const HOTPLUG_RETURNED_REPORT: &str = "TD-AUDIO-HOTPLUG-RETURNED";
+const HOTPLUG_PLAYED_REPORT: &str = "TD-AUDIO-HOTPLUG-PLAYED";
+
+/// The guest's half of `qemu-boot-audio-hotplug`, typed on ttyS0 as the
+/// primary account, a controller. The machine boots with the HDA output
+/// alone. Plugged in, the USB output is listed and does not take over; the
+/// human chooses it and sets its level; unplugged, the daemon falls back to
+/// HDA, which plays a tone; plugged back in, it is listed under a new sink
+/// index and, as the human's latest choice, plays again at the level it
+/// left with, and plays a tone. Each wait polls `td-audio outputs` until
+/// the listing shows the change or `HOTPLUG_WAIT_TENTHS` runs out, and the
+/// report says what was listed either way. One line per command, as
+/// `audio_switch_steps`.
+fn audio_hotplug_steps() -> Vec<serial_shell::ShellStep> {
+    let dir = "/run/user/1000";
+    let usb = SWITCH_USB_SINK;
+    // Poll until the listing, newlines as `;`, matches `ready`'s case arm.
+    let wait = |ready: std::fmt::Arguments| {
+        format!(
+            "for i in $(seq {HOTPLUG_WAIT_TENTHS}); do td-audio outputs >{dir}/outputs 2>&1 && \
+             case \"$(tr '\\n' ';' <{dir}/outputs)\" in {ready};; esac; sleep 0.1; done; "
+        )
+    };
+    vec![
+        serial_shell::ShellStep {
+            command: format!(
+                "{}printf '\\n{HOTPLUG_BOOT_REPORT} %s\\n' \"$(tr '\\n' ';' <{dir}/outputs)\"",
+                wait(format_args!("*) break"))
+            ),
+            report: HOTPLUG_BOOT_REPORT.into(),
+            accepts: Box::new(|payload| {
+                hotplug_listed(payload, &[("0", SWITCH_HDA_SINK, "active")])
+            }),
+            qmp: None,
+        },
+        serial_shell::ShellStep {
+            command: format!(
+                "{}printf '\\n{HOTPLUG_ADDED_REPORT} %s\\n' \"$(tr '\\n' ';' <{dir}/outputs)\"",
+                wait(format_args!("*' {usb} '*) break"))
+            ),
+            report: HOTPLUG_ADDED_REPORT.into(),
+            accepts: Box::new(|payload| {
+                hotplug_listed(
+                    payload,
+                    &[
+                        ("0", SWITCH_HDA_SINK, "active"),
+                        ("1", SWITCH_USB_SINK, "-"),
+                    ],
+                )
+            }),
+            qmp: Some(HOTPLUG_ADD.into()),
+        },
+        serial_shell::ShellStep {
+            command: format!(
+                "for i in $(seq {HOTPLUG_CHOOSE_TENTHS}); do \
+                 td-audio output {usb} >/dev/null 2>&1 && break; sleep 0.1; done; \
+                 td-audio output {usb} >{dir}/chosen 2>&1; echo \"exit $?\" >>{dir}/chosen; \
+                 td-audio volume {HOTPLUG_LEVEL} >>{dir}/chosen 2>&1; \
+                 echo \"exit $?\" >>{dir}/chosen; \
+                 printf '\\n{HOTPLUG_CHOSEN_REPORT} %s\\n' \"$(tr '\\n' ' ' <{dir}/chosen)\""
+            ),
+            report: HOTPLUG_CHOSEN_REPORT.into(),
+            accepts: Box::new(|payload| {
+                payload.split_whitespace().eq([
+                    "output",
+                    SWITCH_USB_SINK,
+                    "exit",
+                    "0",
+                    "volume",
+                    HOTPLUG_LEVEL,
+                    "exit",
+                    "0",
+                ])
+            }),
+            qmp: None,
+        },
+        serial_shell::ShellStep {
+            command: format!(
+                "{}td-audio play {HOTPLUG_FALLBACK_TONE_MS} >{dir}/play 2>&1; \
+                 echo \"exit $?\" >>{dir}/play; \
+                 printf '\\n{HOTPLUG_REMOVED_REPORT} %s| %s\\n' \
+                 \"$(tr '\\n' ';' <{dir}/outputs)\" \"$(tr '\\n' ' ' <{dir}/play)\"",
+                wait(format_args!("*' {usb} '*) ;; *) break"))
+            ),
+            report: HOTPLUG_REMOVED_REPORT.into(),
+            accepts: Box::new(hotplug_fell_back),
+            qmp: Some(HOTPLUG_DEL.into()),
+        },
+        serial_shell::ShellStep {
+            command: format!(
+                "{}td-audio volume >{dir}/level 2>&1; echo \"exit $?\" >>{dir}/level; \
+                 printf '\\n{HOTPLUG_RETURNED_REPORT} %s| %s\\n' \
+                 \"$(tr '\\n' ';' <{dir}/outputs)\" \"$(tr '\\n' ' ' <{dir}/level)\"",
+                wait(format_args!("*' {usb} active '*) break"))
+            ),
+            report: HOTPLUG_RETURNED_REPORT.into(),
+            accepts: Box::new(hotplug_returned),
+            qmp: Some(HOTPLUG_ADD.into()),
+        },
+        serial_shell::ShellStep {
+            command: format!(
+                "td-audio play {HOTPLUG_RETURN_TONE_MS} >{dir}/play 2>&1; \
+                 echo \"exit $?\" >>{dir}/play; \
+                 printf '\\n{HOTPLUG_PLAYED_REPORT} %s\\n' \"$(tr '\\n' ' ' <{dir}/play)\""
+            ),
+            report: HOTPLUG_PLAYED_REPORT.into(),
+            accepts: Box::new(|payload| played_whole(payload, HOTPLUG_RETURN_TONE_MS)),
+            qmp: None,
+        },
+    ]
+}
+
+/// `td-audio outputs` as one line, `;` for each newline, is exactly
+/// `expected`: each output's sink index, name and state, in order, each
+/// with a description after them. A refused report is named whole by the
+/// serial shell, so these say only yes or no.
+fn hotplug_listed(payload: &str, expected: &[(&str, &str, &str)]) -> bool {
+    let mut lines = payload.split(';').filter(|line| !line.is_empty());
+    expected.iter().all(|(index, name, state)| {
+        lines.next().is_some_and(|line| {
+            line.split(' ').take(4).eq(["output", index, name, state])
+                && line.split(' ').count() > 4
+        })
+    }) && lines.next().is_none()
+}
+
+/// Unplugged, the USB output is gone and HDA plays: it alone is listed,
+/// active, and it played the fallback tone whole.
+fn hotplug_fell_back(payload: &str) -> bool {
+    payload.split_once("| ").is_some_and(|(listing, play)| {
+        hotplug_listed(listing, &[("0", SWITCH_HDA_SINK, "active")])
+            && played_whole(play, HOTPLUG_FALLBACK_TONE_MS)
+    })
+}
+
+/// Plugged back in, the USB output is offered under a sink index never
+/// used before and, as the human's latest choice, plays at the level it
+/// left with.
+fn hotplug_returned(payload: &str) -> bool {
+    payload.split_once("| ").is_some_and(|(listing, level)| {
+        hotplug_listed(
+            listing,
+            &[
+                ("0", SWITCH_HDA_SINK, "-"),
+                ("2", SWITCH_USB_SINK, "active"),
+            ],
+        ) && level
+            .split_whitespace()
+            .eq(["volume", HOTPLUG_LEVEL, "exit", "0"])
+    })
+}
+
+/// The USB tone's peak is the HDA tone's at `HOTPLUG_GAIN`, give or take
+/// `HOTPLUG_GAIN_SLACK` of it.
+fn hotplug_level_applied(hda_peak: i32, usb_peak: i32) -> Result<f64, String> {
+    let ratio = f64::from(usb_peak) / f64::from(hda_peak.max(1));
+    if hda_peak > 0 && (ratio / HOTPLUG_GAIN - 1.0).abs() <= HOTPLUG_GAIN_SLACK {
+        Ok(ratio)
+    } else {
+        Err(format!(
+            "the returned USB output played at {ratio:.3} of the HDA output's peak \
+             ({usb_peak}/{hda_peak}), not the {HOTPLUG_GAIN:.4} its {HOTPLUG_LEVEL} stands for \
+             (or QEMU's usb-audio no longer resets its own level to 240 of 255)"
+        ))
+    }
+}
+
+/// `qemu-boot-audio-hotplug`: td-audio follows a USB audio device plugged
+/// in, unplugged and plugged back in while the system runs (§K.4,
+/// "Hotplug"). The switch machine, its USB device left out at power-on and
+/// plugged over QMP between the serial shell's steps (`audio_hotplug_steps`).
+/// The HDA capture must hold the tone played after the unplug and the USB
+/// capture the tone played after the return, each passing the Firefox
+/// proof's tone checks with its own span, the USB one at its old level.
+pub(crate) fn run_audio_hotplug(runner: &RecipeCheckRunner) -> Result<(), String> {
+    let qemu = find_qemu()?;
+    let (bzimage, init_cpio, disk, _btrfs) = build_persistent_system(runner)?;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let captures = Scratch {
+        dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
+    };
+    let (hda_wav, usb_wav) = switch_captures(&captures.dir);
+    let steps = audio_hotplug_steps();
+    println!(
+        "   [qemu-boot-audio-hotplug] {qemu} boots the system with the HDA output, plugs a USB \
+         audio device in, out and back in over QMP, and plays a tone after each move\n              \
+         kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
+        bzimage.display(),
+        init_cpio.display(),
+        disk.display()
+    );
+    let result = boot(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        BootPlan {
+            disk: Some(BootDisk::new(&disk, false)),
+            seed: None,
+            cloud: None,
+            mem: SYSTEM_GUEST_MEMORY_MIB,
+            target_marker: GREETER_MARKER,
+            kill_on_marker: true,
+            extra_append: "",
+            user_net: false,
+            audio: true,
+            physical_input: false,
+            capture_firefox_audio: false,
+            audio_switch: Some(AudioSwitch {
+                hda: &hda_wav,
+                usb: &usb_wav,
+                usb_at_boot: false,
+            }),
+            tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
+            screens: None,
+            devices: Devices::ALL,
+            screen: None,
+            shell: Some(&steps),
+            host_login: None,
+        },
+        runner.scratch_dir(),
+    )?;
+    println!(
+        "   [qemu-boot-audio-hotplug] elapsed: {:.2}s",
+        result.elapsed.as_secs_f64()
+    );
+    for line in result.console.lines().filter(|line| {
+        let line = line.trim_start();
+        line.contains("audio: ") || line.starts_with("TD-AUDIO-HOTPLUG-")
+    }) {
+        println!("   [qemu-boot-audio-hotplug] guest: {}", line.trim());
+    }
+    // Killed at the marker, as `qemu-boot-audio`'s are.
+    let ceiling = firefox_audio_capture_ceiling(boot_timeout())?;
+    let hda = verify_tone_capture(&hda_wav, ceiling, HOTPLUG_FALLBACK_MS, true)
+        .map_err(|error| format!("the HDA output, after the unplug: {error}"))?;
+    let usb = verify_tone_capture(&usb_wav, ceiling, HOTPLUG_RETURN_MS, true)
+        .map_err(|error| format!("the USB output, after its return: {error}"))?;
+    for (name, tone) in [("HDA", &hda), ("USB", &usb)] {
+        let evidence = &tone.evidence;
+        println!(
+            "   [qemu-boot-audio-hotplug] {name}: frames {}..={}, {} ms, peak {}, fitted {:.2} \
+             Hz, AC RMS {:.1}/{:.1}, mean window correlations {:.4}/{:.4}",
+            tone.first,
+            tone.last,
+            evidence.active_ms,
+            evidence.peak,
+            evidence.fitted_hz,
+            evidence.left_ac_rms,
+            evidence.right_ac_rms,
+            evidence.left_correlation,
+            evidence.right_correlation
+        );
+    }
+    let ratio = hotplug_level_applied(hda.evidence.peak, usb.evidence.peak)?;
+    println!(
+        "PASS: td-audio followed a USB output plugged in, out and back in: it was listed and \
+         did not take over, the unplug fell back to HDA ({} ms of tone), and the return played \
+         again as the human's choice at its old level ({} ms of tone at {ratio:.3} of HDA's \
+         peak)",
         hda.evidence.active_ms, usb.evidence.active_ms
     );
     Ok(())
@@ -4969,11 +5309,8 @@ struct BootPlan<'a> {
     /// audit workload remains real physical input but uses the host-silent
     /// backend so audit scheduling cannot invalidate the HDA timing oracle.
     capture_firefox_audio: bool,
-    /// Two paths, in a private directory and not yet existing, for QEMU to
-    /// capture system audio to as two outputs: the HDA device's and a USB
-    /// audio device's behind its own xHCI controller. The caller reads and
-    /// removes them (`qemu-boot-audio`).
-    audio_switch: Option<(&'a Path, &'a Path)>,
+    /// Two outputs QEMU captures system audio from (`AudioSwitch`).
+    audio_switch: Option<AudioSwitch<'a>>,
     /// Private swtpm control socket; never a host TPM passthrough.
     tpm_socket: Option<&'a Path>,
     /// A file QEMU writes the guest's virtio serial port named
@@ -5416,14 +5753,19 @@ fn boot_source(
         .transpose()?;
     let switch_ceiling = plan
         .audio_switch
+        .as_ref()
         .map(|_| firefox_audio_capture_ceiling(timeout))
         .transpose()?;
     // Every capture QEMU writes, each under the one ceiling a boot's length
     // bounds.
     let captures = [
         firefox_audio_path.as_deref().zip(firefox_audio_ceiling),
-        plan.audio_switch.map(|(hda, _)| hda).zip(switch_ceiling),
-        plan.audio_switch.map(|(_, usb)| usb).zip(switch_ceiling),
+        plan.audio_switch
+            .map(|switch| switch.hda)
+            .zip(switch_ceiling),
+        plan.audio_switch
+            .map(|switch| switch.usb)
+            .zip(switch_ceiling),
     ];
     let diag =
         File::create(&diag_path).map_err(|e| format!("create {}: {e}", diag_path.display()))?;
@@ -5515,9 +5857,21 @@ fn boot_source(
     } else {
         None
     };
+    let shell_changes_machine = plan
+        .shell
+        .is_some_and(|steps| steps.iter().any(|step| step.qmp.is_some()));
+    if shell_changes_machine && (input || plan.screen.is_some() || vt_answers) {
+        return Err("a serial shell that changes the machine needs QMP to itself".into());
+    }
     let qmp_path = qmp_scratch
         .as_ref()
-        .filter(|_| input || plan.screen.is_some() || vt_answers || plan.screens.is_some())
+        .filter(|_| {
+            input
+                || plan.screen.is_some()
+                || vt_answers
+                || plan.screens.is_some()
+                || shell_changes_machine
+        })
         .map(|scratch| scratch.dir.join("qmp.sock"));
     let serial_path = qmp_scratch
         .as_ref()
@@ -5697,7 +6051,7 @@ fn boot_source(
     }
     if plan.audio {
         match plan.audio_switch {
-            Some((hda, usb)) => attach_switch_audio(&mut cmd, hda, usb),
+            Some(switch) => attach_switch_audio(&mut cmd, switch),
             None => attach_system_audio(&mut cmd, firefox_audio_path.as_deref()),
         }
     }
@@ -5869,6 +6223,10 @@ fn boot_source(
         .zip(qmp_path.clone())
         .map(|(steps, path)| guest_screens::ScreenSteps::new(steps, path, CAP));
     let mut vt_typist = qmp_path.clone().filter(|_| vt_answers).map(VtTypist::new);
+    let mut shell_qmp = ShellQmp {
+        path: qmp_path.clone().filter(|_| shell_changes_machine),
+        qmp: None,
+    };
     let mut setup_input = match (source, qmp_path) {
         (BootSource::LiveSetup { script, .. }, Some(path)) => {
             let capture = path.with_file_name("attention.ppm");
@@ -5958,7 +6316,10 @@ fn boot_source(
             }
         }
         if let (Some(controller), Some(port)) = (shell.as_mut(), serial_port.as_mut()) {
-            if let Err(error) = controller.poll(port, evidence.target, evidence.greeter, &buf) {
+            let mut qmp = |command: &str| shell_qmp.send(command);
+            if let Err(error) =
+                controller.poll(port, &mut qmp, evidence.target, evidence.greeter, &buf)
+            {
                 let _ = child.kill();
                 let _ = child.wait();
                 let console = String::from_utf8_lossy(&buf);
@@ -6258,19 +6619,34 @@ fn attach_system_audio(command: &mut Command, capture: Option<&Path>) {
     ]);
 }
 
+/// Two paths, in a private directory and not yet existing, for QEMU to
+/// capture system audio to as two outputs: the HDA device's and a USB
+/// audio device's behind its own xHCI controller. The caller reads and
+/// removes them. The USB device is plugged in at power-on
+/// (`qemu-boot-audio`), or left for the shell's steps to plug in over QMP
+/// as `HOTPLUG_ADD` names it (`qemu-boot-audio-hotplug`).
+#[derive(Clone, Copy)]
+struct AudioSwitch<'a> {
+    hda: &'a Path,
+    usb: &'a Path,
+    usb_at_boot: bool,
+}
+
 /// The system's HDA output and a USB audio output, each captured to its own
-/// WAV: the two outputs `qemu-boot-audio` switches between. The USB device
-/// has its own xHCI controller, so no other USB device shares its bus.
-fn attach_switch_audio(command: &mut Command, hda: &Path, usb: &Path) {
+/// WAV. The USB device has its own xHCI controller, so no other USB device
+/// shares its bus, and that bus is there for a device plugged in later.
+fn attach_switch_audio(command: &mut Command, switch: AudioSwitch) {
     command
         .arg("-audiodev")
-        .arg(wav_audiodev_arg("audio0", hda))
+        .arg(wav_audiodev_arg("audio0", switch.hda))
         .args(["-device", "intel-hda"])
         .args(["-device", "hda-output,audiodev=audio0,mixer=off"])
         .arg("-audiodev")
-        .arg(wav_audiodev_arg("audio1", usb))
-        .args(["-device", "qemu-xhci,id=audio-xhci"])
-        .args(["-device", "usb-audio,bus=audio-xhci.0,audiodev=audio1"]);
+        .arg(wav_audiodev_arg("audio1", switch.usb))
+        .args(["-device", "qemu-xhci,id=audio-xhci"]);
+    if switch.usb_at_boot {
+        command.args(["-device", "usb-audio,bus=audio-xhci.0,audiodev=audio1"]);
+    }
 }
 
 fn wav_audiodev_arg(id: &str, path: &Path) -> OsString {
@@ -9165,6 +9541,31 @@ struct VtTypist {
     qmp: Option<Qmp>,
 }
 
+/// QEMU's monitor for the serial shell's steps that change the machine,
+/// connected at the first.
+struct ShellQmp {
+    path: Option<PathBuf>,
+    qmp: Option<Qmp>,
+}
+
+impl ShellQmp {
+    fn send(&mut self, command: &str) -> Result<(), String> {
+        let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
+        if self.qmp.is_none() {
+            let path = self
+                .path
+                .as_deref()
+                .ok_or("the boot has no QMP socket for the shell's steps")?;
+            self.qmp = Some(Qmp::connect_until(path, deadline)?);
+        }
+        let qmp = self
+            .qmp
+            .as_mut()
+            .ok_or("QMP disappeared before the shell's step")?;
+        qmp.exchange_until(command, deadline)
+    }
+}
+
 /// The gap after each key a `VtTypist` or the wizard's key entry presses.
 const VT_KEY_PACE: Duration = Duration::from_millis(50);
 
@@ -10034,15 +10435,33 @@ mod tests {
     #[test]
     fn switch_audio_captures_hda_and_usb_apart() {
         let mut command = Command::new("qemu-system-x86_64");
-        attach_switch_audio(
-            &mut command,
-            Path::new("/tmp/td,a/hda.wav"),
-            Path::new("/tmp/td,a/usb.wav"),
-        );
+        let switch = AudioSwitch {
+            hda: Path::new("/tmp/td,a/hda.wav"),
+            usb: Path::new("/tmp/td,a/usb.wav"),
+            usb_at_boot: true,
+        };
+        attach_switch_audio(&mut command, switch);
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        // Left for the shell to plug in, the USB device alone is missing:
+        // its bus and its capture are there for it.
+        let mut later = Command::new("qemu-system-x86_64");
+        attach_switch_audio(
+            &mut later,
+            AudioSwitch {
+                usb_at_boot: false,
+                ..switch
+            },
+        );
+        assert_eq!(
+            later
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            arguments.get(..arguments.len() - 2).unwrap()
+        );
         assert_eq!(
             arguments,
             [
@@ -10104,6 +10523,146 @@ mod tests {
             "output audio-0 exit 0 stream 2 frames 192000 started 1 underflows 0 overflows 0 exit 0",
         ] {
             assert!(switch_played(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    /// The hot-plug steps: one line each, the machine changed before the
+    /// adding, removing and returning steps alone, and QMP's device the
+    /// switch machine's USB bus and capture.
+    #[test]
+    fn the_hotplug_steps_plug_in_out_and_back_in() {
+        let steps = audio_hotplug_steps();
+        for step in &steps {
+            assert!(!step.command.contains('\n'), "{:?}", step.command);
+            assert!(!step.command.starts_with(&step.report));
+            assert!(step.command.contains(&format!("\\n{} ", step.report)));
+        }
+        let changes: Vec<_> = steps
+            .iter()
+            .map(|step| (step.report.as_str(), step.qmp.as_deref()))
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                (HOTPLUG_BOOT_REPORT, None),
+                (HOTPLUG_ADDED_REPORT, Some(HOTPLUG_ADD)),
+                (HOTPLUG_CHOSEN_REPORT, None),
+                (HOTPLUG_REMOVED_REPORT, Some(HOTPLUG_DEL)),
+                (HOTPLUG_RETURNED_REPORT, Some(HOTPLUG_ADD)),
+                (HOTPLUG_PLAYED_REPORT, None),
+            ]
+        );
+        // One device, by one id, in both.
+        assert_eq!(
+            HOTPLUG_ADD,
+            r#"{"execute":"device_add","arguments":{"driver":"usb-audio","id":"hotplug-audio","bus":"audio-xhci.0","audiodev":"audio1"}}"#
+        );
+        assert_eq!(
+            HOTPLUG_DEL,
+            r#"{"execute":"device_del","arguments":{"id":"hotplug-audio"}}"#
+        );
+        // The choice is tried until td-seatd watch's grant, then made once
+        // more for the report, whose status is the one judged.
+        assert!(steps[2].command.starts_with(&format!(
+            "for i in $(seq {HOTPLUG_CHOOSE_TENTHS}); do td-audio output {SWITCH_USB_SINK} \
+             >/dev/null 2>&1 && break; sleep 0.1; done; td-audio output {SWITCH_USB_SINK} \
+             >/run/user/1000/chosen 2>&1; echo \"exit $?\""
+        )));
+        // Each wait is bounded, and the removal waits for the USB output's
+        // absence, the return for it active.
+        let removed = &steps[3].command;
+        assert!(removed.contains(&format!("*' {SWITCH_USB_SINK} '*) ;; *) break;;")));
+        assert!(steps[4]
+            .command
+            .contains(&format!("*' {SWITCH_USB_SINK} active '*) break;;")));
+        assert!(steps
+            .iter()
+            .filter(|step| step.command.contains("do td-audio outputs "))
+            .all(|step| step
+                .command
+                .contains(&format!("$(seq {HOTPLUG_WAIT_TENTHS})"))));
+    }
+
+    /// Each hot-plug report passes only the listing and the playing it
+    /// names: a hot-added output that takes over, a fallback that leaves
+    /// the USB output listed or plays short, and a return under a used
+    /// index, not active or at another level all fail.
+    #[test]
+    fn the_hotplug_reports_hold_each_move_exact() {
+        let steps = audio_hotplug_steps();
+        let accepts = |at: usize, payload: &str| (steps[at].accepts)(payload);
+        let hda = "output 0 intel-0 active Generic Analog;";
+        assert!(accepts(0, hda));
+        assert!(!accepts(
+            0,
+            "output 0 intel-0 active Generic Analog;output 1 audio-0 - USB;"
+        ));
+        assert!(!accepts(
+            0,
+            "td-audio: connect: No such file or directory (os error 2);"
+        ));
+        let added = "output 0 intel-0 active Generic Analog;output 1 audio-0 - USB Audio;";
+        assert!(accepts(1, added));
+        for refused in [
+            hda,
+            "output 0 intel-0 - Generic Analog;output 1 audio-0 active USB Audio;",
+            "output 0 intel-0 active Generic Analog;output 1 audio-0 -;",
+        ] {
+            assert!(!accepts(1, refused), "{refused:?}");
+        }
+        assert!(accepts(2, "output audio-0 exit 0 volume 80% exit 0 "));
+        for refused in [
+            "output audio-0 exit 0 volume 81% exit 0",
+            "output intel-0 exit 0 volume 80% exit 0",
+            "output audio-0 exit 1 volume 80% exit 0",
+        ] {
+            assert!(!accepts(2, refused), "{refused:?}");
+        }
+        let fallback = "stream 2 frames 72000 started 1 underflows 0 overflows 0 exit 0 ";
+        assert!(accepts(3, &format!("{hda}| {fallback}")));
+        for refused in [
+            format!("{added}| {fallback}"),
+            format!("output 0 intel-0 - Generic Analog;| {fallback}"),
+            format!("{hda}| stream 2 frames 96000 started 1 underflows 0 overflows 0 exit 0"),
+            format!("{hda}| stream 2 frames 72000 started 2 underflows 0 overflows 0 exit 0"),
+            format!("{hda} {fallback}"),
+        ] {
+            assert!(!accepts(3, &refused), "{refused:?}");
+        }
+        let back = "output 0 intel-0 - Generic Analog;output 2 audio-0 active USB Audio;";
+        assert!(accepts(4, &format!("{back}| volume 80% exit 0 ")));
+        for refused in [
+            "output 0 intel-0 - Generic Analog;output 1 audio-0 active USB Audio;| volume 80% exit 0",
+            "output 0 intel-0 active Generic Analog;output 2 audio-0 - USB Audio;| volume 80% exit 0",
+            "output 0 intel-0 - Generic Analog;output 2 audio-0 active USB Audio;| volume 100% exit 0",
+            "output 0 intel-0 - Generic Analog;output 2 audio-0 active USB Audio; volume 80% exit 0",
+        ] {
+            assert!(!accepts(4, refused), "{refused:?}");
+        }
+        assert!(accepts(
+            5,
+            "stream 2 frames 96000 started 1 underflows 0 overflows 0 exit 0"
+        ));
+        assert!(!accepts(5, fallback));
+    }
+
+    /// The level is the cube of its fraction, and the USB tone must carry
+    /// it: full level, or the 40% that first failed the peak floor, fails.
+    #[test]
+    fn the_returned_level_is_heard_not_only_reported() {
+        let percent: f64 = HOTPLUG_LEVEL.trim_end_matches('%').parse().unwrap();
+        assert!((f64::powi(percent / 100.0, 3) * 240.0 / 255.0 - HOTPLUG_GAIN).abs() < 1e-9);
+        // As measured; and the cube alone, QEMU's level forgotten, is not.
+        assert!(hotplug_level_applied(10_000, 4_819).is_ok());
+        for (hda, usb) in [
+            (10_000, 10_000),
+            (10_000, 9_412),
+            (10_000, 5_120),
+            (10_000, 602),
+            (10_000, 4_500),
+            (0, 0),
+        ] {
+            assert!(hotplug_level_applied(hda, usb).is_err(), "{hda} {usb}");
         }
     }
 

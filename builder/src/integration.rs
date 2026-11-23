@@ -47,6 +47,13 @@ const STEPS: &[Step] = &[
                  each output playing its part of the tone and the player told of no seam",
     },
     Step {
+        name: "qemu-boot-audio-hotplug",
+        argv: &["qemu-boot-audio-hotplug"],
+        proves: "td-audio follows a USB output plugged in, out and back in: listed without \
+                 taking over, the unplug falling back to HDA, and the return playing again as \
+                 the human's choice at its old level",
+    },
+    Step {
         name: "qemu-deploy-rollback",
         argv: &["qemu-deploy-rollback"],
         proves: "an approved deploy-rollback selects the previous system, and an approved set-hostname names the system, at the next boot",
@@ -353,7 +360,7 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             line.contains(
-                "of 7 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 5 not run"
+                "of 8 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 6 not run"
             ),
             "{line}"
         );
@@ -365,7 +372,7 @@ mod tests {
         let (line, code) = verdict(&warm_gap);
         assert_eq!(code, td_engine::exit::EXIT_UNPROVISIONED);
         assert!(
-            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 7 not run"),
+            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 8 not run"),
             "{line}"
         );
         // Every oracle from the memo, warm skipped: a pass that booted nothing,
@@ -374,6 +381,7 @@ mod tests {
             ("qemu-boot-system", Outcome::Memo, s(0)),
             ("qemu-boot-server", Outcome::Memo, s(0)),
             ("qemu-boot-audio", Outcome::Memo, s(0)),
+            ("qemu-boot-audio-hotplug", Outcome::Memo, s(0)),
             ("qemu-deploy-rollback", Outcome::Memo, s(0)),
             ("qemu-admin-update", Outcome::Memo, s(0)),
             ("qemu-boot-live", Outcome::Memo, s(0)),
@@ -382,7 +390,7 @@ mod tests {
         let (line, code) = verdict(&all_memo);
         assert_eq!(code, 0);
         assert!(
-            line.contains("7 passed (7 from the memo), 0 unprovisioned"),
+            line.contains("8 passed (8 from the memo), 0 unprovisioned"),
             "{line}"
         );
         assert_eq!(Outcome::Memo.word(), "memo");
@@ -433,6 +441,7 @@ mod tests {
         for name in [
             "qemu-boot-system",
             "qemu-boot-audio",
+            "qemu-boot-audio-hotplug",
             "qemu-deploy-rollback",
             "qemu-boot-live",
             "qemu-install-system",

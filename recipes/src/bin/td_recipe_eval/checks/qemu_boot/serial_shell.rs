@@ -19,11 +19,14 @@ pub(super) const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One command line and the report it must print: `report`, a space and a
-/// payload `accepts` takes.
+/// payload `accepts` takes. `qmp`, when set, is a QMP command the oracle
+/// sends QEMU once, just before the line is typed: a change to the machine,
+/// such as a device plugged in, that the line then waits to see.
 pub(super) struct ShellStep {
     pub(super) command: String,
     pub(super) report: String,
     pub(super) accepts: Box<dyn Fn(&str) -> bool>,
+    pub(super) qmp: Option<String>,
 }
 
 /// The lines `console` has finished: a read can end inside a line whose
@@ -166,10 +169,12 @@ impl<'a> SerialShell<'a> {
         self.steps.get(self.next).map(|step| step.report.as_str())
     }
 
-    /// The deadline starts at the marker; typing waits for the greeter.
+    /// The deadline starts at the marker; typing waits for the greeter. A
+    /// step's QMP command goes through `qmp` once, before its line.
     pub(super) fn poll(
         &mut self,
         port: &mut SerialPort,
+        qmp: &mut dyn FnMut(&str) -> Result<(), String>,
         target: bool,
         greeter: bool,
         console: &[u8],
@@ -201,6 +206,11 @@ impl<'a> SerialShell<'a> {
             return Ok(());
         };
         if !self.sent {
+            if let Some(command) = step.qmp.as_deref() {
+                qmp(command).map_err(|error| {
+                    format!("QEMU refused the {} step's change: {error}", step.report)
+                })?;
+            }
             port.send(&step.command)?;
             self.sent = true;
         }
@@ -413,6 +423,7 @@ mod tests {
             command: command.into(),
             report: report.into(),
             accepts: Box::new(move |seen| seen == payload),
+            qmp: None,
         }
     }
 
@@ -467,24 +478,35 @@ mod tests {
             }
         };
         let mut port = SerialPort::over(ours).unwrap();
+        let mut no_qmp = |_: &str| Err("no step here changes the machine".to_string());
         let steps = [step("one", "A-1", "x"), step("two", "A-2", "y")];
         let mut shell = SerialShell::new(&steps);
-        shell.poll(&mut port, false, true, b"").unwrap();
+        shell
+            .poll(&mut port, &mut no_qmp, false, true, b"")
+            .unwrap();
         assert!(shell.until.is_none());
-        shell.poll(&mut port, true, false, b"").unwrap();
+        shell
+            .poll(&mut port, &mut no_qmp, true, false, b"")
+            .unwrap();
         assert!(shell.until.is_some());
         assert_eq!(typed(&mut theirs), "");
-        shell.poll(&mut port, true, true, b"").unwrap();
-        shell.poll(&mut port, true, true, b"A-1 x").unwrap();
+        shell.poll(&mut port, &mut no_qmp, true, true, b"").unwrap();
+        shell
+            .poll(&mut port, &mut no_qmp, true, true, b"A-1 x")
+            .unwrap();
         assert_eq!(typed(&mut theirs), "one\n");
         assert_eq!(shell.awaiting(), Some("A-1"));
-        shell.poll(&mut port, true, true, b"A-1 x\n").unwrap();
+        shell
+            .poll(&mut port, &mut no_qmp, true, true, b"A-1 x\n")
+            .unwrap();
         assert_eq!(shell.awaiting(), Some("A-2"));
-        shell.poll(&mut port, true, true, b"A-1 x\nA-2 y").unwrap();
+        shell
+            .poll(&mut port, &mut no_qmp, true, true, b"A-1 x\nA-2 y")
+            .unwrap();
         assert_eq!(typed(&mut theirs), "two\n");
         assert!(!shell.done());
         shell
-            .poll(&mut port, true, true, b"A-1 x\nA-2 y\n")
+            .poll(&mut port, &mut no_qmp, true, true, b"A-1 x\nA-2 y\n")
             .unwrap();
         assert!(shell.done());
         assert_eq!(typed(&mut theirs), "");
@@ -495,15 +517,76 @@ mod tests {
         // The marker starts the deadline, and a greeter that never comes
         // is named.
         let mut waiting = SerialShell::new(&steps);
-        waiting.poll(&mut port, true, false, b"").unwrap();
+        waiting
+            .poll(&mut port, &mut no_qmp, true, false, b"")
+            .unwrap();
         waiting.until = Some(Instant::now());
-        let error = waiting.poll(&mut port, true, false, b"").unwrap_err();
+        let error = waiting
+            .poll(&mut port, &mut no_qmp, true, false, b"")
+            .unwrap_err();
         assert!(error.contains("greeter"), "{error}");
         let mut silent = SerialShell::new(&steps);
-        silent.poll(&mut port, true, true, b"").unwrap();
+        silent
+            .poll(&mut port, &mut no_qmp, true, true, b"")
+            .unwrap();
         silent.until = Some(Instant::now());
-        let error = silent.poll(&mut port, true, true, b"").unwrap_err();
+        let error = silent
+            .poll(&mut port, &mut no_qmp, true, true, b"")
+            .unwrap_err();
         assert!(error.contains("did not report A-1"), "{error}");
+        port.finish();
+    }
+
+    /// A step's QMP command is sent once, before its line is typed; one
+    /// QEMU refuses fails the step with nothing typed.
+    #[test]
+    fn a_steps_machine_change_comes_first_and_once() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        theirs.set_nonblocking(true).unwrap();
+        let typed = |theirs: &mut UnixStream| {
+            let mut bytes = [0u8; 64];
+            theirs
+                .read(&mut bytes)
+                .map(|read| String::from_utf8_lossy(&bytes[..read]).into_owned())
+                .unwrap_or_default()
+        };
+        let mut port = SerialPort::over(ours).unwrap();
+        let mut plugged = step("one", "A-1", "x");
+        plugged.qmp = Some("plug".into());
+        let steps = [plugged, step("two", "A-2", "y")];
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut qmp = |command: &str| {
+            sent.borrow_mut().push(command.to_string());
+            Ok(())
+        };
+        let mut shell = SerialShell::new(&steps);
+        shell.poll(&mut port, &mut qmp, true, false, b"").unwrap();
+        assert!(sent.borrow().is_empty(), "not before the greeter");
+        shell.poll(&mut port, &mut qmp, true, true, b"").unwrap();
+        assert_eq!(*sent.borrow(), ["plug"]);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(typed(&mut theirs), "one\n");
+        shell.poll(&mut port, &mut qmp, true, true, b"").unwrap();
+        shell
+            .poll(&mut port, &mut qmp, true, true, b"A-1 x\n")
+            .unwrap();
+        shell
+            .poll(&mut port, &mut qmp, true, true, b"A-1 x\n")
+            .unwrap();
+        assert_eq!(*sent.borrow(), ["plug"], "once, and not for a plain step");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(typed(&mut theirs), "two\n");
+        let mut refused = SerialShell::new(&steps);
+        let mut refusing = |_: &str| Err("no such bus".to_string());
+        let error = refused
+            .poll(&mut port, &mut refusing, true, true, b"")
+            .unwrap_err();
+        assert!(
+            error.contains("A-1 step") && error.contains("no such bus"),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(typed(&mut theirs), "", "the refused step typed nothing");
         port.finish();
     }
 }

@@ -469,10 +469,10 @@ recipes/src/bin/td_recipe_eval/checks/provisioned_account.rs	allocation-macro	17
 recipes/src/bin/td_recipe_eval/checks/provisioned_account.rs	unchecked-growth-or-clone	8
 recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	allocating-constructor	10
 recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	allocating-conversion	231
-recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	allocation-macro	347
+recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	allocation-macro	358
 recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	direct-reservation	2
-recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	heap-owner	2
-recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	unchecked-growth-or-clone	61
+recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	heap-owner	8
+recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	unchecked-growth-or-clone	62
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/build_iso.rs	allocating-conversion	12
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/build_iso.rs	allocation-macro	28
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/build_iso.rs	unchecked-growth-or-clone	2
@@ -524,7 +524,7 @@ recipes/src/bin/td_recipe_eval/checks/qemu_boot/secret.rs	unchecked-growth-or-cl
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/secret/login_system.rs	allocating-conversion	15
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/secret/login_system.rs	allocation-macro	17
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/serial_shell.rs	allocating-conversion	2
-recipes/src/bin/td_recipe_eval/checks/qemu_boot/serial_shell.rs	allocation-macro	14
+recipes/src/bin/td_recipe_eval/checks/qemu_boot/serial_shell.rs	allocation-macro	15
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/server.rs	allocating-conversion	16
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/server.rs	allocation-macro	36
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/server_image.rs	allocating-constructor	1

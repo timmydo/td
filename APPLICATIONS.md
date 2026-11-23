@@ -8777,30 +8777,33 @@ listed is dropped, its level and mute remembered by key (the latest 64
 keys), and announced as a sink remove event. A card plugged back in
 under another number is a new output under its old key; when the playing
 output is gone and its card is back so in the same table, the new output
-takes its name and level. A new output never takes over. The human's
-choices, each `SET_DEFAULT_SINK` including one naming the output that
-plays, form a preference list of keys, most recent first (the latest
-64). A fallback tries those present in that order, then the rest in
-discovery order. Going down the list, the first chosen output present
-that is newly listed, or awaiting a retry, is switched to as if asked,
-logging that a chosen output came back, unless one chosen more recently
-plays; a chosen output listed but neither, such as one whose device
-failed, is passed over. A return refused as `ACCESS`, a node not yet
-handed to audio, is tried again at each rescan while the output stays
-listed; any other refusal waits for it to be plugged in again. The
-playing output no longer listed is lost: the daemon switches to the next
-in preference order that opens, announcing the switch, then drops it;
-none opening ends the daemon, including when the only other is one whose
-node is not yet audio's, and the supervisor's restart finds it then.
-Such a move does not count toward the limit on fallbacks without a
-frame, and an output the table drops resets that count, since the table,
-not a failing device, says the output went; without that, a headset
-unplugged and replugged while nothing plays would run the limit down. A
-table with no ordinary playback PCM left lists none, so every output is
-gone, and a named `--card`/`--device` no longer listed leads no longer.
-A table that cannot be read or parsed, or a card whose id cannot be
-read, keeps the outputs as they were, said once until it reads again.
-The preference list and every level are kept across restarts (below).
+takes its name and level. A new output never takes over. An output is
+listed from the table, before its node is necessarily audio's: a choice
+naming it in that window, until `td-seatd watch`'s next tick, is refused
+as `ACCESS`, and the human chooses again. The human's choices, each
+`SET_DEFAULT_SINK` including one naming the output that plays, form a
+preference list of keys, most recent first (the latest 64). A fallback
+tries those present in that order, then the rest in discovery order.
+Going down the list, the first chosen output present that is newly
+listed, or awaiting a retry, is switched to as if asked, logging that a
+chosen output came back, unless one chosen more recently plays; a chosen
+output listed but neither, such as one whose device failed, is passed
+over. A return refused as `ACCESS`, a node not yet handed to audio, is
+tried again at each rescan while the output stays listed; any other
+refusal waits for it to be plugged in again. The playing output no
+longer listed is lost: the daemon switches to the next in preference
+order that opens, announcing the switch, then drops it; none opening
+ends the daemon, including when the only other is one whose node is not
+yet audio's, and the supervisor's restart finds it then. Such a move
+does not count toward the limit on fallbacks without a frame, and an
+output the table drops resets that count, since the table, not a failing
+device, says the output went; without that, a headset unplugged and
+replugged while nothing plays would run the limit down. A table with no
+ordinary playback PCM left lists none, so every output is gone, and a
+named `--card`/`--device` no longer listed leads no longer. A table that
+cannot be read or parsed, or a card whose id cannot be read, keeps the
+outputs as they were, said once until it reads again. The preference
+list and every level are kept across restarts (below).
 
 **Kept across restarts.** What the human sets on the outputs, the
 preference list and each output's level and mute by key, is kept in
@@ -8854,6 +8857,30 @@ named `audio-0` and exited 0. The boot ends with a kill at the shell's
 last report, before QEMU writes its WAV sizes; the host reads such a
 capture by its own length in whole frames, and only with QEMU's zero
 placeholders, every format field still exact.
+
+The host oracle `qemu-boot-audio-hotplug`, also an integration-tier
+step, proves Hotplug above on the same machine with its USB device left
+out at power-on: the oracle plugs it in and out over QMP between the
+serial shell's steps, on the xHCI bus that stays, under one device id,
+each command sent once just before its step's line is typed and a
+refusal failing the step; no other QMP client may share the boot.
+Booted, the daemon lists `intel-0` alone, active. Plugged in, `audio-0`
+is listed as output 1 and does not take over. The primary account
+chooses it (`td-audio output audio-0`, tried again for up to 50 polls a
+tenth of a second apart while it is refused, then once for the report)
+and sets it to 80%. Unplugged, `intel-0` alone is listed, active, and
+plays a 1500 ms tone. Plugged back in, `audio-0` is listed as output 2,
+never 1 again, and plays as the human's latest choice, `td-audio volume`
+saying 80%; it plays a 2000 ms tone. Each wait polls the outputs, at
+most 300 times a tenth of a second apart, for the change it waits on and
+reports what it saw either way; each player must have sent and drained
+its whole tone with one `STARTED`, no `UNDERFLOW` and no overflow. The
+HDA capture must hold the first tone, 1350–1500 ms, and the USB capture
+the second, 1850–2000 ms, each passing the Firefox proof's tone checks,
+and the second's peak must be the first's times the level within 3%: 0.8
+cubed, times QEMU's USB device's own reset level of 240 in 255 (on QEMU
+10.2.1, 4819 of 10000, 0.4819 for 0.4819), so the level returned in the
+audio, not only in what the daemon says.
 
 **OSS emulation is refused, and the reason matters.** It survives in
 `linux-7.3.1` (`CONFIG_SND_PCM_OSS`, `sound/core/oss/pcm_oss.c`,
