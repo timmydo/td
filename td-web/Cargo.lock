@@ -97,6 +97,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-picture"
+version = "0.1.0"
+dependencies = [
+ "td-alloc",
+ "td-avif",
+ "td-gif",
+ "td-jpeg",
+ "td-page",
+ "td-png",
+ "td-ui",
+ "td-webp",
+]
+
+[[package]]
 name = "td-png"
 version = "0.1.0"
 dependencies = [
@@ -123,21 +137,19 @@ name = "td-web"
 version = "0.1.0"
 dependencies = [
  "td-alloc",
- "td-avif",
  "td-charset",
  "td-css",
  "td-fetch-client",
  "td-fs",
- "td-gif",
  "td-html",
  "td-jpeg",
  "td-layout",
  "td-page",
+ "td-picture",
  "td-png",
  "td-test-compositor",
  "td-ui",
  "td-url",
- "td-webp",
 ]
 
 [[package]]

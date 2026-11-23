@@ -39,7 +39,8 @@ caller brings:
 - the sheets a page names: `gather::Sheets` says which it wants, and the
   caller answers each `arrived` or `refused`, from wherever it likes;
 - the pictures: `inline::Inline` from pixels the caller decoded, and an
-  `inline::Set` of them by node for a layout;
+  `inline::Set` of them by node for a layout; td-picture is the decoding
+  td's callers share, each at its own limits;
 - a `page::Want` (viewport, scale, body face, styles, pictures) and a
   `fonts::Measure`.
 

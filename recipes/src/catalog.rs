@@ -707,6 +707,7 @@ mod tests {
                 "td-pass",
                 "td-passkeys",
                 "td-photo",
+                "td-picture",
                 "td-png",
                 "td-portal",
                 "td-primitives",

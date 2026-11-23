@@ -1,0 +1,33 @@
+[package]
+name = "td-picture"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded picture decoding for td's page readers: format, header plan, working peak and pixels"
+
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+# The PNG, JPEG, GIF, WebP and AVIF decoders; td-ui's picture, which holds
+# their pixels within its bounds; td-page's resident charge a kept picture
+# is held under; td-alloc's budgets.
+[dependencies]
+td-alloc = { path = "../td-alloc" }
+td-avif = { path = "../td-avif" }
+td-gif = { path = "../td-gif" }
+td-jpeg = { path = "../td-jpeg" }
+td-page = { path = "../td-page" }
+td-png = { path = "../td-png" }
+td-ui = { path = "../td-ui" }
+td-webp = { path = "../td-webp" }

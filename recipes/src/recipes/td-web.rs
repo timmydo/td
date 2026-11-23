@@ -4,7 +4,8 @@ use crate::types::Recipe;
 /// `web` application packages. Built as the other toolkit consumers are: a
 /// static Cargo build of its own tree with its path dependencies staged
 /// beside it (td-page, which makes, lays out and paints its pages, and
-/// td-css, td-dom and td-layout, which it does that with), td-compositor
+/// td-css, td-dom and td-layout, which it does that with; td-picture, the
+/// picture path it decodes through), td-compositor
 /// for the font and wire sources td-ui mounts, engine for td-png's
 /// checksums, td-inflate for its decoder and td-util for its DEFLATE
 /// encoder, the dev-only td-fs its tests' scratch comes from and
@@ -28,6 +29,7 @@ pub fn recipe() -> Recipe {
             "td-jpeg",
             "td-layout",
             "td-page",
+            "td-picture",
             "td-png",
             "td-alloc",
             "td-ui",
@@ -73,6 +75,7 @@ mod tests {
                 "td-jpeg".into(),
                 "td-layout".into(),
                 "td-page".into(),
+                "td-picture".into(),
                 "td-png".into(),
                 "td-alloc".into(),
                 "td-ui".into(),
@@ -122,6 +125,7 @@ mod tests {
                 "td-jpeg",
                 "td-layout",
                 "td-page",
+                "td-picture",
                 "td-png",
                 "td-test-compositor",
                 "td-ui",

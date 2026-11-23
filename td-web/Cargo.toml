@@ -38,27 +38,26 @@ indexing_slicing = "deny"
 # td's own crates, by the one sibling-dependency spelling the lock guard
 # admits (AGENTS.md 'Rust code'): the fetch service's client, the HTML
 # document tree, layout, the page td-page makes and paints from them,
-# legacy text encodings, the PNG, JPEG, GIF, WebP and AVIF decoders,
-# the shared UI toolkit and URLs.
+# legacy text encodings, the bounded picture path over the PNG, JPEG,
+# GIF, WebP and AVIF decoders, the shared UI toolkit and URLs.
 [dependencies]
 td-alloc = { path = "../td-alloc" }
-td-avif = { path = "../td-avif" }
 td-charset = { path = "../td-charset" }
 td-fetch-client = { path = "../td-fetch-client" }
-td-gif = { path = "../td-gif" }
 td-html = { path = "../td-html" }
-td-jpeg = { path = "../td-jpeg" }
 td-layout = { path = "../td-layout" }
 td-page = { path = "../td-page" }
-td-png = { path = "../td-png" }
+td-picture = { path = "../td-picture" }
 td-ui = { path = "../td-ui" }
 td-url = { path = "../td-url" }
-td-webp = { path = "../td-webp" }
 
 # Test scratch, owned by td-fs's TempDir guard (AGENTS.md "Parallel work"),
 # the computed values the tests read a page's styles by, and the native
-# cases' headless compositor harness.
+# cases' headless compositor harness; the PNG and JPEG encoders its
+# picture fixtures are made with.
 [dev-dependencies]
 td-css = { path = "../td-css" }
 td-fs = { path = "../td-fs" }
+td-jpeg = { path = "../td-jpeg" }
+td-png = { path = "../td-png" }
 td-test-compositor = { path = "../td-test-compositor" }

@@ -48,8 +48,10 @@ making, laying out and painting a page (§10) with `td-html` for
 markup's tree, `td-css` for style sheets, `td-dom` for the tree's HTML
 projection and `td-layout` for layout, `td-charset` for text in
 other encodings, `td-fetch-client` for the network, `td-url` for URLs,
-and the shared decoders (`td-png`,
-`td-jpeg`, `td-gif`, `td-webp`, `td-avif`) for pictures. td-charset's
+and `td-picture` for pictures, the bounded path over the shared
+decoders (`td-png`, `td-jpeg`, `td-gif`, `td-webp`, `td-avif`), shared
+crate code any page reader may take at its own limits; td-web's are a
+document's body and `PICTURE_WORK` (`picture.rs`). td-charset's
 tables are WHATWG data under BSD-3-Clause, so the `web` package carries
 its notice, td-charset's `data/LICENSE-WHATWG` byte for byte, at
 `files/share/licenses/td-charset/LICENSE-WHATWG`, copied from the
@@ -219,9 +221,14 @@ A navigated picture admits `PICTURE_WORK` (200 MiB) before decoding
 and, decoded, keeps its actual RGBA capacity, Charge::shrink_to
 releasing the excess without a gap. An inline picture (§10,
 "Subresources") admits instead its own decoding's peak, reckoned from
-its header by each decoder's layout (`picture::work`, at most
+its header by each decoder's layout (td-picture's `work`, at most
 `PICTURE_WORK`), to its page's pictures term, and keeps its capacity,
-made its own fit in place. A held save body owns its capacity
+made its own fit in place. `PICTURE_WORK` must cover the reckoning of
+every picture td-web admits (a document's body, td-ui's pixel bound):
+td-picture refuses a picture reckoned past its caller's cap, so a cap
+below it, or an estimate grown past it, would refuse td-web's largest
+pictures; `picture::tests::td_webs_costliest_picture_is_admitted` holds
+the costliest, a 16-bit RGBA interlaced PNG, within it. A held save body owns its capacity
 charge through the save worker, even after its Document is dropped. A
 wrapper frees its value before releasing its charge.
 
@@ -1180,7 +1187,7 @@ resident peak's growth decoding each was 0.08 to 0.99 of its reckoning,
 a 4000x3000 baseline JPEG and its progressive 4:4:4 transcode the
 closest, as their RGB beside RGBA is all they hold; each format's
 reckoning is pinned by
-`picture::tests::each_estimate_is_its_decoders_largest_phase`. Measured
+td-picture's `tests::each_estimate_is_its_decoders_largest_phase`. Measured
 (`app::tests::measure_window` over the corpus below, with every
 picture each page names, and `pictures::tests::measure_decoding`, a
 process a picture), and before block-level and floated pictures were

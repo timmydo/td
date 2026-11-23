@@ -3258,6 +3258,7 @@ td-photo/src/window.rs	allocating-conversion	32
 td-photo/src/window.rs	allocation-macro	26
 td-photo/src/window.rs	heap-owner	10
 td-photo/src/window.rs	unchecked-growth-or-clone	39
+td-picture/src/lib.rs	unchecked-growth-or-clone	2
 td-pinentry/src/app.rs	allocating-conversion	6
 td-pinentry/src/app.rs	allocation-macro	6
 td-pinentry/src/app.rs	unchecked-growth-or-clone	5
@@ -4353,7 +4354,6 @@ td-web/src/document.rs	unchecked-growth-or-clone	3
 td-web/src/fetch.rs	allocating-conversion	1
 td-web/src/fetch.rs	allocation-macro	3
 td-web/src/main.rs	allocating-conversion	1
-td-web/src/picture.rs	unchecked-growth-or-clone	2
 td-webp/src/lib.rs	unchecked-growth-or-clone	4
 td-webp/src/lossless.rs	unchecked-growth-or-clone	7
 td-webp/src/vp8.rs	unchecked-growth-or-clone	4
