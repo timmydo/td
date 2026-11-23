@@ -321,10 +321,17 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         return Err(format!("crypto {action} failed: {status}"));
     }
     if let Some((mail, fetch)) = live_fixture {
+        // One process per case: probes running concurrently in one process
+        // contend for td-mta's process-wide tickets (DEVELOPMENT.md, "Native
+        // mail fixtures").
         for (selector, target, case) in [
             ("--test", "postgres_probe", "real_postgres_td_mail_reads_and_downloads"),
             ("--test", "postgres_probe", "real_postgres_td_mail_sends_plain_text"),
             ("--test", "postgres_probe", "real_postgres_executable_receives_and_serves_database_profiles"),
+            ("--test", "postgres_probe", "real_postgres_mail_schema_bounds_references_and_rollback"),
+            ("--test", "postgres_probe", "real_postgres_uploads_publish_chunks_quotas_and_retained_outcomes"),
+            ("--test", "postgres_probe", "real_postgres_email_views_keep_metadata_values_and_bodies_on_one_snapshot"),
+            ("--test", "postgres_probe", "real_postgres_smtp_owner_accepts_after_uncertain_commit"),
             ("--bin", "td-mta-deploy", "physical::postgres_test::real_postgres_backup_replays_to_exact_marker_without_later_mail"),
             ("--bin", "td-mta-deploy", "service_database::postgres_test::real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants"),
             ("--bin", "td-mta-deploy", "activate::transport::postgres_test::real_postgres_fence_file_and_live_mode_close_new_connections"),

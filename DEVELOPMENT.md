@@ -1266,9 +1266,16 @@ warms both locked external closures; each build verifies its archived inputs.
 Cargo artifact records identify the helper executables inside the selected
 target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
 them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL
-read, plain-text send, foreground-service, deployment WAL replay,
-service-login provisioning and socket writer fence cases. Each requires a
-positive passing libtest summary and exit success. These six native cases
+read, plain-text send, foreground-service, schema-bounds, uploads,
+email-views, SMTP-owner, deployment WAL replay, service-login
+provisioning and socket writer fence cases, each in its own process.
+Each requires a positive passing libtest summary and exit success. The
+other ignored `postgres_probe` cases, the performance harness aside,
+run only by hand: one `--exact` case per `cargo test --release` process,
+with `TD_TEST_TRUSTED_ROOT=private` and TD_MTA_TEST_MAIL and
+TD_MTA_TEST_FETCH naming the helpers. Concurrent cases in one process
+contend for td-mta's process-wide configuration and TLS-generation
+tickets, which take one attempt, and fail setup. These native cases
 use the host release profile with debug information retained, matching the
 native MTA build and performance harness. Their real operation deadlines
 include hashing and TLS; an unoptimized full-size body hash can exhaust a
