@@ -195,7 +195,8 @@ fn install_terminfo(path: &str) -> Result<(), String> {
         ));
     }
     let bytes = terminfo::entry()?;
-    std::fs::write(path, bytes).map_err(|error| format!("write {path}: {error}"))
+    td_fs::replace(Path::new(path), &bytes, 0o644)
+        .map_err(|error| format!("write terminfo: {error}"))
 }
 
 /// Runs what was asked; answers the status to exit with, which for the
@@ -399,12 +400,17 @@ mod tests {
     #[test]
     fn terminfo_is_written_only_where_ncurses_looks() {
         assert!(install_terminfo("/tmp/share/terminfo/x/td-term").is_err());
-        let directory = std::env::temp_dir().join(format!("td-term-info-{}", std::process::id()));
-        let path = directory.join(terminfo::INSTALL_PATH);
+        use std::io::Read;
+        let directory = td_fs::TempDir::new("td-term-info").unwrap();
+        let path = directory.path().join(terminfo::INSTALL_PATH);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"previous entry").unwrap();
+        let mut previous = std::fs::File::open(&path).unwrap();
         install_terminfo(path.to_str().unwrap()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), terminfo::entry().unwrap());
-        std::fs::remove_dir_all(&directory).unwrap();
+        let mut bytes = Vec::new();
+        previous.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"previous entry");
     }
 
     #[test]

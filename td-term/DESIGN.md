@@ -240,7 +240,9 @@ and no such descriptor.
 
 The td-owned terminfo entry is compiled by `td_ui::vt_terminfo` from a
 human-readable capability source; `tic`, ncurses, and a host terminfo
-database are not build inputs. `td-term terminfo PATH` writes it, and refuses
+database are not build inputs. `td-term terminfo PATH` publishes the generated
+entry with the same synced atomic replacement used for runtime terminfo (mode
+0644 less the umask). A failed staging write preserves the installed entry. It refuses
 a path that does not end in `share/terminfo/t/td-term`, the only place
 ncurses looks for it. The `td-term-terminfo` data recipe runs that verb from
 the built td-term into its own `share/terminfo`, because a Cargo build
