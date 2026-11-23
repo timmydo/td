@@ -34,6 +34,8 @@ fn migration_archive_cli_preserves_and_verifies_snapshots() {
 #[path = "support/postgres_mail_client.rs"]
 mod mail_client;
 
+#[path = "postgres_probe/config_converge.rs"]
+mod config_converge;
 #[path = "postgres_probe/isolated_grants.rs"]
 mod isolated_grants;
 
@@ -2858,6 +2860,15 @@ fn real_postgres_executable_receives_and_serves_database_profiles() {
     timed("configuration Serving", || {
         exercise_configuration(ConfigurationExercise::Serving)
     });
+    timed("configuration Converge", || {
+        exercise_configuration(ConfigurationExercise::Converge)
+    });
+}
+
+#[test]
+#[ignore = "real local PostgreSQL tools required"]
+fn real_postgres_config_converge_publishes_and_stays_restorable() {
+    exercise_configuration(ConfigurationExercise::Converge);
 }
 
 #[test]
@@ -2908,6 +2919,7 @@ fn real_postgres_service_secrets_follow_selected_profile_and_rotation() {
 }
 
 enum ConfigurationExercise {
+    Converge,
     ServiceMaterials,
     ServiceIsolation,
     HttpAuthentication,
@@ -3630,6 +3642,10 @@ per_peer_limit = 1
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
+    if matches!(exercise, ConfigurationExercise::Converge) {
+        config_converge::exercise(&fixture, &request, epoch, &connection, version);
+        return;
+    }
     if matches!(exercise, ConfigurationExercise::ServiceIsolation) {
         isolated_services::exercise(&fixture, &request, epoch, &shared, &desktop, &connection);
         return;
@@ -3785,7 +3801,8 @@ per_peer_limit = 1
         );
         if name == "desktop" {
             match exercise {
-                ConfigurationExercise::ServiceIsolation
+                ConfigurationExercise::Converge
+                | ConfigurationExercise::ServiceIsolation
                 | ConfigurationExercise::ServiceMaterials
                 | ConfigurationExercise::AccountAdmin
                 | ConfigurationExercise::AccountRoutes

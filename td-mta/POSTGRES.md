@@ -1495,6 +1495,93 @@ selection can supersede the observed generation; use that exact generation
 for the compare-and-select procedure, never as current serving authority.
 All candidate imports and selection validation remain mandatory.
 
+### Configuration convergence command
+
+```text
+td-mta postgres config-converge --connection-file PATH --epoch HEX \
+    (--version HEX | --plan-only) < POLICY
+```
+
+`config-converge` rewrites the selected source set to this release's
+documented defaults plus a reviewed override policy, and reports exactly
+what that changes. It reads the policy from standard input, at most 64 KiB
+through end of file, before it connects; a caller that never closes its
+input blocks it there. The policy holds only public resource values, so no
+protected file is involved. Under one ten-second owner deadline it observes
+the selection, reads that immutable version's sources as `config-snapshot`
+does, rewrites each profile, prepares the complete candidate with current
+materials and providers as `config-import` does, and, given `--version`,
+publishes it under that retained ID when any setting changes. It never
+selects: the selection commands below apply the result. `--plan-only` runs
+the same validation and publishes nothing.
+
+The policy uses the configuration syntax (CONFIG.md, "Literal grammar")
+with only the resource sections, each labelled with a profile name:
+`[limits "PROFILE"]`, `[disk "PROFILE"]`, `[work "PROFILE"]` and
+`[network "PROFILE"]`, holding integer fields of that section
+(CONFIG.md, "Resource stanza schema"). A section repeated for one profile,
+a field repeated within it, any other section or value, and a profile the
+selected configuration does not contain refuse. An empty policy means every
+profile takes every default.
+
+Each profile is rewritten as follows. Every unlabelled `[limits]`,
+`[disk]`, `[work]` and `[network]` header and assignment line is removed,
+with any comment on that line; comment and blank lines stay. The policy's
+sections for that profile are appended in the order limits, disk, work,
+network. The profile's one SMTP listener, if any, gets `session_limit`
+equal to the planned `smtp_sessions` and `per_peer_limit` equal to
+`smtp_per_peer`; only a differing integer is replaced, so spacing and a
+trailing comment stay. With two or more SMTP listeners in one profile, such
+as separate IPv4 and IPv6 binds or a direct and a gateway listener
+(SCHEMA.md section 8), the defaults cannot divide the pool and the command
+refuses (`several-smtp-listeners`); such a profile is converged by hand
+through `config-import`. When no setting changes, the profile's stored
+bytes are kept exactly, however its resource stanzas are placed or
+spelled, so an unchanged report never publishes a respelled copy. A
+converged source converges to itself.
+
+Each profile's limits (the defaults plus its `[limits]` policy) are
+planned as serving plans them, the profiles the policy names before
+connecting. The plan must fit `memory_budget_bytes` (`memory-budget`,
+`resource-plan`) and leave at least one maximal 32-MiB message buffer
+unassigned (`message-buffer-headroom`; RESOURCES.md, "Connection pool
+sizing"). Candidate preparation then checks every other rule, including
+the disk, work and network fields against the profile's view mode and the
+shared quotas every profile must agree on.
+
+Success prints the epoch, the observed `generation` and
+`selected_version`, `changed`, `published` and the published `version` (or
+null), the candidate `digest`, every `changes` entry and, per profile, its
+pool sizes, planned bytes, budget and unassigned bytes, with
+`content_validated:true` and `profile_activated:false`. A change names the
+profile, section, listener label for listener fields, key, `before` and
+`after`, where null means absent, the release default; removing an
+explicit value equal to its default is reported as a change too. An
+unchanged source set reports `changed:false` and an empty `changes`,
+publishes nothing, and its digest is the selected one's. Sources are never
+printed.
+
+Refusals print `status:"error"` with a fixed `stage` and `error`.
+Stage `policy`: `capacity`, `policy-too-large`, `policy-read`,
+`policy-syntax` (with the refused `line`), `policy-unknown-profile`,
+`memory-budget`, `resource-plan`, `message-buffer-headroom`. Stage
+`configuration`: `unselected`, `source-syntax`,
+`several-smtp-listeners`, `smtp-listener-limits`, `capacity` and the
+`config-import` codes, including
+`source-or-material-validation`, `version-content-conflict` and
+`indeterminate-retain-version`. Stage `input` reports the connection file,
+and connection, schema and selection failures keep their usual stages.
+The report is built before publication, so after a durable publication
+only writing it can fail. Either way, and after
+`indeterminate-retain-version`, `config-check --version ID` settles whether
+that version exists, and rerunning with the same ID and policy resolves to
+its receipt while the selection and release are unchanged. If either
+changed, the rerun reports `version-content-conflict` or `changed:false`,
+neither of which shows that the earlier attempt rolled back, or, when the
+earlier attempt left nothing, publishes the newly derived candidate under
+that ID. Check with `config-check` before rerunning. Exit status is zero
+for success, one for refusal and two for arguments.
+
 ### Configuration selection (schema 7)
 
 Schema version 7 adds a singleton `config_selection` row and

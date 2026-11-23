@@ -1003,14 +1003,8 @@ fn apply_context(
             .peer(arena, c.label()?, c.required_text("network")?, c.at)
             .map_err(Error::from_gateway),
         Section::Listener => {
-            let kind = match c.required_text("kind")? {
-                "direct_smtp" => listener::Kind::DirectSmtp,
-                "gateway_smtp" => listener::Kind::GatewaySmtp,
-                "https" => listener::Kind::Https,
-                "local_jmap" => listener::Kind::LocalJmap,
-                "http01" => listener::Kind::Http01,
-                "loopback_smtp_fixture" => listener::Kind::LoopbackSmtpFixture,
-                _ => return Err(c.value_error("kind")),
+            let Some(kind) = listener::Kind::from_name(c.required_text("kind")?) else {
+                return Err(c.value_error("kind"));
             };
             targets
                 .listeners

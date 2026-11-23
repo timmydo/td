@@ -275,7 +275,10 @@ default plan is 499186944 bytes (about 476.06 MiB), including the
 connections reserve 39458816 bytes (about 37.63 MiB) more than eight of each,
 and eight event-stream slots of their own another 4980736 bytes;
 RESOURCES.md derives them, and a tightly sized explicit budget must allow
-them. A listener's explicit `session_limit` still bounds its own sessions.
+them. A listener's explicit `session_limit` still bounds its own sessions;
+`postgres config-converge` sets a profile's one SMTP listener to the pool
+and also requires the plan to leave one 32-MiB message buffer unassigned
+(POSTGRES.md, "Configuration convergence command").
 Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.

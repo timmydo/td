@@ -116,10 +116,18 @@ connections; the pool stays at 16, since ordinary connections are
 authenticated clients served by at most three body workers. Eight streams
 serve four td-mail processes at two each. Four peer keys at the default two
 sessions each hold 8 of the 32 SMTP slots, and filling the pool takes 16.
+`Limits::plan` refuses only a plan above the budget. The headroom rule is
+enforced where a configuration is derived from the defaults: `postgres
+config-converge` refuses a converged profile whose plan leaves less than
+one 32-MiB message buffer unassigned (POSTGRES.md, "Configuration
+convergence command"), while `config-import` accepts any plan within the
+budget.
 
 The compiled maxima are 64 SMTP sessions, 64 ordinary HTTPS connections
 and 32 event streams. With every other default, 64 SMTP sessions plan
-528030976 bytes and 32 streams 514129152, inside the default budget.
+528030976 bytes and 32 streams 514129152, inside the default budget but
+short of the one unassigned message buffer, so a converged profile needs
+a larger `memory_budget_bytes` for either.
 Sixty-four HTTPS connections plan 606141696 bytes: an operator raises
 `memory_budget_bytes` to that or shrinks the request arena (256 KiB of JSON
 and 4096 tokens plan 526449920 bytes). The maxima size the fixed readiness

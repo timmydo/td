@@ -1601,8 +1601,10 @@ implemented bounded syntax and resource stanzas, typed local routing, reader
 completion and identity preimage helpers. [SCHEMA.md](SCHEMA.md) specifies
 the operator schema and snapshot partitions. `postgres config-import`
 validates every profile of a complete candidate and stores one immutable
-source version in PostgreSQL; `config-check` revalidates a stored version
-and the selection commands activate one (POSTGRES.md, [Configuration import, check and snapshot commands](POSTGRES.md#configuration-import-check-and-snapshot-commands) and [Configuration selection (schema 7)](POSTGRES.md#configuration-selection-schema-7)).
+source version in PostgreSQL; `config-check` revalidates a stored version,
+`config-converge` derives one from the selected version, this release's
+defaults and a reviewed override policy, and the selection commands
+activate one (POSTGRES.md, [Configuration import, check and snapshot commands](POSTGRES.md#configuration-import-check-and-snapshot-commands) and [Configuration selection (schema 7)](POSTGRES.md#configuration-selection-schema-7)).
 
 PostgreSQL holds configuration, mail, credentials, certificates and logs.
 Besides owner tools' explicit state directories, the local filesystem holds
@@ -1626,7 +1628,7 @@ Current commands use stable JSON output and exit codes:
 
 | Command | Contract |
 | --- | --- |
-| `postgres config-import`, `postgres config-check`, `postgres config-select` | Validate, store and select database configuration |
+| `postgres config-import`, `postgres config-check`, `postgres config-converge`, `postgres config-select` | Validate, store, converge to the defaults and select database configuration |
 | `serve --connection-file PATH --profile NAME --runtime PATH --scratch PATH` | Foreground PostgreSQL receive/JMAP/relay service; `--read-only` serves a replica, `--minimum-retry-seconds` shortens the relay retry floor |
 | `acme`, `acme-status` | Native certificate issuance and inspection ([ACME.md](ACME.md)) |
 | `status --json --runtime PATH` | Selected service lifecycle; `--require-ready` makes its exit code a readiness probe |

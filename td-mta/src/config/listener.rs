@@ -14,6 +14,17 @@ pub enum Kind {
     LoopbackSmtpFixture,
 }
 impl Kind {
+    pub const ALL: &[Self] = &[
+        Self::DirectSmtp,
+        Self::GatewaySmtp,
+        Self::Https,
+        Self::LocalJmap,
+        Self::Http01,
+        Self::LoopbackSmtpFixture,
+    ];
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.name() == name)
+    }
     pub const fn name(self) -> &'static str {
         match self {
             Self::DirectSmtp => "direct_smtp",
@@ -730,6 +741,23 @@ mod tests {
                 slots: vec![Slot::EMPTY; MAX_LISTENERS],
             }
         }
+    }
+    #[test]
+    fn every_kind_is_named_once_and_round_trips() {
+        for kind in Kind::ALL {
+            // A new variant must be added here, to Kind::ALL and to the count.
+            match kind {
+                Kind::DirectSmtp
+                | Kind::GatewaySmtp
+                | Kind::Https
+                | Kind::LocalJmap
+                | Kind::Http01
+                | Kind::LoopbackSmtpFixture => {}
+            }
+            assert_eq!(Kind::from_name(kind.name()), Some(*kind));
+        }
+        assert_eq!(Kind::ALL.len(), 6);
+        assert_eq!(Kind::from_name("smtp"), None);
     }
     #[test]
     fn direct_aliases_are_bounded_unique_dns_names() {
