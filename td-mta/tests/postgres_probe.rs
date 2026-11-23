@@ -9308,6 +9308,9 @@ fn exercise_read_boundaries(
         Err(Error::Unauthenticated)
     ));
     let between = open().finish_method().unwrap();
+    // A reopen resolves through its helper once the bootstrap's one-second
+    // address reuse (POSTGRES.md, "Writer endpoint resolution") has passed.
+    thread::sleep(Duration::from_millis(1100));
     let failed = between.reopen(&loaded, &fixture.root.join("missing-helper"), password);
     assert!(matches!(failed, Err(Error::Resolution(_))));
     let view = Snapshot::open_runtime(
