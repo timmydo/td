@@ -4,7 +4,8 @@
 //! launcher built the closure (the PostgreSQL output and td glibc) and sent
 //! each store path as a NAR; it enters /td/store only verified. Nothing in
 //! production changes before the td server passes a trial on a fresh copy.
-//! The server switched from stays for rollback.
+//! The server switched from stays for rollback; the Debian tree until
+//! `--retire-rollback` removes it after its window.
 use super::*;
 use crate::{
     common::{
@@ -806,6 +807,13 @@ impl Deployment {
             self.healthy(&self.previous)?;
             self.probes.probe("smtp")?;
             self.probes.probe("jmap")?;
+            // A host switched before the time was recorded starts its
+            // Debian tree's window now.
+            super::retire::record_switch(
+                Path::new(super::retire::SWITCHED),
+                super::retire::now_secs()?,
+                false,
+            )?;
             self.event("already on the td-built PostgreSQL")?;
             return Ok(());
         }
@@ -933,6 +941,11 @@ impl Deployment {
         // a leftover backup drop-in this run adopted included.
         switch.dropin = Some(setting);
         switch.backup = Some(backup);
+        // An unverified td server never inherits a window: only the
+        // verified end of this switch records one.
+        if matches!(switch.source, Source::Debian) {
+            super::retire::clear_switch(Path::new(super::retire::SWITCHED))?;
+        }
         switch.stopped = true;
         self.host
             .run(self.host.cmd("systemctl").args(["stop", PG]))?;
@@ -987,6 +1000,13 @@ impl Deployment {
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
         require(self.active_timers()? == self.timers, "timer set changed")?;
+        // Leaving the Debian server starts its tree's window; another td
+        // closure keeps the window it has.
+        super::retire::record_switch(
+            Path::new(super::retire::SWITCHED),
+            super::retire::now_secs()?,
+            matches!(switch.source, Source::Debian),
+        )?;
         self.event("verified td-built PostgreSQL")?;
         Ok(())
     }
@@ -1039,6 +1059,7 @@ impl Deployment {
             self.journal_identity()?;
             self.config(&self.previous, &[], self.isolated)?;
             self.healthy(&self.previous)?;
+            super::retire::clear_switch(Path::new(super::retire::SWITCHED))?;
             self.event("already on the Debian PostgreSQL")?;
             return Ok(());
         }
@@ -1078,6 +1099,8 @@ impl Deployment {
             !Path::new(BINARIES_DROPIN).try_exists()? && !Path::new(BACKUP_DROPIN).try_exists()?,
             "PostgreSQL binaries drop-in remains",
         )?;
+        // Only a later verified switch starts the tree's window again.
+        super::retire::clear_switch(Path::new(super::retire::SWITCHED))?;
         self.host.select_tools(None);
         self.host
             .run(self.host.cmd("systemctl").arg("daemon-reload"))?;
@@ -1399,6 +1422,29 @@ impl Deployment {
         require(
             self.show_backup("EnvironmentFiles")?.trim().is_empty(),
             "the scheduled backup job reads an environment file",
+        )
+    }
+
+    /// The live server is the selected td one, mapping only its closure,
+    /// and the scheduled backup runs its tools.
+    pub(super) fn td_in_use(&mut self) -> R<()> {
+        let source = Source::of(&self.host)?;
+        require(
+            !matches!(source, Source::Debian),
+            "the Debian server is selected",
+        )?;
+        self.live_server(&source)?;
+        self.check_backup_tools()
+    }
+
+    /// The scheduled backup runs the selected td tools.
+    pub(super) fn check_backup_tools(&self) -> R<()> {
+        let postgres = self.host.tool("postgres")?;
+        self.no_environment_file()?;
+        backup_environment(
+            &self.show_backup("Environment")?,
+            &self.show_backup("UnsetEnvironment")?,
+            parent(&postgres)?.to_str().ok_or("store path")?,
         )
     }
 

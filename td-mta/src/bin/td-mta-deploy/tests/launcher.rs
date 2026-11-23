@@ -153,6 +153,12 @@ fn retiring_rollback_material_needs_irreversible_and_runs_alone() {
     for refused in [
         args(&["--retire-rollback"]),
         args(&["--retire-rollback", "--irreversible", "--skip-tests"]),
+        args(&[
+            "--retire-rollback",
+            "--irreversible",
+            "--window-seconds",
+            "60",
+        ]),
         args(&["--retire-rollback", "--irreversible", "--postgres-binaries"]),
         args(&["--postgres-binaries", "--irreversible"]),
     ] {

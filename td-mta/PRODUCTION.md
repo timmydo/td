@@ -40,7 +40,7 @@ decision.
 | PostgreSQL socket directory | `/var/lib/td-mta-postgres` (`td-mta:td-mta-db` 0750) |
 | Database writer fence (present only while fenced) | `/etc/td-mta/postgres-fence.conf` |
 | PostgreSQL server and tools, once switched | `/td/store/HASH-postgresql-x86-64-17.N/bin`, with td glibc in `/td/store/HASH-glibc-x86-64-VERSION` |
-| Retained Debian PostgreSQL | `/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` |
+| Retained Debian PostgreSQL, until retired | `/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` |
 | Binary selection (present only once switched) | `/etc/systemd/system/td-mta-postgres.service.d/91-td-mta-binaries.conf` and `/etc/systemd/system/td-mta-maint-backup.service.d/91-td-mta-binaries.conf` |
 | Per-profile readiness and diagnostics | `/var/lib/td-mta/mail/PROFILE/runtime` |
 | System service definitions | `/etc/systemd/system/td-mta-*.service` |
@@ -105,22 +105,23 @@ delayed mail from that provider mean its traffic, or one of its users, has
 reached the limit. The bounds are fixed constants, so raising them is a code
 change (DESIGN.md section 9).
 
-`td-mta-postgres.service` separately runs PostgreSQL 17 on the private Unix
-socket `/var/lib/td-mta-postgres/.s.PGSQL.35432`, with no TCP listener and
-no TLS. The socket is `td-mta:td-mta-db` mode 0660 in a 0750 directory;
-PostgreSQL runs as `td-mta` and joins the memberless system group
-`td-mta-db` through its `90-td-mta-socket.conf` drop-in, so it can give the
-socket that group. Each login authenticates with SCRAM. Its cluster is
-`/var/lib/td-mta/mail/postgres` and its configuration is
+`td-mta-postgres.service` separately runs PostgreSQL 17 on the private
+Unix socket `/var/lib/td-mta-postgres/.s.PGSQL.35432`, with no TCP
+listener and no TLS. The socket is `td-mta:td-mta-db` mode 0660 in a
+0750 directory; PostgreSQL runs as `td-mta` and joins the memberless
+system group `td-mta-db` through its `90-td-mta-socket.conf` drop-in, so
+it can give the socket that group. Each login authenticates with SCRAM.
+Its cluster is `/var/lib/td-mta/mail/postgres` and its configuration is
 `/var/lib/td-mta/mail/postgresql.conf`. It runs td's source-built
 PostgreSQL 17 from `/td/store` once switched (see "Switch PostgreSQL to
 the td-built binaries"), and the Debian binaries extracted under
-`/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` before that; they stay
-there for rollback. The deployment controller uses the client tools of
-whichever server the `91-td-mta-binaries.conf` drop-in selects. The configuration ends
-by including `/etc/td-mta/postgres-fence.conf` if it exists; only a
-deployment writes that file, while it holds the writer fence. An MTA binary
-update does not require restarting or replacing PostgreSQL.
+`/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` before that; they
+stay there for rollback until `--retire-rollback` removes them. The
+deployment controller uses the client tools of whichever server the
+`91-td-mta-binaries.conf` drop-in selects. The configuration ends by
+including `/etc/td-mta/postgres-fence.conf` if it exists; only a
+deployment writes that file, while it holds the writer fence. An MTA
+binary update does not require restarting or replacing PostgreSQL.
 
 ### Search planner setting
 
@@ -774,13 +775,24 @@ Rollback material stays for seven days after its last write: each
 earlier job directory under `/var/lib/td-mta-operator` (its receipt, the
 original data directory a migration left, uploaded closures, and the
 loopback TLS material and CA key the socket cutover moved there), and
-each physical recovery copy under `/data/td-mta-physical-recovery`
-(base backup, WAL and `bootstrap.tar`; copies taken before the socket
-cutover hold the old TLS directory and its CA key). The retained Debian
-tree `/opt/td-mta/postgresql` stays: changing td's PostgreSQL closure
-still goes through it, until the binary switch can go from one td
-closure to another. Removing material cannot be undone, so the command
-names that:
+each physical recovery copy under `/data/td-mta-physical-recovery` (base
+backup, WAL and `bootstrap.tar`; copies taken before the socket cutover
+hold the old TLS directory and its CA key). While td's server is
+selected, the retained Debian tree `/opt/td-mta/postgresql` is material
+too, from the time a verified switch left the Debian server, which the
+switch records in
+`/var/lib/td-mta-operator/debian-postgresql-retained-since`. A switch
+from the Debian server clears that record before it stops the server and
+writes it only once verified; a switch between td closures keeps it; a
+verified rerun on td's server writes it when none is, or none readable;
+`--to-debian` clears it once the drop-ins are gone, and its rerun on the
+Debian server too. Retirement never writes it: without a record, or
+unless the running server is the selected td one mapping only its
+closure and the backup job runs its tools, the tree stays, the rest
+still goes, and the receipt's `debian_tree_kept` names what to run. Once
+the tree is gone the record goes too, `--to-debian` refuses, and the
+server moves only between td closures. Removing material cannot be
+undone, so the command names that:
 
 ```text
 ./td-mta/deploy --retire-rollback --irreversible
@@ -789,11 +801,14 @@ names that:
 It keeps the live release, takes the activation lock, refuses while a
 deployment or PostgreSQL fence is held, and first checks the live system
 as the binary switch does (source, journal identity, configuration,
-health). It then checks every piece past its seven days (a root-owned
-directory with nothing mounted inside) before removing any, renames
-each to `.retired-NAME` and removes it; a rerun finishes such a name
-whatever its age. Each removal is a receipt event first, and the
-receipt lists what went (`rollback_retired`) and, while any remains,
+health); on td's server it also checks that the running server is the
+selected one mapping only its closure and the scheduled backup runs its
+tools, and keeps the tree (event and `debian_tree_kept`) when not. It
+then checks every piece past its seven days (a root-owned directory with
+nothing mounted inside) before removing any, renames each to
+`.retired-NAME` and removes it; a rerun finishes such a name whatever
+its age. Each removal is a receipt event first, and the receipt lists
+what went (`rollback_retired`) and, while any remains,
 `rollback_retire_not_before`, the Unix time the next piece may go. When
 everything is inside its window it refuses and records that time. A
 piece it may not remove refuses the run with its path.
@@ -1358,14 +1373,17 @@ share the data format, so the Debian release may be older than td's,
 and Debian's server reads everything td's can; no rehearsal runs.
 Before fencing it requires the Debian tree's server and clients to be
 root-owned executables. A rerun on the Debian server
-records `already on the Debian PostgreSQL`. The store paths stay.
+records `already on the Debian PostgreSQL`. The store paths stay. The
+launcher refuses `--to-debian` once the Debian tree is retired.
 
 Once switched, the bootstrap archive that each activation's recovery
 copy keeps includes the server's drop-in, the backup job's where
-present, and the two selected store paths, not the rest of `/td/store`.
+present, and the two selected store paths, not the rest of `/td/store`;
+the Debian tree only while it is selected or present.
 
 A regenerated backup job keeps the drop-in's tools: its own
 `--postgres-bin` and `--tool-library-dir` matter again only on the
-Debian binaries. The restore drill runs on the recovery host, not
-here; its supported layouts do not include `/td/store`, so a drill that
-should use td's tools needs that layout admitted first.
+Debian binaries, which no longer exist once the tree is retired. The
+restore drill runs on the recovery host, not here; its supported layouts
+do not include `/td/store`, so a drill that should use td's tools needs
+that layout admitted first.

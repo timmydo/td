@@ -43,7 +43,8 @@ switch it from the Debian PostgreSQL or another td closure to td's
 source-built one, applying what the reviewed minor-release table says each
 release in between needs; --to-debian returns it to the retained Debian one.
 --retire-rollback deletes rollback material older than seven days: earlier
-job directories and physical recovery copies.
+job directories, physical recovery copies, and the Debian PostgreSQL tree
+once a verified switch left it.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
@@ -57,6 +58,7 @@ struct Options<'a> {
     budget: u64,
     account: Option<&'a str>,
     config: Option<&'a str>,
+    window: bool,
     socket: bool,
     binaries: bool,
     to_debian: bool,
@@ -69,6 +71,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         budget: 60,
         account: None,
         config: None,
+        window: false,
         socket: false,
         binaries: false,
         to_debian: false,
@@ -81,6 +84,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--skip-tests" => out.skip = true,
             "--window-seconds" => {
                 out.budget = it.next().ok_or("missing window")?.parse()?;
+                out.window = true;
                 require(
                     (1..=3600).contains(&out.budget),
                     "window must be 1..3600 seconds",
@@ -109,8 +113,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         "--to-debian belongs to --postgres-binaries",
     )?;
     require(
-        !(out.retire && (out.socket || out.binaries || out.skip)),
-        "retiring rollback material is its own job",
+        !(out.retire && (out.socket || out.binaries || out.skip || out.window)),
+        "retiring rollback material is its own job and has no writer window",
     )?;
     require(
         out.irreversible || !out.retire,

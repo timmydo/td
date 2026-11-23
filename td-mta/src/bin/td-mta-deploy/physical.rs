@@ -420,9 +420,12 @@ impl Recovery {
                 include(&path)?;
             }
         }
+        // Needed while selected; once retired on td's, gone.
+        if h.host.debian_tools() || Path::new(DEBIAN_POSTGRES).try_exists()? {
+            include(Path::new(DEBIAN_POSTGRES))?;
+        }
         for path in [
             Path::new("/var/lib/td-mta/backup-control"),
-            Path::new(DEBIAN_POSTGRES),
             Path::new(PG_DROPIN),
             h.previous.parent().ok_or("release parent")?,
         ] {
