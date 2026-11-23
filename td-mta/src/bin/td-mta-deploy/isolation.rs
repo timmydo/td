@@ -86,6 +86,15 @@ pub(crate) fn installed() -> R<bool> {
     files::installed(&files::production()?)
 }
 
+/// Whether some but not all identity settings are in place.
+pub(crate) fn partial(tls: bool) -> R<bool> {
+    files::partial(&if tls {
+        files::production_tls()?
+    } else {
+        files::production()?
+    })
+}
+
 /// The identity settings as they were while PostgreSQL used loopback TLS.
 pub(crate) fn installed_tls() -> R<bool> {
     files::installed(&files::production_tls()?)

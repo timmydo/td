@@ -26,6 +26,8 @@ pub(crate) mod binaries;
 mod database;
 #[path = "activation_fence.rs"]
 mod fence;
+#[path = "activation_recover.rs"]
+mod recover;
 #[path = "activation_release.rs"]
 mod release;
 #[path = "activation_retire.rs"]
@@ -171,6 +173,8 @@ pub(super) struct Deployment {
     dropins_started: bool,
     cold: PathBuf,
     original: PathBuf,
+    /// The job whose deployment fence `--recover` finishes; else this one.
+    fence_owner: Option<PathBuf>,
 }
 
 pub(super) fn run(job: Json, mode: &str) -> R<()> {
@@ -190,7 +194,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "PostgreSQL still uses loopback TLS: run td-mta/deploy --postgres-socket",
     )?;
     host.select_tools(binaries::selected()?);
-    let mut deployment = Deployment::new(host, work, job, tls, &config)?;
+    let mut deployment = Deployment::new(host, work, job, tls, &config, mode == "recover")?;
     if mode == "refresh-notifications" {
         require(
             deployment.isolated && !Path::new(FENCE).try_exists()?,
@@ -214,6 +218,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
             | "postgres-binaries"
             | "postgres-to-debian"
             | "retire-rollback"
+            | "recover"
     ) {
         // Reserve the first activation receipt under the host lock. A repeated
         // invocation must leave the original event and recovery evidence intact.
@@ -226,6 +231,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "postgres-binaries" => deployment.postgres_binaries(),
         "postgres-to-debian" => deployment.postgres_to_debian(),
         "retire-rollback" => deployment.retire_rollback(),
+        "recover" => deployment.recover(),
         _ => Err("unknown deployment operation".into()),
     };
     if let Err(ref err) = result {
@@ -240,7 +246,14 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
 }
 
 impl Deployment {
-    fn new(host: Host, work: PathBuf, mut job: Json, tls: bool, config: &HostConfig) -> R<Self> {
+    fn new(
+        host: Host,
+        work: PathBuf,
+        mut job: Json,
+        tls: bool,
+        config: &HostConfig,
+        recover: bool,
+    ) -> R<Self> {
         let basename = name(&work)?;
         require(
             work.parent() == Some(Path::new(OP)) && numbered_name(basename, "deploy-"),
@@ -262,7 +275,10 @@ impl Deployment {
         set(&mut job, "status", "preflight".into())?;
         set(&mut job, "started", now()?.into())?;
         set(&mut job, "events", Json::Arr(Vec::new()))?;
-        let isolated = if tls {
+        let isolated = if recover && isolation::partial(tls)? {
+            // A recovery removes the partial install its job left.
+            false
+        } else if tls {
             isolation::installed_tls()?
         } else {
             isolation::installed()?
@@ -296,6 +312,7 @@ impl Deployment {
             socket_fence: false,
             tls,
             dropins_started: false,
+            fence_owner: None,
         })
     }
 
@@ -337,7 +354,7 @@ impl Deployment {
     fn execute(&mut self) -> R<()> {
         require(
             !Path::new(FENCE).try_exists()?,
-            "unfinished deployment fence: inspect previous receipt",
+            "unfinished deployment fence: run td-mta/deploy --recover",
         )?;
         require(
             fs::canonicalize(ACTIVE)? == self.previous,

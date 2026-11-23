@@ -926,6 +926,39 @@ impl Recovery {
     }
 }
 
+/// After its controller died, a recovery copy's working parts (`copy`, on
+/// the recovery volume) and every runtime directory, which only a live
+/// controller under the activation lock uses; the copy itself stays.
+pub(super) fn close_dead(copy: Option<&Path>) -> R<()> {
+    if let Some(copy) = copy {
+        require(
+            copy.parent() == Some(Path::new(VOLUME))
+                && copy
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("deploy-")),
+            "the job's recovery copy is not on the recovery volume",
+        )?;
+        for name in ["migration", "replay", "transport", "binaries", "archive"] {
+            let path = child(copy, name)?;
+            if path.try_exists()? {
+                fs::remove_dir_all(path)?;
+            }
+        }
+    }
+    for entry in fs::read_dir("/run")? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("td-mta-recovery-"))
+        {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn stop_unit(h: &Host, unit: &str) -> R<()> {
     h.exec(
         h.cmd("systemctl").arg("stop").arg(unit),

@@ -547,7 +547,7 @@ impl Deployment {
         )?;
         require(
             !Path::new(PG_FENCE).try_exists()?,
-            "stale PostgreSQL socket fence: inspect the previous receipt",
+            "stale PostgreSQL socket fence: run td-mta/deploy --recover",
         )?;
         fence::fence_directory(false)?;
         self.socket_settings(&[])?;
@@ -558,7 +558,7 @@ impl Deployment {
     pub(super) fn postgres_socket(&mut self) -> R<()> {
         require(
             !Path::new(FENCE).try_exists()?,
-            "unfinished deployment fence: inspect previous receipt",
+            "unfinished deployment fence: run td-mta/deploy --recover",
         )?;
         require(
             self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous,

@@ -451,7 +451,12 @@ impl Deployment {
         if Path::new(FENCE).try_exists()? {
             require(
                 std::str::from_utf8(&td_fs::read_bounded(Path::new(FENCE), 4096)?)?.trim()
-                    == self.work.to_str().ok_or("job path")?,
+                    == self
+                        .fence_owner
+                        .as_deref()
+                        .unwrap_or(&self.work)
+                        .to_str()
+                        .ok_or("job path")?,
                 "foreign deployment fence",
             )?;
             fs::remove_file(FENCE)?;

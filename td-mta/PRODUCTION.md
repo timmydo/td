@@ -759,15 +759,80 @@ selected database, including accepted mail, for operator recovery.
 
 Watch the job and its receipt with `systemctl status td-mta-deploy-XXXXXXXX`
 and `sudo cat /var/lib/td-mta-operator/deploy-XXXXXXXX/receipt.json`,
-substituting the printed identifier. After an interrupted host boot,
-`/var/lib/td-mta-operator/deployment-fence` names the owning job. Check
-its event record, unit states, selected executable, both PGDATA directories
-and the recovery receipt before reopening writers. Never restore a retained
-cluster after writers may have reopened without reconciling subsequent mail.
+substituting the printed identifier. A job whose controller died or
+failed inside its fence is finished with `--recover`
+([Recovering an interrupted job](#recovering-an-interrupted-job)).
 ACME may need its separate four-minute lease budget after SMTP and JMAP
 return. The original data stays in the job directory and the recovery
 inputs in `/data/td-mta-physical-recovery` through the rollback window
 ([Retiring rollback material](#retiring-rollback-material)).
+
+### Recovering an interrupted job
+
+```text
+./td-mta/deploy --recover
+```
+
+Every later job refuses while a deployment fence is held. `--recover`
+is its own job that keeps the live release; under the activation lock
+no controller runs, so what the fence's job left is what its receipt and
+the host say. The launcher skips its first public JMAP check, which a
+held fence fails. `/var/lib/td-mta-operator/deployment-fence` names that
+job; a fence naming no job directory (empty or torn: its controller died
+writing it) belongs to the most recent job that recorded `fencing` and
+since neither began admission nor recorded an end, and recovery rewrites
+it with that job's path; with no such job it stops. The receipt records
+`recovered_job` and `recovering JOB MODE: STATE`. Before anything else
+a rollback leaves `recover-rollback` in that job's directory, so that a
+later recovery never goes forward on what this one half restored:
+
+- `Admitting`: the last step was `opening writers` and the database
+  socket fence, which admission removes first, is gone. It recovers
+  forward as the controller does: reopens the socket, removes the
+  fence, starts the services and the timers that job recorded and
+  requires the selected release healthy.
+- `Switch` (`--postgres-binaries`, `--to-debian`): the rollback before
+  admission, from the receipt. Each switch records, before it fences,
+  the source's drop-in paths (`postgres_source_dropins`) and the Debian
+  tree's window (`postgres_window`); recovery rebuilds the source's
+  and the switch's drop-ins from them and the unit's arguments and
+  restores path by path, then starts the source server, requires it to
+  be the running executable, admits writers and puts the window back.
+- `Activation`: the rollback before admission. Once the receipt records
+  `exact recovery point verified` the migration may have stopped the
+  primary or moved its data directory: the job's `original-pgdata`,
+  the shut-down primary the migration never changes, goes back in
+  place once `pg_controldata` reads it shut down with the production
+  system identifier (a migrated or half-swapped one goes aside as
+  `unreleased-pgdata`; `original primary data directory restored`).
+  An isolation cutover's identity settings go, the previous release is
+  selected, the socket reopens, and the primary must hold the epoch and
+  `schema_before` the job recorded before writers are admitted and the
+  release verified (`rollback`). Writers never returned while the fence
+  stood, so the original holds everything; the recovery copy is not
+  needed and stays for its window.
+- `Shared`: a `--restore-shared-services` fence changes no data, so the
+  restore is completed against the deployment's recorded epoch.
+
+After a host reboot the fence keeps the services and, for a migration,
+PostgreSQL stopped; recovery recreates the start permit. A recovery that
+fails before admission leaves the fence for the next `--recover`; once
+it begins admission it records `opening writers` first, so the next one
+recovers forward. Without a fence, recovery finishes the admission of the
+latest job that fenced if its last step was `opening writers` and it
+recorded neither its listeners' return nor a finished rollback or
+recovery (a controller dying after removing the fence and before
+starting the services); else it reopens a socket fence left alone over
+the production primary, requires the live release healthy and clears
+every job's candidate copy and what the latest job left (`nothing to
+recover`). Once the fence is gone
+it removes the candidate copy, the start permit, the fence conditions,
+the working parts of a recovery copy and the decision, then records
+`recovered`. The
+loopback-TLS socket cutover, which production has completed, is the one
+fenced job it refuses. A switch recovered forward leaves no Debian tree
+window: `--postgres-binaries` naming the running closure verifies it and
+records one.
 
 ### Retiring rollback material
 
@@ -1287,41 +1352,16 @@ source server starts on the same data directory and must be the running
 executable, the fence opens and the services are verified; the receipt
 records `source PostgreSQL restored: NAME` and, as td's `pg_controldata`
 read it before the source started, `postgres_td_control_state`. After
-admission the job recovers forward on td's server. If the host reboots
-inside the window, the deployment fence keeps the services stopped and
-PostgreSQL starts on whichever binary the drop-in selects, with its
-socket closed; inspect the receipt before reopening writers.
-
-If the controller itself dies mid-switch (killed, power loss), recover
-by hand from the receipt; once it records `fencing`, every later mode
-refuses on the deployment fence or the stale socket fence file:
-
-- If it lacks `fencing`, the source server (`postgres_source`) still
-  runs unfenced and only the store paths and the inert fence conditions
-  changed: run the same command again.
-- Otherwise, if it lacks `td-built PostgreSQL started` (or, returning,
-  `Debian PostgreSQL started`), return to the source server: stop
-  PostgreSQL; make each `91-td-mta-binaries.conf` drop-in what the
-  source had (none from the Debian server; from a td closure, the
-  server's naming `postgres_source` and the backup job's naming its
-  `bin`, as before the run); run `systemctl daemon-reload`; remove
-  `/etc/td-mta/postgres-fence.conf`; start PostgreSQL and check that
-  `/proc/MAINPID/exe` is the source's `postgres`. Each drop-in is
-  replaced in one rename, so each always holds the source's setting or
-  the new one.
-- Otherwise the new server runs on the data directory: keep the
-  drop-ins, remove the fence file if present and run `sudo -u td-mta
-  chmod 0660 /var/lib/td-mta-postgres/.s.PGSQL.35432`.
-
-Then, as for any interrupted job, remove
-`/var/lib/td-mta-operator/deployment-fence`, start the services and
-timers the receipt recorded and require health. The next controller run
-of any mode selects its PostgreSQL tools from the drop-in: td's while
-`91-td-mta-binaries.conf` exists, the Debian tree otherwise. Run
-`--postgres-binaries` again to finish or verify the switch; on a host
-the drop-in already switched it verifies, after installing the backup
-job's drop-in if a switch made before the backup followed the server
-left it out.
+admission the job recovers forward on td's server. If the controller
+dies or the host reboots inside the window, the deployment fence keeps
+the services stopped: run `--recover`
+([Recovering an interrupted job](#recovering-an-interrupted-job)).
+The next controller run of any mode selects its PostgreSQL tools from
+the drop-in: td's while `91-td-mta-binaries.conf` exists, the Debian
+tree otherwise. Run `--postgres-binaries` again to finish or verify the
+switch; on a host the drop-in already switched it verifies, after
+installing the backup job's drop-in if a switch made before the backup
+followed the server left it out.
 
 The receipt's events are the evidence: `scheduled backup moved to td's
 PostgreSQL tools` after both drop-ins verify, and `verified td-built

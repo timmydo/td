@@ -204,13 +204,23 @@ pub(crate) fn present(file: &Setting) -> R<bool> {
     Ok(true)
 }
 
-pub(crate) fn installed(files: &[Setting]) -> R<bool> {
+fn count_present(files: &[Setting]) -> R<usize> {
     let mut count = 0;
     for item in files {
         if present(item)? {
             count += 1;
         }
     }
+    Ok(count)
+}
+
+pub(crate) fn partial(files: &[Setting]) -> R<bool> {
+    let count = count_present(files)?;
+    Ok(count != 0 && count != files.len())
+}
+
+pub(crate) fn installed(files: &[Setting]) -> R<bool> {
+    let count = count_present(files)?;
     require(
         count == 0 || count == files.len(),
         "incomplete isolated service installation",

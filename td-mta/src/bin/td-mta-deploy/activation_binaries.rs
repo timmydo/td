@@ -188,6 +188,26 @@ impl Source {
         })
     }
 
+    /// The source a switch job recorded (`postgres_source`).
+    pub(super) fn named(name: &str) -> R<Self> {
+        if name == DEBIAN_SOURCE {
+            return Ok(Self::Debian);
+        }
+        store_basename(name, "postgresql-x86-64")?;
+        let bin = child(Path::new(STORE), &fmt(format_args!("{name}/bin"))?)?;
+        let interpreter = loader::interpreter(&child(&bin, "postgres")?)?
+            .ok_or("the td-built server names no loader")?;
+        let glibc = loader::store_root(&interpreter, "glibc-x86-64")?;
+        let glibc = glibc
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("store path")?;
+        Ok(Self::Td {
+            bin,
+            basenames: [owned(name)?, owned(glibc)?],
+        })
+    }
+
     pub(super) fn postgres(&self) -> R<PathBuf> {
         match self {
             Self::Debian => child(Path::new(DEBIAN_TOOLS), "postgres"),
@@ -781,7 +801,7 @@ impl Deployment {
     pub(super) fn postgres_binaries(&mut self) -> R<()> {
         require(
             !Path::new(FENCE).try_exists()?,
-            "unfinished deployment fence: inspect previous receipt",
+            "unfinished deployment fence: run td-mta/deploy --recover",
         )?;
         require(
             self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous,
@@ -832,6 +852,7 @@ impl Deployment {
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
         let mut switch = Switch::from(source, previous);
+        self.note_switch(&switch)?;
         self.guarded(
             &mut switch,
             |d, switch| d.binaries_cutover(&closure, switch),
@@ -1020,7 +1041,7 @@ impl Deployment {
     pub(super) fn postgres_to_debian(&mut self) -> R<()> {
         require(
             !Path::new(FENCE).try_exists()?,
-            "unfinished deployment fence: inspect previous receipt",
+            "unfinished deployment fence: run td-mta/deploy --recover",
         )?;
         require(
             self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous,
@@ -1076,6 +1097,7 @@ impl Deployment {
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
         let mut switch = Switch::from(source, previous);
+        self.note_switch(&switch)?;
         self.guarded(
             &mut switch,
             |d, switch| d.debian_cutover(target, switch),
@@ -1487,6 +1509,85 @@ impl Deployment {
         )
     }
 
+    /// What `--recover` needs of a switch before it fences: the source's
+    /// drop-in paths and the Debian tree's window it recorded.
+    fn note_switch(&mut self, switch: &Switch) -> R<()> {
+        let mut paths = Vec::new();
+        for setting in &switch.previous {
+            let path = setting.path.to_str().ok_or("drop-in path")?;
+            td_alloc::push(&mut paths, Json::Str(owned(path)?))?;
+        }
+        set(
+            &mut self.record,
+            "postgres_source_dropins",
+            Json::Arr(paths),
+        )?;
+        let window = super::retire::switched_at(Path::new(super::retire::SWITCHED));
+        set(
+            &mut self.record,
+            "postgres_window",
+            window.map_or(Json::Null, Json::from),
+        )
+    }
+
+    /// `--recover` of a switch whose controller stopped inside its fence
+    /// before writer admission, from its receipt: the source server back,
+    /// path by path from what each drop-in holds, as its rollback does.
+    pub(super) fn recover_switch(&mut self, receipt: &Json) -> R<()> {
+        let source = Source::named(field(receipt, "postgres_source")?)?;
+        // The unit's arguments, whichever server systemd has loaded.
+        let property = crate::readiness::exec_start(&self.host, PG_BUS)?;
+        let mut args = None;
+        let mut programs = Vec::new();
+        td_alloc::push(&mut programs, source.postgres()?)?;
+        td_alloc::push(&mut programs, child(Path::new(DEBIAN_TOOLS), "postgres")?)?;
+        let closure = match field(receipt, "mode")? {
+            "postgres-binaries" => {
+                let closure = Closure::from_job(receipt)?;
+                td_alloc::push(&mut programs, closure.postgres()?)?;
+                Some(closure)
+            }
+            "postgres-to-debian" => None,
+            _ => return Err("not a PostgreSQL switch job".into()),
+        };
+        for program in &programs {
+            if let Ok(found) = server_arguments(&property, program.to_str().ok_or("server path")?) {
+                args = Some(found);
+                break;
+            }
+        }
+        let args = args.ok_or("td-mta-postgres.service runs none of the switch's servers")?;
+        let held = receipt
+            .get("postgres_source_dropins")
+            .and_then(Json::as_arr)
+            .ok_or("the switch recorded no source drop-ins")?;
+        let mut previous = Vec::new();
+        for setting in source.settings(&args)? {
+            let path = setting.path.to_str().ok_or("drop-in path")?;
+            if held.iter().any(|p| p.as_str() == Some(path)) {
+                td_alloc::push(&mut previous, setting)?;
+            }
+        }
+        let mut switch = Switch::from(source, previous);
+        switch.window = receipt.get("postgres_window").and_then(Json::as_u64);
+        if let Some(closure) = closure {
+            let program = closure.postgres()?;
+            let bin = closure.bin()?;
+            switch.dropin = Some(Setting {
+                path: PathBuf::from(BINARIES_DROPIN),
+                text: dropin_text(program.to_str().ok_or("store path")?, &args)?,
+                mode: 0o644,
+            });
+            switch.backup = Some(Setting {
+                path: PathBuf::from(BACKUP_DROPIN),
+                text: backup_dropin_text(bin.to_str().ok_or("store path")?)?,
+                mode: 0o644,
+            });
+        }
+        switch.stopped = true;
+        self.restore_source(&mut switch)
+    }
+
     // Before writer admission: the source server on the same data directory.
     // The verified store paths stay; nothing runs them.
     fn restore_source(&mut self, switch: &mut Switch) -> R<()> {
@@ -1565,6 +1666,11 @@ impl Deployment {
         if self.socket_fence {
             open_socket(&mut LiveSocket(&self.host))?;
             self.socket_fence = false;
+        }
+        // A recovery starts without the switch's journal identity, which
+        // needs the socket open.
+        if self.epoch.is_empty() {
+            self.journal_identity()?;
         }
         self.config(&self.previous, &[], self.isolated)?;
         self.admit()?;

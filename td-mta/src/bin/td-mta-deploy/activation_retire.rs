@@ -249,7 +249,7 @@ impl Deployment {
         )?;
         require(
             !Path::new(FENCE).try_exists()? && !Path::new(PG_FENCE).try_exists()?,
-            "unfinished deployment fence: recover that job first",
+            "unfinished deployment fence: run td-mta/deploy --recover",
         )?;
         require(
             self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous,

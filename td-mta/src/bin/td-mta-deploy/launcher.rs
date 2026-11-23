@@ -30,6 +30,7 @@ const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [OPTIONS]
        td-mta/deploy --postgres-binaries [--to-debian] [OPTIONS]
        td-mta/deploy --retire-rollback --irreversible [OPTIONS]
+       td-mta/deploy --recover [OPTIONS]
        td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
          --identity KEY --jmap-account ACCOUNT --jmap-url URL
          [--host-key-sha256 SHA256:FP] [--config FILE] [--replace]
@@ -44,7 +45,9 @@ source-built one, applying what the reviewed minor-release table says each
 release in between needs; --to-debian returns it to the retained Debian one.
 --retire-rollback deletes rollback material older than seven days: earlier
 job directories, physical recovery copies, and the Debian PostgreSQL tree
-once a verified switch left it.
+once a verified switch left it. --recover finishes or rolls back a job
+whose controller stopped inside its writer fence, as that controller
+would have, keeping the live release otherwise.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
@@ -63,6 +66,7 @@ struct Options<'a> {
     binaries: bool,
     to_debian: bool,
     retire: bool,
+    recover: bool,
     irreversible: bool,
 }
 fn parse(args: &[String]) -> R<Options<'_>> {
@@ -76,6 +80,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         binaries: false,
         to_debian: false,
         retire: false,
+        recover: false,
         irreversible: false,
     };
     let mut it = args.iter();
@@ -96,6 +101,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--postgres-binaries" => out.binaries = true,
             "--to-debian" => out.to_debian = true,
             "--retire-rollback" => out.retire = true,
+            "--recover" => out.recover = true,
             "--irreversible" => out.irreversible = true,
             _ => return Err(HELP.into()),
         }
@@ -115,6 +121,16 @@ fn parse(args: &[String]) -> R<Options<'_>> {
     require(
         !(out.retire && (out.socket || out.binaries || out.skip || out.window)),
         "retiring rollback material is its own job and has no writer window",
+    )?;
+    require(
+        !(out.recover
+            && (out.socket
+                || out.binaries
+                || out.skip
+                || out.window
+                || out.retire
+                || out.irreversible)),
+        "recovery is its own job: it takes no other operation",
     )?;
     require(
         out.irreversible || !out.retire,
@@ -699,7 +715,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
         Some(p) => PathBuf::from(p),
         None => child(&home, ".local/state/td/main-integration")?,
     };
-    let (selected, verdict) = if opts.socket || opts.binaries || opts.retire {
+    let (selected, verdict) = if opts.socket || opts.binaries || opts.retire || opts.recover {
         require(
             local.is_ancestor(live, &tip)?,
             "live release is not an ancestor of advertised main",
@@ -746,7 +762,12 @@ pub(super) fn run(args: &[String]) -> R<()> {
         }
         _ => None,
     };
-    let before = local.qualify_jmap(account, &target.jmap_url)?;
+    // A held fence keeps the services, and so public JMAP, down.
+    let before = if opts.recover {
+        None
+    } else {
+        Some(local.qualify_jmap(account, &target.jmap_url)?)
+    };
     if selected != live {
         let key = local.key.to_str().ok_or("invalid SSH key path")?;
         let mirror = site.mirror()?;
@@ -816,6 +837,9 @@ pub(super) fn run(args: &[String]) -> R<()> {
     if opts.retire {
         set(&mut spec, "mode", Json::Str(owned("retire-rollback")?))?;
     }
+    if opts.recover {
+        set(&mut spec, "mode", Json::Str(owned("recover")?))?;
+    }
     set(&mut spec, "irreversible", Json::Bool(opts.irreversible))?;
     if let Some((source, live_minor)) = &live_server {
         // What the launcher read; the controller requires the same.
@@ -864,7 +888,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
     ] {
         set(&mut probe, k, Json::Str(owned(v)?))?;
     }
-    set(&mut probe, "before", Json::from(before))?;
+    set(&mut probe, "before", before.map_or(Json::Null, Json::from))?;
     local.save(&probe_path, &probe)?;
     let unit = fmt(format_args!("--unit=td-mta-deploy-{token}"))?;
     let working = fmt(format_args!("--property=WorkingDirectory={job}"))?;
@@ -890,6 +914,8 @@ pub(super) fn run(args: &[String]) -> R<()> {
                 "--postgres-binaries"
             } else if opts.retire {
                 "--retire-rollback"
+            } else if opts.recover {
+                "--recover"
             } else {
                 "--activate"
             },

@@ -91,7 +91,7 @@ fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
         declared
             == match mode {
                 "postgres-socket" | "postgres-binaries" | "postgres-to-debian"
-                | "retire-rollback" => Some(mode),
+                | "retire-rollback" | "recover" => Some(mode),
                 _ => None,
             },
         "job operation does not match the requested mode",
@@ -142,6 +142,7 @@ fn run() -> R<()> {
         [s] if s == "--postgres-binaries" => supervise("postgres-binaries"),
         [s] if s == "--postgres-to-debian" => supervise("postgres-to-debian"),
         [s] if s == "--retire-rollback" => supervise("retire-rollback"),
+        [s] if s == "--recover" => supervise("recover"),
         [s] if s == "--restore-shared-services" => supervise("restore-shared-services"),
         [s] if s == "--refresh-notifications" => supervise("refresh-notifications"),
         [s, rest @ ..]
