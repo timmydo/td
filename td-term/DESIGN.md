@@ -470,8 +470,9 @@ td-term makes those files in `XDG_RUNTIME_DIR` when it is absolute and a
 directory private to td-term's account that the account can write and
 search, which a session's runtime directory is and which is memory, and
 otherwise in the temporary directory, which may be a disk the written pages
-go back to. A memory directory's size bounds the buffers: a frame the
-directory has no room for fails its present, and the terminal with it.
+go back to. After the first frame, a full pool directory defers presentation.
+The PTY and terminal model stay live, and td-ui retries the latest display
+state when space becomes available.
 Every glyph and decoration is clipped to the surface before pixels are
 visited, and a surface smaller than the grid renders its visible corner.
 

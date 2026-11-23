@@ -753,7 +753,16 @@ of its own files may name each module.
   rule; `present_changed`, the same for a closure told whether the raster
   holds the last frame at this extent that answers the pixel rows it
   changed (`Changed`), at most `DAMAGE_BANDS` bands; `buffers`, `pixels`,
-  `frame_callback`, and `scrub_frames`), the
+  `frame_callback`, and `scrub_frames`). With `retry_live_pool_writes`, after
+  the first submitted frame a full pool filesystem or exhausted quota defers
+  the frame or pointer image. The event loop keeps servicing input and other
+  work, reports the storage error once per pending operation, and retries at
+  one-second intervals. If unlinking the empty pool file runs out of space,
+  the retry reuses that file after checking its identity. A released buffer
+  of the wrong size is retired before allocating its replacement. A partial
+  frame stays private and forces a full
+  repaint on retry. Initial presentation and frame scrubbing still propagate
+  errors. The client also owns the
   devices (`seat`, `keyboard`, `pointer`, `entered` for the pointer's enter
   serial, `input` for the keyboard's state, and the repeat half of that
   state a consumer drives: `cancel_repeat`, `arm`, `repeat` and

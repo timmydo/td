@@ -356,27 +356,47 @@ impl Connection {
     }
 }
 
-pub(crate) fn pool_error(
-    operation: &str,
-    directory: &Path,
-    size: usize,
-    error: io::Error,
-) -> String {
-    td_alloc::format(format_args!(
-        "{operation} ({size} bytes) in {}: {error}",
-        directory.display()
-    ))
-    .unwrap_or_default()
+/// Only local backing storage exhaustion is eligible for a deferred redraw.
+pub(crate) enum PoolError {
+    Io(&'static str, usize, io::Error),
+    Unlink(PathBuf, File, io::Error),
+    Other(String),
+}
+
+impl PoolError {
+    pub(crate) fn full(&self) -> bool {
+        matches!(self, Self::Io(_, _, error) | Self::Unlink(_, _, error) if matches!(error.kind(),
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded))
+    }
+
+    pub(crate) fn describe(self, directory: &Path) -> String {
+        match self {
+            Self::Io(operation, size, error) => td_alloc::format(format_args!(
+                "{operation} ({size} bytes) in {}: {error}",
+                directory.display()
+            ))
+            .unwrap_or_default(),
+            Self::Unlink(path, _, error) => format!("unlink pool {}: {error}", path.display()),
+            Self::Other(message) => message,
+        }
+    }
 }
 
 /// A private, unlinked, 0600 regular file of `size` bytes for a SHM pool:
 /// `create_new` under a checked process-local serial, unlinked before it
 /// is sized, reachable afterwards only through the returned owner.
 pub fn backing_file(directory: &Path, size: usize) -> Result<File> {
+    try_backing_file(directory, size).map_err(|e| e.describe(directory))
+}
+
+pub(crate) fn try_backing_file(
+    directory: &Path,
+    size: usize,
+) -> std::result::Result<File, PoolError> {
     for _ in 0..64 {
         let serial = NEXT_FILE
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| "pool name counter exhausted")?;
+            .map_err(|_| PoolError::Other("pool name counter exhausted".into()))?;
         let path = directory.join(format!(".td-ui-shm-{}-{serial}", std::process::id()));
         match OpenOptions::new()
             .read(true)
@@ -386,19 +406,30 @@ pub fn backing_file(directory: &Path, size: usize) -> Result<File> {
             .open(&path)
         {
             Ok(file) => {
-                std::fs::remove_file(&path)
-                    .map_err(|e| format!("unlink pool {}: {e}", path.display()))?;
-                file.set_len(size as u64)
-                    .map_err(|e| pool_error("size Wayland pool", directory, size, e))?;
-                return Ok(file);
+                return unlink_and_size(path, file, size);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return Err(pool_error("create Wayland pool", directory, size, e));
+                return Err(PoolError::Io("create Wayland pool", size, e));
             }
         }
     }
-    Err("Wayland pool filename collision budget".into())
+    Err(PoolError::Other(
+        "Wayland pool filename collision budget".into(),
+    ))
+}
+
+pub(crate) fn unlink_and_size(
+    path: PathBuf,
+    file: File,
+    size: usize,
+) -> std::result::Result<File, PoolError> {
+    if let Err(error) = std::fs::remove_file(&path) {
+        return Err(PoolError::Unlink(path, file, error));
+    }
+    file.set_len(size as u64)
+        .map_err(|e| PoolError::Io("size Wayland pool", size, e))?;
+    Ok(file)
 }
 
 pub const CURSOR_WIDTH: usize = 16;

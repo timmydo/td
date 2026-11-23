@@ -313,8 +313,10 @@ impl Window {
         };
         ui.dispatch(Event::SelectTab(first)).map_err(error)?;
         ui.dispatch(Event::Focus(false)).map_err(error)?;
+        let mut client = Client::new(stream, temporary)?;
+        client.retry_live_pool_writes();
         Ok(Self {
-            client: Client::new(stream, temporary)?,
+            client,
             ui,
             font: crate::font::pinned()?,
             typeface: None,

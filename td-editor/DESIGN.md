@@ -2253,7 +2253,9 @@ the client shows on pointer enter and on ARGB's arrival while the
 pointer is inside. This is CPU SHM presentation, not GPU rendering.
 
 Pool files are td-ui's `backing_file`, under the creation rules
-`td-ui/DESIGN.md` records. No mmap, host library or persistent font/file
+`td-ui/DESIGN.md` records. After the first frame, pool space or quota
+exhaustion defers redrawing while the file session and unsaved buffers stay
+live. td-ui retries the current view once per second. No mmap, host library or persistent font/file
 lookup is involved.
 
 The descriptor transport (sendmsg, recvmsg and F_DUPFD_CLOEXEC, one syscall

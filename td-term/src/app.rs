@@ -656,6 +656,7 @@ impl Window {
             std::env::temp_dir(),
         );
         let mut client = Client::new(stream, pools)?;
+        client.retry_live_pool_writes();
         client.want_primary();
         let waker = client.connection().waker()?;
         // Before the first frame: a machine whose devpts is missing should

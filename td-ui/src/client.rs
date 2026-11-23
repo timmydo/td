@@ -14,12 +14,13 @@ use crate::pointer;
 use crate::raster::{MAX_AXIS, MAX_FRAME_BYTES};
 use crate::repeat::Input;
 use crate::wayland::{
-    backing_file, cursor_pixels, error, pool_error, Connection, Result, CURSOR_HEIGHT,
+    cursor_pixels, error, try_backing_file, Connection, PoolError, Result, CURSOR_HEIGHT,
     CURSOR_WIDTH, IDLE_WAIT, WRITE_DEADLINE,
 };
 use crate::wire::{Builder, Cursor, Message};
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
@@ -270,6 +271,90 @@ pub struct Client<T: Tag> {
     bound: bool,
     closed: bool,
     temporary: PathBuf,
+    retry_live_pools: bool,
+    frame_retry: PoolRetry,
+    cursor_retry: PoolRetry,
+}
+
+#[derive(Default)]
+struct PoolRetry {
+    deadline: Option<Instant>,
+    named: Option<(PathBuf, File)>,
+}
+
+fn same_pool(path: &std::path::Path, file: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let opened = file.metadata()?;
+    match std::fs::symlink_metadata(path) {
+        Ok(named) => Ok((opened.dev(), opened.ino()) == (named.dev(), named.ino())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+impl Drop for PoolRetry {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+impl PoolRetry {
+    fn due(&self) -> bool {
+        self.deadline.is_none_or(|time| Instant::now() >= time)
+    }
+
+    fn cleanup(&mut self) {
+        if let Some((path, file)) = &self.named {
+            match same_pool(path, file) {
+                Ok(false) => self.named = None,
+                Ok(true) if std::fs::remove_file(path).is_ok() => self.named = None,
+                _ => {}
+            }
+        }
+    }
+
+    fn backing(
+        &mut self,
+        directory: &std::path::Path,
+        size: usize,
+    ) -> std::result::Result<File, PoolError> {
+        if let Some((path, file)) = self.named.take() {
+            match same_pool(&path, &file) {
+                Ok(true) => return crate::wayland::unlink_and_size(path, file, size),
+                Err(error) => return Err(PoolError::Unlink(path, file, error)),
+                Ok(false) => {}
+            }
+        }
+        try_backing_file(directory, size)
+    }
+
+    fn failed(&mut self, error: PoolError, directory: &std::path::Path, retry: bool) -> Result<()> {
+        if !retry || !error.full() {
+            return Err(error.describe(directory));
+        }
+        match error {
+            PoolError::Unlink(path, file, error) => {
+                if self.deadline.is_none() {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "unlink pool {}: {error}; waiting for space",
+                        path.display()
+                    );
+                }
+                self.named = Some((path, file));
+            }
+            other if self.deadline.is_none() => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "{}; waiting for space",
+                    other.describe(directory)
+                );
+            }
+            _ => {}
+        }
+        self.deadline = Some(Instant::now() + Duration::from_secs(1));
+        Ok(())
+    }
 }
 
 /// One of the seat's selections: its seat-bound device, its live
@@ -353,6 +438,9 @@ impl<T: Tag> Client<T> {
             pending_activated: None,
             activated: false,
             presented: None,
+            retry_live_pools: false,
+            frame_retry: PoolRetry::default(),
+            cursor_retry: PoolRetry::default(),
             xrgb: false,
             argb: false,
             cursor_image: None,
@@ -1321,25 +1409,44 @@ impl<T: Tag> Client<T> {
             .map(|image| (image.surface, image.buffer))
     }
 
+    /// Keep an already mapped session alive when local frame storage fills.
+    pub fn retry_live_pool_writes(&mut self) {
+        self.retry_live_pools = true;
+    }
+
     /// Sets the pointer image at the pointer's enter serial, building the
     /// one immutable ARGB pool on the first call. Nothing happens until
     /// the pointer is inside and ARGB was advertised.
     fn show_cursor(&mut self) -> Result<()> {
         let (Some(device), Some(serial), true) = (self.pointer, self.enter, self.argb) else {
+            self.cursor_retry.cleanup();
+            self.cursor_retry.deadline = None;
             return Ok(());
         };
         if let Some(image) = &self.cursor_image {
             let surface = image.surface;
             return self.connection.words(device, 0, &[serial, surface, 0, 0]);
         }
-        let file = backing_file(&self.temporary, CURSOR_BYTES)?;
-        write_pixels(
-            &file,
-            &cursor_pixels(),
-            0,
-            &self.temporary,
-            "write Wayland cursor",
-        )?;
+        if !self.cursor_retry.due() {
+            return Ok(());
+        }
+        let file = match self
+            .cursor_retry
+            .backing(&self.temporary, CURSOR_BYTES)
+            .and_then(|file| {
+                write_pixels(&file, &cursor_pixels(), 0, "write Wayland cursor")?;
+                Ok(file)
+            }) {
+            Ok(file) => file,
+            Err(error) => {
+                return self.cursor_retry.failed(
+                    error,
+                    &self.temporary,
+                    self.retry_live_pools && self.presented.is_some(),
+                )
+            }
+        };
+        self.cursor_retry.deadline = None;
         let surface = self.allocate_kind(Kind::CursorSurface)?;
         let pool = self.allocate_kind(Kind::Pool)?;
         let buffer = self.allocate_kind(Kind::CursorBuffer)?;
@@ -1373,7 +1480,11 @@ impl<T: Tag> Client<T> {
     /// Whether `present` can submit now: configured, XRGB advertised, no
     /// frame callback outstanding, not closed.
     pub fn can_present(&self) -> bool {
-        self.configured && self.xrgb && self.callback.is_none() && !self.closed
+        self.configured
+            && self.xrgb
+            && self.callback.is_none()
+            && !self.closed
+            && self.frame_retry.due()
     }
 
     /// Paints and submits one `width` by `height` XRGB frame when a buffer
@@ -1427,17 +1538,30 @@ impl<T: Tag> Client<T> {
         if free.is_none() && self.buffers.len() == BUFFERS {
             return Ok(false);
         }
-        let index = match free {
-            Some(index)
-                if self.buffers.get(index).ok_or("buffer slot")?.size() != (width, height) =>
-            {
+        let reusable = free.filter(|&index| {
+            self.buffers
+                .get(index)
+                .is_some_and(|b| b.size() == (width, height))
+        });
+        let fresh = if reusable.is_none() {
+            if let Some(index) = free {
                 let old = self.buffers.remove(index);
                 self.connection.words(old.id, 0, &[])?;
                 self.set_kind(old.id, Kind::RetiredBuffer)?;
-                self.create_buffer(width, height, size)?
             }
-            Some(index) => index,
-            None => self.create_buffer(width, height, size)?,
+            match self.frame_retry.backing(&self.temporary, size) {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    self.frame_retry.failed(
+                        error,
+                        &self.temporary,
+                        self.retry_live_pools && self.presented.is_some(),
+                    )?;
+                    return Ok(false);
+                }
+            }
+        } else {
+            None
         };
         self.pixels.resize(size, 0);
         // A paint that fails leaves the raster holding no known frame.
@@ -1464,44 +1588,58 @@ impl<T: Tag> Client<T> {
             }
         }
         let stride = width * 4;
-        let buffer = self.buffers.get_mut(index).ok_or("buffer slot")?;
-        match buffer.holds {
-            // Only the rows changed since this file last held a frame.
-            Some(held_frame) => {
-                let mut row = 0;
-                while row < height {
-                    let stale = |row: &usize| {
-                        self.row_frames
-                            .get(*row)
-                            .is_none_or(|&changed| changed > held_frame)
-                    };
-                    if !stale(&row) {
-                        row += 1;
-                        continue;
-                    }
-                    let end = (row + 1..height)
-                        .find(|later| !stale(later))
-                        .unwrap_or(height);
-                    let (start, stop) = (row * stride, end * stride);
-                    let rows = self.pixels.get(start..stop).ok_or("raster rows")?;
-                    write_pixels(
-                        &buffer.file,
-                        rows,
-                        start as u64,
-                        &self.temporary,
-                        "write Wayland frame",
-                    )?;
-                    row = end;
+        let buffer = reusable.and_then(|index| self.buffers.get(index));
+        let file = fresh
+            .as_ref()
+            .or_else(|| buffer.map(|b| &b.file))
+            .ok_or("buffer slot")?;
+        let written = if let Some(held_frame) = buffer.and_then(|b| b.holds) {
+            let mut row = 0;
+            loop {
+                if row == height {
+                    break Ok(());
                 }
+                let stale = |row: &usize| {
+                    self.row_frames
+                        .get(*row)
+                        .is_none_or(|&changed| changed > held_frame)
+                };
+                if !stale(&row) {
+                    row += 1;
+                    continue;
+                }
+                let end = (row + 1..height)
+                    .find(|later| !stale(later))
+                    .unwrap_or(height);
+                let (start, stop) = (row * stride, end * stride);
+                let rows = self.pixels.get(start..stop).ok_or("raster rows")?;
+                if let Err(error) = write_pixels(file, rows, start as u64, "write Wayland frame") {
+                    break Err(error);
+                }
+                row = end;
             }
-            None => write_pixels(
-                &buffer.file,
-                &self.pixels,
-                0,
+        } else {
+            write_pixels(file, &self.pixels, 0, "write Wayland frame")
+        };
+        if let Err(error) = written {
+            self.painted = None;
+            if let Some(buffer) = reusable.and_then(|index| self.buffers.get_mut(index)) {
+                buffer.holds = None;
+            }
+            self.frame_retry.failed(
+                error,
                 &self.temporary,
-                "write Wayland frame",
-            )?,
+                self.retry_live_pools && self.presented.is_some(),
+            )?;
+            return Ok(false);
         }
+        self.frame_retry.deadline = None;
+        let index = if let Some(file) = fresh {
+            self.create_buffer(width, height, size, file)?
+        } else {
+            reusable.ok_or("buffer slot")?
+        };
+        let buffer = self.buffers.get_mut(index).ok_or("buffer slot")?;
         buffer.holds = Some(frame);
         let id = buffer.id;
         let (w, h) = (
@@ -1566,8 +1704,13 @@ impl<T: Tag> Client<T> {
 
     /// Creates the pool and buffer for one `width` by `height` frame of
     /// `size` bytes, which `present` validated.
-    fn create_buffer(&mut self, width: usize, height: usize, size: usize) -> Result<usize> {
-        let file = backing_file(&self.temporary, size)?;
+    fn create_buffer(
+        &mut self,
+        width: usize,
+        height: usize,
+        size: usize,
+        file: File,
+    ) -> Result<usize> {
         let pool = self.allocate_kind(Kind::Pool)?;
         let buffer = self.allocate_kind(Kind::Buffer)?;
         let mut body = Builder::new();
@@ -2004,7 +2147,26 @@ pub fn run<A: App>(app: &mut A) -> Result<()> {
         }
         // Queued releases and focus changes settle before a repeat can fire.
         app.end_turn(now()?, processed < MESSAGES_PER_TURN && waiting.is_none())?;
+        if app.client().cursor_retry.deadline.is_some() {
+            app.client().show_cursor()?;
+        }
         app.draw()?;
+        let client = app.client();
+        for retry in [client.frame_retry.deadline, client.cursor_retry.deadline]
+            .into_iter()
+            .flatten()
+        {
+            // A clean window at the old size may no longer need the pending frame.
+            let wait = retry
+                .checked_duration_since(Instant::now())
+                .unwrap_or(IDLE_WAIT);
+            client.connection.set_wait(
+                client
+                    .connection
+                    .wait()
+                    .min(wait.max(Duration::from_millis(1))),
+            );
+        }
         if !app.client().closed && processed < MESSAGES_PER_TURN {
             if let Some((_, deadline)) = &waiting {
                 let remaining = deadline
@@ -2053,11 +2215,10 @@ fn write_pixels(
     file: &File,
     pixels: &[u8],
     offset: u64,
-    directory: &std::path::Path,
-    operation: &str,
-) -> Result<()> {
+    operation: &'static str,
+) -> std::result::Result<(), PoolError> {
     file.write_all_at(pixels, offset)
-        .map_err(|e| pool_error(operation, directory, pixels.len(), e))
+        .map_err(|e| PoolError::Io(operation, pixels.len(), e))
 }
 
 /// Writes `size` zero bytes over a buffer's backing file.
@@ -2067,7 +2228,8 @@ fn zero(file: &File, size: usize, directory: &std::path::Path) -> Result<()> {
     while at < size {
         let n = (size - at).min(ZEROS.len());
         let chunk = ZEROS.get(..n).ok_or("zero chunk")?;
-        write_pixels(file, chunk, at as u64, directory, "zero Wayland frame")?;
+        write_pixels(file, chunk, at as u64, "zero Wayland frame")
+            .map_err(|e| e.describe(directory))?;
         at += n;
     }
     Ok(())
@@ -2077,22 +2239,67 @@ fn zero(file: &File, size: usize, directory: &std::path::Path) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::wayland::backing_file;
     #[test]
     fn full_frame_store_reports_directory_and_write_size() {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/full")
             .unwrap();
-        let error = write_pixels(
-            &file,
-            &[0; 32],
-            0,
-            std::path::Path::new("/frames"),
-            "write Wayland frame",
-        )
-        .unwrap_err();
+        let error = write_pixels(&file, &[0; 32], 0, "write Wayland frame")
+            .unwrap_err()
+            .describe(std::path::Path::new("/frames"));
         assert!(error.contains("write Wayland frame (32 bytes) in /frames"));
         assert!(error.contains("os error 28"));
+    }
+
+    #[test]
+    fn a_full_live_frame_retries_the_latest_model_with_full_damage() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut client: Client<Never> = Client::new(stream, std::env::temp_dir()).unwrap();
+        client.retry_live_pool_writes();
+        client.xrgb = true;
+        client.configured = true;
+        assert!(client
+            .present(2, 2, &mut |p| {
+                p.fill(1);
+                Ok(())
+            })
+            .unwrap());
+        let original = client.presented();
+        client.callback = None;
+        client.buffers[0].busy = false;
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let file = std::mem::replace(&mut client.buffers[0].file, full);
+        assert!(!client
+            .present(2, 2, &mut |p| {
+                p.fill(2);
+                Ok(())
+            })
+            .unwrap());
+        assert_eq!(client.presented(), original);
+        assert!(client.callback.is_none());
+        assert!(!client.can_present());
+        assert!(client.buffers[0].holds.is_none());
+        client.buffers[0].file = file;
+        client.frame_retry.deadline = Some(Instant::now());
+        assert!(client
+            .present_changed(2, 2, &mut |p, held| {
+                assert!(!held);
+                p.fill(3);
+                Ok(Changed::Rows(Vec::new()))
+            })
+            .unwrap());
+        let mut contents = [0; 16];
+        client.buffers[0]
+            .file
+            .read_exact_at(&mut contents, 0)
+            .unwrap();
+        assert_eq!(contents, [3; 16]);
+        assert!(client.frame_retry.deadline.is_none());
     }
 
     use std::io::{Read, Seek, SeekFrom};

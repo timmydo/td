@@ -747,7 +747,7 @@ fn presentation_waits_for_configure_xrgb_and_the_frame_callback() {
         .unwrap_err()
         .contains("paint refused"));
     let (messages, files) = drain(&peer);
-    assert_eq!(files.len(), 1, "the buffer exists before the paint");
+    assert!(files.is_empty(), "a refused paint publishes no pool");
     assert!(
         messages
             .iter()
@@ -755,8 +755,7 @@ fn presentation_waits_for_configure_xrgb_and_the_frame_callback() {
         "nothing attached or committed for a refused paint"
     );
     assert!(p.client.frame_callback().is_none());
-    assert_eq!(p.client.buffers().len(), 2);
-    assert!(!p.client.buffers()[1].busy());
+    assert_eq!(p.client.buffers().len(), 1);
 }
 
 #[test]
