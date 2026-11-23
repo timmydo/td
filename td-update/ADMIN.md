@@ -46,7 +46,9 @@ SSH command vocabulary cannot enroll or replace keys.
 `update-from-source [--no-reboot]` explicitly selects a local source build. `rollback [--no-reboot]`
 restores the exact current/previous selector pair through td-boot and also
 reboots by default; a changed pair refuses inside the boot transaction. `status` returns the latest
-job's state (or `status ID` a retained job); `logs [ID]` returns the last 64 KiB of its build log; `cancel` requests
+job's state (or `status ID` a retained job); `logs [ID]` returns the last 64 KiB of its build log,
+both printed with terminal controls replaced for a UTF-8 terminal (a carriage
+return becomes a newline, or is dropped before one); `cancel` requests
 cancellation before installation; `reboot` requests orderly reboot when no
 admin update is active. Repeated updates while a job runs return its status
 and do not change its recorded reboot choice. A lost submission reply is

@@ -19,6 +19,12 @@ pub(crate) const BUILD_UID: u32 = 985;
 const STATE: &str = "/var/lib/td-admin";
 const BUILD_HOME: &str = "/var/lib/td-admin-build";
 const SOCKET: &str = "/run/td-admin/control";
+/// The longest reply a client reads: `OK`, then a whole `LOG_TAIL`, every
+/// byte of which the service's lossy decoding widened to a three-byte
+/// U+FFFD; anything shorter would cut the newest end or split a character.
+const REPLY_BYTES: u64 = 3 + 3 * LOG_TAIL;
+/// How much of a job's log `logs` returns: its newest bytes.
+const LOG_TAIL: u64 = 65536;
 /// The primary account's read-only socket: job status and logs only.
 const STATUS_DIRECTORY: &str = "/run/td-admin-status";
 const STATUS_SOCKET: &str = "/run/td-admin-status/status";
@@ -788,12 +794,12 @@ fn request(shared: &Shared, request: Request) -> Result<String> {
             let mut file = io(File::open(path), "open build log")?;
             let length = io(file.metadata(), "inspect build log")?.len();
             io(
-                file.seek(SeekFrom::Start(length.saturating_sub(65536))),
+                file.seek(SeekFrom::Start(length.saturating_sub(LOG_TAIL))),
                 "seek recent build log",
             )?;
             let mut bytes = Vec::new();
             io(
-                file.take(65536).read_to_end(&mut bytes),
+                file.take(LOG_TAIL).read_to_end(&mut bytes),
                 "read recent build log",
             )?;
             return Ok(String::from_utf8_lossy(&bytes).into_owned());
@@ -1134,20 +1140,53 @@ fn local_read(words: &[&str]) -> Result<bool> {
     if uid == 0 || uid == ADMIN_UID {
         return Ok(false);
     }
-    let response = exchange(STATUS_SOCKET, words)?;
-    io(
-        std::io::stdout().write_all(response.as_bytes()),
-        "show admin result",
-    )?;
+    show(&mut std::io::stdout(), exchange(STATUS_SOCKET, words)?)?;
     Ok(true)
 }
 
 fn client(words: &[&str]) -> Result<()> {
-    let response = exchange(SOCKET, words)?;
-    io(
-        std::io::stdout().write_all(response.as_bytes()),
-        "show admin result",
-    )
+    show(&mut std::io::stdout(), exchange(SOCKET, words)?)
+}
+
+/// Every reply a reader sees, through `printable`.
+fn show(out: &mut impl Write, response: String) -> Result<()> {
+    io(out.write_all(&printable(response)), "show admin result")
+}
+
+/// A reply made safe for a UTF-8 terminal, compacted in place: a log tail
+/// quotes helper output (Git, the downloader, the build), and a status is
+/// filtered alike as a defence. Every C0 control but tab and newline, DEL,
+/// and each C1 character (U+0080 to U+009F, the 8-bit CSI among them)
+/// becomes one `?`; a carriage return before a newline is dropped, and any
+/// other becomes a newline, so progress lines stay readable. Other text,
+/// Unicode format characters included, is kept, and the result stays valid
+/// UTF-8. A terminal in an 8-bit or Latin-1 mode could still read raw
+/// continuation bytes of ordinary characters as C1 controls.
+fn printable(text: String) -> Vec<u8> {
+    let mut bytes = text.into_bytes();
+    let mut kept = 0usize;
+    let mut index = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        let next = bytes.get(index.saturating_add(1)).copied();
+        let (shown, width) = match byte {
+            b'\r' if next == Some(b'\n') => (None, 1),
+            b'\r' => (Some(b'\n'), 1),
+            b'\n' | b'\t' => (Some(byte), 1),
+            0..=0x1f | 0x7f => (Some(b'?'), 1),
+            0xc2 if next.is_some_and(|next| (0x80..=0x9f).contains(&next)) => (Some(b'?'), 2),
+            _ => (Some(byte), 1),
+        };
+        // `kept` never passes `index`, so no unread byte is overwritten.
+        if let Some(shown) = shown {
+            if let Some(slot) = bytes.get_mut(kept) {
+                *slot = shown;
+            }
+            kept = kept.saturating_add(1);
+        }
+        index = index.saturating_add(width);
+    }
+    bytes.truncate(kept);
+    bytes
 }
 
 /// The service's `OK` reply to `words` on `socket`, without its `OK` line.
@@ -1179,7 +1218,7 @@ fn exchange(socket: &str, words: &[&str]) -> Result<String> {
     )?;
     let mut response = String::new();
     io(
-        stream.take(70000).read_to_string(&mut response),
+        stream.take(REPLY_BYTES).read_to_string(&mut response),
         "read admin response",
     )?;
     if let Some(text) = response.strip_prefix("OK\n") {
@@ -1646,6 +1685,62 @@ mod tests {
         if fs::metadata("/proc/self").unwrap().uid() != 0 {
             assert!(submit(&["update"]).is_err());
         }
+    }
+
+    /// Terminal controls from helper output never reach the reader's
+    /// terminal; text, tabs, newlines and other non-ASCII stay, and both
+    /// print paths go through it.
+    #[test]
+    fn replies_reach_the_terminal_without_its_controls() {
+        let mut out = Vec::new();
+        show(
+            &mut out,
+            "job 4: building\n\x1b[31mred\x1b]0;title\x07\tok\r50%\r100%\n\u{9b}2J\u{85}\x7f\x00caf\u{e9} \u{a0}\u{2014}\n".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "job 4: building\n?[31mred?]0;title?\tok\n50%\n100%\n?2J???caf\u{e9} \u{a0}\u{2014}\n"
+        );
+        for (reply, shown) in [
+            ("", ""),
+            ("a\r\nb\r\n", "a\nb\n"),
+            ("\r\r\n", "\n\n"),
+            ("\r", "\n"),
+            // The C1 range's bounds, and one last in the reply.
+            ("\u{80}\u{9f}", "??"),
+            ("a\u{9f}", "a?"),
+            // Ordinary characters whose continuation bytes lie in 0x80 to
+            // 0x9f, and U+00BF, the last character with a 0xc2 lead.
+            (
+                "\u{bf}\u{1f600}\u{fffd}\u{202e}",
+                "\u{bf}\u{1f600}\u{fffd}\u{202e}",
+            ),
+        ] {
+            assert_eq!(printable(reply.into()), shown.as_bytes(), "{reply:?}");
+        }
+        let source = include_str!("admin.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(
+            source
+                .matches("show(&mut std::io::stdout(), exchange(")
+                .count(),
+            2
+        );
+        assert_eq!(source.matches("write_all(&printable(").count(), 1);
+    }
+
+    /// The client reads the widest reply whole: a 64 KiB tail of invalid
+    /// bytes, each one U+FFFD, after `OK`.
+    #[test]
+    fn the_client_reads_the_widest_log_reply() {
+        let reply = format!(
+            "OK\n{}",
+            String::from_utf8_lossy(&vec![0xff; usize::try_from(LOG_TAIL).unwrap()])
+        );
+        assert_eq!(u64::try_from(reply.len()).unwrap(), REPLY_BYTES);
     }
 
     /// The status socket reads; every other request, valid or not, is the
