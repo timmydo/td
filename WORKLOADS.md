@@ -35,7 +35,9 @@ of the human's directories, or a sandbox the host's network; td-agent's
 own control socket, so it can answer its own cards; root's workspace
 intake, so it
 can create, delete and launch any sandbox and spend workload rows, and
-empty or enter any confined conversation's slot; and no bound on the
+empty or enter any confined conversation's slot; the admin service's
+read-only status socket, so it can read every retained update job's
+status and log (td-update/ADMIN.md); and no bound on the
 processes it leaves (td-login/THREAT-MODEL.md §1). Every other td-agent
 workspace on td is jailed and runs as a workload account. A template
 explicitly naming a td-sandbox profile shares that sandbox’s account,

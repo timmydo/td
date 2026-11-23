@@ -3,7 +3,7 @@
 use super::*;
 #[path = "../../td-authd/src/primary_account.rs"]
 #[allow(dead_code, reason = "shared validated primary account lookup")]
-mod primary_account;
+pub(super) mod primary_account;
 
 const STAGING: &str = ".releases-recovery";
 const JOURNAL: &str = "release-recovery";

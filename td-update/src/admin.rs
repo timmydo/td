@@ -19,6 +19,11 @@ pub(crate) const BUILD_UID: u32 = 985;
 const STATE: &str = "/var/lib/td-admin";
 const BUILD_HOME: &str = "/var/lib/td-admin-build";
 const SOCKET: &str = "/run/td-admin/control";
+/// The primary account's read-only socket: job status and logs only.
+const STATUS_DIRECTORY: &str = "/run/td-admin-status";
+const STATUS_SOCKET: &str = "/run/td-admin-status/status";
+/// The primary account's private group: its loader requires GID = UID.
+const PRIMARY_GID: u32 = recovery::primary_account::UID;
 const OPERATION_GROUP: &str = "/sys/fs/cgroup/system/td-admin/operation";
 const GIT_GROUP: &str = "/sys/fs/cgroup/system/td-admin/git";
 const BUILD_GROUP: &str = "/sys/fs/cgroup/system/td-admin/build";
@@ -30,7 +35,7 @@ const RELEASE_EVIDENCE: &str = "/var/lib/td-admin-build/release-state.metadata";
 const UPSTREAM: &str = "https://github.com/timmydo/td.git";
 const OFFICIAL_ENDPOINT: &str = "https://releases.tdlinux.org";
 const OFFICIAL_ROOT: &str = include_str!("official.root");
-const HELP: &str = "td-admin update [--no-reboot] | update-from-source [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates download a valid signed release and reboot by default. Jobs survive disconnects.\nUse update-from-source explicitly to build trusted upstream main.\nLocally, update and update-from-source queue a request; approve H on secure attention.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\nKey recovery: td-admin trust-publisher ROOT_FILE SHA256, then approve H; trusts future releases.\nOne image only: td-update trust-image DIRECTORY SHA256, then approve I.\n";
+const HELP: &str = "td-admin update [--no-reboot] | update-from-source [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates download a valid signed release and reboot by default. Jobs survive disconnects.\nUse update-from-source explicitly to build trusted upstream main.\nLocally, update and update-from-source queue a request; approve H on secure attention.\nLocally, the primary account also reads status and logs; cancel, rollback and reboot stay with the admin key.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\nKey recovery: td-admin trust-publisher ROOT_FILE SHA256, then approve H; trusts future releases.\nOne image only: td-update trust-image DIRECTORY SHA256, then approve I.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Request {
@@ -964,18 +969,53 @@ fn serve() -> Result<()> {
         text,
         ..Job::default()
     }));
-    if crate::present(Path::new(SOCKET))? {
-        io(fs::remove_file(SOCKET), "remove old admin socket")?;
+    let listener = bind(SOCKET, ADMIN_UID)?;
+    // A status socket that cannot start never withholds the update service.
+    let reader = Arc::clone(&shared);
+    match directory(Path::new(STATUS_DIRECTORY), 0, PRIMARY_GID, 0o750)
+        .and_then(|()| bind(STATUS_SOCKET, PRIMARY_GID))
+    {
+        Ok(status) => {
+            if let Err(error) = std::thread::Builder::new()
+                .name("admin-status".into())
+                .spawn(move || loop {
+                    // Only a failed accept returns; the socket keeps serving.
+                    if let Err(error) = answer(&status, &reader, readable) {
+                        eprintln!("td-admin: status listener: {error}");
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                })
+            {
+                eprintln!("td-admin: start status listener: {error}");
+            }
+        }
+        Err(error) => eprintln!("td-admin: status socket unavailable: {error}"),
     }
-    let listener = io(UnixListener::bind(SOCKET), "bind admin socket")?;
+    answer(&listener, &shared, |_| true)
+}
+
+/// `path` bound afresh, root's and `gid`'s alone: mode 0660.
+fn bind(path: &str, gid: u32) -> Result<UnixListener> {
+    if crate::present(Path::new(path))? {
+        io(fs::remove_file(path), "remove old admin socket")?;
+    }
+    let listener = io(UnixListener::bind(path), "bind admin socket")?;
+    io(chown(path, Some(0), Some(gid)), "assign admin socket")?;
     io(
-        chown(SOCKET, Some(0), Some(ADMIN_UID)),
-        "assign admin socket",
-    )?;
-    io(
-        fs::set_permissions(SOCKET, fs::Permissions::from_mode(0o660)),
+        fs::set_permissions(path, fs::Permissions::from_mode(0o660)),
         "protect admin socket",
     )?;
+    Ok(listener)
+}
+
+/// Whether the primary account's status socket answers `request`: only
+/// reads of a job's status and log.
+fn readable(request: &Request) -> bool {
+    matches!(request, Request::Status(_) | Request::Logs(_))
+}
+
+/// Each connection's one command, answered when `admits` allows it.
+fn answer(listener: &UnixListener, shared: &Shared, admits: fn(&Request) -> bool) -> Result<()> {
     for stream in listener.incoming() {
         let mut stream = io(stream, "accept admin connection")?;
         let result = (|| {
@@ -996,10 +1036,11 @@ fn serve() -> Result<()> {
                 return Err("admin command is too long".into());
             }
             let text = std::str::from_utf8(&bytes).map_err(|_| "admin command is not UTF-8")?;
-            request(
-                &shared,
-                parse(&text.split_whitespace().collect::<Vec<_>>())?,
-            )
+            let parsed = parse(&text.split_whitespace().collect::<Vec<_>>())?;
+            if !admits(&parsed) {
+                return Err("this socket answers only status and logs".into());
+            }
+            request(shared, parsed)
         })();
         let reply = match result {
             Ok(text) => format!("OK\n{text}"),
@@ -1075,27 +1116,50 @@ fn submit(words: &[&str]) -> Result<()> {
         return Err("only an update is submitted after local consent".into());
     }
     root()?;
-    if queued(&exchange(words)?, words) {
+    if queued(&exchange(SOCKET, words)?, words) {
         Ok(())
     } else {
         Err("another admin job is running; nothing new was started".into())
     }
 }
 
+/// Root and the dedicated SSH account read through the control socket; any
+/// other caller's `status` or `logs` uses the primary account's read-only
+/// socket, which its permissions admit to that account alone.
+fn local_read(words: &[&str]) -> Result<bool> {
+    if !parse(words).is_ok_and(|request| readable(&request)) {
+        return Ok(false);
+    }
+    let uid = io(fs::metadata("/proc/self"), "read admin identity")?.uid();
+    if uid == 0 || uid == ADMIN_UID {
+        return Ok(false);
+    }
+    let response = exchange(STATUS_SOCKET, words)?;
+    io(
+        std::io::stdout().write_all(response.as_bytes()),
+        "show admin result",
+    )?;
+    Ok(true)
+}
+
 fn client(words: &[&str]) -> Result<()> {
-    let response = exchange(words)?;
+    let response = exchange(SOCKET, words)?;
     io(
         std::io::stdout().write_all(response.as_bytes()),
         "show admin result",
     )
 }
 
-/// The service's `OK` reply to `words`, without its `OK` line.
-fn exchange(words: &[&str]) -> Result<String> {
+/// The service's `OK` reply to `words` on `socket`, without its `OK` line.
+fn exchange(socket: &str, words: &[&str]) -> Result<String> {
     parse(words)?;
     let mut stream = io(
-        UnixStream::connect(SOCKET),
-        "connect to admin service (use the dedicated admin SSH key)",
+        UnixStream::connect(socket),
+        if socket == SOCKET {
+            "connect to admin service (use the dedicated admin SSH key)"
+        } else {
+            "connect to the primary account's read-only admin status socket"
+        },
     )?;
     io(
         stream.set_read_timeout(Some(Duration::from_secs(10))),
@@ -1389,6 +1453,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             client(&original.split_whitespace().collect::<Vec<_>>())
         }
         _ if local_update(&words)? => Ok(()),
+        _ if local_read(&words)? => Ok(()),
         _ => client(&words),
     }
 }
@@ -1581,6 +1646,78 @@ mod tests {
         if fs::metadata("/proc/self").unwrap().uid() != 0 {
             assert!(submit(&["update"]).is_err());
         }
+    }
+
+    /// The status socket reads; every other request, valid or not, is the
+    /// control socket's.
+    #[test]
+    fn the_status_socket_answers_only_reads() {
+        for words in [
+            vec!["status"],
+            vec!["status", "7"],
+            vec!["logs"],
+            vec!["logs", "7"],
+        ] {
+            assert!(readable(&parse(&words).unwrap()), "{words:?}");
+        }
+        for words in [
+            vec!["update"],
+            vec!["update-from-source", "--no-reboot"],
+            vec!["rollback"],
+            vec!["cancel"],
+            vec!["reboot"],
+        ] {
+            assert!(!readable(&parse(&words).unwrap()), "{words:?}");
+        }
+        for words in [vec!["update"], vec!["cancel"], vec!["status", "x"], vec![]] {
+            assert_eq!(local_read(&words), Ok(false));
+        }
+    }
+
+    /// Over a real socket, a listener given `readable` answers status and
+    /// refuses every state-changing command before the handler; `serve`
+    /// gives it to the status socket and admits everything only on the
+    /// control socket.
+    #[test]
+    fn the_status_listener_refuses_every_change() {
+        let scratch = crate::temp_dir::TempDir::new("admin-status").unwrap();
+        let path = scratch.path().join("status");
+        let listener = UnixListener::bind(&path).unwrap();
+        let shared: Shared = Arc::new(Mutex::new(Job {
+            id: 3,
+            text: "job 3: building\n".into(),
+            ..Job::default()
+        }));
+        let reader = Arc::clone(&shared);
+        std::thread::spawn(move || answer(&listener, &reader, readable));
+        let path = path.to_str().unwrap();
+        assert_eq!(exchange(path, &["status"]), Ok("job 3: building\n".into()));
+        for words in [
+            vec!["update"],
+            vec!["update-from-source", "--no-reboot"],
+            vec!["rollback"],
+            vec!["cancel"],
+            vec!["reboot"],
+        ] {
+            assert_eq!(
+                exchange(path, &words),
+                Err("this socket answers only status and logs\n".into()),
+                "{words:?}"
+            );
+        }
+        assert!(!shared.lock().unwrap().cancel);
+        let serve = include_str!("admin.rs")
+            .split("\nfn serve() -> Result<()> {")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(serve.contains("    let listener = bind(SOCKET, ADMIN_UID)?;"));
+        assert!(serve.contains(".and_then(|()| bind(STATUS_SOCKET, PRIMARY_GID))"));
+        assert!(serve.contains("answer(&status, &reader, readable)"));
+        assert!(serve.ends_with("    answer(&listener, &shared, |_| true)"));
+        assert_eq!(serve.matches("answer(").count(), 2);
     }
 
     /// Only a fresh job of the approved kind and reboot choice counts as

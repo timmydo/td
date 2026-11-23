@@ -62,7 +62,8 @@ startup files to disable. The shell accepts that exact `-c` invocation and parse
 shell syntax. Another executable and extra arguments cannot bypass it, and
 td-sshd refuses a subsystem request from every account.
 This explicitly remains available in both login-key policy forms. Root SSH
-stays disabled and the primary account's ordinary keys confer no admin grant.
+stays disabled and the primary account's ordinary keys confer no admin grant;
+its sessions can only read job status and logs (below).
 
 The system service's socket is `/run/td-admin/control`, root:986 mode 0660,
 inside root:986 mode 0710 `/run/td-admin`. The immutable account table gives
@@ -71,6 +72,25 @@ are the authority boundary: the dedicated SSH process and root can connect;
 the primary account and the builder cannot. Possession or deliberate
 transfer of a connected descriptor is delegation of this administrative
 capability. It is not a per-command cryptographic assertion.
+
+A second, read-only socket serves the primary account:
+`/run/td-admin-status/status`, root:1000 mode 0660 inside root:1000 mode
+0750 `/run/td-admin-status`. GID 1000 is that account's private group:
+no other account and no confined workload holds it on the host, and a
+jailed application's in-namespace 1000 is a different host identity.
+Everything that runs as the primary account can read it, including its
+SSH sessions and td-agent's unconfined workspace (WORKLOADS.md). Root
+owns both, so the account cannot widen their modes. The service answers
+`status [JOB]` and `logs [JOB]` there exactly as on the control socket
+and refuses every other command, valid or not; it starts nothing,
+cancels nothing and reboots nothing. Run as any account but root or UID
+986, `td-admin status` and `td-admin logs` use this socket. Its own
+listener thread starts after the control socket is bound; a status
+socket that cannot be created or started is reported on the service's
+stderr and never withholds updates or rollback; a failed accept is
+reported and retried a second later. One status reader is answered at
+a time, under the control socket's two-second per-read bounds, so a
+slow reader delays only other status readers.
 
 `td-admin` is an argv-zero dispatch of the installed `td-update` executable.
 No internal root or builder verb is exposed by the SSH parser. Neither
@@ -89,8 +109,9 @@ release or trusted main, the requester, and whether it restarts. The
 distinct `admin-update` elevation-table grant, given to the primary
 account, admits it; the ordinary presented Enter, cancellation, requester
 liveness and backoff rules apply (`td-authd/DESIGN.md`, "Local admin
-updates"). Other verbs from such an account still dial the socket and
-are refused by its permissions.
+updates"). Its `status` and `logs` use the read-only status socket
+("Interface and identities"); `cancel`, `rollback` and `reboot` still
+dial the control socket and are refused by its permissions.
 
 After commit, root runs `/bin/td-admin submit` with those words. That
 root-only internal verb admits only the four update requests, which the
@@ -110,9 +131,11 @@ like the SSH caller, the person cannot see which main or which signed
 release the job will fetch. This path needs neither an enrolled admin
 key nor td-sshd, and grants no SSH key anything.
 
-It submits only. The socket stays root:986, so the primary account can
-read neither the job's status nor its log, and cannot cancel a job; an
-approved job that restarts will restart once it installs. A failed job
+It submits only. The control socket stays root:986: the primary
+account follows the job with `td-admin status` and `td-admin logs`
+through its read-only status socket ("Interface and identities"), but
+cannot cancel it; an approved job that restarts will restart once it
+installs. A failed job
 installs nothing and requests no reboot. A failed or timed-out
 submission is not proof that nothing started: the request may already
 have reached the service. Rollback has its own local consent

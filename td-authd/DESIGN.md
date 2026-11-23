@@ -5010,8 +5010,8 @@ disk-protector operation.
 The settings intake also accepts `admin-update WORDS`, where WORDS is
 exactly `update`, `update --no-reboot`, `update-from-source` or
 `update-from-source --no-reboot`, the four requests `td-admin` sends from
-an account that cannot reach its service (`td-update/ADMIN.md`, "Local
-consent"). The distinct `admin-update` elevation-table operation, granted
+an account that cannot reach its control socket (`td-update/ADMIN.md`,
+"Local consent"). The distinct `admin-update` elevation-table operation, granted
 to the primary account last, is required at admission and selection as
 for `manage-time`. There is no saved value to compare.
 
