@@ -38,6 +38,7 @@ name = "td-editor"
 version = "0.1.0"
 dependencies = [
  "td-civil",
+ "td-fs",
  "td-remote",
  "td-ui",
 ]

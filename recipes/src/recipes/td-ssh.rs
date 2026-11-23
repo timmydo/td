@@ -5,8 +5,8 @@ use crate::types::Recipe;
 /// td-primitives and its base64 td-encoding, both by path; its server mounts
 /// td-login's account tables and status reader by relative `#[path]`, so td-login
 /// is staged beside them, with the engine tree for the workload account ledger
-/// reader td-login's tables include, and td-fs and td-source-scan, which its lock names for
-/// its tests, td-source-scan being td-primitives' dev-dependency too. The lock lists
+/// reader td-login's tables include. td-fs stages signatures; td-source-scan is
+/// a test dependency of td-ssh and td-primitives. The lock lists
 /// only td crates, so the closure is std and the vendor set is empty; the
 /// binaries are linked fully static, as each server stage re-executes its own
 /// file with nothing else reachable from its jail. `td-ssh-test` is its

@@ -1687,7 +1687,7 @@ rename. An exactly associated open file must still match its saved
 metadata and complete encoded baseline; dirty model text is never
 written by rename.
 
-Publication uses the private audited Linux x86-64 `renameat2` (316)
+Publication uses the shared td-fs Linux x86-64 `renameat2` (316)
 wrapper, with directory descriptors pinned to the opened
 source/destination parents and flags fixed to `RENAME_NOREPLACE` (1). No
 existing destination is replaced, even when created concurrently.
@@ -2259,7 +2259,7 @@ lookup is involved.
 The descriptor transport (sendmsg, recvmsg and F_DUPFD_CLOEXEC, one syscall
 site and one owned-descriptor adoption site) is td-ui's, recorded as
 `UNSAFE.md` §19, as are the clipboard destination's fcntl status
-commands, moved there with the outgoing writer; the editor's own surface,
+commands, moved there with the outgoing writer; the file adapter’s shared td-fs surface,
 §14, is the file adapter's size-only flistxattr query and renameat2,
 through one syscall site that adopts no descriptor and changes no
 transport authorization. Endpoint resolution, the borrowed

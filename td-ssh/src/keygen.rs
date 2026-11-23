@@ -442,6 +442,73 @@ pub fn signer_allowed(allowed: &str, identity: &str, key: &[u8; 32]) -> bool {
     false
 }
 
+// Bounded ASCII paths for procfs descriptors and private staging names.
+fn small_path<'a>(bytes: &'a mut [u8], args: std::fmt::Arguments<'_>) -> io::Result<&'a Path> {
+    let mut cursor = io::Cursor::new(&mut *bytes);
+    cursor.write_fmt(args)?;
+    let len = cursor.position() as usize;
+    let bytes = bytes.get(..len).ok_or(io::ErrorKind::InvalidInput)?;
+    Ok(Path::new(OsStr::from_bytes(bytes)))
+}
+
+fn publish_signature(out: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> Result<()> {
+    use std::hash::BuildHasher;
+    use std::os::fd::AsRawFd;
+    // Keep both parents pinned across staging, cleanup, and publication.
+    const DIRECTORY_NOFOLLOW: i32 = 0o200000 | 0o400000;
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = out
+        .file_name()
+        .ok_or(io::ErrorKind::InvalidInput)
+        .map_err(io::Error::from)?;
+    let directory = File::open(parent)?;
+    let nonce = std::collections::hash_map::RandomState::new().hash_one(out);
+    let mut name_buf = [0; 80];
+    let stage = small_path(
+        &mut name_buf,
+        format_args!(
+            "/proc/self/fd/{}/.td-ssh-sign-{nonce:016x}",
+            directory.as_raw_fd()
+        ),
+    )?;
+    fs::DirBuilder::new().mode(0o700).create(stage)?;
+    let result = (|| -> Result<()> {
+        let staging = File::options()
+            .read(true)
+            .custom_flags(DIRECTORY_NOFOLLOW)
+            .open(stage)?;
+        let mut stage_buf = [0; 64];
+        let child = small_path(
+            &mut stage_buf,
+            format_args!("/proc/self/fd/{}/signature", staging.as_raw_fd()),
+        )?;
+        let mut file = File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(child)?;
+        let result = write(&mut file)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| {
+                td_fs::rename_entry(&staging, OsStr::new("signature"), &directory, name)
+            });
+        if result.is_err() {
+            let _ = fs::remove_file(child);
+        }
+        result?;
+        Ok(())
+    })();
+    // Only an empty directory can be removed. Never traverse a replaced name.
+    let cleanup = fs::remove_dir(stage);
+    result.map_err(|error| Error::refused(format!("{}: {error}", out.display())))?;
+    directory.sync_all()?;
+    cleanup?;
+    Ok(())
+}
+
 fn sign_command(arguments: &Arguments) -> Result<i32> {
     let namespace = arguments
         .namespace
@@ -463,13 +530,7 @@ fn sign_command(arguments: &Arguments) -> Result<i32> {
                     .map_err(|error| Error::refused(format!("{}: {error}", name.display())))?;
                 let armored = sign_message(&key, namespace, &message)?;
                 let out = with_suffix(name, ".sig");
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o644)
-                    .open(&out)
-                    .and_then(|mut file| file.write_all(armored.as_bytes()))
-                    .map_err(|error| Error::refused(format!("{}: {error}", out.display())))?;
+                publish_signature(&out, |file| file.write_all(armored.as_bytes()))?;
                 if !arguments.quiet {
                     diagnostic(&format!("Write signature to {}", out.display()));
                 }
@@ -549,6 +610,31 @@ mod tests {
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_failed_signature_can_be_retried_and_never_removes_a_competing_signature() {
+        let dir = td_fs::TempDir::new("signature-stage").unwrap();
+        let out = dir.path().join("note.sig");
+        for concurrent in [false, true] {
+            assert!(publish_signature(&out, |stage| {
+                stage.write_all(b"partial")?;
+                if concurrent {
+                    fs::write(&out, b"other signer")?;
+                }
+                Err(io::Error::from_raw_os_error(28))
+            })
+            .is_err());
+            if concurrent {
+                assert_eq!(fs::read(&out).unwrap(), b"other signer");
+                assert!(publish_signature(&out, |stage| stage.write_all(b"retry")).is_err());
+            } else {
+                assert!(!out.exists());
+                publish_signature(&out, |stage| stage.write_all(b"retry")).unwrap();
+                assert_eq!(fs::read(&out).unwrap(), b"retry");
+                fs::remove_file(&out).unwrap();
+            }
+        }
     }
 
     #[test]

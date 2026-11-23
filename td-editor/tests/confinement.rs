@@ -177,7 +177,6 @@ fn source_inventory_and_allowances_are_closed() {
         );
         let budget = match name.as_str() {
             "lib.rs" | "main.rs" => 1,
-            "sys.rs" => 2,
             _ => 0,
         };
         assert_eq!(
@@ -225,12 +224,16 @@ fn source_inventory_and_allowances_are_closed() {
 
 #[test]
 fn complete_raw_layer_and_production_callers_are_pinned() {
-    let raw = include_str!("../src/sys.rs");
+    assert_eq!(
+        include_str!("../src/sys.rs").lines().last(),
+        Some("pub(super) use td_fs::{has_attributes, rename_entry};")
+    );
+    let raw = include_str!("../../td-fs/src/entry.rs");
     let hash = raw.bytes().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x1963649271b03139,
+        hash, 0x227896fa334f0c4e,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [

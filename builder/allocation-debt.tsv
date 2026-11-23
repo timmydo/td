@@ -3779,11 +3779,11 @@ td-ssh/src/bin/td-ssh-keygen.rs	allocating-conversion	2
 td-ssh/src/bin/td-ssh.rs	allocating-conversion	2
 td-ssh/src/bin/td-sshd.rs	allocating-conversion	3
 td-ssh/src/bin/td-sshd.rs	allocation-macro	8
-td-ssh/src/client.rs	allocating-constructor	3
+td-ssh/src/client.rs	allocating-constructor	2
 td-ssh/src/client.rs	allocating-conversion	35
 td-ssh/src/client.rs	allocation-macro	50
 td-ssh/src/client.rs	heap-owner	6
-td-ssh/src/client.rs	unchecked-growth-or-clone	36
+td-ssh/src/client.rs	unchecked-growth-or-clone	34
 td-ssh/src/client_config.rs	allocating-constructor	1
 td-ssh/src/client_config.rs	allocating-conversion	10
 td-ssh/src/client_config.rs	allocation-macro	25

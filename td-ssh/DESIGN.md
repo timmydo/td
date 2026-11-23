@@ -690,7 +690,10 @@ says that line of that file is corrupt: only a key that does decode and differs 
 reported as the host's identity having changed. A host recorded only in other key types prints OpenSSH's warning with
 each such entry, and is otherwise unknown (§3). New entries are appended under
 `HashKnownHosts`, on a line of their own, and only once the key's signature over the
-exchange has verified, so a key a peer merely sent cannot be pinned. If hashing cannot
+exchange has verified, so a key a peer merely sent cannot be pinned. Regular-file writers in td serialize their reservations. They reserve
+blank lines at EOF, stage the pin as a comment and sync its body before
+activating it. An interrupted append can leave whitespace or a comment.
+Concurrent appenders keep their own bytes, including writers outside td. Failure to record an accepted key is reported. If hashing cannot
 get its salt nothing is recorded: a line in the clear is what `HashKnownHosts` refuses.
 
 **`td-ssh-keygen`.** Only what callers use: `-t ed25519` (and no other type) with
@@ -701,7 +704,9 @@ asking for the passphrase of a protected key without `-P`, which td-firstboot (e
 and td-vm-guest pass as `-P ''`, so a protected key fails rather than prompting on a
 closed stdin, and which nothing else takes; `-l [-E sha256] -f`, printing
 exactly one line `256 SHA256:B64 COMMENT (ED25519)`, its comment through the filter
-above; `-q -Y sign -n -f`; `-q -Y
+above; `-q -Y sign -n -f` (a signature is synced in a private staging directory
+and renamed into place exclusively through td-fs’s descriptor-bound
+`RENAME_NOREPLACE` wrapper (UNSAFE.md §14)); `-q -Y
 verify -n -I -f -s`. SSHSIG uses SHA-512 with allowed-signers files of plain
 `principal[,principal] ssh-ed25519 KEY` lines, with no options. It writes no protected
 key: every td caller makes an unprotected one, so any other `-N`, or none, refuses, rather

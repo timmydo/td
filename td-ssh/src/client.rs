@@ -571,17 +571,72 @@ fn append_known_host(path: &Path, line: &str) -> io::Result<()> {
         .append(true)
         .mode(0o644)
         .open(path)?;
-    let mut text = String::with_capacity(line.len() + 1);
-    if file.metadata()?.len() > 0 {
-        file.seek(SeekFrom::End(-1))?;
-        let mut last = [0u8];
-        file.read_exact(&mut last)?;
-        if last != *b"\n" {
-            text.push('\n');
-        }
+    if !file.metadata()?.is_file() {
+        return file.write_all(line.as_bytes());
     }
-    text.push_str(line);
-    file.write_all(text.as_bytes())
+    file.lock()?;
+    let inode = file.metadata()?;
+    let writer = OpenOptions::new().write(true).open(path)?;
+    let target = writer.metadata()?;
+    if (inode.dev(), inode.ino()) != (target.dev(), target.ino()) {
+        return Err(io::Error::other("known hosts file changed while opening"));
+    }
+    append_record(&mut file, &writer, line.as_bytes(), File::write)
+}
+
+/// Reserve blank lines with O_APPEND. Even a short reservation leaves only
+/// delimiters, and an independent appender's bytes are never truncated.
+/// Fill our own slot as a comment; activate only after the body is durable.
+fn append_record(
+    append: &mut File,
+    writer: &File,
+    line: &[u8],
+    mut write: impl FnMut(&mut File, &[u8]) -> io::Result<usize>,
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let body = line
+        .strip_suffix(b"\n")
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let (first, rest) = body.split_first().ok_or(io::ErrorKind::InvalidInput)?;
+    if body.contains(&b'\n') {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let before = append.seek(SeekFrom::End(0))?;
+    let mut last = [b'\n'];
+    if before != 0 {
+        append.read_exact_at(&mut last, before - 1)?;
+    }
+    let separator = usize::from(last != *b"\n");
+    let length = line
+        .len()
+        .checked_add(separator)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let mut remaining = length;
+    let mut end = before;
+    const BLANKS: &[u8] = &[b'\n'; 4096];
+    while remaining > 0 {
+        let chunk = BLANKS
+            .get(..remaining.min(BLANKS.len()))
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let n = match write(append, chunk) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        end = end
+            .checked_add(n as u64)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        if append.stream_position()? != end {
+            return Err(io::Error::other("another writer appended to known hosts"));
+        }
+        remaining = remaining.checked_sub(n).ok_or(io::ErrorKind::InvalidData)?;
+    }
+    let start = before + separator as u64;
+    writer.write_all_at(b"#", start)?;
+    writer.write_all_at(rest, start + 1)?;
+    writer.sync_data()?;
+    writer.write_all_at(std::slice::from_ref(first), start)?;
+    writer.sync_data()
 }
 
 /// Asks at most `HOST_KEY_TRIES` times: an askpass answering nonsense must not
@@ -2918,6 +2973,55 @@ mod tests {
             fs::read_to_string(&file).unwrap(),
             "other ssh-ed25519 KEY\nh ssh-ed25519 NEW\ni ssh-ed25519 NEWER\n"
         );
+    }
+
+    #[test]
+    fn simultaneous_td_writers_record_both_hosts() {
+        let dir = td_fs::TempDir::new("concurrent-hosts").unwrap();
+        let path = dir.path().join("known_hosts");
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for pin in ["first key\n", "second key\n"] {
+                scope.spawn(|| {
+                    start.wait();
+                    append_known_host(&path, pin).unwrap();
+                });
+            }
+        });
+        let lines = fs::read_to_string(path).unwrap();
+        assert!(matches!(
+            lines.as_str(),
+            "first key\nsecond key\n" | "second key\nfirst key\n"
+        ));
+    }
+
+    #[test]
+    fn short_host_append_preserves_complete_lines_and_independent_appends() {
+        let dir = td_fs::TempDir::new("td-host-short").unwrap();
+        let path = dir.path().join("hosts");
+        fs::write(&path, b"old pin").unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let writer = OpenOptions::new().write(true).open(&path).unwrap();
+        let mut first = true;
+        let result = append_record(&mut file, &writer, b"new pin\n", |file, bytes| {
+            if std::mem::take(&mut first) {
+                file.write(&bytes[..3])
+            } else {
+                OpenOptions::new()
+                    .append(true)
+                    .open(&path)?
+                    .write_all(b"other pin\n")?;
+                Err(io::Error::from_raw_os_error(28))
+            }
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(28));
+        assert_eq!(fs::read(&path).unwrap(), b"old pin\n\n\nother pin\n");
+        append_known_host(&path, "new pin\n").unwrap();
+        assert!(fs::read(&path).unwrap().ends_with(b"other pin\nnew pin\n"));
     }
 
     #[test]

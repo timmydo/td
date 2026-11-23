@@ -16,6 +16,7 @@ license = "MIT"
 td-civil = { path = "../td-civil" }
 td-remote = { path = "../td-remote" }
 td-ui = { path = "../td-ui" }
+td-fs = { path = "../td-fs" }
 
 [features]
 test-file-barrier = []
@@ -36,5 +37,4 @@ unimplemented = "deny"
 indexing_slicing = "deny"
 
 [dev-dependencies]
-td-fs = { path = "../td-fs" }
 td-test-compositor = { path = "../td-test-compositor" }

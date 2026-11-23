@@ -2749,7 +2749,8 @@ amendment here and in `APPLICATIONS.md` §K in the same landing.
 
 ## 14. `td-editor` — the Wayland scratch editor
 
-The editor's `sys.rs` carries exactly TWO x86-64 Linux syscalls through one
+The editor's `sys.rs` imports two safe wrappers from `td-fs/src/entry.rs`.
+That shared module carries exactly TWO x86-64 Linux syscalls through one
 function-scoped instruction: `flistxattr` (196) and `renameat2` (316). It
 adopts no descriptor: the Wayland transport — `recvmsg`, `sendmsg`,
 `fcntl` pinned to `F_DUPFD_CLOEXEC` and the one adoption site — and the
@@ -2779,7 +2780,8 @@ An unsupported query refuses saving, not just replacement. Attributes hidden
 from the calling credentials are not proven absent by Linux's listing API;
 the exact supported-file boundary is recorded in `td-editor/DESIGN.md`.
 
-`files.rs` alone also calls `rename_entry`, borrowing opened source and
+The editor file adapter and td-ssh-keygen signature publisher call
+`rename_entry`, borrowing opened source and
 destination directories and two literal Unix basenames. The wrapper rejects empty, dot, dot-dot,
 slash-containing, NUL-containing and over-4096-byte names, owns both C
 strings across the call, pins the first and third arguments to those borrowed
@@ -4000,6 +4002,10 @@ edit the test. Any additional instruction family, call or allowance amends this
 section and `td-primitives/DESIGN.md` in the same landing.
 
 ## 27. `td-ssh` — a reduced SSH client and server
+
+The local key tool also uses §14’s shared `td_fs::rename_entry` to
+publish a complete signature under an exclusively claimed destination.
+Both directory descriptors stay open across the no-replace rename.
 
 The primitives are `td-primitives`, whose `unsafe` is section 26's and for CPU
 instructions alone. The `td-ssh` library and its binaries deny it, with two

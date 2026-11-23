@@ -9,6 +9,13 @@
 //! `private_dir.rs` alone. The control-plane workspace includes
 //! `temp_dir.rs` only under `cfg(test)` to own disposable fixtures.
 
+#![deny(unsafe_code)]
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod entry;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use entry::{has_attributes, rename_entry};
+
 mod bounded;
 mod on_path;
 mod private_dir;
