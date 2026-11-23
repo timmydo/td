@@ -1263,15 +1263,16 @@ binary and td-net unit-test executable offline. Native source preparation
 warms both locked external closures; each build verifies its archived inputs.
 Cargo artifact records identify the helper executables inside the selected
 target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
-them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL read,
-plain-text send, foreground-service, deployment WAL replay and service-login
-provisioning cases. Each requires a positive passing libtest summary and exit
-success. These five native cases use the host release
-profile with debug information retained, matching the native MTA build and
-performance harness. Their real operation deadlines include hashing and TLS;
-an unoptimized full-size body hash can exhaust a deadline before database work
-starts. Ordinary unit and documentation tests retain the test profile. This
-does not change target compiler flags or relax an operation deadline.
+them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL
+read, plain-text send, foreground-service, deployment WAL replay,
+service-login provisioning and socket writer fence cases. Each requires a
+positive passing libtest summary and exit success. These six native cases
+use the host release profile with debug information retained, matching the
+native MTA build and performance harness. Their real operation deadlines
+include hashing and TLS; an unoptimized full-size body hash can exhaust a
+deadline before database work starts. Ordinary unit and documentation tests
+retain the test profile. This does not change target compiler flags or relax
+an operation deadline.
 Host preparation must put PostgreSQL 17 on `PATH`; td-postgres's
 real-server test, which its preflight runs through `--include-ignored`,
 starts its cluster from the same first `initdb`, with `postgres` and
@@ -1288,15 +1289,15 @@ Use a Guix PostgreSQL 17 profile or store package, Debian's
 The test host needs unprivileged Linux namespaces and PostgreSQL's catalog,
 shared libraries and extensions. The performance harness launches its
 database directly and accepts other PostgreSQL 17 package layouts.
-The deployment fixtures exercise streaming backup and exact recovery, and
-verified TLS, SCRAM and per-role grants, on disposable clusters. The native
-mail leg also runs the host operator’s scheduled logical backup, off-host
-transfer and isolated restore drill against a disposable PostgreSQL cluster. Interactive
-service-login tests use util-linux `setsid` to exercise detached password
-prompting. The
-wrapper checks this before any test runs and names what is missing; the
-fixtures find the same directory on `PATH` themselves, so no variable names
-it. The fixtures require no existing database service or public endpoint.
+The deployment fixtures exercise streaming backup and exact recovery, SCRAM
+and per-role grants over a private Unix socket, and the socket writer fence,
+on disposable clusters. The native mail leg also runs the host operator’s
+scheduled logical backup, off-host transfer and isolated restore drill
+against a disposable PostgreSQL cluster. Interactive service-login tests use
+util-linux `setsid` to exercise detached password prompting. The wrapper
+checks this before any test runs and names what is missing; the fixtures
+find the same directory on `PATH` themselves, so no variable names it. The
+fixtures require no existing database service or public endpoint.
 
 td-mta/CONFORMANCE.md records what this native client fixture proves. Its
 private root certificate enters only the isolated fetch test process behind

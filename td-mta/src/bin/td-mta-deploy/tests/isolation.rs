@@ -39,7 +39,15 @@ fn service_units_and_sudoers_bind_only_their_named_role() {
         );
         assert!(unit.contains(&format!("BindPaths={BASE}/{}:{MAIL}", role.name)));
         assert!(unit.contains("TemporaryFileSystem=/var/lib/td-mta:ro,mode=0755"));
+        assert!(unit.contains("\nSupplementaryGroups=td-mta-db\n"));
         assert!(!unit.contains("ExecStart="));
+    }
+    // Readiness jobs never reach the database.
+    for file in files
+        .iter()
+        .filter(|f| f.path.to_str().unwrap().contains("/td-mta-maint-mail-"))
+    {
+        assert!(file.text.contains("\nSupplementaryGroups=\n"));
     }
     let rules = &files.iter().find(|f| f.mode == 0o440).unwrap().text;
     let expected: BTreeSet<_> = ROLES
@@ -240,9 +248,9 @@ fn clock_transfer_carries_or_clears_evidence_and_refuses_linked_ancestors() {
 #[ignore = "requires root-owned fixture in /run"]
 fn unit_install_and_rollback_recover_partial_install_and_preserve_operator_files() {
     let tmp = TempDir::new_in(Path::new("/run"), "isolation-settings").unwrap();
-    let list = files::settings(tmp.path(), &tmp.path().join("sudoers")).unwrap();
+    let list = files::settings(tmp.path(), &tmp.path().join("sudoers"), false).unwrap();
     let host = Host::default();
-    let readiness = crate::readiness::settings(tmp.path()).unwrap();
+    let readiness = crate::readiness::settings(tmp.path(), false).unwrap();
     // Adopt an existing installation with just the three original jobs.
     files::install(&host, &readiness[..3]).unwrap();
     let existing = fs::metadata(&readiness[0].path).unwrap().ino();
@@ -395,7 +403,7 @@ fn private_files_across_real_unix_uids() {
         let uid = 61501 + i as u32;
         let account = Account { uid, gid: uid };
         for _ in 0..2 {
-            prepare(&base, r, account, r.name.as_bytes(), b"ca fixture").unwrap();
+            prepare(&base, r, account, r.name.as_bytes()).unwrap();
         }
     }
     worker("", 61500, "legacy-dac");
@@ -435,8 +443,51 @@ fn private_files_across_real_unix_uids() {
             gid: 61502,
         },
         b"replacement",
-        b"ca",
     )
     .unwrap();
     assert_eq!(fs::read(secret).unwrap(), b"owner fixture");
+}
+
+#[test]
+fn live_groups_are_exactly_the_account_and_socket_group() {
+    assert!(live_groups("901 950", 901, Some(950)).unwrap());
+    assert!(live_groups("950 901", 901, Some(950)).unwrap());
+    assert!(!live_groups("901", 901, Some(950)).unwrap());
+    assert!(!live_groups("950", 901, Some(950)).unwrap());
+    assert!(!live_groups("901 950 27", 901, Some(950)).unwrap());
+    assert!(live_groups("901", 901, None).unwrap());
+    assert!(live_groups("", 901, None).unwrap());
+    assert!(!live_groups("901 950", 901, None).unwrap());
+    assert!(live_groups("x", 901, None).is_err());
+}
+
+#[test]
+fn service_connections_use_only_the_private_socket() {
+    let pass = "ab".repeat(32);
+    let uri = socket_uri("td_mta_relay", &pass).unwrap();
+    assert_eq!(
+        uri,
+        format!(
+            "postgresql://td_mta_relay:{pass}@:35432/td_mta?host=%2Fvar%2Flib%2Ftd-mta-postgres"
+        )
+    );
+    assert_eq!(socket_password(&uri, "td_mta_relay").unwrap(), pass);
+    assert!(socket_password(&uri, "td_mta_receive").is_err());
+    assert!(socket_password(&format!("{uri}&sslmode=disable"), "td_mta_relay").is_err());
+    // Any password the URI carries verbatim, not only provisioned hex.
+    let unreserved = "Mixed-Case_1.~";
+    let uri = socket_uri("td_mta_owner", unreserved).unwrap();
+    assert_eq!(socket_password(&uri, "td_mta_owner").unwrap(), unreserved);
+    for refused in [
+        "",
+        "a b",
+        "p%40ss",
+        "a/b",
+        "a@b",
+        "a:b",
+        "a?b",
+        &"x".repeat(129),
+    ] {
+        assert!(socket_uri("td_mta_relay", refused).is_err(), "{refused}");
+    }
 }

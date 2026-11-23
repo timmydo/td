@@ -18,8 +18,10 @@ Usage: ./install-td-mta --setup-local --root PATH --account EMAIL
 
 Requires an installed td-mta, PostgreSQL 17 tools and openssl on PATH.
 Creates a NEW private directory; never adopts or overwrites existing data.
-Defaults: prefix $HOME/.local; PostgreSQL 35432, HTTPS 54443, SMTP 55225;
-relay 465 (implicit TLS). All local listeners bind IPv4 loopback only.
+Defaults: prefix $HOME/.local; HTTPS 54443, SMTP 55225; relay 465 (implicit
+TLS). Both mail listeners bind IPv4 loopback only. PostgreSQL listens only
+on the private socket ROOT/socket; --postgres-port (default 35432) names its
+socket file. openssl creates the local CA and leaf for the mail listeners.
 Provisioning briefly starts its own database, then stops it. No mail is sent.
 Writes credentials, receipts, td-mail config and user service definitions.
 It does not enable services, alter DNS/MX, or install PostgreSQL.
@@ -215,9 +217,7 @@ fn settings_mode(args: &[String], home: &str, replica: bool) -> Result<Settings>
             None
         },
     };
-    if s.replica.is_none()
-        && (s.pg_port == s.https_port || s.pg_port == s.smtp_port || s.https_port == s.smtp_port)
-    {
+    if s.replica.is_none() && s.https_port == s.smtp_port {
         return Err("local ports must be distinct".into());
     }
     Ok(Settings {
@@ -437,8 +437,8 @@ fn preflight(s: &Settings) -> Result<()> {
     if text(&s.root.join("frontend/runtime/smtp-control.sock"))?.len() > 107 {
         return Err("setup root is too long for the MTA control socket (maximum 72 bytes)".into());
     }
+    // PostgreSQL has no TCP listener; its port only names the socket file.
     for n in [
-        s.replica.is_none().then_some(s.pg_port),
         s.replica.is_none().then_some(s.https_port),
         s.replica.is_none().then_some(s.smtp_port),
     ]
@@ -474,6 +474,8 @@ fn preflight(s: &Settings) -> Result<()> {
     Ok(())
 }
 
+// The local CA and leaf serve the HTTPS and SMTP listeners and td-mail's
+// trust. PostgreSQL never uses them: it offers only its private socket.
 fn certificates(p: &mut Setup<'_>) -> Result<()> {
     let tls = p.path("tls");
     let mut cmd = command(Path::new("openssl"));
@@ -767,15 +769,11 @@ fn replica_services(
 }
 
 fn database_connection(s: &Settings, role: &str, password: &str) -> Result<String> {
-    if s.replica.is_some() {
-        Ok(format!(
-            "postgresql://td_mta_{role}:{password}@:{}/td_mta?host={}",
-            s.pg_port,
-            uri_path(&s.root.join("socket"))?
-        ))
-    } else {
-        Ok(format!("postgresql://td_mta_{role}:{password}@localhost:{}/td_mta?sslmode=verify-full&sslrootcert={}", s.pg_port, uri_path(&s.root.join("tls/ca.pem"))?))
-    }
+    Ok(format!(
+        "postgresql://td_mta_{role}:{password}@:{}/td_mta?host={}",
+        s.pg_port,
+        uri_path(&s.root.join("socket"))?
+    ))
 }
 
 fn database_configuration(s: &Settings) -> Result<(String, String, String)> {
@@ -784,30 +782,16 @@ fn database_configuration(s: &Settings) -> Result<(String, String, String)> {
     };
     let socket = quote(s.root.join("socket"))?;
     let common = format!("port = {}\npassword_encryption = 'scram-sha-256'\nfsync = on\nsynchronous_commit = on\nfull_page_writes = on\nlog_statement = 'none'\nlog_min_error_statement = 'panic'\n", s.pg_port);
-    let base = if s.replica.is_some() {
-        format!("{common}listen_addresses = ''\nssl = off\nunix_socket_permissions = 0600\n")
-    } else {
-        format!("{common}listen_addresses = '127.0.0.1'\nssl = on\nssl_cert_file = '{}'\nssl_key_file = '{}'\n", quote(s.root.join("tls/server.pem"))?, quote(s.root.join("tls/server.key"))?)
-    };
-    let runtime_socket = if s.replica.is_some() {
-        socket.as_str()
-    } else {
-        ""
-    };
-    let runtime = format!("{base}unix_socket_directories = '{runtime_socket}'\n");
+    let base =
+        format!("{common}listen_addresses = ''\nssl = off\nunix_socket_permissions = 0600\n");
+    let runtime = format!("{base}unix_socket_directories = '{socket}'\n");
     let bootstrap = format!(
         "{base}unix_socket_directories = '{socket}'\nhba_file = '{}'\n",
         quote(s.root.join("bootstrap-hba.conf"))?
     );
     let mut hba = String::new();
     for role in ["owner", "runtime", "reader"] {
-        if s.replica.is_some() {
-            hba.push_str(&format!("local td_mta td_mta_{role} scram-sha-256\n"));
-        } else {
-            hba.push_str(&format!(
-                "hostssl all td_mta_{role} 127.0.0.1/32 scram-sha-256\n"
-            ));
-        }
+        hba.push_str(&format!("local td_mta td_mta_{role} scram-sha-256\n"));
     }
     hba.push_str("local all all reject\nhost all all 0.0.0.0/0 reject\nhost all all ::/0 reject\n");
     Ok((runtime, bootstrap, hba))
@@ -1217,7 +1201,7 @@ COMMIT;
             shell(&p.path(&format!("{profile}/runtime")))
         ));
     }
-    start.push_str(&format!("\nClient:\n  td-mail --config={}\nRelay uses implicit TLS. Setup did not send any mail.\nLeaf certificates expire in 90 days; renew before expiry (DEPLOYMENT.md).\nProtect this directory and backups: it contains passwords and private keys.\n", shell(&p.path("mail.toml"))));
+    start.push_str(&format!("\nClient:\n  td-mail --config={}\nRelay uses implicit TLS. Setup did not send any mail.\nThe mail listeners' leaf certificate expires in 90 days; renew it before expiry (DEPLOYMENT.md).\nPostgreSQL offers only its private socket and uses no certificate.\nProtect this directory and backups: it contains passwords and private keys.\n", shell(&p.path("mail.toml"))));
     p.write("START.txt", start)?;
     println!(
         "Local setup complete: {} (services stopped)",
@@ -1299,7 +1283,40 @@ mod tests {
         assert!(bootstrap.contains("hba_file = '/private/replica/bootstrap-hba.conf'\n"));
         let uri = database_connection(&s, "reader", "private").unwrap();
         assert!(uri.contains("@:35433/td_mta?host="));
-        assert!(!uri.contains("sslrootcert"));
+        assert!(!uri.contains("ssl"));
+        assert!(!hba.contains("hostssl"));
+    }
+
+    #[test]
+    fn local_database_listens_only_on_its_private_socket() {
+        let s = options(Path::new("/private/mail"));
+        let (runtime, bootstrap, hba) = database_configuration(&s).unwrap();
+        for config in [&runtime, &bootstrap] {
+            assert!(config.contains("port = 35432\n"));
+            assert!(config.contains("listen_addresses = ''\n"));
+            assert!(config.contains("ssl = off\n"));
+            assert!(config.contains("unix_socket_permissions = 0600\n"));
+            assert!(config.contains("unix_socket_directories = '/private/mail/socket'\n"));
+            assert!(!config.contains("ssl_"));
+            assert!(!config.contains("127.0.0.1"));
+        }
+        assert!(!hba.contains("hostssl"));
+        assert!(!hba.contains("trust"));
+        for role in ["owner", "runtime"] {
+            assert!(hba.contains(&format!("local td_mta td_mta_{role} scram-sha-256\n")));
+            let uri = database_connection(&s, role, "private").unwrap();
+            assert_eq!(
+                uri,
+                format!(
+                    "postgresql://td_mta_{role}:private@:35432/td_mta?host=/private/mail/socket"
+                )
+            );
+            assert!(!uri.contains("ssl"));
+        }
+        let lines: Vec<_> = hba.lines().collect();
+        assert!(lines
+            .iter()
+            .all(|l| l.starts_with("local ") || l.ends_with(" reject")));
     }
 
     #[test]
@@ -1391,7 +1408,7 @@ mod tests {
         for extra in [
             vec!["--postgres-port", "543"],
             vec!["--relay-port", "0"],
-            vec!["--smtp-port", "35432"],
+            vec!["--smtp-port", "54443"],
             vec!["--account", "duplicate@example.test"],
         ] {
             let mut input = args(Path::new("/private/mail"));

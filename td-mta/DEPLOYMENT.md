@@ -144,8 +144,8 @@ independent scheduled operations with the same installer:
   --mail-profile frontend --mail-profile receive --mail-profile relay \
   --certificate-profile public \
   --connection-file /home/alice/.config/td-mta/runtime-connection \
-  --tls-certificate /home/alice/.local/state/td-mta/postgres/server.pem \
-  --tls-certificate /home/alice/.local/state/td-mta/postgres/ca.pem \
+  --tls-certificate /home/alice/mail-test/tls/server.pem \
+  --tls-certificate /home/alice/mail-test/tls/ca.pem \
   --openssl-bin /usr/bin/openssl \
   --backup-service-file /home/alice/.config/td-mta/backup.pg_service.conf \
   --backup-service td-mta-backup \
@@ -154,8 +154,8 @@ independent scheduled operations with the same installer:
 
 Select any complete group independently: mail profiles, managed certificate
 profiles with their connection file, private certificate files with an explicit
-OpenSSL executable, the four backup arguments, or the local PostgreSQL renewal
-group described below. Recovery hosts can independently select the
+OpenSSL executable (such as the local setup's listener leaf and CA), or the
+four backup arguments. Recovery hosts can independently select the
 [weekly restore drill and daily backup pull](#pull-backups-to-a-recovery-host).
 Repeat profiles/certificate
 files up to 32 per kind. All paths are absolute. On a mail host, use the state directory
@@ -350,16 +350,19 @@ orchestrate the preparation below:
 
 Install the binary first with `./install-td-mta`; use the same `--prefix` for
 setup when overriding its default. PostgreSQL 17's `initdb`, `postgres`,
-`pg_ctl`, `psql`, and OpenSSL must be available on the host PATH. These are
-host provisioning tools, not target recipe dependencies. The command runs
+`pg_ctl`, `psql`, and OpenSSL must be available on the host PATH. OpenSSL
+creates only the mail listeners' local CA and leaf. These are host
+provisioning tools, not target recipe dependencies. The command runs
 them directly, without a shell. It creates a new mode-0700 root under
 trusted physical ancestors; existing roots, symlinks, privileged local
 ports and conflicting local port assignments refuse. The parent must already
 exist. Roots are limited to 72 bytes for the MTA control socket.
 
-Default ports are PostgreSQL 35432, HTTPS 54443 and incoming SMTP 55225;
-`--postgres-port`, `--https-port` and `--smtp-port` override them. All three
-bind IPv4 loopback only. Relay uses verified implicit TLS on port 465;
+Default ports are HTTPS 54443 and incoming SMTP 55225; `--https-port` and
+`--smtp-port` override them. Both bind IPv4 loopback only. PostgreSQL has no
+TCP listener: it listens only on the private socket `ROOT/socket`, and
+`--postgres-port` (default 35432) names its socket file
+`ROOT/socket/.s.PGSQL.PORT`. Relay uses verified implicit TLS on port 465;
 `--relay-port` overrides the port, not the transport. Supply the relay login
 explicitly. Its password input must be a private, user-owned regular file;
 its ancestors must be physical, root/user-owned and not shared-writable.
@@ -368,13 +371,18 @@ similarly protected trust bundle; otherwise the bundled public roots apply.
 Account addresses, relay hostnames and relay users use simple ASCII names.
 The resolver must be an explicit IP:port endpoint reachable by the service.
 
-Setup creates a local CA and 90-day server leaf, initializes its own cluster,
-briefly starts PostgreSQL, creates separate schema-owner and runtime logins,
-initializes the schema/account/device, imports immutable materials and all
-three profiles, publishes a retained selection request, and checks runtime
-privileges. Temporary local trust authentication is confined to the private
-socket and setup administrator. The final configuration disables Unix
-sockets and accepts only TLS/SCRAM owner/runtime connections over loopback.
+Setup creates a local CA and 90-day server leaf for the HTTPS and SMTP
+listeners, initializes its own cluster, briefly starts PostgreSQL, creates
+separate schema-owner and runtime logins, initializes the
+schema/account/device, imports immutable materials and all three profiles,
+publishes a retained selection request, and checks runtime privileges.
+Temporary local trust authentication is confined to the private socket and
+setup administrator. The final configuration has `listen_addresses = ''`
+and `ssl = off`: PostgreSQL accepts only SCRAM owner and runtime logins
+(`local` HBA lines) on its mode-0600 socket in the mode-0700 `ROOT/socket`,
+the private form td-mta's Unix transport admits. The connection files use
+the Unix form `postgresql://USER:PASSWORD@:PORT/td_mta?host=ROOT/socket`
+(POSTGRES.md). The leaf and CA are not PostgreSQL's.
 PostgreSQL is stopped before successful return. No MTA service starts and
 no mail is sent. This does not provision an existing or remote database.
 
@@ -397,7 +405,7 @@ per user service manager. Definitions use the installed MTA path and the
 PostgreSQL executable found on PATH; retain those host installations.
 Choose one manager, start the services explicitly, and require each profile's
 readiness. `ROOT/mail.toml` configures td-mail with this account's private CA
-and device-password command. Use `td-net launch --allow-loopback` for this
+(for the HTTPS listener) and device-password command. Use `td-net launch --allow-loopback` for this
 local account. Startup persistence, certificate renewal and backups still
 follow the procedures elsewhere in this document.
 
@@ -413,7 +421,8 @@ privileges](POSTGRES.md#shared-runtime-login-privileges);
 process the schema-owner connection file.
 
 Run the service as a dedicated unprivileged identity. Provision its protected
-connection file and CA as POSTGRES.md specifies. Provision separate private
+connection file, and the database CA for a TLS endpoint, as POSTGRES.md
+specifies. Provision separate private
 mode-0700 runtime and scratch directories owned by that identity, under
 trusted physical ancestors. Each instance owns its own runtime and scratch;
 the shared database owns durable mail, configuration and device credentials.
@@ -655,10 +664,16 @@ and its files as 0600. A backup on the service disk does not protect against
 loss of that disk; copy retained backups to separately protected storage.
 
 Provision a private libpq service file and password file for the owner login,
-separately from td-mta's connection-file syntax. The service contains `host`,
-`port`, `dbname`, `user`, `sslmode=verify-full`, `sslrootcert`, `passfile`, and
-`connect_timeout=10`; the referenced mode-0600 password file uses PostgreSQL's
-`host:port:database:user:password` format, escaping colons and backslashes.
+separately from td-mta's connection-file syntax. For a local cluster on its
+private socket the service contains `host` (the absolute socket directory,
+which makes libpq use the Unix socket), `port`, `dbname`, `user`, `passfile`,
+and `connect_timeout=10`, with no SSL settings. The referenced mode-0600
+password file uses PostgreSQL's `host:port:database:user:password` format,
+escaping colons and backslashes. For a socket connection libpq matches the
+`host` field against the socket directory exactly as `host` names it, and
+also against `localhost` only when that directory is libpq's compiled-in
+default; write the directory there. A network database instead needs
+`sslmode=verify-full` and `sslrootcert`.
 Do not put the password or the full connection URI in command arguments or
 shell history. Clear conflicting ambient `PG*` variables before using these
 examples; retain only the explicit service selection for the dump:
@@ -683,9 +698,9 @@ release/schema version alongside the archive. `--list` alone checks the
 archive directory, not whether its data can be restored.
 
 Retain protected bootstrap material separately: database login credentials
-for the owner and each service, role/grant provisioning, database
-TLS trust, the local CA key
-if used, profile source files, current selection receipts, the td-mail device
+for the owner and each service, role/grant provisioning, database TLS trust
+for a network database, the mail listeners' local CA key if used, profile
+source files, current selection receipts, the td-mail device
 password and its per-account CA configuration, and the matching executable
 release. `pg_dump` does not include cluster roles, server configuration,
 bootstrap files or mail accepted after its snapshot. A restored device
@@ -709,7 +724,8 @@ A retained host builder can run the same operation without compiling:
 `/absolute/td-builder install-td-mta --backup ...`. This is host control-plane
 backup orchestration, not a target distribution executable or a database
 restore command. The operator's service selection controls which database is
-backed up; use the owner login and verified local PostgreSQL TLS.
+backed up; use the owner login over the private socket (or verified TLS for
+a network database).
 
 Defaults retain at most 30 completed archives, cap each archive at 1 GiB and
 cap total directory bytes at 8 GiB. Override these with `--retain`,
@@ -931,8 +947,9 @@ and its private runtime directory. Check each native certificate worker with
 `td-mta acme-status --connection-file PATH --certificate-profile NAME
 --require-ready --minimum-validity-seconds 2592000`. Keep these as separate
 supervisor commands so a failing profile cannot be hidden by another healthy
-one. Public ACME health does not cover a private PostgreSQL certificate;
-check that leaf and its CA with the expiry command in the next section.
+one. Public ACME health does not cover a local setup's private listener
+certificate; check that leaf and its CA with the expiry commands in
+"Renew a local private certificate". A local PostgreSQL uses no certificate.
 
 For a bounded backup destination, use:
 
@@ -958,75 +975,35 @@ status in the supervisor, and arrange operator notification appropriate to the
 host. A timer alone does not send an alert. Check free disk space and off-host
 backup copies separately; a recent local archive does not cover VM loss.
 
-## Automatic local PostgreSQL leaf renewal
+## Existing TCP/TLS local installations
 
-`./install-td-mta --postgres-tls-renew` renews the setup profile's private
-PostgreSQL leaf certificate under its existing CA and server key. It supports
-only the localhost/127.0.0.1 certificate and a loopback PostgreSQL endpoint.
-Run it as the cluster owner with PostgreSQL 17 and OpenSSL 3 or 4:
+Local setups made before PostgreSQL moved to its private socket listen on
+loopback TCP with a private TLS leaf, and may run the generated
+`td-mta-maint-postgres-tls-renew` job. New operator helpers no longer have
+that renewal mode, so disable the job in its supervisor and delete its
+generated `td-mta-maint-postgres-tls-renew.service`, `.timer` and `.scm`
+under `PREFIX/share/td-mta/services` before installing a new operations
+helper; the retained older helper still serves it until then. Migrate deliberately, retaining credentials, epochs and mail
+data:
 
-```text
-./install-td-mta --postgres-tls-renew \
-  --tls-dir /home/alice/.local/state/td-mta/tls \
-  --data-dir /home/alice/.local/state/td-mta/postgres \
-  --postgres-bin /usr/lib/postgresql/17/bin --openssl-bin /usr/bin/openssl \
-  --port 35432
-```
+1. Stop the MTA services, scheduled jobs that use the database, then
+   PostgreSQL.
+2. In `ROOT/postgresql.conf` set `listen_addresses = ''`, `ssl = off`,
+   `unix_socket_directories = 'ROOT/socket'` and `unix_socket_permissions =
+   0600`, and remove `ssl_cert_file` and `ssl_key_file`. Create
+   `ROOT/socket` mode 0700 if it does not exist.
+3. Replace the `hostssl` lines in the cluster's `pg_hba.conf` with `local
+   td_mta td_mta_ROLE scram-sha-256` for each login, ending with the
+   existing reject rules.
+4. Rewrite the owner and runtime connection files (mode 0600) to
+   `postgresql://td_mta_ROLE:PASSWORD@:PORT/td_mta?host=ROOT/socket`, and
+   the backup libpq service and password files as in "Local logical backup
+   and an isolated restore drill".
+5. Start PostgreSQL, run `postgres runtime-check` and `schema-inspect`, start
+   the services and require each profile's readiness, then run a backup.
 
-The TLS directory must contain private owned `ca.pem`, `ca.key`, `server.pem`
-and `server.key` files. Both directories and their physical ancestors must
-meet the private-path contract. PostgreSQL must already use that server
-certificate/key pair. Host-library provisioning remains the operator's
-responsibility, as for setup and backups. The helper checks key correspondence,
-local subject-alternative names and the old chain, allowing an expired leaf
-only for renewal. The CA must remain valid for at least 91 days; CA trust/key
-rotation is always explicit. A leaf with fewer than 30 days remaining is
-reissued for 90 days. `--force` exercises issuance immediately; never put that
-flag in the unattended schedule.
-
-The server key stays unchanged, so publication replaces only the certificate.
-The helper retains one `server.previous.pem`, syncs the replacement, asks
-`pg_ctl reload` to signal the named cluster, then establishes a new verified
-PostgreSQL TLS connection and compares its first presented certificate with
-the selected file. [OpenSSL's PostgreSQL STARTTLS probe](https://docs.openssl.org/3.0/man1/openssl-s_client/)
-uses explicit CA/name verification and fails on verification errors. A failure
-after publication leaves the candidate on disk and returns failure; it does
-not silently roll back or claim reload succeeded. A subsequent invocation also
-repairs a missed reload when a healthy on-disk certificate differs from the
-one being served. It never restarts PostgreSQL or mail services.
-
-One private lock excludes overlapping invocations. Tool output is bounded to
-64 KiB per command, diagnostics to 16 KiB, and execution to 30 seconds per
-command, at most 64 commands. Reserved `renew-work` scratch is reclaimed on
-normal return and after interruption; unexpected entries refuse cleanup.
-Private `renew-last-error` retains a tool diagnostic until a successful run.
-Supervisor results also cover validation failures before a tool can run.
-Previous certificates and the publication staging slot have fixed names;
-unattended renewal does not accumulate generations or new private keys.
-
-Generate its daily systemd/Shepherd schedule with the operations installer:
-
-```text
-./install-td-mta --operations-services --state-dir /home/alice/.local/state/td-mta \
-  --postgres-tls-dir /home/alice/.local/state/td-mta/tls \
-  --postgres-data-dir /home/alice/.local/state/td-mta/postgres \
-  --postgres-port 35432 --postgres-bin /usr/lib/postgresql/17/bin \
-  --openssl-bin /usr/bin/openssl
-```
-
-The generated `td-mta-maint-postgres-tls-renew` job uses the retained host
-helper. Enable it through the printed supervisor commands, as for backups.
-The daily job never forces issuance. It shares the daily schedule's bounded
-45-minute supervisor ceiling; private certificate health checks remain
-independent. For a hardened system service, allow writes only to its TLS
-directory and retain read access to the PostgreSQL data directory. Provision
-the service identity and tool runtime libraries explicitly.
-
-This updates PostgreSQL's local certificate files only. It does not change
-immutable certificate materials already imported into td-mta, a public ACME
-profile, another account's trust, or the CA. Installations using the same old
-leaf for mail listeners must separately update those stored materials using
-the procedure below. Failure notifications and CA rotation remain explicit.
+The leaf and CA remain the mail listeners' certificates; renew them as
+below. Retain the old files until validation is complete.
 
 ## Local replica transport
 
@@ -1047,11 +1024,11 @@ connection files and the td-mail account; restart and verify discovery,
 mailboxes, body reads and sync progress. Remove the old renewal service from
 its persistent supervisor configuration. Retain recovery files until validation
 is complete. Do not run fresh setup over an existing root: it intentionally
-refuses existing data. A pending old renewal journal is retained and refused
-by the PostgreSQL-only renewal helper rather than overwritten.
+refuses existing data. A pending old renewal journal is retained for
+inspection; no current helper renews or overwrites it.
 
-Public HTTPS/ACME and a primary's network PostgreSQL TLS renewal are independent
-of this local transport and remain enabled where configured.
+Public HTTPS/ACME is independent of this local transport and remains enabled
+where configured.
 
 ## Renew a local private certificate
 
@@ -1061,10 +1038,11 @@ with `openssl x509 -in FILE -noout -dates`, and check the renewal threshold
 with `openssl x509 -in FILE -checkend 2592000 -noout`. Nonzero means renewal
 is due (or the input could not be checked); it is not an instruction to
 ignore verification. Schedule the operator check before either certificate
-expires. The commands in this section are manual. The local PostgreSQL-only helper
-above provides automatic leaf renewal; other imported mail materials still
-require explicit configuration selection.
+expires; `--operations-services --tls-certificate` can schedule that
+expiry check. Renewal is manual and, because the leaf is an imported mail
+material, requires explicit configuration selection.
 
+This leaf serves the HTTPS and SMTP listeners; PostgreSQL does not use it.
 Retain the CA certificate/key and prior server generation privately. Create
 new files in a new mode-0700 directory with umask 077. A 90-day leaf under an
 existing CA can be prepared with the following commands; select a new random
@@ -1122,10 +1100,8 @@ commands; do not invent a fresh request to hide uncertainty.
 Certificate files on disk do not update td-mta's immutable database materials.
 Selecting a configuration advances the database-wide generation and fences
 every instance using that selection. Restart all of them, including unchanged
-listener-free relay profiles, and require ready status from each instance. When the private PostgreSQL server uses the same local leaf,
-install its new certificate/key pair and reload or restart PostgreSQL too;
-keep its bootstrap clients' trust valid throughout the transition. Verify new
-connections to PostgreSQL, JMAP HTTPS and SMTP STARTTLS with name/chain checks,
+listener-free relay profiles, and require ready status from each instance.
+Verify new JMAP HTTPS and SMTP STARTTLS connections with name/chain checks,
 and confirm that they present the intended certificate and expiration. Keep
 the old files and selected configuration receipt for diagnosing a failed
 rotation. Do not claim live reload or automatic ACME support from this manual

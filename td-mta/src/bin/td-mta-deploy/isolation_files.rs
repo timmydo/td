@@ -1,5 +1,5 @@
 //! Fixed systemd and sudoers settings, including their pre-Rust file format.
-use super::{Role, BASE, BIN, LEGACY, MAIL, NOTIFY, ROLES};
+use super::{Role, BASE, BIN, DB_GROUP, LEGACY, MAIL, NOTIFY, ROLES};
 use crate::common::{child, fmt, require, Host};
 use crate::R;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -31,9 +31,12 @@ fn dropin(units: &Path, unit: &str) -> R<PathBuf> {
     )
 }
 
-fn service_settings(role: &Role, daemon: bool) -> R<String> {
+// A service daemon reaches PostgreSQL's shared socket through its group; a
+// readiness job never touches the database. `tls` is the old layout.
+fn service_settings(role: &Role, daemon: bool, tls: bool) -> R<String> {
     let user = role.user;
-    let mut settings = fmt(format_args!("[Service]\nUser={user}\nGroup={user}\nSupplementaryGroups=\nUMask=0077\nNoNewPrivileges=yes\nAmbientCapabilities=\nCapabilityBoundingSet=\n"))?;
+    let group = if daemon && !tls { DB_GROUP } else { "" };
+    let mut settings = fmt(format_args!("[Service]\nUser={user}\nGroup={user}\nSupplementaryGroups={group}\nUMask=0077\nNoNewPrivileges=yes\nAmbientCapabilities=\nCapabilityBoundingSet=\n"))?;
     if daemon && role.low_port {
         push_str(&mut settings,"CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n")?;
     }
@@ -58,7 +61,7 @@ fn service_settings(role: &Role, daemon: bool) -> R<String> {
     Ok(settings)
 }
 
-pub(super) fn settings(units: &Path, sudoers: &Path) -> R<Vec<Setting>> {
+pub(super) fn settings(units: &Path, sudoers: &Path, tls: bool) -> R<Vec<Setting>> {
     let mut settings = Vec::new();
     let mut sudo = String::new();
     for role in ROLES {
@@ -66,7 +69,7 @@ pub(super) fn settings(units: &Path, sudoers: &Path) -> R<Vec<Setting>> {
             &mut settings,
             Setting {
                 path: dropin(units, role.unit)?,
-                text: service_settings(role, true)?,
+                text: service_settings(role, true, tls)?,
                 mode: 0o644,
             },
         )?;
@@ -78,7 +81,7 @@ pub(super) fn settings(units: &Path, sudoers: &Path) -> R<Vec<Setting>> {
             &mut settings,
             Setting {
                 path: dropin(units, &unit)?,
-                text: service_settings(role, false)?,
+                text: service_settings(role, false, tls)?,
                 mode: 0o644,
             },
         )?;
@@ -123,12 +126,16 @@ pub(super) fn settings(units: &Path, sudoers: &Path) -> R<Vec<Setting>> {
     Ok(settings)
 }
 
-pub(super) fn production() -> R<Vec<Setting>> {
-    settings(Path::new(SYSTEMD), Path::new(SUDOERS))
+pub(crate) fn production() -> R<Vec<Setting>> {
+    settings(Path::new(SYSTEMD), Path::new(SUDOERS), false)
+}
+
+pub(crate) fn production_tls() -> R<Vec<Setting>> {
+    settings(Path::new(SYSTEMD), Path::new(SUDOERS), true)
 }
 
 // Check from the root down so no lookup traverses an unchecked parent.
-pub(super) fn safe_parents(path: &Path) -> R<()> {
+pub(crate) fn safe_parents(path: &Path) -> R<()> {
     if let Some(parent) = path.parent() {
         safe_parents(parent)?;
         let m = fs::symlink_metadata(parent)?;

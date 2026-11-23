@@ -78,6 +78,22 @@ fn load_job(work: &Path, mode: &str, owner: u32) -> R<td_json::Json> {
     }
     Ok(record)
 }
+// Only the socket cutover's job names its operation; an activation job, and
+// every earlier job, does not.
+fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
+    let declared = match job.get("mode") {
+        None => None,
+        Some(value) => Some(value.as_str().ok_or("invalid job mode")?),
+    };
+    require(
+        declared
+            == match mode {
+                "postgres-socket" => Some("postgres-socket"),
+                _ => None,
+            },
+        "job operation does not match the requested mode",
+    )
+}
 fn supervise(mode: &str) -> R<()> {
     let work = std::env::current_dir()?;
     let operator = Path::new("/var/lib/td-mta-operator");
@@ -90,6 +106,7 @@ fn supervise(mode: &str) -> R<()> {
         "private production job required",
     )?;
     let job = load_job(&work, mode, 0)?;
+    check_mode(&job, mode)?;
     let lock = OpenOptions::new()
         .write(true)
         .truncate(false)
@@ -108,6 +125,7 @@ fn run() -> R<()> {
     match args.as_slice() {
         [s, rest @ ..] if s == "__isolation" => isolation::helper(rest),
         [s] if s == "--activate" => supervise("activate"),
+        [s] if s == "--postgres-socket" => supervise("postgres-socket"),
         [s] if s == "--restore-shared-services" => supervise("restore-shared-services"),
         [s] if s == "--refresh-notifications" => supervise("refresh-notifications"),
         [s, rest @ ..]
@@ -156,6 +174,26 @@ mod tests {
         assert!(load_job(work, "activate", owner).is_err());
         fs::set_permissions(&receipt, fs::Permissions::from_mode(0o644))?;
         assert!(load_job(work, "refresh-notifications", owner).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_socket_cutover_job_runs_the_socket_cutover() -> R<()> {
+        let plain = td_json::parse(r#"{"revision":"r"}"#)?;
+        let socket = td_json::parse(r#"{"revision":"r","mode":"postgres-socket"}"#)?;
+        let other = td_json::parse(r#"{"revision":"r","mode":"activate"}"#)?;
+        for mode in [
+            "activate",
+            "restore-shared-services",
+            "refresh-notifications",
+        ] {
+            check_mode(&plain, mode)?;
+            assert!(check_mode(&socket, mode).is_err());
+            assert!(check_mode(&other, mode).is_err());
+        }
+        check_mode(&socket, "postgres-socket")?;
+        assert!(check_mode(&plain, "postgres-socket").is_err());
+        assert!(check_mode(&td_json::parse(r#"{"mode":1}"#)?, "postgres-socket").is_err());
         Ok(())
     }
 }

@@ -146,9 +146,7 @@ pub fn hba_rules() -> R<String> {
     for &role in ROLES {
         td_alloc::push_str(
             &mut s,
-            &fmt(format_args!(
-                "hostssl td_mta td_mta_{role} 127.0.0.1/32 scram-sha-256\n"
-            ))?,
+            &fmt(format_args!("local td_mta td_mta_{role} scram-sha-256\n"))?,
         )?;
     }
     Ok(s)

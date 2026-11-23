@@ -24,8 +24,6 @@ const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PA
   [--backup-drill-scratch-directory PATH --backup-destination PATH
    --postgres-bin PATH [--tool-library-dir PATH]
    [--backup-pull-host SSH_ALIAS [--backup-max-archive-bytes N]]]
-  [--postgres-tls-dir PATH --postgres-data-dir PATH --postgres-port N
-   --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]]
 
 Notification collection runs every minute; digests run at 08:00 (or --notify-hour)
 in the supervisor local timezone. Notification SMTP is loopback only; credentials
@@ -34,7 +32,7 @@ Generates independent systemd timers and Shepherd timed services, without starti
 anything. Search preparation runs one bounded page per minute, waits five minutes
 after each cycle, and has a separate freshness check. Body scrubbing runs one bounded page per minute, starts a new cycle
 a day after completion, and has a separate freshness check. Mail, certificate and backup freshness checks run every 15 minutes;
-backups and private PostgreSQL leaf renewal run daily at 03:15 in the supervisor's local timezone. Certificate checks
+backups run daily at 03:15 in the supervisor's local timezone. Certificate checks
 require 30 days remaining; backups must be at most two days old. The local backup
 writer requires PostgreSQL 17 and protected credentials. Its default limits are
 1 GiB/archive, 8 GiB/directory and 30 archives; override with --backup-* bounds.
@@ -58,7 +56,6 @@ struct Options {
     drill: Option<RestoreDrill>,
     scrub: Option<Scrub>,
     search: Option<Scrub>,
-    renewal: Option<Renewal>,
     notification: Option<Notification>,
 }
 struct Notification {
@@ -74,10 +71,6 @@ struct Scrub {
     connection: PathBuf,
     epoch: String,
     state: PathBuf,
-}
-struct Renewal {
-    argv: Vec<String>,
-    environment: Vec<String>,
 }
 struct BackupPull {
     host: String,
@@ -164,9 +157,6 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             | "--backup-retain"
             | "--postgres-bin"
             | "--tool-library-dir"
-            | "--postgres-tls-dir"
-            | "--postgres-data-dir"
-            | "--postgres-port"
             | "--notify-recipient"
             | "--notify-connection-file"
             | "--notify-epoch"
@@ -344,49 +334,8 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     } else {
         None
     };
-    let renewal = if [
-        "--postgres-tls-dir",
-        "--postgres-data-dir",
-        "--postgres-port",
-    ]
-    .iter()
-    .any(|key| values.contains_key(key))
-    {
-        let tools = postgres_tools()?;
-        let openssl = required("--openssl-bin")?;
-        let tls_dir = required("--postgres-tls-dir")?;
-        let data = required("--postgres-data-dir")?;
-        let port = values
-            .get("--postgres-port")
-            .ok_or("missing --postgres-port")?
-            .parse::<u16>()
-            .map_err(|_| "invalid PostgreSQL port")?;
-        if port == 0 {
-            return Err("PostgreSQL port must be nonzero".into());
-        }
-        Some(Renewal {
-            argv: vec![
-                "install-td-mta".into(),
-                "--postgres-tls-renew".into(),
-                "--tls-dir".into(),
-                text(&tls_dir)?.into(),
-                "--data-dir".into(),
-                text(&data)?.into(),
-                "--postgres-bin".into(),
-                text(&tools.bin)?.into(),
-                "--openssl-bin".into(),
-                text(&openssl)?.into(),
-                "--port".into(),
-                port.to_string(),
-            ],
-            environment: tools.environment()?,
-        })
-    } else {
-        None
-    };
     if backup.is_none()
         && drill.is_none()
-        && renewal.is_none()
         && ["--postgres-bin", "--tool-library-dir"]
             .iter()
             .any(|key| values.contains_key(key))
@@ -395,9 +344,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     }
     let connection = path("--connection-file")?;
     let openssl = path("--openssl-bin")?;
-    if certificates.is_empty() != connection.is_none()
-        || (tls.is_empty() && renewal.is_none()) != openssl.is_none()
-    {
+    if certificates.is_empty() != connection.is_none() || tls.is_empty() != openssl.is_none() {
         return Err("certificate profiles need --connection-file; TLS files need --openssl-bin (no unused options)".into());
     }
     let notification = if values.keys().any(|k| k.starts_with("--notify-")) {
@@ -456,7 +403,6 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         && search.is_none()
         && backup.is_none()
         && drill.is_none()
-        && renewal.is_none()
         && notification.is_none()
     {
         return Err("select at least one operation".into());
@@ -473,7 +419,6 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         drill,
         scrub,
         search,
-        renewal,
         notification,
     })
 }
@@ -652,16 +597,6 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
             Schedule::WeeklyDrill {
                 pull_first: drill.pull.is_some(),
             },
-        );
-    }
-    if let Some(renewal) = &opts.renewal {
-        let mut argv = vec![text(&helper)?.into()];
-        argv.extend(renewal.argv.iter().cloned());
-        add(
-            "postgres-tls-renew".into(),
-            argv,
-            renewal.environment.clone(),
-            Schedule::Daily,
         );
     }
     if let Some(scrub) = &opts.scrub {
@@ -998,11 +933,7 @@ fn install(opts: &Options) -> Result<()> {
             write_new(&config_path, config.to_canonical().as_bytes())?;
         }
     }
-    if opts.backup.is_some()
-        || opts.drill.is_some()
-        || opts.renewal.is_some()
-        || opts.notification.is_some()
-    {
+    if opts.backup.is_some() || opts.drill.is_some() || opts.notification.is_some() {
         // A stable command path keeps schedules independent of the source checkout.
         let releases = opts.prefix.join("lib/td-mta/host-tools");
         directory(&releases, 0o755)?;
@@ -1423,33 +1354,42 @@ mod tests {
     }
 
     #[test]
-    fn renewal_is_daily_without_forcing_issuance() {
-        let opts = options(
+    fn postgres_tls_renewal_options_are_gone() {
+        for flag in [
+            "--postgres-tls-dir",
+            "--postgres-data-dir",
+            "--postgres-port",
+        ] {
+            let error = options(
+                &args(&[
+                    "--state-dir",
+                    "/state",
+                    "--mail-profile",
+                    "frontend",
+                    flag,
+                    "/x",
+                ]),
+                "/home/a",
+            )
+            .err();
+            assert_eq!(
+                error.as_deref(),
+                Some(format!("unknown operations option: {flag}").as_str())
+            );
+        }
+        // An OpenSSL path no longer stands for renewal: it needs certificates.
+        assert!(options(
             &args(&[
                 "--state-dir",
                 "/state",
-                "--postgres-tls-dir",
-                "/tls",
-                "--postgres-data-dir",
-                "/pg",
-                "--postgres-port",
-                "35432",
-                "--postgres-bin",
-                "/tools",
+                "--mail-profile",
+                "front",
                 "--openssl-bin",
-                "/openssl",
+                "/openssl"
             ]),
-            "/home/a",
+            "/home/a"
         )
-        .unwrap();
-        let jobs = jobs(&opts).unwrap();
-        assert_eq!(jobs.len(), 1);
-        assert!(matches!(jobs[0].schedule, Schedule::Daily));
-        assert!(jobs[0].argv.iter().any(|v| v == "--postgres-tls-renew"));
-        assert!(!jobs[0].argv.iter().any(|v| v == "--force"));
-        assert!(files(&jobs[0], &opts.state).unwrap()[1]
-            .1
-            .contains("OnCalendar=*-*-* 03:15:00"));
+        .is_err());
     }
 
     #[test]

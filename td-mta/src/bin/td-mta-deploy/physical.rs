@@ -21,6 +21,9 @@ pub(super) const PGDATA: &str = "/var/lib/td-mta/mail/postgres";
 pub(super) const TOOLS: &str = "/opt/td-mta/postgresql/usr/lib/postgresql/17/bin";
 pub(super) const CONTROL: &str = "/var/lib/td-mta-operator/physical-backup";
 pub(super) const SYSTEM: &str = "7698635942461075926";
+pub(super) const SOCKET_DIR: &str = "/var/lib/td-mta-postgres";
+pub(super) const PG_DROPIN: &str =
+    "/etc/systemd/system/td-mta-postgres.service.d/90-td-mta-socket.conf";
 const VOLUME: &str = "/data/td-mta-physical-recovery";
 pub(super) const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -41,6 +44,7 @@ pub(super) struct Recovery {
     start_lsn: u64,
     receiver: Option<Receiver>,
     unit: Option<String>,
+    holder: Option<String>,
 }
 
 fn tool(name: &str) -> R<PathBuf> {
@@ -183,6 +187,7 @@ impl Recovery {
             start_lsn: 0,
             receiver: None,
             unit: None,
+            holder: None,
         };
         let initialize = || -> R<()> {
             fs::set_permissions(&state.runtime, fs::Permissions::from_mode(0o711))?;
@@ -192,10 +197,16 @@ impl Recovery {
             h.host
                 .run(h.host.cmd("chown").arg("root:td-mta").arg(&archive))?;
             fs::set_permissions(archive, fs::Permissions::from_mode(0o750))?;
+            // Each trial serves the production socket form from its own directory.
             let socket = child(&state.runtime, "socket")?;
             private_subdir(&socket)?;
-            h.host
-                .run(h.host.cmd("chown").arg("td-mta:td-mta").arg(socket))?;
+            h.host.run(
+                h.host
+                    .cmd("chown")
+                    .arg(fmt(format_args!("td-mta:{}", isolation::DB_GROUP))?)
+                    .arg(&socket),
+            )?;
+            fs::set_permissions(socket, fs::Permissions::from_mode(0o750))?;
             Ok(())
         };
         if let Err(error) = initialize() {
@@ -288,39 +299,7 @@ impl Recovery {
             "streaming replication sender timed out",
             || Self::streaming(h),
         )?;
-        let base = child(&self.work, "base")?;
-        h.host.exec(
-            h.host
-                .cmd(tool("pg_basebackup")?)
-                .args(["-w", "--no-slot", "--wal-method=stream", "-D"])
-                .arg(&base)
-                .args(["-d", "service=cutover_repl"])
-                .env("PGSERVICEFILE", child(Path::new(CONTROL), "service.conf")?),
-            &[],
-            Duration::from_secs(1200),
-            true,
-        )?;
-        h.host.exec(
-            h.host.cmd(tool("pg_verifybackup")?).arg(&base),
-            &[],
-            Duration::from_secs(300),
-            true,
-        )?;
-        let manifest = child(&base, "backup_manifest")?;
-        let (range, start) = read_manifest(&manifest, SYSTEM, self.timeline)?;
-        self.start_lsn = start;
-        set(&mut self.receipt, "system_identifier", SYSTEM.into())?;
-        set(
-            &mut self.receipt,
-            "timeline",
-            Json::Str(fmt(format_args!("{}", self.timeline))?),
-        )?;
-        set(
-            &mut self.receipt,
-            "manifest_sha256",
-            Json::Str(digest(&manifest)?),
-        )?;
-        set(&mut self.receipt, "wal_range", range)?;
+        self.base_backup(h)?;
         let archive = child(&self.work, "bootstrap.tar")?;
         self.archive_bootstrap(h, &archive)?;
         set(
@@ -330,25 +309,7 @@ impl Recovery {
         )?;
 
         self.start_copy(h, false)?;
-        let unit = self.unit.as_deref().ok_or("missing trial unit")?;
-        let pid = h.host.out(
-            h.host
-                .cmd("systemctl")
-                .args(["show", unit, "-p", "MainPID", "--value"]),
-        )?;
-        require(
-            pid.parse::<u32>()? > 0
-                && fs::metadata(fmt(format_args!("/proc/{pid}/ns/net"))?)?.ino()
-                    != fs::metadata("/proc/self/ns/net")?.ino(),
-            "trial network isolation",
-        )?;
-        let ns = [
-            owned("nsenter")?,
-            owned("--target")?,
-            pid,
-            owned("--net")?,
-            owned("--")?,
-        ];
+        let ns = self.hold(h, "migration", &[])?;
         self.wait(&h.host, 40, "migration rehearsal startup timed out", || {
             h.ready_db(&ns)
         })?;
@@ -396,6 +357,47 @@ impl Recovery {
         durable(&child(&self.work, "receipt.json")?, &self.receipt)
     }
 
+    /// A fresh, verified online base backup of the primary in `base`.
+    pub(super) fn base_backup(&mut self, h: &Deployment) -> R<()> {
+        if self.timeline == 0 {
+            self.timeline = Self::source(h)?;
+        }
+        let base = child(&self.work, "base")?;
+        h.host.exec(
+            h.host
+                .cmd(tool("pg_basebackup")?)
+                .args(["-w", "--no-slot", "--wal-method=stream", "-D"])
+                .arg(&base)
+                .args(["-d", "service=cutover_repl"])
+                .env("PGSERVICEFILE", child(Path::new(CONTROL), "service.conf")?),
+            &[],
+            Duration::from_secs(1200),
+            true,
+        )?;
+        h.host.exec(
+            h.host.cmd(tool("pg_verifybackup")?).arg(&base),
+            &[],
+            Duration::from_secs(300),
+            true,
+        )?;
+        let manifest = child(&base, "backup_manifest")?;
+        let (range, start) = read_manifest(&manifest, SYSTEM, self.timeline)?;
+        self.start_lsn = start;
+        set(&mut self.receipt, "system_identifier", SYSTEM.into())?;
+        set(
+            &mut self.receipt,
+            "timeline",
+            Json::Str(fmt(format_args!("{}", self.timeline))?),
+        )?;
+        set(
+            &mut self.receipt,
+            "manifest_sha256",
+            Json::Str(digest(&manifest)?),
+        )?;
+        set(&mut self.receipt, "wal_range", range)?;
+        Ok(())
+    }
+
     fn archive_bootstrap(&self, h: &Deployment, archive: &Path) -> R<()> {
         let mut tar = h.host.cmd("tar");
         tar.arg("-cf").arg(archive).args(["-C", "/"]);
@@ -406,7 +408,6 @@ impl Recovery {
         let mail = Path::new(MAIL);
         for name in [
             "postgresql.conf",
-            "tls",
             "owner-connection",
             "owner-password",
             "runtime-connection",
@@ -426,6 +427,7 @@ impl Recovery {
         for path in [
             Path::new("/var/lib/td-mta/backup-control"),
             Path::new("/opt/td-mta/postgresql"),
+            Path::new(PG_DROPIN),
             h.previous.parent().ok_or("release parent")?,
         ] {
             include(path)?;
@@ -448,13 +450,8 @@ impl Recovery {
         Ok(())
     }
 
-    fn start_copy(&mut self, h: &Deployment, standby: bool) -> R<()> {
-        let name = if standby { "replay" } else { "migration" };
-        let scoped = h
-            .plan
-            .as_ref()
-            .and_then(|p| p.get("service_grants"))
-            .is_some();
+    // A private, writable copy of the base owned by the server account.
+    fn copy_base(&self, h: &Deployment, name: &str, standby: bool) -> R<PathBuf> {
         let data = child(&self.work, name)?;
         h.host.exec(
             h.host
@@ -476,23 +473,32 @@ impl Recovery {
         }
         h.host
             .run(h.host.cmd("chown").args(["-R", "td-mta:td-mta"]).arg(&data))?;
-        let mount = child(&self.runtime, "cluster")?;
-        let wal = child(&self.runtime, "wal")?;
-        for dir in [&mount, &wal] {
+        for dir in [
+            child(&self.runtime, "cluster")?,
+            child(&self.runtime, "wal")?,
+        ] {
             fs::DirBuilder::new()
                 .mode(0o700)
                 .recursive(true)
                 .create(dir)?;
         }
-        for file in ["server.pem", "server.key"] {
-            h.host.run(
-                h.host
-                    .cmd("install")
-                    .args(["-m", "0600", "-o", "td-mta", "-g", "td-mta"])
-                    .arg(child(&child(Path::new(MAIL), "tls")?, file)?)
-                    .arg(child(&self.runtime, file)?),
-            )?;
-        }
+        Ok(data)
+    }
+
+    fn bind(&self) -> R<&str> {
+        let bind = self.runtime.to_str().ok_or("non-UTF8 trial path")?;
+        require(unit_path(bind), "invalid trial directory")?;
+        Ok(bind)
+    }
+
+    fn start_copy(&mut self, h: &Deployment, standby: bool) -> R<()> {
+        let name = if standby { "replay" } else { "migration" };
+        let scoped = h
+            .plan
+            .as_ref()
+            .and_then(|p| p.get("service_grants"))
+            .is_some();
+        let data = self.copy_base(h, name, standby)?;
         let hba = trial_hba(standby, scoped)?;
         self.config_file(&h.host, "hba", hba.as_bytes())?;
         self.config_file(&h.host, "ident", b"trial root setup_admin\n")?;
@@ -505,26 +511,15 @@ impl Recovery {
             )?;
             self.config_file(&h.host, "admin-ident", b"trial root setup_admin\n")?;
         }
-        let bind = self.runtime.to_str().ok_or("non-UTF8 trial path")?;
-        require(
-            bind.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b)),
-            "invalid trial directory",
-        )?;
+        let bind = self.bind()?;
         let mut config = fmt(format_args!(
             "data_directory='{bind}/cluster'\nhba_file='{bind}/hba'\nident_file='{bind}/ident'\n\
-             listen_addresses='{}'\nport='35432'\nunix_socket_directories='{}'\n\
-             unix_socket_permissions='0700'\nssl='{}'\nssl_cert_file='{bind}/server.pem'\n\
-             ssl_key_file='{bind}/server.key'\nshared_preload_libraries=''\narchive_mode='off'\n\
+             listen_addresses=''\nport='35432'\nunix_socket_directories='{bind}/socket'\n\
+             unix_socket_group='{}'\nunix_socket_permissions='0660'\nssl='off'\n\
+             shared_preload_libraries=''\narchive_mode='off'\n\
              archive_command=''\nprimary_conninfo=''\nprimary_slot_name=''\nhot_standby='on'\n\
              log_statement='none'\nlog_min_error_statement='panic'\n",
-            if standby { "" } else { "127.0.0.1" },
-            if standby || scoped {
-                fmt(format_args!("{bind}/socket"))?
-            } else {
-                String::new()
-            },
-            if standby { "off" } else { "on" }
+            isolation::DB_GROUP,
         ))?;
         for limit in [
             "max_connections",
@@ -551,6 +546,40 @@ impl Recovery {
             td_alloc::push_str(&mut config, &recovery)?;
         }
         self.config_file(&h.host, "conf", config.as_bytes())?;
+        let file = fmt(format_args!("config_file={bind}/conf"))?;
+        self.launch(h, name, &data, &[owned("-c")?, file])
+    }
+
+    /// The staged production configuration on a fresh copy of the base. The
+    /// command line overrides only where the trial and its files live, keeps
+    /// its socket open whatever the fence include says, and stops archiving
+    /// and replication. The staged listen and TLS settings stay in effect.
+    pub(super) fn start_transport(&mut self, h: &Deployment, conf: &[u8], hba: &[u8]) -> R<()> {
+        let data = self.copy_base(h, "transport", false)?;
+        self.config_file(&h.host, "conf", conf)?;
+        self.config_file(&h.host, "hba", hba)?;
+        self.config_file(&h.host, "ident", b"")?;
+        let bind = self.bind()?;
+        let mut args = Vec::new();
+        for setting in [
+            fmt(format_args!("config_file={bind}/conf"))?,
+            fmt(format_args!("data_directory={bind}/cluster"))?,
+            fmt(format_args!("hba_file={bind}/hba"))?,
+            fmt(format_args!("ident_file={bind}/ident"))?,
+            fmt(format_args!("unix_socket_directories={bind}/socket"))?,
+            owned("unix_socket_permissions=0660")?,
+            owned("archive_mode=off")?,
+            owned("primary_conninfo=")?,
+        ] {
+            td_alloc::push(&mut args, owned("-c")?)?;
+            td_alloc::push(&mut args, setting)?;
+        }
+        self.launch(h, "transport", &data, &args)
+    }
+
+    fn launch(&mut self, h: &Deployment, name: &str, data: &Path, args: &[String]) -> R<()> {
+        let bind = self.bind()?;
+        let mount = child(&self.runtime, "cluster")?;
         let job = h
             .work
             .file_name()
@@ -578,6 +607,7 @@ impl Recovery {
                 "ReadWritePaths={bind}/socket {}",
                 mount.display()
             ))?,
+            fmt(format_args!("SupplementaryGroups={}", isolation::DB_GROUP))?,
         ] {
             command.arg(fmt(format_args!("--property={property}"))?);
         }
@@ -600,10 +630,40 @@ impl Recovery {
             .arg(tool("postgres")?)
             .arg("-D")
             .arg(mount)
-            .arg("-c")
-            .arg(fmt(format_args!("config_file={bind}/conf"))?);
+            .args(args);
         self.unit = Some(unit); // systemd may accept the start before losing the reply.
-        h.host.run(&mut command)
+        h.host.run(&mut command)?;
+        let pid = self.trial_pid(&h.host)?;
+        require(
+            fs::metadata(fmt(format_args!("/proc/{pid}/ns/net"))?)?.ino()
+                != fs::metadata("/proc/self/ns/net")?.ino(),
+            "trial network isolation",
+        )
+    }
+
+    pub(super) fn trial_pid(&self, h: &Host) -> R<u32> {
+        let unit = self.unit.as_deref().ok_or("missing trial unit")?;
+        let pid = h
+            .out(
+                h.cmd("systemctl")
+                    .args(["show", unit, "-p", "MainPID", "--value"]),
+            )?
+            .parse::<u32>()?;
+        require(pid > 0, "trial has no MainPID")?;
+        Ok(pid)
+    }
+
+    /// Enter the running trial's socket, and `files` over their production
+    /// paths, through a mount namespace holder stopped with the trial.
+    pub(super) fn hold(
+        &mut self,
+        h: &Deployment,
+        name: &str,
+        files: &[(&Path, &Path)],
+    ) -> R<Vec<String>> {
+        let unit = fmt(format_args!("td-mta-holder-{}-{name}", self.point))?;
+        self.holder = Some(owned(&unit)?);
+        hold(h, &unit, &child(&self.runtime, "socket")?, files)
     }
 
     fn config_file(&self, h: &Host, name: &str, data: &[u8]) -> R<()> {
@@ -795,23 +855,13 @@ impl Recovery {
         }
     }
 
-    fn stop_copy(&mut self, h: &Host) -> R<()> {
+    pub(super) fn stop_copy(&mut self, h: &Host) -> R<()> {
+        if let Some(unit) = &self.holder {
+            stop_unit(h, unit)?;
+            self.holder = None;
+        }
         if let Some(unit) = &self.unit {
-            h.exec(
-                h.cmd("systemctl").arg("stop").arg(unit),
-                &[],
-                Duration::from_secs(50),
-                false,
-            )?;
-            let state = h.out(h.cmd("systemctl").arg("show").arg(unit).args([
-                "-p",
-                "ActiveState",
-                "--value",
-            ]))?;
-            require(
-                matches!(state.as_str(), "inactive" | "failed"),
-                "isolated PostgreSQL still running",
-            )?;
+            stop_unit(h, unit)?;
             self.unit = None;
         }
         Ok(())
@@ -820,7 +870,7 @@ impl Recovery {
     pub(super) fn close(&mut self, h: &Deployment) -> R<()> {
         let receiver = self.stop_receiver();
         self.stop_copy(&h.host)?;
-        for name in ["migration", "replay", "archive"] {
+        for name in ["migration", "replay", "transport", "archive"] {
             let path = child(&self.work, name)?;
             if path.try_exists()? {
                 fs::remove_dir_all(path)?;
@@ -829,6 +879,113 @@ impl Recovery {
         fs::remove_dir_all(&self.runtime)?;
         receiver
     }
+}
+
+pub(super) fn stop_unit(h: &Host, unit: &str) -> R<()> {
+    h.exec(
+        h.cmd("systemctl").arg("stop").arg(unit),
+        &[],
+        Duration::from_secs(50),
+        false,
+    )?;
+    let state =
+        h.out(
+            h.cmd("systemctl")
+                .arg("show")
+                .arg(unit)
+                .args(["-p", "ActiveState", "--value"]),
+        )?;
+    require(
+        matches!(state.as_str(), "inactive" | "failed"),
+        "isolated PostgreSQL or its holder still running",
+    )
+}
+
+// A pathname systemd's space- and colon-separated path properties carry intact.
+fn unit_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
+}
+
+fn same_inode(a: &Path, b: &Path) -> R<bool> {
+    let (a, b) = (fs::metadata(a)?, fs::metadata(b)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+/// Start `unit`, a root process with no other sandboxing in a mount namespace
+/// where `socket` is the production socket directory and each `(source,
+/// target)` file is bound read-only over its production path. Returns the
+/// prefix that runs a command there: native commands, root's psql and
+/// runuser then reach the trial with the production connection settings.
+/// The holder is bound to the job and must be stopped with its trial.
+pub(super) fn hold(
+    h: &Deployment,
+    unit: &str,
+    socket: &Path,
+    files: &[(&Path, &Path)],
+) -> R<Vec<String>> {
+    let job = h
+        .work
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or("invalid job name")?;
+    let text = |path: &Path| -> R<String> {
+        let text = path.to_str().ok_or("non-UTF8 holder path")?;
+        require(unit_path(text), "invalid holder path")?;
+        owned(text)
+    };
+    let mut command = h.host.cmd("systemd-run");
+    command
+        .args(["--quiet", "--collect"])
+        .arg(fmt(format_args!("--unit={unit}"))?)
+        .arg("--property=Type=exec")
+        .arg(fmt(format_args!(
+            "--property=BindsTo=td-mta-{job}.service"
+        ))?)
+        .arg(fmt(format_args!("--property=After=td-mta-{job}.service"))?)
+        .arg(fmt(format_args!(
+            "--property=BindPaths={}:{SOCKET_DIR}",
+            text(socket)?
+        ))?);
+    for (source, target) in files {
+        command.arg(fmt(format_args!(
+            "--property=BindReadOnlyPaths={}:{}",
+            text(source)?,
+            text(target)?
+        ))?);
+    }
+    command.args(["/usr/bin/sleep", "infinity"]);
+    h.host.run(&mut command)?;
+    let pid = h.pid(unit)?;
+    require(
+        fs::metadata(fmt(format_args!("/proc/{pid}/ns/mnt"))?)?.ino()
+            != fs::metadata("/proc/self/ns/mnt")?.ino(),
+        "holder mount namespace",
+    )?;
+    let root = |target: &Path| fmt(format_args!("/proc/{pid}/root{}", target.display()));
+    require(
+        same_inode(Path::new(&root(Path::new(SOCKET_DIR))?), socket)?,
+        "holder socket directory",
+    )?;
+    for (source, target) in files {
+        require(
+            same_inode(Path::new(&root(target)?), source)?,
+            "holder file binding",
+        )?;
+    }
+    let mut prefix = td_alloc::with_capacity(5)?;
+    for word in [
+        owned("nsenter")?,
+        owned("--target")?,
+        fmt(format_args!("{pid}"))?,
+        owned("--mount")?,
+        owned("--")?,
+    ] {
+        td_alloc::push(&mut prefix, word)?;
+    }
+    Ok(prefix)
 }
 
 fn trial_hba(standby: bool, scoped: bool) -> R<String> {
@@ -842,8 +999,8 @@ fn trial_hba(standby: bool, scoped: bool) -> R<String> {
     }
     td_alloc::push_str(
         &mut rules,
-        "hostssl td_mta td_mta_owner 127.0.0.1/32 scram-sha-256\n\
-         hostssl td_mta td_mta_runtime 127.0.0.1/32 scram-sha-256\n",
+        "local td_mta td_mta_owner scram-sha-256\n\
+         local td_mta td_mta_runtime scram-sha-256\n",
     )?;
     Ok(rules)
 }
@@ -903,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn trial_admin_only_listens_on_the_private_socket() -> R<()> {
+    fn trial_logins_use_scram_on_the_socket_and_admin_peer_only_privately() -> R<()> {
         assert_eq!(
             trial_hba(true, true)?,
             "local all setup_admin peer map=trial\n"
@@ -913,19 +1070,31 @@ mod tests {
             assert_eq!(
                 rules
                     .lines()
-                    .filter(|line| line.starts_with("hostssl "))
+                    .filter(|line| line.starts_with("local td_mta td_mta_")
+                        && line.ends_with(" scram-sha-256"))
                     .count(),
                 count
             );
             for line in rules.lines() {
                 assert!(
                     line == "local td_mta setup_admin peer map=trial"
-                        || line.ends_with(" 127.0.0.1/32 scram-sha-256")
+                        || line.ends_with(" scram-sha-256")
                 );
+                assert!(line.starts_with("local "));
             }
             assert_eq!(rules.contains("setup_admin"), scoped);
         }
         Ok(())
+    }
+
+    #[test]
+    fn holder_paths_are_absolute_and_free_of_unit_separators() {
+        for valid in ["/run/td-mta-recovery-ab12/socket", SOCKET_DIR, PG_DROPIN] {
+            assert!(unit_path(valid), "{valid}");
+        }
+        for invalid in ["relative", "/a b", "/a:b", "/a\\b", "/a\nb", ""] {
+            assert!(!unit_path(invalid), "{invalid}");
+        }
     }
 }
 

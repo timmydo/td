@@ -172,7 +172,7 @@ impl Host {
            .env_clear().env("HOME","/root").env("LANG","C").env("LC_ALL","C")
            .env("PATH","/opt/td-mta/postgresql/usr/lib/postgresql/17/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
            .env("LD_LIBRARY_PATH","/opt/td-mta/postgresql/usr/lib/x86_64-linux-gnu")
-           .env("PGSERVICEFILE","/var/lib/td-mta/backup-control/service.conf").env("PGCONNECT_TIMEOUT","3");
+           .env("PGCONNECT_TIMEOUT","3");
         cmd
     }
     pub fn deadline(&self, until: Option<Instant>) {

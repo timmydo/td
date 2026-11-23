@@ -15,8 +15,6 @@ mod install_mta_operations;
 mod install_mta_restore_engine;
 #[path = "install_mta_setup.rs"]
 mod install_mta_setup;
-#[path = "install_mta_tls.rs"]
-mod install_mta_tls;
 #[path = "install_mta_backup/restore_layout.rs"]
 pub(crate) mod restore_layout;
 const HELP: &str = "Usage: ./install-td-mta [--prefix PATH]
@@ -35,7 +33,6 @@ Database preparation and credentials remain explicit (td-mta/POSTGRES.md).
 --services-only uses the already installed executable without rebuilding.
 Use --setup-replica --help to provision a new read-only local account copy.
 Use --setup-local --help to provision a new private local PostgreSQL account.
-Use --postgres-tls-renew --help for local PostgreSQL leaf renewal.
 Use --operations-services --help to generate backup, health and notification schedules.
 Use --notifications-resolve --config-file PATH --message-id ID --outcome accepted|not-delivered
 to resolve an inspected uncertain delivery.
@@ -461,9 +458,6 @@ fn install(root: &Path, opts: &Options) -> Result<()> {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
-    if args.first().is_some_and(|v| v == "--postgres-tls-renew") {
-        return install_mta_tls::run(args.get(1..).unwrap_or_default());
-    }
     for (flag, mode) in [
         ("--notifications-monitor", "monitor"),
         ("--notifications-preview", "preview"),

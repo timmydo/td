@@ -1,7 +1,20 @@
 use super::*;
 
+pub(super) const OWNER_SERVICE: &str = "/var/lib/td-mta/backup-control/service.conf";
+pub(super) const CONTROL_SERVICE: &str = "/var/lib/td-mta-operator/physical-backup/service.conf";
+
+// A service login keeps its own primary group and gains only the socket group.
+// runuser would otherwise make the first supplementary group the primary one.
+fn database_member(cmd: &mut Command, user: &str) {
+    cmd.args(["-u", user, "-g", user, "-G", isolation::DB_GROUP]);
+}
+
 impl Deployment {
-    fn in_namespace(&self, ns: &[String], program: impl AsRef<std::ffi::OsStr>) -> Command {
+    pub(super) fn in_namespace(
+        &self,
+        ns: &[String],
+        program: impl AsRef<std::ffi::OsStr>,
+    ) -> Command {
         if let Some((head, rest)) = ns.split_first() {
             let mut cmd = self.host.cmd(head);
             cmd.args(rest).arg(program);
@@ -12,17 +25,18 @@ impl Deployment {
     }
 
     pub(crate) fn sql(&self, role: &str, query: &str, ns: &[String], script: bool) -> R<String> {
-        let service = match role {
-            "owner" => "service=td-mta-backup",
-            "marker" => "service=cutover_marker",
-            "replication" => "service=cutover_repl dbname=replication replication=true",
+        let (service, file) = match role {
+            "owner" => ("service=td-mta-backup", OWNER_SERVICE),
+            "marker" => ("service=cutover_marker", CONTROL_SERVICE),
+            "replication" => (
+                "service=cutover_repl dbname=replication replication=true",
+                CONTROL_SERVICE,
+            ),
             _ => return Err("unknown SQL role".into()),
         };
         let mut cmd = self.in_namespace(ns, child(Path::new(TOOLS), "psql")?);
-        cmd.args(["-XwqAt", "-v", "ON_ERROR_STOP=1", service]);
-        if role != "owner" {
-            cmd.env("PGSERVICEFILE", child(Path::new(CONTROL), "service.conf")?);
-        }
+        cmd.args(["-XwqAt", "-v", "ON_ERROR_STOP=1", service])
+            .env("PGSERVICEFILE", file);
         if script {
             let result =
                 self.host
@@ -35,7 +49,8 @@ impl Deployment {
 
     pub(crate) fn ready_db(&self, ns: &[String]) -> R<bool> {
         let mut cmd = self.in_namespace(ns, child(Path::new(TOOLS), "psql")?);
-        cmd.args(["-XwqAt", "service=td-mta-backup", "-c", "select 1"]);
+        cmd.args(["-XwqAt", "service=td-mta-backup", "-c", "select 1"])
+            .env("PGSERVICEFILE", OWNER_SERVICE);
         Ok(self
             .host
             .exec(&mut cmd, &[], Duration::from_secs(4), false)?
@@ -52,21 +67,21 @@ impl Deployment {
         login: Login<'_>,
     ) -> R<Command> {
         let mut cmd = self.in_namespace(ns, "runuser");
-        let (uid, file) = match login {
-            Login::Owner => (
-                "td-mta",
-                PathBuf::from("/var/lib/td-mta/mail/owner-connection"),
-            ),
-            Login::Runtime => (
-                "td-mta",
-                PathBuf::from("/var/lib/td-mta/mail/runtime-connection"),
-            ),
-            Login::Service(role) => (
-                isolation::role_user(role)?,
-                PathBuf::from(isolation::connection(role)?),
-            ),
+        let file = match login {
+            Login::Owner => {
+                cmd.args(["-u", "td-mta"]);
+                "/var/lib/td-mta/mail/owner-connection"
+            }
+            Login::Runtime => {
+                cmd.args(["-u", "td-mta"]);
+                "/var/lib/td-mta/mail/runtime-connection"
+            }
+            Login::Service(role) => {
+                database_member(&mut cmd, isolation::role_user(role)?);
+                isolation::connection(role)?
+            }
         };
-        cmd.args(["-u", uid, "--"])
+        cmd.arg("--")
             .arg(bin)
             .args(["postgres", op, "--connection-file"])
             .arg(file)
@@ -154,7 +169,7 @@ impl Deployment {
         Ok(())
     }
 
-    pub(super) fn pid(&self, unit: &str) -> R<u32> {
+    pub(crate) fn pid(&self, unit: &str) -> R<u32> {
         let pid = self
             .host
             .out(
@@ -199,7 +214,7 @@ impl Deployment {
             }
         }
         if self.isolated {
-            isolation::verify(&self.host, true)?;
+            isolation::verify(&self.host, true, self.tls)?;
         }
         for &role in PROFILES {
             let (uid, runtime) = if self.isolated {
@@ -229,30 +244,24 @@ impl Deployment {
         }
         let pid = self.pid(ACME)?;
         require(self.acme_online()?, "ACME listener")?;
-        let (user, connection) = if self.isolated {
-            (
-                isolation::role_user("acme")?,
-                isolation::connection("acme")?,
-            )
+        let mut status = self.host.cmd("runuser");
+        let connection = if self.isolated {
+            database_member(&mut status, isolation::role_user("acme")?);
+            isolation::connection("acme")?
         } else {
-            ("td-mta", "/var/lib/td-mta/mail/runtime-connection")
+            status.args(["-u", "td-mta"]);
+            "/var/lib/td-mta/mail/runtime-connection"
         };
-        self.host.run(
-            self.host
-                .cmd("runuser")
-                .args(["-u", user, "--"])
-                .arg(bin)
-                .args([
-                    "acme-status",
-                    "--connection-file",
-                    connection,
-                    "--certificate-profile",
-                    "production",
-                    "--require-ready",
-                    "--minimum-validity-seconds",
-                    "2592000",
-                ]),
-        )?;
+        self.host.run(status.arg("--").arg(bin).args([
+            "acme-status",
+            "--connection-file",
+            connection,
+            "--certificate-profile",
+            "production",
+            "--require-ready",
+            "--minimum-validity-seconds",
+            "2592000",
+        ]))?;
         require(self.pid(ACME)? == pid, "ACME changed")?;
         self.host.run(self.host.cmd("systemctl").args([
             "start",

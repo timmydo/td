@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::FileTypeExt;
 
 fn unit_names(list: &str, suffix: &str) -> R<Vec<String>> {
     let mut names = Vec::new();
@@ -59,50 +60,142 @@ fn install_condition(directory: &Path, filename: &str, content: &str) -> R<PathB
     Ok(path)
 }
 
-fn has_firewall(host: &Host, table: &str) -> R<bool> {
-    let tables = host.out(host.cmd("nft").args(["list", "tables"]))?;
-    Ok(tables
-        .lines()
-        .any(|line| line.split_ascii_whitespace().eq(["table", "inet", table])))
+pub(super) const PG_FENCE: &str = "/etc/td-mta/postgres-fence.conf";
+pub(super) const FENCE_SETTING: &str = "unix_socket_permissions = 0\n";
+pub(super) const SOCKET: &str = "/var/lib/td-mta-postgres/.s.PGSQL.35432";
+
+// The database writer fence. The included file is its durable state: a
+// PostgreSQL start while it exists creates the socket with mode 0000, which
+// only root (CAP_DAC_OVERRIDE) connects through. The live socket's mode is
+// the running server's half of the same fence.
+pub(super) trait SocketFence {
+    fn write_file(&mut self) -> R<()>;
+    fn remove_file(&mut self) -> R<()>;
+    fn set_mode(&mut self, mode: u32) -> R<()>;
 }
 
-fn firewall_command(host: &Host, table: &str, check: bool) -> R<Command> {
-    let rules = fmt(format_args!(
-        "create table inet {table}\n\
-         add chain inet {table} output {{ type filter hook output priority -10; policy accept; }}\n\
-         add rule inet {table} output ip daddr 127.0.0.1 tcp dport 35432 meta skuid != 0 reject with tcp reset\n"
-    ))?;
-    let mut cmd = host.cmd("nft");
-    if check {
-        cmd.arg("--check");
+// Persist the file before closing the live socket, so a restart between the
+// two steps still starts fenced.
+pub(super) fn close_socket(fence: &mut impl SocketFence) -> R<()> {
+    fence.write_file()?;
+    fence.set_mode(0)
+}
+
+// Remove the file before opening the live socket, so a restart between the
+// two steps starts open instead of closing it again.
+pub(super) fn open_socket(fence: &mut impl SocketFence) -> R<()> {
+    fence.remove_file()?;
+    fence.set_mode(0o660)
+}
+
+/// The root-owned 0755 directory of the fence file, created if `create`.
+/// PostgreSQL's include must reach into it, and nobody else may write it.
+pub(super) fn fence_directory(create: bool) -> R<&'static Path> {
+    let directory = parent(Path::new(PG_FENCE))?;
+    if create {
+        match fs::DirBuilder::new().mode(0o755).create(directory) {
+            Ok(()) => {
+                // The supervisor's umask would leave PostgreSQL unable to stat it.
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
+                sync_dir(parent(directory)?)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.into()),
+        }
     }
-    // nft reopens file input; the supervisor gives children a socket for stdin.
-    cmd.arg(rules);
-    Ok(cmd)
+    let meta = fs::symlink_metadata(directory)?;
+    require(
+        meta.is_dir() && meta.uid() == 0 && meta.gid() == 0 && meta.mode() & 0o7777 == 0o755,
+        "the PostgreSQL fence directory must be root-owned 0755",
+    )?;
+    Ok(directory)
 }
 
-fn drop_firewall(host: &Host, table: &str) -> R<()> {
-    host.run(host.cmd("nft").args(["delete", "table", "inet", table]))
+pub(super) struct LiveSocket<'a>(pub(super) &'a Host);
+
+impl SocketFence for LiveSocket<'_> {
+    fn write_file(&mut self) -> R<()> {
+        let path = Path::new(PG_FENCE);
+        let directory = fence_directory(true)?;
+        match create_file(path, 0o644) {
+            Ok(mut file) => {
+                file.set_permissions(fs::Permissions::from_mode(0o644))?;
+                file.write_all(FENCE_SETTING.as_bytes())?;
+                file.sync_all()?;
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::AlreadyExists) =>
+            {
+                let (file, meta) = td_fs::open_real_file(path, "PostgreSQL fence")?;
+                require(
+                    meta.uid() == 0 && meta.mode() & 0o7777 == 0o644,
+                    "conflicting PostgreSQL fence",
+                )?;
+                require(
+                    td_fs::read_bounded(path, 4096)? == FENCE_SETTING.as_bytes(),
+                    "conflicting PostgreSQL fence",
+                )?;
+                // The previous process may have died after writing, before fsync.
+                file.sync_all()?;
+            }
+            Err(error) => return Err(error),
+        }
+        sync_dir(directory)
+    }
+
+    fn remove_file(&mut self) -> R<()> {
+        let path = Path::new(PG_FENCE);
+        match fs::remove_file(path) {
+            Ok(()) => sync_dir(parent(path)?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // PostgreSQL removes its socket when it stops; the next start applies the
+    // file. The server account owns the socket, so the change runs with its
+    // credentials and a replaced pathname reaches nothing root alone could.
+    fn set_mode(&mut self, mode: u32) -> R<()> {
+        match fs::symlink_metadata(SOCKET) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+            Ok(meta) => require(meta.file_type().is_socket(), "unexpected PostgreSQL socket")?,
+        }
+        let host = self.0;
+        host.run(
+            host.cmd("runuser")
+                .args(["-u", "td-mta", "--", "chmod"])
+                .arg(fmt(format_args!("{mode:04o}"))?)
+                .args(["--", SOCKET]),
+        )?;
+        let meta = fs::symlink_metadata(SOCKET)?;
+        require(
+            meta.file_type().is_socket() && meta.mode() & 0o7777 == mode,
+            "PostgreSQL socket mode",
+        )
+    }
 }
 
 // The kernel may already have acted when a command loses its reply. Authorize
 // rewind only when both the database and service fences are still observable.
 fn open_writer_fences(
     admitting: &mut bool,
-    firewall: &mut bool,
+    database: &mut bool,
     fence: &Path,
-    delete: impl FnOnce() -> R<()>,
+    open: impl FnOnce() -> R<()>,
     observe: impl FnOnce() -> R<bool>,
 ) -> R<()> {
-    if *firewall {
+    if *database {
         *admitting = true;
-        if let Err(error) = delete() {
+        if let Err(error) = open() {
             if fence.try_exists()? && observe()? {
                 *admitting = false;
             }
             return Err(error);
         }
-        *firewall = false;
+        *database = false;
     }
     let previously_exposed = *admitting;
     *admitting = true;
@@ -111,19 +204,6 @@ fn open_writer_fences(
             *admitting = false;
         }
         return Err(error);
-    }
-    Ok(())
-}
-
-// If installation or deletion was interrupted, act on the rule still in the
-// kernel. A positive observation after a failed deletion keeps services shut.
-fn reconcile_firewall(observe: impl Fn() -> R<bool>, delete: impl FnOnce() -> R<()>) -> R<()> {
-    if observe()? {
-        if let Err(error) = delete() {
-            if observe()? {
-                return Err(error);
-            }
-        }
     }
     Ok(())
 }
@@ -167,8 +247,7 @@ impl Deployment {
     }
     pub(super) fn prepare_fence(&mut self, require_ready: bool, recovery: bool) -> R<()> {
         if recovery {
-            self.host
-                .run(&mut firewall_command(&self.host, &self.table, true)?)?;
+            self.socket_preflight()?;
         }
         self.timers = self.active_timers()?;
         require(
@@ -273,9 +352,8 @@ impl Deployment {
         }
         self.config(&self.previous, &[], !shared_rollback && self.isolated)?;
         if recovery {
-            let mut cmd = firewall_command(&self.host, &self.table, false)?;
-            self.firewall = true;
-            self.host.run(&mut cmd)?;
+            self.socket_fence = true;
+            close_socket(&mut LiveSocket(&self.host))?;
         }
         self.check_source()?;
         require(self.sql("owner","SELECT NOT EXISTS(SELECT FROM pg_stat_activity WHERE datname IS NOT NULL AND pid<>pg_backend_pid()),NOT EXISTS(SELECT FROM pg_prepared_xacts)",&[],false)?=="t|t","database writers")?;
@@ -294,15 +372,14 @@ impl Deployment {
         let operation = self.event("opening writers")?;
         self.host.remaining()?;
         let host = &self.host;
-        let table = &self.table;
         open_writer_fences(
             &mut self.admitting,
-            &mut self.firewall,
+            &mut self.socket_fence,
             Path::new(FENCE),
-            || drop_firewall(host, table),
+            || open_socket(&mut LiveSocket(host)),
             || {
                 host.recover();
-                has_firewall(host, table)
+                Ok(Path::new(PG_FENCE).try_exists()?)
             },
         )?;
         sync_dir(Path::new(OP))?;
@@ -353,14 +430,24 @@ impl Deployment {
         Ok(())
     }
 
-    pub(super) fn finish_admission(&mut self) -> R<()> {
-        if self.firewall {
-            reconcile_firewall(
-                || has_firewall(&self.host, &self.table),
-                || drop_firewall(&self.host, &self.table),
-            )?;
+    /// A restart inside the fence must have created the socket closed.
+    pub(super) fn fenced_start(&self) -> R<()> {
+        if !self.socket_fence {
+            return Ok(());
         }
-        self.firewall = false;
+        let meta = fs::symlink_metadata(SOCKET)?;
+        require(
+            meta.file_type().is_socket() && meta.mode() & 0o7777 == 0,
+            "PostgreSQL restarted inside the fence with an open socket",
+        )
+    }
+
+    pub(super) fn finish_admission(&mut self) -> R<()> {
+        // The file is the database fence's state; reopening is idempotent.
+        if self.socket_fence || Path::new(PG_FENCE).try_exists()? {
+            open_socket(&mut LiveSocket(&self.host))?;
+        }
+        self.socket_fence = false;
         if Path::new(FENCE).try_exists()? {
             require(
                 std::str::from_utf8(&td_fs::read_bounded(Path::new(FENCE), 4096)?)?.trim()
@@ -410,13 +497,14 @@ impl Deployment {
             self.host
                 .run(self.host.cmd("systemctl").args(["start", PG]))?;
             self.wait(25, "original primary restart", || self.ready_db(&[]))?;
+            // The next step opens the socket anyway; keep rolling back.
+            if self.fenced_start().is_err() {
+                set(&mut self.record, "rollback_socket_open", true.into())?;
+            }
         }
-        if self.firewall {
-            reconcile_firewall(
-                || has_firewall(&self.host, &self.table),
-                || drop_firewall(&self.host, &self.table),
-            )?;
-            self.firewall = false;
+        if self.socket_fence {
+            open_socket(&mut LiveSocket(&self.host))?;
+            self.socket_fence = false;
         }
         revert_partial_identity_install(&mut self.dropins_started, &mut self.isolated, || {
             isolation::rollback(&self.host)
@@ -481,23 +569,53 @@ fn failure_range(samples: &[(f64, bool)]) -> Option<(usize, usize)> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
-    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct Recorded {
+        steps: Vec<String>,
+        fail: Option<&'static str>,
+    }
+    impl Recorded {
+        fn step(&mut self, step: String) -> R<()> {
+            let failed = self.fail.is_some_and(|f| f == step);
+            self.steps.push(step);
+            if failed {
+                return Err("injected fault".into());
+            }
+            Ok(())
+        }
+    }
+    impl SocketFence for Recorded {
+        fn write_file(&mut self) -> R<()> {
+            self.step("write".into())
+        }
+        fn remove_file(&mut self) -> R<()> {
+            self.step("remove".into())
+        }
+        fn set_mode(&mut self, mode: u32) -> R<()> {
+            self.step(format!("chmod {mode:04o}"))
+        }
+    }
 
     #[test]
-    fn nft_checks_and_applies_the_same_batch_as_one_argument() {
-        let host = Host::default();
-        let batch = "create table inet td_mta_deploy_Ab12\n\
-                     add chain inet td_mta_deploy_Ab12 output { type filter hook output priority -10; policy accept; }\n\
-                     add rule inet td_mta_deploy_Ab12 output ip daddr 127.0.0.1 tcp dport 35432 meta skuid != 0 reject with tcp reset\n";
-        for check in [true, false] {
-            let cmd = firewall_command(&host, "td_mta_deploy_Ab12", check).unwrap();
-            let mut args = cmd.get_args().skip_while(|arg| *arg != "nft");
-            assert_eq!(args.next(), Some("nft".as_ref()));
-            if check {
-                assert_eq!(args.next(), Some("--check".as_ref()));
-            }
-            assert_eq!(args.next(), Some(batch.as_ref()));
-            assert_eq!(args.next(), None);
+    fn socket_fence_persists_before_closing_and_unlinks_before_opening() {
+        let mut fence = Recorded::default();
+        close_socket(&mut fence).unwrap();
+        open_socket(&mut fence).unwrap();
+        assert_eq!(fence.steps, ["write", "chmod 0000", "remove", "chmod 0660"]);
+        // A failed durable step never changes the live socket.
+        for (fail, close) in [("write", true), ("remove", false)] {
+            let mut fence = Recorded {
+                fail: Some(fail),
+                ..Recorded::default()
+            };
+            let result = if close {
+                close_socket(&mut fence)
+            } else {
+                open_socket(&mut fence)
+            };
+            assert!(result.is_err());
+            assert_eq!(fence.steps, [fail]);
         }
     }
 
@@ -515,16 +633,16 @@ mod tests {
                 fs::write(&fence, b"job").unwrap();
             }
             let mut opening = false;
-            let mut firewall = true;
+            let mut database = true;
             let result = open_writer_fences(
                 &mut opening,
-                &mut firewall,
+                &mut database,
                 &fence,
                 || Err("lost acknowledgement".into()),
                 || visible.ok_or_else(|| "observation failed".into()),
             );
             assert!(result.is_err());
-            assert!(firewall);
+            assert!(database);
             assert_eq!(opening, !(fenced && visible == Some(true)));
             assert_eq!(fence.exists(), fenced);
             if fenced {
@@ -539,18 +657,18 @@ mod tests {
         let fence = scratch.path().join("cannot-unlink");
         fs::create_dir(&fence).unwrap();
         for database_guard in [true, false] {
-            let mut firewall = database_guard;
+            let mut database = database_guard;
             let mut opening = false;
             assert!(open_writer_fences(
                 &mut opening,
-                &mut firewall,
+                &mut database,
                 &fence,
                 || Ok(()),
-                || panic!("acknowledged rule deletion")
+                || panic!("acknowledged socket reopening")
             )
             .is_err());
             assert_eq!(opening, database_guard);
-            assert!(!firewall);
+            assert!(!database);
         }
     }
 
@@ -569,24 +687,6 @@ mod tests {
         assert!(!started && !isolated);
         revert_partial_identity_install(&mut started, &mut isolated, || panic!("already restored"))
             .unwrap();
-    }
-
-    #[test]
-    fn reconcile_ambiguous_firewall_install_and_delete_from_actual_rules() {
-        for (before, after) in [(false, false), (true, false), (true, true)] {
-            let table = Cell::new(before);
-            let tried = Cell::new(false);
-            let result = reconcile_firewall(
-                || Ok(table.get()),
-                || {
-                    tried.set(true);
-                    table.set(after);
-                    Err("lost acknowledgement".into())
-                },
-            );
-            assert_eq!(result.is_err(), before && after);
-            assert_eq!(tried.get(), before);
-        }
     }
 
     #[test]

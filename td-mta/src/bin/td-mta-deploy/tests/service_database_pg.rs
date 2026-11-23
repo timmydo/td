@@ -7,7 +7,6 @@ use crate::{
 };
 use std::{
     fs,
-    net::TcpListener,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -21,25 +20,23 @@ const PLAN: &str = r#"{
     "acme":{"certificates":"SELECT, INSERT, UPDATE (der)"}
 }"#;
 
+const PORT: &str = "35432";
+
 struct Fixture {
     tools: PgTools,
-    port: String,
-    ca: PathBuf,
+    socket: PathBuf,
     admin: String,
 }
 
 impl Fixture {
     fn query(&self, database: &str, role: &str, password: &str, sql: &str) -> Command {
         let mut cmd = self.tools.cmd("psql");
-        cmd.env("PGHOST", "localhost")
-            .env("PGHOSTADDR", "127.0.0.1")
-            .env("PGSSLMODE", "verify-full")
-            .env("PGSSLROOTCERT", &self.ca)
+        cmd.env("PGHOST", &self.socket)
             .env("PGPASSWORD", password)
             .args([
                 "-XwqAt",
                 "-p",
-                &self.port,
+                PORT,
                 "-d",
                 database,
                 "-U",
@@ -79,8 +76,7 @@ fn denied(output: Output, expected: &str) {
 fn candidate_hba_preserves_metadata_and_other_rules_on_reapplication() -> R<()> {
     let root = td_fs::TempDir::new("mta-hba")?;
     let path = root.path().join("pg_hba.conf");
-    let original =
-        "hostssl all fixture_owner 127.0.0.1/32 scram-sha-256\nhost all all 127.0.0.1/32 reject\n";
+    let original = "local all fixture_owner scram-sha-256\nhost all all 127.0.0.1/32 reject\n";
     fs::write(&path, original)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
     let before = fs::metadata(&path)?;
@@ -107,7 +103,7 @@ fn conninfo_path(path: &Path) -> R<String> {
 }
 
 #[test]
-#[ignore = "requires PostgreSQL 17 tools, loopback TCP and a non-root process"]
+#[ignore = "requires PostgreSQL 17 tools as a non-root process"]
 fn real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants() -> R<()> {
     if fs::File::open("/dev/tty").is_ok() {
         // Keep production psql directly supervised. Interactive test runners
@@ -127,21 +123,19 @@ fn real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants() ->
     }
     let tools = PgTools::new()?;
     let psql = tools.bin.join("psql");
-    let temp = td_fs::TempDir::new("mta-scram")?;
+    // Keep the socket address below Linux's sockaddr_un limit.
+    let temp = td_fs::TempDir::new_in(Path::new("/tmp"), "mta-scram")?;
     let root = temp.path();
     let data = root.join("pgdata");
-    let pems = crate::tls_fixture::ServerPems::new("localhost")?;
     let passfile = root.join("pgpass");
     let initpass = root.join("initpass");
     let fixture = Fixture {
         tools,
-        port: TcpListener::bind(("127.0.0.1", 0))?
-            .local_addr()?
-            .port()
-            .to_string(),
-        ca: root.join("ca.pem"),
+        socket: root.join("s"),
         admin: random_hex(32)?,
     };
+    fs::create_dir(&fixture.socket)?;
+    fs::set_permissions(&fixture.socket, fs::Permissions::from_mode(0o750))?;
     fs::write(&initpass, &fixture.admin)?;
     fs::set_permissions(&initpass, fs::Permissions::from_mode(0o600))?;
     checked(
@@ -154,28 +148,26 @@ fn real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants() ->
             .arg(&initpass),
     )?;
     fs::remove_file(initpass)?;
-    fs::write(&fixture.ca, pems.root)?;
-    fs::write(data.join("server.crt"), pems.chain)?;
-    fs::write(data.join("server.key"), pems.key)?;
-    fs::set_permissions(data.join("server.key"), fs::Permissions::from_mode(0o600))?;
     let persistent = data.join("pg_hba.conf");
     fs::write(
         &persistent,
-        "hostssl all fixture_owner 127.0.0.1/32 scram-sha-256\nhost all all 127.0.0.1/32 reject\n",
+        "local all fixture_owner scram-sha-256\nhost all all 127.0.0.1/32 reject\n",
     )?;
     add_hba(&persistent)?;
     let overlay = root.join("candidate-hba");
     fs::write(&overlay, private_hba(&persistent)?)?;
     let _server = run(
         fixture.tools.cmd("postgres").arg("-D").arg(&data).args([
-            "-h",
-            "127.0.0.1",
             "-p",
-            &fixture.port,
+            PORT,
             "-c",
-            "unix_socket_directories=",
+            "listen_addresses=",
             "-c",
-            "ssl=on",
+            &format!("unix_socket_directories={}", fixture.socket.display()),
+            "-c",
+            "unix_socket_permissions=0660",
+            "-c",
+            "ssl=off",
             "-c",
             "log_statement=all",
             "-c",
@@ -183,7 +175,7 @@ fn real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants() ->
         ]),
         &root.join("server.log"),
     )?;
-    wait("TLS startup", || {
+    wait("socket startup", || {
         checked(&mut fixture.query("postgres", "fixture_owner", &fixture.admin, "SELECT 1")).is_ok()
     })?;
     checked(&mut fixture.query(
@@ -205,13 +197,17 @@ fn real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants() ->
     fs::write(
         &passfile,
         format!(
-            "localhost:{}:*:fixture_owner:{}\n",
-            fixture.port, fixture.admin
+            "{}:{PORT}:*:fixture_owner:{}\n",
+            fixture.socket.display(),
+            fixture.admin
         ),
     )?;
     fs::set_permissions(&passfile, fs::Permissions::from_mode(0o600))?;
-    let conn = format!("dbname=td_mta host=localhost hostaddr=127.0.0.1 sslmode=verify-full sslcertmode=disable port={} sslrootcert={} passfile={}",
-        fixture.port, conninfo_path(&fixture.ca)?, conninfo_path(&passfile)?);
+    let conn = format!(
+        "dbname=td_mta host={} port={PORT} passfile={}",
+        conninfo_path(&fixture.socket)?,
+        conninfo_path(&passfile)?
+    );
     let values = Passwords::new()?;
     let args = [
         "-Xwq",
@@ -277,12 +273,17 @@ fn real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants() ->
             assert!(query.status.success());
         }
     }
+    // Each login reaches only its own database through the socket.
     denied(
         fixture
-            .service(&values, "receive", "SELECT 1")?
-            .env("PGSSLMODE", "disable")
+            .query(
+                "postgres",
+                "td_mta_receive",
+                values.get("receive").ok_or("role")?,
+                "SELECT 1",
+            )
             .output()?,
-        "rejects connection",
+        "no pg_hba.conf entry",
     );
     checked(&mut fixture.service(
         &values,

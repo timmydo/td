@@ -17,6 +17,9 @@ fn accepts_only_exact_release_and_origin_fields() {
     assert!(parse(&["--s".into()]).is_err());
     assert!(parse(&["--skip-tests".into()]).unwrap().skip);
     assert!(parse(&["--window-seconds".into(), "0".into()]).is_err());
+    assert!(parse(&["--postgres-socket".into()]).unwrap().socket);
+    assert!(!parse(&[]).unwrap().socket);
+    assert!(parse(&["--postgres-socket".into(), "--skip-tests".into()]).is_err());
 }
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")

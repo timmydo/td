@@ -327,6 +327,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             ("--test", "postgres_probe", "real_postgres_executable_receives_and_serves_database_profiles"),
             ("--bin", "td-mta-deploy", "physical::postgres_test::real_postgres_backup_replays_to_exact_marker_without_later_mail"),
             ("--bin", "td-mta-deploy", "service_database::postgres_test::real_postgres_provisions_five_scram_roles_and_atomically_replaces_grants"),
+            ("--bin", "td-mta-deploy", "activate::transport::postgres_test::real_postgres_fence_file_and_live_mode_close_new_connections"),
         ] {
             let mut fixture = command("test", manifest);
             fixture

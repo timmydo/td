@@ -15,17 +15,19 @@ use td_json::Json;
 const REMOTE: &str = "timmy@172.179.0.6";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
-const HELP:&str="Usage: td-mta/deploy [--skip-tests] [--window-seconds 1..3600] [--jmap-account ACCOUNT]\nSelect a verified origin/main revision and deploy it to claw1.";
+const HELP:&str="Usage: td-mta/deploy [--skip-tests] [--window-seconds 1..3600] [--jmap-account ACCOUNT]\n       td-mta/deploy --postgres-socket [--window-seconds 1..3600] [--jmap-account ACCOUNT]\nSelect a verified origin/main revision and deploy it to claw1, or move the\nlive release's database from loopback TLS to its private socket.";
 struct Options<'a> {
     skip: bool,
     budget: u64,
     account: &'a str,
+    socket: bool,
 }
 fn parse(args: &[String]) -> R<Options<'_>> {
     let mut out = Options {
         skip: false,
         budget: 60,
         account: "xyz882015",
+        socket: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -39,9 +41,14 @@ fn parse(args: &[String]) -> R<Options<'_>> {
                 )?;
             }
             "--jmap-account" => out.account = it.next().ok_or("missing JMAP account")?,
+            "--postgres-socket" => out.socket = true,
             _ => return Err(HELP.into()),
         }
     }
+    require(
+        !(out.socket && out.skip),
+        "--postgres-socket keeps the live release and selects no revision",
+    )?;
     Ok(out)
 }
 fn revision(value: &str) -> R<&str> {
@@ -451,7 +458,15 @@ pub(super) fn run(args: &[String]) -> R<()> {
         Some(p) => PathBuf::from(p),
         None => child(&home, ".local/state/td/main-integration")?,
     };
-    let (selected, verdict) = local.select(&tip, live, opts.skip, &child(&base, "verdicts")?)?;
+    let (selected, verdict) = if opts.socket {
+        require(
+            local.is_ancestor(live, &tip)?,
+            "live release is not an ancestor of advertised main",
+        )?;
+        (owned(live)?, None)
+    } else {
+        local.select(&tip, live, opts.skip, &child(&base, "verdicts")?)?
+    };
     let tree = local.host.out(
         local
             .git()
@@ -509,6 +524,9 @@ pub(super) fn run(args: &[String]) -> R<()> {
         set(&mut spec, k, Json::Str(owned(v)?))?;
     }
     set(&mut spec, "skip_tests", Json::Bool(opts.skip))?;
+    if opts.socket {
+        set(&mut spec, "mode", Json::Str(owned("postgres-socket")?))?;
+    }
     set(&mut spec, "budget", Json::from(opts.budget))?;
     set(&mut spec, "verdict", verdict.map_or(Json::Null, Json::Str))?;
     local.save(&fmt(format_args!("{job}/job.json"))?, &spec)?;
@@ -542,7 +560,11 @@ pub(super) fn run(args: &[String]) -> R<()> {
             "--property=KillMode=mixed",
             &working,
             &program,
-            "--activate",
+            if opts.socket {
+                "--postgres-socket"
+            } else {
+                "--activate"
+            },
         ])?
         .stdin(Stdio::null())
         .status()?;

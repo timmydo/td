@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use td_json::Json;
 
-const NOTIFICATION_LIMIT: usize = 3 * 1024 * 1024;
+pub(crate) const NOTIFICATION_LIMIT: usize = 3 * 1024 * 1024;
 const JOURNAL_SIZE: usize = 96;
 #[path = "isolation_path_sys.rs"]
 mod path_sys;
@@ -256,13 +256,7 @@ fn inaccessible(path: &Path) -> R<()> {
 pub(super) fn check_dac(base: &Path, role: &Role, account: Account, forbidden: &[&str]) -> R<()> {
     let home = child(base, role.name)?;
     private_entry(&home, account, true)?;
-    for (leaf, dir) in [
-        ("runtime-connection", false),
-        ("tls", true),
-        ("tls/ca.pem", false),
-    ] {
-        private_entry(&child(&home, leaf)?, account, dir)?;
-    }
+    private_entry(&child(&home, "runtime-connection")?, account, false)?;
     if role.name != "acme" {
         let profile = child(&home, role.name)?;
         for path in [
@@ -288,8 +282,6 @@ const FORBIDDEN: &[&str] = &[
     "/var/lib/td-mta/mail/runtime-connection",
     "/var/lib/td-mta/mail/runtime-password",
     "/var/lib/td-mta/mail/postgres",
-    "/var/lib/td-mta/mail/tls/ca.key",
-    "/var/lib/td-mta/mail/tls/server.key",
     "/var/lib/td-mta/mail/.operations/notifications",
     "/var/lib/td-mta/backup-control/service.conf",
     "/var/lib/td-mta/backups/scheduled",

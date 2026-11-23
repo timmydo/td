@@ -31,6 +31,8 @@ points here.
 | Installed maintenance helper | `/opt/td-mta/bin/td-mta-operator` |
 | Mail state root | `/var/lib/td-mta/mail` |
 | Private PostgreSQL connection files | `/var/lib/td-mta/mail/runtime-connection`, `/var/lib/td-mta/mail/owner-connection` |
+| PostgreSQL socket directory | `/var/lib/td-mta-postgres` (`td-mta:td-mta-db` 0750) |
+| Database writer fence (present only while fenced) | `/etc/td-mta/postgres-fence.conf` |
 | Per-profile readiness and diagnostics | `/var/lib/td-mta/mail/PROFILE/runtime` |
 | System service definitions | `/etc/systemd/system/td-mta-*.service` |
 | Root-owned deployment receipts and diagnostics | `/var/lib/td-mta-operator/` |
@@ -94,11 +96,18 @@ delayed mail from that provider mean its traffic, or one of its users, has
 reached the limit. The bounds are fixed constants, so raising them is a code
 change (DESIGN.md section 9).
 
-`td-mta-postgres.service` separately runs PostgreSQL 17 on loopback port 35432.
-Its cluster is `/var/lib/td-mta/mail/postgres`, its configuration is
+`td-mta-postgres.service` separately runs PostgreSQL 17 on the private Unix
+socket `/var/lib/td-mta-postgres/.s.PGSQL.35432`, with no TCP listener and
+no TLS. The socket is `td-mta:td-mta-db` mode 0660 in a 0750 directory;
+PostgreSQL runs as `td-mta` and joins the memberless system group
+`td-mta-db` through its `90-td-mta-socket.conf` drop-in, so it can give the
+socket that group. Each login authenticates with SCRAM. Its cluster is
+`/var/lib/td-mta/mail/postgres`, its configuration is
 `/var/lib/td-mta/mail/postgresql.conf`, and its retained binaries are under
-`/opt/td-mta/postgresql/usr/lib/postgresql/17/bin`. An MTA binary update does
-not require restarting or replacing PostgreSQL.
+`/opt/td-mta/postgresql/usr/lib/postgresql/17/bin`. The configuration ends
+by including `/etc/td-mta/postgres-fence.conf` if it exists; only a
+deployment writes that file, while it holds the writer fence. An MTA binary
+update does not require restarting or replacing PostgreSQL.
 
 ### Search planner setting
 
@@ -156,9 +165,10 @@ prefix before touching the live installation.
 
 Public certificates renew through `td-mta-acme-production.service`, without
 certbot. Leave public TCP 80 reachable for HTTP-01 renewal, as well as SMTP 25
-and HTTPS 443. The private PostgreSQL TLS material has a separate generated
-`td-mta-maint-postgres-tls-renew.timer`. Certificate management and software
-updates are independent.
+and HTTPS 443. The database has no certificate to renew: the private socket
+cutover disabled and removed the former
+`td-mta-maint-postgres-tls-renew.timer` and its service. Certificate
+management and software updates are independent.
 
 Scheduled backups use `td-mta-maint-backup.timer`, retaining at most seven
 archives within a 4 GiB total bound and a 1 GiB per-archive bound. These bounds
@@ -435,18 +445,17 @@ their existing policy.
 Use the PostgreSQL 17 client binaries alongside the installed server.
 Place the private base, WAL spool and isolated trial on the recovery
 volume under `/data`. The live cluster uses an external configuration
-file and TLS material; retain those separately and give the trial its
-own configuration. Budget space for two cluster copies and the WAL spool
+file; retain it separately and give the trial its own configuration and
+socket directory. Budget space for two cluster copies and the WAL spool
 before each window.
 
 For physical backup access, provision a dedicated `LOGIN REPLICATION
 NOSUPERUSER` PostgreSQL role with a private SCRAM credential. Restrict
-its HBA entry to `hostssl replication`, that role and the loopback client
-address. Reload HBA and verify a replication connection using
-`sslmode=verify-full`, the configured CA, the server certificate name as
-`host`, and `hostaddr=127.0.0.1`. The mode-0600 passfile entry names that
-host, the PostgreSQL port, `replication` and the backup role. Keep the credential with
-the backup operator. The streaming procedure uses no permanent replication
+its HBA entry to `local replication` and that role. Reload HBA and verify
+a replication connection whose libpq service names
+`host=/var/lib/td-mta-postgres` and `port=35432`. The mode-0600 passfile
+entry names that directory as its host, the PostgreSQL port, `replication`
+and the backup role. Keep the credential with the backup operator. The streaming procedure uses no permanent replication
 slot and requires no change to `archive_mode`.
 
 Stage both binaries, the migration commands and the comparison queries.
@@ -918,23 +927,30 @@ A recognized pending migration or a change to required runtime grants
 also needs the private PostgreSQL profiles and comparison SQL described
 in the online recovery procedure. The deployment takes a fresh verified
 base, rehearses the candidate on an independent writable copy inside a
-private network namespace, and proves archive replay on another copy.
+private network namespace on its own socket directory, and proves
+archive replay on another copy. The controller reaches each trial through
+a holder: a transient unit whose mount namespace shows the trial's socket
+directory at `/var/lib/td-mta-postgres`, so the production connection
+files and libpq services reach the trial and nothing else changes.
 
 The default forward activation budget is 60 seconds. On expiry the job
 restores service and records the observed outage. Recovery and clean
 PostgreSQL shutdown can extend the interruption beyond the budget. Use
 `./td-mta/deploy --window-seconds N` to set it for an invocation.
 The job records the active timers and conditions the mail and scheduled
-writer services on a durable deployment fence. During schema cutover a
-temporary nftables output rule reserves the loopback database connection
-for the root operator. Before pausing mail the job validates the complete
-firewall batch with `nft --check`. It applies the same batch atomically
-after stopping the writers. It verifies the named restore point and selected
+writer services on a durable deployment fence. During schema cutover the
+job also closes the database to everyone but root after stopping the
+writers: it writes and syncs `/etc/td-mta/postgres-fence.conf`
+(`unix_socket_permissions = 0`), then sets the live socket to mode 0000.
+Root still connects; `td-mta` and the service accounts cannot. A PostgreSQL
+restart while the file exists creates the socket closed. Admission removes
+the file first, then sets the socket back to 0660. A start after an
+interrupted step therefore follows the file, which is the fence's state. It verifies the named restore point and selected
 mail evidence before attempting DDL. A preseeded, primary-device copy
 is synchronized by content after clean PostgreSQL shutdown. Budget
 space for this additional data directory and time to read both copies.
 The actual upgrade and runtime checks use the candidate data directory
-on private loopback. The original shut-down primary remains in the private
+on its own trial socket. The original shut-down primary remains in the private
 job directory. Before writer admission a failed migration can reopen that
 original cluster and binary. Once admission begins the job preserves the
 selected database, including accepted mail, for operator recovery.
@@ -999,8 +1015,11 @@ next monitor and digest invocation use the new settings.
    admission. Their profile names and single-role assignments must match
    this roster. ACME uses its own database login. The controller repeats
    the checks on
-   the final cold copy. The installed HBA uses verified loopback TLS and
-   SCRAM. The local setup-admin peer rule exists only on the private copies.
+   the final cold copy. The installed HBA admits each login only on the
+   private socket, by SCRAM, and each service unit's identity drop-in adds
+   the `td-mta-db` group that reaches the socket. Readiness jobs never
+   connect and keep no supplementary group. The local setup-admin peer
+   rule exists only on the private copies.
 2. With writers fenced, the controller installs the systemd identity
    drop-ins and verifies effective accounts and filesystem permissions.
    After opening writers it checks all five database sessions, listener
@@ -1054,7 +1073,10 @@ On claw1 the root-only libpq service file is
 `/var/lib/td-mta-operator/physical-backup/service.conf`. Its
 `cutover_repl` profile uses `td_mta_cutover_backup` and `repl.pass`.
 The ordinary `cutover_marker` profile uses `td_mta_cutover_marker`,
-`marker.pass` and the `postgres` database. Both use verified loopback TLS.
+`marker.pass` and the `postgres` database. Both name
+`host=/var/lib/td-mta-postgres` and `port=35432`, and their passfile
+entries name that directory as the host. The controller passes each
+service file to `psql` explicitly through `PGSERVICEFILE`.
 The same operator directory supplies `compare-selected.sql`, a bounded
 read-only transaction producing deterministic rows for schema, epoch,
 selected configuration, sampled emails, recipients and body chunks.
@@ -1062,5 +1084,172 @@ The backup volume directory is `/data/td-mta-physical-recovery`, root:root
 0700 on the separate data disk. The owner login uses the scheduled backup
 libpq profile in `/var/lib/td-mta/backup-control/service.conf`.
 The host uses its installed PostgreSQL 17 tools, systemd,
-nftables, rsync with --fsync, tar, util-linux and the native build
+rsync with --fsync, tar, util-linux and the native build
 toolchain. Database passwords stay in protected files on claw1.
+
+### Move PostgreSQL to the private socket
+
+Before this change the production database listened on loopback TCP
+35432 with verified TLS. The current controller manages only the private
+socket and refuses any other operation on a host still using loopback
+TLS, saying so. Move a host once with the fenced transport cutover.
+
+The live release must admit a group-shared PostgreSQL socket
+(`td_fs::check_server_socket`, which td-mta's Unix endpoint calls). An
+older release refuses the socket, and the cutover's rehearsal fails
+before anything in production changes. If the live release is older,
+first deploy a current release with a controller from before this change,
+then run the cutover from the current checkout:
+
+```text
+./td-mta/deploy --postgres-socket
+```
+
+The job keeps the live release; it accepts `--window-seconds` and
+`--jmap-account` as for a deployment. The launcher records the
+`postgres-socket` operation in `job.json`, and the controller refuses a
+job whose recorded operation differs from the one it was asked to run. A
+second run on a host already on the socket first finishes retiring the
+loopback TLS units and material, as below, if a failed cutover left any,
+then verifies health and reports `already on the private socket`.
+
+Before the window, check on the host that the owner and runtime
+connection passwords use only letters, digits, `-`, `.`, `_` and `~`
+(the forms the socket URI carries verbatim; provisioned passwords are
+hexadecimal), and that `/etc/td-mta`, if it exists, is root-owned mode
+0755: the server configuration includes the fence file there, so it must
+stay so afterwards.
+
+Unfenced, the controller checks the release and primary as for an
+activation, creates the system group `td-mta-db` if it is missing
+(nonzero, unique and memberless), creates or verifies `/etc/td-mta`
+(root-owned 0755), creates the empty socket directory
+`/var/lib/td-mta-postgres` (`td-mta:td-mta-db` 0750) that no
+configuration yet names, and stages each new file in
+`postgres-socket/staged/` under the job directory with the owner, group
+and mode of the file it replaces:
+
+- `postgresql.conf` without its listen, TLS and socket settings, ending
+  with `listen_addresses = ''`, `ssl = off`, the socket directory,
+  `unix_socket_group = 'td-mta-db'`, `unix_socket_permissions = 0660` and
+  the fence include. An include or another `ssl_*` setting is refused.
+- `pg_hba.conf` with each `hostssl DB USER 127.0.0.1/32 scram-sha-256`
+  rule rewritten in place as `local DB USER scram-sha-256` (DB is
+  `td_mta`, `replication`, `postgres` or `all`). TCP `reject` rules stay;
+  a socket rule must already use SCRAM or `reject`; anything else is
+  refused.
+- The owner and runtime connection files and, if isolated, each service's
+  `runtime-connection`, as
+  `postgresql://USER:PASSWORD@:35432/td_mta?host=%2Fvar%2Flib%2Ftd-mta-postgres`
+  with the same credentials.
+- Both libpq service files and every passfile they name: `host` becomes
+  the socket directory, `hostaddr` and the TLS settings go, and passfile
+  entries name the socket directory as their host.
+- The `td-mta-postgres.service.d/90-td-mta-socket.conf` drop-in
+  (`SupplementaryGroups=td-mta-db`), the service identity drop-ins with
+  that group if the services are isolated, and the aggregate health
+  drop-in without its two database certificate checks.
+
+It refuses if any other loaded `td-mta-*` unit's command names a
+`/var/lib/td-mta*/.../tls` path, such as a generated certificate expiry
+check of the database leaf, or a `--*connection-file` outside the files
+above, and if a notification configuration's `connection` is another
+file: such a job would fail once the transport moves. Remove or
+regenerate it first.
+
+It then takes a fresh online base backup through the existing TLS
+service and starts a trial from it with the staged configuration on its
+own socket directory, with no network. Through a holder that also binds
+each staged connection, service and passfile read-only over its
+production path, it requires: readiness, an owner query and a
+replication `IDENTIFY_SYSTEM` as root; the owner, runtime and, if
+isolated, every service login through the live release exactly as
+activations check them; the staged settings as `postgres -C` reports
+them; a `td-mta:td-mta-db` 0660 socket in a 0750 directory; and no TCP
+listener in the trial's network namespace. The trial and holder stop and
+the copy and its base backup are removed. Any failure up to here leaves
+production as it was, apart from the group and `/etc/td-mta`, and
+removes the socket directory again. The trial runs with production's
+memory settings beside the live server; schedule the window when the
+host has that much memory free.
+
+The controller then fences the writers as an activation does, writes the
+database fence file, stops PostgreSQL and requires a clean shutdown. It
+checks that every file is unchanged since staging, saves each original
+in `postgres-socket/original/` with its metadata, installs the staged
+files atomically and starts PostgreSQL. It requires the socket closed
+(mode 0000), root's checks through it, an empty `listen_addresses`,
+`ssl` off and no listener on TCP 35432. It opens the socket, starts the
+services and the recorded timers except the renewal timer, and verifies
+the live release, every login and health as after an activation. Only
+then it runs `systemctl disable --now` on
+`td-mta-maint-postgres-tls-renew.timer` and its service, which also
+removes the links the operations installer's printed commands made. It
+moves the unit files that installer generated under
+`PREFIX/share/td-mta/services` (the `.service`, `.timer` and `.scm`) into
+`postgres-socket/retired/units/`, removes any link left to them, reloads
+systemd and requires both units to be gone. A renewal unit file found
+anywhere else was not td-mta's: the job leaves it in place and records
+it as `renewal_units_left`. Finally it moves `/var/lib/td-mta/mail/tls`
+and each service's `tls` directory into `postgres-socket/retired/`. The
+receipt records the staged files, the originals, the group, the renewal
+timer, the retired and left unit files and the moved material.
+
+Verify the receipt's `verified private socket transport` and `retired
+loopback TLS` events, then:
+
+```text
+sudo ls -l /var/lib/td-mta-postgres
+sudo ss -ltnp 'sport = :35432'
+systemctl show td-mta-frontend.service -p SupplementaryGroups
+sudo -u td-mta /opt/td-mta/bin/td-mta postgres runtime-check \
+  --connection-file /var/lib/td-mta/mail/runtime-connection
+```
+
+The listing shows `.s.PGSQL.35432` as `srw-rw---- td-mta td-mta-db`,
+`ss` prints nothing, and each isolated service shows `td-mta-db`. Repeat
+the service login checks of the isolation section with `runuser -u
+td-mta-ROLE -g td-mta-ROLE -G td-mta-db`, and the public SMTP and JMAP
+checks.
+
+A failure before writer admission is reversed automatically: PostgreSQL
+stops, every original file and setting returns, the new drop-in is
+removed, PostgreSQL starts on loopback TLS, the fence is removed and the
+services are verified; the receipt records `transport restored`. After
+admission the job recovers forward and keeps the socket. To return to
+loopback TLS later, fence the writers by hand, stop PostgreSQL, copy each
+file in `postgres-socket/original/` back over its path with its owner,
+group and mode, remove `90-td-mta-socket.conf`, move the retired `tls`
+directories back, copy the files in `postgres-socket/retired/units/`
+back to the paths `renewal_units_retired` records, run `systemctl
+daemon-reload`, start PostgreSQL, `systemctl link` the service and
+`systemctl enable --now` the timer by those paths, and use a controller
+from before this change.
+Check the certificates' validity first: nothing renews them meanwhile.
+
+If the receipt's `renewal_units_left` is not empty, remove those files
+and run `systemctl daemon-reload` after the rollback window; td-mta's
+tooling did not install them. Renewal unit files the operations
+installer generated but nobody ever linked are not loaded, so the job
+cannot find them: delete any `td-mta-maint-postgres-tls-renew.*` left
+under the operations prefix's `share/td-mta/services`. Keep the job
+directory, its originals and the retired TLS material, including the CA
+key, through that window; delete them only after the operator accepts
+the cutover.
+
+If the controller itself dies mid-cutover (killed, power loss), every
+later mode refuses on the deployment fence or the stale socket fence
+file. Recover by hand from the receipt: if it lacks `private socket
+installed`, stop PostgreSQL, copy each file in
+`postgres-socket/original/` back with its owner, group and mode (if that
+directory is absent nothing was installed: skip the copy and the
+removal), remove every installed file the receipt's `socket_files` lists
+that has no original (the new drop-ins), run `systemctl daemon-reload`,
+remove `/etc/td-mta/postgres-fence.conf`, start PostgreSQL and confirm
+it listens on loopback TLS again; otherwise the socket is live, so
+remove the fence file and run `sudo -u td-mta chmod 0660
+/var/lib/td-mta-postgres/.s.PGSQL.35432`. Then, as for any interrupted
+job above, remove `/var/lib/td-mta-operator/deployment-fence` (the
+services' start condition), start the services and timers the receipt
+recorded, require health, and run `--postgres-socket` again; on the
+socket it finishes the retirement.

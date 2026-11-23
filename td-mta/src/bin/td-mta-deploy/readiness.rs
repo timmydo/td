@@ -7,10 +7,21 @@ use td_json::Json;
 
 const HEALTH: &str = "td-mta-health.service";
 const HEALTH_CHECKS: &str = include_str!("units/zz-readiness-jobs.conf");
+// The aggregate while PostgreSQL used loopback TLS: only the private socket
+// cutover expects and replaces it.
+const HEALTH_CHECKS_TLS: &str = include_str!("units/zz-readiness-jobs.tls.conf");
 const UNIT_DIR: &str = "/etc/systemd/system";
 const BUS_PATH: &str = "/org/freedesktop/systemd1/unit/td_2dmta_2dhealth_2eservice";
 
-pub(crate) fn settings(dir: &Path) -> R<Vec<Setting>> {
+fn checks(tls: bool) -> &'static str {
+    if tls {
+        HEALTH_CHECKS_TLS
+    } else {
+        HEALTH_CHECKS
+    }
+}
+
+pub(crate) fn settings(dir: &Path, tls: bool) -> R<Vec<Setting>> {
     let mut list = Vec::new();
     for role in crate::activate::PROFILES {
         let name = fmt(format_args!("td-mta-maint-mail-{role}"))?;
@@ -31,7 +42,7 @@ pub(crate) fn settings(dir: &Path) -> R<Vec<Setting>> {
         &mut list,
         Setting {
             path: child(dir, "td-mta-health.service.d/zz-readiness-jobs.conf")?,
-            text: owned(HEALTH_CHECKS)?,
+            text: owned(checks(tls))?,
             mode: 0o644,
         },
     )?;
@@ -80,12 +91,12 @@ fn arguments<'a>(row: &'a Json, expected_flags: &[&str]) -> R<&'a [Json]> {
 
 // ExecStart= resets the whole list. Compare systemd's parsed argv and flags
 // before publishing it so a host-local check cannot silently disappear.
-fn check_commands(property: &Json, allow_old_sockets: bool) -> R<()> {
+fn check_commands(property: &Json, allow_old_sockets: bool, expected: &str) -> R<()> {
     let rows = property
         .get("data")
         .and_then(Json::as_arr)
         .ok_or("missing ExecStartEx")?;
-    let mut retained = HEALTH_CHECKS
+    let mut retained = expected
         .lines()
         .filter_map(|l| l.strip_prefix("ExecStart="))
         .filter(|l| !l.is_empty());
@@ -149,8 +160,12 @@ fn check_job(property: &Json, role: &str) -> R<()> {
     )
 }
 
-fn qualify(host: &Host) -> R<()> {
-    check_commands(&command_property(host, HEALTH, BUS_PATH)?, false)?;
+fn qualify(host: &Host, tls: bool) -> R<()> {
+    check_commands(
+        &command_property(host, HEALTH, BUS_PATH)?,
+        false,
+        checks(tls),
+    )?;
     for role in crate::activate::PROFILES {
         let unit = fmt(format_args!("td-mta-maint-mail-{role}.service"))?;
         let path = fmt(format_args!(
@@ -171,24 +186,35 @@ fn qualify(host: &Host) -> R<()> {
     Ok(())
 }
 
-pub(crate) fn prepare(host: &Host) -> R<()> {
+/// The production aggregate health drop-in of one transport layout.
+pub(crate) fn aggregate(tls: bool) -> R<Setting> {
+    settings(Path::new(UNIT_DIR), tls)?
+        .pop()
+        .ok_or_else(|| "missing aggregate health setting".into())
+}
+
+pub(crate) fn prepare(host: &Host, tls: bool) -> R<()> {
     let mut missing = Vec::new();
-    for file in settings(Path::new(UNIT_DIR))? {
+    for file in settings(Path::new(UNIT_DIR), tls)? {
         if !files::present(&file)? {
             td_alloc::push(&mut missing, file)?;
         }
     }
     host.run(host.cmd("systemctl").arg("daemon-reload"))?;
     if missing.is_empty() {
-        return qualify(host);
+        return qualify(host, tls);
     }
-    check_commands(&command_property(host, HEALTH, BUS_PATH)?, true)?;
+    check_commands(
+        &command_property(host, HEALTH, BUS_PATH)?,
+        true,
+        checks(tls),
+    )?;
     let mut created = td_alloc::with_capacity(missing.len())?;
     let result = files::install_tracking(host, &missing, |file| {
         Ok(td_alloc::push(&mut created, file)?)
     })
     .and_then(|()| host.run(host.cmd("systemctl").arg("daemon-reload")))
-    .and_then(|()| qualify(host));
+    .and_then(|()| qualify(host, tls));
     if result.is_err() {
         let recovery = Host::default();
         recovery.recover();

@@ -3,7 +3,7 @@
 use crate::{
     common::{child, digest, durable, fmt, free_bytes, owned, require, set, Host},
     isolation,
-    physical::{Recovery, CONTROL, GIB, MAIL, PGDATA, SYSTEM, TOOLS},
+    physical::{Recovery, GIB, MAIL, PGDATA, SYSTEM, TOOLS},
     probes::Probes,
     service_database::{self, Passwords, ROLES},
     R,
@@ -25,6 +25,8 @@ mod database;
 mod fence;
 #[path = "activation_release.rs"]
 mod release;
+#[path = "activation_transport.rs"]
+mod transport;
 
 const OP: &str = "/var/lib/td-mta-operator";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases";
@@ -156,9 +158,9 @@ pub(super) struct Deployment {
     fence_owned: bool,
     admitting: bool,
     pg_stopped: bool,
-    firewall: bool,
+    socket_fence: bool,
+    tls: bool,
     dropins_started: bool,
-    table: String,
     cold: PathBuf,
     original: PathBuf,
 }
@@ -171,7 +173,14 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "claw1 operator identity",
     )?;
     let work = std::env::current_dir()?;
-    let mut deployment = Deployment::new(host, work, job)?;
+    // Settings of the loopback TLS layout differ from those this controller
+    // installs, so only the transport cutover may run against it.
+    let tls = transport::loopback_tls()?;
+    require(
+        !tls || mode == "postgres-socket",
+        "PostgreSQL still uses loopback TLS: run td-mta/deploy --postgres-socket",
+    )?;
+    let mut deployment = Deployment::new(host, work, job, tls)?;
     if mode == "refresh-notifications" {
         require(
             deployment.isolated && !Path::new(FENCE).try_exists()?,
@@ -188,7 +197,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
             "shared service identities are already selected",
         )?;
     }
-    if mode == "activate" {
+    if matches!(mode, "activate" | "postgres-socket") {
         // Reserve the first activation receipt under the host lock. A repeated
         // invocation must leave the original event and recovery evidence intact.
         start_receipt(&deployment.receipt, &deployment.record)?;
@@ -196,6 +205,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
     let result = match mode {
         "restore-shared-services" => deployment.restore_shared_services(),
         "activate" => deployment.execute(),
+        "postgres-socket" => deployment.postgres_socket(),
         _ => Err("unknown deployment operation".into()),
     };
     if let Err(ref err) = result {
@@ -210,7 +220,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
 }
 
 impl Deployment {
-    fn new(host: Host, work: PathBuf, mut job: Json) -> R<Self> {
+    fn new(host: Host, work: PathBuf, mut job: Json, tls: bool) -> R<Self> {
         let basename = name(&work)?;
         require(
             work.parent() == Some(Path::new(OP)) && numbered_name(basename, "deploy-"),
@@ -232,19 +242,22 @@ impl Deployment {
         set(&mut job, "status", "preflight".into())?;
         set(&mut job, "started", now()?.into())?;
         set(&mut job, "events", Json::Arr(Vec::new()))?;
-        let suffix = basename.strip_prefix("deploy-").ok_or("job name")?;
+        let isolated = if tls {
+            isolation::installed_tls()?
+        } else {
+            isolation::installed()?
+        };
         Ok(Self {
             host,
             previous,
             candidate,
             budget: Duration::from_secs(seconds),
             record: job,
-            table: fmt(format_args!("td_mta_deploy_{suffix}"))?,
             cold: child(&work, "candidate-pgdata")?,
             original: child(&work, "original-pgdata")?,
             receipt: child(&work, "receipt.json")?,
             work,
-            isolated: isolation::installed()?,
+            isolated,
             isolation_change: false,
             plan: None,
             old_version: 0,
@@ -259,7 +272,8 @@ impl Deployment {
             fence_owned: false,
             admitting: false,
             pg_stopped: false,
-            firewall: false,
+            socket_fence: false,
+            tls,
             dropins_started: false,
         })
     }
@@ -309,7 +323,8 @@ impl Deployment {
             "production release changed",
         )?;
         self.check_source()?;
-        crate::readiness::prepare(&self.host)?;
+        self.socket_preflight()?;
+        crate::readiness::prepare(&self.host, false)?;
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
@@ -440,7 +455,7 @@ impl Deployment {
             self.dropins_started = true;
             isolation::install(&self.host)?;
             self.isolated = true;
-            isolation::verify(&self.host, false)?;
+            isolation::verify(&self.host, false, self.tls)?;
         }
         self.switch(&self.candidate)?;
         self.admit()?;

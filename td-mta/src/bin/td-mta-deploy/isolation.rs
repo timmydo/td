@@ -18,6 +18,7 @@ mod scoped;
 mod tests;
 
 pub(crate) const NOTIFY: &str = "/var/lib/td-mta/mail/.operations/notifications";
+pub(crate) use scoped::NOTIFICATION_LIMIT;
 const BASE: &str = "/var/lib/td-mta-services";
 const MAIL: &str = "/var/lib/td-mta/mail";
 const BIN: &str = "/opt/td-mta/bin/td-mta";
@@ -83,6 +84,11 @@ pub(crate) fn backup_files() -> R<Vec<PathBuf>> {
 
 pub(crate) fn installed() -> R<bool> {
     files::installed(&files::production()?)
+}
+
+/// The identity settings as they were while PostgreSQL used loopback TLS.
+pub(crate) fn installed_tls() -> R<bool> {
+    files::installed(&files::production_tls()?)
 }
 
 pub(crate) fn install(host: &Host) -> R<()> {
@@ -266,24 +272,77 @@ fn read_legacy(host: &Host, name: &str, limit: usize) -> R<Vec<u8>> {
     Ok(out.stdout)
 }
 
-fn authority(uri: &str) -> R<&str> {
-    let (secret, remainder) = uri
-        .trim()
-        .strip_prefix("postgresql://td_mta_runtime:")
-        .and_then(|s| s.split_once('@'))
-        .ok_or("unexpected production runtime connection")?;
+pub(crate) const DB_GROUP: &str = "td-mta-db";
+const SOCKET_QUERY: &str = "@:35432/td_mta?host=%2Fvar%2Flib%2Ftd-mta-postgres";
+
+// A password the URI carries verbatim: RFC 3986 unreserved characters only,
+// which every provisioned hex password is.
+fn uri_password(s: &str) -> bool {
+    (1..=128).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+}
+
+/// The one private-socket connection URI the controller writes for `user`.
+pub(crate) fn socket_uri(user: &str, password: &str) -> R<String> {
+    require(uri_password(password), "invalid database password")?;
+    fmt(format_args!("postgresql://{user}:{password}{SOCKET_QUERY}"))
+}
+
+/// The password of an exact private-socket connection URI for `user`.
+pub(crate) fn socket_password<'a>(uri: &'a str, user: &str) -> R<&'a str> {
+    let password = uri
+        .strip_prefix("postgresql://")
+        .and_then(|s| s.strip_prefix(user))
+        .and_then(|s| s.strip_prefix(':'))
+        .and_then(|s| s.strip_suffix(SOCKET_QUERY))
+        .ok_or("unexpected private socket connection")?;
     require(
-        !secret.is_empty() && !secret.bytes().any(|b| b.is_ascii_whitespace() || b == b'/'),
-        "unexpected runtime password syntax",
+        uri_password(password),
+        "unexpected database password syntax",
     )?;
-    let host = remainder
-        .strip_suffix("/td_mta?sslmode=verify-full&sslrootcert=/var/lib/td-mta/mail/tls/ca.pem")
-        .ok_or("unexpected production TLS settings")?;
+    Ok(password)
+}
+
+/// The memberless system group whose members may reach the shared socket.
+pub(crate) fn db_group(host: &Host, create: bool) -> R<u32> {
+    let lookup = || {
+        host.exec(
+            host.cmd("getent").args(["group", DB_GROUP]),
+            &[],
+            Duration::from_secs(10),
+            false,
+        )
+    };
+    let mut found = lookup()?;
+    if create && found.status.code() == Some(2) {
+        host.run(host.cmd("groupadd").args(["--system", DB_GROUP]))?;
+        found = lookup()?;
+    }
+    require(found.status.success(), "missing PostgreSQL socket group")?;
+    let row = std::str::from_utf8(&found.stdout)?.trim_end();
+    let mut fields = row.split(':');
+    require(fields.next() == Some(DB_GROUP), "invalid socket group")?;
+    let gid: u32 = fields.nth(1).ok_or("missing socket group id")?.parse()?;
     require(
-        matches!(host, "localhost:35432" | "127.0.0.1:35432"),
-        "unexpected database address",
+        gid != 0 && fields.next() == Some("") && fields.next().is_none(),
+        "socket group must be a memberless nonzero group",
     )?;
-    Ok(host)
+    let groups = host.out(host.cmd("getent").arg("group"))?;
+    require(
+        groups
+            .lines()
+            .filter(|l| l.split(':').nth(2).and_then(|g| g.parse::<u32>().ok()) == Some(gid))
+            .count()
+            == 1,
+        "shared socket group id",
+    )?;
+    let all = host.out(host.cmd("getent").arg("passwd"))?;
+    for entry in all.lines() {
+        let (_, ids, _, _) = passwd_ids(entry)?;
+        require(ids.gid != gid, "socket group is an account's primary group")?;
+    }
+    Ok(gid)
 }
 
 fn make_directory(path: &Path, mode: u32) -> R<()> {
@@ -307,27 +366,23 @@ fn private_file(path: &Path, contents: &[u8], account: Account) -> R<()> {
 
 // Construct and chown the new tree behind an unopened root-only directory.
 // Once published, only the service user descends into it.
-fn prepare(base: &Path, role: &Role, account: Account, uri: &[u8], ca: &[u8]) -> R<()> {
+fn prepare(base: &Path, role: &Role, account: Account, uri: &[u8]) -> R<()> {
     let home = child(base, role.name)?;
     if matches!(fs::symlink_metadata(&home), Err(e) if e.kind() == ErrorKind::NotFound) {
         let private = td_fs::TempDir::new_in(base, ".identity")?;
         let stage = child(private.path(), role.name)?;
-        let tls = child(&stage, "tls")?;
         let profile = child(&stage, role.name)?;
         let runtime = child(&profile, "runtime")?;
         let scratch = child(&profile, "scratch")?;
-        for dir in [&stage, &tls] {
-            make_directory(dir, 0o700)?;
-        }
+        make_directory(&stage, 0o700)?;
         if role.name != "acme" {
             for dir in [&profile, &runtime, &scratch] {
                 make_directory(dir, 0o700)?;
             }
         }
         private_file(&child(&stage, "runtime-connection")?, uri, account)?;
-        private_file(&child(&tls, "ca.pem")?, ca, account)?;
-        for dir in [&scratch, &runtime, &profile, &tls, &stage] {
-            if role.name == "acme" && dir != &tls && dir != &stage {
+        for dir in [&scratch, &runtime, &profile, &stage] {
+            if role.name == "acme" && dir != &stage {
                 continue;
             }
             chown(dir, Some(account.uid), Some(account.gid))?;
@@ -367,39 +422,24 @@ pub(crate) fn provision(host: &Host, passwords: &Passwords) -> R<()> {
     )?;
     let accounts = accounts(host, true)?;
     let legacy = read_legacy(host, "runtime-connection", 16384)?;
-    let server = authority(std::str::from_utf8(&legacy)?)?;
-    let ca = read_legacy(host, "tls/ca.pem", 128 * 1024)?;
-    let pem = std::str::from_utf8(&ca)?;
-    require(
-        pem.contains("-----BEGIN CERTIFICATE-----") && !pem.contains("PRIVATE KEY"),
-        "unexpected database CA",
+    let legacy = std::str::from_utf8(&legacy)?;
+    socket_password(
+        legacy.strip_suffix('\n').unwrap_or(legacy),
+        "td_mta_runtime",
     )?;
     prepare_notifications(host)?;
     for (role, account) in accounts {
         let pass = passwords
             .get(role.name)
             .ok_or("missing isolated password")?;
-        require(
-            pass.len() == 64
-                && pass
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "invalid isolated password",
+        let uri = socket_uri(&fmt(format_args!("td_mta_{}", role.name))?, pass)?;
+        prepare(base, role, account, uri.as_bytes())?;
+        host.exec(
+            as_user(host, role.user, "cmp").args(["-s", role.connection, "-"]),
+            uri.as_bytes(),
+            Duration::from_secs(10),
+            true,
         )?;
-        let uri = fmt(format_args!("postgresql://td_mta_{}:{pass}@{server}/td_mta?sslmode=verify-full&sslrootcert={BASE}/{}/tls/ca.pem",role.name,role.name))?;
-        prepare(base, role, account, uri.as_bytes(), &ca)?;
-        let cert = fmt(format_args!("{BASE}/{}/tls/ca.pem", role.name))?;
-        for (path, bytes) in [
-            (role.connection, uri.as_bytes()),
-            (cert.as_str(), ca.as_slice()),
-        ] {
-            host.exec(
-                as_user(host, role.user, "cmp").args(["-s", path, "-"]),
-                bytes,
-                Duration::from_secs(10),
-                true,
-            )?;
-        }
     }
     Ok(())
 }
@@ -434,7 +474,9 @@ fn status_field<'a>(status: &'a str, field: &str) -> R<&'a str> {
         .ok_or("missing process credential field".into())
 }
 
-fn verify_live(host: &Host, role: &Role, account: Account) -> R<()> {
+// `db` is the socket group's id once the services reach PostgreSQL through
+// the shared socket, and None on the loopback TLS layout.
+fn verify_live(host: &Host, role: &Role, account: Account, db: Option<u32>) -> R<()> {
     let pid: u32 = host
         .out(
             host.cmd("systemctl")
@@ -444,20 +486,20 @@ fn verify_live(host: &Host, role: &Role, account: Account) -> R<()> {
     require(pid > 1, "missing running service")?;
     let proc = PathBuf::from(fmt(format_args!("/proc/{pid}"))?);
     let status = fs::read_to_string(child(&proc, "status")?)?;
-    for (field, id) in [
-        ("Uid", account.uid),
-        ("Gid", account.gid),
-        ("Groups", account.gid),
-    ] {
+    for (field, id) in [("Uid", account.uid), ("Gid", account.gid)] {
         let fields = status_field(&status, field)?;
         require(
-            (field == "Groups" || fields.split_whitespace().count() == 4)
+            fields.split_whitespace().count() == 4
                 && fields
                     .split_whitespace()
                     .all(|v| v.parse::<u32>() == Ok(id)),
             "unexpected live uid or gid",
         )?;
     }
+    require(
+        live_groups(status_field(&status, "Groups")?, account.gid, db)?,
+        "unexpected live supplementary groups",
+    )?;
     require(
         status_field(&status, "NoNewPrivs")? == "1",
         "live service allows new privileges",
@@ -477,8 +519,33 @@ fn verify_live(host: &Host, role: &Role, account: Account) -> R<()> {
     )
 }
 
-pub(crate) fn verify(host: &Host, live: bool) -> R<()> {
-    require(installed()?, "isolated unit settings missing")?;
+// With a socket group, a live service's groups are exactly its own and that
+// group. On the loopback TLS layout every listed group is its own.
+fn live_groups(groups: &str, own: u32, db: Option<u32>) -> R<bool> {
+    let (mut seen_own, mut seen_db) = (false, false);
+    for value in groups.split_whitespace() {
+        let id = value.parse::<u32>()?;
+        if id == own {
+            seen_own = true;
+        } else if Some(id) == db {
+            seen_db = true;
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(db.is_none() || (seen_own && seen_db))
+}
+
+/// `tls` selects the settings of the loopback TLS layout, which only the
+/// private socket cutover still meets.
+pub(crate) fn verify(host: &Host, live: bool, tls: bool) -> R<()> {
+    let settings = if tls { installed_tls()? } else { installed()? };
+    require(settings, "isolated unit settings missing")?;
+    let db = if tls {
+        None
+    } else {
+        Some(db_group(host, false)?)
+    };
     for (role, account) in accounts(host, false)? {
         verify_unit(host, role.unit, role.user)?;
         if role.name != "acme" {
@@ -498,7 +565,7 @@ pub(crate) fn verify(host: &Host, live: bool) -> R<()> {
         }
         run_helper(host, role.user, &["check-dac", role.name], &[])?;
         if live {
-            verify_live(host, role, account)?;
+            verify_live(host, role, account, db)?;
         }
     }
     Ok(())

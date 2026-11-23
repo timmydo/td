@@ -14,6 +14,7 @@ fn checks(rows: &[Json], legacy: bool) -> bool {
     check_commands(
         &Json::Obj(vec![("data".into(), Json::Arr(rows.to_vec()))]),
         legacy,
+        HEALTH_CHECKS,
     )
     .is_ok()
 }
@@ -43,9 +44,31 @@ fn aggregate_preserves_effective_commands_and_refuses_drift() {
 }
 
 #[test]
+fn loopback_tls_checks_are_expected_only_by_the_transport_cutover() {
+    let rows = |text: &str| -> Vec<Json> {
+        text.lines()
+            .filter_map(|s| s.strip_prefix("ExecStart="))
+            .filter(|s| !s.is_empty())
+            .map(command)
+            .collect()
+    };
+    let data = |rows: Vec<Json>| Json::Obj(vec![("data".into(), Json::Arr(rows))]);
+    assert!(!HEALTH_CHECKS.contains("openssl"));
+    assert!(check_commands(&data(rows(HEALTH_CHECKS_TLS)), false, HEALTH_CHECKS_TLS).is_ok());
+    assert!(check_commands(&data(rows(HEALTH_CHECKS_TLS)), false, HEALTH_CHECKS).is_err());
+    assert!(check_commands(&data(rows(HEALTH_CHECKS)), false, HEALTH_CHECKS_TLS).is_err());
+    let (tls, socket) = (aggregate(true).unwrap(), aggregate(false).unwrap());
+    assert_eq!(tls.path, socket.path);
+    assert_eq!(
+        (tls.text.as_str(), socket.text.as_str()),
+        (HEALTH_CHECKS_TLS, HEALTH_CHECKS)
+    );
+}
+
+#[test]
 fn four_ordered_readiness_jobs_survive_identity_rollback() {
     let root = Path::new("/etc/systemd/system");
-    let permanent = settings(root).unwrap();
+    let permanent = settings(root, false).unwrap();
     let reversible = crate::isolation::backup_files().unwrap();
     assert!(permanent.iter().all(|s| !reversible.contains(&s.path)));
     let (aggregate, jobs) = permanent.split_last().unwrap();

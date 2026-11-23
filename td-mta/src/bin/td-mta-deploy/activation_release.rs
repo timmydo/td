@@ -295,7 +295,7 @@ impl Deployment {
         outcome
     }
 
-    fn control_state(&self, data: &Path) -> R<String> {
+    pub(super) fn control_state(&self, data: &Path) -> R<String> {
         let info = self.host.out(
             self.host
                 .cmd(child(Path::new(TOOLS), "pg_controldata")?)
@@ -329,6 +329,11 @@ impl Deployment {
             service_database::add_hba(&child(&self.cold, "pg_hba.conf")?)?;
         }
         let unit = fmt(format_args!("td-mta-{}-candidate-db", name(&self.work)?))?;
+        let holder = fmt(format_args!(
+            "td-mta-{}-candidate-holder",
+            name(&self.work)?
+        ))?;
+        let socket = child(&copy.runtime, "socket")?;
         let trial = (|| -> R<()> {
             let job = fmt(format_args!("td-mta-{}.service", name(&self.work)?))?;
             let mut cmd = self.host.cmd("systemd-run");
@@ -348,35 +353,45 @@ impl Deployment {
                     "--property=KillSignal=SIGINT",
                 ])
                 .arg(fmt(format_args!(
+                    "--property=SupplementaryGroups={}",
+                    isolation::DB_GROUP
+                ))?)
+                .arg(fmt(format_args!(
                     "--property=BindPaths={}:{PGDATA}",
                     self.cold.display()
                 ))?)
-                .arg(fmt(format_args!("--property=ReadWritePaths={PGDATA}"))?);
-            if self.has_service_grants() {
-                cmd.arg(fmt(format_args!(
-                    "--property=ReadWritePaths={}/socket",
-                    copy.runtime.display()
+                .arg(fmt(format_args!("--property=ReadWritePaths={PGDATA}"))?)
+                .arg(fmt(format_args!(
+                    "--property=ReadWritePaths={}",
+                    socket.display()
                 ))?);
-            }
+            // Command-line settings override the production file and its
+            // fence include: the candidate serves only its own trial socket.
             cmd.arg(child(Path::new(TOOLS), "postgres")?)
                 .args(["-D", PGDATA, "-c"])
                 .arg(fmt(format_args!("config_file={MAIL}/postgresql.conf"))?)
                 .arg("-c")
                 .arg(fmt(format_args!("data_directory={PGDATA}"))?)
-                .args(["-c", "archive_mode=off", "-c", "primary_conninfo="]);
+                .args(["-c", "archive_mode=off", "-c", "primary_conninfo="])
+                .args(["-c", "listen_addresses=", "-c", "ssl=off"])
+                .arg("-c")
+                .arg(fmt(format_args!(
+                    "unix_socket_directories={}",
+                    socket.display()
+                ))?)
+                .arg("-c")
+                .arg(fmt(format_args!(
+                    "unix_socket_group={}",
+                    isolation::DB_GROUP
+                ))?)
+                .args(["-c", "unix_socket_permissions=0660"]);
             if self.has_service_grants() {
-                for (setting, file) in [
-                    ("unix_socket_directories", "socket"),
-                    ("hba_file", "admin-hba"),
-                    ("ident_file", "admin-ident"),
-                ] {
+                for (setting, file) in [("hba_file", "admin-hba"), ("ident_file", "admin-ident")] {
                     cmd.arg("-c").arg(fmt(format_args!(
                         "{setting}={}/{file}",
                         copy.runtime.display()
                     ))?);
                 }
-            } else {
-                cmd.args(["-c", "unix_socket_directories="]);
             }
             self.host.run(&mut cmd)?;
             let pid = self.pid(&unit)?;
@@ -385,13 +400,7 @@ impl Deployment {
                     != fs::metadata("/proc/self/ns/net")?.ino(),
                 "candidate database namespace",
             )?;
-            let ns = [
-                owned("nsenter")?,
-                owned("--target")?,
-                fmt(format_args!("{pid}"))?,
-                owned("--net")?,
-                owned("--")?,
-            ];
+            let ns = crate::physical::hold(self, &holder, &socket, &[])?;
             self.wait(15, "private candidate database startup", || {
                 self.ready_db(&ns)
             })?;
@@ -400,6 +409,7 @@ impl Deployment {
         })();
         let cleanup = Host::default();
         cleanup.recover();
+        let stop_holder = crate::physical::stop_unit(&cleanup, &holder);
         let stop = cleanup.exec(
             cleanup.cmd("systemctl").args(["stop", &unit]),
             &[],
@@ -407,6 +417,7 @@ impl Deployment {
             false,
         );
         trial?;
+        stop_holder?;
         stop?;
         require(
             self.control_state(&self.cold)? == "shut down",
@@ -418,6 +429,7 @@ impl Deployment {
         self.host
             .run(self.host.cmd("systemctl").args(["start", PG]))?;
         self.wait(15, "candidate database startup", || self.ready_db(&[]))?;
+        self.fenced_start()?;
         self.check_source()?;
         let target = uint(
             self.plan.as_ref().ok_or("missing migration plan")?,
