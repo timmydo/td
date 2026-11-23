@@ -13,6 +13,7 @@ mod readiness;
 mod service_database;
 #[path = "../../signal_sys.rs"]
 mod signal_sys;
+mod target;
 #[cfg(test)]
 #[path = "tests/tls_fixture.rs"]
 mod tls_fixture;

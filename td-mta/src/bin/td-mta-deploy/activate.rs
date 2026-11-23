@@ -6,6 +6,7 @@ use crate::{
     physical::{Recovery, GIB, MAIL, PGDATA, SYSTEM},
     probes::Probes,
     service_database::{self, Passwords, ROLES},
+    target::HostConfig,
     R,
 };
 use std::{
@@ -154,6 +155,7 @@ pub(super) struct Deployment {
     epoch: String,
     selected: String,
     passwords: Option<Passwords>,
+    builder: release::Builder,
     probes: Probes,
     timers: Vec<String>,
     drops: Vec<PathBuf>,
@@ -171,10 +173,11 @@ pub(super) struct Deployment {
 
 pub(super) fn run(job: Json, mode: &str) -> R<()> {
     let host = Host::default();
+    let config = HostConfig::load()?;
     require(
-        fs::read_to_string("/proc/sys/kernel/hostname")?.trim() == "claw1"
+        fs::read_to_string("/proc/sys/kernel/hostname")?.trim() == config.host_name
             && host.out(host.cmd("id").arg("-u"))? == "0",
-        "claw1 operator identity",
+        "the controller must run as root on the host host.json's host_name names",
     )?;
     let work = std::env::current_dir()?;
     // Settings of the loopback TLS layout differ from those this controller
@@ -185,7 +188,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "PostgreSQL still uses loopback TLS: run td-mta/deploy --postgres-socket",
     )?;
     host.select_tools(binaries::selected()?);
-    let mut deployment = Deployment::new(host, work, job, tls)?;
+    let mut deployment = Deployment::new(host, work, job, tls, &config)?;
     if mode == "refresh-notifications" {
         require(
             deployment.isolated && !Path::new(FENCE).try_exists()?,
@@ -226,7 +229,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
 }
 
 impl Deployment {
-    fn new(host: Host, work: PathBuf, mut job: Json, tls: bool) -> R<Self> {
+    fn new(host: Host, work: PathBuf, mut job: Json, tls: bool, config: &HostConfig) -> R<Self> {
         let basename = name(&work)?;
         require(
             work.parent() == Some(Path::new(OP)) && numbered_name(basename, "deploy-"),
@@ -270,7 +273,8 @@ impl Deployment {
             epoch: String::new(),
             selected: String::new(),
             passwords: None,
-            probes: Probes::new()?,
+            builder: release::Builder::new(config)?,
+            probes: Probes::new(&config.public_name)?,
             timers: Vec::new(),
             drops: Vec::new(),
             record_listeners: false,
@@ -334,9 +338,10 @@ impl Deployment {
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
+        // Before the build: host.json's public_name must verify now.
+        self.probes.probe("smtp")?;
+        self.probes.probe("jmap")?;
         if self.previous == self.candidate {
-            self.probes.probe("smtp")?;
-            self.probes.probe("jmap")?;
             self.event("already deployed and healthy")?;
             return Ok(());
         }

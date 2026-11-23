@@ -6,18 +6,53 @@ use std::{
     process::Stdio,
 };
 
-const BUILD_USER: &str = "timmy";
-const BUILD_ROOT: &str = "/home/timmy/.local/state/td-mta-candidates";
-const MIRROR: &str = "/home/timmy/src/td";
 const COPY_LIMIT: u64 = 512 * 1024 * 1024;
 const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// The unprivileged account host.json names to build candidates, with its
+/// source mirror and candidate directory at fixed places in its home.
+pub(super) struct Builder {
+    account: String,
+    home: PathBuf,
+    root: PathBuf,
+    mirror: PathBuf,
+    home_env: String,
+    path_env: String,
+}
+
+impl Builder {
+    pub(super) fn new(config: &HostConfig) -> R<Self> {
+        let home = PathBuf::from(owned(&config.build_home)?);
+        Ok(Self {
+            account: owned(&config.build_account)?,
+            root: child(&home, ".local/state/td-mta-candidates")?,
+            mirror: config.mirror()?,
+            home_env: fmt(format_args!("HOME={}", config.build_home))?,
+            path_env: fmt(format_args!(
+                "PATH={}/.cargo/bin:{SAFE_PATH}",
+                config.build_home
+            ))?,
+            home,
+        })
+    }
+}
+
 impl Deployment {
     fn build_command(&self) -> Command {
+        let b = &self.builder;
         let mut cmd = self.host.cmd("/usr/sbin/runuser");
-        cmd.env_clear().env("PATH", SAFE_PATH).env("LANG", "C").env("LC_ALL", "C")
-            .args(["-u", BUILD_USER, "--", "/usr/bin/env", "HOME=/home/timmy",
-                "PATH=/home/timmy/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]);
+        cmd.env_clear()
+            .env("PATH", SAFE_PATH)
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .args([
+                "-u",
+                &b.account,
+                "--",
+                "/usr/bin/env",
+                &b.home_env,
+                &b.path_env,
+            ]);
         cmd
     }
 
@@ -36,22 +71,40 @@ impl Deployment {
             )?;
             return set(&mut self.record, "binary_sha256", Json::Str(hash));
         }
+        let b = &self.builder;
+        let uid = self
+            .host
+            .out(self.host.cmd("id").args(["-u", "--", &b.account]))?;
+        let home = fs::metadata(&b.home)?;
+        // The built release path is compared after `readlink -e`, so a
+        // symlinked component of the candidate directory (below the home
+        // or in it) would fail only once the build had run.
+        require(
+            home.is_dir()
+                && uid
+                    .parse::<u32>()
+                    .ok()
+                    .is_some_and(|u| u != 0 && u == home.uid())
+                && fs::canonicalize(&b.root).is_ok_and(|p| p == b.root),
+            "build_home must be an unprivileged build_account's directory, with no symbolic link to its candidate directory",
+        )?;
         let prefix = PathBuf::from(
             self.host.out(
                 self.build_command()
                     .args(["mktemp", "-d"])
-                    .arg(child(Path::new(BUILD_ROOT), "deploy-XXXXXXXX")?),
+                    .arg(child(&b.root, "deploy-XXXXXXXX")?),
             )?,
         );
         require(
-            prefix.parent() == Some(Path::new(BUILD_ROOT))
-                && numbered_name(name(&prefix)?, "deploy-"),
+            prefix.parent() == Some(b.root.as_path()) && numbered_name(name(&prefix)?, "deploy-"),
             "unrecognized build directory",
         )?;
         let source = child(&prefix, "src")?;
         let checkout = self.host.run(
             self.build_command()
-                .args(["git", "-C", MIRROR, "worktree", "add", "--detach"])
+                .args(["git", "-C"])
+                .arg(&b.mirror)
+                .args(["worktree", "add", "--detach"])
                 .arg(&source)
                 .arg(revision),
         );
@@ -64,7 +117,9 @@ impl Deployment {
             clean = cleanup
                 .exec(
                     self.build_command()
-                        .args(["git", "-C", MIRROR, "worktree", "remove", "--force"])
+                        .args(["git", "-C"])
+                        .arg(&b.mirror)
+                        .args(["worktree", "remove", "--force"])
                         .arg(&source),
                     &[],
                     Duration::from_secs(120),
@@ -473,6 +528,26 @@ fn release_member(entry: &str) -> R<(u8, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_build_account_and_its_paths_come_from_host_json() -> R<()> {
+        let config = HostConfig::parse(
+            br#"{"host_name":"mx1","build_account":"alice","build_home":"/home/alice","public_name":"mx.example.org"}"#,
+        )?;
+        let b = Builder::new(&config)?;
+        assert_eq!(b.account, "alice");
+        assert_eq!(b.home, Path::new("/home/alice"));
+        assert_eq!(b.mirror, Path::new("/home/alice/src/td"));
+        assert_eq!(
+            b.root,
+            Path::new("/home/alice/.local/state/td-mta-candidates")
+        );
+        assert_eq!(b.home_env, "HOME=/home/alice");
+        assert_eq!(
+            b.path_env,
+            ["PATH=/home/alice/.cargo/bin:", SAFE_PATH].concat()
+        );
+        Ok(())
+    }
     #[test]
     fn release_inventory_only_admits_normal_relative_files_and_directories() {
         for valid in ["dnotices", "fnotices/LICENSE", "ftd-mta"] {

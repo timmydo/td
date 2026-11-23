@@ -20,6 +20,18 @@ fn accepts_only_exact_release_and_origin_fields() {
     assert!(parse(&["--postgres-socket".into()]).unwrap().socket);
     assert!(!parse(&[]).unwrap().socket);
     assert!(parse(&["--postgres-socket".into(), "--skip-tests".into()]).is_err());
+    let defaults = parse(&[]).unwrap();
+    assert_eq!((defaults.account, defaults.config), (None, None));
+    let args = [
+        "--jmap-account".into(),
+        "alice".into(),
+        "--config".into(),
+        "/home/alice/target.json".into(),
+    ];
+    let chosen = parse(&args).unwrap();
+    assert_eq!(chosen.account, Some("alice"));
+    assert_eq!(chosen.config, Some("/home/alice/target.json"));
+    assert!(parse(&["--config".into()]).is_err());
 }
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -64,6 +76,7 @@ fn selected_release_requires_passing_first_parent_and_live_ancestry_even_with_ov
     let local = Local {
         host: Host::default(),
         root: root.into(),
+        destination: "alice@192.0.2.10".into(),
         key: PathBuf::new(),
     };
     fs::write(verdicts.join(&side), "pass 0 1 2\n").unwrap();
@@ -109,6 +122,7 @@ fn fetches_only_advertised_main_and_requires_an_already_submitted_controller() {
     let local = Local {
         host: Host::default(),
         root: client.clone(),
+        destination: "alice@192.0.2.10".into(),
         key: PathBuf::new(),
     };
     assert_eq!(local.origin_revisions().unwrap(), (tip.clone(), live));

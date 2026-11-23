@@ -5,6 +5,7 @@ use crate::{
         Host, DEBIAN_LIBRARIES, DEBIAN_TOOLS,
     },
     probes::now,
+    target::{HostConfig, Target, HOST_CONFIG},
     R,
 };
 use std::{
@@ -18,22 +19,23 @@ use td_json::Json;
 #[path = "launcher_closure.rs"]
 mod closure;
 
-const REMOTE: &str = "timmy@172.179.0.6";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
-const HELP: &str =
-    "Usage: td-mta/deploy [--skip-tests] [--window-seconds 1..3600] [--jmap-account ACCOUNT]
-       td-mta/deploy --postgres-socket [--window-seconds 1..3600] [--jmap-account ACCOUNT]
-       td-mta/deploy --postgres-binaries --postgres-minor-reviewed 17.N
-                     [--window-seconds 1..3600] [--jmap-account ACCOUNT]
-Select a verified origin/main revision and deploy it to claw1, move the
-live release's database from loopback TLS to its private socket, or switch
-it from the Debian PostgreSQL to td's source-built one. 17.N is the live
-Debian release whose notes up to td's release the operator read.";
+const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
+       td-mta/deploy --postgres-socket [OPTIONS]
+       td-mta/deploy --postgres-binaries --postgres-minor-reviewed 17.N [OPTIONS]
+Options: [--window-seconds 1..3600] [--jmap-account ACCOUNT] [--config FILE]
+Select a verified origin/main revision and deploy it to the configured host,
+move the live release's database from loopback TLS to its private socket, or
+switch it from the Debian PostgreSQL to td's source-built one. 17.N is the
+live Debian release whose notes up to td's release the operator read. The
+target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
+~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md).";
 struct Options<'a> {
     skip: bool,
     budget: u64,
-    account: &'a str,
+    account: Option<&'a str>,
+    config: Option<&'a str>,
     socket: bool,
     binaries: bool,
     reviewed: Option<&'a str>,
@@ -42,7 +44,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
     let mut out = Options {
         skip: false,
         budget: 60,
-        account: "xyz882015",
+        account: None,
+        config: None,
         socket: false,
         binaries: false,
         reviewed: None,
@@ -58,7 +61,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
                     "window must be 1..3600 seconds",
                 )?;
             }
-            "--jmap-account" => out.account = it.next().ok_or("missing JMAP account")?,
+            "--jmap-account" => out.account = Some(it.next().ok_or("missing JMAP account")?),
+            "--config" => out.config = Some(it.next().ok_or("missing target configuration")?),
             "--postgres-socket" => out.socket = true,
             "--postgres-binaries" => out.binaries = true,
             "--postgres-minor-reviewed" => {
@@ -150,6 +154,7 @@ fn words(parts: &[&str]) -> R<String> {
 struct Local {
     host: Host,
     root: PathBuf,
+    destination: String,
     key: PathBuf,
 }
 impl Local {
@@ -169,7 +174,7 @@ impl Local {
             "-i",
         ])
         .arg(&self.key)
-        .arg(REMOTE)
+        .arg(&self.destination)
         .arg(words(args)?);
         Ok(c)
     }
@@ -435,7 +440,7 @@ impl Local {
         ])?;
         Ok((installed, hash))
     }
-    fn qualify_jmap(&self, account: &str) -> R<f64> {
+    fn qualify_jmap(&self, account: &str, url: &str) -> R<f64> {
         fn request(command: &str, account: Option<&str>) -> R<Json> {
             let mut j = Json::Obj(Vec::new());
             set(&mut j, "command", Json::Str(owned(command)?))?;
@@ -478,14 +483,7 @@ impl Local {
         require(
             accounts.iter().any(|a| {
                 a.get("name").and_then(Json::as_str) == Some(account)
-                    && matches!(
-                        a.get("well_known_url").and_then(Json::as_str),
-                        Some(
-                            "https://mx.timmydouglas.com/.well-known/jmap"
-                                | "https://mx.timmyd.info/.well-known/jmap"
-                                | "https://mx.882015.xyz/.well-known/jmap"
-                        )
-                    )
+                    && a.get("well_known_url").and_then(Json::as_str) == Some(url)
             }),
             "production discovery URL required",
         )?;
@@ -511,11 +509,25 @@ pub(super) fn run(args: &[String]) -> R<()> {
     let host = Host::default();
     let root = PathBuf::from(host.out(Command::new("git").args(["rev-parse", "--show-toplevel"]))?);
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("operator home")?);
+    require(home.is_absolute(), "operator home must be absolute")?;
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let target = Target::load(opts.config.map(Path::new), &home, xdg.as_deref())?;
+    let account = opts.account.unwrap_or(&target.jmap_account);
     let local = Local {
         host,
         root,
-        key: child(&home, ".ssh/td_mta_systemd_test")?,
+        destination: target.destination,
+        key: target.identity,
     };
+    // The host's own description names its build mirror and identity.
+    let site = local.sudo(&["cat", "--", HOST_CONFIG]).map_err(|_| {
+        "cannot read /var/lib/td-mta-operator/host.json over SSH and sudo; see td-mta/PRODUCTION.md, \"Deploy target configuration\""
+    })?;
+    let site = HostConfig::parse(site.as_bytes())?;
+    require(
+        site.host_name == target.host_name,
+        "the host's host.json names another host than target.json's host_name",
+    )?;
     let (tip, controller) = local.origin_revisions()?;
     let live = local.remote(&["readlink", "-f", "/opt/td-mta/bin/td-mta"])?;
     let live = live_path(&live)?;
@@ -538,7 +550,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
             .args(["rev-parse", &fmt(format_args!("{selected}^{{tree}}"))?]),
     )?;
     revision(&tree)?;
-    println!("claw1 current {live}, selected {selected}");
+    println!("{} current {live}, selected {selected}", site.host_name);
     if let Some(reviewed) = opts.reviewed {
         local.debian_release(reviewed)?;
     }
@@ -559,9 +571,15 @@ pub(super) fn run(args: &[String]) -> R<()> {
         }
         None => None,
     };
-    let before = local.qualify_jmap(opts.account)?;
+    let before = local.qualify_jmap(account, &target.jmap_url)?;
     if selected != live {
         let key = local.key.to_str().ok_or("invalid SSH key path")?;
+        let mirror = site.mirror()?;
+        let remote = fmt(format_args!(
+            "{}:{}",
+            local.destination,
+            mirror.to_str().ok_or("invalid source mirror")?
+        ))?;
         let ssh = words(&[
             "ssh",
             "-T",
@@ -576,7 +594,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
             local.git().env("GIT_SSH_COMMAND", ssh).args([
                 "push",
                 "--no-follow-tags",
-                "timmy@172.179.0.6:/home/timmy/src/td",
+                &remote,
                 &fmt(format_args!("{selected}:refs/td-mta-deploy/{selected}"))?,
             ]),
             &[],
@@ -681,7 +699,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
             "failed"
         })?),
     )?;
-    let post = local.qualify_jmap(opts.account);
+    let post = local.qualify_jmap(account, &target.jmap_url);
     set(&mut probe, "after", Json::from(now()?))?;
     set(
         &mut probe,

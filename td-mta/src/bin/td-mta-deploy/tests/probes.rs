@@ -9,6 +9,7 @@ use crate::tls_fixture::ServerPems;
 
 const FAKE_NOW: i64 = 1_800_000_000_000;
 const TEST_LIMIT: Duration = Duration::from_secs(6);
+const NAME: &str = "mx.example.org";
 
 struct FixtureClock(RuntimeClock);
 impl Clock for FixtureClock {
@@ -28,11 +29,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> R<Self> {
-        let pems = ServerPems::new(DOMAIN)?;
+        let pems = ServerPems::new(NAME)?;
         let identity = ServerIdentity::from_pem(
             &pems.chain,
             &pems.key,
-            &[DOMAIN],
+            &[NAME],
             Some((FAKE_NOW / 1000) as u64),
         )?;
         Ok(Self {
@@ -56,6 +57,7 @@ impl Fixture {
             address,
             if trusted { &self.roots } else { &public },
             self.clock.clone(),
+            NAME,
         )?;
         let clock = self.clock.clone();
         let config = Arc::new(ServerConfig::new(
@@ -105,7 +107,7 @@ impl Fixture {
             } else {
                 for header in [
                     b"GET /.well-known/jmap HTTP/1.1\r\n".as_slice(),
-                    b"Host: mx.timmydouglas.com\r\n",
+                    b"Host: mx.example.org\r\n",
                     b"Connection: close\r\n",
                     b"\r\n",
                 ] {
@@ -165,7 +167,13 @@ fn jmap_requires_the_authentication_challenge_over_verified_tls() -> R<()> {
 fn stalled_smtp_greeting_exhausts_the_probe_budget() -> R<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let f = Fixture::new()?;
-    let client = Listener::new(TlsProtocol::Smtp, listener.local_addr()?, &f.roots, f.clock)?;
+    let client = Listener::new(
+        TlsProtocol::Smtp,
+        listener.local_addr()?,
+        &f.roots,
+        f.clock,
+        NAME,
+    )?;
     // The kernel accepts the connection but no peer ever sends its greeting.
     let start = Instant::now();
     let result = client.probe(Duration::from_millis(25));

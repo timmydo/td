@@ -14,6 +14,11 @@ change drains and reloads the service. Managed certificates update in place.
 The live Azure host serving `mx.timmydouglas.com`, `mx.timmyd.info` and
 `mx.882015.xyz` has a separate [production runbook](PRODUCTION.md), including
 SSH access, source selection, binary updates, verification and rollback.
+Its supervised `./td-mta/deploy` path takes its target only from the
+operator: the host, administrator account, SSH key and public names, in two
+files kept outside the repository, `target.json` on the development
+machine and `/var/lib/td-mta-operator/host.json` on the host
+([Deploy target configuration](PRODUCTION.md#deploy-target-configuration)).
 
 Existing local replicas have a separate [operations runbook](REPLICA-OPERATIONS.md)
 for updates, synchronization status, integrity checks and restore evidence.

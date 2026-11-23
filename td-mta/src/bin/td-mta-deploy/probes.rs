@@ -1,6 +1,6 @@
 //! Independent SMTP and HTTPS listener samples before and during the writer fence.
 use crate::{
-    common::{durable, owned, require, set},
+    common::{durable, fmt, owned, require, set},
     R,
 };
 use std::{
@@ -22,7 +22,6 @@ use td_mta::{
     transport::TcpTransport,
 };
 
-const DOMAIN: &str = "mx.timmydouglas.com";
 const PROBES: &[(&str, u16)] = &[("smtp", 25), ("jmap", 443)];
 type Data = Vec<(String, Vec<(f64, bool)>)>;
 struct Records {
@@ -30,6 +29,8 @@ struct Records {
     data: Mutex<Data>,
 }
 pub struct Probes {
+    /// The public name, from host.json, the listeners' certificate presents.
+    name: String,
     records: td_alloc::BudgetShared<Records>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -98,9 +99,11 @@ struct Listener {
     address: SocketAddr,
     clock: Arc<dyn Clock>,
     config: Arc<ClientConfig>,
+    name: String,
+    request: String,
 }
 impl Listener {
-    fn production(name: &str) -> R<Self> {
+    fn production(name: &str, public: &str) -> R<Self> {
         let &(_, port) = PROBES
             .iter()
             .find(|(n, _)| *n == name)
@@ -115,6 +118,7 @@ impl Listener {
             (Ipv4Addr::LOCALHOST, port).into(),
             &TrustStore::public_roots()?,
             Arc::new(RuntimeClock::new()),
+            public,
         )
     }
 
@@ -123,6 +127,7 @@ impl Listener {
         address: SocketAddr,
         trust: &TrustStore,
         clock: Arc<dyn Clock>,
+        name: &str,
     ) -> R<Self> {
         let config = ClientConfig::new(
             trust,
@@ -134,6 +139,10 @@ impl Listener {
             address,
             clock,
             config: Arc::new(config),
+            name: owned(name)?,
+            request: fmt(format_args!(
+                "GET /.well-known/jmap HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n"
+            ))?,
         })
     }
 
@@ -149,7 +158,7 @@ impl Listener {
             write(&mut tcp, b"STARTTLS\r\n", end)?;
             smtp(&mut tcp, b"220", end)?;
         }
-        let session = TlsSession::client(Arc::clone(&self.config), DOMAIN)?;
+        let session = TlsSession::client(Arc::clone(&self.config), &self.name)?;
         let (mut input, mut output) = ([0u8; TLS_WIRE_BYTES], [0u8; TLS_WIRE_BYTES]);
         let mut tls = TlsIo::new(
             tcp,
@@ -170,7 +179,7 @@ impl Listener {
             write(&mut tls, b"QUIT\r\n", end)?;
             smtp(&mut tls, b"221", end)?;
         } else {
-            write(&mut tls,b"GET /.well-known/jmap HTTP/1.1\r\nHost: mx.timmydouglas.com\r\nConnection: close\r\n\r\n",end)?;
+            write(&mut tls, self.request.as_bytes(), end)?;
             let mut buf = [0; 1024];
             let n = line(&mut tls, end, &mut buf)?;
             let header = std::str::from_utf8(buf.get(..n).ok_or("HTTP length")?)?;
@@ -187,7 +196,7 @@ impl Listener {
 }
 
 impl Probes {
-    pub fn new() -> R<Self> {
+    pub fn new(name: &str) -> R<Self> {
         // One shared control block plus its fixed-size record-list header.
         let budget = td_alloc::Budget::new(1024)?;
         let records = td_alloc::BudgetShared::new(
@@ -198,17 +207,18 @@ impl Probes {
             },
         )?;
         Ok(Self {
+            name: owned(name)?,
             records,
             threads: Vec::new(),
         })
     }
     pub fn probe(&self, name: &str) -> R<()> {
-        Listener::production(name)?.probe(Duration::from_secs(1))
+        Listener::production(name, &self.name)?.probe(Duration::from_secs(1))
     }
     pub fn start(&mut self, require_ready: bool) -> R<()> {
         td_alloc::reserve(&mut self.threads, PROBES.len())?;
         for &(name, _) in PROBES {
-            let listener = Listener::production(name)?;
+            let listener = Listener::production(name, &self.name)?;
             if require_ready {
                 listener.probe(Duration::from_secs(1))?;
             }

@@ -16,16 +16,18 @@ ssh -o IdentitiesOnly=yes -i KEY ADMIN@HOST
 
 `HOST`, `ADMIN` and `KEY` stand for the host's address, its administrator
 account and the dedicated key file. The operator keeps their values in
-private notes outside this repository. `./td-mta/deploy` compiles in its
-own copies of them (`td-mta/src/bin/td-mta-deploy/`), so the notes must
-agree with that source. The `ADMIN` account can administer
+private notes outside this repository, and `./td-mta/deploy` reads them
+from the operator's own [deploy target
+configuration](#deploy-target-configuration); nothing in the repository
+names them. The `ADMIN` account can administer
 the services with `sudo`. The daemon runs as `td-mta`. SSH does not grant
 access to the former Stalwart host merely because its old DNS name now
 points here.
 
 | Item | Location or name |
 | --- | --- |
-| Source checkout | `/home/ADMIN/src/td` |
+| Source checkout | `/home/ADMIN/src/td`: `src/td` under `host.json`'s `build_home` |
+| Supervisor's host description | `/var/lib/td-mta-operator/host.json` |
 | Selected executable | `/opt/td-mta/bin/td-mta` (symlink) |
 | Retained binaries and build notices | `/opt/td-mta/lib/td-mta/releases/` |
 | Installed maintenance helper | `/opt/td-mta/bin/td-mta-operator` |
@@ -58,7 +60,7 @@ Five processes use the selected MTA executable:
 - `td-mta-migadu.service`: production outbound relay profile.
 - `td-mta-acme-production.service`: certificate issuance/renewal for all three MX names.
 
-On claw1 the selected frontend profile sets `event_streams = 4` in
+On this host the selected frontend profile sets `event_streams = 4` in
 `[limits]`: four stream slots of their own, beside the frontend's
 `https_connections` for ordinary requests, which default to sixteen. The
 default is eight streams; selecting a configuration without the setting
@@ -901,7 +903,8 @@ after the upgrade unless that mail is separately preserved.
 Run `./td-mta/deploy` from the root of the reviewed development checkout. The command
 fetches shared main, selects the newest first-parent descendant of the
 installed release with a passing main-integration verdict on this machine,
-and sends that exact Git object to claw1 using the production SSH identity.
+and pushes that exact Git object into the host's build mirror over the SSH
+identity its [target configuration](#deploy-target-configuration) names.
 It checks the deployed tree and refuses divergent history. When no newer
 revision qualifies it checks the running release and leaves mail online.
 The main-integration runner owns the verdicts (see DEVELOPMENT.md).
@@ -923,8 +926,10 @@ A detached systemd job owns each activation through SSH disconnects.
 Each job runs one activation. The launcher prints the private receipt
 path before activation and creates a new job for a retry. The development
 machine checks authenticated public JMAP before and after the job using
-td-mail account xyz882015 (override with `--jmap-account NAME`). The
-second check records both observations in public-jmap.json beside the receipt.
+the td-mail account the target configuration names (override with
+`--jmap-account NAME`), which must be configured with the target's
+`jmap_url`. The second check records both observations in
+public-jmap.json beside the receipt.
 
 A fresh unprivileged checkout builds the candidate with install-td-mta.
 The operator stages the release, validates the epoch, selected configuration
@@ -973,6 +978,84 @@ ACME may need its separate four-minute lease budget after SMTP and JMAP
 return. Keep recovery inputs and the original data through the rollback
 window.
 
+
+### Deploy target configuration
+
+The tool takes its host, accounts, key and public names only from two
+small JSON files the operator provisions outside the repository. Each is
+one object holding exactly the fields below, as strings. A missing,
+unknown, duplicate, mistyped or invalid field refuses with a fixed
+message that never includes a value. Nothing falls back to an
+environment variable or a built-in value.
+
+On the development machine, `target.json` says how to reach the host. The
+launcher reads the file `--config FILE` names, else
+`$XDG_CONFIG_HOME/td-mta-deploy/target.json` when that variable is an
+absolute path, else `~/.config/td-mta-deploy/target.json`. For example:
+
+```json
+{
+  "host": "192.0.2.10",
+  "host_name": "mx1",
+  "account": "alice",
+  "identity": "~/.ssh/td-mta-deploy",
+  "jmap_account": "alice",
+  "jmap_url": "https://mx.example.org/.well-known/jmap"
+}
+```
+
+- `host`: the SSH host, a DNS name or IPv4 address. There is no port
+  field: for another port, name a `Host` alias from `~/.ssh/config`.
+- `host_name`: the host name the host's own `host.json` must state; the
+  launcher refuses before building when they differ.
+- `account`: the administrator account (`ADMIN`), which logs in, runs
+  `sudo` and pushes into the build mirror. Lowercase letters, digits, `_`,
+  `.` and `-`, starting with a letter or `_`.
+- `identity`: the private key file (`KEY`), an absolute path or one
+  starting with `~/` for the invoking user's home, without `%` or `$`.
+  SSH uses only this key and requires the host's key to be known already.
+- `jmap_account`: the td-mail account of the public JMAP checks;
+  `--jmap-account` overrides it.
+- `jmap_url`: the `https://` discovery URL that account must use.
+
+On the host, the root-owned `/var/lib/td-mta-operator/host.json`, mode
+0600, describes the host to the supervisor, which refuses every mode
+without it:
+
+```json
+{
+  "host_name": "mx1",
+  "build_account": "alice",
+  "build_home": "/home/alice",
+  "public_name": "mx.example.org"
+}
+```
+
+- `host_name`: the kernel host name the supervisor requires before it
+  acts.
+- `build_account`: the unprivileged account that builds each candidate;
+  root is refused.
+- `build_home`: that account's home directory, which the account must
+  own. Its source mirror is `src/td` there, candidates build under
+  `.local/state/td-mta-candidates`, which must exist with no symbolic
+  link anywhere in its path, and Cargo comes from `.cargo/bin`. The
+  launcher pushes into that mirror as `account`, and Git refuses a push
+  into another account's repository unless that repository is listed in
+  `safe.directory`, so use the same account for both.
+- `public_name`: the DNS name, not an address, that the public SMTP and
+  HTTPS listeners' certificate presents. The listener probes send it as
+  SNI and HTTP `Host`. An activation probes both listeners before it
+  builds, so a deployment, even one with nothing newer to deploy,
+  checks the name before anything changes. A shared-services rollback
+  does not require the listeners to answer before it starts, so check a
+  changed `public_name` with a deployment first.
+
+Install it with `sudo install -o root -g root -m 0600 host.json
+/var/lib/td-mta-operator/host.json`. The launcher reads it with `sudo
+cat` over SSH before building, to compare host names, find the mirror and
+print the host name; when that read fails it says so without telling an
+absent file from a refused login. A current controller run in an older
+job directory (see the next section) needs the file too.
 
 ### Isolating production service accounts
 
@@ -1076,7 +1159,7 @@ next monitor and digest invocation use the new settings.
    A logical restore that only includes the `td_mta` schema requires the
    owner binding step and service grants again before admitting writers.
 
-On claw1 the root-only libpq service file is
+On this host the root-only libpq service file is
 `/var/lib/td-mta-operator/physical-backup/service.conf`. Its
 `cutover_repl` profile uses `td_mta_cutover_backup` and `repl.pass`.
 The ordinary `cutover_marker` profile uses `td_mta_cutover_marker`,
@@ -1092,7 +1175,7 @@ The backup volume directory is `/data/td-mta-physical-recovery`, root:root
 libpq profile in `/var/lib/td-mta/backup-control/service.conf`.
 The controller uses the selected PostgreSQL 17 tools, systemd,
 rsync with --fsync, tar, util-linux and the native build
-toolchain. Database passwords stay in protected files on claw1.
+toolchain. Database passwords stay in protected files on the host.
 
 ### Move PostgreSQL to the private socket
 
