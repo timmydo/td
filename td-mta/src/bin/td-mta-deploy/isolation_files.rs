@@ -204,7 +204,7 @@ pub(crate) fn present(file: &Setting) -> R<bool> {
     Ok(true)
 }
 
-pub(super) fn installed(files: &[Setting]) -> R<bool> {
+pub(crate) fn installed(files: &[Setting]) -> R<bool> {
     let mut count = 0;
     for item in files {
         if present(item)? {
@@ -277,6 +277,53 @@ pub(crate) fn install_tracking<'a>(
         result?;
         File::open(parent)?.sync_all()?;
     }
+    Ok(())
+}
+
+/// What a setting's path holds.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Held {
+    Absent,
+    This,
+    Other,
+}
+
+/// Whether `file`'s path holds nothing, exactly `file`, or anything else.
+pub(crate) fn held(file: &Setting) -> R<Held> {
+    match fs::symlink_metadata(&file.path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Held::Absent),
+        Err(e) => return Err(e.into()),
+        Ok(_) => (),
+    }
+    // Drift is an answer here, not a failure.
+    Ok(if present(file).unwrap_or(false) {
+        Held::This
+    } else {
+        Held::Other
+    })
+}
+
+/// Replaces `old`, which must be in place, with `new` at the same path in
+/// one rename, so the path always holds one of them.
+pub(crate) fn replace(old: &Setting, new: &Setting) -> R<()> {
+    require(
+        old.path == new.path && present(old)?,
+        "the setting to replace is not in place",
+    )?;
+    let parent = new.path.parent().ok_or("missing setting parent")?;
+    safe_parents(&new.path)?;
+    let temp = td_fs::TempDir::new_in(parent, ".td-mta-identity")?;
+    let staged = child(temp.path(), "setting")?;
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged)?;
+    out.write_all(new.text.as_bytes())?;
+    out.set_permissions(fs::Permissions::from_mode(new.mode))?;
+    out.sync_all()?;
+    fs::rename(&staged, &new.path)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 

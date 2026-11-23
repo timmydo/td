@@ -90,7 +90,8 @@ fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     require(
         declared
             == match mode {
-                "postgres-socket" | "postgres-binaries" | "retire-rollback" => Some(mode),
+                "postgres-socket" | "postgres-binaries" | "postgres-to-debian"
+                | "retire-rollback" => Some(mode),
                 _ => None,
             },
         "job operation does not match the requested mode",
@@ -139,6 +140,7 @@ fn run() -> R<()> {
         [s] if s == "--activate" => supervise("activate"),
         [s] if s == "--postgres-socket" => supervise("postgres-socket"),
         [s] if s == "--postgres-binaries" => supervise("postgres-binaries"),
+        [s] if s == "--postgres-to-debian" => supervise("postgres-to-debian"),
         [s] if s == "--retire-rollback" => supervise("retire-rollback"),
         [s] if s == "--restore-shared-services" => supervise("restore-shared-services"),
         [s] if s == "--refresh-notifications" => supervise("refresh-notifications"),
@@ -219,6 +221,11 @@ mod tests {
         assert!(check_mode(&plain, "retire-rollback").is_err());
         assert!(check_mode(&retire, "activate").is_err());
         assert!(check_mode(&retire, "postgres-binaries").is_err());
+        let back = td_json::parse(r#"{"revision":"r","mode":"postgres-to-debian"}"#)?;
+        check_mode(&back, "postgres-to-debian")?;
+        assert!(check_mode(&back, "postgres-binaries").is_err());
+        assert!(check_mode(&binaries, "postgres-to-debian").is_err());
+        assert!(check_mode(&plain, "postgres-to-debian").is_err());
         Ok(())
     }
 }

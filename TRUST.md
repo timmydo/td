@@ -341,8 +341,8 @@ store, and nothing builds into it on the host.
   claim.
 - The debug companions ship inside the PostgreSQL output; nothing on the
   host reads them.
-- The extracted Debian PostgreSQL stays beside it for rollback, outside
-  td's store and this class.
+- The extracted Debian PostgreSQL stays beside it for rollback and the
+  explicit return (`--to-debian`), outside td's store and this class.
 
 ## Rust toolchain and dependencies
 

@@ -1,5 +1,6 @@
 //! Select a tested main revision and submit a pinned, standalone operator job.
 use crate::{
+    activate::binaries::{dropin_program, BINARIES_DROPIN, DEBIAN_SOURCE},
     common::{
         banner_minor, child, digest, fmt, owned, postgres_minor, require, set, store_basename,
         Host, DEBIAN_LIBRARIES, DEBIAN_TOOLS,
@@ -27,7 +28,7 @@ const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [OPTIONS]
-       td-mta/deploy --postgres-binaries [OPTIONS]
+       td-mta/deploy --postgres-binaries [--to-debian] [OPTIONS]
        td-mta/deploy --retire-rollback --irreversible [OPTIONS]
        td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
          --identity KEY --jmap-account ACCOUNT --jmap-url URL
@@ -38,8 +39,9 @@ Options: [--window-seconds 1..3600] [--jmap-account ACCOUNT] [--config FILE]
   [--irreversible] (required by a deployment that migrates the database)
 Select a verified origin/main revision and deploy it to the configured host,
 move the live release's database from loopback TLS to its private socket, or
-switch it from the Debian PostgreSQL to td's source-built one, applying
-what the reviewed minor-release table says each release in between needs.
+switch it from the Debian PostgreSQL or another td closure to td's
+source-built one, applying what the reviewed minor-release table says each
+release in between needs; --to-debian returns it to the retained Debian one.
 --retire-rollback deletes rollback material older than seven days: earlier
 job directories and physical recovery copies.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
@@ -57,6 +59,7 @@ struct Options<'a> {
     config: Option<&'a str>,
     socket: bool,
     binaries: bool,
+    to_debian: bool,
     retire: bool,
     irreversible: bool,
 }
@@ -68,6 +71,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         config: None,
         socket: false,
         binaries: false,
+        to_debian: false,
         retire: false,
         irreversible: false,
     };
@@ -86,6 +90,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--config" => out.config = Some(it.next().ok_or("missing target configuration")?),
             "--postgres-socket" => out.socket = true,
             "--postgres-binaries" => out.binaries = true,
+            "--to-debian" => out.to_debian = true,
             "--retire-rollback" => out.retire = true,
             "--irreversible" => out.irreversible = true,
             _ => return Err(HELP.into()),
@@ -100,6 +105,10 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         "one PostgreSQL operation per job",
     )?;
     require(
+        out.binaries || !out.to_debian,
+        "--to-debian belongs to --postgres-binaries",
+    )?;
+    require(
         !(out.retire && (out.socket || out.binaries || out.skip)),
         "retiring rollback material is its own job",
     )?;
@@ -112,6 +121,13 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         "--irreversible applies to a deployment or --retire-rollback",
     )?;
     Ok(out)
+}
+/// A file's text as the remote command printed it, which loses its final
+/// newline.
+fn remote_text(output: &str) -> R<String> {
+    let mut text = owned(output.trim_end_matches('\n'))?;
+    td_alloc::push_str(&mut text, "\n")?;
+    Ok(text)
 }
 fn revision(value: &str) -> R<&str> {
     require(
@@ -351,8 +367,37 @@ impl Local {
             "uploaded NAR mismatch",
         )
     }
-    // Early and read-only, before a build of up to hours: the live Debian
-    // release, which the minor-release table must list.
+    // Early and read-only, before a build of up to hours: the live server,
+    // `debian` or the td closure's PostgreSQL output, and its release,
+    // which the minor-release table must list.
+    fn live_release(&self) -> R<(String, u32)> {
+        // Found whether or not its directory exists.
+        let found = self.sudo(&[
+            "find",
+            "/etc/systemd/system",
+            "-maxdepth",
+            "2",
+            "-path",
+            BINARIES_DROPIN,
+            "-type",
+            "f",
+        ])?;
+        if found.trim().is_empty() {
+            return Ok((owned(DEBIAN_SOURCE)?, self.debian_release()?));
+        }
+        let text = remote_text(&self.sudo(&["cat", "--", BINARIES_DROPIN])?)?;
+        let program = dropin_program(&text)?;
+        let banner = self.sudo(&["env", "-i", program, "--version"])?;
+        let minor = banner_minor(&banner)?;
+        crate::postgres_minors::covered(minor)?;
+        let basename = program
+            .strip_prefix("/td/store/")
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(name, _)| name)
+            .ok_or("the PostgreSQL binaries drop-in names no td-built server")?;
+        Ok((owned(basename)?, minor))
+    }
+    // The retained Debian release, which the minor-release table must list.
     fn debian_release(&self) -> R<u32> {
         let library = fmt(format_args!("LD_LIBRARY_PATH={DEBIAN_LIBRARIES}"))?;
         let server = child(Path::new(DEBIAN_TOOLS), "postgres")?;
@@ -666,8 +711,18 @@ pub(super) fn run(args: &[String]) -> R<()> {
     )?;
     revision(&tree)?;
     println!("{} current {live}, selected {selected}", site.host_name);
-    let live_minor = if opts.binaries {
-        Some(local.debian_release()?)
+    let live_server = if opts.binaries {
+        Some(local.live_release()?)
+    } else {
+        None
+    };
+    let debian_minor = if opts.to_debian {
+        Some(local.debian_release().map_err(|e| {
+            fmt(format_args!(
+                "the retained Debian PostgreSQL did not report its release ({e}); once its tree is gone the server moves only between td closures"
+            ))
+            .map_or(e, Into::into)
+        })?)
     } else {
         None
     };
@@ -675,16 +730,17 @@ pub(super) fn run(args: &[String]) -> R<()> {
     fs::create_dir_all(&cache)?;
     let scratch = td_fs::TempDir::new_in(&cache, "mta-deploy")?;
     let binary = local.artifact(scratch.path(), &controller)?;
-    let closure = match live_minor {
-        Some(live_minor) => {
+    let closure = match &live_server {
+        Some((_, live_minor)) if !opts.to_debian => {
+            let live_minor = *live_minor;
             let built = local.closure(scratch.path())?;
             let server = built.first().ok_or("missing PostgreSQL output")?;
             let td_minor = postgres_minor(store_basename(&server.basename, "postgresql-x86-64")?)?;
             // Before anything reaches the host: the table covers the move.
             crate::postgres_minors::movable(live_minor, td_minor)?;
-            Some((built, live_minor))
+            Some(built)
         }
-        None => None,
+        _ => None,
     };
     let before = local.qualify_jmap(account, &target.jmap_url)?;
     if selected != live {
@@ -733,7 +789,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
         "invalid operator job",
     )?;
     let (program, hash) = local.install(&binary, &controller, &job)?;
-    for (built, _) in closure.iter() {
+    for built in closure.iter() {
         for built in built {
             local.send_nar(built, &job)?;
         }
@@ -757,7 +813,28 @@ pub(super) fn run(args: &[String]) -> R<()> {
         set(&mut spec, "mode", Json::Str(owned("retire-rollback")?))?;
     }
     set(&mut spec, "irreversible", Json::Bool(opts.irreversible))?;
-    if let Some((built, live_minor)) = &closure {
+    if let Some((source, live_minor)) = &live_server {
+        // What the launcher read; the controller requires the same.
+        set(
+            &mut spec,
+            "postgres_launcher_minor",
+            Json::Str(fmt(format_args!("17.{live_minor}"))?),
+        )?;
+        set(
+            &mut spec,
+            "postgres_launcher_source",
+            Json::Str(owned(source)?),
+        )?;
+    }
+    if let Some(minor) = debian_minor {
+        set(&mut spec, "mode", Json::Str(owned("postgres-to-debian")?))?;
+        set(
+            &mut spec,
+            "postgres_target_minor",
+            Json::Str(fmt(format_args!("17.{minor}"))?),
+        )?;
+    }
+    if let Some(built) = &closure {
         set(&mut spec, "mode", Json::Str(owned("postgres-binaries")?))?;
         let mut entries = Vec::new();
         for item in built {
@@ -767,12 +844,6 @@ pub(super) fn run(args: &[String]) -> R<()> {
             td_alloc::push(&mut entries, entry)?;
         }
         set(&mut spec, "closure", Json::Arr(entries))?;
-        // What the launcher read; the controller requires the same.
-        set(
-            &mut spec,
-            "postgres_launcher_minor",
-            Json::Str(fmt(format_args!("17.{live_minor}"))?),
-        )?;
     }
     set(&mut spec, "budget", Json::from(opts.budget))?;
     set(&mut spec, "verdict", verdict.map_or(Json::Null, Json::Str))?;
@@ -809,6 +880,8 @@ pub(super) fn run(args: &[String]) -> R<()> {
             &program,
             if opts.socket {
                 "--postgres-socket"
+            } else if opts.to_debian {
+                "--postgres-to-debian"
             } else if opts.binaries {
                 "--postgres-binaries"
             } else if opts.retire {

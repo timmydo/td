@@ -165,8 +165,14 @@ fn the_binary_switch_takes_no_attestation() {
     let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let only = args(&["--postgres-binaries"]);
     let opts = parse(&only).unwrap();
-    assert!(opts.binaries && !opts.socket);
+    assert!(opts.binaries && !opts.socket && !opts.to_debian);
+    let back = args(&["--postgres-binaries", "--to-debian"]);
+    let back = parse(&back).unwrap();
+    assert!(back.binaries && back.to_debian);
     for refused in [
+        args(&["--to-debian"]),
+        args(&["--postgres-socket", "--to-debian"]),
+        args(&["--postgres-binaries", "--to-debian", "--irreversible"]),
         args(&["--postgres-binaries", "--postgres-minor-reviewed", "17.6"]),
         args(&["--postgres-binaries", "--skip-tests"]),
         args(&["--postgres-binaries", "--postgres-socket"]),
@@ -796,4 +802,20 @@ fn only_a_private_key_file_at_a_literal_path_pins_ssh() {
     assert!(host_key::known_hosts(Path::new("relative.json"))
         .unwrap()
         .is_absolute());
+}
+
+#[test]
+fn the_live_drop_in_reads_back_as_the_controller_wrote_it() {
+    const OLD: &str = "a1f6m76fp7k1scqd064a892wz5d4aqcq-postgresql-x86-64-17.6";
+    let program = format!("/td/store/{OLD}/bin/postgres");
+    let written =
+        crate::activate::binaries::dropin_text(&program, &["-D", "/var/lib/td-mta/mail"]).unwrap();
+    // What the SSH command printed, trimmed, reads back as written.
+    let printed = remote_text(written.trim()).unwrap();
+    assert_eq!(printed, written);
+    assert_eq!(
+        crate::activate::binaries::dropin_program(&printed).unwrap(),
+        program
+    );
+    assert_eq!(remote_text("").unwrap(), "\n");
 }

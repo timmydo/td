@@ -9,7 +9,7 @@ const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 
 fn job(closure: &str, reviewed: &str) -> Json {
     td_json::parse(&format!(
-        r#"{{"mode":"postgres-binaries","closure":{closure},"postgres_launcher_minor":"{reviewed}"}}"#
+        r#"{{"mode":"postgres-binaries","closure":{closure},"postgres_launcher_minor":"{reviewed}","postgres_launcher_source":"debian"}}"#
     ))
     .unwrap()
 }
@@ -708,5 +708,100 @@ fn the_scheduled_backup_follows_the_server_to_tds_tools() {
             backup_environment(environment, unset, &bin).is_err(),
             "{environment} / {unset}"
         );
+    }
+}
+
+#[test]
+fn a_switch_names_its_source_and_puts_back_exactly_its_drop_ins() {
+    const OLD: &str = "a1f6m76fp7k1scqd064a892wz5d4aqcq-postgresql-x86-64-17.6";
+    let with = |source: &str| {
+        td_json::parse(&format!(
+            r#"{{"closure":{},"postgres_launcher_minor":"17.6","postgres_launcher_source":"{source}"}}"#,
+            entries(PG, GLIBC)
+        ))
+        .unwrap()
+    };
+    assert_eq!(launcher_source(&with("debian")).unwrap(), "debian");
+    assert_eq!(launcher_source(&with(OLD)).unwrap(), OLD);
+    Closure::from_job(&with(OLD)).unwrap();
+    let nested = format!("{OLD}/bin");
+    for refused in ["", "Debian", "../x", GLIBC, nested.as_str()] {
+        assert!(Closure::from_job(&with(refused)).is_err(), "{refused}");
+    }
+    let unnamed = td_json::parse(&format!(
+        r#"{{"closure":{},"postgres_launcher_minor":"17.6"}}"#,
+        entries(PG, GLIBC)
+    ))
+    .unwrap();
+    assert!(Closure::from_job(&unnamed).is_err());
+
+    assert_eq!(Source::Debian.name(), "debian");
+    assert!(Source::Debian.settings(&["-D", "/x"]).unwrap().is_empty());
+    assert!(Source::Debian.tools().unwrap().is_none());
+    let bin = PathBuf::from(format!("/td/store/{OLD}/bin"));
+    let td = Source::Td {
+        bin: bin.clone(),
+        basenames: [OLD.into(), GLIBC.into()],
+    };
+    assert_eq!(td.name(), OLD);
+    assert_eq!(td.postgres().unwrap(), bin.join("postgres"));
+    assert_eq!(td.tools().unwrap(), Some(bin.clone()));
+    let settings = td
+        .settings(&["-D", "/var/lib/td-mta/mail/postgres"])
+        .unwrap();
+    assert_eq!(settings.len(), 2);
+    assert_eq!(settings[0].path, Path::new(BINARIES_DROPIN));
+    assert_eq!(
+        dropin_program(&settings[0].text).unwrap(),
+        format!("/td/store/{OLD}/bin/postgres")
+    );
+    assert_eq!(settings[1].path, Path::new(BACKUP_DROPIN));
+    assert_eq!(
+        settings[1].text,
+        backup_dropin_text(bin.to_str().unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn the_restore_returns_each_drop_in_to_the_source_wherever_the_run_stopped() {
+    use Held::{Absent, Other, This};
+    let step = |new, previous| restore_step(new, previous).unwrap();
+    // From the Debian server: the source had no drop-in at the path.
+    assert_eq!(step(Absent, None), Restore::Keep);
+    assert_eq!(step(This, None), Restore::Remove);
+    assert!(restore_step(Other, None).is_err());
+    // From a td closure: before the replacement, after it, or with the
+    // path emptied by hand.
+    assert_eq!(step(Other, Some(This)), Restore::Keep);
+    assert_eq!(step(Absent, Some(This)), Restore::Keep);
+    assert_eq!(step(This, Some(Other)), Restore::Replace);
+    assert_eq!(step(Absent, Some(Absent)), Restore::PutBack);
+    // Something else at the path is for the operator.
+    assert!(restore_step(Other, Some(Other)).is_err());
+    assert!(restore_step(Absent, Some(Other)).is_err());
+}
+
+#[test]
+fn a_return_to_debian_names_both_releases_and_the_td_server() {
+    const OLD: &str = "a1f6m76fp7k1scqd064a892wz5d4aqcq-postgresql-x86-64-17.12";
+    let job = |target: &str, source: &str| {
+        td_json::parse(&format!(
+            r#"{{"mode":"postgres-to-debian","postgres_target_minor":"{target}","postgres_launcher_minor":"17.12","postgres_launcher_source":"{source}"}}"#
+        ))
+        .unwrap()
+    };
+    assert_eq!(to_debian_job(&job("17.6", OLD)).unwrap(), (6, 12, OLD));
+    // A rerun after the return verifies the Debian server.
+    assert_eq!(
+        to_debian_job(&job("17.6", "debian")).unwrap(),
+        (6, 12, "debian")
+    );
+    for refused in [
+        job("17.99", OLD),
+        job("16.4", OLD),
+        job("17.6", "../x"),
+        td_json::parse(r#"{"postgres_launcher_minor":"17.12"}"#).unwrap(),
+    ] {
+        assert!(to_debian_job(&refused).is_err(), "{refused}");
     }
 }

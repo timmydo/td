@@ -1,13 +1,16 @@
-//! Fenced switch of the production server from the extracted Debian
-//! PostgreSQL to td's source-built one, on the same data directory. The
+//! Fenced switch of the production server to td's source-built one, on the
+//! same data directory, from the extracted Debian PostgreSQL or from
+//! another td closure; and the explicit return to the Debian server. The
 //! launcher built the closure (the PostgreSQL output and td glibc) and sent
 //! each store path as a NAR; it enters /td/store only verified. Nothing in
 //! production changes before the td server passes a trial on a fresh copy.
-//! The Debian tree stays for rollback.
+//! The server switched from stays for rollback.
 use super::*;
 use crate::{
-    common::{banner_minor, free_bytes, postgres_minor, store_basename, DEBIAN_TOOLS},
-    isolation::files::{self, Setting},
+    common::{
+        banner_minor, free_bytes, postgres_minor, store_basename, DEBIAN_LIBRARIES, DEBIAN_TOOLS,
+    },
+    isolation::files::{self, Held, Setting},
     physical::SOCKET_DIR,
     postgres_minors::{self, Check, Note, GIN_BYTES, GIN_INDEXES, REINDEX_GIN},
 };
@@ -148,6 +151,120 @@ fn entry(json: &Json) -> R<Entry> {
     })
 }
 
+/// The server a switch moves from: the retained Debian one, or the td
+/// closure the drop-in selects.
+pub(super) enum Source {
+    Debian,
+    Td {
+        bin: PathBuf,
+        basenames: [String; 2],
+    },
+}
+
+/// What the launcher and the job call the Debian server.
+pub(crate) const DEBIAN_SOURCE: &str = "debian";
+
+impl Source {
+    /// The selected tools of `host`.
+    fn of(host: &Host) -> R<Self> {
+        if host.debian_tools() {
+            return Ok(Self::Debian);
+        }
+        let postgres = host.tool("postgres")?;
+        let bin = PathBuf::from(owned(parent(&postgres)?.to_str().ok_or("store path")?)?);
+        let mut names = selected_store(host)?.into_iter().map(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("store path")
+                .and_then(|n| owned(n).map_err(|_| "store path"))
+        });
+        let (Some(server), Some(glibc)) = (names.next(), names.next()) else {
+            return Err("the selected td-built tools name no closure".into());
+        };
+        Ok(Self::Td {
+            bin,
+            basenames: [server?, glibc?],
+        })
+    }
+
+    pub(super) fn postgres(&self) -> R<PathBuf> {
+        match self {
+            Self::Debian => child(Path::new(DEBIAN_TOOLS), "postgres"),
+            Self::Td { bin, .. } => child(bin, "postgres"),
+        }
+    }
+
+    /// The tools the controller runs while this server serves.
+    fn tools(&self) -> R<Option<PathBuf>> {
+        match self {
+            Self::Debian => Ok(None),
+            Self::Td { bin, .. } => Ok(Some(PathBuf::from(owned(
+                bin.to_str().ok_or("store path")?,
+            )?))),
+        }
+    }
+
+    /// `debian`, or the PostgreSQL output's store basename.
+    pub(super) fn name(&self) -> &str {
+        match self {
+            Self::Debian => DEBIAN_SOURCE,
+            Self::Td {
+                basenames: [server, _],
+                ..
+            } => server,
+        }
+    }
+
+    /// The drop-ins that select this server, which a switch away removes
+    /// and its rollback puts back; none for the Debian server.
+    fn settings(&self, args: &[&str]) -> R<Vec<Setting>> {
+        let mut settings = Vec::new();
+        if let Self::Td { bin, .. } = self {
+            let postgres = child(bin, "postgres")?;
+            td_alloc::push(
+                &mut settings,
+                Setting {
+                    path: PathBuf::from(BINARIES_DROPIN),
+                    text: dropin_text(postgres.to_str().ok_or("store path")?, args)?,
+                    mode: 0o644,
+                },
+            )?;
+            td_alloc::push(
+                &mut settings,
+                Setting {
+                    path: PathBuf::from(BACKUP_DROPIN),
+                    text: backup_dropin_text(bin.to_str().ok_or("store path")?)?,
+                    mode: 0o644,
+                },
+            )?;
+        }
+        Ok(settings)
+    }
+}
+
+/// The source the job's launcher read: `debian` or a PostgreSQL output.
+pub(super) fn launcher_source(job: &Json) -> R<&str> {
+    let source = field(job, "postgres_launcher_source")?;
+    if source != DEBIAN_SOURCE {
+        store_basename(source, "postgresql-x86-64")?;
+    }
+    Ok(source)
+}
+
+/// A `postgres-to-debian` job: the Debian release the launcher read, which
+/// the table must list, and the live server and release.
+pub(super) fn to_debian_job(job: &Json) -> R<(u32, u32, &str)> {
+    let target = postgres_minor(field(job, "postgres_target_minor")?)?;
+    postgres_minors::covered(target)?;
+    let live = postgres_minor(field(job, "postgres_launcher_minor")?)?;
+    Ok((target, live, launcher_source(job)?))
+}
+
+/// The collation versions the running server's C library reports for every
+/// database's default.
+pub(super) const COLLATION_VERSIONS: &str = "SELECT count(*) FROM pg_database \
+     WHERE datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)";
+
 impl Closure {
     pub(super) fn from_job(job: &Json) -> R<Self> {
         let Some([postgres, glibc]) = job.get("closure").and_then(Json::as_arr) else {
@@ -158,6 +275,7 @@ impl Closure {
         store_basename(&glibc.basename, "glibc-x86-64")?;
         let live = postgres_minor(field(job, "postgres_launcher_minor")?)?;
         postgres_minors::movable(live, minor)?;
+        launcher_source(job)?;
         Ok(Self {
             postgres,
             glibc,
@@ -247,7 +365,7 @@ pub(super) fn server_arguments<'a>(property: &'a Json, program: &str) -> R<Vec<&
 
 /// The drop-in that runs `program` with `args` in place of the unit's own
 /// command, without the loader variables.
-pub(super) fn dropin_text(program: &str, args: &[&str]) -> R<String> {
+pub(crate) fn dropin_text(program: &str, args: &[&str]) -> R<String> {
     let mut text = owned(DROPIN_HEAD)?;
     td_alloc::push_str(&mut text, program)?;
     for arg in args {
@@ -294,7 +412,7 @@ pub(super) fn backup_environment(environment: &str, unset: &str, bin: &str) -> R
 }
 
 /// The td-built server a drop-in `dropin_text` wrote runs.
-pub(super) fn dropin_program(text: &str) -> R<&str> {
+pub(crate) fn dropin_program(text: &str) -> R<&str> {
     let (command, tail) = text
         .strip_prefix(DROPIN_HEAD)
         .and_then(|rest| rest.split_once('\n'))
@@ -440,7 +558,8 @@ pub(super) fn trigram(output: &str) -> R<()> {
     )
 }
 
-const LIVE_CHANGED: &str = "the live Debian PostgreSQL is not the release the launcher read: run td-mta/deploy --postgres-binaries again";
+const LIVE_CHANGED: &str = "the live PostgreSQL is not the server and release the launcher read: run td-mta/deploy --postgres-binaries again";
+const LIVE_CHANGED_BACK: &str = "the live PostgreSQL is not the server and release the launcher read: run td-mta/deploy --postgres-binaries --to-debian again";
 
 /// A minor-release note's count, which must be zero.
 pub(super) fn concerned(release: u32, note: &Note, count: &str) -> R<()> {
@@ -451,7 +570,7 @@ pub(super) fn concerned(release: u32, note: &Note, count: &str) -> R<()> {
         .parse::<u64>()
         .map_err(|_| "unexpected minor-release check result")?;
     Err(fmt(format_args!(
-        "PostgreSQL 17.{release} note {}: the cluster holds what it concerns, which the switch does not repair; stay on the Debian server",
+        "PostgreSQL 17.{release} note {}: the cluster holds what it concerns, which the switch does not repair; stay on the live server",
         note.id
     ))?
     .into())
@@ -602,12 +721,57 @@ pub(super) fn unit_state(state: &str) -> R<()> {
     )
 }
 
-#[derive(Default)]
 pub(super) struct Switch {
+    source: Source,
+    /// The drop-ins selecting the source: what the restore puts back.
+    previous: Vec<Setting>,
     stopped: bool,
     dropin: Option<Setting>,
     backup: Option<Setting>,
 }
+
+impl Switch {
+    fn from(source: Source, previous: Vec<Setting>) -> Self {
+        Self {
+            source,
+            previous,
+            stopped: false,
+            dropin: None,
+            backup: None,
+        }
+    }
+
+    /// The source's setting at `path`, if it had one.
+    fn previous_at(&self, path: &Path) -> Option<&Setting> {
+        self.previous.iter().find(|s| s.path == path)
+    }
+}
+
+/// What the restore does at one drop-in's path, from what it holds of the
+/// switch's setting and of the source's (none: the source had none there).
+#[derive(PartialEq, Debug)]
+pub(super) enum Restore {
+    Keep,
+    Remove,
+    Replace,
+    PutBack,
+}
+
+pub(super) fn restore_step(new: Held, previous: Option<Held>) -> R<Restore> {
+    Ok(match (new, previous) {
+        (_, Some(Held::This)) | (Held::Absent, None) => Restore::Keep,
+        (Held::This, None) => Restore::Remove,
+        (Held::This, Some(_)) => Restore::Replace,
+        (Held::Absent, Some(Held::Absent)) => Restore::PutBack,
+        _ => return Err(
+            "a PostgreSQL drop-in holds neither the source's setting nor the switch's: inspect it against the receipt"
+                .into(),
+        ),
+    })
+}
+
+/// The two drop-ins' paths.
+const DROPINS: &[&str] = &[BINARIES_DROPIN, BACKUP_DROPIN];
 
 impl Deployment {
     pub(super) fn postgres_binaries(&mut self) -> R<()> {
@@ -623,15 +787,11 @@ impl Deployment {
         self.check_source()?;
         self.socket_preflight()?;
         crate::readiness::prepare(&self.host, false)?;
-        if !self.host.debian_tools() {
-            require(
-                self.host.tool("postgres")? == closure.postgres()?,
-                "PostgreSQL already runs other td-built binaries",
-            )?;
+        if !self.host.debian_tools() && self.host.tool("postgres")? == closure.postgres()? {
             loader::check_loading(&self.host, &closure)?;
             self.td_process(self.pid(PG)?, &closure)?;
             // A switch before the backup followed the server converges here.
-            let backup = self.backup_dropin(&closure)?;
+            let backup = self.backup_dropin(&closure, true)?;
             let placed = files::present(&backup)?;
             files::install(&self.host, std::slice::from_ref(&backup))?;
             // Also after a run that placed the file and died before reloading.
@@ -649,38 +809,81 @@ impl Deployment {
             self.event("already on the td-built PostgreSQL")?;
             return Ok(());
         }
-        self.debian_server(&closure)?;
+        let source = Source::of(&self.host)?;
+        let minor = self.live_server(&source)?;
+        require(
+            minor == closure.live && source.name() == launcher_source(&self.record)?,
+            LIVE_CHANGED,
+        )?;
+        let previous = self.source_settings(&source)?;
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
-        let mut switch = Switch::default();
+        let mut switch = Switch::from(source, previous);
         self.guarded(
             &mut switch,
             |d, switch| d.binaries_cutover(&closure, switch),
-            Self::restore_debian,
+            Self::restore_source,
         )
     }
 
-    // Gate 6: the live server is the release the launcher read.
-    fn debian_server(&mut self, closure: &Closure) -> R<()> {
-        let debian = child(Path::new(DEBIAN_TOOLS), "postgres")?;
+    // Gate 6: the live server is the one selected, and its release.
+    fn live_server(&mut self, source: &Source) -> R<u32> {
+        let program = source.postgres()?;
         let exe = fs::canonicalize(fmt(format_args!("/proc/{}/exe", self.pid(PG)?))?)?;
         require(
-            exe == fs::canonicalize(&debian)?,
-            "the live server is not the retained Debian PostgreSQL",
+            program.try_exists()? && exe == fs::canonicalize(&program)?,
+            "the live server is not the selected PostgreSQL",
         )?;
-        let minor = banner_minor(&self.host.out(self.host.cmd(&debian).arg("--version"))?)?;
+        if let Source::Td { basenames, .. } = source {
+            let [server, glibc] = basenames;
+            self.td_code(self.pid(PG)?, &[server, glibc])?;
+        }
+        let minor = banner_minor(&self.host.out(self.host.cmd(&program).arg("--version"))?)?;
         set(
             &mut self.record,
-            "postgres_debian_minor",
+            "postgres_source",
+            Json::Str(owned(source.name())?),
+        )?;
+        set(
+            &mut self.record,
+            "postgres_source_minor",
             Json::from(u64::from(minor)),
         )?;
-        require(minor == closure.live, LIVE_CHANGED)
+        Ok(minor)
+    }
+
+    /// The drop-ins selecting `source`, which must be in place as this
+    /// controller wrote them.
+    /// A switch made before the backup followed the server has none for
+    /// the backup job.
+    fn source_settings(&self, source: &Source) -> R<Vec<Setting>> {
+        let property = crate::readiness::exec_start(&self.host, PG_BUS)?;
+        let program = source.postgres()?;
+        let args = server_arguments(&property, program.to_str().ok_or("server path")?)?;
+        let mut settings = Vec::new();
+        for setting in source.settings(&args)? {
+            match files::held(&setting)? {
+                Held::This => td_alloc::push(&mut settings, setting)?,
+                Held::Absent if setting.path == Path::new(BACKUP_DROPIN) => (),
+                _ => {
+                    return Err(fmt(format_args!(
+                        "{} is not what this controller writes for the live td-built server: inspect it",
+                        setting.path.display()
+                    ))?
+                    .into())
+                }
+            }
+        }
+        Ok(settings)
     }
 
     fn binaries_cutover(&mut self, closure: &Closure, switch: &mut Switch) -> R<()> {
-        let setting = self.binaries_dropin(closure)?;
-        let backup = self.backup_dropin(closure)?;
+        let setting = self.binaries_dropin(closure, &switch.source)?;
+        let backup = self.backup_dropin(
+            closure,
+            switch.previous_at(Path::new(BACKUP_DROPIN)).is_none(),
+        )?;
         self.event("installing the td-built PostgreSQL closure")?;
         let placed = store::install(&self.host, &self.work, closure)?;
         set(&mut self.record, "postgres_store", placed)?;
@@ -704,11 +907,21 @@ impl Deployment {
         self.rehearse_binaries(closure)?;
         self.event("td-built PostgreSQL rehearsal verified")?;
 
-        require(
-            !setting.path.try_exists()?,
-            "unexpected PostgreSQL binaries drop-in",
-        )?;
-        self.backup_adoptable(&backup)?;
+        // Each path holds the source's setting, or none and at most this
+        // switch's from an interrupted run.
+        for new in [&setting, &backup] {
+            match switch.previous_at(&new.path) {
+                Some(previous) => require(
+                    files::held(previous)? == Held::This,
+                    "the drop-ins selecting the live td-built server changed",
+                )?,
+                None if new.path == Path::new(BINARIES_DROPIN) => require(
+                    !new.path.try_exists()?,
+                    "unexpected PostgreSQL binaries drop-in",
+                )?,
+                None => self.backup_adoptable(new)?,
+            }
+        }
         let uid = fs::metadata(PGDATA)?.uid();
         let gid = isolation::db_group(&self.host, false)?;
         self.prepare_fence(true, false)?;
@@ -723,15 +936,19 @@ impl Deployment {
         switch.stopped = true;
         self.host
             .run(self.host.cmd("systemctl").args(["stop", PG]))?;
-        // Gate 4: td's pg_controldata reads the Debian server's clean shutdown.
+        // Gate 4: td's pg_controldata reads the source's clean shutdown.
         require(
             self.control_state(Path::new(PGDATA))? == "shut down",
             "clean PostgreSQL shutdown",
         )?;
+        // Each path holds the source's setting or the new one, never none.
+        for new in switch.dropin.iter().chain(&switch.backup) {
+            match switch.previous_at(&new.path) {
+                Some(previous) => files::replace(previous, new)?,
+                None => files::install(&self.host, std::slice::from_ref(new))?,
+            }
+        }
         let setting = switch.dropin.as_ref().ok_or("missing binaries drop-in")?;
-        files::install(&self.host, std::slice::from_ref(setting))?;
-        let backup = switch.backup.as_ref().ok_or("missing backup drop-in")?;
-        files::install(&self.host, std::slice::from_ref(backup))?;
         self.host
             .run(self.host.cmd("systemctl").arg("daemon-reload"))?;
         self.check_unit(closure, &setting.text)?;
@@ -771,6 +988,146 @@ impl Deployment {
         self.healthy(&self.previous)?;
         require(self.active_timers()? == self.timers, "timer set changed")?;
         self.event("verified td-built PostgreSQL")?;
+        Ok(())
+    }
+
+    /// The explicit return from a td closure to the retained Debian server,
+    /// fenced like the switch. Minor releases of 17 share the data format,
+    /// so the Debian release may be older; the table must list it.
+    pub(super) fn postgres_to_debian(&mut self) -> R<()> {
+        require(
+            !Path::new(FENCE).try_exists()?,
+            "unfinished deployment fence: inspect previous receipt",
+        )?;
+        require(
+            self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous,
+            "the return to the Debian PostgreSQL keeps the live release",
+        )?;
+        let debian = child(Path::new(DEBIAN_TOOLS), "postgres")?;
+        require(
+            debian.try_exists()?,
+            "the retained Debian PostgreSQL tree is gone: the server can only move between td closures",
+        )?;
+        let (target, live, launcher) = to_debian_job(&self.record)?;
+        let launcher = owned(launcher)?;
+        // What the scheduled backup and the controller run from the tree.
+        for program in PROGRAMS {
+            files::trusted_binary(&child(Path::new(DEBIAN_TOOLS), program)?)?;
+        }
+        let banner = self.host.out(
+            self.host
+                .cmd(&debian)
+                .env("LD_LIBRARY_PATH", DEBIAN_LIBRARIES)
+                .arg("--version"),
+        )?;
+        require(
+            banner_minor(&banner)? == target,
+            "the retained Debian PostgreSQL is not the release the launcher read: run td-mta/deploy --postgres-binaries --to-debian again",
+        )?;
+        self.check_source()?;
+        self.socket_preflight()?;
+        crate::readiness::prepare(&self.host, false)?;
+        let source = Source::of(&self.host)?;
+        if matches!(source, Source::Debian) {
+            require(launcher.as_str() == DEBIAN_SOURCE, LIVE_CHANGED_BACK)?;
+            self.live_server(&source)?;
+            require(
+                !Path::new(BACKUP_DROPIN).try_exists()?
+                    && !self.show_backup("Environment")?.contains(STORE),
+                "the scheduled backup still names td's PostgreSQL tools: inspect td-mta-maint-backup.service.d",
+            )?;
+            self.journal_identity()?;
+            self.config(&self.previous, &[], self.isolated)?;
+            self.healthy(&self.previous)?;
+            self.event("already on the Debian PostgreSQL")?;
+            return Ok(());
+        }
+        let minor = self.live_server(&source)?;
+        require(
+            minor == live && source.name() == launcher.as_str(),
+            LIVE_CHANGED_BACK,
+        )?;
+        let previous = self.source_settings(&source)?;
+        self.journal_identity()?;
+        self.config(&self.previous, &[], self.isolated)?;
+        self.healthy(&self.previous)?;
+        let mut switch = Switch::from(source, previous);
+        self.guarded(
+            &mut switch,
+            |d, switch| d.debian_cutover(target, switch),
+            Self::restore_source,
+        )
+    }
+
+    fn debian_cutover(&mut self, target: u32, switch: &mut Switch) -> R<()> {
+        let uid = fs::metadata(PGDATA)?.uid();
+        let gid = isolation::db_group(&self.host, false)?;
+        self.prepare_fence(true, false)?;
+        self.fence(false, false)?;
+        self.socket_fence = true;
+        LiveSocket(&self.host).write_file()?;
+        switch.stopped = true;
+        self.host
+            .run(self.host.cmd("systemctl").args(["stop", PG]))?;
+        require(
+            self.control_state(Path::new(PGDATA))? == "shut down",
+            "clean PostgreSQL shutdown",
+        )?;
+        files::rollback(&switch.previous)?;
+        require(
+            !Path::new(BINARIES_DROPIN).try_exists()? && !Path::new(BACKUP_DROPIN).try_exists()?,
+            "PostgreSQL binaries drop-in remains",
+        )?;
+        self.host.select_tools(None);
+        self.host
+            .run(self.host.cmd("systemctl").arg("daemon-reload"))?;
+        // The unit's own command and the backup job's own tools again.
+        let debian = child(Path::new(DEBIAN_TOOLS), "postgres")?;
+        let property = crate::readiness::exec_start(&self.host, PG_BUS)?;
+        server_arguments(&property, debian.to_str().ok_or("Debian path")?)?;
+        require(
+            !self.show_backup("Environment")?.contains(STORE),
+            "the scheduled backup still names td's PostgreSQL tools",
+        )?;
+        self.event("scheduled backup moved to the Debian PostgreSQL tools")?;
+        self.host
+            .run(self.host.cmd("systemctl").args(["start", PG]))?;
+        self.wait(25, "Debian PostgreSQL startup", || self.ready_db(&[]))?;
+        check_socket(Path::new(SOCKET_DIR), uid, gid, 0)?;
+        self.check_source()?;
+        require(
+            fs::canonicalize(fmt(format_args!("/proc/{}/exe", self.pid(PG)?))?)?
+                == fs::canonicalize(&debian)?,
+            "PostgreSQL does not run the Debian server",
+        )?;
+        require(
+            number_minor(&self.sql(
+                "owner",
+                "SELECT current_setting('server_version_num')",
+                &[],
+                false,
+            )?)? == target,
+            "the Debian server reports another release",
+        )?;
+        // The collation versions the indexes were built under must be what
+        // the Debian C library reports, as the switch to td requires.
+        require(
+            self.sql("owner", COLLATION_VERSIONS, &[], false)? == "0",
+            "a database's collation version differs under the Debian C library",
+        )?;
+        for role in ["owner", "marker"] {
+            database_gates(&self.sql(role, DATABASE_GATES, &[], false)?, true).map_err(|e| {
+                fmt(format_args!("on the returned Debian server: {e}")).map_or(e, Into::into)
+            })?;
+        }
+        trigram(&self.sql("owner", TRIGRAM, &[], true)?)?;
+        self.event("Debian PostgreSQL started")?;
+        self.admit()?;
+        self.wait(240, "ACME lease recovery", || self.acme_online())?;
+        self.config(&self.previous, &[], self.isolated)?;
+        self.healthy(&self.previous)?;
+        require(self.active_timers()? == self.timers, "timer set changed")?;
+        self.event("verified Debian PostgreSQL")?;
         Ok(())
     }
 
@@ -874,7 +1231,7 @@ impl Deployment {
                 } else if gin {
                     require(
                         copy.superuser(host, name, GIN_INDEXES, short)? == "0",
-                        "a GIN index outside the mail database, which the switch does not rebuild; stay on the Debian server",
+                        "a GIN index outside the mail database, which the switch does not rebuild; stay on the live server",
                     )?;
                 }
                 let scan = copy.superuser(host, name, LZ4_SCAN, Duration::from_secs(3600))?;
@@ -948,9 +1305,15 @@ impl Deployment {
                 == fs::canonicalize(closure.postgres()?)?,
             "PostgreSQL does not run the td-built server",
         )?;
+        self.td_code(pid, &closure.basenames())
+    }
+
+    /// The process `pid` maps code only from `basenames` and runs without
+    /// loader variables.
+    fn td_code(&self, pid: u32, basenames: &[&str]) -> R<()> {
         let maps =
             td_fs::read_bounded(Path::new(&fmt(format_args!("/proc/{pid}/maps"))?), 1 << 22)?;
-        if let Some(path) = foreign_code(std::str::from_utf8(&maps)?, &closure.basenames()) {
+        if let Some(path) = foreign_code(std::str::from_utf8(&maps)?, basenames) {
             return Err(fmt(format_args!("td-built PostgreSQL maps code from {path}"))?.into());
         }
         let environ = td_fs::read_bounded(
@@ -966,8 +1329,8 @@ impl Deployment {
     }
 
     /// The drop-in that runs the td-built server with the arguments the unit
-    /// gives the Debian one.
-    fn binaries_dropin(&self, closure: &Closure) -> R<Setting> {
+    /// gives the source.
+    fn binaries_dropin(&self, closure: &Closure, source: &Source) -> R<Setting> {
         let mut show = self.host.cmd("systemctl");
         show.args(["show", PG]);
         for property in UNIT_PROPERTIES {
@@ -975,8 +1338,8 @@ impl Deployment {
         }
         unit_state(&self.host.out(&mut show)?)?;
         let property = crate::readiness::exec_start(&self.host, PG_BUS)?;
-        let debian = child(Path::new(DEBIAN_TOOLS), "postgres")?;
-        let args = server_arguments(&property, debian.to_str().ok_or("Debian path")?)?;
+        let source = source.postgres()?;
+        let args = server_arguments(&property, source.to_str().ok_or("server path")?)?;
         let program = closure.postgres()?;
         Ok(Setting {
             path: PathBuf::from(BINARIES_DROPIN),
@@ -985,9 +1348,9 @@ impl Deployment {
         })
     }
 
-    /// The backup job's drop-in; the job must exist. One an interrupted
-    /// run left is adopted when it says the same.
-    fn backup_dropin(&self, closure: &Closure) -> R<Setting> {
+    /// The backup job's drop-in; the job must exist. Where the source has
+    /// none, one an interrupted run left is adopted when it says the same.
+    fn backup_dropin(&self, closure: &Closure, adopt: bool) -> R<Setting> {
         let state = self.host.out(self.host.cmd("systemctl").args([
             "show",
             BACKUP,
@@ -1006,7 +1369,9 @@ impl Deployment {
             text: backup_dropin_text(bin.to_str().ok_or("store path")?)?,
             mode: 0o644,
         };
-        self.backup_adoptable(&setting)?;
+        if adopt {
+            self.backup_adoptable(&setting)?;
+        }
         Ok(setting)
     }
 
@@ -1072,14 +1437,14 @@ impl Deployment {
         )
     }
 
-    // Before writer admission: the Debian server on the same data directory.
+    // Before writer admission: the source server on the same data directory.
     // The verified store paths stay; nothing runs them.
-    fn restore_debian(&mut self, switch: &mut Switch) -> R<()> {
+    fn restore_source(&mut self, switch: &mut Switch) -> R<()> {
         if !self.fence_owned || self.admitting {
-            self.host.select_tools(None);
+            self.host.select_tools(switch.source.tools()?);
             return Ok(());
         }
-        self.event("restoring the Debian PostgreSQL before writer admission")?;
+        self.event("restoring the source PostgreSQL before writer admission")?;
         if switch.stopped {
             self.host.exec(
                 self.host.cmd("systemctl").args(["stop", PG]),
@@ -1087,7 +1452,8 @@ impl Deployment {
                 Duration::from_secs(120),
                 true,
             )?;
-            // What the td server, if it ran, left for the Debian one.
+            // What the stopped server, if it ran, left for the source, as
+            // td's pg_controldata read it.
             let state = match self.control_state(Path::new(PGDATA)) {
                 Ok(state) => state,
                 Err(e) => fmt(format_args!("unreadable: {e}"))?,
@@ -1097,26 +1463,55 @@ impl Deployment {
                 "postgres_td_control_state",
                 Json::Str(state),
             )?;
-            files::rollback(switch.dropin.iter().chain(&switch.backup))?;
+            // Path by path from what each holds, wherever the run stopped.
+            for path in DROPINS {
+                let path = Path::new(path);
+                let new = switch
+                    .dropin
+                    .iter()
+                    .chain(&switch.backup)
+                    .find(|s| s.path == path);
+                let previous = switch.previous_at(path);
+                let held = match new {
+                    Some(new) => files::held(new)?,
+                    None => Held::Absent,
+                };
+                let before = match previous {
+                    Some(previous) => Some(files::held(previous)?),
+                    None => None,
+                };
+                match (restore_step(held, before)?, new, previous) {
+                    (Restore::Remove, Some(new), _) => files::rollback([new])?,
+                    (Restore::Replace, Some(new), Some(previous)) => files::replace(new, previous)?,
+                    (Restore::PutBack, _, Some(previous)) => {
+                        files::install(&self.host, std::slice::from_ref(previous))?
+                    }
+                    _ => (),
+                }
+                // Exactly the source's drop-ins: none for the Debian server.
+                require(
+                    path.try_exists()? == previous.is_some(),
+                    "the source's PostgreSQL drop-ins are not back in place",
+                )?;
+            }
             require(
-                !Path::new(BINARIES_DROPIN).try_exists()?
-                    && !Path::new(BACKUP_DROPIN).try_exists()?,
-                "PostgreSQL binaries drop-in remains",
+                files::installed(&switch.previous)?,
+                "the source's PostgreSQL drop-ins are not back in place",
             )?;
-            self.host.select_tools(None);
+            self.host.select_tools(switch.source.tools()?);
             self.host
                 .run(self.host.cmd("systemctl").arg("daemon-reload"))?;
             self.host
                 .run(self.host.cmd("systemctl").args(["start", PG]))?;
-            self.wait(25, "Debian PostgreSQL restart", || self.ready_db(&[]))?;
+            self.wait(25, "source PostgreSQL restart", || self.ready_db(&[]))?;
             self.check_source()?;
             require(
                 fs::canonicalize(fmt(format_args!("/proc/{}/exe", self.pid(PG)?))?)?
-                    == fs::canonicalize(child(Path::new(DEBIAN_TOOLS), "postgres")?)?,
-                "the restored server is not the Debian PostgreSQL",
+                    == fs::canonicalize(switch.source.postgres()?)?,
+                "the restored server is not the source PostgreSQL",
             )?;
         }
-        self.host.select_tools(None);
+        self.host.select_tools(switch.source.tools()?);
         if self.socket_fence {
             open_socket(&mut LiveSocket(&self.host))?;
             self.socket_fence = false;
@@ -1128,7 +1523,10 @@ impl Deployment {
         set(
             &mut self.record,
             "rollback",
-            "Debian PostgreSQL restored".into(),
+            Json::Str(fmt(format_args!(
+                "source PostgreSQL restored: {}",
+                switch.source.name()
+            ))?),
         )
     }
 }

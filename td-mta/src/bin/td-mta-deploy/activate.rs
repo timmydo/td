@@ -21,7 +21,7 @@ use std::{
 use td_json::Json;
 
 #[path = "activation_binaries.rs"]
-mod binaries;
+pub(crate) mod binaries;
 #[path = "activation_database.rs"]
 mod database;
 #[path = "activation_fence.rs"]
@@ -209,7 +209,11 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
     }
     if matches!(
         mode,
-        "activate" | "postgres-socket" | "postgres-binaries" | "retire-rollback"
+        "activate"
+            | "postgres-socket"
+            | "postgres-binaries"
+            | "postgres-to-debian"
+            | "retire-rollback"
     ) {
         // Reserve the first activation receipt under the host lock. A repeated
         // invocation must leave the original event and recovery evidence intact.
@@ -220,6 +224,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "activate" => deployment.execute(),
         "postgres-socket" => deployment.postgres_socket(),
         "postgres-binaries" => deployment.postgres_binaries(),
+        "postgres-to-debian" => deployment.postgres_to_debian(),
         "retire-rollback" => deployment.retire_rollback(),
         _ => Err("unknown deployment operation".into()),
     };
