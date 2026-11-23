@@ -2,6 +2,7 @@
 use crate::activate::Deployment;
 use crate::common::{
     child, digest, durable, fmt, free_bytes, owned, private_dir, random_hex, require, set, Host,
+    DEBIAN_POSTGRES,
 };
 use crate::{isolation, service_database, R};
 use std::ffi::OsStr;
@@ -18,7 +19,6 @@ use receiver::Receiver;
 
 pub(super) const MAIL: &str = "/var/lib/td-mta/mail";
 pub(super) const PGDATA: &str = "/var/lib/td-mta/mail/postgres";
-pub(super) const TOOLS: &str = "/opt/td-mta/postgresql/usr/lib/postgresql/17/bin";
 pub(super) const CONTROL: &str = "/var/lib/td-mta-operator/physical-backup";
 pub(super) const SYSTEM: &str = "7698635942461075926";
 pub(super) const SOCKET_DIR: &str = "/var/lib/td-mta-postgres";
@@ -45,10 +45,6 @@ pub(super) struct Recovery {
     receiver: Option<Receiver>,
     unit: Option<String>,
     holder: Option<String>,
-}
-
-fn tool(name: &str) -> R<PathBuf> {
-    child(Path::new(TOOLS), name)
 }
 
 fn private_subdir(path: &Path) -> R<()> {
@@ -323,7 +319,7 @@ impl Recovery {
         self.wait(&h.host, 45, "archive recovery startup timed out", || {
             let output = h.host.exec(
                 h.host
-                    .cmd(tool("pg_isready")?)
+                    .cmd(h.host.tool("pg_isready")?)
                     .args(["-q", "-h"])
                     .arg(child(&self.runtime, "socket")?)
                     .args(["-p", "35432", "-U", "setup_admin", "-d", "td_mta"]),
@@ -365,7 +361,7 @@ impl Recovery {
         let base = child(&self.work, "base")?;
         h.host.exec(
             h.host
-                .cmd(tool("pg_basebackup")?)
+                .cmd(h.host.tool("pg_basebackup")?)
                 .args(["-w", "--no-slot", "--wal-method=stream", "-D"])
                 .arg(&base)
                 .args(["-d", "service=cutover_repl"])
@@ -375,7 +371,7 @@ impl Recovery {
             true,
         )?;
         h.host.exec(
-            h.host.cmd(tool("pg_verifybackup")?).arg(&base),
+            h.host.cmd(h.host.tool("pg_verifybackup")?).arg(&base),
             &[],
             Duration::from_secs(300),
             true,
@@ -426,11 +422,19 @@ impl Recovery {
         }
         for path in [
             Path::new("/var/lib/td-mta/backup-control"),
-            Path::new("/opt/td-mta/postgresql"),
+            Path::new(DEBIAN_POSTGRES),
             Path::new(PG_DROPIN),
             h.previous.parent().ok_or("release parent")?,
         ] {
             include(path)?;
+        }
+        // The td-built server and its closure once selected: those two store
+        // paths, not the rest of /td/store.
+        if !h.host.debian_tools() {
+            include(Path::new(crate::activate::BINARIES_DROPIN))?;
+            for path in crate::activate::selected_store(&h.host)? {
+                include(&path)?;
+            }
         }
         for file in ["service.conf", "marker.pass", "repl.pass"] {
             include(&child(Path::new(CONTROL), file)?)?;
@@ -547,18 +551,27 @@ impl Recovery {
         }
         self.config_file(&h.host, "conf", config.as_bytes())?;
         let file = fmt(format_args!("config_file={bind}/conf"))?;
-        self.launch(h, name, &data, &[owned("-c")?, file])
+        let postgres = h.host.tool("postgres")?;
+        self.launch(h, name, &data, &postgres, &[owned("-c")?, file])
     }
 
-    /// The staged production configuration on a fresh copy of the base. The
-    /// command line overrides only where the trial and its files live, keeps
-    /// its socket open whatever the fence include says, and stops archiving
-    /// and replication. The staged listen and TLS settings stay in effect.
-    pub(super) fn start_transport(&mut self, h: &Deployment, conf: &[u8], hba: &[u8]) -> R<()> {
-        let data = self.copy_base(h, "transport", false)?;
+    /// A production configuration, run by `postgres`, on a fresh copy of the
+    /// base. The command line overrides only where the trial and its files
+    /// live, keeps its socket open whatever the fence include says, and stops
+    /// archiving and replication. Listen and TLS settings stay in effect.
+    pub(super) fn start_staged(
+        &mut self,
+        h: &Deployment,
+        name: &str,
+        postgres: &Path,
+        conf: &[u8],
+        hba: &[u8],
+        ident: &[u8],
+    ) -> R<()> {
+        let data = self.copy_base(h, name, false)?;
         self.config_file(&h.host, "conf", conf)?;
         self.config_file(&h.host, "hba", hba)?;
-        self.config_file(&h.host, "ident", b"")?;
+        self.config_file(&h.host, "ident", ident)?;
         let bind = self.bind()?;
         let mut args = Vec::new();
         for setting in [
@@ -574,10 +587,17 @@ impl Recovery {
             td_alloc::push(&mut args, owned("-c")?)?;
             td_alloc::push(&mut args, setting)?;
         }
-        self.launch(h, "transport", &data, &args)
+        self.launch(h, name, &data, postgres, &args)
     }
 
-    fn launch(&mut self, h: &Deployment, name: &str, data: &Path, args: &[String]) -> R<()> {
+    fn launch(
+        &mut self,
+        h: &Deployment,
+        name: &str,
+        data: &Path,
+        postgres: &Path,
+        args: &[String],
+    ) -> R<()> {
         let bind = self.bind()?;
         let mount = child(&self.runtime, "cluster")?;
         let job = h
@@ -627,7 +647,7 @@ impl Recovery {
                 "--property=UMask=0077",
                 "--property=InaccessiblePaths=/var/lib/td-mta /var/lib/td-mta-operator /data",
             ])
-            .arg(tool("postgres")?)
+            .arg(postgres)
             .arg("-D")
             .arg(mount)
             .args(args);
@@ -673,16 +693,34 @@ impl Recovery {
         h.run(h.cmd("chown").arg("root:td-mta").arg(path))
     }
 
-    fn admin(&self, h: &Host) -> R<std::process::Command> {
-        let mut cmd = h.cmd(tool("psql")?);
+    fn admin(&self, h: &Host, database: &str) -> R<std::process::Command> {
+        let mut cmd = h.cmd(h.tool("psql")?);
         cmd.args(["-XwqAt", "-v", "ON_ERROR_STOP=1", "-h"])
             .arg(child(&self.runtime, "socket")?)
-            .args(["-p", "35432", "-U", "setup_admin", "-d", "td_mta"]);
+            .args(["-p", "35432", "-U", "setup_admin", "-d", database]);
         Ok(cmd)
     }
 
     fn local(&self, h: &Host, query: &str) -> R<String> {
-        h.out(self.admin(h)?.args(["-c", query]))
+        h.out(self.admin(h, "td_mta")?.args(["-c", query]))
+    }
+
+    /// `script` as the trial's superuser in `database`, through the trial's
+    /// own peer rule: only a trial whose HBA has that rule admits it.
+    pub(super) fn superuser(
+        &self,
+        h: &Host,
+        database: &str,
+        script: &str,
+        timeout: Duration,
+    ) -> R<String> {
+        let out = h.exec(
+            &mut self.admin(h, database)?,
+            script.as_bytes(),
+            timeout,
+            true,
+        )?;
+        owned(std::str::from_utf8(&out.stdout)?.trim())
     }
 
     pub(super) fn create_service_logins(
@@ -729,7 +767,7 @@ impl Recovery {
                 "-d",
                 "td_mta",
             ];
-            service_database::create_logins(&h.host, &tool("psql")?, &args, values)?;
+            service_database::create_logins(&h.host, &h.host.tool("psql")?, &args, values)?;
         }
         Ok(())
     }
@@ -870,7 +908,7 @@ impl Recovery {
     pub(super) fn close(&mut self, h: &Deployment) -> R<()> {
         let receiver = self.stop_receiver();
         self.stop_copy(&h.host)?;
-        for name in ["migration", "replay", "transport", "archive"] {
+        for name in ["migration", "replay", "transport", "binaries", "archive"] {
             let path = child(&self.work, name)?;
             if path.try_exists()? {
                 fs::remove_dir_all(path)?;

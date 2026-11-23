@@ -33,6 +33,9 @@ points here.
 | Private PostgreSQL connection files | `/var/lib/td-mta/mail/runtime-connection`, `/var/lib/td-mta/mail/owner-connection` |
 | PostgreSQL socket directory | `/var/lib/td-mta-postgres` (`td-mta:td-mta-db` 0750) |
 | Database writer fence (present only while fenced) | `/etc/td-mta/postgres-fence.conf` |
+| PostgreSQL server and tools, once switched | `/td/store/HASH-postgresql-x86-64-17.N/bin`, with td glibc in `/td/store/HASH-glibc-x86-64-VERSION` |
+| Retained Debian PostgreSQL | `/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` |
+| Binary selection (present only once switched) | `/etc/systemd/system/td-mta-postgres.service.d/91-td-mta-binaries.conf` |
 | Per-profile readiness and diagnostics | `/var/lib/td-mta/mail/PROFILE/runtime` |
 | System service definitions | `/etc/systemd/system/td-mta-*.service` |
 | Root-owned deployment receipts and diagnostics | `/var/lib/td-mta-operator/` |
@@ -102,9 +105,13 @@ no TLS. The socket is `td-mta:td-mta-db` mode 0660 in a 0750 directory;
 PostgreSQL runs as `td-mta` and joins the memberless system group
 `td-mta-db` through its `90-td-mta-socket.conf` drop-in, so it can give the
 socket that group. Each login authenticates with SCRAM. Its cluster is
-`/var/lib/td-mta/mail/postgres`, its configuration is
-`/var/lib/td-mta/mail/postgresql.conf`, and its retained binaries are under
-`/opt/td-mta/postgresql/usr/lib/postgresql/17/bin`. The configuration ends
+`/var/lib/td-mta/mail/postgres` and its configuration is
+`/var/lib/td-mta/mail/postgresql.conf`. It runs td's source-built
+PostgreSQL 17 from `/td/store` once switched (see "Switch PostgreSQL to
+the td-built binaries"), and the Debian binaries extracted under
+`/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` before that; they stay
+there for rollback. The deployment controller uses the client tools of
+whichever server the `91-td-mta-binaries.conf` drop-in selects. The configuration ends
 by including `/etc/td-mta/postgres-fence.conf` if it exists; only a
 deployment writes that file, while it holds the writer fence. An MTA binary
 update does not require restarting or replacing PostgreSQL.
@@ -1083,7 +1090,7 @@ selected configuration, sampled emails, recipients and body chunks.
 The backup volume directory is `/data/td-mta-physical-recovery`, root:root
 0700 on the separate data disk. The owner login uses the scheduled backup
 libpq profile in `/var/lib/td-mta/backup-control/service.conf`.
-The host uses its installed PostgreSQL 17 tools, systemd,
+The controller uses the selected PostgreSQL 17 tools, systemd,
 rsync with --fsync, tar, util-linux and the native build
 toolchain. Database passwords stay in protected files on claw1.
 
@@ -1253,3 +1260,219 @@ job above, remove `/var/lib/td-mta-operator/deployment-fence` (the
 services' start condition), start the services and timers the receipt
 recorded, require health, and run `--postgres-socket` again; on the
 socket it finishes the retirement.
+
+### Switch PostgreSQL to the td-built binaries
+
+The server first ran PostgreSQL 17 binaries extracted from Debian
+packages under `/opt/td-mta/postgresql`. td builds its own
+(`postgresql-x86-64`: no ICU, OpenSSL, lz4 or zstd), and TRUST.md, "td
+store on a foreign deployment host", says what enters the host's
+`/td/store` and what runs it. The switch keeps the live release and the
+data directory in place. The host must already use the private socket.
+
+First read the PostgreSQL 17 release notes from the live Debian minor
+up to td's release, the version in the `postgresql-x86-64` store name
+(17.12 at this writing), for steps an update needs, such as a reindex.
+Find the live minor with:
+
+```text
+sudo LD_LIBRARY_PATH=/opt/td-mta/postgresql/usr/lib/x86_64-linux-gnu \
+  /opt/td-mta/postgresql/usr/lib/postgresql/17/bin/postgres --version
+```
+
+Then run, from the reviewed development checkout:
+
+```text
+./td-mta/deploy --postgres-binaries --postgres-minor-reviewed 17.N
+```
+
+`--window-seconds` and `--jmap-account` work as for a deployment. Before
+building anything the launcher reads the live Debian `postgres
+--version` over its SSH connection (read-only) and refuses unless it
+reports the reviewed minor. In the clean checkout of the controller
+revision, it then builds td-builder and td-recipe-eval and runs
+`td-recipe-eval build-run postgresql-x86-64 postgresql-x86-64
+glibc-x86-64`. When the development machine built that revision's graph
+before, this is a cache hit; otherwise it is a cold build of up to six
+hours. The reviewed minor must not be newer than the built one. The
+launcher refuses an output whose ELF interpreter or run path leaves the
+two store paths, and resolves what each executable and shared object of
+the PostgreSQL output loads as td's loader would: every NEEDED library
+must be one already loaded or one the needing object's own run path
+finds inside the closure, never the loader's default directories or
+cache. It writes each output with `td-builder nar-dump` and uploads the
+NAR into the job directory (root 0600), checking its SHA-256 there.
+job.json records the `postgres-binaries` operation, each basename with
+its NAR hash and the reviewed minor.
+
+The controller then checks, unfenced, what an activation checks, the
+private socket, that the live server's executable is the Debian
+`postgres`, and gate 6 below. It requires that the retained
+`/opt/td-mta/bin/td-mta-operator` has the `nar-hash` and `nar-restore`
+verbs, and installs td glibc and then the PostgreSQL output. A path
+already in `/td/store` must be a root-owned directory, writable by root
+alone, and hash as built. A missing one is unpacked from its NAR after
+the file's digest matches, made root's (directories and executables
+0755, other files 0644), hashed again and renamed into place. Before
+placing a path the controller removes the partial trees
+`/td/store/.BASENAME.partial-*` that an interrupted run left for that
+basename, and nothing else. No store path is replaced or removed,
+rollback included. The job's uploaded NAR files are deleted however the
+job ends. Before any td program runs, td glibc's loader, with an empty
+environment, lists (`--list`) the server and every client below and
+every shared object under the PostgreSQL output's `lib`; every library
+it opens, links followed, must lie inside the two store paths. From
+here the controller's own clients are td's (`psql`, `pg_basebackup`,
+`pg_verifybackup`, `pg_receivewal`, `pg_isready`, `pg_controldata`,
+`pg_dump`). `postgres --version` must report the store name's release.
+
+The in-place switch needs all six gates:
+
+1. No database uses the ICU locale provider, and in no database does a
+   column, an index or any other object (a view, default, constraint or
+   partition key, through `pg_depend`) use an ICU collation.
+2. `default_toast_compression` is `pglz`, no column is set to lz4, no
+   database has an unlogged table with a variable-length column (a base
+   backup copies it empty, so the scan below cannot read its values),
+   and a `pg_column_compression` scan of every variable-length column of
+   every table and populated materialized view in every database finds
+   no lz4 value.
+3. `wal_compression` is `off`, `on` or `pglz`, never `lz4` or `zstd`.
+4. After the Debian server stops, td's `pg_controldata` reports `shut
+   down`.
+5. The td server's first start is on a fresh physical copy.
+6. `--postgres-minor-reviewed` names the live Debian minor, both as its
+   `postgres --version` and its `server_version_num` report it.
+
+Gates 1 to 3 run on the live server through the owner login (`td_mta`)
+and the marker login (`postgres`). For gate 5 the controller takes a
+fresh online base backup, checks it with td's `pg_controldata`, and
+starts td's server on it with the production `postgresql.conf` and
+`pg_hba.conf`, overriding only the trial's paths and socket, plus a peer
+rule that lets root in as `setup_admin` on that copy alone. Through a
+holder as in the socket cutover, root, the replication and marker logins
+and every login of the live release must work; the trial's executable
+must be td's, with every executable mapping inside the closure and no
+loader variable. As the copy's superuser it repeats gates 1 and 2 in
+every database that takes connections, scans every stored value for lz4
+(gate 2's scan; the error and the receipt's `postgres_lz4_values` name
+each offending column), and requires that each database's collation version
+and each used libc collation's version are what td glibc reports, and
+that every installed extension is available to td's server. Through the
+owner login `pg_trgm` must answer and serve a probe of td-mta's search
+through its trigram index, and td's `pg_dump --schema-only` of
+`td_mta` must complete. The copy is then removed.
+
+The unit must be `Type=exec` or `Type=simple` (td's server does not
+notify systemd), run exactly
+`/opt/td-mta/postgresql/usr/lib/postgresql/17/bin/postgres` with plain
+arguments, and name the Debian tree in no other command (`ExecCondition`,
+`ExecStartPre`, `ExecStartPost`, `ExecReload`, `ExecStop`,
+`ExecStopPost`) and no `Environment` variable other than the loader
+variables the drop-in unsets; the controller checks this before
+installing anything. After the rehearsal the controller fences
+the writers as an activation does, writes the database fence
+file, stops PostgreSQL, checks gate 4, and installs
+`91-td-mta-binaries.conf`: `ExecStart=` emptied and set to the td
+`postgres` with the same arguments, and
+`UnsetEnvironment=LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT`. After
+`daemon-reload` systemd's command must match it. It starts PostgreSQL
+and requires a closed socket, the production primary, td's executable
+with the closure's mappings and no loader variable, td's release in
+`server_version_num`, and the trigram probe. Then it opens the socket,
+starts the services and timers, and verifies the live release, every
+login and health as after an activation. The receipt records the store
+entries (`installed` or `present`), `postgres_debian_minor`, and the
+events `td-built PostgreSQL started` and `verified td-built
+PostgreSQL`.
+
+A failure before PostgreSQL stops leaves production as it was, apart
+from the verified store paths. A failure after it stops and before
+writer admission is reversed automatically: PostgreSQL stops, the
+drop-in goes, the Debian server starts on the same data directory and
+must be the running executable, the fence opens and the services are
+verified; the receipt records `Debian PostgreSQL restored` and, as td's
+`pg_controldata` read it before the Debian server started,
+`postgres_td_control_state`. After admission the job recovers forward on
+td's server. If the host reboots inside the window, the deployment
+fence keeps the services stopped and PostgreSQL starts on whichever
+binary the drop-in selects, with its socket closed; inspect the receipt
+before reopening writers.
+
+If the controller itself dies mid-switch (killed, power loss), recover
+by hand from the receipt; once it records `fencing`, every later mode
+refuses on the deployment fence or the stale socket fence file:
+
+- If it lacks `fencing`, the Debian server still runs unfenced and only
+  the store paths and the inert fence conditions changed: run
+  `--postgres-binaries` again.
+- Otherwise, if it lacks `td-built PostgreSQL started`, return to the
+  Debian server: stop PostgreSQL; if `91-td-mta-binaries.conf` exists,
+  remove it and run `systemctl daemon-reload`; remove
+  `/etc/td-mta/postgres-fence.conf`; start PostgreSQL and check that
+  `/proc/MAINPID/exe` is the Debian `postgres`.
+- Otherwise td's server runs on the data directory: keep the drop-in,
+  remove the fence file if present and run `sudo -u td-mta chmod 0660
+  /var/lib/td-mta-postgres/.s.PGSQL.35432`.
+
+Then, as for any interrupted job, remove
+`/var/lib/td-mta-operator/deployment-fence`, start the services and
+timers the receipt recorded and require health. The next controller run
+of any mode selects its PostgreSQL tools from the drop-in: td's while
+`91-td-mta-binaries.conf` exists, the Debian tree otherwise. Run
+`--postgres-binaries` again to finish or verify the switch; on a host
+the drop-in already switched it only verifies.
+
+Verify:
+
+```text
+systemctl show td-mta-postgres.service -p ExecStart -p UnsetEnvironment
+sudo readlink /proc/$(systemctl show -p MainPID --value td-mta-postgres.service)/exe
+```
+
+The executable is under `/td/store/`, and the effective `ExecStart` names
+the same path.
+
+If gate 1, 2 or 3, a collation version or an extension refuses, the
+in-place switch is unsafe: td's server cannot read lz4 values, has no
+ICU, and could order text differently from the indexes. Stay on the
+Debian server and plan a logical move instead, in its own maintenance
+window: with the writers stopped, take a logical backup with the
+operator's backup tooling (DEPLOYMENT.md, "Local logical backup and an
+isolated restore drill"), restore it into a new cluster that td's
+`initdb` creates (without ICU, and with `default_toast_compression` and
+`wal_compression` td supports), qualify it as the restore drill does,
+and only then point the service at it. This controller does not automate
+that move. A gate 4 or 5 failure leaves the Debian server running;
+inspect the receipt and the trial's evidence. A gate 6 refusal means the
+named minor is not the live one: read the notes from the live minor and
+run again.
+
+`--postgres-binaries` moves only from the Debian binaries to a td
+closure. Moving from one td closure to another, as after the
+`postgresql-x86-64` pin changes, is not supported yet: the controller
+refuses a host whose drop-in selects other td-built binaries. Roll back
+to the Debian binaries by hand as below, then run the switch again with
+the new closure.
+
+To return to the Debian binaries later, fence the writers by hand as for
+the socket rollback, remove `91-td-mta-binaries.conf`, run `systemctl
+daemon-reload`, restart `td-mta-postgres.service`, check that its
+executable is the Debian `postgres`, and reopen the writers. The data
+directory stays; moving back to an older 17 minor is supported unless
+the release notes between them say otherwise. The next controller run
+uses the Debian tools again. The store paths stay.
+
+Once switched, the bootstrap archive that each activation's recovery
+copy keeps includes the drop-in and the two selected store paths, not
+the rest of `/td/store`.
+
+The scheduled backup's tools are an operations setting. After the
+switch, regenerate the backup job with `--postgres-bin
+/td/store/HASH-postgresql-x86-64-17.N/bin` and without
+`--tool-library-dir`, whose library path would override td's run path
+(DEPLOYMENT.md: retain the existing definitions, regenerate, then
+replace and reload the installed unit). Until then the Debian `pg_dump`
+still dumps the 17.N server. The restore drill runs on the recovery
+host, not here; its supported layouts do not include `/td/store`, so a
+drill that should use td's tools needs that layout admitted first.

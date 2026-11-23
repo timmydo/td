@@ -278,9 +278,68 @@ during the build, as they do the kernel's; what they write is source the
 root's GCC compiles, never a runtime input. It links td zlib and no TLS
 library, since td builds none in C: a td-built server offers td-mta its
 Unix socket alone, as td-mta refuses a network connection without
-verified TLS (`td-mta/POSTGRES.md` §1).
+verified TLS (`td-mta/POSTGRES.md` §1). No image holds it yet; the
+production mail host runs it from a td store of its own (next section).
 
 Changing the root's packages is a reviewed lock change.
+
+## td store on a foreign deployment host
+
+The production mail host (`td-mta/PRODUCTION.md`) runs Debian, not td.
+The only td outputs on it are td-mta's PostgreSQL and its runtime
+closure: the `postgresql-x86-64` output and the `glibc-x86-64` output it
+loads, at the `/td/store` paths they were built for. Both are zone-one
+outputs of the recipe graph, built on the development machine from the
+revision of the deployment controller that installs them
+(`td-mta/deploy --postgres-binaries`). Nothing else of td's enters that
+store, and nothing builds into it on the host.
+
+- Entry: only the root deployment controller, under the host's
+  activation lock, writes `/td/store` (root:root 0755). The launcher
+  refuses an output whose ELF interpreter or run path leaves the two
+  store paths, dumps each path as a NAR and records its SHA-256 where it
+  was built. The hash travels in the root-only job record, and the NAR
+  into the same job directory, over the operator's pinned SSH identity.
+  The controller checks the NAR file's digest before the host's retained
+  td-builder unpacks it, makes the tree root's and writable by root
+  alone, checks its NAR hash again and renames it whole into place
+  without replacing anything. A path already present is accepted only
+  if it is a directory whose tree is root's and hashes as built. No store
+  path is overwritten or deleted, rollback included; the controller
+  removes only that basename's own partial trees an interrupted run left
+  (`.BASENAME.partial-*`), and the job's NAR files however the job ends.
+  An activation's bootstrap archive copies the two selected store paths,
+  nothing else of `/td/store`.
+- Execution: `td-mta-postgres.service` runs the server as `td-mta`
+  through a drop-in that also unsets the loader's environment
+  variables; the root controller runs the server in its trials and runs
+  the client tools. The operator may point the scheduled backup at those
+  tools; nothing else on the host runs these paths. Three checks bound
+  what the loader maps. At build, the launcher resolves every executable
+  and shared object of the PostgreSQL output as its own root, breadth
+  first as the loader does: each NEEDED name must be already loaded or
+  found through the needing object's own run path inside the closure,
+  never the loader's default directories or cache. td glibc's own
+  programs and libraries are checked only where those roots load them.
+  On the host, before any PostgreSQL program runs, td glibc's verified
+  loader lists (`--list`, empty environment) the server, every client
+  the controller runs and every shared object under the PostgreSQL
+  output's `lib`, and every path it opens, links followed, must lie in
+  the two store paths; the output's other programs, which nothing on
+  the host runs, have only the build-time check. Of the
+  running server, the controller checks that its executable is the
+  closure's and that every executable mapping comes from the two store
+  paths. td glibc is Debian's with only its interpreter path changed:
+  it keeps its compiled-in `/usr` paths and the loader's default library
+  directories and `/etc/ld.so.cache`. The host's locale data, and an NSS
+  module that the host's `nsswitch.conf` names for a lookup `files` does
+  not answer, with any library that module needs, can therefore still
+  load from the host into these programs; that is the edge of this
+  claim.
+- The debug companions ship inside the PostgreSQL output; nothing on the
+  host reads them.
+- The extracted Debian PostgreSQL stays beside it for rollback, outside
+  td's store and this class.
 
 ## Rust toolchain and dependencies
 

@@ -3,7 +3,7 @@
 use crate::{
     common::{child, digest, durable, fmt, free_bytes, owned, require, set, Host},
     isolation,
-    physical::{Recovery, GIB, MAIL, PGDATA, SYSTEM, TOOLS},
+    physical::{Recovery, GIB, MAIL, PGDATA, SYSTEM},
     probes::Probes,
     service_database::{self, Passwords, ROLES},
     R,
@@ -19,6 +19,8 @@ use std::{
 };
 use td_json::Json;
 
+#[path = "activation_binaries.rs"]
+mod binaries;
 #[path = "activation_database.rs"]
 mod database;
 #[path = "activation_fence.rs"]
@@ -27,6 +29,8 @@ mod fence;
 mod release;
 #[path = "activation_transport.rs"]
 mod transport;
+
+pub(crate) use binaries::{discard_nars, selected_store, BINARIES_DROPIN};
 
 const OP: &str = "/var/lib/td-mta-operator";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases";
@@ -180,6 +184,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         !tls || mode == "postgres-socket",
         "PostgreSQL still uses loopback TLS: run td-mta/deploy --postgres-socket",
     )?;
+    host.select_tools(binaries::selected()?);
     let mut deployment = Deployment::new(host, work, job, tls)?;
     if mode == "refresh-notifications" {
         require(
@@ -197,7 +202,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
             "shared service identities are already selected",
         )?;
     }
-    if matches!(mode, "activate" | "postgres-socket") {
+    if matches!(mode, "activate" | "postgres-socket" | "postgres-binaries") {
         // Reserve the first activation receipt under the host lock. A repeated
         // invocation must leave the original event and recovery evidence intact.
         start_receipt(&deployment.receipt, &deployment.record)?;
@@ -206,6 +211,7 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "restore-shared-services" => deployment.restore_shared_services(),
         "activate" => deployment.execute(),
         "postgres-socket" => deployment.postgres_socket(),
+        "postgres-binaries" => deployment.postgres_binaries(),
         _ => Err("unknown deployment operation".into()),
     };
     if let Err(ref err) = result {
@@ -358,19 +364,7 @@ impl Deployment {
             let passwords = service_database::passwords(self.isolation_change)?;
             isolation::provision(&self.host, &passwords)?;
             self.passwords = Some(passwords);
-            let hba = self.host.out(
-                self.host
-                    .cmd("runuser")
-                    .args(["-u", "td-mta", "--"])
-                    .arg(child(Path::new(TOOLS), "postgres")?)
-                    .args(["-D", PGDATA, "-c"])
-                    .arg(fmt(format_args!("config_file={MAIL}/postgresql.conf"))?)
-                    .args(["-C", "hba_file"]),
-            )?;
-            require(
-                Path::new(&hba) == child(Path::new(PGDATA), "pg_hba.conf")?,
-                "unexpected production HBA path",
-            )?;
+            self.hba_file()?;
         }
         let migrate = self.needs_migration()?;
         let target = self
@@ -414,6 +408,99 @@ impl Deployment {
         };
         let cleanup = self.cleanup(true);
         result.and(logs).and(close).and(cleanup)
+    }
+
+    /// Run a fenced operation that keeps the live release. A failure before
+    /// writer admission runs `restore`; once admission began it recovers
+    /// forward on whatever is selected.
+    fn guarded<S>(
+        &mut self,
+        state: &mut S,
+        operation: impl FnOnce(&mut Self, &mut S) -> R<()>,
+        restore: impl FnOnce(&mut Self, &mut S) -> R<()>,
+    ) -> R<()> {
+        let result = operation(self, state);
+        let result = if result.is_err() {
+            self.host.recover();
+            let restore = if self.admitting {
+                Ok(())
+            } else {
+                restore(self, state)
+            };
+            let admission = if self.admitting {
+                self.finish_admission()
+            } else {
+                Ok(())
+            };
+            admission.and(restore).and(result)
+        } else {
+            result
+        };
+        self.host.deadline(None);
+        let logs = self.finish_probes("listener-samples.json");
+        let cleanup = self.cleanup(true);
+        result.and(logs).and(cleanup)
+    }
+
+    /// A fresh verified base backup on the recovery volume for `trial`,
+    /// removed afterwards whatever happens.
+    fn rehearsal(&mut self, trial: impl FnOnce(&mut Self, &mut Recovery) -> R<()>) -> R<()> {
+        let mut copy = Recovery::new(self)?;
+        set(
+            &mut self.record,
+            "recovery",
+            Json::Str(owned(copy.work.to_str().ok_or("recovery path")?)?),
+        )?;
+        let result = (|| -> R<()> {
+            let size = self
+                .sql(
+                    "owner",
+                    "SELECT sum(pg_database_size(oid)) FROM pg_database",
+                    &[],
+                    false,
+                )?
+                .parse::<u64>()?;
+            require(
+                free_bytes(&copy.work)?
+                    > size
+                        .checked_mul(2)
+                        .and_then(|n| n.checked_add(4 * GIB))
+                        .ok_or("rehearsal size overflow")?,
+                "rehearsal capacity",
+            )?;
+            copy.base_backup(self)?;
+            trial(self, &mut copy)
+        })();
+        let close = copy.close(self);
+        // Unlike an activation's, a rehearsal's base backup is evidence of
+        // nothing later.
+        let base = child(&copy.work, "base").and_then(|base| {
+            if base.try_exists()? {
+                fs::remove_dir_all(base)?;
+            }
+            Ok(())
+        });
+        result.and(close).and(base)
+    }
+
+    /// Root, replication, marker and every login of the live release reach
+    /// the writable trial behind the holder `ns`.
+    fn qualify_trial(&self, ns: &[String]) -> R<()> {
+        self.wait(40, "rehearsal startup", || self.ready_db(ns))?;
+        require(
+            self.sql("owner", "SELECT pg_is_in_recovery()", ns, false)? == "f",
+            "writable rehearsal",
+        )?;
+        let identity = self.sql("replication", "IDENTIFY_SYSTEM", ns, false)?;
+        require(
+            identity.split('|').next() == Some(SYSTEM),
+            "rehearsal replication identity",
+        )?;
+        require(
+            self.sql("marker", "SELECT 1", ns, false)? == "1",
+            "rehearsal marker login",
+        )?;
+        self.config(&self.previous, ns, self.isolated)
     }
 
     fn cutover(&mut self, migration: bool, recovery: &mut Option<Recovery>) -> R<()> {

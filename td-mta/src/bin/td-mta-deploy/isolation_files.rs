@@ -149,7 +149,7 @@ pub(crate) fn safe_parents(path: &Path) -> R<()> {
     Ok(())
 }
 
-pub(super) fn trusted_binary(path: &Path) -> R<()> {
+pub(crate) fn trusted_binary(path: &Path) -> R<()> {
     let mut current = PathBuf::from(path);
     for _ in 0..40 {
         safe_parents(&current)?;
@@ -221,7 +221,7 @@ pub(super) fn installed(files: &[Setting]) -> R<bool> {
 // Both names are on the same root-owned filesystem. GNU mv uses a single
 // no-replace rename here. A killed installer leaves either the staged file
 // or a published file with exactly one link, which rollback can recognize.
-pub(super) fn publish(host: &Host, staged: &Path, target: &Path) -> R<()> {
+pub(crate) fn publish(host: &Host, staged: &Path, target: &Path) -> R<()> {
     host.run(
         host.cmd("/usr/bin/mv")
             .args(["-nT", "--"])
@@ -235,7 +235,7 @@ pub(super) fn publish(host: &Host, staged: &Path, target: &Path) -> R<()> {
     }
 }
 
-pub(super) fn install(host: &Host, files: &[Setting]) -> R<()> {
+pub(crate) fn install(host: &Host, files: &[Setting]) -> R<()> {
     install_tracking(host, files, |_| Ok(()))
 }
 

@@ -78,8 +78,8 @@ fn load_job(work: &Path, mode: &str, owner: u32) -> R<td_json::Json> {
     }
     Ok(record)
 }
-// Only the socket cutover's job names its operation; an activation job, and
-// every earlier job, does not.
+// Only the PostgreSQL socket and binary switches' jobs name their operation;
+// an activation job, and every earlier job, does not.
 fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     let declared = match job.get("mode") {
         None => None,
@@ -88,7 +88,7 @@ fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     require(
         declared
             == match mode {
-                "postgres-socket" => Some("postgres-socket"),
+                "postgres-socket" | "postgres-binaries" => Some(mode),
                 _ => None,
             },
         "job operation does not match the requested mode",
@@ -105,7 +105,10 @@ fn supervise(mode: &str) -> R<()> {
             && meta.mode() & 0o7777 == 0o700,
         "private production job required",
     )?;
-    let job = load_job(&work, mode, 0)?;
+    operate(&work, operator, mode)
+}
+fn operate(work: &Path, operator: &Path, mode: &str) -> R<()> {
+    let job = load_job(work, mode, 0)?;
     check_mode(&job, mode)?;
     let lock = OpenOptions::new()
         .write(true)
@@ -115,7 +118,14 @@ fn supervise(mode: &str) -> R<()> {
         .open(child(operator, "activation.lock")?)?;
     File::try_lock(&lock).map_err(|_| "another production operation owns the activation lock")?;
     common::block_signals()?;
-    activate::run(job, mode)
+    let result = activate::run(job, mode);
+    if mode == "postgres-binaries" {
+        // Once this job holds the lock its uploaded NARs go whatever the
+        // outcome; a store path keeps none.
+        result.and(activate::discard_nars(work))
+    } else {
+        result
+    }
 }
 fn run() -> R<()> {
     let mut args = Vec::new();
@@ -126,6 +136,7 @@ fn run() -> R<()> {
         [s, rest @ ..] if s == "__isolation" => isolation::helper(rest),
         [s] if s == "--activate" => supervise("activate"),
         [s] if s == "--postgres-socket" => supervise("postgres-socket"),
+        [s] if s == "--postgres-binaries" => supervise("postgres-binaries"),
         [s] if s == "--restore-shared-services" => supervise("restore-shared-services"),
         [s] if s == "--refresh-notifications" => supervise("refresh-notifications"),
         [s, rest @ ..]
@@ -178,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_socket_cutover_job_runs_the_socket_cutover() -> R<()> {
+    fn only_a_job_naming_a_postgres_operation_runs_it() -> R<()> {
         let plain = td_json::parse(r#"{"revision":"r"}"#)?;
         let socket = td_json::parse(r#"{"revision":"r","mode":"postgres-socket"}"#)?;
         let other = td_json::parse(r#"{"revision":"r","mode":"activate"}"#)?;
@@ -193,6 +204,12 @@ mod tests {
         }
         check_mode(&socket, "postgres-socket")?;
         assert!(check_mode(&plain, "postgres-socket").is_err());
+        let binaries = td_json::parse(r#"{"revision":"r","mode":"postgres-binaries"}"#)?;
+        check_mode(&binaries, "postgres-binaries")?;
+        assert!(check_mode(&binaries, "postgres-socket").is_err());
+        assert!(check_mode(&socket, "postgres-binaries").is_err());
+        assert!(check_mode(&plain, "postgres-binaries").is_err());
+        assert!(check_mode(&binaries, "activate").is_err());
         assert!(check_mode(&td_json::parse(r#"{"mode":1}"#)?, "postgres-socket").is_err());
         Ok(())
     }

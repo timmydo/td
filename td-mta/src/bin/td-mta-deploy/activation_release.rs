@@ -296,16 +296,20 @@ impl Deployment {
     }
 
     pub(super) fn control_state(&self, data: &Path) -> R<String> {
-        let info = self.host.out(
-            self.host
-                .cmd(child(Path::new(TOOLS), "pg_controldata")?)
-                .arg(data),
-        )?;
-        let state = info
+        self.control_field(data, "Database cluster state")
+    }
+
+    /// One field of the selected pg_controldata's report on `data`.
+    pub(super) fn control_field(&self, data: &Path, key: &str) -> R<String> {
+        let info = self
+            .host
+            .out(self.host.cmd(self.host.tool("pg_controldata")?).arg(data))?;
+        let value = info
             .lines()
-            .find_map(|line| line.strip_prefix("Database cluster state:"))
-            .ok_or("missing cluster state")?;
-        owned(state.trim())
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| (name == key).then_some(value))
+            .ok_or("missing pg_controldata field")?;
+        owned(value.trim())
     }
 
     pub(super) fn migrate(&mut self, copy: &mut Recovery) -> R<()> {
@@ -367,7 +371,7 @@ impl Deployment {
                 ))?);
             // Command-line settings override the production file and its
             // fence include: the candidate serves only its own trial socket.
-            cmd.arg(child(Path::new(TOOLS), "postgres")?)
+            cmd.arg(self.host.tool("postgres")?)
                 .args(["-D", PGDATA, "-c"])
                 .arg(fmt(format_args!("config_file={MAIL}/postgresql.conf"))?)
                 .arg("-c")

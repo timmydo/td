@@ -108,6 +108,54 @@ fn nar_hash(path: &str) -> Result<String, std::io::Error> {
     nar_hash_path(Path::new(path))
 }
 
+/// Serialize PATH as a NAR into a new file OUT, hashing the bytes as they are
+/// written; the result is the hex digest `nar-hash PATH` prints after
+/// `sha256:`. OUT is synced before returning, and removed on failure.
+fn nar_dump(path: &Path, out: &Path) -> Result<String, std::io::Error> {
+    struct Tee<W> {
+        file: W,
+        hasher: sha256::Sha256,
+    }
+    impl<W: std::io::Write> std::io::Write for Tee<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.file.write(buf)?;
+            self.hasher.update(buf.get(..n).unwrap_or_default());
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out)?;
+    let mut tee = Tee {
+        file: std::io::BufWriter::new(file),
+        hasher: sha256::Sha256::new(),
+    };
+    let written = (|| {
+        nar::write_nar(&mut tee, path)?;
+        std::io::Write::flush(&mut tee)?;
+        tee.file.get_ref().sync_all()
+    })();
+    match written {
+        Ok(()) => Ok(sha256::to_base16(&tee.hasher.finalize())),
+        // OUT was created above, so it is this call's to remove.
+        Err(e) => Err(match std::fs::remove_file(out) {
+            Ok(()) => e,
+            Err(c) => std::io::Error::new(
+                e.kind(),
+                td_engine::allocation::format(format_args!(
+                    "{e}; and {} could not be removed: {c}",
+                    out.display()
+                ))
+                .unwrap_or_default(),
+            ),
+        }),
+    }
+}
+
 /// Adapter: hash AND count the NAR bytes in one serialization pass (the seed
 /// manifest needs both the NAR hash and the NAR size — the daemon's `narSize`).
 struct HashSizeWriter {
@@ -9248,6 +9296,25 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Write PATH's NAR to OUT (a new file) and print its hash, which is
+        // nar-hash PATH: a NAR moved to another host is verified before
+        // nar-restore unpacks it, and the restored tree hashes the same.
+        Some("nar-dump") if args.len() == 4 => match args.as_slice() {
+            [_, _, path, out] => match nar_dump(Path::new(path), Path::new(out)) {
+                Ok(h) => {
+                    println!("sha256:{h}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: nar-dump {path} {out}: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ => {
+                eprintln!("usage: td-builder nar-dump PATH OUT");
+                ExitCode::FAILURE
+            }
+        },
         // The inverse of nar-hash's serializer: restore NARFILE onto DEST (which must
         // not already exist). The read side of the codec the substitute consumer uses to
         // unpack a fetched NAR; strict — a truncated/garbled archive errors, never a
@@ -12065,6 +12132,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder daemon-budget-check LOG BUDGET");
             eprintln!("       td-builder gzip-decompress GZFILE OUTFILE");
             eprintln!("       td-builder nar-hash PATH");
+            eprintln!("       td-builder nar-dump PATH OUT");
             eprintln!("       td-builder nar-restore NARFILE DEST");
             eprintln!("       td-builder tar-extract TARFILE DEST");
             eprintln!("       td-builder tar-gz-extract TAR_GZ_FILE DEST");
@@ -12104,6 +12172,33 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nar_dump_writes_the_bytes_nar_hash_names_and_restores_them() {
+        let dir = crate::test_temp::TempDir::new("td-nar-dump").unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        std::fs::write(tree.join("bin/tool"), b"payload").unwrap();
+        std::os::unix::fs::symlink("bin/tool", tree.join("link")).unwrap();
+        let nar = dir.path().join("tree.nar");
+        let hash = format!("sha256:{}", super::nar_dump(&tree, &nar).unwrap());
+        assert_eq!(hash, super::nar_hash_path(&tree).unwrap());
+        assert_eq!(
+            hash,
+            format!("sha256:{}", crate::sha256::sha256_file(&nar).unwrap())
+        );
+        // OUT must be new: a dump never overwrites.
+        assert!(super::nar_dump(&tree, &nar).is_err());
+        assert!(nar.is_file());
+        // A failed dump leaves no partial archive.
+        let partial = dir.path().join("missing.nar");
+        assert!(super::nar_dump(&dir.path().join("missing"), &partial).is_err());
+        assert!(!partial.exists());
+        let restored = dir.path().join("restored");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&nar).unwrap());
+        crate::nar::read_nar(&mut reader, &restored).unwrap();
+        assert_eq!(super::nar_hash_path(&restored).unwrap(), hash);
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

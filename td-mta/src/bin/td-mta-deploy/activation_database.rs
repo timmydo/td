@@ -34,7 +34,7 @@ impl Deployment {
             ),
             _ => return Err("unknown SQL role".into()),
         };
-        let mut cmd = self.in_namespace(ns, child(Path::new(TOOLS), "psql")?);
+        let mut cmd = self.in_namespace(ns, self.host.tool("psql")?);
         cmd.args(["-XwqAt", "-v", "ON_ERROR_STOP=1", service])
             .env("PGSERVICEFILE", file);
         if script {
@@ -48,7 +48,7 @@ impl Deployment {
     }
 
     pub(crate) fn ready_db(&self, ns: &[String]) -> R<bool> {
-        let mut cmd = self.in_namespace(ns, child(Path::new(TOOLS), "psql")?);
+        let mut cmd = self.in_namespace(ns, self.host.tool("psql")?);
         cmd.args(["-XwqAt", "service=td-mta-backup", "-c", "select 1"])
             .env("PGSERVICEFILE", OWNER_SERVICE);
         Ok(self
@@ -95,11 +95,9 @@ impl Deployment {
             fs::canonicalize(fmt(format_args!("/proc/{pid}/cwd"))?)? == Path::new(PGDATA),
             "unexpected primary data directory",
         )?;
-        let control = self.host.out(
-            self.host
-                .cmd(child(Path::new(TOOLS), "pg_controldata")?)
-                .arg(PGDATA),
-        )?;
+        let control = self
+            .host
+            .out(self.host.cmd(self.host.tool("pg_controldata")?).arg(PGDATA))?;
         require(
             control
                 .lines()
@@ -108,6 +106,26 @@ impl Deployment {
                 && self.sql("owner", "SELECT pg_is_in_recovery()", &[], false)? == "f",
             "production primary",
         )
+    }
+
+    /// The production HBA file, as the selected server reads the
+    /// production configuration.
+    pub(super) fn hba_file(&self) -> R<PathBuf> {
+        let hba = self.host.out(
+            self.host
+                .cmd("runuser")
+                .args(["-u", "td-mta", "--"])
+                .arg(self.host.tool("postgres")?)
+                .args(["-D", PGDATA, "-c"])
+                .arg(fmt(format_args!("config_file={MAIL}/postgresql.conf"))?)
+                .args(["-C", "hba_file"]),
+        )?;
+        let hba = PathBuf::from(hba);
+        require(
+            hba == child(Path::new(PGDATA), "pg_hba.conf")?,
+            "unexpected production HBA path",
+        )?;
+        Ok(hba)
     }
 
     pub(super) fn native(

@@ -139,6 +139,11 @@ fn command_property(host: &Host, unit: &str, path: &str) -> R<Json> {
             .all(|p| props.lines().any(|l| l == *p)),
         "health unit must run a fresh oneshot at each invocation",
     )?;
+    exec_start(host, path)
+}
+
+/// systemd's parsed ExecStart= list of the unit at bus object `path`.
+pub(crate) fn exec_start(host: &Host, path: &str) -> R<Json> {
     let reply = host.out(host.cmd("busctl").args([
         "--json=short",
         "get-property",

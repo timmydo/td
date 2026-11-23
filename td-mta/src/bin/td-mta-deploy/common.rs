@@ -78,8 +78,11 @@ fn hex(bytes: &[u8]) -> R<String> {
     Ok(output)
 }
 pub fn digest(path: &Path) -> R<String> {
+    digest_reader(&mut File::open(path)?)
+}
+/// SHA-256 of what `input` yields from its current position.
+pub fn digest_reader(input: &mut impl Read) -> R<String> {
     let mut hash = Provider.sha256()?;
-    let mut input = File::open(path)?;
     let mut buffer = [0; 65536];
     loop {
         let n = input.read(&mut buffer)?;
@@ -129,10 +132,59 @@ pub fn free_bytes(path: &Path) -> R<u64> {
         .trim()
         .parse()?)
 }
+/// The extracted Debian PostgreSQL production ran first and keeps for rollback.
+pub const DEBIAN_POSTGRES: &str = "/opt/td-mta/postgresql";
+pub const DEBIAN_TOOLS: &str = "/opt/td-mta/postgresql/usr/lib/postgresql/17/bin";
+pub const DEBIAN_LIBRARIES: &str = "/opt/td-mta/postgresql/usr/lib/x86_64-linux-gnu";
+const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEBIAN_PATH: &str = "/opt/td-mta/postgresql/usr/lib/postgresql/17/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// `NAME-STEM-VERSION`, a store basename the recipe graph names: a
+/// 32-character lowercase hash, the output stem and its version.
+pub fn store_basename<'a>(name: &'a str, stem: &str) -> R<&'a str> {
+    let version = name
+        .split_at_checked(32)
+        .filter(|(hash, _)| {
+            hash.bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        })
+        .and_then(|(_, rest)| rest.strip_prefix('-'))
+        .and_then(|rest| rest.strip_prefix(stem))
+        .and_then(|rest| rest.strip_prefix('-'))
+        .ok_or("unexpected store basename")?;
+    require(
+        !version.is_empty()
+            && version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)),
+        "unexpected store basename",
+    )?;
+    Ok(version)
+}
+
+/// N of a PostgreSQL `17.N` release.
+pub fn postgres_minor(version: &str) -> R<u32> {
+    let minor = version
+        .strip_prefix("17.")
+        .filter(|n| (1..=3).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or("expected a PostgreSQL 17.N release")?;
+    Ok(minor.parse()?)
+}
+
+/// N of `postgres --version`'s `postgres (PostgreSQL) 17.N`.
+pub fn banner_minor(banner: &str) -> R<u32> {
+    let rest = banner
+        .strip_prefix("postgres (PostgreSQL) ")
+        .ok_or("unexpected PostgreSQL version")?;
+    postgres_minor(rest.split_once(' ').map_or(rest, |(release, _)| release))
+}
+
 #[derive(Default)]
 pub struct Host {
     until: Mutex<Option<Instant>>,
     recovering: AtomicBool,
+    // The td-built tools' directory once selected; the Debian tree otherwise.
+    tools: Mutex<Option<PathBuf>>,
 }
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static SUPERVISING: AtomicBool = AtomicBool::new(false);
@@ -168,12 +220,36 @@ impl Host {
     pub fn cmd(&self, program: impl AsRef<OsStr>) -> Command {
         // Children must receive ordinary TERM/INT, including the WAL receiver.
         let mut cmd = Command::new("env");
-        cmd.args(["--default-signal=INT,TERM","--"]).arg(program)
-           .env_clear().env("HOME","/root").env("LANG","C").env("LC_ALL","C")
-           .env("PATH","/opt/td-mta/postgresql/usr/lib/postgresql/17/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-           .env("LD_LIBRARY_PATH","/opt/td-mta/postgresql/usr/lib/x86_64-linux-gnu")
-           .env("PGCONNECT_TIMEOUT","3");
+        cmd.args(["--default-signal=INT,TERM", "--"])
+            .arg(program)
+            .env_clear()
+            .env("HOME", "/root")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env("PGCONNECT_TIMEOUT", "3");
+        // The extracted Debian tools need its library directory. td's find
+        // their own through RUNPATH, which a library path would override.
+        if self.debian_tools() {
+            cmd.env("PATH", DEBIAN_PATH)
+                .env("LD_LIBRARY_PATH", DEBIAN_LIBRARIES);
+        } else {
+            cmd.env("PATH", SYSTEM_PATH);
+        }
         cmd
+    }
+    /// The selected PostgreSQL program `name`.
+    pub fn tool(&self, name: &str) -> R<PathBuf> {
+        let tools = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        child(tools.as_deref().unwrap_or(Path::new(DEBIAN_TOOLS)), name)
+    }
+    pub fn select_tools(&self, bin: Option<PathBuf>) {
+        *self.tools.lock().unwrap_or_else(|e| e.into_inner()) = bin;
+    }
+    pub fn debian_tools(&self) -> bool {
+        self.tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
     }
     pub fn deadline(&self, until: Option<Instant>) {
         *self.until.lock().unwrap_or_else(|e| e.into_inner()) = until;

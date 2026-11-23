@@ -1,6 +1,9 @@
 //! Select a tested main revision and submit a pinned, standalone operator job.
 use crate::{
-    common::{child, digest, fmt, owned, require, set, Host},
+    common::{
+        banner_minor, child, digest, fmt, owned, postgres_minor, require, set, store_basename,
+        Host, DEBIAN_LIBRARIES, DEBIAN_TOOLS,
+    },
     probes::now,
     R,
 };
@@ -12,15 +15,28 @@ use std::{
 };
 use td_json::Json;
 
+#[path = "launcher_closure.rs"]
+mod closure;
+
 const REMOTE: &str = "timmy@172.179.0.6";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
-const HELP:&str="Usage: td-mta/deploy [--skip-tests] [--window-seconds 1..3600] [--jmap-account ACCOUNT]\n       td-mta/deploy --postgres-socket [--window-seconds 1..3600] [--jmap-account ACCOUNT]\nSelect a verified origin/main revision and deploy it to claw1, or move the\nlive release's database from loopback TLS to its private socket.";
+const HELP: &str =
+    "Usage: td-mta/deploy [--skip-tests] [--window-seconds 1..3600] [--jmap-account ACCOUNT]
+       td-mta/deploy --postgres-socket [--window-seconds 1..3600] [--jmap-account ACCOUNT]
+       td-mta/deploy --postgres-binaries --postgres-minor-reviewed 17.N
+                     [--window-seconds 1..3600] [--jmap-account ACCOUNT]
+Select a verified origin/main revision and deploy it to claw1, move the
+live release's database from loopback TLS to its private socket, or switch
+it from the Debian PostgreSQL to td's source-built one. 17.N is the live
+Debian release whose notes up to td's release the operator read.";
 struct Options<'a> {
     skip: bool,
     budget: u64,
     account: &'a str,
     socket: bool,
+    binaries: bool,
+    reviewed: Option<&'a str>,
 }
 fn parse(args: &[String]) -> R<Options<'_>> {
     let mut out = Options {
@@ -28,6 +44,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         budget: 60,
         account: "xyz882015",
         socket: false,
+        binaries: false,
+        reviewed: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -42,12 +60,26 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             }
             "--jmap-account" => out.account = it.next().ok_or("missing JMAP account")?,
             "--postgres-socket" => out.socket = true,
+            "--postgres-binaries" => out.binaries = true,
+            "--postgres-minor-reviewed" => {
+                let release = it.next().ok_or("missing reviewed PostgreSQL release")?;
+                postgres_minor(release)?;
+                out.reviewed = Some(release);
+            }
             _ => return Err(HELP.into()),
         }
     }
     require(
-        !(out.socket && out.skip),
-        "--postgres-socket keeps the live release and selects no revision",
+        !((out.socket || out.binaries) && out.skip),
+        "a PostgreSQL operation keeps the live release and selects no revision",
+    )?;
+    require(
+        !(out.socket && out.binaries),
+        "one PostgreSQL operation per job",
+    )?;
+    require(
+        out.binaries == out.reviewed.is_some(),
+        "--postgres-binaries requires --postgres-minor-reviewed 17.N, which nothing else takes",
     )?;
     Ok(out)
 }
@@ -256,10 +288,61 @@ impl Local {
         self.sudo(&["sync", "-f", path])?;
         Ok(())
     }
-    fn upload(&self, file: &Path, dst: &str) -> R<()> {
-        let mut c = self.ssh(&["sudo", "-n", "install", "-m", "0755", "/dev/stdin", dst])?;
+    fn upload(&self, file: &Path, dst: &str, mode: &str) -> R<()> {
+        let mut c = self.ssh(&["sudo", "-n", "install", "-m", mode, "/dev/stdin", dst])?;
         let out = c.stdin(File::open(file)?).stdout(Stdio::null()).status()?;
-        require(out.success(), "controller upload failed")
+        require(out.success(), "upload failed")
+    }
+    // Into the root-only job directory, checked there.
+    fn send_nar(&self, built: &closure::Built, job: &str) -> R<()> {
+        let dst = fmt(format_args!("{job}/{}.nar", built.basename))?;
+        self.upload(&built.nar, &dst, "0600")?;
+        require(
+            self.sudo(&["sha256sum", "--", &dst])?
+                .split_whitespace()
+                .next()
+                == Some(&built.sha256),
+            "uploaded NAR mismatch",
+        )
+    }
+    // Gate 6 early, read-only: the live Debian server is the reviewed minor.
+    fn debian_release(&self, reviewed: &str) -> R<()> {
+        let library = fmt(format_args!("LD_LIBRARY_PATH={DEBIAN_LIBRARIES}"))?;
+        let server = child(Path::new(DEBIAN_TOOLS), "postgres")?;
+        let banner = self.sudo(&[
+            "env",
+            "-i",
+            &library,
+            server.to_str().ok_or("Debian path")?,
+            "--version",
+        ])?;
+        require(
+            banner_minor(&banner)? == postgres_minor(reviewed)?,
+            "--postgres-minor-reviewed must name the live Debian release",
+        )
+    }
+    fn cargo(&self, checkout: &Path) -> R<Command> {
+        let mut build = Command::new("cargo");
+        build.current_dir(checkout);
+        // The Guix seed puts its host GCC runtime outside the dynamic loader's
+        // search path. Cargo's build scripts and proc macros run on that host.
+        if Path::new("/gnu/store").is_dir() {
+            let runtime = self
+                .host
+                .out(Command::new("cc").arg("-print-file-name=libgcc_s.so.1"))?;
+            let path = Path::new(&runtime);
+            if path.is_absolute() && path.is_file() {
+                let mut directory = fs::canonicalize(path)?;
+                require(directory.pop(), "compiler runtime directory")?;
+                let previous = std::env::var_os("LD_LIBRARY_PATH");
+                let inherited = previous.iter().flat_map(std::env::split_paths);
+                build.env(
+                    "LD_LIBRARY_PATH",
+                    std::env::join_paths(std::iter::once(directory).chain(inherited))?,
+                );
+            }
+        }
+        Ok(build)
     }
     fn artifact(&self, temp: &Path, controller: &str) -> R<PathBuf> {
         let checkout = child(temp, "source")?;
@@ -282,28 +365,10 @@ impl Local {
             true,
         )?;
         let target = child(temp, "target")?;
-        let mut build = Command::new("cargo");
-        build.current_dir(&checkout)
+        let mut build = self.cargo(&checkout)?;
+        build
             .args(["build","--frozen","--release","--target","x86_64-unknown-linux-musl","--bin","td-mta-deploy","--manifest-path","td-mta/Cargo.toml","--target-dir"]).arg(&target)
             .env("CARGO_ENCODED_RUSTFLAGS",fmt(format_args!("-Clinker=rust-lld\x1f-Ctarget-feature=+crt-static\x1f--remap-path-prefix={}=/td-deploy-source",checkout.display()))?);
-        // The Guix seed puts its host GCC runtime outside the dynamic loader's
-        // search path. Cargo's build scripts and proc macros run on that host.
-        if Path::new("/gnu/store").is_dir() {
-            let runtime = self
-                .host
-                .out(Command::new("cc").arg("-print-file-name=libgcc_s.so.1"))?;
-            let path = Path::new(&runtime);
-            if path.is_absolute() && path.is_file() {
-                let mut directory = fs::canonicalize(path)?;
-                require(directory.pop(), "compiler runtime directory")?;
-                let previous = std::env::var_os("LD_LIBRARY_PATH");
-                let inherited = previous.iter().flat_map(std::env::split_paths);
-                build.env(
-                    "LD_LIBRARY_PATH",
-                    std::env::join_paths(std::iter::once(directory).chain(inherited))?,
-                );
-            }
-        }
         require(
             build.status()?.success(),
             "building pinned static controller failed",
@@ -330,7 +395,7 @@ impl Local {
         self.sudo(&["install", "-d", "-m", "0755", &dir])?;
         let jobname = job.rsplit('/').next().ok_or("job name")?;
         let stage = fmt(format_args!("{dir}/.{jobname}"))?;
-        self.upload(bin, &stage)?;
+        self.upload(bin, &stage, "0755")?;
         require(
             self.sudo(&["sha256sum", "--", &stage])?
                 .split_whitespace()
@@ -458,7 +523,7 @@ pub(super) fn run(args: &[String]) -> R<()> {
         Some(p) => PathBuf::from(p),
         None => child(&home, ".local/state/td/main-integration")?,
     };
-    let (selected, verdict) = if opts.socket {
+    let (selected, verdict) = if opts.socket || opts.binaries {
         require(
             local.is_ancestor(live, &tip)?,
             "live release is not an ancestor of advertised main",
@@ -474,10 +539,26 @@ pub(super) fn run(args: &[String]) -> R<()> {
     )?;
     revision(&tree)?;
     println!("claw1 current {live}, selected {selected}");
+    if let Some(reviewed) = opts.reviewed {
+        local.debian_release(reviewed)?;
+    }
     let cache = child(&local.root, ".td-build-cache")?;
     fs::create_dir_all(&cache)?;
     let scratch = td_fs::TempDir::new_in(&cache, "mta-deploy")?;
     let binary = local.artifact(scratch.path(), &controller)?;
+    let closure = match opts.reviewed {
+        Some(reviewed) => {
+            let built = local.closure(scratch.path())?;
+            let server = built.first().ok_or("missing PostgreSQL output")?;
+            require(
+                postgres_minor(reviewed)?
+                    <= postgres_minor(store_basename(&server.basename, "postgresql-x86-64")?)?,
+                "--postgres-minor-reviewed is newer than the td-built server",
+            )?;
+            Some(built)
+        }
+        None => None,
+    };
     let before = local.qualify_jmap(opts.account)?;
     if selected != live {
         let key = local.key.to_str().ok_or("invalid SSH key path")?;
@@ -512,6 +593,9 @@ pub(super) fn run(args: &[String]) -> R<()> {
         "invalid operator job",
     )?;
     let (program, hash) = local.install(&binary, &controller, &job)?;
+    for built in closure.iter().flatten() {
+        local.send_nar(built, &job)?;
+    }
     let mut spec = Json::Obj(Vec::new());
     for (k, v) in [
         ("previous", live),
@@ -526,6 +610,22 @@ pub(super) fn run(args: &[String]) -> R<()> {
     set(&mut spec, "skip_tests", Json::Bool(opts.skip))?;
     if opts.socket {
         set(&mut spec, "mode", Json::Str(owned("postgres-socket")?))?;
+    }
+    if let (Some(built), Some(reviewed)) = (&closure, opts.reviewed) {
+        set(&mut spec, "mode", Json::Str(owned("postgres-binaries")?))?;
+        let mut entries = Vec::new();
+        for item in built {
+            let mut entry = Json::Obj(Vec::new());
+            set(&mut entry, "basename", Json::Str(owned(&item.basename)?))?;
+            set(&mut entry, "nar_sha256", Json::Str(owned(&item.sha256)?))?;
+            td_alloc::push(&mut entries, entry)?;
+        }
+        set(&mut spec, "closure", Json::Arr(entries))?;
+        set(
+            &mut spec,
+            "postgres_minor_reviewed",
+            Json::Str(owned(reviewed)?),
+        )?;
     }
     set(&mut spec, "budget", Json::from(opts.budget))?;
     set(&mut spec, "verdict", verdict.map_or(Json::Null, Json::Str))?;
@@ -562,6 +662,8 @@ pub(super) fn run(args: &[String]) -> R<()> {
             &program,
             if opts.socket {
                 "--postgres-socket"
+            } else if opts.binaries {
+                "--postgres-binaries"
             } else {
                 "--activate"
             },

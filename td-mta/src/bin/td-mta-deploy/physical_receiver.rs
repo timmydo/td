@@ -1,5 +1,5 @@
 //! Own the WAL receiver until it flushes or a recovery budget is exhausted.
-use super::{tool, CONTROL, GIB};
+use super::{CONTROL, GIB};
 use crate::common::{child, fmt, free_bytes, require, Host};
 use crate::R;
 use std::fs::{self, File};
@@ -76,7 +76,7 @@ impl Receiver {
     pub(super) fn start(host: &Host, work: &Path) -> R<Self> {
         let wal = child(work, "wal")?;
         let output = File::create(child(work, "receiver.log")?)?;
-        let mut child_process = host.cmd(tool("pg_receivewal")?);
+        let mut child_process = host.cmd(host.tool("pg_receivewal")?);
         child_process
             .args(["-wn", "--verbose", "--synchronous", "-D"])
             .arg(&wal)

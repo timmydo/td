@@ -17,8 +17,8 @@ const PG_DROPIN_TEXT: &str = "[Service]\nSupplementaryGroups=td-mta-db\n";
 const RENEW: &str = "td-mta-maint-postgres-tls-renew.timer";
 const RENEW_SERVICE: &str = "td-mta-maint-postgres-tls-renew.service";
 const RENEW_SCHEDULE: &str = "td-mta-maint-postgres-tls-renew.scm";
-const CONF_LIMIT: u64 = 64 * 1024;
-const FILE_LIMIT: u64 = 16 * 1024;
+pub(super) const CONF_LIMIT: u64 = 64 * 1024;
+pub(super) const FILE_LIMIT: u64 = 16 * 1024;
 const DROPPED: &[&str] = &[
     "listen_addresses",
     "ssl",
@@ -157,7 +157,7 @@ pub(super) fn postgresql_conf(text: &str, settings: &str) -> R<String> {
     Ok(out)
 }
 
-fn role_name(s: &str) -> bool {
+pub(super) fn role_name(s: &str) -> bool {
     s.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
         && s.len() <= 63
         && s.bytes()
@@ -348,7 +348,7 @@ pub(super) fn tcp_listening(table: &str) -> R<bool> {
     Ok(false)
 }
 
-fn check_socket(directory: &Path, uid: u32, gid: u32, mode: u32) -> R<()> {
+pub(super) fn check_socket(directory: &Path, uid: u32, gid: u32, mode: u32) -> R<()> {
     let dir = fs::symlink_metadata(directory)?;
     require(
         dir.is_dir() && dir.uid() == uid && dir.gid() == gid && dir.mode() & 0o7777 == 0o750,
@@ -364,7 +364,7 @@ fn check_socket(directory: &Path, uid: u32, gid: u32, mode: u32) -> R<()> {
     )
 }
 
-fn read_file(path: &Path, limit: u64) -> R<(Vec<u8>, fs::Metadata)> {
+pub(super) fn read_file(path: &Path, limit: u64) -> R<(Vec<u8>, fs::Metadata)> {
     let (mut file, meta) = td_fs::open_real_file(path, "production file")?;
     require(
         meta.len() <= limit && meta.nlink() == 1,
@@ -520,7 +520,7 @@ impl Deployment {
         for &(setting, expected) in STAGED_SETTINGS {
             let mut cmd = self.in_namespace(ns, "runuser");
             cmd.args(["-u", "td-mta", "--"])
-                .arg(child(Path::new(TOOLS), "postgres")?)
+                .arg(self.host.tool("postgres")?)
                 .args(["-D", PGDATA, "-c"])
                 .arg(fmt(format_args!("config_file={MAIL}/postgresql.conf"))?)
                 .args(["-C", setting]);
@@ -599,27 +599,11 @@ impl Deployment {
             touched: false,
             renew_excluded: false,
         };
-        let result = self.socket_cutover(&mut cut, gid);
-        let result = if result.is_err() {
-            self.host.recover();
-            let restore = if self.admitting {
-                Ok(())
-            } else {
-                self.restore_transport(&mut cut)
-            };
-            let admission = if self.admitting {
-                self.finish_admission()
-            } else {
-                Ok(())
-            };
-            admission.and(restore).and(result)
-        } else {
-            result
-        };
-        self.host.deadline(None);
-        let logs = self.finish_probes("listener-samples.json");
-        let cleanup = self.cleanup(true);
-        result.and(logs).and(cleanup)
+        self.guarded(
+            &mut cut,
+            |d, cut| d.socket_cutover(cut, gid),
+            Self::restore_transport,
+        )
     }
 
     fn socket_cutover(&mut self, cut: &mut Cutover, gid: u32) -> R<()> {
@@ -731,20 +715,7 @@ impl Deployment {
         let settings = socket_settings(SOCKET_DIR, isolation::DB_GROUP, PG_FENCE)?;
         let new = postgresql_conf(std::str::from_utf8(&old)?, &settings)?;
         cut.add(&conf, Some((old, meta)), new, true)?;
-        let hba = self.host.out(
-            self.host
-                .cmd("runuser")
-                .args(["-u", "td-mta", "--"])
-                .arg(child(Path::new(TOOLS), "postgres")?)
-                .args(["-D", PGDATA, "-c"])
-                .arg(fmt(format_args!("config_file={MAIL}/postgresql.conf"))?)
-                .args(["-C", "hba_file"]),
-        )?;
-        let hba = PathBuf::from(hba);
-        require(
-            hba == child(Path::new(PGDATA), "pg_hba.conf")?,
-            "unexpected production HBA path",
-        )?;
+        let hba = self.hba_file()?;
         let (old, meta) = read_file(&hba, CONF_LIMIT)?;
         let new = pg_hba(std::str::from_utf8(&old)?)?;
         cut.add(&hba, Some((old, meta)), new, false)?;
@@ -858,72 +829,27 @@ impl Deployment {
     }
 
     fn rehearse(&mut self, cut: &Cutover, uid: u32, gid: u32) -> R<()> {
-        let mut copy = Recovery::new(self)?;
-        set(
-            &mut self.record,
-            "recovery",
-            Json::Str(owned(copy.work.to_str().ok_or("recovery path")?)?),
-        )?;
-        let result = (|| -> R<()> {
-            let size = self
-                .sql(
-                    "owner",
-                    "SELECT sum(pg_database_size(oid)) FROM pg_database",
-                    &[],
-                    false,
-                )?
-                .parse::<u64>()?;
-            require(
-                free_bytes(&copy.work)?
-                    > size
-                        .checked_mul(2)
-                        .and_then(|n| n.checked_add(4 * GIB))
-                        .ok_or("rehearsal size overflow")?,
-                "socket rehearsal capacity",
-            )?;
-            copy.base_backup(self)?;
+        self.rehearsal(|d, copy| {
             let conf = cut.file(&child(Path::new(MAIL), "postgresql.conf")?)?;
             let hba = cut.file(&child(Path::new(PGDATA), "pg_hba.conf")?)?;
-            copy.start_transport(self, &conf.new, &hba.new)?;
+            let postgres = d.host.tool("postgres")?;
+            copy.start_staged(d, "transport", &postgres, &conf.new, &hba.new, b"")?;
             let mut binds = Vec::new();
             for file in cut.files.iter().filter(|f| f.bind) {
                 td_alloc::push(&mut binds, (file.staged.as_path(), file.target.as_path()))?;
             }
-            let ns = copy.hold(self, "transport", &binds)?;
-            self.wait(40, "socket rehearsal startup", || self.ready_db(&ns))?;
-            require(
-                self.sql("owner", "SELECT pg_is_in_recovery()", &ns, false)? == "f",
-                "writable socket rehearsal",
-            )?;
-            let identity = self.sql("replication", "IDENTIFY_SYSTEM", &ns, false)?;
-            require(
-                identity.split('|').next() == Some(SYSTEM),
-                "socket rehearsal replication identity",
-            )?;
-            require(
-                self.sql("marker", "SELECT 1", &ns, false)? == "1",
-                "socket rehearsal marker login",
-            )?;
+            let ns = copy.hold(d, "transport", &binds)?;
             // The live release must admit the group-shared socket.
-            self.config(&self.previous, &ns, self.isolated)?;
-            self.socket_settings(&ns)?;
+            d.qualify_trial(&ns)?;
+            d.socket_settings(&ns)?;
             check_socket(&child(&copy.runtime, "socket")?, uid, gid, 0o660)?;
-            let pid = copy.trial_pid(&self.host)?;
+            let pid = copy.trial_pid(&d.host)?;
             for table in ["tcp", "tcp6"] {
                 let rows = fs::read_to_string(fmt(format_args!("/proc/{pid}/net/{table}"))?)?;
                 require(!tcp_listening(&rows)?, "rehearsal TCP listener")?;
             }
             Ok(())
-        })();
-        let close = copy.close(self);
-        // Unlike an activation's, this base backup is evidence of nothing later.
-        let base = child(&copy.work, "base").and_then(|base| {
-            if base.try_exists()? {
-                fs::remove_dir_all(base)?;
-            }
-            Ok(())
-        });
-        result.and(close).and(base)
+        })
     }
 
     // Every original is unchanged since staging and is kept for rollback.
