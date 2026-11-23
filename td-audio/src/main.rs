@@ -89,6 +89,7 @@ usage: td-audio devices [--proc PATH]
        td-audio probe [--socket PATH]
        td-audio status [--socket PATH]
        td-audio outputs [--socket PATH]
+       td-audio output [--socket PATH] NAME
        td-audio volume [--socket PATH] [LEVEL]
        td-audio mute [--socket PATH] [on|off|toggle]
        td-audio apps [--socket PATH]
@@ -106,6 +107,7 @@ usage: td-audio devices [--proc PATH]
   probe        connect to the supervised daemon's socket
   status       the active output, its level and mute, and the stream count
   outputs      every output; the active one is marked
+  output       make the output NAME (or its number) the one that plays
   volume       print the output's level, or set it: 40%, +5% or -5%
   mute         print the output's mute, or set it
   apps         each application's level and mute, then each of its streams

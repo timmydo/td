@@ -23,7 +23,7 @@ use td_pulse::tag;
 
 /// The personalities this module answers for.
 pub const PERSONALITIES: &[&str] = &[
-    "status", "outputs", "volume", "mute", "apps", "app", "watch",
+    "status", "outputs", "output", "volume", "mute", "apps", "app", "watch",
 ];
 
 const SUCCESS: u8 = 0;
@@ -87,6 +87,7 @@ fn run(
 enum Command<'a> {
     Status,
     Outputs,
+    Output(&'a str),
     Volume(Option<Level>),
     Mute(Option<Switch>),
     Apps,
@@ -114,6 +115,7 @@ fn parse<'a>(personality: &str, words: &'a [OsString]) -> Option<Command<'a>> {
     Some(match (personality, words) {
         ("status", []) => Command::Status,
         ("outputs", []) => Command::Outputs,
+        ("output", [name]) => Command::Output(text(name).filter(|name| is_sink_name(name))?),
         ("volume", []) => Command::Volume(None),
         ("volume", [value]) => Command::Volume(Some(parse_level(text(value)?)?)),
         ("mute", []) => Command::Mute(None),
@@ -133,6 +135,14 @@ fn parse<'a>(personality: &str, words: &'a [OsString]) -> Option<Command<'a>> {
         ("watch", []) => Command::Watch,
         _ => return None,
     })
+}
+
+/// What `output` may send as a sink's name. A flag is a usage error, not
+/// a name; an output whose name starts with `-` is named by its number.
+/// Nor is a name longer than the protocol carries, which the daemon would
+/// hang up on.
+fn is_sink_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('-') && name.len() <= tag::STRING_MAX
 }
 
 /// `40%` or `40` sets a level; `+5%` and `-5%` step from the one read.
@@ -259,6 +269,7 @@ fn refusal(code: u32) -> &'static str {
         error::ACCESS => "access denied",
         error::INVALID => "invalid argument",
         error::NOENTITY => "no such entity",
+        error::NOTSUPPORTED => "not supported",
         error::TOOLARGE => "too large",
         error::NOTIMPLEMENTED => "not implemented, or not for this account",
         _ => "an error td-audio does not name",
@@ -474,6 +485,18 @@ fn execute<'a>(
                 .map_err(output)?;
             }
         }
+        Command::Output(name) => {
+            client.set_default_sink(name)?;
+            // What the daemon made default, by its name: `0` or
+            // `@DEFAULT_SINK@` resolve to one.
+            let server = client.server_info()?;
+            writeln!(
+                out,
+                "output {}",
+                Token(server.default_sink.as_deref().unwrap_or(""))
+            )
+            .map_err(output)?;
+        }
         Command::Volume(wanted) => {
             let sink = client.sink(DEFAULT_SINK)?;
             let mut shown = percent(level(&sink.volume));
@@ -614,7 +637,7 @@ mod tests {
     use crate::mixer::VOLUME_NORM;
     use crate::serve::tests::{
         admit_as, auth_packet, browser_policy, client_name_packet, created_sink_input,
-        drain_socket, named_create_request, own_uid, BROWSER_UID,
+        drain_socket, named_create_request, offer_outputs, own_uid, BROWSER_UID,
     };
     use crate::serve::Server;
     use crate::sink::{AudioSink, MemorySink, Spec};
@@ -760,6 +783,109 @@ mod tests {
         let (code, out, err) = cli(socket, personality, words);
         assert_eq!((code, err.as_str()), (0, ""), "{personality} {words:?}");
         out
+    }
+
+    /// `output NAME` makes an output the one that plays, by name or by
+    /// number, and says which by name; `outputs` and `status` follow it. An
+    /// output the daemon has not is refused, an output that will not open
+    /// is refused with the old one still playing, and a missing or empty
+    /// name is a usage error.
+    #[test]
+    fn output_switches_the_output_that_plays() {
+        let daemon = daemon("cli-output", |server, _| {
+            offer_outputs(
+                server,
+                &[
+                    (0, "pch-0", "ALC892 Analog"),
+                    (1, "device-0", "USB Audio"),
+                    (7, "locked-0", "Locked"),
+                    (8, "small-0", "Small Ring"),
+                ],
+            );
+        });
+        let socket = daemon.path.clone();
+        let at = |personality: &str, words: &[&str]| ok(&socket, personality, words);
+        assert_eq!(
+            at("outputs", &[]),
+            "output 0 pch-0 active ALC892 Analog\n\
+             output 1 device-0 - USB Audio\n\
+             output 2 locked-0 - Locked\n\
+             output 3 small-0 - Small Ring\n"
+        );
+        assert_eq!(at("output", &["device-0"]), "output device-0\n");
+        assert_eq!(
+            at("outputs", &[]),
+            "output 0 pch-0 - ALC892 Analog\n\
+             output 1 device-0 active USB Audio\n\
+             output 2 locked-0 - Locked\n\
+             output 3 small-0 - Small Ring\n"
+        );
+        assert_eq!(at("output", &["0"]), "output pch-0\n");
+        assert_eq!(
+            at("status", &[]),
+            "output pch-0\nvolume 100%\nmute off\nstreams 0\n"
+        );
+        for (name, why) in [
+            ("hdmi-9", "no such entity"),
+            ("locked-0", "access denied"),
+            ("small-0", "not supported"),
+        ] {
+            let (code, out, err) = cli(&socket, "output", &[name]);
+            assert_eq!(
+                (code, out.as_str(), err),
+                (1, "", format!("td-audio: the daemon refused: {why}\n")),
+                "{name}"
+            );
+        }
+        assert_eq!(at("output", &["@DEFAULT_SINK@"]), "output pch-0\n");
+        let long = "a".repeat(td_pulse::tag::STRING_MAX + 1);
+        for words in [
+            &[][..],
+            &[""],
+            &["a", "b"],
+            &["--help"],
+            &["-h"],
+            &["--socket"],
+            &[long.as_str()],
+        ] {
+            let (code, out, err) = cli(&socket, "output", words);
+            assert_eq!(
+                (code, out.as_str(), err.as_str()),
+                (
+                    2,
+                    "",
+                    "td-audio: usage:\n  td-audio output [--socket PATH] NAME\n"
+                ),
+                "{words:?}"
+            );
+        }
+    }
+
+    /// The personalities this module answers for, the usage forms, and the
+    /// commands `main` runs itself are one set: a personality dropped from
+    /// the list would leave its usage line, and its tests, pointing at a
+    /// command the binary no longer has.
+    #[test]
+    fn every_usage_form_has_a_command_and_every_personality_a_form() {
+        const RUN_BY_MAIN: &[&str] = &["devices", "tone", "verify-tone", "serve", "probe"];
+        let forms: Vec<&str> = crate::USAGE
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("td-audio ") || line.starts_with("usage: td-audio "))
+            .filter_map(|line| line.trim_start_matches("usage: ").split(' ').nth(1))
+            .collect();
+        for form in &forms {
+            assert!(
+                PERSONALITIES.contains(form) || RUN_BY_MAIN.contains(form),
+                "{form} has a usage form and no command"
+            );
+        }
+        for personality in PERSONALITIES {
+            assert!(
+                forms.contains(personality),
+                "{personality} has no usage form"
+            );
+        }
     }
 
     /// Lines in an order-free form: a session's streams are not ordered.

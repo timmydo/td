@@ -150,6 +150,11 @@ impl OutputSet {
                 if let Some(position) = self.entries().iter().position(|entry| entry.name == name) {
                     return Some(position);
                 }
+                // Plain decimal digits: upstream refuses a sign, and so does
+                // this, where `parse` would take one.
+                if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
                 let index = name.parse::<u32>().ok()?;
                 self.by_index(index)
             }
@@ -258,6 +263,9 @@ mod tests {
         assert_eq!(set.resolve(1, None), Some(1));
         assert_eq!(set.resolve(INVALID_INDEX, Some("device-0")), Some(1));
         assert_eq!(set.resolve(INVALID_INDEX, Some("1")), Some(1));
+        assert_eq!(set.resolve(INVALID_INDEX, Some("+1")), None, "a sign");
+        assert_eq!(set.resolve(INVALID_INDEX, Some(" 1")), None, "a space");
+        assert_eq!(set.resolve(INVALID_INDEX, Some("01")), Some(1));
         assert_eq!(set.resolve(INVALID_INDEX, Some(DEFAULT_SINK)), Some(0));
         assert_eq!(set.resolve(INVALID_INDEX, Some(SINK_NAME)), Some(0));
         assert!(set.set_active(1));

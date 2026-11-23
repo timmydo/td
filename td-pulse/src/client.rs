@@ -355,6 +355,16 @@ impl<T: Transport> Client<T> {
         })
     }
 
+    /// Make the sink `name` names the default: the output that plays. A
+    /// number is sent as a name, as `pactl` sends it. A name holding a NUL
+    /// cannot be a string on the wire and goes as the NULL string, which
+    /// upstream reads as "the automatic default" and td-audio refuses.
+    pub fn set_default_sink(&mut self, name: &str) -> Result<(), T::Error> {
+        self.acknowledged(command::SET_DEFAULT_SINK, |writer| {
+            writer.string(name);
+        })
+    }
+
     pub fn sink_inputs(&mut self) -> Result<Listing<SinkInput>, T::Error> {
         let packet = self.call(command::GET_SINK_INPUT_INFO_LIST, |_| {})?;
         Ok(Listing {
@@ -874,6 +884,12 @@ mod tests {
             }),
             (captured_17::SET_SINK_UNMUTE_BY_INDEX, 4, |client| {
                 client.set_sink_mute(0, false).unwrap();
+            }),
+            (captured_17::SET_DEFAULT_SINK_BY_NAME, 2, |client| {
+                client.set_default_sink("pch-3").unwrap();
+            }),
+            (captured_17::SET_DEFAULT_SINK_BY_NUMBER_NAME, 2, |client| {
+                client.set_default_sink("2").unwrap();
             }),
             (captured::SET_SINK_INPUT_VOLUME, 16, |client| {
                 client.set_sink_input_volume(0, &[0x8000, 0x8000]).unwrap();

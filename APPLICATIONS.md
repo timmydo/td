@@ -8766,20 +8766,24 @@ already; `td-portal` has since taken `#12`):
 restricted to `SOL_SOCKET`/`SO_PEERCRED` with a pinned 12-byte
 `[i32; 3]`. The landed multicall provides the server, deterministic ALSA
 and WAV tone paths, WAV verification, device enumeration and a live-socket
-probe, plus the control personalities `status`, `outputs`, `volume`,
-`mute`, `apps`, `app` and `watch`. Those are ordinary Pulse clients of the
-daemon's own socket, so policy tooling costs no second protocol, and they
-are controllers only when run as a controller uid. They print one
-`key value` fact per line, with daemon text stripped of what a terminal
-acts on, and exit 0 on success, 1 when the daemon refuses or cannot be
-reached, and 2 on a usage error. Levels are whole percents of
-`PA_VOLUME_NORM`, clamped to 0–100, and a `+5%` or `-5%` step starts from
-the level just read. `app NAME` addresses the application its streams
-name, or `client-N` for a client that named itself nothing or a name of
-that form; on a player's streams that is the human's level for it, so it
-needs one of them to be playing, and a stream that ended meanwhile is
-passed over. Each command but `watch`'s wait for events has one
-five-second deadline, which a daemon that drips bytes cannot stretch.
+probe, plus the control personalities `status`, `outputs`, `output`,
+`volume`, `mute`, `apps`, `app` and `watch`. Those are ordinary Pulse
+clients of the daemon's own socket, so policy tooling costs no second
+protocol, and they are controllers only when run as a controller uid.
+They print one `key value` fact per line, with daemon text stripped of
+what a terminal acts on, and exit 0 on success, 1 when the daemon
+refuses or cannot be reached, and 2 on a usage error. Levels are whole
+percents of `PA_VOLUME_NORM`, clamped to 0–100, and a `+5%` or `-5%`
+step starts from the level just read. `app NAME` addresses the
+application its streams name, or `client-N` for a client that named
+itself nothing or a name of that form; on a player's streams that is the
+human's level for it, so it needs one of them to be playing, and a
+stream that ended meanwhile is passed over. `output NAME` switches the
+output that plays (§K.4) by sink name, or by number for a name that
+starts with `-`, and prints the one the daemon then names its default; a
+refused switch leaves the old one playing. Each command but `watch`'s
+wait for events has one five-second deadline, which a daemon that drips
+bytes cannot stretch.
 The protocol codec they share with the daemon, the pstream framing, the
 tagstruct reader and writer and the captured command table, is the
 separate safe, std-only `td-pulse` crate, which
@@ -8999,8 +9003,9 @@ the output is the one the captured fixtures describe. A protocol volume
 is an amplitude by the cube of its fraction of unity, libpulse's own
 `pa_sw_volume_to_linear` and the inverse of what Firefox's backend
 applies before sending, and nothing is amplified above unity. A sink
-named by its decimal index resolves as the index: `pactl` sends
-`pactl get-sink-volume 0` as the name `"0"`.
+named by its decimal index, in plain digits with no sign or space,
+resolves as the index: `pactl` sends `pactl get-sink-volume 0` as the
+name `"0"`.
 A controller or the compositor is shown every output (§K.4) as its own
 sink, indexed from zero in that order: the active one in the mixer's
 state, the others `SUSPENDED`, each with its own level and mute, and the

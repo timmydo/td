@@ -491,9 +491,13 @@ impl<S: AudioSink> Server<S> {
     /// `bind` was given, and open the others with `open` when one is asked
     /// for or the active one is lost.
     pub fn with_outputs(mut self, outputs: OutputSet, open: Open<S>) -> Self {
+        self.offer(outputs, open);
+        self
+    }
+
+    fn offer(&mut self, outputs: OutputSet, open: Open<S>) {
         *self.mixer.outputs_mut() = outputs;
         self.open = Some(open);
-        self
     }
 
     /// The most any one client is owed and has not taken.
@@ -4289,13 +4293,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// A daemon offering `outputs`, `(card, sink name, description)`, the
-    /// first of which is the device `server` bound.
-    fn server_with_outputs(
-        name: &str,
-        outputs: &[(u32, &str, &str)],
-    ) -> (Server<MemorySink>, PathBuf) {
-        let (server, path) = server(name);
+    /// Offer `outputs` from a daemon already bound, as `with_outputs` does,
+    /// opening them with `memory_output`.
+    pub(crate) fn offer_outputs(server: &mut Server<MemorySink>, outputs: &[(u32, &str, &str)]) {
+        server.offer(output_set(outputs), memory_output);
+    }
+
+    fn output_set(outputs: &[(u32, &str, &str)]) -> OutputSet {
         let found = outputs
             .iter()
             .map(|(card, name, description)| crate::device::Output {
@@ -4311,7 +4315,17 @@ pub(crate) mod tests {
                 name: (*name).to_owned(),
             })
             .collect();
-        let set = OutputSet::discovered(found, 0).unwrap();
+        OutputSet::discovered(found, 0).unwrap()
+    }
+
+    /// A daemon offering `outputs`, `(card, sink name, description)`, the
+    /// first of which is the device `server` bound.
+    fn server_with_outputs(
+        name: &str,
+        outputs: &[(u32, &str, &str)],
+    ) -> (Server<MemorySink>, PathBuf) {
+        let (server, path) = server(name);
+        let set = output_set(outputs);
         (server.with_outputs(set, memory_output), path)
     }
 
