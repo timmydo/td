@@ -1685,7 +1685,8 @@ and the oracle that shows it.
      consumed, and locks only an enrolled or unavailable session; the
      direct profile leaves it the client's. `L: LOCK SCREEN` sits below
      `K` on the menu alone, where the menu's last row moved to 564 on
-     1280x800 (§L.1's `B` and `H` rows later moved it to 636) and every
+     1280x800 (later rows moved it further; the compositor's DESIGN.md,
+     "The menu's rows", gives the current places) and every
      other screen's stays at 528. A lock while a
      lifetime is open ends it through Escape's drain. Host tests cover
      `Super+l` on each state and profile, under the sheet and launcher

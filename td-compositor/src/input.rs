@@ -377,6 +377,8 @@ enum LoginScreen {
     #[default]
     Closed,
     Menu,
+    /// The credential store's screen `V` opens: unlock and enrollment.
+    Store,
     Removing(crate::secret_client::Removal),
     /// The storage screen (DESIGN.md, "Storage operations").
     Storage,
@@ -870,6 +872,16 @@ impl KeyBindings {
             }
             return;
         }
+        if self.login_screen == LoginScreen::Store {
+            decision.secret = match code {
+                KEY_U => Some(Selection::Unlock(Role::Primary)),
+                KEY_T => Some(Selection::Unlock(Role::Recovery)),
+                KEY_E => Some(Selection::Enroll(Recovery::SecondToken)),
+                KEY_X => Some(Selection::Enroll(Recovery::Unrecoverable)),
+                _ => None,
+            };
+            return;
+        }
         if self.login_screen == LoginScreen::Storage {
             decision.secret = match code {
                 KEY_U => Some(Selection::Login(LoginSelection::SelectorUpdate)),
@@ -1006,10 +1018,11 @@ impl KeyBindings {
             }
             KEY_W => Some(Selection::Write),
             KEY_I => Some(Selection::Install),
-            KEY_U => Some(Selection::Unlock(Role::Primary)),
-            KEY_T => Some(Selection::Unlock(Role::Recovery)),
-            KEY_E => Some(Selection::Enroll(Recovery::SecondToken)),
-            KEY_X => Some(Selection::Enroll(Recovery::Unrecoverable)),
+            KEY_V => {
+                self.login_screen = LoginScreen::Store;
+                decision.notice = Some(Notice::CredentialStore);
+                None
+            }
             KEY_K => {
                 self.login_screen = LoginScreen::Menu;
                 decision.notice = Some(Notice::LoginKeys);
@@ -5566,6 +5579,16 @@ mod tests {
             kind: EV_KEY,
             code,
             value,
+        }
+    }
+
+    /// `V`'s press and release before a credential-store key, which
+    /// selects only on the screen `V` opens.
+    fn store_opens(code: u16) -> Vec<Event> {
+        if [KEY_U, KEY_T, KEY_E, KEY_X].contains(&code) {
+            vec![key(KEY_V, KEY_PRESS), key(KEY_V, KEY_RELEASE)]
+        } else {
+            Vec::new()
         }
     }
 
@@ -11236,11 +11259,11 @@ mod tests {
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         }
         runtime.lock().unwrap().fail_next_repaint();
-        let decision = bindings.feed(key(KEY_U, KEY_PRESS));
+        let decision = bindings.feed(key(KEY_W, KEY_PRESS));
         deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         assert!(target.secret_attempt.is_some());
         assert!(bindings.attention != AttentionState::Closed);
-        let decision = bindings.feed(key(KEY_U, KEY_RELEASE));
+        let decision = bindings.feed(key(KEY_W, KEY_RELEASE));
         deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         assert!(bindings.feed(key(KEY_T, KEY_PRESS)).secret.is_none());
         bindings.feed(key(KEY_T, KEY_RELEASE));
@@ -11392,19 +11415,22 @@ mod tests {
                 apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
             }
             assert!(target.lock().unwrap().secret_roles.is_empty());
-            for event in [
+            let chord = [
                 key(KEY_LEFTCTRL, KEY_PRESS),
                 key(KEY_LEFTALT, KEY_PRESS),
                 key(KEY_ESC, KEY_PRESS),
                 key(KEY_ESC, KEY_RELEASE),
                 key(KEY_LEFTCTRL, KEY_RELEASE),
                 key(KEY_LEFTALT, KEY_RELEASE),
+            ];
+            let chosen = [
                 key(code, KEY_PRESS),
                 key(code, KEY_REPEAT),
                 key(code, KEY_RELEASE),
                 key(KEY_U, KEY_PRESS),
                 key(KEY_U, KEY_RELEASE),
-            ] {
+            ];
+            for event in chord.into_iter().chain(store_opens(code)).chain(chosen) {
                 apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
             }
             let target = target.lock().unwrap();
@@ -11494,7 +11520,7 @@ mod tests {
         }
         let typed = target.lock().unwrap().keys.len();
         // A touch types modhex and Enter: nothing is selected or confirmed.
-        for code in [KEY_U, KEY_T, KEY_E, KEY_X, KEY_W, KEY_I, KEY_ENTER] {
+        for code in [KEY_V, KEY_U, KEY_T, KEY_E, KEY_X, KEY_W, KEY_I, KEY_ENTER] {
             for value in [KEY_PRESS, KEY_RELEASE] {
                 apply_device_event(&target, key(code, value), KEY, &bindings, &mut token).unwrap();
             }
@@ -11538,6 +11564,9 @@ mod tests {
             apply_device_event(&target, key(shift, KEY_RELEASE), device, &bindings, state).unwrap();
         }
         // Its held U does not stand in the keyboard's way.
+        for value in [KEY_PRESS, KEY_RELEASE] {
+            apply_device_event(&target, key(KEY_V, value), 0, &bindings, &mut keyboard).unwrap();
+        }
         apply_device_event(&target, key(KEY_U, KEY_PRESS), KEY, &bindings, &mut token).unwrap();
         for value in [KEY_PRESS, KEY_RELEASE] {
             apply_device_event(&target, key(KEY_U, value), 0, &bindings, &mut keyboard).unwrap();
@@ -11608,6 +11637,12 @@ mod tests {
                 let decision = bindings.feed(event);
                 deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
             }
+            // On the screen where the letter selects: the store's for `E`
+            // and `X`.
+            for event in store_opens(code) {
+                let decision = bindings.feed(event);
+                deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
+            }
             assert!(bindings.feed(key(code, KEY_REPEAT)).secret.is_none());
             assert!(bindings
                 .feed_device(1, key(code, KEY_PRESS))
@@ -11651,6 +11686,8 @@ mod tests {
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         }
         for event in [
+            key(KEY_V, KEY_PRESS),
+            key(KEY_V, KEY_RELEASE),
             key(KEY_T, KEY_PRESS),
             key(KEY_T, KEY_REPEAT),
             key(KEY_T, KEY_RELEASE),
@@ -11666,10 +11703,9 @@ mod tests {
                 crate::authority::consent::Role::Recovery
             )]
         );
-        assert!(target
-            .keys
+        assert!(target.keys.iter().all(|key| ![KEY_V, KEY_U, KEY_T]
             .iter()
-            .all(|key| key.key != u32::from(KEY_U) && key.key != u32::from(KEY_T)));
+            .any(|code| key.key == u32::from(*code))));
         for event in [key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE)] {
             let decision = bindings.feed(event);
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
@@ -11679,6 +11715,7 @@ mod tests {
             key(KEY_LEFTCTRL, KEY_PRESS),
             key(KEY_LEFTALT, KEY_PRESS),
             key(KEY_ESC, KEY_PRESS),
+            key(KEY_V, KEY_PRESS),
             key(KEY_U, KEY_PRESS),
         ] {
             let decision = bindings.feed(event);
@@ -13846,6 +13883,74 @@ mod tests {
         }
     }
 
+    /// `V` opens the credential store's screen, where alone `U`, `T`, `E`
+    /// and `X` select, and only once its paint is on glass. The menu's own
+    /// letters select nothing there, and a security key's own keyboard
+    /// selects nothing on it.
+    #[test]
+    fn the_store_screen_alone_selects_unlock_and_enrollment() {
+        use crate::attention::Notice;
+        use crate::authority::consent::{Recovery, Role};
+        use crate::secret_client::Selection;
+        let store = [
+            (KEY_U, Selection::Unlock(Role::Primary)),
+            (KEY_T, Selection::Unlock(Role::Recovery)),
+            (KEY_E, Selection::Enroll(Recovery::SecondToken)),
+            (KEY_X, Selection::Enroll(Recovery::Unrecoverable)),
+        ];
+        for (code, selected) in store.clone() {
+            // On the menu the letter is no choice.
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(&[code], 20));
+            {
+                let target = target.lock().unwrap();
+                assert!(target.notices.is_empty(), "{code}");
+                assert!(target.secret_roles.is_empty(), "{code}");
+            }
+            // On the store screen it is, once that screen is on glass.
+            let target = Mutex::new(RecordingTarget {
+                notices_owed: true,
+                ..RecordingTarget::default()
+            });
+            let bindings = attention_bindings(None);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            let clock = Arc::clone(&target.lock().unwrap().clock);
+            read_reports(&target, &bindings, 0, &presses(&[KEY_V, code], 20));
+            assert!(target.lock().unwrap().secret_roles.is_empty(), "{code}");
+            clock.publish_for_test(1);
+            read_reports(&target, &bindings, 0, &presses(&[code], 30));
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, [Notice::CredentialStore], "{code}");
+            assert_eq!(target.secret_roles, [selected], "{code}");
+        }
+        for code in [
+            KEY_V, KEY_W, KEY_I, KEY_K, KEY_L, KEY_B, KEY_H, KEY_S, KEY_R, KEY_P, KEY_Z,
+        ] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(&[KEY_V, code], 20));
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, [Notice::CredentialStore], "{code}");
+            assert!(target.secret_roles.is_empty(), "{code}");
+            assert_eq!(target.attention_events, [true], "{code}");
+        }
+        const KEY: usize = 1;
+        for (code, _) in store {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            bindings.lock().unwrap().attention_excluded.insert(KEY);
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(&[KEY_V], 20));
+            read_reports(&target, &bindings, KEY, &presses(&[code], 30));
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, [Notice::CredentialStore], "{code}");
+            assert!(target.secret_roles.is_empty(), "{code}");
+        }
+    }
+
     /// The role and authorization screens choose nothing until their own
     /// paint is on glass, as the storage screen.
     #[test]
@@ -15851,7 +15956,7 @@ mod tests {
             let why = Some(Notice::Login(&["NO LOGIN KEYS ENROLLED"]));
             assert!(!seat.locked() && seat.attention_open());
             assert_eq!(seat.shown(), why);
-            seat.press(&[KEY_U, KEY_K, KEY_L, KEY_I], 30);
+            seat.press(&[KEY_W, KEY_V, KEY_K, KEY_L, KEY_I], 30);
             assert!(seat.queued.attempt().is_none());
             assert_eq!(seat.shown(), why);
             seat.press(&[KEY_ESC], 40);
@@ -15875,7 +15980,7 @@ mod tests {
         // An operation already chosen.
         let seat = LockedSeat::open(&[]);
         seat.chord(10);
-        seat.press(&[KEY_U], 20);
+        seat.press(&[KEY_W], 20);
         let attempt = seat.queued.attempt().unwrap();
         seat.press(&[KEY_L], 30);
         assert!(!seat.locked() && seat.attention_open());
@@ -15903,7 +16008,7 @@ mod tests {
     fn attention_reads_super_l_under_its_own_rules() {
         let seat = LockedSeat::open(&[]);
         seat.chord(10);
-        seat.press(&[KEY_U], 20);
+        seat.press(&[KEY_W], 20);
         let _attempt = seat.queued.attempt().unwrap();
         seat.super_l(30);
         assert!(!seat.locked() && seat.attention_open());
@@ -16069,7 +16174,7 @@ mod tests {
     fn a_failed_drain_paint_still_locks_an_open_lifetime() {
         let seat = LockedSeat::open(&[]);
         seat.chord(10);
-        seat.press(&[KEY_U], 20);
+        seat.press(&[KEY_W], 20);
         let _attempt = seat.queued.attempt().unwrap();
         seat.runtime.lock().unwrap().fail_next_repaint();
         assert!(seat.lock().is_err());

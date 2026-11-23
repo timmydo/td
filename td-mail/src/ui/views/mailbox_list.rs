@@ -104,13 +104,13 @@ enum Screen {
 /// compositor binds; no step needs root.
 fn store_steps(name: &str) -> String {
     format!(
-        "1. Enroll the store, once: press Ctrl+Alt+Esc, then E, with two FIDO2 \
-         security keys at hand, and follow the screen. (X enrolls one key instead, \
-         and the store is then lost with it.) Enrollment needs the machine's TPM; \
-         where there is none, as in td's stock VM, the store stays unenrolled and \
-         td-mail cannot be given a password.\n\
-         2. After each boot, unlock it: Ctrl+Alt+Esc, then U, and touch the key \
-         (R uses the recovery key).\n\
+        "1. Enroll the store, once: press Ctrl+Alt+Esc, then V, then E, with two \
+         FIDO2 security keys at hand, and follow the screen. (X instead of E enrolls \
+         one key, and the store is then lost with it.) Enrollment needs the \
+         machine's TPM; where there is none, as in td's stock VM, the store stays \
+         unenrolled and td-mail cannot be given a password.\n\
+         2. After each boot, unlock it: Ctrl+Alt+Esc, then V, then U, and touch the \
+         key (T instead of U uses the recovery key).\n\
          3. Store the password: put it alone in a file, run \
          td-secret set mail/{name} < FILE in a terminal, then press Ctrl+Alt+Esc, \
          then W, check the target and touch the key. Delete the file afterwards."
@@ -1564,8 +1564,8 @@ mod tests {
             text.contains("td-secret set mail/personal < FILE"),
             "{text}"
         );
-        assert!(text.contains("Ctrl+Alt+Esc, then E"), "{text}");
-        assert!(text.contains("Ctrl+Alt+Esc, then U"), "{text}");
+        assert!(text.contains("Ctrl+Alt+Esc, then V, then E"), "{text}");
+        assert!(text.contains("Ctrl+Alt+Esc, then V, then U"), "{text}");
         assert!(text.contains("Ctrl+Alt+Esc, then W"), "{text}");
         assert!(text.contains("4. Then press R here"), "{text}");
         assert!(

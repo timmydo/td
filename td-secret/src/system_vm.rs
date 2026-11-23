@@ -14,7 +14,7 @@ fn notice_pixels() -> Vec<u8> {
     // The full-system QEMU output is fixed at 1280x800, with 32-bit pixels.
     File::open("/dev/fb0")
         .unwrap()
-        .read_exact_at(&mut pixels, (STRIDE * 330) as u64)
+        .read_exact_at(&mut pixels, (STRIDE * 312) as u64)
         .unwrap();
     pixels
 }
@@ -39,6 +39,7 @@ fn notice(text: &str) {
             b'S' => [15, 16, 16, 14, 1, 1, 30],
             b'T' => [31, 4, 4, 4, 4, 4, 4],
             b'U' => [17, 17, 17, 17, 17, 17, 14],
+            b'V' => [17, 17, 17, 17, 17, 10, 4],
             b'Y' => [17, 17, 10, 4, 4, 4, 4],
             _ => panic!("unsupported notice glyph"),
         })
@@ -81,7 +82,14 @@ fn select(keyboard: &mut Keyboard, key: u8) {
     keyboard.report(5, 0);
     keyboard.report(5, 0x29);
     keyboard.report(0, 0);
-    notice("U: UNLOCK");
+    notice("V: CREDENTIAL STORE");
+    keyboard.key(key);
+}
+
+/// `key` on the credential store's screen, which `V` opens.
+fn store(keyboard: &mut Keyboard, key: u8) {
+    select(keyboard, 0x19); // V.
+    notice("CREDENTIAL STORE");
     keyboard.key(key);
 }
 
@@ -499,7 +507,7 @@ fn qemu_installed_system_secret_lifecycle() {
     restart_mail(true);
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     if !recover {
-        select(&mut keyboard, 0x08); // E.
+        store(&mut keyboard, 0x08); // E.
         wait("primary proof request", || {
             requests.load(Ordering::SeqCst) == 3
         });
@@ -536,7 +544,7 @@ fn qemu_installed_system_secret_lifecycle() {
         no_release();
         close(&mut keyboard);
     }
-    select(&mut keyboard, if recover { 0x17 } else { 0x18 }); // T or U.
+    store(&mut keyboard, if recover { 0x17 } else { 0x18 }); // T or U.
     released(if written {
         REPLACEMENT
     } else if recover {

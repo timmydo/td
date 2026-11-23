@@ -10881,8 +10881,9 @@ teardown still clears it. The former root-console `set --uid` bypass is
 removed. Firstboot initializes only the empty unenrolled store.
 
 **Hardware enrollment and session release.** Physical Ctrl+Alt+Esc opens
-the trusted screen. E selects enrollment with a second recovery token;
-X explicitly selects unrecoverability. Keep both tokens ready before a
+the trusted screen, and its V the credential store's screen. There E
+selects enrollment with a second recovery token; X explicitly selects
+unrecoverability. Keep both tokens ready before a
 two-token enrollment. Each creation and proof step has a complete immutable
 prompt, including the remaining overall time when shown, before device I/O.
 The operation has one 120-second deadline, not a renewed per-step allowance.
@@ -10900,7 +10901,8 @@ the compositor queries admitted read-only store state. An uncertain reply
 never triggers automatic replay. A published token store remains locked
 and requires a fresh unlock operation, including after successful enrollment.
 
-U selects the primary token; T selects the enrolled recovery token. Release
+On that screen U selects the primary token; T selects the enrolled recovery
+token. Release
 verifies a fresh assertion bound to the immutable displayed operation before
 TPM unseal and volatile publication. Escape cancels before the private
 execution decision; after that decision, completion can race cancellation.

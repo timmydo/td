@@ -47,6 +47,8 @@ pub(crate) enum Notice {
     Unavailable,
     Failed,
     Busy,
+    /// The credential store's screen `V` opens.
+    CredentialStore,
     /// The key-management screen `K` opens.
     LoginKeys,
     /// The storage screen `S` opens (DESIGN.md, "Storage operations").
@@ -685,7 +687,7 @@ fn hostname_row(intake: HostnameIntake) -> String {
 /// boot oracles' rows do not move.
 fn notice_rows(notice: Notice) -> Vec<String> {
     let first = match notice {
-        Notice::Menu(_) => "U: UNLOCK  T: RECOVERY TOKEN",
+        Notice::Menu(_) => "V: CREDENTIAL STORE",
         Notice::Pending => "PREPARING REQUEST",
         Notice::PowerConfirm(crate::authority::consent::Power::Restart) => "RESTART THE COMPUTER?",
         Notice::PowerConfirm(crate::authority::consent::Power::Off) => "POWER OFF THE COMPUTER?",
@@ -711,11 +713,12 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::Stored => "CREDENTIAL STORED",
         Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
         Notice::Unlocked => "SECRETS UNLOCKED",
-        Notice::Enrolled => "STORE ENROLLED - REOPEN AND PRESS U TO UNLOCK",
+        Notice::Enrolled => "STORE ENROLLED - REOPEN AND PRESS V THEN U",
         Notice::Unenrolled => "STORE NOT ENROLLED - REOPEN TO TRY AGAIN",
         Notice::Unavailable => "STORE STATE UNAVAILABLE",
         Notice::Failed => "REQUEST FAILED",
         Notice::Busy => "PREVIOUS REQUEST IS STILL FINISHING",
+        Notice::CredentialStore => "CREDENTIAL STORE",
         Notice::LoginKeys => "LOGIN KEYS",
         Notice::StateUnknown => "LOGIN KEY STATE NOT KNOWN",
         Notice::DiskEncryption => "DISK ENCRYPTION",
@@ -754,13 +757,16 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::SleepConfirm => &["ENTER TO CONFIRM", "ENROLLED SESSIONS LOCK BEFORE SLEEP"],
         Notice::PowerConfirm(_) => &["ENTER TO CONFIRM", "UNSAVED WORK MAY BE LOST"],
         Notice::Menu(_) => &[
-            "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
-            "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
             "K: LOGIN KEYS",
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
+        ],
+        Notice::CredentialStore => &[
+            "U: UNLOCK  T: RECOVERY TOKEN",
+            "E: ENROLL TWO TOKENS - HAVE BOTH READY",
+            "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
         ],
         Notice::LoginKeys => &[
             "1: ENROLL ONE KEY",
@@ -1159,18 +1165,15 @@ mod tests {
     }
 
     /// The menu's rows where the update and setup oracles read them on a
-    /// 1280x800 output, as before `L`: the title at 276, the selections
-    /// from 312 and `I` at 456, 36 apart; `K` below `I`, `L` below `K` at
-    /// 528, `B` below `L` at 564, `H` below `B` at 600, `S` below `H` at
-    /// 636, power at 672 and Escape at 708. On 800x600 the thirteen
-    /// rows start at 153; on 320x200 they close to a 16-pixel pitch.
+    /// 1280x800 output: the title at 276, the selections from 312, 36
+    /// apart, `V` first, then `W`, `I` at 384, `K`, `L`, `B` at 492, `H` at
+    /// 528, `S` at 564, power at 600 and Escape at 636. On 800x600 the
+    /// eleven rows start at 176; on 320x200 they keep an 18-pixel pitch.
     #[test]
     fn the_menu_keeps_its_large_output_rows_and_fits_power_choices() {
         const MENU: &[&str] = &[
             "TD SECURE ATTENTION",
-            "U: UNLOCK  T: RECOVERY TOKEN",
-            "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
-            "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
+            "V: CREDENTIAL STORE",
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
             "K: LOGIN KEYS",
@@ -1183,8 +1186,8 @@ mod tests {
         ];
         for (width, height, top, scale, pitch) in [
             (1280, 800, 276, 2, 36),
-            (800, 600, 153, 2, 36),
-            (320, 200, 0, 1, 16),
+            (800, 600, 176, 2, 36),
+            (320, 200, 0, 1, 18),
         ] {
             let stride = width * 4;
             let mut painted = vec![0; stride * height];
@@ -1224,12 +1227,12 @@ mod tests {
             }
             assert!(painted == expected, "{width}x{height}");
         }
-        // Twelve doubled rows, the last row's foot included, are 410
-        // tall and keep their top on 800 and 600 lines; on 200 twelve
-        // single rows, 205 tall at their pitch, close up to 17 from the top.
-        assert_eq!(rows_top(800, 11 * 36 + 14), 276);
-        assert_eq!(rows_top(600, 11 * 36 + 14), 176);
-        assert_eq!(rows_top(200, 11 * 18 + 7), 0);
+        // Eleven doubled rows, the last row's foot included, are 374
+        // tall and keep their top on 800 and 600 lines; on 200 eleven
+        // single rows, 187 tall at their pitch, start at the top.
+        assert_eq!(rows_top(800, 10 * 36 + 14), 276);
+        assert_eq!(rows_top(600, 10 * 36 + 14), 176);
+        assert_eq!(rows_top(200, 10 * 18 + 7), 0);
     }
 
     /// The `H` row says what root's last `9f` answer said: nothing waits,
@@ -1407,6 +1410,7 @@ mod tests {
         Notice::Unavailable,
         Notice::Failed,
         Notice::Busy,
+        Notice::CredentialStore,
         Notice::LoginKeys,
         Notice::StateUnknown,
         Notice::DiskEncryption,
@@ -1701,6 +1705,8 @@ mod tests {
             Notice::PowerFailed,
             Notice::SleepConfirm,
             Notice::Resumed,
+            Notice::Enrolled,
+            Notice::CredentialStore,
             Notice::LoginKeys,
             Notice::StateUnknown,
             Notice::Removing {
@@ -1886,9 +1892,9 @@ mod tests {
                 .chain(notice_rows(menu))
                 .enumerate()
                 .collect();
-            assert_eq!(rows[5], (5, "I: REVIEW PENDING SYSTEM INSTALLATION".into()));
-            rows.push((12, text.into()));
-            rows.push((13, "ESC TO RETURN".into()));
+            assert_eq!(rows[3], (3, "I: REVIEW PENDING SYSTEM INSTALLATION".into()));
+            rows.push((10, text.into()));
+            rows.push((11, "ESC TO RETURN".into()));
             let rows: Vec<(usize, &str)> =
                 rows.iter().map(|(at, row)| (*at, row.as_str())).collect();
             assert!(painted == expected(&rows), "menu {text}");
@@ -1933,7 +1939,7 @@ mod tests {
             Some(RESTARTING_NOTICE),
         );
         let inked = |y: usize| (0..width).any(|x| small[y * stride + x * 4] == 0xff);
-        // Fourteen rows at a 14-pixel pitch: the last foot ends at 188.
+        // Twelve rows at a 17-pixel pitch: the last foot ends at 194.
         assert!(inked(0) && (180..200).any(inked) && !inked(199));
     }
 

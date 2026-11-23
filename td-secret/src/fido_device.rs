@@ -1512,6 +1512,13 @@ pub(crate) mod vm_tests {
                 self.report(0, 0);
                 self.key(key);
             }
+            /// `key` on the credential store's screen, which `V` opens and
+            /// which reads no key before its paint is on glass.
+            fn store(&mut self, key: u8) {
+                self.select(0x19); // V.
+                thread::sleep(Duration::from_secs(1));
+                self.key(key);
+            }
             fn close(&mut self) {
                 self.key(0x29);
             }
@@ -1833,7 +1840,7 @@ pub(crate) mod vm_tests {
             thread::sleep(Duration::from_millis(500));
             assert_eq!(requests.load(Ordering::SeqCst), 0);
             assert!(!Path::new("/var/lib/td/secrets/1000/sealed").exists());
-            keyboard.select(if recovery { 0x08 } else { 0x1b }); // E: recovery; X: unrecoverable.
+            keyboard.store(if recovery { 0x08 } else { 0x1b }); // E: recovery; X: unrecoverable.
             let recovery_hid = if recovery {
                 wait("primary proof request", || {
                     requests.load(Ordering::SeqCst) == 3
@@ -1907,7 +1914,7 @@ pub(crate) mod vm_tests {
             assert_eq!(requests.load(Ordering::SeqCst), 3);
             mail.retrieve("main", "unavailable");
             keyboard.close();
-            keyboard.select(0x18); // U: fresh primary assertion.
+            keyboard.store(0x18); // U: fresh primary assertion.
             wait("desktop unlock", || {
                 Path::new("/run/td-secret/1000/key").exists()
             });
@@ -1973,7 +1980,7 @@ pub(crate) mod vm_tests {
             // A fresh production generation must prepare while locked and
             // require another physical selection and assertion before release.
             let pair = Pair::start();
-            keyboard.select(0x18);
+            keyboard.store(0x18);
             wait("replacement generation unlock", || {
                 Path::new("/run/td-secret/1000/key").exists()
             });
@@ -2181,7 +2188,7 @@ pub(crate) mod vm_tests {
             mail.retrieve("main", "unavailable");
             news.retrieve("main", "unavailable");
             assert_eq!(requests.load(Ordering::SeqCst), 0);
-            keyboard.select(if recovery { 0x17 } else { 0x18 }); // T or U.
+            keyboard.store(if recovery { 0x17 } else { 0x18 }); // T or U.
             wait("cold desktop unlock", || {
                 Path::new("/run/td-secret/1000/key").exists()
             });

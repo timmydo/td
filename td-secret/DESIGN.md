@@ -1105,10 +1105,11 @@ seat setup does; the FIDO hidraw node remains root-only.
 
 A separate UHID keyboard supplies ordinary key reports. X outside secure
 attention must cause no token traffic or enrollment. Ctrl+Alt+Esc followed
-by X enrolls an explicitly unrecoverable store through the compositor's
+by V and X enrolls an explicitly unrecoverable store through the compositor's
 physical-input adapter, immutable renderer, private client, authority
 controller and production token workers. Enrollment leaves the store locked;
-a new attention lifetime with U must obtain a fresh assertion to release it.
+a new attention lifetime with V and U must obtain a fresh assertion to
+release it.
 
 The real human-UID `td-secret set mail/main` client submits credential bytes
 through its sealed descriptor. Before W selection it must remain pending,
@@ -1194,7 +1195,8 @@ CTAP sequence permits no automatic enrollment or assertion before attention.
 
 The `fido-cold-recovery-create` and `fido-cold-recovery-reopen` pair repeats
 that disk lifecycle on a separate fresh volume with the second-token policy.
-E on the real compositor attention screen selects enrollment. Only the primary
+E on the real compositor's credential store screen (attention, then V)
+selects enrollment. Only the primary
 device is initially connected; after its proof request the fixture inserts a
 second virtual device while leaving the first attached. Recovery creation
 must retain the same opaque user handle and exclude the primary credential.
@@ -1249,8 +1251,8 @@ extension, so this does not activate a measured-deployment release policy.
 Authenticated firmware entry and update authorization remain unimplemented.
 
 The creation boot requires firstboot's mail configuration without an
-application password file. E enrolls
-primary and recovery devices, U unlocks, and the public one-operation writer
+application password file. V's E enrolls
+primary and recovery devices, V's U unlocks, and the public one-operation writer
 queues mail/main for W and a fresh assertion. The stock session starts mail
 and news at boot only on an autotest boot, which this is not, so the
 fixture's image restores their boot start (and the workspace switches
@@ -1272,7 +1274,8 @@ no application capture or consent shortcut is added.
 The recovery boot connects only the enrolled second device, requires the
 same encrypted bundle, mail configuration, durable identity ledger and
 machine identity after stock firstboot, and proves a different kernel boot
-ID. T performs exactly one fresh recovery assertion before mail retrieval.
+ID. V's T performs exactly one fresh recovery assertion before mail
+retrieval.
 Both boots require exact CTAP sequences and nonzero, globally fresh
 challenges; each cold boot starts with no release. The runner requires one
 successful ignored test, the exact supervised result line, the selected

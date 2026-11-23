@@ -18,9 +18,7 @@ const UNREADABLE: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT B
 /// No settings change waits on this guest.
 const MENU: &[&str] = &[
     "TD SECURE ATTENTION",
-    "U: UNLOCK  T: RECOVERY TOKEN",
-    "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
-    "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
+    "V: CREDENTIAL STORE",
     "W: REVIEW PENDING CREDENTIAL WRITE",
     "I: REVIEW PENDING SYSTEM INSTALLATION",
     "K: LOGIN KEYS",
@@ -75,9 +73,7 @@ fn menu_rows() -> Vec<(usize, String)> {
         .collect()
 }
 
-/// Exactly the menu's rows on the ground. The chrome face has no
-/// parenthesis, which the compositor draws as its missing box, so `E`'s
-/// row is required only to lie in its band.
+/// Exactly the menu's rows on the ground.
 fn menu(pixels: &[u8], arguments: &[&str]) -> Result<bool, String> {
     bare(arguments)?;
     let rows = menu_rows();
@@ -92,7 +88,7 @@ fn menu(pixels: &[u8], arguments: &[&str]) -> Result<bool, String> {
             return Ok(false);
         }
     }
-    for (top, text) in rows.iter().filter(|(_, text)| !text.contains('(')) {
+    for (top, text) in &rows {
         if !super::super::update::menu_row_matches(pixels, *top, text)? {
             return Ok(false);
         }
@@ -891,14 +887,7 @@ mod tests {
             assert_eq!(locked(&surface, &[]), Ok(false));
             assert!(blank_or_lock(&surface).unwrap() && blank_or_lock(&notice).unwrap());
         }
-        // The test face has no parenthesis either: `E`'s row drawn short.
-        let drawable: Vec<(usize, String)> = menu_rows()
-            .into_iter()
-            .map(|(top, text)| match text.split_once(" (") {
-                Some((head, _)) => (top, head.to_string()),
-                None => (top, text),
-            })
-            .collect();
+        let drawable = menu_rows();
         let menu_frame = frame(&drawable);
         assert_eq!(menu(&menu_frame, &[]), Ok(true));
         let mut without_l = drawable.clone();

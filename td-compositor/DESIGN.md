@@ -6116,7 +6116,32 @@ client directory. A bare readiness filename without a directory is refused.
 
 ## Physical secure attention
 
-The menu uses `T` for recovery-token unlock and offers `R: REBOOT`,
+**The menu's rows.** Below the title, 36 pixels apart on 1280x800 (title
+at 276): `V: CREDENTIAL STORE` at 312, `W` at 348, `I` at 384, `K` at
+420, `L` at 456, `B` at 492, `H` at 528, `S` at 564, the power row at
+600 and `ESC TO RETURN` at 636. The eleven rows are 374 pixels tall at
+double scale and start at 176 on 800x600; on 320x200 they keep an
+18-pixel pitch from 0. Every other attention screen pads to the title
+and six rows and draws its last at 528. Places an increment below gives
+for the menu's rows were that increment's; these are current.
+
+**The credential store screen.** A fresh physical `V`, under the menu's
+rules, opens `CREDENTIAL STORE` as `K` and `S` open theirs:
+`U: UNLOCK  T: RECOVERY TOKEN`, `E: ENROLL TWO TOKENS - HAVE BOTH
+READY` (the chrome face has no parenthesis, which the menu once drew as
+a box) and `X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL`. There, and
+only there, `U` selects primary-token unlock, `T` recovery-token unlock,
+`E` enrollment with a second recovery token and `X` explicitly
+unrecoverable enrollment; no key is read before the screen's paint is
+on glass, the menu's own letters select nothing on it, and Escape ends
+the lifetime as anywhere. Each selection's request, prompts and notices
+are as before; a successful enrollment says `STORE ENROLLED - REOPEN
+AND PRESS V THEN U`. `V`, `U`, `T` and `E` are modhex, and the exclusion
+of a security key's own keyboard applies to them and `X` as to every
+selection. `W` stays on the menu: it reviews a queued write rather than
+managing the store.
+
+The menu offers `R: REBOOT`,
 `P: POWER OFF` and `Z: SLEEP`. Restart and power off open named confirmations with an unsaved-work notice; only
 fresh Enter timestamped after
 that prompt reached the display selects the lifetime's operation. A per-prompt
@@ -6128,9 +6153,7 @@ td-authd (its DESIGN.md, "Physical console power") and reports acceptance,
 busy, or failure. It does not run a power applet or expose the supervisor's
 control socket. These choices work without token enrollment on installed
 systems and live media. They do not authorize another privileged operation.
-The power row follows the storage row. The menu keeps existing row positions
-on 1280x800; on 800x600 its top moves to 153 to fit all thirteen rows, and
-on 320x200 the rows use a 16-pixel pitch.
+The power row follows the storage row ("The menu's rows").
 
 Sleep uses its own confirmation without the unsaved-work warning. A fresh
 Enter after that frame selects the single operation. The authority worker
@@ -6232,9 +6255,11 @@ capture or synthetic-input portal is implemented by this increment. The
 lock surface ("The lock surface" below) is a private screen in each of
 these respects.
 
-A fresh physical U selects primary unlock, T recovery unlock, E enrollment
-with a second recovery token, X explicit unrecoverability, and W the ready
-credential write queued through `td-secret set`; I selects a queued system
+A fresh physical V opens the credential store's screen, whose U, T, E and
+X select primary unlock, recovery unlock, enrollment with a second
+recovery token and explicit unrecoverability ("The credential store
+screen" above); W selects the ready credential write queued through
+`td-secret set`; I selects a queued system
 installation, K opens the key-management screen ("Login-key
 operations" below), and L locks the session ("Session lock and
 login-key entry" below, item 5); ENCRYPTION.md increment 8e adds S, the
@@ -7125,7 +7150,7 @@ doubled only on an output of at least 800x600 as a prompt's Unifont
 is, and 18 scaled pixels apart. The first row keeps its long-standing
 place, `(height - 248) / 2`, wherever the whole block, the last row's
 foot included, fits below it, so the boot oracles' rows do not move (on
-1280x800 the title at 276, the notice at 312 and `I` at 456); only an
+1280x800 the title at 276, the notice at 312 and `I` at 384); only an
 output too short for that moves the block up, as little as makes it
 fit. Rows that cannot all fit at that pitch even from the top close up
 to the output's height, never closer than the glyph's height and one
