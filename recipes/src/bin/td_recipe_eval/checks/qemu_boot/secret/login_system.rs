@@ -578,6 +578,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 audio: true,
                 physical_input: false,
                 capture_firefox_audio: false,
+                audio_switch: None,
                 tpm_socket: None,
                 side_channel: None,
                 answers: None,

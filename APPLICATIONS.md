@@ -8761,6 +8761,29 @@ queue ran out with the old ring and that never writes again stays
 running, and owed no `UNDERFLOW`, until it is corked, drained or
 deleted: dropping it would send a second `STARTED` when it did write.
 
+The host oracle `qemu-boot-audio`, an integration-tier step, proves a
+switch on emulated hardware. Its machine has QEMU's HDA output and a USB
+audio device behind its own xHCI controller, each captured to its own
+exact 48 kHz stereo S16 WAV. QEMU attaches both at power-on, and the
+daemon reads its outputs once, at start, so they are its `intel-0`
+(output 0, active) and `audio-0` (output 1); a USB card the guest
+enumerated late would fail the first step, which says so. On ttyS0 the
+primary account, a controller, waits for the daemon to answer and
+requires exactly those two, starts `td-audio play 4000` (§K.5), and a
+second in makes output 1 the one that plays. The HDA capture must hold
+the tone's start and the USB capture the rest, each passing the Firefox
+proof's tone checks with its own span, 300–1600 ms and 2300–3800 ms,
+together 3650–4000 ms: never more than the tone, and on QEMU 10.2.1 225
+ms less in every run, the old ring and 54 ms not attributed. QEMU writes
+each capture only while its output plays, so the two share no clock and
+the hand-over is not timed; an overlap or a replay would show as more
+than the tone. The player must have sent and drained the whole tone with
+one `STARTED`, no `UNDERFLOW` and no overflow, and the switch must have
+named `audio-0` and exited 0. The boot ends with a kill at the shell's
+last report, before QEMU writes its WAV sizes; the host reads such a
+capture by its own length in whole frames, and only with QEMU's zero
+placeholders, every format field still exact.
+
 **OSS emulation is refused, and the reason matters.** It survives in
 `linux-7.3.1` (`CONFIG_SND_PCM_OSS`, `sound/core/oss/pcm_oss.c`,
 including `SNDCTL_DSP_GETODELAY`) and would be genuinely smaller — plain

@@ -779,6 +779,10 @@ const ORACLES: &[(&str, &[&str])] = &[
         &["server-x86-64", "td-btrfs", "td-jail-seccomp-probe"],
     ),
     ("qemu-boot-live", &["system-x86-64"]),
+    (
+        "qemu-boot-audio",
+        &["system-x86-64", "td-btrfs", "td-jail-seccomp-probe"],
+    ),
     ("qemu-deploy-rollback", &["system-x86-64", "td-btrfs"]),
     (
         "qemu-admin-update",
@@ -912,6 +916,17 @@ pub fn qemu_boot_live_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::live::run(&runner)
 }
 
+/// `qemu-boot-audio`: td-audio moves a playing stream from the HDA output
+/// to a USB one mid-tone. Host-side only, like every QEMU oracle.
+pub fn qemu_boot_audio_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    if args.len() > 1 || args.first().is_some_and(|value| value != STEM) {
+        return Err("usage: qemu-boot-audio [system-x86-64]".into());
+    }
+    oracle_host(false)?;
+    system_oracle("qemu-boot-audio", crate::checks::qemu_boot::run_audio)
+}
+
 /// `deploy-rollback` approved by Enter (td-authd/DESIGN.md, "Elevation
 /// operations"): the system image on a two-deployment fixture volume, its
 /// prompt read off the screen, and the reboot it selects.
@@ -921,16 +936,29 @@ pub fn qemu_deploy_rollback_cli(args: &[String]) -> Result<(), String> {
         return Err("usage: qemu-deploy-rollback [system-x86-64]".into());
     }
     oracle_host(false)?;
-    let targets = oracle_targets("qemu-deploy-rollback")?;
+    system_oracle(
+        "qemu-deploy-rollback",
+        crate::checks::qemu_boot::update::run_deploy_rollback,
+    )
+}
+
+/// The rest of a system-image oracle's CLI, once it has its argument and a
+/// host with KVM: its `ORACLES` targets proven and warmed under the ladder
+/// lock, then `run`.
+fn system_oracle(
+    name: &str,
+    run: fn(&RecipeCheckRunner) -> Result<(), String>,
+) -> Result<(), String> {
+    let targets = oracle_targets(name)?;
     ensure_targets_provenance(targets)?;
     let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
-    let name = scratch_name("qemu-deploy-rollback", &[STEM]);
-    let runner = RecipeCheckRunner::new(root, &name)?
+    let scratch = scratch_name(name, &["system-x86-64"]);
+    let runner = RecipeCheckRunner::new(root, &scratch)?
         .with_streamed_progress()
         .with_allowed_builds(oracle_reach(targets)?);
     warm_operator_inputs(&runner, targets);
     let _lock = lock_ladder_for_run(&runner)?;
-    crate::checks::qemu_boot::update::run_deploy_rollback(&runner)
+    run(&runner)
 }
 
 pub fn qemu_admin_update_cli(args: &[String]) -> Result<(), String> {
@@ -11608,6 +11636,7 @@ chmod 755 '{}'
             "qemu_boot_uefi_cli",
             "qemu_deploy_rollback_cli",
             "qemu_admin_update_cli",
+            "qemu_boot_audio_cli",
             "qemu_install_cli",
             "qemu_install_encrypted_cli",
             "qemu_install_system_cli",
@@ -11818,6 +11847,7 @@ chmod 755 '{}'
                 "ensure_targets_provenance(",
                 "RecipeCheckRunner::new(",
                 "qemu_kernel_cli(",
+                "system_oracle(",
             ] {
                 if let Some(at) = body.find(builds) {
                     assert!(asked < at, "qemu_{name} reaches {builds} before KVM");

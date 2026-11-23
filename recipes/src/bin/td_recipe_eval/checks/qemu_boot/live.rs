@@ -159,6 +159,7 @@ pub(super) fn drive_wizard(run: &LiveRun<'_>) -> Result<BootResult, String> {
             audio: true,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: run.tpm_socket,
             side_channel: None,
             answers: None,

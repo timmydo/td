@@ -437,6 +437,8 @@ const FIREFOX_AUDIO_MAX_HZ: f64 = 445.0;
 const FIREFOX_AUDIO_HZ_STEP: f64 = 0.25;
 const FIREFOX_AUDIO_MIN_ACTIVE_MS: u64 = 900;
 const FIREFOX_AUDIO_MAX_ACTIVE_MS: u64 = 1_300;
+const FIREFOX_AUDIO_ACTIVE_MS: (u64, u64) =
+    (FIREFOX_AUDIO_MIN_ACTIVE_MS, FIREFOX_AUDIO_MAX_ACTIVE_MS);
 const FIREFOX_AUDIO_ACTIVE_FLOOR: i32 = 256;
 const FIREFOX_AUDIO_MAX_INTERNAL_QUIET_FRAMES: usize = 64;
 const FIREFOX_AUDIO_FIT_WINDOW_FRAMES: usize = 4_800;
@@ -817,6 +819,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -882,6 +885,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -1031,6 +1035,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -1633,6 +1638,7 @@ fn boot_system_once(
             audio: true,
             physical_input,
             capture_firefox_audio,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -1679,6 +1685,7 @@ fn boot_failed_target_once(
             audio: true,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -3010,6 +3017,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: true,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -3033,6 +3041,264 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
         "PASS: one system session proves firstboot identity, immutable root, \
         owned state, component health, compositor/terminal readiness, application placement, \
         browser support and clean shutdown"
+    );
+    Ok(())
+}
+
+/// `qemu-boot-audio`'s two captures, in the plan's `audio_switch` directory.
+const SWITCH_HDA_WAV: &str = "hda.wav";
+const SWITCH_USB_WAV: &str = "usb.wav";
+/// How long `td-audio play` plays, and when the shell switches outputs.
+const SWITCH_TONE_MS: u64 = 4_000;
+const SWITCH_AFTER_SECS: u64 = 1;
+/// The tone's span on each output. The HDA output plays from the stream's
+/// start to the switch, a second after the player starts; the USB output
+/// plays the rest. A switch drops what the old device had queued and not
+/// played, at most its ring (8192 frames, about 171 ms), and nothing is
+/// played twice, so together they are at most the tone. Measured on QEMU
+/// 10.2.1 they lose 225 ms in all, the same every run: the ring and 54 ms
+/// this oracle does not attribute. The floor allows 125 ms past that.
+/// QEMU writes each capture only while its output plays, so the two share
+/// no clock and the hand-over itself is not timed; an overlap or a replay
+/// shows as more than the tone, a longer cut as less than the floor.
+const SWITCH_HDA_MS: (u64, u64) = (300, 1_600);
+const SWITCH_USB_MS: (u64, u64) = (2_300, 3_800);
+const SWITCH_TOTAL_MS: (u64, u64) = (3_650, SWITCH_TONE_MS);
+/// The sinks td-audio derives from QEMU's cards: HDA's id `Intel`, the USB
+/// device's `Audio`.
+const SWITCH_HDA_SINK: &str = "intel-0";
+const SWITCH_USB_SINK: &str = "audio-0";
+/// The serial shell's reports.
+const SWITCH_OUTPUTS_REPORT: &str = "TD-AUDIO-OUTPUTS";
+const SWITCH_PLAYED_REPORT: &str = "TD-AUDIO-SWITCHED";
+
+/// The guest's half of `qemu-boot-audio`, typed on ttyS0 as the primary
+/// account, which td-audio admits as a controller. First, once the daemon
+/// answers, it must list both outputs, HDA as output 0 (the default,
+/// lowest card) and USB as output 1; then `td-audio play` plays the tone as
+/// a stream while, a second in, `td-audio output 1` moves it to USB. Each
+/// step reports one line: the outputs, and what `output` and `play` printed
+/// with their exit statuses. Each command is one line, its newlines spelt
+/// `\n` for printf and tr, so no echo of it can begin a report line
+/// (`serial_shell`).
+fn audio_switch_steps() -> Vec<serial_shell::ShellStep> {
+    let dir = "/run/user/1000";
+    vec![
+        serial_shell::ShellStep {
+            command: format!(
+                "for i in $(seq 100); do td-audio outputs >{dir}/outputs 2>&1 && break; \
+                 sleep 0.1; done; \
+                 printf '\\n{SWITCH_OUTPUTS_REPORT} %s\\n' \"$(tr '\\n' ';' <{dir}/outputs)\""
+            ),
+            report: SWITCH_OUTPUTS_REPORT.into(),
+            accepts: Box::new(|payload| switch_outputs_listed(payload).is_ok()),
+        },
+        serial_shell::ShellStep {
+            command: format!(
+                "(td-audio play {SWITCH_TONE_MS} >{dir}/play 2>&1; echo \"exit $?\" >>{dir}/play) & \
+                 sleep {SWITCH_AFTER_SECS}; \
+                 td-audio output 1 >{dir}/switch 2>&1; echo \"exit $?\" >>{dir}/switch; wait; \
+                 printf '\\n{SWITCH_PLAYED_REPORT} %s| %s\\n' \
+                 \"$(tr '\\n' ' ' <{dir}/switch)\" \"$(tr '\\n' ' ' <{dir}/play)\""
+            ),
+            report: SWITCH_PLAYED_REPORT.into(),
+            accepts: Box::new(|payload| switch_played(payload).is_ok()),
+        },
+    ]
+}
+
+/// `td-audio outputs` as one line, `;` for each newline: exactly two
+/// outputs, HDA active as output 0 and USB as output 1.
+fn switch_outputs_listed(payload: &str) -> Result<(), String> {
+    // Each line's first four words, then its description.
+    let begins = |line: Option<&str>, words: [&str; 4]| {
+        line.is_some_and(|line| line.split(' ').take(4).eq(words) && line.split(' ').count() > 4)
+    };
+    let mut lines = payload.split(';').filter(|line| !line.is_empty());
+    let hda = begins(lines.next(), ["output", "0", SWITCH_HDA_SINK, "active"]);
+    let usb = begins(lines.next(), ["output", "1", SWITCH_USB_SINK, "-"]);
+    match (hda, usb, lines.next()) {
+        (true, true, None) => Ok(()),
+        _ => Err(format!(
+            "the daemon did not list {SWITCH_HDA_SINK} active and {SWITCH_USB_SINK} after it: \
+             {payload:?}"
+        )),
+    }
+}
+
+/// Whether a boot failed on the outputs step: the failure itself names its
+/// report. The console tail after it does not count, since once the step
+/// passed that tail holds its report whatever failed later.
+fn the_outputs_step_failed(error: &str) -> bool {
+    error
+        .split(". Last serial output:")
+        .next()
+        .is_some_and(|failure| failure.contains(SWITCH_OUTPUTS_REPORT))
+}
+
+/// What `output 1` and `play` printed, with their exit statuses: the
+/// switch named the USB output and succeeded, and the tone was sent whole
+/// and drained with nothing dropped, and the player saw no seam: one
+/// `STARTED` and no `UNDERFLOW` across the switch (§K.4).
+fn switch_played(payload: &str) -> Result<(), String> {
+    let Some((switch, play)) = payload.split_once("| ") else {
+        return Err(format!("the switch report has no `| `: {payload:?}"));
+    };
+    let frames = SWITCH_TONE_MS * u64::from(FIREFOX_AUDIO_RATE) / 1_000;
+    let switched = switch
+        .split_whitespace()
+        .eq(["output", SWITCH_USB_SINK, "exit", "0"]);
+    // From the end: no seam and a clean exit, then the whole tone sent.
+    let mut tail = play.split_whitespace().rev();
+    let seamless = [
+        "0",
+        "exit",
+        "0",
+        "overflows",
+        "0",
+        "underflows",
+        "1",
+        "started",
+    ]
+    .iter()
+    .all(|word| tail.next() == Some(*word));
+    // The count as td-audio prints it: plain decimal, no sign or padding.
+    let whole = tail
+        .next()
+        .filter(|count| count.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter(|count| !count.starts_with('0'))
+        .and_then(|count| count.parse::<u64>().ok())
+        == Some(frames)
+        && tail.next() == Some("frames");
+    let played = play.split_whitespace().next() == Some("stream") && seamless && whole;
+    if switched && played {
+        Ok(())
+    } else {
+        Err(format!(
+            "td-audio output printed {switch:?} and td-audio play printed {play:?}"
+        ))
+    }
+}
+
+/// `qemu-boot-audio`: the system's audio daemon switches a playing stream
+/// from one output to another mid-tone. The machine has two outputs, the
+/// HDA device and a USB audio device, each captured to its own WAV. From
+/// the serial shell, `td-audio play` plays a four-second 440 Hz tone as an
+/// ordinary client stream, and a second in `td-audio output 1` makes the
+/// USB output the one that plays. The HDA capture must hold the tone's
+/// start and the USB capture the rest, each a clean fit of the tone, and
+/// the player must have sent and drained the whole tone without noticing.
+pub(crate) fn run_audio(runner: &RecipeCheckRunner) -> Result<(), String> {
+    let qemu = find_qemu()?;
+    let (bzimage, init_cpio, disk, _btrfs) = build_persistent_system(runner)?;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let captures = Scratch {
+        dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
+    };
+    let (hda_wav, usb_wav) = (
+        captures.dir.join(SWITCH_HDA_WAV),
+        captures.dir.join(SWITCH_USB_WAV),
+    );
+    let steps = audio_switch_steps();
+    println!(
+        "   [qemu-boot-audio] {qemu} boots the system with HDA and USB audio outputs, plays a \
+         {SWITCH_TONE_MS} ms tone through td-audio and switches to USB after \
+         {SWITCH_AFTER_SECS} s\n              kernel:        {}\n              initramfs:     \
+         {}\n              Btrfs volume:  {}",
+        bzimage.display(),
+        init_cpio.display(),
+        disk.display()
+    );
+    let result = boot(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        BootPlan {
+            disk: Some(BootDisk::new(&disk, false)),
+            seed: None,
+            cloud: None,
+            mem: SYSTEM_GUEST_MEMORY_MIB,
+            target_marker: GREETER_MARKER,
+            kill_on_marker: true,
+            extra_append: "",
+            user_net: false,
+            audio: true,
+            physical_input: false,
+            capture_firefox_audio: false,
+            audio_switch: Some((&hda_wav, &usb_wav)),
+            tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
+            screens: None,
+            devices: Devices::ALL,
+            screen: None,
+            shell: Some(&steps),
+            host_login: None,
+        },
+        runner.scratch_dir(),
+    )
+    .map_err(|error| {
+        if the_outputs_step_failed(&error) {
+            format!(
+                "{error}\n(td-audio reads its outputs once, at start: a USB audio device the \
+                 guest enumerated after the audio service started is not among them)"
+            )
+        } else {
+            error
+        }
+    })?;
+    println!(
+        "   [qemu-boot-audio] elapsed: {:.2}s",
+        result.elapsed.as_secs_f64()
+    );
+    for line in result.console.lines().filter(|line| {
+        let line = line.trim_start();
+        line.contains("audio: ")
+            || line.starts_with(SWITCH_OUTPUTS_REPORT)
+            || line.starts_with(SWITCH_PLAYED_REPORT)
+    }) {
+        println!("   [qemu-boot-audio] guest: {}", line.trim());
+    }
+    // The boot ends with a kill at the marker, before QEMU closes its
+    // captures, so their headers keep QEMU's placeholder sizes.
+    let ceiling = firefox_audio_capture_ceiling(boot_timeout())?;
+    let hda = verify_tone_capture(&hda_wav, ceiling, SWITCH_HDA_MS, true)
+        .map_err(|error| format!("the HDA output, before the switch: {error}"))?;
+    let usb = verify_tone_capture(&usb_wav, ceiling, SWITCH_USB_MS, true)
+        .map_err(|error| format!("the USB output, after the switch: {error}"))?;
+    let total = hda
+        .evidence
+        .active_ms
+        .saturating_add(usb.evidence.active_ms);
+    for (name, tone) in [("HDA", &hda), ("USB", &usb)] {
+        let evidence = &tone.evidence;
+        println!(
+            "   [qemu-boot-audio] {name}: frames {}..={}, {} ms, peak {}, fitted {:.2} Hz, AC RMS \
+             {:.1}/{:.1}, mean window correlations {:.4}/{:.4}",
+            tone.first,
+            tone.last,
+            evidence.active_ms,
+            evidence.peak,
+            evidence.fitted_hz,
+            evidence.left_ac_rms,
+            evidence.right_ac_rms,
+            evidence.left_correlation,
+            evidence.right_correlation
+        );
+    }
+    if !(SWITCH_TOTAL_MS.0..=SWITCH_TOTAL_MS.1).contains(&total) {
+        return Err(format!(
+            "the two outputs played {total} ms of the {SWITCH_TONE_MS} ms tone, outside \
+             {}..={} ms",
+            SWITCH_TOTAL_MS.0, SWITCH_TOTAL_MS.1
+        ));
+    }
+    println!(
+        "PASS: td-audio switched a playing stream from the HDA output to the USB output \
+         mid-tone: {} ms then {} ms of the tone, and the player sent and drained all of it",
+        hda.evidence.active_ms, usb.evidence.active_ms
     );
     Ok(())
 }
@@ -3104,6 +3370,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: true,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -3259,6 +3526,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -4701,6 +4969,11 @@ struct BootPlan<'a> {
     /// audit workload remains real physical input but uses the host-silent
     /// backend so audit scheduling cannot invalidate the HDA timing oracle.
     capture_firefox_audio: bool,
+    /// Two paths, in a private directory and not yet existing, for QEMU to
+    /// capture system audio to as two outputs: the HDA device's and a USB
+    /// audio device's behind its own xHCI controller. The caller reads and
+    /// removes them (`qemu-boot-audio`).
+    audio_switch: Option<(&'a Path, &'a Path)>,
     /// Private swtpm control socket; never a host TPM passthrough.
     tpm_socket: Option<&'a Path>,
     /// A file QEMU writes the guest's virtio serial port named
@@ -5104,6 +5377,11 @@ fn boot_source(
             "Firefox audio capture requires both system audio and physical input".to_string(),
         );
     }
+    if plan.audio_switch.is_some() && (!plan.audio || plan.capture_firefox_audio) {
+        return Err(
+            "the two-output audio capture requires system audio and no Firefox capture".to_string(),
+        );
+    }
     // Per-invocation console/diag dir created EXCLUSIVELY (mkdir, not mkdir -p)
     // with 0700 under the runner's private scratch base — NOT world-writable
     // `/tmp`. Exclusive creation means this process is the sole creator (a stale or
@@ -5136,6 +5414,17 @@ fn boot_source(
         .as_ref()
         .map(|_| firefox_audio_capture_ceiling(timeout))
         .transpose()?;
+    let switch_ceiling = plan
+        .audio_switch
+        .map(|_| firefox_audio_capture_ceiling(timeout))
+        .transpose()?;
+    // Every capture QEMU writes, each under the one ceiling a boot's length
+    // bounds.
+    let captures = [
+        firefox_audio_path.as_deref().zip(firefox_audio_ceiling),
+        plan.audio_switch.map(|(hda, _)| hda).zip(switch_ceiling),
+        plan.audio_switch.map(|(_, usb)| usb).zip(switch_ceiling),
+    ];
     let diag =
         File::create(&diag_path).map_err(|e| format!("create {}: {e}", diag_path.display()))?;
     let diag_err = diag
@@ -5407,7 +5696,10 @@ fn boot_source(
         cmd.args(["-nic", "none"]);
     }
     if plan.audio {
-        attach_system_audio(&mut cmd, firefox_audio_path.as_deref());
+        match plan.audio_switch {
+            Some((hda, usb)) => attach_switch_audio(&mut cmd, hda, usb),
+            None => attach_system_audio(&mut cmd, firefox_audio_path.as_deref()),
+        }
     }
     // Optional raw disk: if=none defines the backing store; the device selects
     // virtio or the installation fixture's AHCI transport.
@@ -5786,19 +6078,17 @@ fn boot_source(
             end = EndReason::Flooded(on_disk);
             break;
         }
-        if let Some((path, ceiling)) = firefox_audio_path.as_deref().zip(firefox_audio_ceiling) {
+        let flooded = captures.iter().flatten().find_map(|(path, ceiling)| {
             let capture_bytes = fs::metadata(path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
-            if capture_bytes > ceiling {
-                let _ = child.kill();
-                let _ = child.wait();
-                end = EndReason::AudioFlooded {
-                    bytes: capture_bytes,
-                    ceiling,
-                };
-                break;
-            }
+            (capture_bytes > *ceiling).then_some((capture_bytes, *ceiling))
+        });
+        if let Some((bytes, ceiling)) = flooded {
+            let _ = child.kill();
+            let _ = child.wait();
+            end = EndReason::AudioFlooded { bytes, ceiling };
+            break;
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
@@ -5948,7 +6238,7 @@ fn attach_system_audio(command: &mut Command, capture: Option<&Path>) {
     command.arg("-audiodev");
     match capture {
         Some(path) => {
-            command.arg(wav_audiodev_arg(path));
+            command.arg(wav_audiodev_arg("audio0", path));
         }
         None => {
             command.arg("none,id=audio0");
@@ -5968,8 +6258,23 @@ fn attach_system_audio(command: &mut Command, capture: Option<&Path>) {
     ]);
 }
 
-fn wav_audiodev_arg(path: &Path) -> OsString {
-    let mut argument = OsString::from("wav,id=audio0,path=");
+/// The system's HDA output and a USB audio output, each captured to its own
+/// WAV: the two outputs `qemu-boot-audio` switches between. The USB device
+/// has its own xHCI controller, so no other USB device shares its bus.
+fn attach_switch_audio(command: &mut Command, hda: &Path, usb: &Path) {
+    command
+        .arg("-audiodev")
+        .arg(wav_audiodev_arg("audio0", hda))
+        .args(["-device", "intel-hda"])
+        .args(["-device", "hda-output,audiodev=audio0,mixer=off"])
+        .arg("-audiodev")
+        .arg(wav_audiodev_arg("audio1", usb))
+        .args(["-device", "qemu-xhci,id=audio-xhci"])
+        .args(["-device", "usb-audio,bus=audio-xhci.0,audiodev=audio1"]);
+}
+
+fn wav_audiodev_arg(id: &str, path: &Path) -> OsString {
+    let mut argument = OsString::from(format!("wav,id={id},path="));
     let mut escaped = Vec::with_capacity(path.as_os_str().as_bytes().len());
     for byte in path.as_os_str().as_bytes() {
         if *byte == b',' {
@@ -6313,6 +6618,28 @@ fn firefox_audio_capture_ceiling(timeout: Duration) -> Result<u64, String> {
 }
 
 fn verify_firefox_audio(path: &Path, ceiling: u64) -> Result<FirefoxAudioEvidence, String> {
+    verify_tone_capture(path, ceiling, FIREFOX_AUDIO_ACTIVE_MS, false).map(|tone| tone.evidence)
+}
+
+/// A verified tone and where in its capture it was: the frames of its
+/// first and last sample above the floor.
+#[derive(Debug)]
+struct ToneCapture {
+    evidence: FirefoxAudioEvidence,
+    first: usize,
+    last: usize,
+}
+
+/// A WAV QEMU captured holds one span of the 440 Hz tone, `active_ms` long
+/// within the inclusive bounds, and silence around it. The tone checks are
+/// Firefox's; only the span's length is the caller's, and whether QEMU was
+/// `killed` before it could finish the header (`validate_wav_header`).
+fn verify_tone_capture(
+    path: &Path,
+    ceiling: u64,
+    active_ms: (u64, u64),
+    killed: bool,
+) -> Result<ToneCapture, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect {}: {error}", path.display()))?;
     if !metadata.file_type().is_file() || metadata.len() < 44 {
@@ -6330,7 +6657,7 @@ fn verify_firefox_audio(path: &Path, ceiling: u64) -> Result<FirefoxAudioEvidenc
     let mut header = [0_u8; 44];
     file.read_exact(&mut header)
         .map_err(|error| format!("read {} header: {error}", path.display()))?;
-    let data_len = validate_firefox_audio_header(&header, metadata.len())?;
+    let data_len = validate_wav_header(&header, metadata.len(), killed)?;
 
     // A timeout-sized capture is hundreds of MiB because QEMU writes silence
     // for the whole boot. Scan it in one fixed buffer, then seek back and retain
@@ -6371,8 +6698,13 @@ fn verify_firefox_audio(path: &Path, ceiling: u64) -> Result<FirefoxAudioEvidenc
         .and_then(|span| span.checked_add(1))
         .ok_or_else(|| "QEMU WAV active-frame span overflowed".to_string())?;
     let detail = span.detail();
-    validate_firefox_audio_shape(active_frames, span.peak, span.longest_internal_quiet)
-        .map_err(|error| format!("{error}; {detail}"))?;
+    validate_tone_shape(
+        active_frames,
+        span.peak,
+        span.longest_internal_quiet,
+        active_ms,
+    )
+    .map_err(|error| format!("{error}; {detail}"))?;
     let active_bytes = active_frames
         .checked_mul(4)
         .ok_or_else(|| "QEMU WAV active-byte span overflowed".to_string())?;
@@ -6391,13 +6723,18 @@ fn verify_firefox_audio(path: &Path, ceiling: u64) -> Result<FirefoxAudioEvidenc
     active.resize(active_bytes, 0);
     file.read_exact(&mut active)
         .map_err(|error| format!("read {} active samples: {error}", path.display()))?;
-    verify_firefox_audio_active(&active, span.peak, span.longest_internal_quiet)
-        .map_err(|error| format!("{error}; {detail}"))
+    let evidence = verify_tone_active(&active, span.peak, span.longest_internal_quiet, active_ms)
+        .map_err(|error| format!("{error}; {detail}"))?;
+    Ok(ToneCapture {
+        evidence,
+        first,
+        last,
+    })
 }
 
 #[cfg(test)]
 fn verify_firefox_audio_bytes(bytes: &[u8]) -> Result<FirefoxAudioEvidence, String> {
-    let data_len = validate_firefox_audio_header(bytes, bytes.len() as u64)?;
+    let data_len = validate_wav_header(bytes, bytes.len() as u64, false)?;
     let data = bytes
         .get(44..)
         .ok_or_else(|| "QEMU WAV capture has no sample data".to_string())?;
@@ -6417,11 +6754,20 @@ fn verify_firefox_audio_bytes(bytes: &[u8]) -> Result<FirefoxAudioEvidence, Stri
     let active = data
         .get(active_start..active_end)
         .ok_or_else(|| "QEMU WAV active span is truncated".to_string())?;
-    verify_firefox_audio_active(active, span.peak, span.longest_internal_quiet)
-        .map_err(|error| format!("{error}; {}", span.detail()))
+    verify_tone_active(
+        active,
+        span.peak,
+        span.longest_internal_quiet,
+        FIREFOX_AUDIO_ACTIVE_MS,
+    )
+    .map_err(|error| format!("{error}; {}", span.detail()))
 }
 
-fn validate_firefox_audio_header(bytes: &[u8], actual_file: u64) -> Result<usize, String> {
+/// The capture's data length, from a header that must be QEMU's exact
+/// 48 kHz stereo S16 one. QEMU writes the two sizes when it closes the file;
+/// a QEMU this run `killed` first leaves the zeros it opened with, and then
+/// the file's own length, cut to whole frames, is what it wrote.
+fn validate_wav_header(bytes: &[u8], actual_file: u64, killed: bool) -> Result<usize, String> {
     if bytes.get(..4) != Some(b"RIFF")
         || bytes.get(8..12) != Some(b"WAVE")
         || bytes.get(12..16) != Some(b"fmt ")
@@ -6429,7 +6775,12 @@ fn validate_firefox_audio_header(bytes: &[u8], actual_file: u64) -> Result<usize
     {
         return Err("QEMU WAV capture does not have the canonical RIFF/PCM layout".to_string());
     }
-    let declared_file = u64::from(wav_u32(bytes, 4)?).saturating_add(8);
+    let unfinished = killed && wav_u32(bytes, 4)? == 0 && wav_u32(bytes, 40)? == 0;
+    let declared_file = if unfinished {
+        actual_file
+    } else {
+        u64::from(wav_u32(bytes, 4)?).saturating_add(8)
+    };
     if declared_file != actual_file
         || wav_u32(bytes, 16)? != 16
         || wav_u16(bytes, 20)? != 1
@@ -6440,6 +6791,18 @@ fn validate_firefox_audio_header(bytes: &[u8], actual_file: u64) -> Result<usize
         || wav_u16(bytes, 34)? != 16
     {
         return Err("QEMU WAV capture is not exact 48 kHz stereo signed 16-bit PCM".to_string());
+    }
+    if killed && !unfinished {
+        return Err(
+            "QEMU was killed before closing its WAV, which then keeps zero sizes, and this one \
+             has others"
+                .to_string(),
+        );
+    }
+    if unfinished {
+        let written = actual_file.saturating_sub(44);
+        return usize::try_from(written - written % 4)
+            .map_err(|_| "QEMU WAV data length does not fit memory".to_string());
     }
     let data_len = usize::try_from(wav_u32(bytes, 40)?)
         .map_err(|_| "QEMU WAV data length does not fit memory".to_string())?;
@@ -6528,16 +6891,16 @@ fn firefox_audio_active_span(data: &[u8]) -> Result<FirefoxAudioSpan, String> {
     scan.finish()
 }
 
-fn validate_firefox_audio_shape(
+fn validate_tone_shape(
     active_frames: usize,
     peak: i32,
     longest_internal_quiet: usize,
+    (min_ms, max_ms): (u64, u64),
 ) -> Result<u64, String> {
     let active_ms = (active_frames as u64).saturating_mul(1_000) / u64::from(FIREFOX_AUDIO_RATE);
-    if !(FIREFOX_AUDIO_MIN_ACTIVE_MS..=FIREFOX_AUDIO_MAX_ACTIVE_MS).contains(&active_ms) {
+    if !(min_ms..=max_ms).contains(&active_ms) {
         return Err(format!(
-            "QEMU WAV active span is {active_ms} ms, outside \
-             {FIREFOX_AUDIO_MIN_ACTIVE_MS}..={FIREFOX_AUDIO_MAX_ACTIVE_MS} ms"
+            "QEMU WAV active span is {active_ms} ms, outside {min_ms}..={max_ms} ms"
         ));
     }
     if peak < FIREFOX_AUDIO_MIN_PEAK {
@@ -6578,16 +6941,17 @@ fn firefox_audio_keyed_level(left_ac_rms: f64, right_ac_rms: f64) -> Result<(), 
     .unwrap_or_default())
 }
 
-fn verify_firefox_audio_active(
+fn verify_tone_active(
     data: &[u8],
     peak: i32,
     longest_internal_quiet: usize,
+    bounds: (u64, u64),
 ) -> Result<FirefoxAudioEvidence, String> {
     if !data.len().is_multiple_of(4) {
         return Err("QEMU WAV active span is not frame-aligned".to_string());
     }
     let active_frames = data.len() / 4;
-    let active_ms = validate_firefox_audio_shape(active_frames, peak, longest_internal_quiet)?;
+    let active_ms = validate_tone_shape(active_frames, peak, longest_internal_quiet, bounds)?;
     let fit = fit_firefox_tone(data, active_frames)?;
     if fit.left_ac_rms < FIREFOX_AUDIO_MIN_AC_RMS || fit.right_ac_rms < FIREFOX_AUDIO_MIN_AC_RMS {
         return Err(format!(
@@ -9663,6 +10027,195 @@ mod tests {
                 "hda-output,audiodev=audio0,mixer=off",
             ]
         );
+    }
+
+    /// The switch oracle's machine: the HDA output and a USB audio output
+    /// on its own xHCI controller, each captured to its own exact WAV.
+    #[test]
+    fn switch_audio_captures_hda_and_usb_apart() {
+        let mut command = Command::new("qemu-system-x86_64");
+        attach_switch_audio(
+            &mut command,
+            Path::new("/tmp/td,a/hda.wav"),
+            Path::new("/tmp/td,a/usb.wav"),
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "-audiodev",
+                "wav,id=audio0,path=/tmp/td,,a/hda.wav,out.frequency=48000,out.channels=2,out.format=s16",
+                "-device",
+                "intel-hda",
+                "-device",
+                "hda-output,audiodev=audio0,mixer=off",
+                "-audiodev",
+                "wav,id=audio1,path=/tmp/td,,a/usb.wav,out.frequency=48000,out.channels=2,out.format=s16",
+                "-device",
+                "qemu-xhci,id=audio-xhci",
+                "-device",
+                "usb-audio,bus=audio-xhci.0,audiodev=audio1",
+            ]
+        );
+    }
+
+    /// The outputs step passes only two outputs, HDA active first.
+    #[test]
+    fn the_switch_needs_both_outputs_hda_active_first() {
+        let listed = "output 0 intel-0 active Generic Analog;output 1 audio-0 - USB Audio;";
+        assert!(switch_outputs_listed(listed).is_ok());
+        for refused in [
+            "",
+            "output 0 audio-0 active USB Audio;output 1 intel-0 - Generic Analog;",
+            "output 0 intel-0 active Generic Analog;output 1 card2-0 - USB Audio;",
+            "output 0 intel-0 active HDA Intel;",
+            "output 0 intel-0 - HDA Intel;output 1 audio-0 active USB Audio;",
+            "output 0 intel-0 active HDA Intel;output 2 audio-0 - USB Audio;",
+            "output 0 intel-0 active A;output 1 audio-0 - B;output 2 c-0 - C;",
+            "td-audio: connect /run/td-audio/native: No such file or directory (os error 2);",
+        ] {
+            assert!(switch_outputs_listed(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    /// The switch step passes only a switch that succeeded and a tone sent
+    /// whole, drained and never overflowed, both exiting 0.
+    #[test]
+    fn the_switch_needs_the_whole_tone_and_a_clean_switch() {
+        let good = "output audio-0 exit 0 | stream 2 frames 192000 started 1 underflows 0 \
+                    overflows 0 exit 0 ";
+        assert!(switch_played(good).is_ok());
+        for refused in [
+            "output intel-0 exit 0 | stream 2 frames 192000 started 1 underflows 0 overflows 0 exit 0",
+            "output audio-0 exit 0 | stream 2 frames 192000 started 2 underflows 0 overflows 0 exit 0",
+            "output audio-0 exit 0 | stream 2 frames 192000 started 1 underflows 1 overflows 0 exit 0",
+            "output audio-0 exit 1 | stream 2 frames 192000 started 1 underflows 0 overflows 0 exit 0",
+            "td-audio: the daemon refused: not supported exit 1 | stream 2 frames 192000 \
+             started 1 underflows 0 overflows 0 exit 0",
+            "output audio-0 exit 0 | stream 2 frames 96000 started 1 underflows 0 overflows 0 exit 0",
+            "output audio-0 exit 0 | stream 2 frames +192000 started 1 underflows 0 overflows 0 exit 0",
+            "output audio-0 exit 0 | stream 2 frames 0192000 started 1 underflows 0 overflows 0 exit 0",
+            "output audio-0 exit 0 | stream 2 frames 192000 started 1 underflows 0 overflows 1 exit 0",
+            "output audio-0 exit 0 | td-audio: the daemon ended the stream: no output is left \
+             to play it exit 1",
+            "output audio-0 exit 0 stream 2 frames 192000 started 1 underflows 0 overflows 0 exit 0",
+        ] {
+            assert!(switch_played(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    /// The late-USB hint is for the outputs step's own failure, not a later
+    /// step's whose console tail holds the outputs report.
+    #[test]
+    fn only_the_outputs_step_failing_gets_the_late_usb_hint() {
+        let tail = ". Last serial output:\nTD-AUDIO-OUTPUTS output 0 intel-0 active A;";
+        assert!(the_outputs_step_failed(&format!(
+            "the serial shell reported \"TD-AUDIO-OUTPUTS output 0 intel-0 active A;\"{tail}"
+        )));
+        assert!(the_outputs_step_failed(
+            "the serial shell did not report TD-AUDIO-OUTPUTS within 120s. Last serial output:\n"
+        ));
+        assert!(!the_outputs_step_failed(&format!(
+            "the serial shell reported \"TD-AUDIO-SWITCHED output intel-0 exit 0 | x\"{tail}"
+        )));
+    }
+
+    /// Every step is one line, so nothing the console echoes of it can begin
+    /// a report line; only printf's own `\n` can.
+    #[test]
+    fn each_switch_step_is_one_line_no_echo_can_report() {
+        for step in audio_switch_steps() {
+            assert!(!step.command.contains('\n'), "{:?}", step.command);
+            assert!(
+                !step.command.starts_with(&step.report),
+                "{:?}",
+                step.command
+            );
+            assert!(step.command.contains(&format!("\\n{} ", step.report)));
+        }
+    }
+
+    /// One tone verifier, two sets of bounds: a second of tone is the HDA
+    /// side of a switch and not the USB side, and neither is Firefox's.
+    #[test]
+    fn a_captured_tone_is_held_to_the_callers_bounds() {
+        let dir = crate::test_temp::TempDir::new("td-audio-switch").unwrap();
+        let path = dir.path().join("hda.wav");
+        fs::write(&path, synthetic_firefox_wave(440.0, 1_000)).unwrap();
+        let hda =
+            verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_HDA_MS, false).unwrap();
+        assert!((990..=1_000).contains(&hda.evidence.active_ms));
+        assert_eq!(
+            hda.first, 4_800,
+            "the synthetic tone starts after 100 ms of silence"
+        );
+        let usb =
+            verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, false).unwrap_err();
+        assert!(usb.contains("outside 2300..=3800 ms"), "{usb}");
+        assert!(verify_firefox_audio(&path, MAX_AUDIO_CAPTURE_BYTES).is_ok());
+        fs::write(&path, synthetic_firefox_wave(440.0, 3_000)).unwrap();
+        assert!(verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, false).is_ok());
+        assert!(verify_firefox_audio(&path, MAX_AUDIO_CAPTURE_BYTES).is_err());
+    }
+
+    /// QEMU killed at the marker never writes its WAV's sizes: the header
+    /// keeps the zeros it opened with, and a write may stop mid-frame. That
+    /// capture reads as the file's whole frames, but only for a run that
+    /// killed QEMU, and only with QEMU's zeros; any other size, and every
+    /// format field, is still held exact.
+    #[test]
+    fn a_capture_whose_qemu_was_killed_reads_as_written() {
+        let dir = crate::test_temp::TempDir::new("td-audio-killed").unwrap();
+        let path = dir.path().join("usb.wav");
+        let mut wave = synthetic_firefox_wave(440.0, 3_000);
+        let finished = verify_tone_capture_bytes(&wave, false);
+        wave[4..8].fill(0);
+        wave[40..44].fill(0);
+        wave.extend_from_slice(&[1, 2]);
+        fs::write(&path, &wave).unwrap();
+        let killed =
+            verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, true).unwrap();
+        assert_eq!(killed.evidence.active_ms, finished);
+        // A finished header is no killed QEMU's.
+        let mut finished_wave = synthetic_firefox_wave(440.0, 3_000);
+        fs::write(&path, &finished_wave).unwrap();
+        let sized =
+            verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, true).unwrap_err();
+        assert!(sized.contains("zero sizes"), "{sized}");
+        // A killed QEMU whose USB output never played left a header alone.
+        finished_wave.truncate(44);
+        finished_wave[4..8].fill(0);
+        finished_wave[40..44].fill(0);
+        fs::write(&path, &finished_wave).unwrap();
+        assert!(verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, true).is_err());
+        let strict =
+            verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, false).unwrap_err();
+        assert!(strict.contains("not exact 48 kHz"), "{strict}");
+        // One size left as QEMU's zero and the other not is no killed
+        // capture, and a killed one must still be 48 kHz.
+        let mut half = wave.clone();
+        half[40..44].copy_from_slice(&4_u32.to_le_bytes());
+        fs::write(&path, &half).unwrap();
+        assert!(verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, true).is_err());
+        let mut slow = wave.clone();
+        slow[24..28].copy_from_slice(&44_100_u32.to_le_bytes());
+        fs::write(&path, &slow).unwrap();
+        let rate =
+            verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, true).unwrap_err();
+        assert!(rate.contains("not exact 48 kHz"), "{rate}");
+    }
+
+    fn verify_tone_capture_bytes(wave: &[u8], killed: bool) -> u64 {
+        let dir = crate::test_temp::TempDir::new("td-audio-finished").unwrap();
+        let path = dir.path().join("hda.wav");
+        fs::write(&path, wave).unwrap();
+        verify_tone_capture(&path, MAX_AUDIO_CAPTURE_BYTES, SWITCH_USB_MS, killed)
+            .unwrap()
+            .evidence
+            .active_ms
     }
 
     fn synthetic_firefox_wave_signal(
@@ -14382,6 +14935,7 @@ mod tests {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            audio_switch: None,
             tpm_socket: None,
             side_channel: None,
             answers: None,
@@ -14467,6 +15021,7 @@ mod tests {
                 audio: false,
                 physical_input: other == "input",
                 capture_firefox_audio: false,
+                audio_switch: None,
                 tpm_socket: None,
                 side_channel: None,
                 answers: (other == "answers").then_some(&answers),
