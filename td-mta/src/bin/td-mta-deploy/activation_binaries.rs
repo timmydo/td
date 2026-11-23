@@ -24,17 +24,23 @@ pub(crate) use store::discard_nars;
 
 pub(crate) const BINARIES_DROPIN: &str =
     "/etc/systemd/system/td-mta-postgres.service.d/91-td-mta-binaries.conf";
+/// The scheduled backup's tools follow the server's.
+pub(crate) const BACKUP_DROPIN: &str =
+    "/etc/systemd/system/td-mta-maint-backup.service.d/91-td-mta-binaries.conf";
+const BACKUP: &str = "td-mta-maint-backup.service";
 const STORE: &str = "/td/store";
 const PG_BUS: &str = "/org/freedesktop/systemd1/unit/td_2dmta_2dpostgres_2eservice";
 const DROPIN_HEAD: &str = "[Service]\nExecStart=\nExecStart=:";
 // td's loader must resolve the server's libraries through its RUNPATH alone.
 const UNSET: &str = "UnsetEnvironment=LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT\n";
 const UNSET_NAMES: &[&str] = &["LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT"];
-/// What the controller and the server run from the selected tree.
+/// What the controller, the server and the scheduled backup run from the
+/// selected tree.
 const PROGRAMS: &[&str] = &[
     "postgres",
     "psql",
     "pg_dump",
+    "pg_restore",
     "pg_basebackup",
     "pg_verifybackup",
     "pg_receivewal",
@@ -252,6 +258,39 @@ pub(super) fn dropin_text(program: &str, args: &[&str]) -> R<String> {
     td_alloc::push_str(&mut text, "\n")?;
     td_alloc::push_str(&mut text, UNSET)?;
     Ok(text)
+}
+
+/// The backup job's drop-in: td's tools first and alone on `PATH`, and no
+/// library path of the Debian tree overriding their run path.
+pub(super) fn backup_dropin_text(bin: &str) -> R<String> {
+    require(plain(bin), "unexpected PostgreSQL tools directory")?;
+    let mut text = owned("[Service]\nEnvironment=PATH=")?;
+    td_alloc::push_str(&mut text, bin)?;
+    td_alloc::push_str(&mut text, "\n")?;
+    td_alloc::push_str(&mut text, UNSET)?;
+    Ok(text)
+}
+
+/// systemd's `Environment` and `UnsetEnvironment` of the backup job run
+/// td's tools from `bin` alone.
+pub(super) fn backup_environment(environment: &str, unset: &str, bin: &str) -> R<()> {
+    let mut path = None;
+    for assignment in environment.split_ascii_whitespace() {
+        if let Some(value) = assignment.strip_prefix("PATH=") {
+            require(path.is_none(), "repeated backup PATH")?;
+            path = Some(value);
+        }
+    }
+    require(
+        path == Some(bin),
+        "systemd does not run the scheduled backup with td's PostgreSQL tools",
+    )?;
+    require(
+        UNSET_NAMES
+            .iter()
+            .all(|name| unset.split_ascii_whitespace().any(|v| v == *name)),
+        "systemd keeps a loader variable for the scheduled backup",
+    )
 }
 
 /// The td-built server a drop-in `dropin_text` wrote runs.
@@ -567,6 +606,7 @@ pub(super) fn unit_state(state: &str) -> R<()> {
 pub(super) struct Switch {
     stopped: bool,
     dropin: Option<Setting>,
+    backup: Option<Setting>,
 }
 
 impl Deployment {
@@ -590,6 +630,17 @@ impl Deployment {
             )?;
             loader::check_loading(&self.host, &closure)?;
             self.td_process(self.pid(PG)?, &closure)?;
+            // A switch before the backup followed the server converges here.
+            let backup = self.backup_dropin(&closure)?;
+            let placed = files::present(&backup)?;
+            files::install(&self.host, std::slice::from_ref(&backup))?;
+            // Also after a run that placed the file and died before reloading.
+            self.host
+                .run(self.host.cmd("systemctl").arg("daemon-reload"))?;
+            self.check_backup(&closure)?;
+            if !placed {
+                self.event("scheduled backup moved to td's PostgreSQL tools")?;
+            }
             self.journal_identity()?;
             self.config(&self.previous, &[], self.isolated)?;
             self.healthy(&self.previous)?;
@@ -629,6 +680,7 @@ impl Deployment {
 
     fn binaries_cutover(&mut self, closure: &Closure, switch: &mut Switch) -> R<()> {
         let setting = self.binaries_dropin(closure)?;
+        let backup = self.backup_dropin(closure)?;
         self.event("installing the td-built PostgreSQL closure")?;
         let placed = store::install(&self.host, &self.work, closure)?;
         set(&mut self.record, "postgres_store", placed)?;
@@ -656,6 +708,7 @@ impl Deployment {
             !setting.path.try_exists()?,
             "unexpected PostgreSQL binaries drop-in",
         )?;
+        self.backup_adoptable(&backup)?;
         let uid = fs::metadata(PGDATA)?.uid();
         let gid = isolation::db_group(&self.host, false)?;
         self.prepare_fence(true, false)?;
@@ -663,6 +716,10 @@ impl Deployment {
         // The included file fences a restart from here on.
         self.socket_fence = true;
         LiveSocket(&self.host).write_file()?;
+        // Recorded first: a rollback removes what of them is in place,
+        // a leftover backup drop-in this run adopted included.
+        switch.dropin = Some(setting);
+        switch.backup = Some(backup);
         switch.stopped = true;
         self.host
             .run(self.host.cmd("systemctl").args(["stop", PG]))?;
@@ -671,11 +728,15 @@ impl Deployment {
             self.control_state(Path::new(PGDATA))? == "shut down",
             "clean PostgreSQL shutdown",
         )?;
-        let setting = &*switch.dropin.get_or_insert(setting);
+        let setting = switch.dropin.as_ref().ok_or("missing binaries drop-in")?;
         files::install(&self.host, std::slice::from_ref(setting))?;
+        let backup = switch.backup.as_ref().ok_or("missing backup drop-in")?;
+        files::install(&self.host, std::slice::from_ref(backup))?;
         self.host
             .run(self.host.cmd("systemctl").arg("daemon-reload"))?;
         self.check_unit(closure, &setting.text)?;
+        self.check_backup(closure)?;
+        self.event("scheduled backup moved to td's PostgreSQL tools")?;
         self.host
             .run(self.host.cmd("systemctl").args(["start", PG]))?;
         self.wait(25, "td-built PostgreSQL startup", || self.ready_db(&[]))?;
@@ -924,6 +985,69 @@ impl Deployment {
         })
     }
 
+    /// The backup job's drop-in; the job must exist. One an interrupted
+    /// run left is adopted when it says the same.
+    fn backup_dropin(&self, closure: &Closure) -> R<Setting> {
+        let state = self.host.out(self.host.cmd("systemctl").args([
+            "show",
+            BACKUP,
+            "-p",
+            "LoadState",
+            "--value",
+        ]))?;
+        require(
+            state.trim() == "loaded",
+            "the scheduled backup job td-mta-maint-backup.service is not installed",
+        )?;
+        self.no_environment_file()?;
+        let bin = closure.bin()?;
+        let setting = Setting {
+            path: PathBuf::from(BACKUP_DROPIN),
+            text: backup_dropin_text(bin.to_str().ok_or("store path")?)?,
+            mode: 0o644,
+        };
+        self.backup_adoptable(&setting)?;
+        Ok(setting)
+    }
+
+    /// Absent, or exactly what this switch writes.
+    fn backup_adoptable(&self, setting: &Setting) -> R<()> {
+        match files::present(setting) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(fmt(format_args!(
+                "td-mta-maint-backup.service.d/91-td-mta-binaries.conf is not what this switch writes: {e}"
+            ))?
+            .into()),
+        }
+    }
+
+    fn show_backup(&self, property: &str) -> R<String> {
+        self.host.out(
+            self.host
+                .cmd("systemctl")
+                .args(["show", BACKUP, "-p", property, "--value"]),
+        )
+    }
+
+    // An environment file would override what the drop-in sets.
+    fn no_environment_file(&self) -> R<()> {
+        require(
+            self.show_backup("EnvironmentFiles")?.trim().is_empty(),
+            "the scheduled backup job reads an environment file",
+        )
+    }
+
+    fn check_backup(&self, closure: &Closure) -> R<()> {
+        let show = |property| self.show_backup(property);
+        self.no_environment_file()?;
+        let bin = closure.bin()?;
+        backup_environment(
+            &show("Environment")?,
+            &show("UnsetEnvironment")?,
+            bin.to_str().ok_or("store path")?,
+        )
+    }
+
     // systemd's reloaded unit runs exactly what the drop-in says.
     fn check_unit(&self, closure: &Closure, text: &str) -> R<()> {
         let property = crate::readiness::exec_start(&self.host, PG_BUS)?;
@@ -973,11 +1097,10 @@ impl Deployment {
                 "postgres_td_control_state",
                 Json::Str(state),
             )?;
-            if let Some(setting) = &switch.dropin {
-                files::rollback(std::iter::once(setting))?;
-            }
+            files::rollback(switch.dropin.iter().chain(&switch.backup))?;
             require(
-                !Path::new(BINARIES_DROPIN).try_exists()?,
+                !Path::new(BINARIES_DROPIN).try_exists()?
+                    && !Path::new(BACKUP_DROPIN).try_exists()?,
                 "PostgreSQL binaries drop-in remains",
             )?;
             self.host.select_tools(None);

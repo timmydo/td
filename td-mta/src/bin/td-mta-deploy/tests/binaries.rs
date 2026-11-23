@@ -677,3 +677,36 @@ fn minor_release_notes_refuse_what_they_concern_and_size_the_window() {
     let job = job(&entries(&unlisted, GLIBC), "17.6");
     assert!(Closure::from_job(&job).is_err());
 }
+
+#[test]
+fn the_scheduled_backup_follows_the_server_to_tds_tools() {
+    let bin = format!("/td/store/{PG}/bin");
+    let text = backup_dropin_text(&bin).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "[Service]\nEnvironment=PATH={bin}\nUnsetEnvironment=LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT\n"
+        )
+    );
+    assert!(backup_dropin_text("/td/store/x y/bin").is_err());
+    let unset = "LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT";
+    backup_environment(&format!("PATH={bin} TZ=UTC"), unset, &bin).unwrap();
+    let repeated = format!("PATH={bin} PATH={bin}");
+    let alone = format!("PATH={bin}");
+    for (environment, unset) in [
+        // The unit's own Debian tools, or none.
+        (
+            "PATH=/opt/td-mta/postgresql/usr/lib/postgresql/17/bin",
+            unset,
+        ),
+        ("", unset),
+        (repeated.as_str(), unset),
+        // The Debian library path would override td's run path.
+        (alone.as_str(), "LD_PRELOAD LD_AUDIT"),
+    ] {
+        assert!(
+            backup_environment(environment, unset, &bin).is_err(),
+            "{environment} / {unset}"
+        );
+    }
+}

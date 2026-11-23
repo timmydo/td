@@ -313,8 +313,10 @@ store, and nothing builds into it on the host.
 - Execution: `td-mta-postgres.service` runs the server as `td-mta`
   through a drop-in that also unsets the loader's environment
   variables; the root controller runs the server in its trials and runs
-  the client tools. The operator may point the scheduled backup at those
-  tools; nothing else on the host runs these paths. Three checks bound
+  the client tools. The switch also makes the scheduled backup job run,
+  as its own account, from the output's `bin` alone through a drop-in
+  that unsets the same variables, so its `pg_dump` and `pg_restore` are
+  td's; nothing else on the host runs these paths. Three checks bound
   what the loader maps. At build, the launcher resolves every executable
   and shared object of the PostgreSQL output as its own root, breadth
   first as the loader does: each NEEDED name must be already loaded or
@@ -323,10 +325,11 @@ store, and nothing builds into it on the host.
   programs and libraries are checked only where those roots load them.
   On the host, before any PostgreSQL program runs, td glibc's verified
   loader lists (`--list`, empty environment) the server, every client
-  the controller runs and every shared object under the PostgreSQL
-  output's `lib`, and every path it opens, links followed, must lie in
-  the two store paths; the output's other programs, which nothing on
-  the host runs, have only the build-time check. Of the
+  the controller or the scheduled backup runs and every shared object
+  under the PostgreSQL output's `lib`, and every path it opens, links
+  followed, must lie in the two store paths; the output's other
+  programs, which nothing on the host runs, have only the build-time
+  check. Of the
   running server, the controller checks that its executable is the
   closure's and that every executable mapping comes from the two store
   paths. td glibc is Debian's with only its interpreter path changed:

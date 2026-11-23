@@ -31,7 +31,7 @@ mod release;
 #[path = "activation_transport.rs"]
 mod transport;
 
-pub(crate) use binaries::{discard_nars, selected_store, BINARIES_DROPIN};
+pub(crate) use binaries::{discard_nars, selected_store, BACKUP_DROPIN, BINARIES_DROPIN};
 
 const OP: &str = "/var/lib/td-mta-operator";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases";

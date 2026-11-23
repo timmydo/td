@@ -37,7 +37,7 @@ points here.
 | Database writer fence (present only while fenced) | `/etc/td-mta/postgres-fence.conf` |
 | PostgreSQL server and tools, once switched | `/td/store/HASH-postgresql-x86-64-17.N/bin`, with td glibc in `/td/store/HASH-glibc-x86-64-VERSION` |
 | Retained Debian PostgreSQL | `/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` |
-| Binary selection (present only once switched) | `/etc/systemd/system/td-mta-postgres.service.d/91-td-mta-binaries.conf` |
+| Binary selection (present only once switched) | `/etc/systemd/system/td-mta-postgres.service.d/91-td-mta-binaries.conf` and `/etc/systemd/system/td-mta-maint-backup.service.d/91-td-mta-binaries.conf` |
 | Per-profile readiness and diagnostics | `/var/lib/td-mta/mail/PROFILE/runtime` |
 | System service definitions | `/etc/systemd/system/td-mta-*.service` |
 | Root-owned deployment receipts and diagnostics | `/var/lib/td-mta-operator/` |
@@ -1466,7 +1466,9 @@ every shared object under the PostgreSQL output's `lib`; every library
 it opens, links followed, must lie inside the two store paths. From
 here the controller's own clients are td's (`psql`, `pg_basebackup`,
 `pg_verifybackup`, `pg_receivewal`, `pg_isready`, `pg_controldata`,
-`pg_dump`). `postgres --version` must report the store name's release.
+`pg_dump`), and the loader check also covers `pg_restore`, which the
+scheduled backup runs. `postgres --version` must report the store
+name's release.
 
 The in-place switch needs all six gates:
 
@@ -1534,10 +1536,17 @@ the writers as an activation does, writes the database fence
 file, stops PostgreSQL, checks gate 4, and installs
 `91-td-mta-binaries.conf`: `ExecStart=` emptied and set to the td
 `postgres` with the same arguments, and
-`UnsetEnvironment=LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT`. After
-`daemon-reload` systemd's command must match it. It starts PostgreSQL
-and requires a closed socket, the production primary, td's executable
-with the closure's mappings and no loader variable, and td's release in
+`UnsetEnvironment=LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT`, and the same
+name under `td-mta-maint-backup.service.d`, which runs the scheduled
+backup with `PATH` set to td's `bin` alone and the same variables unset,
+so td's `pg_dump` dumps td's server whatever tools the generated unit
+names. The backup job must exist, and a backup drop-in an interrupted
+run left must say the same, with no `EnvironmentFile` in the job,
+all checked before fencing. After `daemon-reload` systemd's command
+must match the first, and the backup job's `Environment` and
+`UnsetEnvironment` the second. It starts PostgreSQL and requires a
+closed socket, the production primary, td's executable with the
+closure's mappings and no loader variable, and td's release in
 `server_version_num`; when the notes rebuild GIN indexes it rebuilds
 them through the owner login, requiring the trial's count, and records
 `rebuilt GIN indexes`; then the trigram probe. Then it opens the socket,
@@ -1550,7 +1559,7 @@ PostgreSQL`.
 A failure before PostgreSQL stops leaves production as it was, apart
 from the verified store paths. A failure after it stops and before
 writer admission is reversed automatically: PostgreSQL stops, the
-drop-in goes, the Debian server starts on the same data directory and
+drop-ins go, the Debian server starts on the same data directory and
 must be the running executable, the fence opens and the services are
 verified; the receipt records `Debian PostgreSQL restored` and, as td's
 `pg_controldata` read it before the Debian server started,
@@ -1568,11 +1577,11 @@ refuses on the deployment fence or the stale socket fence file:
   the store paths and the inert fence conditions changed: run
   `--postgres-binaries` again.
 - Otherwise, if it lacks `td-built PostgreSQL started`, return to the
-  Debian server: stop PostgreSQL; if `91-td-mta-binaries.conf` exists,
-  remove it and run `systemctl daemon-reload`; remove
+  Debian server: stop PostgreSQL; remove both `91-td-mta-binaries.conf`
+  drop-ins that exist and run `systemctl daemon-reload`; remove
   `/etc/td-mta/postgres-fence.conf`; start PostgreSQL and check that
   `/proc/MAINPID/exe` is the Debian `postgres`.
-- Otherwise td's server runs on the data directory: keep the drop-in,
+- Otherwise td's server runs on the data directory: keep the drop-ins,
   remove the fence file if present and run `sudo -u td-mta chmod 0660
   /var/lib/td-mta-postgres/.s.PGSQL.35432`.
 
@@ -1582,17 +1591,14 @@ timers the receipt recorded and require health. The next controller run
 of any mode selects its PostgreSQL tools from the drop-in: td's while
 `91-td-mta-binaries.conf` exists, the Debian tree otherwise. Run
 `--postgres-binaries` again to finish or verify the switch; on a host
-the drop-in already switched it only verifies.
+the drop-in already switched it verifies, after installing the backup
+job's drop-in if a switch made before the backup followed the server
+left it out.
 
-Verify:
-
-```text
-systemctl show td-mta-postgres.service -p ExecStart -p UnsetEnvironment
-sudo readlink /proc/$(systemctl show -p MainPID --value td-mta-postgres.service)/exe
-```
-
-The executable is under `/td/store/`, and the effective `ExecStart` names
-the same path.
+The receipt's events are the evidence: `scheduled backup moved to td's
+PostgreSQL tools` after both drop-ins verify, and `verified td-built
+PostgreSQL`; a rerun on a switched host records `already on the
+td-built PostgreSQL`.
 
 If gate 1, 2 or 3, a collation version or an extension refuses, the
 in-place switch is unsafe: td's server cannot read lz4 values, has no
@@ -1620,23 +1626,19 @@ to the Debian binaries by hand as below, then run the switch again with
 the new closure.
 
 To return to the Debian binaries later, fence the writers by hand as for
-the socket rollback, remove `91-td-mta-binaries.conf`, run `systemctl
-daemon-reload`, restart `td-mta-postgres.service`, check that its
-executable is the Debian `postgres`, and reopen the writers. The data
-directory stays; moving back to an older 17 minor is supported unless
+the socket rollback, remove both `91-td-mta-binaries.conf` drop-ins,
+run `systemctl daemon-reload`, restart `td-mta-postgres.service`, check
+that its executable is the Debian `postgres`, and reopen the writers.
+The data directory stays; moving back to an older 17 minor is supported unless
 the release notes between them say otherwise. The next controller run
 uses the Debian tools again. The store paths stay.
 
 Once switched, the bootstrap archive that each activation's recovery
-copy keeps includes the drop-in and the two selected store paths, not
-the rest of `/td/store`.
+copy keeps includes the server's drop-in, the backup job's where
+present, and the two selected store paths, not the rest of `/td/store`.
 
-The scheduled backup's tools are an operations setting. After the
-switch, regenerate the backup job with `--postgres-bin
-/td/store/HASH-postgresql-x86-64-17.N/bin` and without
-`--tool-library-dir`, whose library path would override td's run path
-(DEPLOYMENT.md: retain the existing definitions, regenerate, then
-replace and reload the installed unit). Until then the Debian `pg_dump`
-still dumps the 17.N server. The restore drill runs on the recovery
-host, not here; its supported layouts do not include `/td/store`, so a
-drill that should use td's tools needs that layout admitted first.
+A regenerated backup job keeps the drop-in's tools: its own
+`--postgres-bin` and `--tool-library-dir` matter again only on the
+Debian binaries. The restore drill runs on the recovery host, not
+here; its supported layouts do not include `/td/store`, so a drill that
+should use td's tools needs that layout admitted first.

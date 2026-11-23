@@ -432,6 +432,10 @@ impl Recovery {
         // paths, not the rest of /td/store.
         if !h.host.debian_tools() {
             include(Path::new(crate::activate::BINARIES_DROPIN))?;
+            let backup = Path::new(crate::activate::BACKUP_DROPIN);
+            if backup.try_exists()? {
+                include(backup)?;
+            }
             for path in crate::activate::selected_store(&h.host)? {
                 include(&path)?;
             }
