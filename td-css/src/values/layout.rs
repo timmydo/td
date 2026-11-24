@@ -72,6 +72,81 @@ const LIST_STYLE_POSITIONS: &[&str] = &["outside", "inside"];
 const STYLES: &[&str] = &[
     "none", "hidden", "dotted", "dashed", "solid", "double", "groove", "ridge", "inset", "outset",
 ];
+const FLEX_DIRECTIONS: &[&str] = &["row", "row-reverse", "column", "column-reverse"];
+const FLEX_WRAPS: &[&str] = &["nowrap", "wrap", "wrap-reverse"];
+/// The single-keyword values of each alignment longhand, and those of
+/// them a `safe` or `unsafe` may precede.
+const JUSTIFY_CONTENT: &[&str] = &[
+    "normal",
+    "space-between",
+    "space-around",
+    "space-evenly",
+    "stretch",
+    "center",
+    "start",
+    "end",
+    "flex-start",
+    "flex-end",
+    "left",
+    "right",
+];
+const JUSTIFY_POSITIONS: &[&str] = &[
+    "center",
+    "start",
+    "end",
+    "flex-start",
+    "flex-end",
+    "left",
+    "right",
+];
+const ALIGN_CONTENT: &[&str] = &[
+    "normal",
+    "space-between",
+    "space-around",
+    "space-evenly",
+    "stretch",
+    "center",
+    "start",
+    "end",
+    "flex-start",
+    "flex-end",
+    "baseline",
+];
+const CONTENT_POSITIONS: &[&str] = &["center", "start", "end", "flex-start", "flex-end"];
+const ALIGN_ITEMS: &[&str] = &[
+    "normal",
+    "stretch",
+    "baseline",
+    "center",
+    "start",
+    "end",
+    "self-start",
+    "self-end",
+    "flex-start",
+    "flex-end",
+];
+const ALIGN_SELF: &[&str] = &[
+    "auto",
+    "normal",
+    "stretch",
+    "baseline",
+    "center",
+    "start",
+    "end",
+    "self-start",
+    "self-end",
+    "flex-start",
+    "flex-end",
+];
+const SELF_POSITIONS: &[&str] = &[
+    "center",
+    "start",
+    "end",
+    "self-start",
+    "self-end",
+    "flex-start",
+    "flex-end",
+];
 const OVERFLOW: &[&str] = &["visible", "hidden", "clip", "scroll", "auto"];
 pub(super) fn targets(name: &str) -> Option<&'static [Property]> {
     match name {
@@ -84,6 +159,9 @@ pub(super) fn targets(name: &str) -> Option<&'static [Property]> {
         "overflow" => Some(&[OverflowX, OverflowY]),
         "background" => Some(&[BackgroundColor]),
         "list-style" => Some(LIST_STYLE),
+        "flex" => Some(&[FlexGrow, FlexShrink, FlexBasis]),
+        "flex-flow" => Some(&[FlexDirection, FlexWrap]),
+        "gap" => Some(&[RowGap, ColumnGap]),
         _ => None,
     }
 }
@@ -121,6 +199,18 @@ pub(super) fn extra(p: Property) -> bool {
             | BorderCollapse
             | BorderSpacing
             | TableLayout
+            | FlexDirection
+            | FlexWrap
+            | FlexGrow
+            | FlexShrink
+            | FlexBasis
+            | JustifyContent
+            | AlignItems
+            | AlignSelf
+            | AlignContent
+            | RowGap
+            | ColumnGap
+            | Order
     )
 }
 pub(super) fn parse(
@@ -145,6 +235,24 @@ pub(super) fn parse(
         BorderCollapse => keyword(v, &["separate", "collapse"]),
         TableLayout => keyword(v, &["auto", "fixed"]),
         BorderSpacing => border_spacing(v, memory)?,
+        FlexDirection => keyword(v, FLEX_DIRECTIONS),
+        FlexWrap => keyword(v, FLEX_WRAPS),
+        FlexGrow | FlexShrink => match v {
+            [Component::Token(Token::Number(n))] => number(&n.representation)
+                .filter(|n| *n >= 0.0)
+                .map(|n| Specified::Ready(ComputedValue::Number(n.min(MAX_ABSOLUTE_VALUE)))),
+            _ => None,
+        },
+        // An integer, clamped to the range browsers keep it in.
+        Order => match v {
+            [Component::Token(Token::Number(n))] if n.integer => number(&n.representation)
+                .map(|n| n.clamp(f64::from(i32::MIN), f64::from(i32::MAX)))
+                .map(|n| Specified::Ready(ComputedValue::Number(n))),
+            _ => None,
+        },
+        FlexBasis => keyword(v, &["content"]).or(parse_length(p, v)?),
+        JustifyContent | AlignItems | AlignSelf | AlignContent => alignment(p, v),
+        RowGap | ColumnGap => keyword(v, &["normal"]).or(parse_length(p, v)?),
         LineHeight => {
             if let Some(v) = keyword(v, &["normal"]) {
                 Some(v)
@@ -220,6 +328,9 @@ pub(super) fn shorthand(
         "font" => font(v, memory)?,
         "overflow" => overflow(v, memory)?,
         "list-style" => list_style(v, memory)?,
+        "flex" => flex(v, memory)?,
+        "flex-flow" => flex_flow(v, memory)?,
+        "gap" => gap(v, memory)?,
         _ => border(v, targets, memory)?,
     };
     if let Some(parsed) = parsed {
@@ -303,6 +414,158 @@ fn list_style(
     output.try_push((ListStyleType, kind.unwrap_or(Specified::Initial)))?;
     output.try_push((ListStylePosition, position.unwrap_or(Specified::Initial)))?;
     Ok(Some(output))
+}
+
+/// `flex` (Flexbox 1 §7.1): `none` (0 0 auto), `auto` (1 1 auto), or
+/// `<grow> <shrink>? || <basis>`, an omitted factor 1 and an omitted
+/// basis 0%. A unitless zero is a factor unless two factors precede it.
+fn flex(
+    v: &[Component],
+    memory: &Budget,
+) -> Result<Option<BudgetVec<(Property, Specified)>>, Error> {
+    let factor = |n: f64| Specified::Ready(ComputedValue::Number(n));
+    let mut grow = None;
+    let mut shrink = None;
+    let mut basis = None;
+    // Whether the last component was the grow factor, which a shrink
+    // factor must follow directly.
+    let mut after_grow = false;
+    // `auto` needs no case: a lone basis takes factors of 1.
+    if single_ident(v).is_some_and(|name| name.eq_ignore_ascii_case("none")) {
+        grow = Some(0.0);
+        shrink = Some(0.0);
+        basis = Some(Specified::Length(0.0, Unit::Auto));
+    } else {
+        for c in v.iter().filter(|c| !c.whitespace()) {
+            let one = std::slice::from_ref(c);
+            if let Component::Token(Token::Number(n)) = c {
+                let Some(n) = number(&n.representation).filter(|n| *n >= 0.0) else {
+                    return Ok(None);
+                };
+                let n = n.min(MAX_ABSOLUTE_VALUE);
+                if grow.is_none() {
+                    grow = Some(n);
+                    after_grow = true;
+                    continue;
+                }
+                if after_grow && shrink.is_none() {
+                    shrink = Some(n);
+                } else if n == 0.0 && shrink.is_some() && basis.is_none() {
+                    basis = Some(Specified::Length(0.0, Unit::Px));
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                let Some(value) = parse(FlexBasis, one, memory)? else {
+                    return Ok(None);
+                };
+                if Option::replace(&mut basis, value).is_some() {
+                    return Ok(None);
+                }
+            }
+            after_grow = false;
+        }
+        if grow.is_none() && basis.is_none() {
+            return Ok(None);
+        }
+    }
+    let mut output = td_alloc::BudgetVec::with_capacity(memory, 3)?;
+    output.try_push((FlexGrow, factor(grow.unwrap_or(1.0))))?;
+    output.try_push((FlexShrink, factor(shrink.unwrap_or(1.0))))?;
+    output.try_push((
+        FlexBasis,
+        basis.unwrap_or(Specified::Length(0.0, Unit::Percent)),
+    ))?;
+    Ok(Some(output))
+}
+
+/// `flex-flow`: a direction and a wrap, each at most once, in either
+/// order; the one omitted is reset to its initial value.
+fn flex_flow(
+    v: &[Component],
+    memory: &Budget,
+) -> Result<Option<BudgetVec<(Property, Specified)>>, Error> {
+    let mut direction = None;
+    let mut wrap = None;
+    for c in v.iter().filter(|c| !c.whitespace()) {
+        let one = std::slice::from_ref(c);
+        let replaced = if let Some(value) = keyword(one, FLEX_DIRECTIONS) {
+            Option::replace(&mut direction, value)
+        } else if let Some(value) = keyword(one, FLEX_WRAPS) {
+            Option::replace(&mut wrap, value)
+        } else {
+            return Ok(None);
+        };
+        if replaced.is_some() {
+            return Ok(None);
+        }
+    }
+    if direction.is_none() && wrap.is_none() {
+        return Ok(None);
+    }
+    let mut output = td_alloc::BudgetVec::with_capacity(memory, 2)?;
+    output.try_push((FlexDirection, direction.unwrap_or(Specified::Initial)))?;
+    output.try_push((FlexWrap, wrap.unwrap_or(Specified::Initial)))?;
+    Ok(Some(output))
+}
+
+/// `gap`: the row gap, then the column gap, which takes the row's when
+/// omitted.
+fn gap(
+    v: &[Component],
+    memory: &Budget,
+) -> Result<Option<BudgetVec<(Property, Specified)>>, Error> {
+    let mut values = v.iter().filter(|c| !c.whitespace());
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    let second = values.next();
+    if values.next().is_some() {
+        return Ok(None);
+    }
+    let Some(row) = parse(RowGap, std::slice::from_ref(first), memory)? else {
+        return Ok(None);
+    };
+    let column = match second {
+        Some(c) => match parse(ColumnGap, std::slice::from_ref(c), memory)? {
+            Some(column) => column,
+            None => return Ok(None),
+        },
+        None => row.try_clone()?,
+    };
+    let mut output = td_alloc::BudgetVec::with_capacity(memory, 2)?;
+    output.try_push((RowGap, row))?;
+    output.try_push((ColumnGap, column))?;
+    Ok(Some(output))
+}
+
+/// Box Alignment 3's values of the four alignment longhands flex
+/// layout reads. `first baseline` computes to `baseline`; a `safe` or
+/// `unsafe` overflow position is accepted before a positional value and
+/// dropped, td-layout not telling them apart.
+fn alignment(p: Property, v: &[Component]) -> Option<Specified> {
+    let (words, positions, baselines) = match p {
+        JustifyContent => (JUSTIFY_CONTENT, JUSTIFY_POSITIONS, false),
+        AlignContent => (ALIGN_CONTENT, CONTENT_POSITIONS, true),
+        AlignItems => (ALIGN_ITEMS, SELF_POSITIONS, true),
+        _ => (ALIGN_SELF, SELF_POSITIONS, true),
+    };
+    let mut parts = v.iter().filter(|c| !c.whitespace());
+    let first = parts.next()?;
+    let Some(second) = parts.next() else {
+        return keyword(std::slice::from_ref(first), words);
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let second = std::slice::from_ref(second);
+    match syntax::keyword(first.ident()?, &["safe", "unsafe", "first", "last"])? {
+        "safe" | "unsafe" => keyword(second, positions),
+        "first" if baselines => keyword(second, &["baseline"]),
+        "last" if baselines => keyword(second, &["baseline"])
+            .map(|_| Specified::Ready(ComputedValue::Keyword("last baseline"))),
+        _ => None,
+    }
 }
 
 /// `border-spacing` (CSS 2.2 §17.6.1), one longhand: one length for both
@@ -511,5 +774,7 @@ pub(super) fn finish(style: &mut ComputedStyle, root: bool) -> Result<(), Error>
     Ok(())
 }
 
+#[cfg(test)]
+mod flex_tests;
 #[cfg(test)]
 mod tests;

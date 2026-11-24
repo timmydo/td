@@ -5,7 +5,7 @@ use crate::{
     test_tree::{tree, Handle},
     Origin, StyleSet,
 };
-fn style(input: &str, parent: Option<&ComputedStyle>) -> ComputedStyle {
+pub(super) fn style(input: &str, parent: Option<&ComputedStyle>) -> ComputedStyle {
     let nodes = tree();
     StyleSet::new(&[])
         .unwrap()
@@ -20,7 +20,7 @@ fn style(input: &str, parent: Option<&ComputedStyle>) -> ComputedStyle {
         )
         .unwrap()
 }
-fn child(input: &str) -> ComputedStyle {
+pub(super) fn child(input: &str) -> ComputedStyle {
     style(
         input,
         Some(&ComputedStyle::new(&crate::memory().unwrap()).unwrap()),
@@ -123,9 +123,29 @@ fn each_added_longhand_has_a_typed_value() {
             },
         ),
         (TableLayout, "fixed", ComputedValue::Keyword("fixed")),
+        (
+            FlexDirection,
+            "column-reverse",
+            ComputedValue::Keyword("column-reverse"),
+        ),
+        (FlexWrap, "wrap", ComputedValue::Keyword("wrap")),
+        (FlexGrow, "2.5", ComputedValue::Number(2.5)),
+        (FlexShrink, "0", ComputedValue::Number(0.0)),
+        (FlexBasis, "2em", ComputedValue::Length(Length::Px(32.0))),
+        (
+            JustifyContent,
+            "space-between",
+            ComputedValue::Keyword("space-between"),
+        ),
+        (AlignItems, "center", ComputedValue::Keyword("center")),
+        (AlignSelf, "flex-end", ComputedValue::Keyword("flex-end")),
+        (AlignContent, "stretch", ComputedValue::Keyword("stretch")),
+        (RowGap, "10%", ComputedValue::Length(Length::Percent(10.0))),
+        (ColumnGap, "1em", ComputedValue::Length(Length::Px(16.0))),
+        (Order, "-3", ComputedValue::Number(-3.0)),
     ];
     assert_eq!(cases.len() + 25, Property::ALL.len());
-    assert_eq!(Property::ALL.len(), 59);
+    assert_eq!(Property::ALL.len(), 71);
     for (p, value, want) in cases {
         assert_eq!(
             child(&format!("{}:{value}", p.name())).get(p),
@@ -379,7 +399,7 @@ fn extra_grammars_reject_unsupported_values_and_clamp_numeric_ranges() {
         (Position, "absolute"),
         (Position, "fixed"),
         (MinWidth, "-1px"),
-        (MinHeight, "auto"),
+        (MinHeight, "none"),
         (LetterSpacing, "10%"),
         (LetterSpacing, "calc(10% - 10%)"),
         (Opacity, "NaN"),

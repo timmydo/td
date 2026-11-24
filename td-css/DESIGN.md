@@ -327,7 +327,8 @@ filling omitted slots), a required size, optional slash line-height, and
 a required family list. It resets all six implemented font longhands;
 system-font keywords, stretch and other font extension/reset properties
 are unsupported. `background` sets the colour of its final layer and
-`list-style` its type and position (both below). Other shorthands remain
+`list-style` its type and position (both below); `flex`, `flex-flow`
+and `gap` set the flex longhands (below). Other shorthands remain
 unsupported. `text-decoration`
 here is the line-set subset, without style, color or thickness. Its propagation to
 descendants is a layout/painting concern, not inheritance. Border widths
@@ -336,7 +337,9 @@ computed color and resolve currentcolor after color. Display blockifies
 for the root (absent parent style) and floats: inline/inline-block and
 table-internal displays become block, inline-table becomes table and
 inline-flex becomes flex. None, list-item, table, block and flex remain.
-Flex-item blockification and unsupported positioning modes are deferred.
+Flex-item blockification and unsupported positioning modes are deferred:
+until td-layout lays flex rows, blockifying a flex container's children
+would stack an inline navigation bar's links as blocks.
 Overflow visible/clip computes to auto/hidden when the opposite axis is
 neither visible nor clip. No scrolling or box generation occurs here.
 Font keyword sizes are 9, 10, 13, 16,
@@ -411,6 +414,11 @@ semantics, the two-axis visible/clip rule from
 [Overflow Level 3](https://www.w3.org/TR/2025/WD-css-overflow-3-20251007/),
 and opacity's number/percentage range from
 [Color Level 4](https://www.w3.org/TR/2026/CRD-css-color-4-20261103/#transparency).
+The flex longhands and shorthands follow
+[Flexbox Level 1](https://www.w3.org/TR/css-flexbox-1/) and the
+alignment longhands [Box Alignment Level
+3](https://www.w3.org/TR/css-align-3/), as far as flex layout reads them;
+the `place-*` shorthands are not parsed yet.
 
 | Property | Accepted values | Initial; inherited |
 |---|---|---|
@@ -428,7 +436,7 @@ and opacity's number/percentage range from
 | position | static, relative | static; no |
 | top, right, bottom, left | signed length/percentage, auto | auto; no |
 | box-sizing | content-box, border-box | content-box; no |
-| min-width, min-height | nonnegative length/percentage | 0; no |
+| min-width, min-height | auto, nonnegative length/percentage | auto; no |
 | max-width, max-height | nonnegative length/percentage, none | none; no |
 | letter-spacing | normal, signed length (no percentage) | normal; yes |
 | opacity | number or percentage, clamped to [0,1] | 1; no |
@@ -436,13 +444,51 @@ and opacity's number/percentage range from
 | border-collapse | separate, collapse | separate; yes |
 | border-spacing | one nonnegative length for both axes, or the horizontal then the vertical; no percentage | 0; yes |
 | table-layout | auto, fixed | auto; no |
+| flex-direction | row, row-reverse, column, column-reverse | row; no |
+| flex-wrap | nowrap, wrap, wrap-reverse | nowrap; no |
+| flex-grow, flex-shrink | nonnegative number | 0 / 1; no |
+| flex-basis | auto, content, nonnegative length/percentage | auto; no |
+| justify-content | normal, space-between, space-around, space-evenly, stretch, and center, start, end, flex-start, flex-end, left, right, each after an optional safe or unsafe | normal; no |
+| align-items | normal, stretch, baseline, first baseline, last baseline, and center, start, end, self-start, self-end, flex-start, flex-end, each after an optional safe or unsafe | normal; no |
+| align-self | auto and align-items' values | auto; no |
+| align-content | normal, space-between, space-around, space-evenly, stretch, baseline, first baseline, last baseline, and center, start, end, flex-start, flex-end, each after an optional safe or unsafe | normal; no |
+| row-gap, column-gap | normal, nonnegative length/percentage | normal; no |
+| order | integer | 0; no |
 
 Line-height numbers stay numbers through inheritance; lengths and
 percentages compute against the declaring element's font size and then
 inherit as px. Normal stays a keyword for later font metrics. Vertical-align
 percentages retain their line-height basis for layout; all other newly
 admitted percentages except line-height remain unresolved. Min/max sizes
-use the CSS 2.2 subset, without auto, intrinsic sizing or fit-content.
+use the CSS 2.2 subset, without intrinsic sizing or fit-content, and
+with Flexbox 1's `auto` as the minimum's initial value, computing to
+`Length::Auto`; td-layout reads it as CSS 2.2's initial 0, the automatic
+minimum being a flex item's (td-layout/DESIGN.md §5).
+
+The flex and alignment longhands compute to keywords, numbers and
+lengths only: no td-css computation depends on them, and td-layout
+does not read them yet. A flex factor clamps to MAX_ABSOLUTE_VALUE and
+`order`, an integer token, to the 32-bit range browsers keep it in.
+`flex-basis: content` is a keyword, auto and a length-percentage are
+lengths, as width's are; a gap's `normal` stays a keyword. Box Alignment
+3's `first baseline` computes to `baseline` and `last baseline` stays
+two words; a `safe` or `unsafe` overflow position is accepted before a
+positional keyword (none other) and dropped, as td-layout will not tell
+them apart. Left and right are justify-content's alone, and
+self-start and self-end the items' and self's. The `flex` shorthand is
+`none` (0 0 auto) or `<grow> <shrink>? || <basis>`: an omitted factor
+is 1 and an omitted basis 0%, so `auto` is 1 1 auto, a lone number n is
+n 1 0% and a lone basis b is 1 1 b; `flex: initial`, the CSS-wide
+keyword, gives the initials 0 1 auto. A unitless zero is a factor unless
+two factors precede it, and the shrink factor must follow the grow
+factor directly. `flex-flow` is a direction and a wrap, each at most
+once in either order, the other reset; `gap` is a row gap and an
+optional column gap that otherwise takes the row's. Anything else
+invalidates the declaration, as any property's invalid value does.
+Accepting these grammars changes what `@supports` reports for them, and
+`min-width: auto`, which was invalid and dropped, now wins its cascade
+and lays as 0 (Vector 2022's `.skin--responsive .mw-page-container`
+below 300 px, which the earlier `min-width: 18.75em` held before).
 Relative offsets retain auto and percentages: choosing the containing
 block, resolving opposing offsets and applying position are layout work.
 Text-transform is a keyword, not an operation on strings. Visibility,
@@ -724,7 +770,7 @@ td-css does not give yet.
 `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
-the fixed 59-longhand roster. `initial` supplies context-free seeds; border
+the fixed 71-longhand roster. `initial` supplies context-free seeds; border
 colors, border widths, overflow and display also undergo the contextual
 computation above. `ComputedStyle::new(&Budget)` fallibly builds initial values with invisible
 borders. `try_clone` replaces owned Clone, and `Property::initial(&Budget)`
@@ -1036,7 +1082,7 @@ independently, and inherited token allocations retain their BudgetShared sharing
 A fingerprint only selects an equality bucket. Signed zero hashes alike.
 No global cache or tree dependency is introduced. A custom map is keyed
 by the same fingerprint over its names and tokens. A complete
-style's fingerprint takes about 230 writes, some 1 KiB, which SipHash-1-3
+style's fingerprint takes about 275 writes, some 1 KiB, which SipHash-1-3
 would run a round per 8-byte block over and buffer write by write; it is
 instead a fold of 64-bit words, each with the state and the pool's own
 key multiplied out to 128 bits and the halves combined (wyhash's mum
@@ -1107,6 +1153,14 @@ every process and with fixed keys):
 | 5,000 elements reading a 60-deep `var()` chain | 72 to 74 | 6,650,828 |
 | an 8,000-property map and 2,000 children adding one each | `MAX_POOL_BYTES` at 100 | |
 
+A style is charged 13,056 bytes with the 71 longhands (10,944 with
+59), so MAX_POOL_BYTES admits some 5,100 distinct styles (6,100
+before the flex longhands; `<p style="width:Npx">`, each distinct)
+and some 4,300 elements each with its own custom map (5,000 before).
+Real pages hold a few hundred (*Germany* 465, The Guardian 734). Each
+longhand added lowers both, until the rarely set ones move to a group
+shared by default.
+
 A lookup or an insertion on these pages probes 1.0 to 1.9 slots on
 average, growth's moves aside (The Guardian's 13,169 token addresses
 1.25, its longest run of occupied slots 18 of 32,768). For 14,000
@@ -1134,6 +1188,38 @@ without, 404 to 408 before both (fastest of five, three processes
 each). The longhands' own cost would need styles that do not hold
 every longhand (a rare-property group, shared until a rule sets one),
 which td-css does not have.
+
+The twelve flex and alignment longhands (59 to 71) cost each element
+twelve more computed values, insertions, fingerprint words and equality
+tests, about as much again per longhand as the table ones. Measured
+2026-11-24 as td-layout's `StyledDocument::new` (cascade, boxes and
+pool), release, pinned to one CPU, user-mode `perf stat`, four
+cascades less one, median of five (seven for blocks, *Cascading Style
+Sheets* and *Germany*), interleaved with the parent build, load average
+3 to 4. The 2 MiB shapes use HTML_UA_CSS alone but flex, whose 2 MiB of
+`<nav>` bars carry a sheet of every new property; the Wikipedia pages
+were captured that day with their two linked sheets and inline styles:
+
+| Page | Instructions before / with flex (M) | Cycles before / with flex (M) |
+| --- | ---: | ---: |
+| 2 MiB blocks | 4,384 / 5,022 (+14.6%) | 1,794 / 2,029 |
+| 2 MiB table rows | 5,109 / 5,816 (+13.8%) | 2,124 / 2,444 |
+| 2 MiB nested lists | 4,472 / 5,139 (+14.9%) | 1,896 / 2,225 |
+| 2 MiB flex bars | 5,108 / 6,411 (+25.5%) | 2,204 / 2,799 |
+| Wikipedia, *Cascading Style Sheets* (637,055 bytes) | 1,810 / 1,851 (+2.2%) | 602 / 626 |
+| Wikipedia, *Germany* (1,645,458 bytes) | 3,945 / 4,009 (+1.6%) | 1,305 / 1,340 |
+| Wikipedia, *List of countries and dependencies by population* | 3,355 / 3,415 (+1.8%) | 1,143 / 1,179 |
+| Wikipedia, *List of chemical elements* | 2,117 / 2,163 (+2.2%) | 705 / 752 |
+
+The blocks cascade's wall time is 475 to 485 ms with them, 416 to 424
+without (fastest of four, seven processes each). The flex bars also
+parse and cascade the declarations the parent dropped. Each style is
+charged 2,112 bytes more (176 a longhand), so a page's styled charge
+grows with its distinct styles: *Germany*'s 465 by 1,036,800 bytes
+(8.5 to 9.6 MB, 3.3% of its page charge), the 2 MiB shapes' three to
+eight by 6 to 17 KB. Pool work grows with the fingerprint and equality
+words: blocks 12,035,902 to 14,224,234 (+18%), *Germany* 1,669,380 to
+1,929,851. The rare-property group above is what would recover it.
 
 PoolLimits may lower MAX_STYLES (16,384), MAX_POOL_BYTES (64 MiB),
 MAX_POOL_WORK (67,108,864 visits: fields, components and string bytes

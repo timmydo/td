@@ -441,6 +441,9 @@ margins use computed values. Percent horizontal dimensions and all
 padding/margins use the containing content width. Percent heights need a
 definite containing height; otherwise height is auto and percentage
 min/max height has the corresponding unconstrained initial behavior.
+A min-width or min-height of `auto`, td-css's initial value, is 0
+everywhere it is read, as CSS 2.2's initial 0 was: Flexbox 1's automatic
+minimum is a flex item's, and no box is laid as one.
 Auto horizontal margins divide positive free space. Over-constrained
 left-to-right boxes adjust the used right margin. Negative margins remain
 signed. Adjacent block sibling margins collapse by largest positive plus
@@ -1991,8 +1994,8 @@ maps and indexes 13,169 token arrays by address, each lookup and
 insertion a fixed two visits (td-css/DESIGN.md, "Computed-style
 sharing"). Most of the pool's work is traversing those maps and
 comparing them with equal ones, linear in their size; a page reaches
-MAX_POOL_WORK that way, or MAX_POOL_BYTES first, at some 5,000
-distinct maps.
+MAX_POOL_WORK that way, or MAX_POOL_BYTES first, at some 4,300
+distinct maps (td-css/DESIGN.md, "Computed-style sharing").
 
 ## 7. Independently landable increments
 

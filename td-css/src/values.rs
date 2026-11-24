@@ -71,6 +71,18 @@ pub enum Property {
     BorderCollapse,
     BorderSpacing,
     TableLayout,
+    FlexDirection,
+    FlexWrap,
+    FlexGrow,
+    FlexShrink,
+    FlexBasis,
+    JustifyContent,
+    AlignItems,
+    AlignSelf,
+    AlignContent,
+    RowGap,
+    ColumnGap,
+    Order,
 }
 
 impl Property {
@@ -134,6 +146,18 @@ impl Property {
         Self::BorderCollapse,
         Self::BorderSpacing,
         Self::TableLayout,
+        Self::FlexDirection,
+        Self::FlexWrap,
+        Self::FlexGrow,
+        Self::FlexShrink,
+        Self::FlexBasis,
+        Self::JustifyContent,
+        Self::AlignItems,
+        Self::AlignSelf,
+        Self::AlignContent,
+        Self::RowGap,
+        Self::ColumnGap,
+        Self::Order,
     ];
 
     pub fn name(self) -> &'static str {
@@ -197,6 +221,18 @@ impl Property {
             Self::BorderCollapse => "border-collapse",
             Self::BorderSpacing => "border-spacing",
             Self::TableLayout => "table-layout",
+            Self::FlexDirection => "flex-direction",
+            Self::FlexWrap => "flex-wrap",
+            Self::FlexGrow => "flex-grow",
+            Self::FlexShrink => "flex-shrink",
+            Self::FlexBasis => "flex-basis",
+            Self::JustifyContent => "justify-content",
+            Self::AlignItems => "align-items",
+            Self::AlignSelf => "align-self",
+            Self::AlignContent => "align-content",
+            Self::RowGap => "row-gap",
+            Self::ColumnGap => "column-gap",
+            Self::Order => "order",
         }
     }
 
@@ -291,7 +327,9 @@ impl Property {
             Self::FontWeight => ComputedValue::Weight(400),
             Self::FontStyle | Self::WhiteSpace => ComputedValue::Keyword("normal"),
             Self::TextDecoration => ComputedValue::Decoration(Decoration::default()),
-            Self::Width | Self::Height => ComputedValue::Length(Length::Auto),
+            Self::Width | Self::Height | Self::MinWidth | Self::MinHeight | Self::FlexBasis => {
+                ComputedValue::Length(Length::Auto)
+            }
             Self::ListStyleType => ComputedValue::Keyword("disc"),
             Self::ListStylePosition => ComputedValue::Keyword("outside"),
             Self::TextAlign => ComputedValue::Keyword("start"),
@@ -318,8 +356,16 @@ impl Property {
                 horizontal: 0.0,
                 vertical: 0.0,
             },
-            Self::TableLayout => ComputedValue::Keyword("auto"),
-            Self::Opacity => ComputedValue::Number(1.0),
+            Self::TableLayout | Self::AlignSelf => ComputedValue::Keyword("auto"),
+            Self::FlexDirection => ComputedValue::Keyword("row"),
+            Self::FlexWrap => ComputedValue::Keyword("nowrap"),
+            Self::JustifyContent
+            | Self::AlignItems
+            | Self::AlignContent
+            | Self::RowGap
+            | Self::ColumnGap => ComputedValue::Keyword("normal"),
+            Self::FlexGrow | Self::Order => ComputedValue::Number(0.0),
+            Self::Opacity | Self::FlexShrink => ComputedValue::Number(1.0),
             Self::Top | Self::Right | Self::Bottom | Self::Left => {
                 ComputedValue::Length(Length::Auto)
             }
@@ -974,6 +1020,9 @@ fn length_property(property: Property, value: &Component) -> Option<Specified> {
                 property,
                 Property::Width
                     | Property::Height
+                    | Property::MinWidth
+                    | Property::MinHeight
+                    | Property::FlexBasis
                     | Property::Top
                     | Property::Right
                     | Property::Bottom
