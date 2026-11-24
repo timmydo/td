@@ -1790,16 +1790,24 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
             }
         }
     }
+    let mut failed = false;
     while let Some(arg) = argv.get(i) {
         i += 1;
         if mode == Some('f') {
             sh.funcs.remove(arg);
             continue;
         }
+        // bash's `unset 'a[i]'` removes one element, and `unset 'a[@]'` the
+        // whole name. The subscript is expanded and then arithmetic, as bash
+        // takes it, so the usual quoted `'a[$i]'` names element `$i`.
+        if let Some((name, sub)) = element_operand(arg) {
+            failed |= unset_element(sh, name, sub)?;
+            continue;
+        }
         // dash unsets through setvar, which takes the name up to an `=` and
-        // rejects only what it cannot parse as one -- so `unset b=c` unsets `b`,
-        // but `unset 'a[1]'` is an error. `unset` is a special builtin, so that
-        // error is fatal to a non-interactive shell rather than a status.
+        // rejects only what it cannot parse as one -- so `unset b=c` unsets `b`.
+        // `unset` is a special builtin, so that error is fatal to a
+        // non-interactive shell rather than a status.
         let name = arg.split_once('=').map_or(arg.as_str(), |(n, _)| n);
         if !ast::is_name(name) {
             // The parsed prefix, not the operand: `unsetvar` is `setvar(s, NULL,
@@ -1828,7 +1836,89 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
             return special_usage_error(sh, &format!("{name}: is read only"));
         }
     }
+    if failed {
+        sh.set_status(1);
+        return Ok(());
+    }
     ok(sh)
+}
+
+/// `name[sub]` as one whole `unset` operand: the name and the subscript text.
+fn element_operand(arg: &str) -> Option<(&str, &str)> {
+    let (name, rest) = arg.split_once('[')?;
+    let sub = rest.strip_suffix(']')?;
+    (ast::is_name(name) && !sub.is_empty()).then_some((name, sub))
+}
+
+/// `unset 'name[sub]'`, true when it failed with a status of 1. Only an
+/// ARRAY's subscript is expanded and evaluated: `unset "$v"` is how scripts
+/// drop a name they were handed, and a `name[$(…)]` arriving that way must
+/// not run. On any other name the subscript is read as written: a name with
+/// no entry has nothing to remove, an entry's `[0]` is the whole of it, and
+/// any other subscript is refused as not an array. That is bash's answer
+/// wherever bash would not have to evaluate the subscript to give it.
+fn unset_element(sh: &mut Shell, name: &str, sub: &str) -> R<bool> {
+    if !sh.is_array(name) {
+        if !sh.vars.contains_key(name) {
+            return Ok(false);
+        }
+        if sub != "0" {
+            let msg = crate::allocation::format(format_args!("{name}: not an array variable"))
+                .map_err(|_| Sig::Abort(1))?;
+            err_line(sh, &msg);
+            return Ok(true);
+        }
+        let gone = match sh.is_local(name) {
+            true => sh.unset_value(name),
+            false => sh.unset_var(name),
+        };
+        if !gone {
+            let msg = crate::allocation::format(format_args!("{name}: is read only"))
+                .map_err(|_| Sig::Abort(1))?;
+            special_usage_error(sh, &msg)?;
+        }
+        return Ok(false);
+    }
+    let refused = if sub == "@" || sub == "*" {
+        !match sh.is_local(name) {
+            true => sh.unset_value(name),
+            false => sh.unset_var(name),
+        }
+    } else {
+        let word = crate::lexer::subscript_word(sub).map_err(|e| sh.fatal(e.text(), 2))?;
+        let text = crate::expand::expand_single(sh, &word)?;
+        let at = crate::arith::eval(sh, &text)?;
+        let Some(at) = sh.resolve_index(name, at) else {
+            let msg = crate::allocation::format(format_args!("{name}[{sub}]: bad array subscript"))
+                .map_err(|_| Sig::Abort(1))?;
+            special_usage_error(sh, &msg)?;
+            return Ok(false);
+        };
+        !sh.unset_element(name, at)
+    };
+    if refused {
+        let msg = crate::allocation::format(format_args!("{name}: is read only"))
+            .map_err(|_| Sig::Abort(1))?;
+        special_usage_error(sh, &msg)?;
+    }
+    Ok(false)
+}
+
+/// An array's value in the `export -p` and `readonly -p` listings: bash's
+/// `=([i]='v' …)`, which this shell reads back as the same array, so the
+/// listing stays one `eval` can restore.
+fn list_array(text: &mut String, sh: &Shell, name: &str) -> R<()> {
+    let oom = crate::exec::oom;
+    crate::allocation::push_str(text, "=(").map_err(oom)?;
+    for (n, (at, v)) in sh.elements(name).enumerate() {
+        if n > 0 {
+            crate::allocation::push_str(text, " ").map_err(oom)?;
+        }
+        let key = crate::allocation::format(format_args!("[{at}]=")).map_err(|_| Sig::Abort(1))?;
+        crate::allocation::push_str(text, &key).map_err(oom)?;
+        crate::allocation::push_str(text, &single_quote(v)).map_err(oom)?;
+    }
+    crate::allocation::push_str(text, ")").map_err(oom)
 }
 
 fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
@@ -1930,7 +2020,9 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
         text.push_str(cmd);
         text.push(' ');
         text.push_str(name.get(..end).unwrap_or(""));
-        if let Some(v) = value.filter(|_| end == name.len()) {
+        if end == name.len() && sh.is_array(name) {
+            list_array(&mut text, sh, name)?;
+        } else if let Some(v) = value.filter(|_| end == name.len()) {
             text.push('=');
             text.push_str(&single_quote(v));
         }
@@ -1961,6 +2053,9 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
     // Only the FIRST save of a name matters -- the frame unwinds newest-first, so
     // a later one is overwritten by it. Re-saving would let `while …; do local
     // x=$i; done` grow the frame without bound for the length of the call.
+    // bash's `-a`, ahead of the names, makes each of them an indexed array.
+    let mut array = false;
+    let mut options = true;
     for arg in argv.iter().skip(1) {
         if arg == "-" {
             if !sh.locals.iter().any(|l| matches!(l, Local::Opts(_))) {
@@ -1968,6 +2063,11 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
             }
             continue;
         }
+        if options && arg == "-a" {
+            array = true;
+            continue;
+        }
+        options = false;
         let (name, value) = match arg.split_once('=') {
             Some((n, v)) => (n, Some(v)),
             None => (arg.as_str(), None),
@@ -1999,10 +2099,14 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
         // is shared with plain assignment, which must NOT grow a `local:` prefix.
         let rejected = match value {
             // `local x=v` keeps the attributes of the name it shadows, since
-            // set_var writes through the existing entry.
+            // set_var writes through the existing entry -- but not an array's
+            // other elements: a fresh `local x=v` is the string v, as in bash.
             Some(v) => {
                 let readonly = sh.vars.get(name).is_some_and(|old| old.readonly);
                 if !readonly {
+                    if fresh {
+                        sh.drop_array(name);
+                    }
                     sh.set_var(name, v)?;
                 }
                 readonly
@@ -2016,6 +2120,11 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
         };
         if rejected {
             return special_usage_error(sh, &format!("{name}: is read only"));
+        }
+        // After the value, which becomes element 0 -- and after the unset, so
+        // a fresh `local -a x` is an empty array rather than an unset name.
+        if array {
+            sh.make_array(name)?;
         }
     }
     ok(sh)
@@ -8471,7 +8580,18 @@ mod tests {
             "after rc=0\n"
         );
         assert_eq!(run_capturing("unset %; echo NOTREACHED").0, 2);
-        assert_eq!(run_capturing("unset 'a[1]'; echo NOTREACHED").0, 2);
+        assert_eq!(run_capturing("unset 'a['; echo NOTREACHED").0, 2);
+        // bash's element form is an operand of its own, which dash refuses.
+        assert_eq!(
+            run_capturing("a=(x y z); unset 'a[1]'; echo ${a[@]}").1,
+            "x z\n"
+        );
+        // On a name that is no array: an entry without a value still goes,
+        // export mark and all, and a dynamic name's element 0 is itself.
+        assert_eq!(
+            run_capturing("export e; unset 'e[0]' 'RANDOM[0]'; export -p; echo \"[$RANDOM]\"").1,
+            "[]\n"
+        );
         // The refusal names the parsed prefix, not the operand.
         for (op, named) in [
             ("'1b=c'", "1b"),

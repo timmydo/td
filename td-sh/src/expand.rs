@@ -7,7 +7,7 @@
 //! may split it). Collapsing to text before splitting is the classic way to get
 //! `x='a b'; f $x` and `f "$x"` both wrong.
 
-use crate::ast::{Param, ParamOp, Seg, Word};
+use crate::ast::{Elem, Param, ParamOp, Seg, Subscript, Word};
 use crate::exec::{command_subst, Shell, Sig, R};
 use crate::pattern;
 use crate::{arith, exec};
@@ -227,10 +227,17 @@ fn command_operand(
 /// a real assignment gets, which is what makes `export n=$(cmd)` keep a value with
 /// a space in it and `export PATH=~/bin` mean what it says. ash cannot decide this
 /// until the command word is expanded and looked up, and neither can this.
-pub fn expand_command_words(sh: &mut Shell, words: &[Word]) -> R<Vec<String>> {
+///
+/// The same goes for bash's compound operands, `local a=(…)`: their elements
+/// are expanded here, before the builtin runs as bash expands them, and the
+/// builtin itself sees only the bare name. The caller stores the arrays
+/// (`exec::run_simple`), since an argument vector of strings cannot hold one.
+pub fn expand_command_words(sh: &mut Shell, words: &[Word]) -> R<(Vec<String>, Decl)> {
     let mut argv: Vec<String> = Vec::new();
+    let mut decl = Decl::default();
     let mut words = words.iter();
     let mut protect = false;
+    let mut compound = false;
     if fill_fields(sh, &mut argv, &mut words)? {
         let mut head = 0;
         let mut nofunc = false;
@@ -245,6 +252,8 @@ pub fn expand_command_words(sh: &mut Shell, words: &[Word]) -> R<Vec<String>> {
             }
             if name != "command" {
                 protect = is_assignment_builtin(name);
+                compound = matches!(name.as_str(), "local" | "export" | "readonly");
+                decl.after_builtin = name == "local";
                 break;
             }
             match command_operand(sh, &mut argv, &mut words, head)? {
@@ -259,6 +268,19 @@ pub fn expand_command_words(sh: &mut Shell, words: &[Word]) -> R<Vec<String>> {
         }
     }
     for w in words {
+        if let Some((name, append, elems)) = compound_operand(w).filter(|_| compound) {
+            let items = expand_compound(sh, elems)?;
+            let bare = crate::allocation::string(name).map_err(exec::oom)?;
+            let name = crate::allocation::string(name).map_err(exec::oom)?;
+            crate::allocation::push(&mut argv, bare).map_err(exec::oom)?;
+            let c = Compound {
+                name,
+                append,
+                items,
+            };
+            crate::allocation::push(&mut decl.compounds, c).map_err(exec::oom)?;
+            continue;
+        }
         if protect {
             if let Some((name, value)) = assignment_split(w) {
                 let value = expand_assign(sh, &value)?;
@@ -268,7 +290,7 @@ pub fn expand_command_words(sh: &mut Shell, words: &[Word]) -> R<Vec<String>> {
         }
         argv.extend(expand_fields(sh, w)?);
     }
-    Ok(argv)
+    Ok((argv, decl))
 }
 
 /// Expansion in a context that takes exactly one word: a redirection target, a
@@ -414,6 +436,11 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
             // Raised from HERE rather than from the parser: ash reports it while
             // expanding, so a word in a branch never taken never reports.
             Seg::BadSub(text) => return Err(sh.fatal(&format!("bad substitution: `{text}`"), 2)),
+            // An array literal is an assignment's value, which `exec::assign`
+            // and `expand_command_words` take apart before anything expands it.
+            // The parser refuses every other place one can stand, so reaching
+            // here means one slipped past it; this is the same refusal.
+            Seg::Array(_) => return Err(sh.fatal("syntax error: unexpected \"(\"", 2)),
         }
     }
     done.push(cur);
@@ -522,6 +549,21 @@ fn expand_param(
 ) -> R<()> {
     let quoted = p.quoted || force_quoted;
 
+    // `${name[@]}`, `${name[*]}` and `${!name[@]}` are lists, as `$@` is.
+    if matches!(
+        p.index,
+        Some(Subscript::All { .. } | Subscript::Keys { .. })
+    ) {
+        return expand_elements(sh, p, force_quoted, splitting, done, cur);
+    }
+    // `${name[i]}` is one element, read once here so its subscript is evaluated
+    // once, however many times the operator below reads the value.
+    let element = match &p.index {
+        Some(Subscript::At(w)) => Some(read_element(sh, &p.name, w)?),
+        _ => None,
+    };
+    let element = element.as_ref();
+
     // `$@` is the one expansion that yields several fields on its own. When
     // there are no positional parameters it contributes nothing at all — and
     // deliberately does not mark the field as quoted, so a lone `"$@"` expands
@@ -621,8 +663,8 @@ fn expand_param(
         if quoted {
             cur.quote();
         }
-        nounset_check(sh, &p.name)?;
-        let value = lookup(sh, &p.name).unwrap_or_default();
+        check_set(sh, p, element)?;
+        let value = read_param(sh, p, element)?.unwrap_or_default();
         let chars: Vec<char> = value.chars().collect();
         let picked = slice_chars(sh, &chars, off, len)?;
         push_expanded(&mut cur.chars, &picked, quoted);
@@ -640,15 +682,18 @@ fn expand_param(
             // `IFS=:` makes it 3. `$#` is the count.
             "@" | "*" => lookup(sh, "*").unwrap_or_default().chars().count(),
             _ => {
-                nounset_check(sh, &p.name)?;
-                lookup(sh, &p.name).unwrap_or_default().chars().count()
+                check_set(sh, p, element)?;
+                read_param(sh, p, element)?
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
             }
         };
         push_expanded(&mut cur.chars, &len.to_string(), quoted);
         return Ok(());
     }
 
-    let raw = lookup(sh, &p.name);
+    let raw = read_param(sh, p, element)?;
     // UNQUOTED, `$@`/`$*` are null by their PARAMETERS -- none, or one that is
     // empty -- so two empty ones are not null even though their join is, which
     // only shows when IFS is empty. QUOTED, the expansion IS that join, so
@@ -667,7 +712,7 @@ fn expand_param(
 
     let value: Option<String> = match &p.op {
         None => {
-            nounset_check(sh, &p.name)?;
+            check_set(sh, p, element)?;
             raw
         }
         // Both are answered above, before this match runs.
@@ -688,10 +733,18 @@ fn expand_param(
         Some(ParamOp::Assign { word, colon }) => {
             if raw.is_none() || (*colon && empty) {
                 let text = QChar::text(&expand_chars(sh, word, quoted, false)?);
-                if !crate::ast::is_name(&p.name) {
-                    return Err(sh.fatal(&format!("cannot assign to ${}", p.name), 2));
+                match element {
+                    Some(e) => {
+                        let stored = crate::allocation::string(&text).map_err(exec::oom)?;
+                        sh.set_element(&p.name, e.at, stored)?;
+                    }
+                    None => {
+                        if !crate::ast::is_name(&p.name) {
+                            return Err(sh.fatal(&format!("cannot assign to ${}", p.name), 2));
+                        }
+                        sh.set_var(&p.name, &text)?;
+                    }
                 }
-                sh.set_var(&p.name, &text)?;
                 Some(text)
             } else {
                 raw
@@ -710,19 +763,19 @@ fn expand_param(
             raw
         }
         Some(ParamOp::TrimPrefix { pat, longest }) => {
-            nounset_check(sh, &p.name)?;
+            check_set(sh, p, element)?;
             let subject = raw.unwrap_or_default();
             let units = pattern::compile(&expand_pattern(sh, pat)?);
             Some(pattern::strip_prefix(&units, &subject, *longest).unwrap_or(subject))
         }
         Some(ParamOp::TrimSuffix { pat, longest }) => {
-            nounset_check(sh, &p.name)?;
+            check_set(sh, p, element)?;
             let subject = raw.unwrap_or_default();
             let units = pattern::compile(&expand_pattern(sh, pat)?);
             Some(pattern::strip_suffix(&units, &subject, *longest).unwrap_or(subject))
         }
         Some(ParamOp::Replace { pat, repl, all }) => {
-            nounset_check(sh, &p.name)?;
+            check_set(sh, p, element)?;
             let subject = raw.unwrap_or_default();
             let units = pattern::compile(&expand_pattern(sh, pat)?);
             // The replacement is expanded even when the pattern turns out empty:
@@ -741,6 +794,367 @@ fn expand_param(
 
     push_expanded(&mut cur.chars, &value.unwrap_or_default(), quoted);
     Ok(())
+}
+
+/// The one element a `${name[i]}` names: its index, and its value if set.
+struct Element {
+    at: usize,
+    value: Option<String>,
+}
+
+/// Evaluate a `${name[i]}` subscript -- arithmetic, like a slice operand --
+/// and read the element. A subscript that is empty, or negative past element
+/// 0, is bash's `bad array subscript`.
+fn read_element(sh: &mut Shell, name: &str, index: &Word) -> R<Element> {
+    let text = QChar::text(&expand_chars(sh, index, false, false)?);
+    let at = match text.trim().is_empty() {
+        true => None,
+        false => {
+            let i = arith::eval(sh, &text)?;
+            sh.resolve_index(name, i)
+        }
+    };
+    let Some(at) = at else {
+        return Err(exec::fatal_args(
+            sh,
+            format_args!("{name}[{text}]: bad array subscript"),
+            1,
+        ));
+    };
+    // Element 0 is the plain reading, so a dynamic name computes it.
+    let value = match (at, sh.element(name, at)) {
+        (0, _) => var_value(sh, name),
+        (_, Some(v)) => Some(crate::allocation::string(v).map_err(exec::oom)?),
+        (_, None) => None,
+    };
+    Ok(Element { at, value })
+}
+
+/// What `p` reads: the element `${name[i]}` named, or the parameter itself.
+fn read_param(sh: &mut Shell, p: &Param, element: Option<&Element>) -> R<Option<String>> {
+    match element {
+        Some(Element { value: Some(v), .. }) => {
+            Ok(Some(crate::allocation::string(v).map_err(exec::oom)?))
+        }
+        Some(Element { value: None, .. }) => Ok(None),
+        None => Ok(lookup(sh, &p.name)),
+    }
+}
+
+/// `nounset_check` for whatever `p` reads.
+fn check_set(sh: &mut Shell, p: &Param, element: Option<&Element>) -> R<()> {
+    match element {
+        Some(e) if sh.opts.nounset && e.value.is_none() => Err(exec::fatal_args(
+            sh,
+            format_args!("{}[{}]: parameter not set", p.name, e.at),
+            2,
+        )),
+        Some(_) => Ok(()),
+        None => nounset_check(sh, &p.name),
+    }
+}
+
+/// `${name[@]}` and `${name[*]}` with any operator, and `${!name[@]}`: a list
+/// rather than one value, as `$@` and `$*` are. The list is the elements in
+/// index order -- the indices, for `keys` -- and turning it into fields
+/// follows this shell's own `$@` and `$*` (`push_list`). The operators are
+/// bash's: `-`, `+`, `?` and `=` ask whether the list is empty, which an empty
+/// array is to them as an unset one is; the trims and the substitution apply
+/// to each element; `#` counts them; and a slice selects by index. `set -u`
+/// never fires on one, as in bash.
+fn expand_elements(
+    sh: &mut Shell,
+    p: &Param,
+    force_quoted: bool,
+    splitting: bool,
+    done: &mut Vec<Field>,
+    cur: &mut Field,
+) -> R<()> {
+    let (star, keys) = match p.index {
+        Some(Subscript::Keys { star }) => (star, true),
+        Some(Subscript::All { star }) => (star, false),
+        _ => (false, false),
+    };
+    let quoted = p.quoted || force_quoted;
+    // Answered from the counts, so `${#a[@]}` in a loop's test visits nothing.
+    if matches!(p.op, Some(ParamOp::Length)) {
+        if quoted {
+            cur.quote();
+        }
+        let count = crate::allocation::format(format_args!("{}", sh.element_count(&p.name)))
+            .map_err(|_| Sig::Abort(1))?;
+        push_expanded(&mut cur.chars, &count, quoted);
+        return Ok(());
+    }
+    let mut list: Vec<(usize, String)> =
+        crate::allocation::with_capacity(sh.element_count(&p.name)).map_err(exec::oom)?;
+    // A dynamic name's element 0 is computed, as its plain reading is.
+    let dynamic = sh.vars.get(&p.name).is_some_and(|v| v.dynamic.is_some());
+    if dynamic {
+        let value = var_value(sh, &p.name).unwrap_or_default();
+        let item = match keys {
+            true => crate::allocation::string("0").map_err(exec::oom)?,
+            false => value,
+        };
+        crate::allocation::push(&mut list, (0, item)).map_err(exec::oom)?;
+    }
+    for (at, v) in sh.elements(&p.name).skip(usize::from(dynamic)) {
+        let item = match keys {
+            true => crate::allocation::format(format_args!("{at}")).map_err(|_| Sig::Abort(1))?,
+            false => crate::allocation::string(v).map_err(exec::oom)?,
+        };
+        crate::allocation::push(&mut list, (at, item)).map_err(exec::oom)?;
+    }
+    match &p.op {
+        None | Some(ParamOp::Length) => {}
+        Some(ParamOp::Substring { offset, length }) => {
+            let off = slice_arith(sh, offset)?;
+            let len = match length {
+                Some(l) => Some(slice_arith(sh, l)?),
+                None => None,
+            };
+            slice_elements(sh, &mut list, off, len)?;
+        }
+        Some(ParamOp::Default { word, colon }) => {
+            if list_absent(sh, &list, *colon, star, quoted, splitting) {
+                return push_word(sh, word, quoted, splitting, done, cur);
+            }
+        }
+        // Absent, the alternative is NOTHING -- not even an empty field when
+        // quoted: bash's `"${a[@]+x}"` over an empty array is no argument.
+        Some(ParamOp::Alt { word, colon }) => {
+            if list_absent(sh, &list, *colon, star, quoted, splitting) {
+                return Ok(());
+            }
+            return push_word(sh, word, quoted, splitting, done, cur);
+        }
+        Some(ParamOp::Error { word, colon }) => {
+            if list_absent(sh, &list, *colon, star, quoted, splitting) {
+                let msg = QChar::text(&expand_chars(sh, word, quoted, false)?);
+                let msg = if msg.is_empty() {
+                    "parameter not set"
+                } else {
+                    &msg
+                };
+                let sub = if star { '*' } else { '@' };
+                return Err(exec::fatal_args(
+                    sh,
+                    format_args!("{}[{sub}]: {msg}", p.name),
+                    2,
+                ));
+            }
+        }
+        // bash cannot assign through `[@]` and says so only when it would.
+        Some(ParamOp::Assign { colon, .. }) => {
+            if list_absent(sh, &list, *colon, star, quoted, splitting) {
+                let sub = if star { '*' } else { '@' };
+                return Err(exec::fatal_args(
+                    sh,
+                    format_args!("{}[{sub}]: bad array subscript", p.name),
+                    1,
+                ));
+            }
+        }
+        Some(ParamOp::TrimPrefix { pat, longest }) => {
+            let units = pattern::compile(&expand_pattern(sh, pat)?);
+            for (_, item) in &mut list {
+                if let Some(cut) = pattern::strip_prefix(&units, item, *longest) {
+                    *item = cut;
+                }
+            }
+        }
+        Some(ParamOp::TrimSuffix { pat, longest }) => {
+            let units = pattern::compile(&expand_pattern(sh, pat)?);
+            for (_, item) in &mut list {
+                if let Some(cut) = pattern::strip_suffix(&units, item, *longest) {
+                    *item = cut;
+                }
+            }
+        }
+        Some(ParamOp::Replace { pat, repl, all }) => {
+            let units = pattern::compile(&expand_pattern(sh, pat)?);
+            let rep = QChar::text(&expand_chars(sh, repl, quoted, false)?);
+            if !units.is_empty() {
+                for (_, item) in &mut list {
+                    *item = pattern::replace(&units, item, &rep, *all);
+                }
+            }
+        }
+    }
+    push_list(sh, &list, star, quoted, splitting, done, cur)
+}
+
+/// Whether a list operand is absent to `-`, `+`, `?` and `=`: no elements at
+/// all, or with the colon, null. Null is `$@`'s rule here: unquoted and split,
+/// no element or one empty one; otherwise an empty JOIN, which for `@` (joined
+/// on a space) is again one empty element.
+fn list_absent(
+    sh: &Shell,
+    list: &[(usize, String)],
+    colon: bool,
+    star: bool,
+    quoted: bool,
+    splitting: bool,
+) -> bool {
+    if list.is_empty() {
+        return true;
+    }
+    if !colon {
+        return false;
+    }
+    let all_empty = list.iter().all(|(_, v)| v.is_empty());
+    let one = list.len() == 1;
+    if (!quoted && splitting) || !star {
+        return one && all_empty;
+    }
+    all_empty && (one || ifs_value(sh).is_empty())
+}
+
+/// A slice of a list operand, by INDEX as bash takes it: from the first
+/// element whose index is at least `off` -- a negative `off` counting back
+/// from one past the highest -- taking at most `len` of them.
+fn slice_elements(
+    sh: &mut Shell,
+    list: &mut Vec<(usize, String)>,
+    off: i64,
+    len: Option<i64>,
+) -> R<()> {
+    let end = list.last().map_or(0, |(i, _)| {
+        i64::try_from(*i).unwrap_or(i64::MAX).saturating_add(1)
+    });
+    let from = if off < 0 {
+        end.saturating_add(off)
+    } else {
+        off
+    };
+    if from < 0 {
+        list.clear();
+        return Ok(());
+    }
+    list.retain(|(i, _)| i64::try_from(*i).unwrap_or(i64::MAX) >= from);
+    match len {
+        None => {}
+        Some(l) if l < 0 => {
+            return Err(exec::fatal_args(
+                sh,
+                format_args!("{l}: substring expression < 0"),
+                1,
+            ))
+        }
+        Some(l) => list.truncate(usize::try_from(l).unwrap_or(usize::MAX)),
+    }
+    Ok(())
+}
+
+/// A list's fields, by this shell's rules for `$@` and `$*` (see
+/// `expand_param`): broken at elements wherever an unquoted one is split; one
+/// field joined on IFS's first character for a quoted `*`; otherwise a field
+/// per element, none at all for an empty list.
+fn push_list(
+    sh: &Shell,
+    list: &[(usize, String)],
+    star: bool,
+    quoted: bool,
+    splitting: bool,
+    done: &mut Vec<Field>,
+    cur: &mut Field,
+) -> R<()> {
+    if !quoted && splitting {
+        for (n, (_, v)) in list.iter().enumerate() {
+            if n > 0 {
+                cur.brk();
+            }
+            push_expanded(&mut cur.chars, v, false);
+        }
+        return Ok(());
+    }
+    if star {
+        if quoted {
+            cur.quote();
+        }
+        let sep = ifs_value(sh).chars().next();
+        for (n, (_, v)) in list.iter().enumerate() {
+            if n > 0 {
+                if let Some(c) = sep {
+                    push_expanded(&mut cur.chars, c.encode_utf8(&mut [0; 4]), quoted);
+                }
+            }
+            push_expanded(&mut cur.chars, v, quoted);
+        }
+        return Ok(());
+    }
+    if quoted && !list.is_empty() {
+        cur.quote();
+    }
+    for (n, (_, v)) in list.iter().enumerate() {
+        if n > 0 {
+            let next = std::mem::replace(cur, Field::opened(quoted));
+            crate::allocation::push(done, next).map_err(exec::oom)?;
+        }
+        push_expanded(&mut cur.chars, v, quoted);
+    }
+    Ok(())
+}
+
+/// Expand a compound assignment's elements: a `[sub]=value` one to
+/// `(Some(index), value)`, the value expanded as an assignment's is and the
+/// subscript as arithmetic; any other to a `(None, field)` per field, split
+/// and globbed as a command's argument is, as bash expands them.
+pub fn expand_compound(sh: &mut Shell, elems: &[Elem]) -> R<Vec<(Option<i64>, String)>> {
+    let mut out: Vec<(Option<i64>, String)> = Vec::new();
+    for elem in elems {
+        match elem {
+            Elem::Keyed { index, value } => {
+                let text = expand_single(sh, index)?;
+                if text.trim().is_empty() {
+                    return Err(exec::fatal_args(
+                        sh,
+                        format_args!("[{text}]: bad array subscript"),
+                        1,
+                    ));
+                }
+                let at = arith::eval(sh, &text)?;
+                let value = expand_assign(sh, value)?;
+                crate::allocation::push(&mut out, (Some(at), value)).map_err(exec::oom)?;
+            }
+            Elem::Plain(w) => {
+                for field in expand_fields(sh, w)? {
+                    crate::allocation::push(&mut out, (None, field)).map_err(exec::oom)?;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A declaration builtin's `name=(…)` operand, expanded.
+pub struct Compound {
+    pub name: String,
+    pub append: bool,
+    pub items: Vec<(Option<i64>, String)>,
+}
+
+/// What `expand_command_words` found beside the words: a declaration
+/// builtin's compound operands, and whether the builtin is `local`, which must
+/// declare the names before they are stored, rather than `export` or
+/// `readonly`, which mark names already stored.
+#[derive(Default)]
+pub struct Decl {
+    pub compounds: Vec<Compound>,
+    pub after_builtin: bool,
+}
+
+/// The parts of a `name=(…)` or `name+=(…)` word.
+fn compound_operand(w: &Word) -> Option<(&str, bool, &[Elem])> {
+    let shape = crate::ast::assignment_shape(&w.0)?;
+    match w.0.as_slice() {
+        [Seg::Lit(head), Seg::Array(elems)]
+            if shape.index_end.is_none() && shape.value_byte == head.len() =>
+        {
+            Some((shape.name, shape.append, elems))
+        }
+        _ => None,
+    }
 }
 
 /// Append a `-` or `+` operator's word to the field being built, keeping the

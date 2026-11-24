@@ -114,40 +114,33 @@
 # (see duplicate_conflicts).
 
 # ---- xfail: td-sh runs, wrong answer (known gaps) ----
+xfail alias.test.sh::Corner case: alias inside LHS array arithmetic expression
 xfail alias.test.sh::alias with word of multiple lines
 xfail alias.test.sh::alias without args lists all aliases
 xfail alias.test.sh::unalias -a
-xfail append.test.sh::Append array to array
-xfail append.test.sh::Append string to string
-xfail append.test.sh::Append string to undefined variable
-xfail append.test.sh::Append to array to undefined variable
-xfail append.test.sh::Strings have value semantics, not reference semantics
 xfail append.test.sh::Type mismatching of lhs+=rhs should not cause a crash
 xfail append.test.sh::assign builtin appending array: declare d+=(d e)
 xfail append.test.sh::error: append used like env prefix
 xfail append.test.sh::error: myarray+=s
-xfail append.test.sh::error: s+=(my array)
 xfail append.test.sh::error: typeset myarray+=s
 xfail append.test.sh::export readonly +=
 xfail append.test.sh::export+=array disallowed (strict_array)
 xfail append.test.sh::local +=
-xfail append.test.sh::myarray[-1]+=s - Append to last element
-xfail append.test.sh::myarray[1]+=s - Append to element
 xfail append.test.sh::typeset s${dyn}+=
 xfail append.test.sh::typeset s+=
 xfail append.test.sh::typeset s+=(my array)
 xfail arith-context.test.sh::$[ is a synonym for $((
 xfail arith-context.test.sh::$[$undefined] is a synonym for $(($undefined (#2566)
 xfail arith-context.test.sh::$[$var is a synonym for $(($var (#2426)
-xfail arith-context.test.sh::Array index on LHS of assignment
 xfail arith-context.test.sh::Array index on LHS with indices
 xfail arith-context.test.sh::Empty expression (( ))  $(( ))
+xfail arith-context.test.sh::Empty expression a[]
 xfail arith-context.test.sh::Empty expression for (( ))
-xfail arith-context.test.sh::Empty expression in ${a[@]: : }
 xfail arith-context.test.sh::Multiple right brackets inside expression
 xfail arith-context.test.sh::Quadruple parens should be disambiguated
 xfail arith-context.test.sh::Triple parens should be disambiguated
 xfail arith-dynamic.test.sh::Variable references
+xfail arith.test.sh::Add integer to associative array (a[0] decay)
 xfail arith.test.sh::Comma operator (borrowed from C)
 xfail arith.test.sh::Constants in base 36
 xfail arith.test.sh::Constants in bases 2 to 64
@@ -155,6 +148,7 @@ xfail arith.test.sh::Dynamic base constants
 xfail arith.test.sh::Dynamic parsing of arithmetic
 xfail arith.test.sh::Exponentiation operator has buggy precedence
 xfail arith.test.sh::Exponentiation with **
+xfail arith.test.sh::Increment and decrement array elements
 xfail arith.test.sh::Integer constant parsing
 xfail arith.test.sh::Invalid string to int
 xfail arith.test.sh::Invalid string to int with strict_arith
@@ -162,15 +156,18 @@ xfail arith.test.sh::Multiple digit constants with base N
 xfail arith.test.sh::Postincrement
 xfail arith.test.sh::Preincrement
 xfail arith.test.sh::Recursive name evaluation is a result of runtime parse/eval
+xfail arith.test.sh::Side Effect in Array Indexing
+xfail arith.test.sh::result of ArithSub -- array[0] decay
 xfail arith.test.sh::unary assignment with dynamic var name
+xfail array-assign.test.sh::Are quotes allowed?
+xfail array-assign.test.sh::Indexed LHS without spaces, and +=
+xfail array-assign.test.sh::More fragments like a[  a[5  a[5 +  a[5 + 3]
 xfail array-assoc.test.sh::${!ref} and assoc array
 xfail array-assoc.test.sh::${A[@]#prefix}
 xfail array-assoc.test.sh::${A[@]/b/B}
 xfail array-assoc.test.sh::${assoc} is like ${assoc[0]}
 xfail array-assoc.test.sh::(( A[5] += 42 ))
 xfail array-assoc.test.sh::(( A[5] += 42 )) with empty cell
-xfail array-assoc.test.sh::Append to associative array value A['x']+='suffix'
-xfail array-assoc.test.sh::Array stored in associative array gets converted to string (without strict_array)
 xfail array-assoc.test.sh::Associative array expressions inside (( )) with keys that look like numbers
 xfail array-assoc.test.sh::BashAssoc ${a[@]@Q}
 xfail array-assoc.test.sh::BashAssoc a+=()
@@ -185,15 +182,11 @@ xfail array-assoc.test.sh::[[ -v assoc[key] ]] syntax errors
 xfail array-assoc.test.sh::associative array and brace expansion
 xfail array-assoc.test.sh::bash bug: "i+1" and i+1 are the same key
 xfail array-assoc.test.sh::bash bug: (( A["$key"] = 1 )) doesn't work
-xfail array-assoc.test.sh::bash variable can have an associative array part and a string part
 xfail array-assoc.test.sh::coerce to string with ${A[*]}, etc.
-xfail array-assoc.test.sh::create empty assoc array, put, then get
 xfail array-assoc.test.sh::declare -A A=() allowed
 xfail array-assoc.test.sh::length ${#a[@]}
 xfail array-assoc.test.sh::lookup by unquoted string doesn't work in OSH because it's a variable
-xfail array-assoc.test.sh::lookup with ${a[0]} -- "0" is a string
 xfail array-assoc.test.sh::lookup with double quoted strings "mykey"
-xfail array-assoc.test.sh::lookup with single quoted string
 xfail array-assoc.test.sh::lookup with unquoted $key and quoted "$i$i"
 xfail array-assoc.test.sh::nameref and assoc array
 xfail array-assoc.test.sh::printf -v and assoc array
@@ -201,24 +194,11 @@ xfail array-assoc.test.sh::readonly associative array can't be modified
 xfail array-assoc.test.sh::retrieve keys with !
 xfail array-assoc.test.sh::retrieve values with ${A[@]}
 xfail array-assoc.test.sh::set associative array to indexed array literal (very surprising bash behavior)
-xfail array-assoc.test.sh::setting key to itself (from bash-bug mailing list)
 xfail array-assoc.test.sh::test -v assoc[key]
 xfail array-assoc.test.sh::test -v with dynamic parsing
 xfail array-assoc.test.sh::unset -v and assoc array
-xfail array-basic.test.sh::"${a[@]}" and "${a[*]}"
-xfail array-basic.test.sh::${a[@]} and ${a[*]}
-xfail array-basic.test.sh::4 ways to interpolate empty array
-xfail array-basic.test.sh::Empty array with :-
-xfail array-basic.test.sh::empty array
 xfail array-compat.test.sh::++ on a whole array increments the first element (disallowed with strict_array)
-xfail array-compat.test.sh::Apply vectorized operations on ${a[*]}
 xfail array-compat.test.sh::Array Decay with IFS
-xfail array-compat.test.sh::Assign to array index without initialization
-xfail array-compat.test.sh::User arrays decay
-xfail array-compat.test.sh::a[40] grows array
-xfail array-compat.test.sh::array decays to string when comparing with [[ a = b ]]
-xfail array-compat.test.sh::strict_array: $array is not valid in OSH, is ${array[0]} in ksh/bash
-xfail array-compat.test.sh::strict_array: ${array} is not valid in OSH, is ${array[0]} in ksh/bash
 xfail array-compat.test.sh::value.BashArray internal representation - Assoc (ordering is a problem)
 xfail array-compat.test.sh::value.BashArray internal representation - Indexed
 xfail array-literal.test.sh::(strict_array) assoc=(key value ...) is not allowed
@@ -228,25 +208,17 @@ xfail array-literal.test.sh::BashArray cannot be changed to BashAssoc and vice v
 xfail array-literal.test.sh::Evaluation order (1)
 xfail array-literal.test.sh::Evaluation order (2)
 xfail array-literal.test.sh::Evaluation order (3)
-xfail array-literal.test.sh::Tilde expansions in RHS of [k]=v (BashArray)
 xfail array-literal.test.sh::Tilde expansions in RHS of [k]=v (BashAssoc)
-xfail array-literal.test.sh::[k1]=v1 (BashArray)
 xfail array-literal.test.sh::[k1]=v1 (BashAssoc)
-xfail array-literal.test.sh::[k1]=v1 looking like brace expansions (BashArray)
-xfail array-literal.test.sh::[k1]=v1 looking like brace expansions (BashAssoc)
-xfail array-literal.test.sh::[k]=$v and [k]="$@" (BashArray)
 xfail array-literal.test.sh::[k]=$v and [k]="$@" (BashAssoc)
 xfail array-literal.test.sh::append to element (BashArray)
 xfail array-literal.test.sh::append to element (BashAssoc)
-xfail array-literal.test.sh::index increments without [k]= (BashArray)
 xfail array-literal.test.sh::non-index forms of element (BashAssoc)
 xfail array-sparse.test.sh::"${a[*]}"
 xfail array-sparse.test.sh::${!a[0]}
 xfail array-sparse.test.sh::${!a[@]}
 xfail array-sparse.test.sh::${@:offset:length}
-xfail array-sparse.test.sh::${a-}
 xfail array-sparse.test.sh::${a[@]#...}
-xfail array-sparse.test.sh::${a[@]-unset}, ${a[@]:-empty}, etc.
 xfail array-sparse.test.sh::${a[@]/pat/rep}
 xfail array-sparse.test.sh::${a[@]:BigInt}
 xfail array-sparse.test.sh::${a[@]:offset:length}
@@ -270,84 +242,39 @@ xfail array-sparse.test.sh::Regression: a[-1]=1
 xfail array-sparse.test.sh::[[ -v a[i] ]]
 xfail array-sparse.test.sh::[[ -v a[i] ]] with invalid negative index
 xfail array-sparse.test.sh::a[i]=v
-xfail array-sparse.test.sh::a[i]=v with BigInt
 xfail array-sparse.test.sh::compadjust
 xfail array-sparse.test.sh::compgen -F _set_COMPREPLY
 xfail array-sparse.test.sh::crash dump
 xfail array-sparse.test.sh::test "declare -p sp"
-xfail array-sparse.test.sh::test length
 xfail array-sparse.test.sh::unset -v a[i]
 xfail array-sparse.test.sh::unset -v a[i] for max index
 xfail array-sparse.test.sh::unset -v a[i] with out-of-bound negative index
-xfail array-sparse.test.sh::xtrace a+=()
-xfail array.test.sh::"$*"
-xfail array.test.sh::$*
 xfail array.test.sh::${!a[1]} is named ref in bash
 xfail array.test.sh::${!a} on array
-xfail array.test.sh::${mystr[@]} and ${mystr[*]} are no-ops
 xfail array.test.sh::${mystr[@]} and ${mystr[*]} disallowed with strict_array
-xfail array.test.sh::All elements quoted
-xfail array.test.sh::All elements unquoted
 xfail array.test.sh::Append sparse arrays
 xfail array.test.sh::Array syntax in wrong place
 xfail array.test.sh::Brace Expansion within Array
-xfail array.test.sh::Command with with word splitting in array
-xfail array.test.sh::Create a "user" array out of the argv array
 xfail array.test.sh::Create sparse array
 xfail array.test.sh::Create sparse array implicitly
-xfail array.test.sh::Dynamic parsing of RHS ${a[$code]}
-xfail array.test.sh::Exporting array doesn't do anything, not even first element
-xfail array.test.sh::Interpolate array into array
+xfail array.test.sh::Dynamic parsing of LHS a[$code]=value
 xfail array.test.sh::Is element set?  test -v a[i]
-xfail array.test.sh::Iteration
-xfail array.test.sh::Length after unset
-xfail array.test.sh::Length of an element
 xfail array.test.sh::More arith expressions in [[ -v array[expr]] ]]
 xfail array.test.sh::Negative index
 xfail array.test.sh::Negative index and sparse array
 xfail array.test.sh::Negative index and sparse array ##2
-xfail array.test.sh::Negative slice begin
-xfail array.test.sh::Negative slice length
-xfail array.test.sh::Number of elements
 xfail array.test.sh::Regression: ${a[@]@Q} crash with `a[0]=x a[2]=y`
-xfail array.test.sh::Regression: Array length after unset
 xfail array.test.sh::Regression: Assigning with out-of-range negative index
 xfail array.test.sh::Regression: Negative index in [[ -v a[index] ]]
 xfail array.test.sh::Regression: Negative out-of-range index in [[ -v a[index] ]]
-xfail array.test.sh::Regression: Out-of-bound negative offset for ${a[@]:offset}
 xfail array.test.sh::Regression: silent out-of-bound negative index in ${a[-2]} and $((a[-2]))
 xfail array.test.sh::Regression: unset a[-2]: out-of-bound negative index should cause error
-xfail array.test.sh::Retrieve array indices with ${!a}
-xfail array.test.sh::Retrieve index
-xfail array.test.sh::Retrieve index that is a command sub
-xfail array.test.sh::Retrieve index that is a variable
-xfail array.test.sh::Retrieve index that is a variable without $
-xfail array.test.sh::Retrieve out of bounds index
 xfail array.test.sh::Retrieve sparse array indices with ${!a}
-xfail array.test.sh::Set element
-xfail array.test.sh::Set element with array ref
-xfail array.test.sh::Set element with var ref
-xfail array.test.sh::Single array with :-
 xfail array.test.sh::Singleton Array Copy and Assign.  OSH can't index strings with ints
-xfail array.test.sh::Slice of array with [@]
 xfail array.test.sh::Slice of sparse array with [@]
-xfail array.test.sh::Slice with arithmetic
-xfail array.test.sh::Stripping a whole array quoted
-xfail array.test.sh::Stripping a whole array unquoted
-xfail array.test.sh::Tilde expansion within array
-xfail array.test.sh::Using an array itself as the index on LHS
 xfail array.test.sh::Using an array itself as the index on RHS
 xfail array.test.sh::[[ -v a[i] ]]
 xfail array.test.sh::a+=() modifies existing instance of BashArray
-xfail array.test.sh::a[$x$y] on LHS and RHS
-xfail array.test.sh::array default
-xfail array.test.sh::array over multiple lines
-xfail array.test.sh::array with empty string
-xfail array.test.sh::declare -a / local -a is empty array
-xfail array.test.sh::declare array and then append
-xfail array.test.sh::glob within array yields separate elements
-xfail array.test.sh::local array
-xfail array.test.sh::nounset / set -u with empty array (bug in bash 4.3, fixed in 4.4)
 xfail array.test.sh::strict_array prevents exporting array
 xfail array.test.sh::test -v a[i] with arith expressions
 xfail assign-deferred.test.sh::export a[7]=8
@@ -361,8 +288,6 @@ xfail assign-dialects.test.sh::K and V are variables in (( array[K] = V ))
 xfail assign-dialects.test.sh::test -v with arrays
 xfail assign-dialects.test.sh::test -v with assoc arrays
 xfail assign-dialects.test.sh::test -v with strings
-xfail assign-extended.test.sh::Env bindings shouldn't contain array assignments
-xfail assign-extended.test.sh::Multiple assignments / array assignments on a line
 xfail assign-extended.test.sh::ble.sh: eval -- "$(declare -p var arr)"
 xfail assign-extended.test.sh::declare
 xfail assign-extended.test.sh::declare -F prints function names
@@ -387,9 +312,7 @@ xfail assign-extended.test.sh::dynamic flag in array in assign builtin
 xfail assign-extended.test.sh::eval -- "$(declare -p arr)" (restore arrays w/ unset elements)
 xfail assign-extended.test.sh::function name with /
 xfail assign-extended.test.sh::invalid var name
-xfail assign-extended.test.sh::local -a
 xfail assign-extended.test.sh::myvar=typeset (another form of dynamic assignment)
-xfail assign-extended.test.sh::syntax error in array assignment
 xfail assign-extended.test.sh::typeset +r removes read-only attribute (TODO: documented in bash to do nothing)
 xfail assign-extended.test.sh::typeset +x
 xfail assign-extended.test.sh::typeset -ar makes it readonly
@@ -398,6 +321,8 @@ xfail assign-extended.test.sh::typeset -p
 xfail assign-extended.test.sh::typeset -r makes a string readonly
 xfail assign-extended.test.sh::typeset -x makes it exported
 xfail assign-extended.test.sh::unset and shell funcs
+xfail assign.test.sh::'declare -A' and then dict assignment
+xfail assign.test.sh::'local x' and then array assignment
 xfail assign.test.sh::Escaped = in command name
 xfail assign.test.sh::Multiple temporary envs on the stack
 xfail assign.test.sh::aliased assignment doesn't split
@@ -407,6 +332,9 @@ xfail assign.test.sh::local a=loc $var c=loc
 xfail assign.test.sh::redirect after assignment builtin (eval redirects after evaluating arguments)
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
 xfail assign.test.sh::static assignment doesn't split
+xfail background.test.sh::Wait for job and PIPESTATUS
+xfail background.test.sh::Wait for job and PIPESTATUS - cat
+xfail ble-idioms.test.sh::Sparse array with big index
 xfail ble-idioms.test.sh::recursive arith: short circuit ?:
 xfail ble-idioms.test.sh::recursive arith: side effects
 xfail blog-other1.test.sh::Blog Post Example
@@ -465,7 +393,9 @@ xfail brace-expansion.test.sh::triple expansion
 xfail brace-expansion.test.sh::triple nested brace expansion
 xfail brace-expansion.test.sh::} in expansion
 xfail bugs.test.sh::#2640 Hanging when reading from character devices
+xfail bugs.test.sh::Turn an array into an integer.
 xfail bugs.test.sh::other builtins fail on writing to full disk
+xfail bugs.test.sh::unset doesn't allow command execution
 xfail builtin-bash.test.sh::bad help topic
 xfail builtin-bash.test.sh::help
 xfail builtin-bash.test.sh::mapfile -t bugs (ble.sh)
@@ -501,7 +431,6 @@ xfail builtin-completion.test.sh::Invalid syntax
 xfail builtin-completion.test.sh::Parse errors for compgen -W and complete -W
 xfail builtin-completion.test.sh::Runtime errors for compgen -F func
 xfail builtin-completion.test.sh::Runtime errors for compgen -W
-xfail builtin-completion.test.sh::compadjust with empty COMP_ARGV
 xfail builtin-completion.test.sh::compadjust with sparse COMP_ARGV
 xfail builtin-completion.test.sh::compgen -A builtin
 xfail builtin-completion.test.sh::compgen -A command completes builtins and keywords
@@ -550,6 +479,7 @@ xfail builtin-dirs.test.sh::dirs test of path alias `.`
 xfail builtin-dirs.test.sh::popd returns error on empty directory stack
 xfail builtin-dirs.test.sh::popd usage error
 xfail builtin-dirs.test.sh::pushd usage
+xfail builtin-eval-source.test.sh::Eval in bash does tilde expansion in array
 xfail builtin-eval-source.test.sh::Eval in does tilde expansion
 xfail builtin-eval-source.test.sh::Source nonexistent
 xfail builtin-eval-source.test.sh::Source with no arguments
@@ -601,6 +531,7 @@ xfail builtin-misc.test.sh::Shifting too far
 xfail builtin-misc.test.sh::time pipeline
 xfail builtin-printf.test.sh::Invalid UTF-8
 xfail builtin-printf.test.sh::Too large
+xfail builtin-printf.test.sh::printf -v a[1]
 xfail builtin-printf.test.sh::printf octal backslash escapes
 xfail builtin-process.test.sh::arg that would overflow 64 bits is detected
 xfail builtin-process.test.sh::exec -- 2>&1
@@ -615,6 +546,7 @@ xfail builtin-process.test.sh::ulimit of 2**32, 2**31 (int overflow)
 xfail builtin-process.test.sh::ulimit that is 64 bits
 xfail builtin-process.test.sh::ulimit with no flags is like -f
 xfail builtin-process.test.sh::write big file with ulimit
+xfail builtin-read.test.sh::read -a reads into array
 xfail builtin-read.test.sh::read -r -d '' for NUL strings, e.g. find -print0
 xfail builtin-set.test.sh::'set' and 'eval' round trip
 xfail builtin-set.test.sh::can continue after unknown option
@@ -694,6 +626,11 @@ xfail builtin-umask.test.sh::umask s perm
 xfail builtin-umask.test.sh::umask t perm
 xfail builtin-umask.test.sh::usage: large octal number
 xfail builtin-vars.test.sh::Export sets a global variable that persists after export -n
+xfail builtin-vars.test.sh::Unset array member
+xfail builtin-vars.test.sh::Unset array member with dynamic parsing
+xfail builtin-vars.test.sh::Unset errors
+xfail builtin-vars.test.sh::Unset wrong type
+xfail builtin-vars.test.sh::can't export array (strict_array)
 xfail builtin-vars.test.sh::export -n foo=bar not allowed
 xfail builtin-vars.test.sh::export -n undefined is ignored
 xfail case_.test.sh::Pattern ? matches 1 code point (many bytes), but not multiple code points
@@ -715,8 +652,6 @@ xfail command_.test.sh::hash -r doesn't allow additional args
 xfail command_.test.sh::hash with args
 xfail command_.test.sh::hash without args prints the cache
 xfail dbracket.test.sh::(( array1 == array2 )) doesn't work
-xfail dbracket.test.sh::Array coerces to string (shopt -s strict_array to disallow)
-xfail dbracket.test.sh::User array compared to "$@" (broken unless shopt -s strict_array)
 xfail dbracket.test.sh::[[ ]] with redirect
 xfail dbracket.test.sh::[[ over multiple lines is OK
 xfail divergence.test.sh::builtin cat crashes a subshell (#2530)
@@ -808,6 +743,7 @@ xfail for-expr.test.sh::For loop with and without semicolon
 xfail for-expr.test.sh::Infinite loop with ((;;))
 xfail for-expr.test.sh::Integers near 31, 32, 62 bits
 xfail glob-bash.test.sh::dotglob (bash option that no_dash_glob is roughly consistent with)
+xfail glob-bash.test.sh::shopt -s failglob in array literal context
 xfail glob.test.sh::Glob unicode char
 xfail glob.test.sh::pattern starting with . does not return . and ..
 xfail globignore.test.sh::Extended glob expansion combined with GLOBIGNORE
@@ -913,8 +849,11 @@ xfail osh-bugs.test.sh::var x = $(echo one; false; echo two) in OSH
 xfail parse-errors.test.sh::Long Token - 65535 bytes
 xfail parse-errors.test.sh::Token that's too long for Oils - 65536 bytes
 xfail parse-errors.test.sh::empty clause in [[
+xfail pipeline.test.sh::PIPESTATUS
+xfail pipeline.test.sh::PIPESTATUS with shopt -s lastpipe
 xfail pipeline.test.sh::Pipeline comments
 xfail pipeline.test.sh::Pipeline in eval
+xfail pipeline.test.sh::SIGPIPE causes pipeline to die (regression for issue #295)
 xfail posix.test.sh::Command substitution in default
 xfail print-source-code.test.sh::non-{ } function bodies can be serialized (rare)
 xfail print-source-code.test.sh::typeset -f prints function source code
@@ -974,7 +913,6 @@ xfail redirect.test.sh::echo foo >&100 (OSH regression: does not fail with inval
 xfail redirect.test.sh::echo foo >&N where N is first unused fd
 xfail redirect.test.sh::noclobber can still write to non-regular files like /dev/null
 xfail regex.test.sh::BASH_REMATCH
-xfail regex.test.sh::Bug: Nix idiom with closing ) next to pattern
 xfail regex.test.sh::Escaped {
 xfail regex.test.sh::Escaped { stored in variable first
 xfail regex.test.sh::Fatal error inside [[ =~ ]]
@@ -995,6 +933,8 @@ xfail sh-options.test.sh::$- with pipefail
 xfail sh-options.test.sh::noclobber on
 xfail sh-options.test.sh::noclobber on <>
 xfail sh-options.test.sh::pipefail
+xfail sh-options.test.sh::set without args and array variables
+xfail sh-options.test.sh::set without args and assoc array variables (not in OSH)
 xfail sh-options.test.sh::set without args lists variables
 xfail sh-options.test.sh::shopt -s strict:all
 xfail sh-usage.test.sh::LC_CTYPE=invalid
@@ -1008,6 +948,9 @@ xfail shell-grammar.test.sh::Invalid token
 xfail shell-grammar.test.sh::Prefix redirect
 xfail shell-grammar.test.sh::case item without ;; is not allowed
 xfail shell-grammar.test.sh::case: Using ; instead of ;;
+xfail strict-options.test.sh::Arrays are incorrectly compared, but strict_array prevents it
+xfail strict-options.test.sh::automatically creating arrays WITHOUT strict_array
+xfail strict-options.test.sh::automatically creating arrays are INDEXED, not associative
 xfail subshell.test.sh::Subshell with redirects
 xfail tilde.test.sh::${x//~/~root}
 xfail tilde.test.sh::temp assignment x=~ env
@@ -1070,18 +1013,18 @@ xfail var-op-patsub.test.sh::When LC_ALL=C, pattern ? doesn't match multibyte ch
 xfail var-op-patsub.test.sh::patsub with [^]]
 xfail var-op-slice.test.sh::${@:offset:length} and ${*:offset:length}
 xfail var-op-slice.test.sh::${@:offset} and ${*:offset}
-xfail var-op-slice.test.sh::${array[@]::} has implicit length of zero - for ble.sh
-xfail var-op-slice.test.sh::${array[@]:} vs ${array[@]: }  - bash and zsh inconsistent
 xfail var-op-slice.test.sh::Cannot take length of substring slice
-xfail var-op-slice.test.sh::Permutations of implicit begin and length
 xfail var-op-slice.test.sh::Slice string with invalid UTF-8 results in empty string and warning
 xfail var-op-slice.test.sh::Slice string with invalid UTF-8 with strict_word_eval
 xfail var-op-slice.test.sh::Slice undefined
 xfail var-op-slice.test.sh::Slice with an assoc array
-xfail var-op-slice.test.sh::Slice with an index that's an array -- silent a[0] decay
+xfail var-op-strip.test.sh::Append using replacement of %
+xfail var-op-strip.test.sh::Prepend using replacement of #
+xfail var-op-strip.test.sh::Remove const suffix is vectorized on user array
 xfail var-op-strip.test.sh::Strip unicode prefix
 xfail var-op-strip.test.sh::strip all unicode
 xfail var-op-test.test.sh::Lazy Evaluation of Alternative
+xfail var-op-test.test.sh::array ${arr[0]=x}
 xfail var-ref.test.sh::${!OPTIND} (used by bash completion
 xfail var-ref.test.sh::${!a[@]-'default'} is legal but fails with more than one element
 xfail var-ref.test.sh::${!array_ref:-set} and ${!array_ref:=assign}
@@ -1124,6 +1067,7 @@ xfail vars-special.test.sh::$?
 xfail vars-special.test.sh::$LINENO in [[
 xfail vars-special.test.sh::$LINENO in for loop
 xfail vars-special.test.sh::$PATH is set if unset at startup
+xfail vars-special.test.sh::$PIPESTATUS
 xfail vars-special.test.sh::$PWD is not only set, but exported
 xfail vars-special.test.sh::$RANDOM
 xfail vars-special.test.sh::$SECONDS
@@ -1132,6 +1076,8 @@ xfail whitespace.test.sh::Parsing shell words \r \v
 xfail whitespace.test.sh::\r at end of line is not special
 xfail whitespace.test.sh::\r in arith expression is allowed by some shells, but not most!
 xfail whitespace.test.sh::whitespace in string to integer conversion
+xfail word-eval.test.sh::Evaluation of each part
+xfail word-eval.test.sh::Word joining
 xfail word-split.test.sh::IFS empty doesn't do splitting
 xfail word-split.test.sh::IFS unset behaves like $' \t\n'
 xfail word-split.test.sh::Unicode in IFS
@@ -1140,7 +1086,6 @@ xfail xtrace.test.sh::PS4 with unterminated $(
 xfail xtrace.test.sh::PS4 with unterminated ${
 xfail xtrace.test.sh::set -o verbose prints unevaluated code
 xfail xtrace.test.sh::xtrace with newlines
-xfail zsh-assoc.test.sh::TODO: SETUP should be shared
 xfail zsh-assoc.test.sh::get length
 xfail zsh-assoc.test.sh::index by integer does not work
 xfail zsh-assoc.test.sh::iterate over both keys and values

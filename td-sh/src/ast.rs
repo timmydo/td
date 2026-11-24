@@ -17,6 +17,10 @@ pub struct SynErr {
     pub msg: String,
     /// Private, so the constructors below are the only way to set it.
     incomplete: bool,
+    /// A reservation failed while reading. Carried as a flag rather than as
+    /// message text so that reporting it allocates nothing; `text` answers
+    /// with the static spelling.
+    oom: bool,
 }
 
 impl SynErr {
@@ -27,11 +31,31 @@ impl SynErr {
         Self {
             msg: msg.into(),
             incomplete: true,
+            oom: false,
+        }
+    }
+
+    /// Storage for what was being read could not be reserved. `String::new`
+    /// does not allocate, so building this one cannot fail the same way.
+    pub fn out_of_memory() -> Self {
+        Self {
+            msg: String::new(),
+            incomplete: false,
+            oom: true,
         }
     }
 
     pub fn is_incomplete(&self) -> bool {
         self.incomplete
+    }
+
+    /// The diagnostic to print: the message, or the static out-of-memory text.
+    pub fn text(&self) -> &str {
+        if self.oom {
+            "out of memory"
+        } else {
+            &self.msg
+        }
     }
 }
 
@@ -43,6 +67,7 @@ impl From<String> for SynErr {
         Self {
             msg,
             incomplete: false,
+            oom: false,
         }
     }
 }
@@ -52,13 +77,14 @@ impl From<&str> for SynErr {
         Self {
             msg: msg.to_string(),
             incomplete: false,
+            oom: false,
         }
     }
 }
 
 impl std::fmt::Display for SynErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.msg)
+        f.write_str(self.text())
     }
 }
 
@@ -140,6 +166,24 @@ pub enum Seg {
     /// raises `bad substitution` from its expander, so this fails there too.
     /// Not a `Param` -- `expand_param` would look the name up first.
     BadSub(String),
+    /// bash's compound assignment, `name=(w1 w2 …)`: the elements, each still
+    /// to be expanded. The lexer makes one only directly after a word that is
+    /// exactly `name=` or `name+=`, in a position where bash would assign (see
+    /// `lexer::AssignPos`), so it is always a whole assignment value. ash has
+    /// no arrays; td-sh carries bash's indexed ones because scripts written
+    /// for bash -- an agent harness's shell snapshot among them -- use them.
+    Array(Vec<Elem>),
+}
+
+/// One element of a compound assignment.
+#[derive(Clone, Debug)]
+pub enum Elem {
+    /// A word, expanded as a command's argument is: split and globbed, each
+    /// field its own element at the index after the one before.
+    Plain(Word),
+    /// `[sub]=value`: the value, expanded as an assignment's is, at the index
+    /// the arithmetic `sub` names.
+    Keyed { index: Word, value: Word },
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +192,23 @@ pub struct Param {
     pub name: String,
     pub op: Option<ParamOp>,
     pub quoted: bool,
+    /// `${name[...]}`: which element(s) of an indexed array. `None` is the
+    /// plain parameter, which for an array is its element 0, as in bash.
+    pub index: Option<Subscript>,
+}
+
+/// The subscript of a `${name[...]}`.
+#[derive(Clone, Debug)]
+pub enum Subscript {
+    /// `[@]` or `[*]`: every element, in index order. `star` is `[*]`, which
+    /// joins quoted where `[@]` keeps a field per element, as `$*` and `$@` do.
+    All { star: bool },
+    /// `${!name[@]}` / `${!name[*]}`: the indices that are set, in order.
+    Keys { star: bool },
+    /// `[expr]`: one element. The expression is arithmetic, like a slice
+    /// operand, and a negative value counts back from one past the highest
+    /// index that is set.
+    At(Word),
 }
 
 #[derive(Clone, Debug)]
@@ -212,7 +273,192 @@ pub struct Redir {
 #[derive(Clone, Debug)]
 pub struct Assign {
     pub name: String,
+    /// `name[expr]=value`: the element's subscript, an arithmetic word.
+    pub index: Option<Word>,
+    /// `name+=value`: append to the value (or, for `name+=(…)`, after the
+    /// highest element) rather than replace it.
+    pub append: bool,
+    /// The value word. A compound assignment's is exactly one `Seg::Array`.
     pub value: Word,
+}
+
+impl Assign {
+    /// The elements of a compound assignment, `name=(…)`.
+    pub fn elements(&self) -> Option<&[Elem]> {
+        match self.value.0.as_slice() {
+            [Seg::Array(elems)] => Some(elems),
+            _ => None,
+        }
+    }
+}
+
+/// Where the parts of an assignment word lie, found without allocating so the
+/// lexer can ask it of every word it scans. The NAME and the operator must be
+/// unquoted literal text, as ash's `isassignment` requires of `name=`; a
+/// subscript may hold anything, including quotes and expansions, up to the
+/// `]` that closes it at bracket depth zero in literal text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssignShape<'a> {
+    pub name: &'a str,
+    /// The subscript's closing `]`: its segment, and its byte offset in that
+    /// segment's literal text. The subscript starts just past the `[` that
+    /// follows the name in segment 0.
+    pub index_end: Option<(usize, usize)>,
+    pub append: bool,
+    /// Where the value starts: a segment, and a byte offset into it when that
+    /// segment is the literal holding the `=`.
+    pub value_seg: usize,
+    pub value_byte: usize,
+}
+
+/// `name=`, `name+=`, `name[sub]=` and `name[sub]+=` at the start of a word's
+/// segments. A slice rather than a `Word` so the lexer can ask it of a word it
+/// has not finished building.
+pub fn assignment_shape(segs: &[Seg]) -> Option<AssignShape<'_>> {
+    let Some(Seg::Lit(first)) = segs.first() else {
+        return None;
+    };
+    let end = first
+        .bytes()
+        .position(|b| !(b == b'_' || b.is_ascii_alphanumeric()))
+        .unwrap_or(first.len());
+    let name = first.get(..end)?;
+    if !is_name(name) {
+        return None;
+    }
+    let operator = |seg: usize, text: &str, at: usize| -> Option<(bool, usize, usize)> {
+        let rest = text.get(at..)?;
+        if rest.starts_with('=') {
+            Some((false, seg, at + 1))
+        } else if rest.starts_with("+=") {
+            Some((true, seg, at + 2))
+        } else {
+            None
+        }
+    };
+    if first.as_bytes().get(end) != Some(&b'[') {
+        let (append, value_seg, value_byte) = operator(0, first, end)?;
+        return Some(AssignShape {
+            name,
+            index_end: None,
+            append,
+            value_seg,
+            value_byte,
+        });
+    }
+    let (seg_no, at) = close_subscript(segs, end)?;
+    let Some(Seg::Lit(text)) = segs.get(seg_no) else {
+        return None;
+    };
+    let (append, value_seg, value_byte) = operator(seg_no, text, at + 1)?;
+    Some(AssignShape {
+        name,
+        index_end: Some((seg_no, at)),
+        append,
+        value_seg,
+        value_byte,
+    })
+}
+
+/// The `]` closing the `[` at byte `open` of segment 0, as (segment, byte).
+/// Brackets count only in literal text: a quoted or expanded `]` is part of
+/// what the brackets hold.
+fn close_subscript(segs: &[Seg], open: usize) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    for (seg_no, seg) in segs.iter().enumerate() {
+        let Seg::Lit(text) = seg else {
+            continue;
+        };
+        let start = if seg_no == 0 { open } else { 0 };
+        for (at, b) in text.bytes().enumerate().skip(start) {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((seg_no, at));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Split an owned word at an assignment's boundaries: the subscript runs from
+/// byte `index_from` of segment 0 to `index_end`, and the value from
+/// `value_at` to the end. A literal can hold the end of one part and the start
+/// of the next -- `a[1]=x` is one segment carrying all three -- and any other
+/// segment lies wholly inside one part, so it MOVES there: copying an
+/// expansion segment would be an allocation with no fallible form.
+pub fn split_word(
+    w: Word,
+    index_from: usize,
+    index_end: Option<(usize, usize)>,
+    value_at: (usize, usize),
+) -> Result<(Option<Word>, Word), crate::allocation::Error> {
+    let (value_seg, value_byte) = value_at;
+    let mut index: Vec<Seg> = Vec::new();
+    let mut value: Vec<Seg> = Vec::new();
+    for (n, seg) in w.0.into_iter().enumerate() {
+        match seg {
+            Seg::Lit(text) => {
+                if let Some((end_seg, end_byte)) = index_end {
+                    if n <= end_seg {
+                        let from = if n == 0 { index_from } else { 0 };
+                        let to = if n == end_seg { end_byte } else { text.len() };
+                        push_lit(&mut index, text.get(from..to))?;
+                    }
+                }
+                if n >= value_seg {
+                    let from = if n == value_seg { value_byte } else { 0 };
+                    push_lit(&mut value, text.get(from..))?;
+                }
+            }
+            other => {
+                let into = match index_end {
+                    Some((end_seg, _)) if n < end_seg => &mut index,
+                    _ => &mut value,
+                };
+                crate::allocation::push(into, other)?;
+            }
+        }
+    }
+    Ok((index_end.map(|_| Word(index)), Word(value)))
+}
+
+/// Append the non-empty part of a split literal.
+fn push_lit(out: &mut Vec<Seg>, text: Option<&str>) -> Result<(), crate::allocation::Error> {
+    match text {
+        Some(t) if !t.is_empty() => {
+            let lit = crate::allocation::string(t)?;
+            crate::allocation::push(out, Seg::Lit(lit))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Classify one word of a compound assignment: `[sub]=value`, with the
+/// brackets and the `=` unquoted, or a plain word.
+pub fn element(w: Word) -> Result<Elem, crate::allocation::Error> {
+    let keyed = match w.0.first() {
+        Some(Seg::Lit(first)) if first.starts_with('[') => {
+            close_subscript(&w.0, 0).filter(|&(seg, at)| match w.0.get(seg) {
+                Some(Seg::Lit(text)) => text.as_bytes().get(at + 1) == Some(&b'='),
+                _ => false,
+            })
+        }
+        _ => None,
+    };
+    let Some((seg, at)) = keyed else {
+        return Ok(Elem::Plain(w));
+    };
+    let (index, value) = split_word(w, 1, Some((seg, at)), (seg, at + 2))?;
+    Ok(Elem::Keyed {
+        index: index.unwrap_or_default(),
+        value,
+    })
 }
 
 #[derive(Clone, Debug)]

@@ -31,9 +31,13 @@ td-sh-authored seed cases
 -------------------------
   smoke.test.sh
   expansion.test.sh
+  arrays.test.sh
 
-  Hand-written in the same Oils format; the original RED-baseline seed corpus.
-  Retained as additional, always-green coverage.
+  Hand-written in the same Oils format. The first two are the original
+  RED-baseline seed corpus. arrays.test.sh covers bash's indexed arrays, which
+  ash does not have: its goldens are bash 5.2's measured answers, with an
+  `OK bash` block wherever td-sh deliberately answers otherwise. Retained as
+  additional, always-green coverage.
 
 Overlay
 -------

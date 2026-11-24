@@ -1749,7 +1749,7 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
 pub fn capture_stdout(sh: &mut Shell, code: &str, line: u32, backtick: bool) -> R<String> {
     let list = match crate::parser::parse_subst_body(code, &sh.aliases, line, backtick) {
         Ok(l) => l,
-        Err(e) => return Err(sh.fatal(&e.msg, 2)),
+        Err(e) => return Err(sh.fatal(e.text(), 2)),
     };
     // ash makes no child for an empty body: `evalbackcmd` returns at
     // `if (n == NULL)` (ash.c:6608) before it forks. So a substitution that ran
@@ -1922,7 +1922,7 @@ pub fn open_procsub(sh: &mut Shell, code: &str, write: bool, line: u32) -> R<Str
     // refuses a closing word in one (`echo <(fi)` is a syntax error there).
     let list = match crate::parser::parse_subst_body(code, &sh.aliases, line, false) {
         Ok(l) => l,
-        Err(e) => return Err(sh.fatal(&e.msg, 2)),
+        Err(e) => return Err(sh.fatal(e.text(), 2)),
     };
     // ash makes neither pipe nor child for an empty body: `evalbackcmd` leaves
     // `result->fd` at -1 and the word becomes the path of a descriptor that

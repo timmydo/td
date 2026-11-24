@@ -767,6 +767,7 @@ impl Units {
         // list word), but a blank-terminated replacement still reaches this far.
         self.check_alias(Chk::None)?;
         match self.peek() {
+            Some(Tok::Word(w)) if has_array(w) => Err(array_out_of_place()),
             Some(Tok::Word(w)) => {
                 let w = w.clone();
                 self.bump();
@@ -1116,6 +1117,7 @@ impl Units {
     /// failing at end of input.
     fn cond_operand(&mut self) -> Syn<Word> {
         match self.peek() {
+            Some(Tok::Word(w)) if has_array(w) => Err(array_out_of_place()),
             Some(Tok::Word(w)) if w.plain() != Some("]]") => {
                 let w = w.clone();
                 self.bump();
@@ -1151,7 +1153,7 @@ impl Units {
         let Some(Tok::Word(w)) = self.peek() else {
             return false;
         };
-        if as_assignment(w).is_some() {
+        if is_ash_assignment(w) || has_array(w) {
             return false;
         }
         matches!(self.tok_at(self.pos + 1), Some(Tok::Op(Op::LParen)))
@@ -1219,7 +1221,7 @@ impl Units {
         // readily -- see `FuncDef::name`. The assignment test is asked of the
         // WORD, since `a="$x"` is that shape too.
         let taken = match self.peek() {
-            Some(Tok::Word(w)) => Some((w.plain().map(str::to_string), as_assignment(w).is_some())),
+            Some(Tok::Word(w)) => Some((w.plain().map(str::to_string), is_ash_assignment(w))),
             _ => None,
         };
         let Some((name, assignment)) = taken else {
@@ -1430,12 +1432,24 @@ impl Units {
                     let w = w.clone();
                     // Only a leading run of `name=value` words are assignments;
                     // after the command word they are ordinary arguments.
-                    if words.is_empty() {
-                        if let Some(a) = as_assignment(&w) {
-                            assigns.push(a);
-                            self.bump();
-                            continue;
+                    let w = if words.is_empty() {
+                        match as_assignment(w)? {
+                            Ok(a) => {
+                                assigns.push(a);
+                                self.bump();
+                                continue;
+                            }
+                            Err(w) => w,
                         }
+                    } else {
+                        w
+                    };
+                    // An array literal as an ARGUMENT is a compound value only
+                    // for the declaration builtins, as in bash; the lexer's
+                    // reading of position is cruder than this, so this is
+                    // where anything else is refused.
+                    if has_array(&w) && !declares(&words) {
+                        return Err(array_out_of_place());
                     }
                     words.push(w);
                     self.bump();
@@ -1448,6 +1462,16 @@ impl Units {
             // wrong -- `f ()` on its own line still has its body coming -- and
             // `unexpected` reads that off the token it names.
             return Err(self.unexpected(None));
+        }
+        // An array cannot be a command's environment. bash refuses `a[1]=x cmd`
+        // at run time and quietly drops `a=(…) cmd`; td-sh refuses both as it
+        // reads them, so a script finds out before anything has run.
+        if !words.is_empty()
+            && assigns
+                .iter()
+                .any(|a| a.index.is_some() || a.elements().is_some())
+        {
+            return Err("syntax error: an array assignment cannot prefix a command".into());
         }
         Ok(Cmd::Simple {
             assigns,
@@ -1523,31 +1547,52 @@ fn reindex(e: usize, a: usize, b: usize, added: usize) -> usize {
     }
 }
 
-/// Recognise `name=value` where `name=` is unquoted literal text.
-fn as_assignment(w: &Word) -> Option<Assign> {
-    let Some(Seg::Lit(s)) = w.0.first() else {
-        return None;
+/// Split an assignment word -- `name=v`, bash's `name+=v`, `name[sub]=v` and
+/// `name[sub]+=v`, with the name and operator unquoted literal text -- into its
+/// parts, or hand the word back when it is not one. By value, so its segments
+/// move into the parts (`ast::split_word`).
+fn as_assignment(w: Word) -> Syn<Result<Assign, Word>> {
+    let Some(shape) = crate::ast::assignment_shape(&w.0) else {
+        return Ok(Err(w));
     };
-    // Locate '=' with `bytes().position` rather than a str search combinator: this
-    // source is embedded into the td-sh recipe as a WriteFile body scanned by the
-    // ladder guard that bars GNU findutils from the tool tier, which rejects that
-    // tool's bare name as a token (see td-sh.rs recipe). '=' is ASCII, so the byte
-    // offset is a valid str boundary for the `get(..eq)`/`get(eq+1..)` splits.
-    let eq = s.bytes().position(|b| b == b'=')?;
-    let name = s.get(..eq)?;
-    if !is_name(name) {
-        return None;
-    }
-    let rest = s.get(eq + 1..)?;
-    let mut segs = Vec::new();
-    if !rest.is_empty() {
-        segs.push(Seg::Lit(rest.to_string()));
-    }
-    segs.extend(w.0.iter().skip(1).cloned());
-    Some(Assign {
-        name: name.to_string(),
-        value: Word(segs),
-    })
+    let oom = |_| SynErr::out_of_memory();
+    let name = crate::allocation::string(shape.name).map_err(oom)?;
+    let index_from = shape.name.len() + 1;
+    let (index_end, append) = (shape.index_end, shape.append);
+    let value_at = (shape.value_seg, shape.value_byte);
+    let (index, value) = crate::ast::split_word(w, index_from, index_end, value_at).map_err(oom)?;
+    Ok(Ok(Assign {
+        name,
+        index,
+        append,
+        value,
+    }))
+}
+
+/// ash's own `name=` shape, which has neither bash's subscript nor its `+=`:
+/// what decides, as it does in ash, that a word is no function's name.
+fn is_ash_assignment(w: &Word) -> bool {
+    crate::ast::assignment_shape(&w.0).is_some_and(|s| s.index_end.is_none() && !s.append)
+}
+
+/// Whether a word carries an array literal, `name=(…)`.
+fn has_array(w: &Word) -> bool {
+    w.0.iter().any(|s| matches!(s, Seg::Array(_)))
+}
+
+/// Whether a simple command's words so far make its operands those of a
+/// declaration builtin, whose `name=(…)` operands are compound values.
+fn declares(words: &[Word]) -> bool {
+    matches!(
+        words.first().and_then(Word::plain),
+        Some("local" | "export" | "readonly")
+    )
+}
+
+/// An array literal where no assignment can stand. Spelled as bash and the
+/// lexer's other refusals spell the `(` it would otherwise have been.
+fn array_out_of_place() -> SynErr {
+    SynErr::from("syntax error: unexpected \"(\"")
 }
 
 #[cfg(test)]
@@ -1568,6 +1613,70 @@ mod tests {
             .next()
             .map(|s| s.cmd)
             .ok_or_else(|| SynErr::from(format!("{src}: pipeline has no command")))
+    }
+
+    /// bash's assignment forms split into name, subscript, operator and value,
+    /// with expansion segments moved to whichever part holds them.
+    #[test]
+    fn bash_assignment_forms_split_into_their_parts() -> Syn<()> {
+        let Cmd::Simple { assigns, words, .. } = one_cmd("a[$i+1]+=\"$x\"y b+=c d[k]=")? else {
+            return Err("not a simple command".into());
+        };
+        assert!(words.is_empty());
+        let shapes: Vec<(&str, Option<usize>, bool, usize)> = assigns
+            .iter()
+            .map(|a| {
+                let index = a.index.as_ref().map(|w| w.0.len());
+                (a.name.as_str(), index, a.append, a.value.0.len())
+            })
+            .collect();
+        // `$i+1` is a Param then the literal `+1`, the empty rest of `a[`
+        // dropped; `"$x"y` is a Param then `y`; `d[k]=` has no value at all.
+        assert_eq!(
+            shapes,
+            [
+                ("a", Some(2), true, 2),
+                ("b", None, true, 1),
+                ("d", Some(1), false, 0)
+            ]
+        );
+        Ok(())
+    }
+
+    /// Splitting an assignment word and classifying a literal's elements grow
+    /// only through td-alloc, so a refused reservation is the parser's
+    /// out-of-memory error, and the same source parses once it is covered.
+    #[test]
+    fn an_assignment_split_refuses_cleanly_when_storage_is_refused() {
+        let src = "a[$i]+=x b=([2]=y z \"$q\")";
+        let mut limit = 0;
+        loop {
+            match crate::allocation::with_reservation_limit(limit, || parse(src)) {
+                Ok(_) => break,
+                Err(e) => assert_eq!(e.text(), "out of memory", "allowance {limit}"),
+            }
+            limit += 1;
+            assert!(limit < 64, "never parsed");
+        }
+        assert!(limit > 0, "the split reserved nothing");
+    }
+
+    /// An array literal is a value only for an assignment or a declaration
+    /// builtin's operand; as an argument, and as a command's environment, it
+    /// is refused as the script is read.
+    #[test]
+    fn an_array_literal_out_of_place_is_a_parse_error() {
+        for ok in ["a=(1)", "local a=(1)", "readonly r=(1) s=(2)"] {
+            assert!(one_cmd(ok).is_ok(), "{ok:?} refused");
+        }
+        for bad in [
+            "a=(1) true",
+            "a[1]=x true",
+            "a=(1) export b",
+            "a+=(1) () { :; }",
+        ] {
+            assert!(one_cmd(bad).is_err(), "{bad:?} accepted");
+        }
     }
 
     fn wrong(src: &str, got: &Cmd) -> SynErr {

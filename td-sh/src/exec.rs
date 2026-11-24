@@ -74,6 +74,13 @@ pub struct Var {
     /// `poplocalvars`), so `local RANDOM` suspends the generator for the call
     /// and returns it afterwards.
     pub dynamic: Option<Dyn>,
+    /// bash's indexed array: the elements at index 1 and up, sorted by index.
+    /// Element 0 is `value` itself, so every scalar reading of the name --
+    /// `$a`, a plain assignment, `${#a}` -- is bash's reading of element 0
+    /// without a case of its own. `Some` is what makes the name an array,
+    /// even with no elements (`a=()`, `local -a a`). An array never reaches a
+    /// child's environment, as bash never exports one.
+    pub array: Option<Vec<(usize, String)>>,
 }
 
 /// The two names whose value is COMPUTED at each read.
@@ -455,6 +462,7 @@ impl Shell {
                     readonly: false,
                     localised: false,
                     dynamic: None,
+                    array: None,
                 },
             );
         }
@@ -539,6 +547,7 @@ impl Shell {
                         readonly: false,
                         localised: false,
                         dynamic: Some(Dyn::Random),
+                        array: None,
                     },
                 );
             }
@@ -636,6 +645,7 @@ impl Shell {
                 readonly: false,
                 localised: false,
                 dynamic: Some(Dyn::Random),
+                array: None,
             },
         );
         sh.start_lineno();
@@ -667,6 +677,7 @@ impl Shell {
                 readonly: false,
                 localised: false,
                 dynamic: Some(Dyn::Lineno),
+                array: None,
             },
         );
     }
@@ -778,6 +789,7 @@ impl Shell {
                         readonly: false,
                         localised: false,
                         dynamic: None,
+                        array: None,
                     },
                 );
             }
@@ -797,6 +809,7 @@ impl Shell {
                     readonly: false,
                     localised: false,
                     dynamic: None,
+                    array: None,
                 },
             );
         }
@@ -826,6 +839,7 @@ impl Shell {
                     readonly: true,
                     localised: false,
                     dynamic: None,
+                    array: None,
                 },
             );
         }
@@ -906,6 +920,7 @@ impl Shell {
                         readonly: false,
                         localised: true,
                         dynamic: None,
+                        array: None,
                     },
                 );
             }
@@ -925,6 +940,7 @@ impl Shell {
         let allexport = self.opts.allexport;
         if let Some(v) = self.vars.get_mut(name) {
             v.value = None;
+            v.array = None;
             v.exported |= allexport;
         } else if allexport {
             self.vars.insert(
@@ -935,6 +951,7 @@ impl Shell {
                     readonly: false,
                     localised: false,
                     dynamic: None,
+                    array: None,
                 },
             );
         }
@@ -942,13 +959,178 @@ impl Shell {
         true
     }
 
-    /// The environment a child process inherits: every exported variable.
+    /// The environment a child process inherits: every exported variable that
+    /// is not an array.
     pub fn exported_env(&self) -> Vec<(String, String)> {
         self.vars
             .iter()
-            .filter(|(_, v)| v.exported)
+            .filter(|(_, v)| v.exported && v.array.is_none())
             .filter_map(|(k, v)| Some((k.clone(), v.value.clone()?)))
             .collect()
+    }
+
+    /// Every element of `name` that is set, in index order. A scalar is the
+    /// one-element array bash takes it for, and an unset name has none.
+    pub fn elements<'a>(&'a self, name: &str) -> impl Iterator<Item = (usize, &'a str)> + 'a {
+        let var = self.vars.get(name);
+        let first = var.and_then(|v| v.value.as_deref()).map(|s| (0, s));
+        let rest = var
+            .and_then(|v| v.array.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .map(|(i, s)| (*i, s.as_str()));
+        first.into_iter().chain(rest)
+    }
+
+    /// One element, if it is set.
+    pub fn element(&self, name: &str, at: usize) -> Option<&str> {
+        let var = self.vars.get(name)?;
+        if at == 0 {
+            return var.value.as_deref();
+        }
+        let rest = var.array.as_deref()?;
+        let pos = rest.binary_search_by_key(&at, |(i, _)| *i).ok()?;
+        rest.get(pos).map(|(_, s)| s.as_str())
+    }
+
+    /// The element a subscript names. A negative one counts back from one past
+    /// the highest index set, as in bash, and names none if it is still
+    /// negative there.
+    pub fn resolve_index(&self, name: &str, at: i64) -> Option<usize> {
+        if at >= 0 {
+            return usize::try_from(at).ok();
+        }
+        let end = i64::try_from(self.next_index(name)).ok()?;
+        usize::try_from(end.checked_add(at)?).ok()
+    }
+
+    /// One past the highest index set: where `name+=(…)` appends.
+    pub fn next_index(&self, name: &str) -> usize {
+        let Some(var) = self.vars.get(name) else {
+            return 0;
+        };
+        match var.array.as_deref().and_then(<[_]>::last) {
+            Some((i, _)) => i.saturating_add(1),
+            None => usize::from(var.value.is_some() || var.dynamic.is_some()),
+        }
+    }
+
+    /// How many elements `name` has set, without visiting them. A dynamic
+    /// name (`RANDOM`, `LINENO`) always has its element 0.
+    pub fn element_count(&self, name: &str) -> usize {
+        let Some(var) = self.vars.get(name) else {
+            return 0;
+        };
+        let first = usize::from(var.value.is_some() || var.dynamic.is_some());
+        first + var.array.as_deref().map_or(0, <[_]>::len)
+    }
+
+    /// Whether `name` is an indexed array.
+    pub fn is_array(&self, name: &str) -> bool {
+        self.vars.get(name).is_some_and(|v| v.array.is_some())
+    }
+
+    /// `set_var`'s readonly refusal, for the element writes.
+    fn writable(&self, name: &str) -> R<()> {
+        if self.readonly_refuses(name) {
+            return Err(self.readonly_fatal(name));
+        }
+        Ok(())
+    }
+
+    /// The entry for `name`, made an array: created if absent, and keeping a
+    /// scalar's value as its element 0. Every write ORs in `set -a`'s export,
+    /// as `set_var` does, though an array never reaches the environment.
+    fn array_entry(&mut self, name: &str) -> R<&mut Var> {
+        let allexport = self.opts.allexport;
+        if !self.vars.contains_key(name) {
+            let key = crate::allocation::string(name).map_err(oom)?;
+            let var = Var {
+                value: None,
+                exported: false,
+                readonly: false,
+                localised: false,
+                dynamic: None,
+                array: None,
+            };
+            crate::allocation::insert(&mut self.vars, key, var).map_err(oom)?;
+        }
+        let var = self.vars.get_mut(name).ok_or(Sig::Abort(1))?;
+        var.exported |= allexport;
+        if var.array.is_none() {
+            var.array = Some(Vec::new());
+        }
+        Ok(var)
+    }
+
+    /// The name is a plain string from here on: its elements past 0 go.
+    pub fn drop_array(&mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.array = None;
+        }
+    }
+
+    /// `local -a name`: the name is an array from here on.
+    pub fn make_array(&mut self, name: &str) -> R<()> {
+        self.writable(name)?;
+        self.array_entry(name).map(|_| ())
+    }
+
+    /// `name[at]=value`. Element 0 goes through `set_var`, so the hooks a plain
+    /// assignment fires (`OPTIND`, `RANDOM`) fire for it too.
+    pub fn set_element(&mut self, name: &str, at: usize, value: String) -> R<()> {
+        self.writable(name)?;
+        if at == 0 {
+            self.set_var(name, &value)?;
+            return self.array_entry(name).map(|_| ());
+        }
+        let var = self.array_entry(name)?;
+        let rest = var.array.as_mut().ok_or(Sig::Abort(1))?;
+        store_sorted(rest, at, value).map_err(oom)
+    }
+
+    /// `name=(…)`: the elements replaced by `list`, which is sorted by index
+    /// with no index twice.
+    pub fn set_elements(&mut self, name: &str, list: Vec<(usize, String)>) -> R<()> {
+        self.writable(name)?;
+        let mut rest: Vec<(usize, String)> =
+            crate::allocation::with_capacity(list.len()).map_err(oom)?;
+        let mut first = None;
+        for (at, value) in list {
+            if at == 0 {
+                first = Some(value);
+            } else {
+                crate::allocation::push(&mut rest, (at, value)).map_err(oom)?;
+            }
+        }
+        match first {
+            Some(value) => self.set_var(name, &value)?,
+            None => {
+                if let Some(var) = self.vars.get_mut(name) {
+                    var.value = None;
+                }
+            }
+        }
+        self.array_entry(name)?.array = Some(rest);
+        Ok(())
+    }
+
+    /// `unset 'name[at]'`. False for a readonly name, as `unset_var` answers.
+    pub fn unset_element(&mut self, name: &str, at: usize) -> bool {
+        if self.readonly_refuses(name) {
+            return false;
+        }
+        let Some(var) = self.vars.get_mut(name) else {
+            return true;
+        };
+        if at == 0 {
+            var.value = None;
+        } else if let Some(rest) = var.array.as_mut() {
+            if let Ok(pos) = rest.binary_search_by_key(&at, |(i, _)| *i) {
+                rest.remove(pos);
+            }
+        }
+        true
     }
 
     /// Resolve a path against the shell's logical cwd.
@@ -1051,7 +1233,7 @@ pub fn run_source(sh: &mut Shell, src: &str) -> R<()> {
                 // point a parse failed, so the line the shell is otherwise
                 // holding belongs to some earlier command.
                 sh.set_lineno(units.error_line());
-                let _ = diag(sh, &e.msg);
+                let _ = diag(sh, e.text());
                 sh.set_status(2);
                 // Abandons the enclosing list, as `eval 'if'; echo` shows in both
                 // references: reporting and returning Ok ran the rest of it.
@@ -1710,7 +1892,7 @@ fn trace(sh: &mut Shell, parts: &[String], errout: Option<Option<&process::Fd>>)
     let expanded = (|| {
         // `fatal` here is only a way to get the diagnostic onto stderr: the `Sig` it
         // builds is dropped with the rest of the error below, so the status is inert.
-        let word = crate::lexer::word_from_str(&ps4).map_err(|e| sh.fatal(&e.msg, 2))?;
+        let word = crate::lexer::word_from_str(&ps4).map_err(|e| sh.fatal(e.text(), 2))?;
         expand::expand_single(sh, &word)
     })();
     sh.in_ps4 = false;
@@ -1732,6 +1914,193 @@ fn trace(sh: &mut Shell, parts: &[String], errout: Option<Option<&process::Fd>>)
     );
 }
 
+/// A reservation failed. Silent and fatal, as the job table's is
+/// (`process::exec_external`): a diagnostic would need the memory that is
+/// missing.
+pub fn oom(_: crate::allocation::Error) -> Sig {
+    Sig::Abort(1)
+}
+
+/// `sh.fatal` over a formatted message, built through the fallible path.
+pub fn fatal_args(sh: &Shell, args: std::fmt::Arguments<'_>, status: i32) -> Sig {
+    match crate::allocation::format(args) {
+        Ok(msg) => sh.fatal(&msg, status),
+        Err(_) => Sig::Abort(status),
+    }
+}
+
+/// Put `value` at index `at` in a list sorted by index, replacing what is
+/// there. A push and a rotation into place, so the growth goes through the
+/// shared admission path rather than an unchecked insert.
+pub fn store_sorted(
+    list: &mut Vec<(usize, String)>,
+    at: usize,
+    value: String,
+) -> Result<(), crate::allocation::Error> {
+    match list.binary_search_by_key(&at, |(i, _)| *i) {
+        Ok(pos) => {
+            if let Some(slot) = list.get_mut(pos) {
+                slot.1 = value;
+            }
+        }
+        Err(pos) => {
+            crate::allocation::push(list, (at, value))?;
+            if let Some(tail) = list.get_mut(pos..) {
+                tail.rotate_right(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `old` with `more` after it: bash's `+=` on a string.
+fn appended(old: Option<&str>, more: &str) -> R<String> {
+    let mut out = crate::allocation::string(old.unwrap_or_default()).map_err(oom)?;
+    crate::allocation::push_str(&mut out, more).map_err(oom)?;
+    Ok(out)
+}
+
+/// The element an assignment's subscript names. Arithmetic, after the word is
+/// expanded, as in bash; an empty subscript, or a negative one reaching before
+/// element 0, is bash's `bad array subscript`.
+fn element_index(sh: &mut Shell, name: &str, index: &Word) -> R<usize> {
+    let text = expand::expand_single(sh, index)?;
+    let at = match text.trim().is_empty() {
+        true => None,
+        false => {
+            let at = arith::eval(sh, &text)?;
+            sh.resolve_index(name, at)
+        }
+    };
+    at.ok_or_else(|| fatal_args(sh, format_args!("{name}[{text}]: bad array subscript"), 1))
+}
+
+/// Store a compound assignment's expanded elements. Each is `(Some(i), v)`
+/// for a `[i]=v` element and `(None, v)` for a plain one, which takes the
+/// index after the one before it. `name=(…)` starts from an empty array and
+/// index 0; `name+=(…)` keeps the elements and starts past the highest.
+pub fn store_compound(
+    sh: &mut Shell,
+    name: &str,
+    append: bool,
+    items: Vec<(Option<i64>, String)>,
+) -> R<()> {
+    let mut next = if append { sh.next_index(name) } else { 0 };
+    if append {
+        sh.make_array(name)?;
+    }
+    let mut list: Vec<(usize, String)> = Vec::new();
+    for (at, value) in items {
+        let at = match at {
+            Some(i) => usize::try_from(i)
+                .map_err(|_| fatal_args(sh, format_args!("{name}[{i}]: bad array subscript"), 1))?,
+            None => next,
+        };
+        next = at.saturating_add(1);
+        if append {
+            sh.set_element(name, at, value)?;
+        } else {
+            store_sorted(&mut list, at, value).map_err(oom)?;
+        }
+    }
+    if append {
+        return Ok(());
+    }
+    sh.set_elements(name, list)
+}
+
+/// What xtrace shows for a compound assignment: the words it stored.
+fn show_compound(name: &str, append: bool, items: &[(Option<i64>, String)]) -> R<String> {
+    let op = if append { "+=(" } else { "=(" };
+    let mut out = crate::allocation::string(name).map_err(oom)?;
+    crate::allocation::push_str(&mut out, op).map_err(oom)?;
+    for (n, (at, value)) in items.iter().enumerate() {
+        if n > 0 {
+            crate::allocation::push_str(&mut out, " ").map_err(oom)?;
+        }
+        if let Some(i) = at {
+            let key =
+                crate::allocation::format(format_args!("[{i}]=")).map_err(|_| Sig::Abort(1))?;
+            crate::allocation::push_str(&mut out, &key).map_err(oom)?;
+        }
+        crate::allocation::push_str(&mut out, value).map_err(oom)?;
+    }
+    crate::allocation::push_str(&mut out, ")").map_err(oom)?;
+    Ok(out)
+}
+
+/// Perform one assignment word in this shell, for good: `name=v`, and bash's
+/// `name+=v`, `name[i]=v`, `name[i]+=v`, `name=(…)` and `name+=(…)`. Returns
+/// what xtrace shows for it.
+pub fn assign(sh: &mut Shell, a: &crate::ast::Assign) -> R<String> {
+    if let Some(elems) = a.elements() {
+        let items = expand::expand_compound(sh, elems)?;
+        let shown = show_compound(&a.name, a.append, &items)?;
+        store_compound(sh, &a.name, a.append, items)?;
+        return Ok(shown);
+    }
+    let value = expand::expand_assign(sh, &a.value)?;
+    let op = if a.append { "+=" } else { "=" };
+    if let Some(index) = &a.index {
+        let at = element_index(sh, &a.name, index)?;
+        let shown = crate::allocation::format(format_args!("{}[{at}]{op}{value}", a.name))
+            .map_err(|_| Sig::Abort(1))?;
+        let value = match a.append {
+            true => appended(sh.element(&a.name, at), &value)?,
+            false => value,
+        };
+        sh.set_element(&a.name, at, value)?;
+        return Ok(shown);
+    }
+    let shown = crate::allocation::format(format_args!("{}{op}{value}", a.name))
+        .map_err(|_| Sig::Abort(1))?;
+    let value = match a.append {
+        true => appended(expand::var_value(sh, &a.name).as_deref(), &value)?,
+        false => value,
+    };
+    sh.set_var(&a.name, &value)?;
+    Ok(shown)
+}
+
+/// The value a prefix assignment binds for the one command it precedes. Only
+/// a string can be bound that way: bash refuses `a[1]=x cmd` and keeps
+/// nothing of `a=(…) cmd`, and td-sh refuses both rather than half-follow.
+pub fn transient_value(sh: &mut Shell, a: &crate::ast::Assign) -> R<String> {
+    if a.index.is_some() || a.elements().is_some() {
+        let name = &a.name;
+        return Err(fatal_args(
+            sh,
+            format_args!("{name}: an array cannot be assigned for one command"),
+            1,
+        ));
+    }
+    let value = expand::expand_assign(sh, &a.value)?;
+    match a.append {
+        true => appended(expand::var_value(sh, &a.name).as_deref(), &value),
+        false => Ok(value),
+    }
+}
+
+/// Bind a prefix assignment's string for one command, exported as that
+/// command's environment. The binding is the string alone: a name that held
+/// an array is a plain variable for the command, so it reaches the child and
+/// `"${a[@]}"` inside a function is that one string, as in bash. The caller
+/// saved the old binding, which its restore puts back whole.
+fn bind_scalar(sh: &mut Shell, name: &str, value: &str) -> R<()> {
+    sh.set_var(name, value)?;
+    sh.drop_array(name);
+    sh.export(name);
+    Ok(())
+}
+
+/// Store a declaration builtin's compound operands.
+fn store_decls(sh: &mut Shell, list: Vec<expand::Compound>) -> R<()> {
+    for c in list {
+        store_compound(sh, &c.name, c.append, c.items)?;
+    }
+    Ok(())
+}
+
 fn run_simple(
     sh: &mut Shell,
     assigns: &[crate::ast::Assign],
@@ -1739,7 +2108,7 @@ fn run_simple(
     redirs: &[Redir],
 ) -> R<()> {
     let cmdsubst_before = sh.cmdsubst_count;
-    let argv = expand::expand_command_words(sh, words)?;
+    let (argv, decl) = expand::expand_command_words(sh, words)?;
     // No command name — either none was given (`a=1 b=2`) or every word field-split
     // away (`x=new $empty`). POSIX: the assignments affect the CURRENT shell,
     // redirections are performed then dropped (`>file` truncates), and the exit
@@ -1757,9 +2126,8 @@ fn run_simple(
             // already expanded, and does it AFTER applying them.
             let mut traced = Vec::with_capacity(assigns.len());
             for a in assigns {
-                let value = expand::expand_assign(sh, &a.value)?;
-                sh.set_var(&a.name, &value)?;
-                traced.push(format!("{}={}", a.name, value));
+                let shown = assign(sh, a)?;
+                traced.push(shown);
             }
             // Through the stderr this command redirected AWAY from: `x=1 2>/dev/null`
             // still traces, because dash traces to `preverrout` and not to fd 2.
@@ -1791,7 +2159,17 @@ fn run_simple(
         sh.localvar_depth = sh.localvar_depth.saturating_add(1);
     }
     trace(sh, &argv, None);
-    let result = dispatch_simple(sh, &argv, assigns, redirs);
+    // A declaration builtin's `name=(…)` operands were expanded above and reach
+    // it as bare names. `export` and `readonly` then mark a name that already
+    // holds the array -- `readonly` would refuse the write after -- while
+    // `local` has to declare the name first, so the array lands in its binding.
+    let (before, after) = match decl.after_builtin {
+        true => (Vec::new(), decl.compounds),
+        false => (decl.compounds, Vec::new()),
+    };
+    let result = store_decls(sh, before)
+        .and_then(|()| dispatch_simple(sh, &argv, assigns, redirs))
+        .and_then(|()| store_decls(sh, after));
     // Same rule as the frame's bindings: a terminating unwind leaves it standing so
     // an EXIT trap can still declare a `local`, and the recovery that drains those
     // bindings puts the depth back along with them. Pushed after the callee's own
@@ -1844,10 +2222,9 @@ fn dispatch_simple(
             // still reaches the rollback below.
             let r = (|| {
                 for a in assigns {
-                    let value = expand::expand_assign(sh, &a.value)?;
+                    let value = transient_value(sh, a)?;
                     saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
-                    sh.set_var(&a.name, &value)?;
-                    sh.export(&a.name);
+                    bind_scalar(sh, &a.name, &value)?;
                 }
                 process::exec_external(sh, argv, None, None)
             })();
@@ -1887,12 +2264,22 @@ fn run_builtin(
         };
         let result = (|| {
             for a in assigns {
-                let value = expand::expand_assign(sh, &a.value)?;
-                sh.set_var(&a.name, &value)?;
                 // `exec`'s prefix bindings go to the replacement process, so they
-                // are exported as well as set (dash's listsetvar VEXPORT).
+                // are exported as well as set (dash's listsetvar VEXPORT) -- and
+                // so, like any command's environment, can only be strings.
+                // Every other special builtin's persist as plain assignments,
+                // and so do a bare `exec`'s, which replaces nothing: there the
+                // string is element 0, as `a=5 :` makes it.
                 if matches!(bi, builtin::Builtin::Exec) {
-                    sh.export(&a.name);
+                    let value = transient_value(sh, a)?;
+                    if argv.len() > 1 {
+                        bind_scalar(sh, &a.name, &value)?;
+                    } else {
+                        sh.set_var(&a.name, &value)?;
+                        sh.export(&a.name);
+                    }
+                } else {
+                    assign(sh, a)?;
                 }
             }
             builtin::run(sh, bi, argv)
@@ -1947,14 +2334,13 @@ fn run_builtin(
             // survived.
             let r = (|| {
                 for a in assigns {
-                    let value = expand::expand_assign(sh, &a.value)?;
-                    if transient {
-                        saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+                    if !transient {
+                        assign(sh, a)?;
+                        continue;
                     }
-                    sh.set_var(&a.name, &value)?;
-                    if transient {
-                        sh.export(&a.name);
-                    }
+                    let value = transient_value(sh, a)?;
+                    saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+                    bind_scalar(sh, &a.name, &value)?;
                 }
                 Ok(())
             })()
@@ -2053,6 +2439,7 @@ fn undo_binding(sh: &mut Shell, entry: Local) {
                         readonly: false,
                         localised: false,
                         dynamic: None,
+                        array: None,
                     },
                 );
             } else {
@@ -2155,11 +2542,10 @@ fn call_function(
     let saved_floor = std::mem::replace(&mut sh.pending_floor, sh.pending_unwind.len());
     let applied = (|| -> R<()> {
         for a in assigns {
-            let value = expand::expand_assign(sh, &a.value)?;
+            let value = transient_value(sh, a)?;
             sh.locals
                 .push(Local::Var(a.name.clone(), sh.vars.get(&a.name).cloned()));
-            sh.set_var(&a.name, &value)?;
-            sh.export(&a.name);
+            bind_scalar(sh, &a.name, &value)?;
         }
         Ok(())
     })();
@@ -2531,12 +2917,16 @@ mod tests {
         ] {
             assert_eq!(run(src).0, 2, "{src:?}");
         }
-        // The assignment test is `as_assignment`, so the boundary is what ash's
-        // `isassignment` calls one: these are NOT assignments and so are names.
-        for name in ["1=b", "a-b=c", ".=b", "=b", "a+=b"] {
+        // The assignment test is ash's `isassignment`, so these are NOT
+        // assignments and so are names.
+        for name in ["1=b", "a-b=c", ".=b", "=b"] {
             let src = format!("{name}() {{ echo B; }}; {name}");
             assert_eq!(run(&src), (0, "B\n".to_string(), String::new()), "{src:?}");
         }
+        // `a+=b` is still a NAME to that test, so it defines -- but as a command
+        // word it is bash's append, which a quoted spelling still calls past.
+        let src = "a+=b() { echo B; }; a+=b; echo \"[$a]\"; 'a+=b'";
+        assert_eq!(run(src), (0, "[b]\nB\n".to_string(), String::new()));
         // Quoted or expanded: ash files these under the word's own text, which
         // no later word can spell, and that is what a `None` name means here.
         // The lookup then misses, and this harness has no PATH, so it is 127.
@@ -2690,6 +3080,47 @@ mod tests {
         assert_eq!(out, "hello world\n");
         let (status, _, _) = run("exit 7");
         assert_eq!(status, 7);
+    }
+
+    /// An array store grows only through td-alloc: under each smaller allowance
+    /// it is refused with the silent `Abort(1)` and nothing else, and once the
+    /// allowance covers it the store lands whole.
+    #[test]
+    fn an_array_store_refuses_cleanly_when_storage_is_refused() {
+        let items = || {
+            vec![
+                (None, "x".to_string()),
+                (Some(5), "y".to_string()),
+                (None, "z".to_string()),
+            ]
+        };
+        let mut limit = 0;
+        let stored = loop {
+            let mut sh = super::Shell::new_for_test();
+            let r = crate::allocation::with_reservation_limit(limit, || {
+                super::store_compound(&mut sh, "a", false, items())?;
+                super::store_compound(&mut sh, "a", true, vec![(None, "w".to_string())])?;
+                sh.set_element("b", 3, "e".to_string())
+            });
+            match r {
+                Ok(()) => break sh,
+                Err(sig) => assert!(matches!(sig, super::Sig::Abort(1)), "allowance {limit}"),
+            }
+            limit += 1;
+            assert!(limit < 64, "never stored");
+        };
+        assert!(limit > 0, "the store reserved nothing");
+        let a: Vec<(usize, &str)> = stored.elements("a").collect();
+        assert_eq!(a, [(0, "x"), (5, "y"), (6, "z"), (7, "w")]);
+        assert_eq!(stored.element("b", 3), Some("e"));
+    }
+
+    /// A bare `exec` replaces nothing, so its prefix persists as `a=5 :`'s
+    /// does, into element 0; with a command the string alone is the child's.
+    #[test]
+    fn a_bare_exec_prefix_writes_element_zero() {
+        let src = "a=(1 2 3); a=8 exec 3</dev/null; echo \"${a[@]}\"; a=5 :; echo \"${a[@]}\"";
+        assert_eq!(run(src), (0, "8 2 3\n5 2 3\n".to_string(), String::new()));
     }
 
     #[test]
@@ -4721,7 +5152,7 @@ mod tests {
     #[test]
     fn a_substitution_this_shell_cannot_serve_fails_when_it_is_expanded() {
         for body in [
-            "${}", "${%}", "${!r}", "${ x}", "${1a}", "${a[@]}", "${PS1@P}", "${x^}",
+            "${}", "${%}", "${!r}", "${ x}", "${1a}", "${a[}", "${PS1@P}", "${x^}",
         ] {
             for guard in [
                 "false && echo \"BODY\"; echo AFTER",

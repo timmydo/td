@@ -3701,7 +3701,7 @@ td-sh/src/complete.rs	allocation-macro	2
 td-sh/src/complete.rs	unchecked-growth-or-clone	18
 td-sh/src/exec.rs	allocating-constructor	3
 td-sh/src/exec.rs	allocating-conversion	25
-td-sh/src/exec.rs	allocation-macro	9
+td-sh/src/exec.rs	allocation-macro	8
 td-sh/src/exec.rs	unchecked-growth-or-clone	42
 td-sh/src/expand.rs	allocating-constructor	1
 td-sh/src/expand.rs	allocating-conversion	21
@@ -3729,10 +3729,10 @@ td-sh/src/line.rs	unchecked-growth-or-clone	48
 td-sh/src/main.rs	allocating-conversion	9
 td-sh/src/main.rs	allocation-macro	6
 td-sh/src/main.rs	unchecked-growth-or-clone	10
-td-sh/src/parser.rs	allocating-conversion	17
+td-sh/src/parser.rs	allocating-conversion	15
 td-sh/src/parser.rs	allocation-macro	17
 td-sh/src/parser.rs	heap-owner	6
-td-sh/src/parser.rs	unchecked-growth-or-clone	26
+td-sh/src/parser.rs	unchecked-growth-or-clone	24
 td-sh/src/pattern.rs	allocating-constructor	2
 td-sh/src/pattern.rs	allocating-conversion	8
 td-sh/src/pattern.rs	unchecked-growth-or-clone	20

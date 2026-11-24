@@ -7,7 +7,7 @@
 //! here: whether `in` is a keyword or an argument depends on grammar position,
 //! which only the parser knows.
 
-use crate::ast::{is_name, Param, ParamOp, Seg, Syn, SynErr, Word};
+use crate::ast::{is_name, Elem, Param, ParamOp, Seg, Subscript, Syn, SynErr, Word};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -213,6 +213,15 @@ fn is_word_end(c: char) -> bool {
         c,
         ' ' | '\t' | '\n' | '|' | '&' | ';' | '<' | '>' | '(' | ')'
     )
+}
+
+/// `syntax error: unexpected "c"`, the parser's spelling for a token it did
+/// not want, for the characters an array literal refuses.
+fn unexpected_char(c: char) -> SynErr {
+    match crate::allocation::format(format_args!("syntax error: unexpected \"{c}\"")) {
+        Ok(msg) => SynErr::from(msg),
+        Err(_) => SynErr::out_of_memory(),
+    }
 }
 
 /// Where a `case` has got to. A `)` that ends a PATTERN closes nothing, and
@@ -741,6 +750,7 @@ impl Scan {
                 regex_next: false,
                 cond_continues: false,
                 cmd_position: true,
+                assign: AssignPos::START,
                 regex_word: false,
                 in_braces: false,
             },
@@ -910,6 +920,12 @@ fn word_from_str_at(text: &str, depth: u32, line: u32) -> Syn<Word> {
     lx.scan_word(false)
 }
 
+/// An array subscript written as runtime text, `unset 'a[$i]'`'s: an ordinary
+/// word, so its quotes come off and its expansions expand.
+pub fn subscript_word(text: &str) -> Syn<Word> {
+    word_from_str_at(text, 0, 1)
+}
+
 /// Scan a whole runtime string as if it were the body of a `"..."` -- dash's
 /// `expandstr`, which parses `$PS4` with DQSYNTAX and expands it EXP_QUOTED.
 /// There is no enclosing quote to close, so a `'` or `"` in the value is an
@@ -975,9 +991,51 @@ fn lexer_over(text: &str, depth: u32, line: u32) -> Syn<Lexer> {
         regex_next: false,
         cond_continues: false,
         cmd_position: true,
+        assign: AssignPos::START,
         regex_word: false,
         in_braces: false,
     })
+}
+
+/// Where bash would read `name=(…)` as a compound assignment, which is the
+/// only place td-sh does: in a command's assignment prefix, and among the
+/// operands of `local`, `export` and `readonly`. Anywhere else `(` stays the
+/// operator it is in a POSIX shell, so `echo a=(1)` remains the syntax error
+/// it is in bash and in ash. Like `cmd_position` this is a crude positional
+/// reading -- the parser still refuses an array literal it finds anywhere but
+/// an assignment -- and it is kept here because only the lexer can stop the
+/// `(` from becoming an operator.
+#[derive(Clone, Copy)]
+struct AssignPos {
+    /// The next word may be an assignment: a command is starting, or each of
+    /// its words so far has been an assignment or a redirection's target.
+    open: bool,
+    /// The command word was one of the declaration builtins whose operands
+    /// take a compound value.
+    decl: bool,
+    /// The next word is a redirection's target, which is neither an
+    /// assignment nor the command word.
+    target: bool,
+    /// The last token was a `(` with another `(` glued to it. `((` is bash's
+    /// arithmetic command, where `x=(` groups, so it opens no assignment.
+    dparen: bool,
+}
+
+impl AssignPos {
+    const START: AssignPos = AssignPos {
+        open: true,
+        decl: false,
+        target: false,
+        dparen: false,
+    };
+
+    /// Inside an array literal: its elements are plain words.
+    const NONE: AssignPos = AssignPos {
+        open: false,
+        decl: false,
+        target: false,
+        dparen: false,
+    };
 }
 
 struct Lexer {
@@ -1029,6 +1087,9 @@ struct Lexer {
     /// that `[[` is counted where it can be the conditional and not where it
     /// is an argument. `echo [[ =~ a|cat` is the case that needs it.
     cmd_position: bool,
+    /// Where `name=(` is a compound assignment rather than a word followed by
+    /// a `(` operator. See `AssignPos`.
+    assign: AssignPos,
     /// Set for exactly the one `scan_word` call that reads a `=~` right-hand
     /// side. bash needs a mode here too, and the corpus says so in as many
     /// words (`regex.test.sh`: "different lexer mode required").
@@ -1094,6 +1155,7 @@ impl Lexer {
                     self.end_cond_command();
                 }
                 self.cmd_position = true;
+                self.assign = AssignPos::START;
                 return Ok(Tok::Newline);
             }
             self.skip_blanks();
@@ -1152,6 +1214,7 @@ impl Lexer {
                 // A redirection is followed by its target, which is not a
                 // command; everything else here separates or groups commands.
                 self.cmd_position = !op.is_redirect();
+                self.track_assign_op(op);
                 return Ok(Tok::Op(op));
             }
             let word = self.scan_word(true)?;
@@ -1167,6 +1230,7 @@ impl Lexer {
                     body: String::new(),
                     body_line: 0,
                 });
+                self.assign.target = false;
                 return Ok(Tok::Word(word));
             }
             // `2>file`: digits glued to a redirection operator name the fd.
@@ -1188,6 +1252,7 @@ impl Lexer {
                 }
             }
             self.track_cond(&word);
+            self.track_assign_word(&word);
             return Ok(Tok::Word(word));
         }
     }
@@ -1222,6 +1287,176 @@ impl Lexer {
             word.plain(),
             Some("if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "!")
         );
+    }
+
+    /// `AssignPos` across an operator. A redirection leaves the position as
+    /// it was, its target aside; anything else starts a command, except the
+    /// second `(` of a glued `((`.
+    fn track_assign_op(&mut self, op: Op) {
+        if op.is_redirect() {
+            self.assign.target = true;
+            self.assign.dparen = false;
+            return;
+        }
+        let lparen = op == Op::LParen;
+        self.assign = AssignPos {
+            open: !(lparen && self.assign.dparen),
+            decl: false,
+            target: false,
+            dparen: lparen && self.sc.peek() == Some('('),
+        };
+    }
+
+    /// `AssignPos` across a word. Called after `track_cond`, whose
+    /// `cmd_position` says whether a reserved word has just opened a command.
+    fn track_assign_word(&mut self, word: &Word) {
+        self.assign.dparen = false;
+        if self.assign.target {
+            self.assign.target = false;
+            return;
+        }
+        if self.assign.open && crate::ast::assignment_shape(&word.0).is_some() {
+            return;
+        }
+        if self.assign.open {
+            self.assign.decl = matches!(word.plain(), Some("local" | "export" | "readonly"));
+        }
+        self.assign.open = self.cmd_position;
+        if self.cmd_position {
+            self.assign.decl = false;
+        }
+    }
+
+    /// Whether a blank under the cursor lies inside an assignment's subscript,
+    /// as in `a[i + 1]=x`, which bash reads as one word: the word so far is
+    /// `name[` with that bracket still open, where an assignment may stand,
+    /// and the rest of the line closes it with `]=` or `]+=`. The lookahead is
+    /// what keeps a command such as `x[ y` from swallowing its arguments.
+    fn in_open_subscript(&self, segs: &[Seg]) -> bool {
+        if self.regex_word || self.in_braces || self.cond_depth > 0 || self.assign.target {
+            return false;
+        }
+        if !self.assign.open {
+            return false;
+        }
+        let Some(Seg::Lit(first)) = segs.first() else {
+            return false;
+        };
+        let name_end = first
+            .bytes()
+            .position(|b| !(b == b'_' || b.is_ascii_alphanumeric()))
+            .unwrap_or(first.len());
+        if !is_name(first.get(..name_end).unwrap_or_default())
+            || first.as_bytes().get(name_end) != Some(&b'[')
+        {
+            return false;
+        }
+        let mut depth = 0usize;
+        for (n, seg) in segs.iter().enumerate() {
+            let Seg::Lit(text) = seg else {
+                continue;
+            };
+            let start = if n == 0 { name_end } else { 0 };
+            for b in text.bytes().skip(start) {
+                match b {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut off = 0usize;
+        while let Some(c) = self.sc.peek_at(off) {
+            match c {
+                '\n' | ';' | '&' | '|' => return false,
+                '[' => depth += 1,
+                ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return match self.sc.peek_at(off + 1) {
+                            Some('=') => true,
+                            Some('+') => self.sc.peek_at(off + 2) == Some('='),
+                            _ => false,
+                        };
+                    }
+                }
+                _ => {}
+            }
+            off += 1;
+        }
+        false
+    }
+
+    /// Whether the word scanned so far is exactly `name=` or `name+=` in a
+    /// place a compound assignment may stand, so a `(` under the cursor opens
+    /// its elements rather than ending the word.
+    fn at_compound(&self, segs: &[Seg]) -> bool {
+        if self.regex_word || self.in_braces || self.cond_depth > 0 || self.assign.target {
+            return false;
+        }
+        if !(self.assign.open || self.assign.decl) {
+            return false;
+        }
+        let Some(shape) = crate::ast::assignment_shape(segs) else {
+            return false;
+        };
+        let whole = match segs {
+            [Seg::Lit(text)] => shape.value_byte == text.len(),
+            _ => false,
+        };
+        whole && shape.index_end.is_none() && shape.value_seg == 0
+    }
+
+    /// The elements of `name=(…)`, with the `(` under the cursor. Blanks,
+    /// newlines and comments separate them, as in bash; any operator but the
+    /// closing `)` is a syntax error, as it is there.
+    fn scan_array(&mut self) -> Syn<Vec<Elem>> {
+        self.sc.bump();
+        let saved = self.assign;
+        self.assign = AssignPos::NONE;
+        let elems = self.scan_array_elements();
+        self.assign = saved;
+        elems
+    }
+
+    fn scan_array_elements(&mut self) -> Syn<Vec<Elem>> {
+        let mut elems: Vec<Elem> = Vec::new();
+        loop {
+            self.skip_blanks();
+            match self.sc.peek() {
+                None => return Err(SynErr::incomplete("syntax error: unexpected end of file")),
+                Some('\n') => {
+                    self.sc.bump();
+                }
+                Some('#') => {
+                    while let Some(c) = self.sc.peek() {
+                        if c == '\n' {
+                            break;
+                        }
+                        self.sc.bump();
+                    }
+                }
+                Some(')') => {
+                    self.sc.bump();
+                    return Ok(elems);
+                }
+                // `<(` and `>(` open a word here as they do anywhere else.
+                Some(c) if is_word_end(c) && self.at_procsub().is_none() => {
+                    return Err(unexpected_char(c))
+                }
+                Some(_) => {
+                    let word = self.scan_word(true)?;
+                    let elem = crate::ast::element(word).map_err(|_| SynErr::out_of_memory())?;
+                    crate::allocation::push(&mut elems, elem)
+                        .map_err(|_| SynErr::out_of_memory())?;
+                }
+            }
+        }
     }
 
     /// Forget any open bracket, because the command it would have belonged to
@@ -1517,6 +1752,24 @@ impl Lexer {
                 let code = self.scan_paren_body()?;
                 buf.push_seg(Seg::ProcSub { code, write, line });
                 continue;
+            }
+            if matches!(c, ' ' | '\t') && stop_at_delims && self.in_open_subscript(&buf.segs) {
+                self.sc.bump();
+                buf.push_lit(c);
+                continue;
+            }
+            if c == '(' && stop_at_delims && self.at_compound(&buf.segs) {
+                let elems = self.scan_array()?;
+                crate::allocation::push(&mut buf.segs, Seg::Array(elems))
+                    .map_err(|_| SynErr::out_of_memory())?;
+                // The literal is the whole value: bash reads nothing glued
+                // after its `)` as part of the assignment.
+                match self.sc.peek() {
+                    Some(next) if !is_word_end(next) => return Err(unexpected_char(next)),
+                    _ => {}
+                }
+                ran_out = false;
+                break;
             }
             if stop_at_delims && is_word_end(c) {
                 ran_out = false;
@@ -1820,6 +2073,7 @@ impl Lexer {
                     name: c.to_string(),
                     op: None,
                     quoted: in_dq,
+                    index: None,
                 })));
             }
             c if c.is_ascii_digit() => {
@@ -1828,6 +2082,7 @@ impl Lexer {
                     name: c.to_string(),
                     op: None,
                     quoted: in_dq,
+                    index: None,
                 })));
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
@@ -1847,6 +2102,7 @@ impl Lexer {
                     name,
                     op: None,
                     quoted: in_dq,
+                    index: None,
                 })));
             }
             _ => push_dollar(buf),
@@ -2202,6 +2458,7 @@ impl Lexer {
             regex_next: false,
             cond_continues: false,
             cmd_position: true,
+            assign: AssignPos::START,
             regex_word: false,
             in_braces: false,
         }
@@ -2299,6 +2556,7 @@ fn heredoc_body_word(body: &str, line: u32) -> Syn<Word> {
         regex_next: false,
         cond_continues: false,
         cmd_position: true,
+        assign: AssignPos::START,
         regex_word: false,
         in_braces: false,
     };
@@ -2360,12 +2618,21 @@ fn parse_braced(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Seg> {
                 name: rest,
                 op: Some(ParamOp::Length),
                 quoted,
+                index: None,
             })));
         }
     }
-    let mut i = 0usize;
+    // `${#name[sub]}` (a length) and `${!name[@]}` (the indices): a leading `#`
+    // or `!` that an ARRAY reference follows to the end of the body. Anything
+    // else takes the readings above and below, which is how `${#}`, `${#x}`
+    // and `${!}` are read.
+    let lead = match chars.first() {
+        Some(&c @ ('#' | '!')) if names_an_element(chars.get(1..).unwrap_or_default()) => Some(c),
+        _ => None,
+    };
+    let mut i = usize::from(lead.is_some());
     let mut name = String::new();
-    match chars.first() {
+    match chars.get(i) {
         Some(c) if c.is_ascii_digit() => {
             while let Some(&c) = chars.get(i) {
                 if !c.is_ascii_digit() {
@@ -2377,7 +2644,7 @@ fn parse_braced(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Seg> {
         }
         Some(&c) if is_special_param(c) => {
             name.push(c);
-            i = 1;
+            i += 1;
         }
         Some(&c) if c.is_ascii_alphabetic() || c == '_' => {
             while let Some(&c) = chars.get(i) {
@@ -2390,11 +2657,40 @@ fn parse_braced(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Seg> {
         }
         _ => return Ok(Seg::BadSub(format!("${{{inner}}}"))),
     }
+    // `name[sub]`. Only a NAME takes one: `${1[0]}` and `${@[0]}` keep `[` as
+    // an operator character, which is the bad substitution they are in bash.
+    let mut index = None;
+    if chars.get(i) == Some(&'[') && is_name(&name) {
+        // Byte offsets: everything before the `[` is ASCII, so `i` is one too.
+        let Some(close) = closing_bracket(inner, i) else {
+            return bad_sub(inner);
+        };
+        let sub = inner.get(i + 1..close).unwrap_or_default();
+        let all = match sub {
+            "@" => Some(false),
+            "*" => Some(true),
+            _ => None,
+        };
+        index = match (lead, all) {
+            (Some('!'), Some(star)) => Some(Subscript::Keys { star }),
+            (Some('!'), None) => return bad_sub(inner),
+            (_, Some(star)) => Some(Subscript::All { star }),
+            _ if sub.trim().is_empty() => return bad_sub(inner),
+            // An ordinary word, so its quotes come off before the arithmetic
+            // sees it, as they do from an assignment's subscript.
+            _ => Some(Subscript::At(word_from_str_at(sub, depth + 1, line)?)),
+        };
+        i += 2 + sub.chars().count();
+    }
     if i >= chars.len() {
         return Ok(Seg::Param(Box::new(Param {
             name,
-            op: None,
+            op: match lead {
+                Some('#') => Some(ParamOp::Length),
+                _ => None,
+            },
             quoted,
+            index,
         })));
     }
     let colon = chars.get(i) == Some(&':');
@@ -2425,6 +2721,7 @@ fn parse_braced(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Seg> {
                 },
             }),
             quoted,
+            index,
         })));
     }
     let doubled = chars.get(i) == Some(&opc) && matches!(opc, '%' | '#' | '/');
@@ -2450,6 +2747,7 @@ fn parse_braced(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Seg> {
                 all: doubled,
             }),
             quoted,
+            index,
         })));
     }
     // Decided BEFORE the operand is lexed. The rest of a body ash never reads
@@ -2486,7 +2784,63 @@ fn parse_braced(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Seg> {
         name,
         op: Some(op),
         quoted,
+        index,
     })))
+}
+
+/// Whether `chars` is exactly `name[sub]`: a name, then a subscript whose `]`
+/// is the last character. What follows a `${#` or `${!` must be this whole for
+/// it to be an array's length or indices.
+fn names_an_element(chars: &[char]) -> bool {
+    let name_end = chars
+        .iter()
+        .position(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
+        .unwrap_or(chars.len());
+    match (chars.first(), chars.get(name_end)) {
+        (Some(c), Some('[')) if c.is_ascii_alphabetic() || *c == '_' => {}
+        _ => return false,
+    }
+    let mut depth = 0usize;
+    for (at, c) in chars.iter().enumerate().skip(name_end) {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at + 1 == chars.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The byte offset of the `]` closing the `[` at byte `open`, nesting counted.
+/// Brackets are ASCII, so a byte scan cannot land inside a multibyte char.
+fn closing_bracket(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, b) in text.bytes().enumerate().skip(open) {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A `${...}` body that is not served, deferred to expansion as `BadSub`.
+fn bad_sub(inner: &str) -> Syn<Seg> {
+    match crate::allocation::format(format_args!("${{{inner}}}")) {
+        Ok(text) => Ok(Seg::BadSub(text)),
+        Err(_) => Err(SynErr::out_of_memory()),
+    }
 }
 
 /// Split a slice operand into offset and optional length at the colon between
@@ -2654,6 +3008,154 @@ mod tests {
                 _ => None,
             })
             .collect())
+    }
+
+    /// How many array literals a source lexes to, or the error it raises.
+    fn arrays(src: &str) -> Syn<usize> {
+        Ok(words(src)?
+            .iter()
+            .filter(|w| w.0.iter().any(|s| matches!(s, Seg::Array(_))))
+            .count())
+    }
+
+    /// A blank inside an assignment's subscript is part of the word, as in
+    /// bash, but only where an assignment may stand and the line closes the
+    /// subscript with `]=` or `]+=`. Anywhere else a blank still ends a word.
+    #[test]
+    fn a_blank_in_an_assignment_subscript_stays_in_the_word() -> Syn<()> {
+        for (src, n) in [
+            ("a[1 + 1]=x", 1),
+            ("a[ i ]+=x y", 2),
+            ("x=1 a[\t$i ]=v cmd", 3),
+            ("a[b[1 ]]=x", 1),
+            ("x[ y", 2),
+            ("x[ y ]", 3),
+            ("a[ 1 ]; =x", 4),
+            ("echo a[1 + 1]=x", 4),
+            ("> a[1 + 1]=x", 3),
+            ("[[ a[1 + 1]=x ]]", 5),
+        ] {
+            assert_eq!(words(src)?.len(), n, "{src:?}");
+        }
+        Ok(())
+    }
+
+    /// `name=(` is a compound assignment exactly where bash assigns: in a
+    /// command's prefix, after a reserved word that opens a command, past a
+    /// redirection, and among the operands of the three declaration builtins.
+    /// Anywhere else the `(` is an operator, as POSIX and ash have it.
+    #[test]
+    fn an_array_literal_is_read_only_where_bash_assigns() -> Syn<()> {
+        for src in [
+            "a=(1 2)",
+            "a+=(1)",
+            "x=1 a=(1) b=(2)",
+            "if a=(1); then b=(2); fi",
+            ">f a=(1)",
+            "local a=(1) b=(2)",
+            "export -n e=(1)",
+            "f() { a=(1); }",
+            "a=(1\n# c\n2)",
+            "a=(<(echo 1) >(cat))",
+        ] {
+            assert!(arrays(src)? > 0, "{src:?} read no literal");
+        }
+        // Each of these reaches the `(` as an operator: a parse error, or a
+        // subshell.
+        for src in [
+            "echo a=(1)",
+            "a= (1)",
+            "for x in a=(1)",
+            "((a=(1)))",
+            "typeset a=(1)",
+        ] {
+            assert_eq!(arrays(src).unwrap_or(0), 0, "{src:?} read a literal");
+        }
+        Ok(())
+    }
+
+    /// Each element is classified as the lexer reads it, while it still owns the
+    /// word: `[sub]=value` splits, and anything else is a plain word.
+    #[test]
+    fn a_keyed_element_is_split_where_it_is_read() -> Syn<()> {
+        let all = words("a=([2]=x y [$i]=\"$v\" [k] '[q]=no')")?;
+        let Some([Seg::Lit(_), Seg::Array(elems)]) = all.first().map(|w| w.0.as_slice()) else {
+            return Err("no literal".into());
+        };
+        let shapes: Vec<&str> = elems
+            .iter()
+            .map(|e| match e {
+                Elem::Keyed { .. } => "keyed",
+                Elem::Plain(_) => "plain",
+            })
+            .collect();
+        assert_eq!(shapes, ["keyed", "plain", "keyed", "plain", "plain"]);
+        Ok(())
+    }
+
+    /// The literal's storage grows through td-alloc, so a refused reservation
+    /// is the lexer's out-of-memory error and never a partial literal, and the
+    /// same source lexes once the allowance covers it.
+    #[test]
+    fn an_array_literal_refuses_cleanly_when_storage_is_refused() {
+        let mut limit = 0;
+        loop {
+            let lexed = crate::allocation::with_reservation_limit(limit, || words("a=(x y z)"));
+            match lexed {
+                Ok(_) => break,
+                Err(e) => assert_eq!(e.text(), "out of memory", "allowance {limit}"),
+            }
+            limit += 1;
+            assert!(limit < 64, "never lexed");
+        }
+        assert!(limit > 0, "the literal reserved nothing");
+        assert!(arrays("a=(x y z)").is_ok_and(|n| n == 1));
+    }
+
+    /// `${name[sub]}` and its length and key forms parse to a subscripted
+    /// parameter; the forms bash calls bad substitutions stay `BadSub`.
+    #[test]
+    fn a_subscript_parses_inside_braces() -> Syn<()> {
+        let param = |src: &str| -> Syn<Option<(Option<Subscript>, bool)>> {
+            Ok(match words(src)?.first().and_then(|w| w.0.first()) {
+                Some(Seg::Param(p)) => {
+                    Some((p.index.clone(), matches!(p.op, Some(ParamOp::Length))))
+                }
+                _ => None,
+            })
+        };
+        assert!(matches!(
+            param("${a[@]}")?,
+            Some((Some(Subscript::All { star: false }), false))
+        ));
+        assert!(matches!(
+            param("${a[*]}")?,
+            Some((Some(Subscript::All { star: true }), false))
+        ));
+        assert!(matches!(
+            param("${#a[@]}")?,
+            Some((Some(Subscript::All { .. }), true))
+        ));
+        assert!(matches!(
+            param("${#a[i+1]}")?,
+            Some((Some(Subscript::At(_)), true))
+        ));
+        assert!(matches!(
+            param("${!a[@]}")?,
+            Some((Some(Subscript::Keys { star: false }), false))
+        ));
+        assert!(matches!(
+            param("${a[b[1]]:-x}")?,
+            Some((Some(Subscript::At(_)), false))
+        ));
+        // Without a subscript, `${#x}` is a length and `${!}` the parameter `!`.
+        assert!(matches!(param("${#x}")?, Some((None, true))));
+        assert!(matches!(param("${!}")?, Some((None, false))));
+        for bad in ["${a[}", "${a[]}", "${!a[1]}", "${1[0]}"] {
+            let seg = words(bad)?.first().and_then(|w| w.0.first().cloned());
+            assert!(matches!(seg, Some(Seg::BadSub(_))), "{bad:?} parsed");
+        }
+        Ok(())
     }
 
     /// The colon between a slice's offset and its length is the one at the TOP
