@@ -654,6 +654,23 @@ impl<'d> StyledDocument<'d> {
     pub fn first_box(&self) -> Option<BoxId> {
         self.first
     }
+    /// Whether `geometry` was laid for a float (DESIGN.md §5, "Floats"):
+    /// never the root's, nor any on a page without floats.
+    pub fn is_float(&self, geometry: &crate::block::BoxGeometry) -> bool {
+        if !self.floats {
+            return false;
+        }
+        let root = self.first.and_then(|id| self.box_node(id)).map(|b| b.node);
+        let kind = if geometry.replaced {
+            BoxKind::Image
+        } else {
+            BoxKind::Block
+        };
+        root != Some(geometry.node)
+            && self
+                .style(geometry.style)
+                .is_some_and(|style| float_side(style, kind).is_some())
+    }
     pub fn style(&self, id: StyleId) -> Option<&ComputedStyle> {
         self.styles.get(id)
     }

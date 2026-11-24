@@ -235,6 +235,48 @@ mod cases {
         assert_eq!(laid.lines()[1], (20.0, 20.0, "after".into()));
     }
 
+    /// A block-level picture does not overlap a float beside it (CSS 2.2
+    /// §9.5): it is placed in the room the float leaves, else below it.
+    #[test]
+    fn a_block_picture_beside_a_float_takes_its_room() {
+        let css = "#f{float:left;width:30px;height:40px}#i{display:block}";
+        let laid = Laid::new("<div id=f></div><img id=i width=12 height=8>", css, 100.0);
+        assert_eq!(rect(laid.border("i")), (30.0, 0.0, 12.0, 8.0));
+        let laid = Laid::new("<div id=f></div><img id=i width=80 height=8>", css, 100.0);
+        assert_eq!(rect(laid.border("i")), (0.0, 40.0, 80.0, 8.0));
+        // Its percentages are its container's, not the room's.
+        let css = "#f{float:left;width:30px;height:40px}#i{display:block;max-width:100%}";
+        let laid = Laid::new("<div id=f></div><img id=i width=90 height=9>", css, 100.0);
+        assert_eq!(rect(laid.border("i")), (0.0, 40.0, 90.0, 9.0));
+        let css = "#f{float:left;width:30px;height:40px}#i{display:block;width:50%;height:8px}";
+        let laid = Laid::new("<div id=f></div><img id=i>", css, 100.0);
+        assert_eq!(rect(laid.border("i")), (30.0, 0.0, 50.0, 8.0));
+        // Auto margins share the room beside the float, not the
+        // container's; a percentage margin is the container's.
+        for (float, margin, x) in [
+            ("right", "0 auto", 5.0),
+            ("right", "0 0 0 auto", 10.0),
+            ("left", "0 auto", 35.0),
+            ("left", "0 0 0 10%", 40.0),
+        ] {
+            let css = format!(
+                "#f{{float:{float};width:30px;height:40px}}\
+                 #i{{display:block;width:60px;height:8px;margin:{margin}}}"
+            );
+            let laid = Laid::new("<div id=f></div><img id=i>", &css, 100.0);
+            assert_eq!(
+                rect(laid.border("i")),
+                (x, 0.0, 60.0, 8.0),
+                "{float} {margin}"
+            );
+        }
+        // One whose percentage margin does not fit goes below.
+        let css = "#f{float:left;width:30px;height:40px}\
+                   #i{display:block;width:62px;height:8px;margin-left:10%}";
+        let laid = Laid::new("<div id=f></div><img id=i>", css, 100.0);
+        assert_eq!(rect(laid.border("i")), (10.0, 40.0, 62.0, 8.0));
+    }
+
     /// A formatting context's root beside a float takes the room it leaves.
     #[test]
     fn a_context_root_beside_a_float_takes_its_room() {

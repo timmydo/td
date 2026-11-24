@@ -816,8 +816,12 @@ room's and its percentages resolved against it, where its margin box
 fits, else it moves down to the nearest float bottom until it fits or
 none is beside it. Its height is unknown when it is placed, so a float
 lower than its top that started beside its lower part (one that went
-down to fit) may overlap it. A table beside floats is laid where it is,
-overlapping them.
+down to fit) may overlap it. A block-level picture is placed so too
+(CSS 2.2 §9.5), opening no context and keeping the size its container
+gives it, its percentage margins the container's: beside the floats if
+its margin box fits, its auto margins sharing the room they leave,
+else below. A table beside floats is laid
+where it is, overlapping them.
 
 **Measured widths.** In an inline sequence measured for a table cell
 or a float's width, a float is no wrap opportunity, as it is none when
@@ -871,10 +875,10 @@ lines, in 37 ms (786,454 work, 108.5 MiB); 2 MiB of zero-width floats
 side by side, some 44,000, is refused `Limit("MAX_LAYOUT_WORK")` in
 109 ms.
 
-**Painting.** Geometry stays in postorder. A painter in tree order
-paints a float's box before the in-flow blocks after it, whose
-backgrounds then cover it; CSS paints floats above the in-flow blocks
-of their context (td-web's painter, td-web/DESIGN.md §10, "Painting").
+**Painting.** Geometry stays in postorder. `StyledDocument::is_float`
+says whether a box's geometry was laid for a float, by the rule above,
+so a painter can paint floats after the in-flow blocks of their
+context, as CSS does (td-web/DESIGN.md §10, "Painting").
 
 ### Tables
 
@@ -1006,7 +1010,8 @@ one after any row is laid below it, in tree order, whatever its
 as on §17.4's table wrapper box, and a caption's own margins add.
 
 **Output and lines.** Geometry is in postorder, as every box's: each
-cell, then its row, then its group, then the table. Lines are in tree
+cell, then its row, then its group, then the table; a caption after
+rows is laid after them all, so its geometry follows theirs. Lines are in tree
 order: row by row, and within a row, cell by cell left to right, each
 cell's lines top to bottom. Line order is therefore not y order inside
 a table: within a row a middle-aligned cell's first line can lie below

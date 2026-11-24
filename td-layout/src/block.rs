@@ -763,8 +763,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 || !matches!(keyword(style, Property::OverflowY), "visible" | "clip")))
     }
     /// A block met in a context with floats: below those it clears, and
-    /// a context's root (not a table) beside those at its top; its x and
-    /// dimensions.
+    /// a context's root (not a table) or a picture beside those at its
+    /// top; its x and dimensions.
     #[cold]
     #[inline(never)]
     fn among_floats(
@@ -780,8 +780,12 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         if let Some(below) = self.floats.clearance(clear) {
             *y = y.max(below);
         }
-        if role != Some(TableRole::Table) && self.floats.any() && self.opens_context(b)? {
-            return self.beside_floats(b, place, y);
+        // A context's root, or a block-level picture (CSS 2.2 §9.5).
+        if role != Some(TableRole::Table)
+            && self.floats.any()
+            && (b.kind == BoxKind::Image || self.opens_context(b)?)
+        {
+            return self.beside_floats(b, dims, place, y);
         }
         Ok((place.container.x, dims))
     }
@@ -794,16 +798,23 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     fn beside_floats(
         &mut self,
         b: &BoxNode,
+        sized: Dimensions,
         place: &Place,
         y: &mut f64,
     ) -> Result<(f64, Dimensions), Error> {
+        // A picture keeps the size its container gives it.
+        let picture = b.kind == BoxKind::Image;
         let sides = (place.container.x, place.container.x + place.container.width);
         loop {
             let band = self
                 .floats
                 .band(sides, *y, 0.0, View::Lines, &mut self.counters)?;
             let room = band.room();
-            let dims = self.block_dimensions(b, room, place.definite)?;
+            let dims = if picture {
+                sized
+            } else {
+                self.block_dimensions(b, room, place.definite)?
+            };
             // Its margins as computed: sizing gives an over-constrained
             // box's excess to its right margin.
             let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
@@ -815,14 +826,37 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     Property::MarginBottom,
                     Property::MarginLeft,
                 ],
-                room,
+                // A picture's percentages are its container's.
+                if picture { place.container.width } else { room },
                 false,
             );
             let outer = dims.width + dims.decoration().horizontal() + margin.horizontal();
             let fits = units(outer) <= units(room);
             match band.below {
                 Some(below) if !fits => *y = below,
+                Some(_) if picture => {
+                    // Its margins resolved again in the room, auto ones
+                    // sharing what it leaves, as sizing shares the
+                    // container's.
+                    let free = (room - outer).max(0.0);
+                    let basis = Some(place.container.width);
+                    let auto_left = length(style, Property::MarginLeft, basis).is_none();
+                    let auto_right = length(style, Property::MarginRight, basis).is_none();
+                    let mut dims = dims;
+                    dims.margin.left = match (auto_left, auto_right) {
+                        (true, true) => free / 2.0,
+                        (true, false) => free,
+                        (false, _) => margin.left,
+                    };
+                    dims.margin.right = match (auto_left, auto_right) {
+                        (true, true) => free / 2.0,
+                        (false, true) => free,
+                        (_, false) => margin.right + if auto_left { 0.0 } else { free },
+                    };
+                    return Ok((band.left, dims));
+                }
                 Some(_) => return Ok((band.left, dims)),
+                None if picture => return Ok((place.container.x, sized)),
                 None => {
                     let dims = self.block_dimensions(b, place.container.width, place.definite)?;
                     return Ok((place.container.x, dims));

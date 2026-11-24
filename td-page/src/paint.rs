@@ -579,8 +579,9 @@ fn hidden(style: &ComputedStyle) -> bool {
 const DEEPEST: usize = td_layout::MAX_DEPTH + 2;
 
 /// Values worked out down one path from the root, each entry the parent
-/// of the next, kept through a paint: asked in tree order, a paint steps
-/// through each ancestor once, not once an item. Keys follow tree order,
+/// of the next, kept through a paint: asked in tree order (a few passes
+/// of it where floats paint after the rest), a paint steps through each
+/// ancestor about once, not once an item. Keys follow tree order,
 /// an ancestor's below its descendants'.
 struct Chain<V> {
     held: [(u64, V); DEEPEST],
@@ -656,7 +657,7 @@ impl<V: Copy> Chain<V> {
 }
 
 /// A geometry's key in tree order: its node's rank, then, of one node's,
-/// the outermost first, as `Laid::painted` orders them.
+/// the outermost first, as `Laid::painted` orders them within a pass.
 fn geometry_key(laid: &Laid, at: u32) -> u64 {
     let rank = laid
         .geometry(at)
@@ -1298,7 +1299,7 @@ pub fn paint(
     let scale = frame.scale.max(1) as f64;
     let top = (damage.y - frame.y) as f64 / scale;
     let bottom = (damage.y + i64::from(damage.height) - frame.y) as f64 / scale;
-    // Boxes in tree order.
+    // Boxes in tree order, floats and what lies in them after the rest.
     // Only what meets the damage is visited: what a chunk holds beside it
     // is passed by as work.
     let painted = laid.painted();

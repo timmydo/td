@@ -297,7 +297,8 @@ pub struct Laid {
     pub want: Want,
     /// Spans of the lines' ink, `CHUNK` lines each.
     line_spans: BudgetVec<Span>,
-    /// Geometry in tree order, a parent before its children.
+    /// Geometry in tree order, a parent before its children, with floats
+    /// after the boxes of their context (`floats_last`).
     painted: BudgetVec<u32>,
     box_spans: BudgetVec<Span>,
     marker_spans: BudgetVec<Span>,
@@ -318,6 +319,44 @@ pub struct Laid {
     /// The node indices of pictures whose copy was refused, for room or
     /// for `FIT_WORK`, in order: each keeps its placeholder.
     short: BudgetVec<usize>,
+}
+
+/// `painted`, in tree order with `parents` worked out over it, ordered
+/// by how many floats each box lies in, the box's own counted, then by
+/// tree order: floats after the in-flow boxes of their context, and a
+/// float within a float after its float's (CSS 2.2 appendix E). A parent
+/// stays before its children, as it lies in no more floats than they.
+fn floats_last(
+    layout: &Layout,
+    styled: &StyledDocument<'static>,
+    tree: &Tree,
+    parents: &[u32],
+    painted: &mut [u32],
+    memory: &Budget,
+) -> Result<(), BudgetError> {
+    let mut depth = BudgetVec::filled(memory, layout.boxes.len(), 0u32)?;
+    for &at in painted.iter() {
+        let Some(geometry) = layout.boxes.get(at as usize) else {
+            continue;
+        };
+        let parent = parents
+            .get(at as usize)
+            .and_then(|&up| depth.get(up as usize))
+            .copied()
+            .unwrap_or(0);
+        if let Some(slot) = depth.get_mut(at as usize) {
+            *slot = parent.saturating_add(u32::from(styled.is_float(geometry)));
+        }
+    }
+    painted.sort_unstable_by_key(|&at| {
+        let rank = layout
+            .boxes
+            .get(at as usize)
+            .map_or(NONE, |g: &BoxGeometry| tree.rank(g.node));
+        let depth = depth.get(at as usize).copied().unwrap_or(0);
+        (depth, rank, u32::MAX - at)
+    });
+    Ok(())
 }
 
 /// An inline picture fitted to the box a layout lays it in: its node's
@@ -680,6 +719,16 @@ impl Laid {
             || cancel.load(Ordering::SeqCst),
             memory,
         )?;
+        if styled.styled().has_floats() {
+            floats_last(
+                &layout,
+                styled.styled(),
+                tree,
+                &parents,
+                &mut painted,
+                memory,
+            )?;
+        }
         let box_spans = chunks(painted.as_slice(), memory, |&at| {
             let g = layout.boxes.get(at as usize)?;
             let (top, bottom) = (g.border.y, g.border.y + g.border.height);
@@ -860,7 +909,8 @@ impl Laid {
         &self.box_spans
     }
 
-    /// Geometry indexes in tree order.
+    /// Geometry indexes in paint order: tree order, floats after the
+    /// boxes of their context.
     pub fn painted(&self) -> &[u32] {
         &self.painted
     }
@@ -989,6 +1039,74 @@ pub(crate) mod tests {
 
     pub(crate) fn laid(markup: &str) -> Laid {
         laid_for(markup, Source::Markup, WANT)
+    }
+
+    /// A float's box, and those in it, paint after the in-flow boxes
+    /// of the page, whose backgrounds would otherwise cover it; the rest
+    /// keep tree order, an ancestor before its descendants.
+    #[test]
+    fn floats_paint_after_the_boxes_in_flow() {
+        let page = laid(
+            "<body style=margin:0><div id=f style=float:left;width:40px;height:40px>\
+             <p id=in style=margin:0>x</p><div id=g style=float:left>y</div></div>\
+             <div id=a style=background:blue>text</div>",
+        );
+        let at = |id: &str| {
+            let node = page.tree().target(id).unwrap();
+            let geometry = page
+                .layout
+                .boxes
+                .iter()
+                .position(|g| g.node == node)
+                .unwrap() as u32;
+            page.painted().iter().position(|&p| p == geometry).unwrap()
+        };
+        assert!(at("a") < at("f"));
+        assert!(at("f") < at("in") && at("in") < at("g"));
+        // A float within a float after its float's in-flow boxes.
+        let page = laid(
+            "<body style=margin:0><div id=f style=float:left;width:200px>\
+             <div id=g style=float:left;width:50px;height:50px>y</div>\
+             <p id=in style=margin:0;background:blue>text text</p></div>",
+        );
+        let at = |id: &str| {
+            let node = page.tree().target(id).unwrap();
+            let geometry = page
+                .layout
+                .boxes
+                .iter()
+                .position(|g| g.node == node)
+                .unwrap() as u32;
+            page.painted().iter().position(|&p| p == geometry).unwrap()
+        };
+        assert!(at("f") < at("in") && at("in") < at("g"));
+        // A caption laid after the rows holds a float: the rows are not
+        // in it.
+        let page = laid(
+            "<body><table><tr><td>r1</td></tr><caption>\
+             <div style=float:left>x</div>cap</caption>\
+             <tr><td id=r2>r2</td></tr></table><p id=after>after</p>",
+        );
+        let at = |id: &str| {
+            let node = page.tree().target(id).unwrap();
+            let geometry = page
+                .layout
+                .boxes
+                .iter()
+                .position(|g| g.node == node)
+                .unwrap() as u32;
+            page.painted().iter().position(|&p| p == geometry).unwrap()
+        };
+        assert!(at("r2") < at("after"));
+        let plain = laid("<body><div id=a>a</div><div id=b>b</div>");
+        let node = |id: &str| plain.tree().target(id).unwrap();
+        let order: Vec<_> = plain
+            .painted()
+            .iter()
+            .map(|&p| plain.layout.boxes[p as usize].node)
+            .filter(|&n| n == node("a") || n == node("b"))
+            .collect();
+        assert_eq!(order, [node("a"), node("b")]);
     }
 
     #[test]

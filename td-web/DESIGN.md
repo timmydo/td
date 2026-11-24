@@ -1974,7 +1974,15 @@ order, then every glyph.
    2.2 §14.2), else `PAPER`, over the whole pane.
 2. Each box in tree order: its background colour over its border box,
    then each border side as a fill of its width, every style but `none`
-   and `hidden` drawn solid.
+   and `hidden` drawn solid. On a page with floats, boxes are ordered
+   by how many floats (`StyledDocument::is_float`) each lies in, its
+   own counted, then in tree order, so an in-flow block's background
+   after a float does not cover it, nor a float's in-flow block a float
+   within it (CSS 2.2 appendix E, floats after in-flow blocks'
+   backgrounds); the count is worked out once down the tree order,
+   from each box's nearest ancestor with geometry. Two floats that
+   overlap each other paint by depth then tree order, not each whole
+   in turn.
 3. Each line's content: the backgrounds of a fragment's inline
    ancestors behind its extent, as one fill, since all lie over that
    extent: the innermost opaque one with the translucent ones inside it
@@ -2009,7 +2017,9 @@ marker, drawn in its item's style, is not painted. `opacity` is not
 applied. td-ui's fills are opaque, so a colour with alpha is blended by
 td-web before it is drawn, over the colour of the nearest ancestor
 with an opaque background, else the canvas's, which the paint knows in
-tree order: a translucent tint shows as a tint, not as solid colour; a
+tree order (a float's translucent background so over its ancestor's,
+not over an in-flow block it overlaps): a translucent tint shows as a
+tint, not as solid colour; a
 glyph's ink is blended so over the ground it is drawn on, and a colour
 whose alpha is zero draws nothing. Every draw is clipped to the pane
 and the damage; a box whose `overflow` is `hidden` or `clip` clips its
@@ -2060,8 +2070,9 @@ another, each replaying to its clip, at about 20 ns a step, 20 ms. The
 grounds a paint blends over, the nearest
 opaque background under a box, a line's block or a marker's item, and
 the inline backgrounds behind a fragment, are kept down the path from
-the root to the last asked for, so a paint, asking in tree order,
-steps through each ancestor once rather than once an item, and a box
+the root to the last asked for, so a paint, asking in tree order (a
+pass more for each depth of floats), steps through each ancestor about
+once rather than once an item, and a box
 walks to its ground only for a translucent colour.
 
 Eight panes is room for what a page shows: a pane of text charges
@@ -2139,8 +2150,9 @@ static and relative (td-css computes no other, so `absolute`, `fixed`
 and `sticky` stay in flow); flex, grid and inline-block until
 td-layout has them, laid in normal flow as td-layout specifies, nothing
 hidden by it; floats are td-layout's (td-layout/DESIGN.md §5,
-"Floats"), their boxes painted in tree order, so an in-flow block's
-background after a float covers the float's; table layout beyond
+"Floats"), their boxes painted after the in-flow boxes of their
+context ("Painting") but their lines with the page's, not each float
+painted whole as CSS 2.2 appendix E does; table layout beyond
 td-layout's automatic one (increment 6); pseudo-elements and generated
 content, list markers aside; presentational attributes; web fonts
 (`@font-face` is skipped); background images, border radii, shadows,
