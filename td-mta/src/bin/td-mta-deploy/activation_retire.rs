@@ -241,19 +241,64 @@ pub(super) fn remove(path: &Path, announce: impl FnOnce(&Path) -> R<()>) -> R<()
     sync_dir(parent(path)?)
 }
 
+/// What retirement requires before it reads the host's health, in this
+/// order: the job says the removal is irreversible, no deployment or
+/// database fence is held, and it keeps the live release.
+pub(super) fn preflight(
+    job: &Json,
+    fenced: impl FnOnce() -> R<bool>,
+    keeps_live: impl FnOnce() -> R<bool>,
+) -> R<()> {
+    require(
+        job.get("irreversible").and_then(Json::as_bool) == Some(true),
+        "retiring rollback material cannot be undone: run td-mta/deploy --retire-rollback --irreversible",
+    )?;
+    require(
+        !fenced()?,
+        "unfinished deployment fence: run td-mta/deploy --recover",
+    )?;
+    require(
+        keeps_live()?,
+        "retiring rollback material keeps the live release",
+    )
+}
+
+/// Why the Debian tree stays, if it does: td's server is selected but
+/// not what runs (`in_use`), or no verified switch to it recorded the
+/// window's start (`recorded`). On the Debian server it is in use.
+pub(super) fn tree_kept(
+    td_server: bool,
+    in_use: &R<()>,
+    recorded: bool,
+) -> R<(bool, Option<String>)> {
+    if !td_server {
+        return Ok((false, None));
+    }
+    if let Err(e) = in_use {
+        return Ok((
+            false,
+            Some(fmt(format_args!(
+                "{e}: run td-mta/deploy --postgres-binaries"
+            ))?),
+        ));
+    }
+    if !recorded {
+        return Ok((
+            true,
+            Some(owned(
+                "no verified switch to the running td PostgreSQL recorded: run td-mta/deploy --postgres-binaries",
+            )?),
+        ));
+    }
+    Ok((true, None))
+}
+
 impl Deployment {
     pub(super) fn retire_rollback(&mut self) -> R<()> {
-        require(
-            self.record.get("irreversible").and_then(Json::as_bool) == Some(true),
-            "retiring rollback material cannot be undone: run td-mta/deploy --retire-rollback --irreversible",
-        )?;
-        require(
-            !Path::new(FENCE).try_exists()? && !Path::new(PG_FENCE).try_exists()?,
-            "unfinished deployment fence: run td-mta/deploy --recover",
-        )?;
-        require(
-            self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous,
-            "retiring rollback material keeps the live release",
+        preflight(
+            &self.record,
+            || Ok(Path::new(FENCE).try_exists()? || Path::new(PG_FENCE).try_exists()?),
+            || Ok(self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous),
         )?;
         // Rollback material is what an unhealthy host needs.
         self.check_source()?;
@@ -266,26 +311,14 @@ impl Deployment {
         // selected td server, mapping only its closure, and the backup job
         // on td's tools. Otherwise it stays and the rest goes.
         let present = Path::new(DEBIAN_POSTGRES).try_exists()?;
-        let mut kept = None;
-        let td_selected = !self.host.debian_tools()
-            && match self.td_in_use() {
-                Ok(()) => true,
-                Err(e) => {
-                    kept = Some(fmt(format_args!(
-                        "{e}: run td-mta/deploy --postgres-binaries"
-                    ))?);
-                    false
-                }
-            };
+        let td_server = !self.host.debian_tools();
+        let in_use = if td_server { self.td_in_use() } else { Ok(()) };
         // A cancelled run stops here, whatever the check said.
         self.host.remaining()?;
+        let recorded = switched_at(Path::new(SWITCHED)).is_some();
+        let (td_selected, kept) = tree_kept(td_server, &in_use, recorded)?;
         let (tree, dead) =
             debian_material(Path::new(DEBIAN_POSTGRES), Path::new(SWITCHED), td_selected)?;
-        if td_selected && tree.is_none() {
-            kept = Some(owned(
-                "no verified switch to the running td PostgreSQL recorded: run td-mta/deploy --postgres-binaries",
-            )?);
-        }
         if let (true, Some(reason)) = (present, kept) {
             self.event(&fmt(format_args!(
                 "keeping the Debian PostgreSQL tree: {reason}"

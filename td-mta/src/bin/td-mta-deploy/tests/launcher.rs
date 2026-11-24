@@ -148,9 +148,47 @@ fn retiring_rollback_material_needs_irreversible_and_runs_alone() {
     let retire = args(&["--retire-rollback", "--irreversible"]);
     let opts = parse(&retire).unwrap();
     assert!(opts.retire && opts.irreversible && !opts.socket && !opts.binaries);
-    let deploy = args(&["--irreversible"]);
-    assert!(parse(&deploy).unwrap().irreversible);
+    let rev = "0123456789abcdef0123456789abcdef01234567";
+    let deploy = args(&["--irreversible", "--schema-target", "7", "--revision", rev]);
+    let opts = parse(&deploy).unwrap();
+    assert!(opts.irreversible && opts.schema_target == Some(7) && opts.revision == Some(rev));
+    let upper = rev.to_ascii_uppercase();
     for refused in [
+        // A deployment authorises one named migration, retirement none.
+        args(&["--irreversible"]),
+        args(&["--schema-target", "7"]),
+        args(&["--irreversible", "--schema-target", "7"]),
+        args(&["--schema-target", "7", "--revision", rev]),
+        args(&[
+            "--irreversible",
+            "--schema-target",
+            "seven",
+            "--revision",
+            rev,
+        ]),
+        args(&["--irreversible", "--schema-target", "+7", "--revision", rev]),
+        args(&[
+            "--irreversible",
+            "--schema-target",
+            "7",
+            "--revision",
+            &upper,
+        ]),
+        args(&[
+            "--irreversible",
+            "--schema-target",
+            "7",
+            "--revision",
+            "abc",
+        ]),
+        args(&["--irreversible", "--schema-target"]),
+        args(&[
+            "--retire-rollback",
+            "--irreversible",
+            "--schema-target",
+            "7",
+        ]),
+        args(&["--retire-rollback", "--irreversible", "--revision", rev]),
         args(&["--retire-rollback"]),
         args(&["--retire-rollback", "--irreversible", "--skip-tests"]),
         args(&[
@@ -164,6 +202,14 @@ fn retiring_rollback_material_needs_irreversible_and_runs_alone() {
     ] {
         assert!(parse(&refused).is_err(), "{refused:?}");
     }
+    // Without a schema target only a stepping stone, whose controller
+    // reads none, is authorised; known once the transport is planned.
+    let stone = args(&["--irreversible", "--revision", rev]);
+    let opts = parse(&stone).unwrap();
+    assert!(named_migration(&opts, true).is_ok());
+    assert!(named_migration(&opts, false).is_err());
+    let full = args(&["--irreversible", "--schema-target", "7", "--revision", rev]);
+    assert!(named_migration(&parse(&full).unwrap(), false).is_ok());
 }
 
 #[test]
@@ -758,6 +804,73 @@ fn a_host_key_is_enrolled_only_with_the_given_fingerprint() {
 }
 
 #[test]
+fn the_plan_picks_the_offered_key_with_the_fingerprint_before_writing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("host-key-plan").unwrap();
+    let target = dir.path().join("target.json");
+    let file = host_key::known_hosts(&target).unwrap();
+    let (ed, ec) = (
+        "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU",
+        "SHA256:ypeBEsobvcr6wjGzmiPcTaeG7/gUfE5yuYB3ha/uSLs",
+    );
+    let offered =
+        "# mx1:22 SSH-2.0-OpenSSH_9.6\nmx1 ssh-ed25519 AAAAC3k\nmx1 ecdsa-sha2-nistp256 AAAAE2v\n";
+    let scan = |out: &'static str| {
+        move |host: &str| -> R<Vec<u8>> {
+            assert_eq!(host, "mx1");
+            Ok(out.as_bytes().to_vec())
+        }
+    };
+    // What ssh-keygen -l prints for each line the host offered.
+    let print = |line: &str| -> R<Vec<u8>> {
+        let printed = match line {
+            "mx1 ssh-ed25519 AAAAC3k\n" => format!("256 {ed} mx1 (ED25519)\n"),
+            "mx1 ecdsa-sha2-nistp256 AAAAE2v\n" => format!("256 {ec} mx1 (ECDSA)\n"),
+            other => return Err(format!("unexpected line {other:?}").into()),
+        };
+        Ok(printed.into_bytes())
+    };
+    let plan = |expected, offered, replace| {
+        host_key::Enrollment::plan_with("mx1", expected, &target, replace, scan(offered), print)
+    };
+    let refused = |r: R<host_key::Enrollment>| r.err().map(|e| e.to_string()).unwrap();
+    let chosen = plan(ec, offered, false).unwrap();
+    assert_eq!(chosen.line, "mx1 ecdsa-sha2-nistp256 AAAAE2v\n");
+    assert_eq!(chosen.result, "host-key-enrolled");
+    assert_eq!(chosen.file, file);
+    // Planning writes nothing.
+    assert!(fs::symlink_metadata(&file).is_err());
+    let missing = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let refusal = refused(plan(missing, offered, false));
+    assert!(refusal.contains("none of the keys"), "{refusal}");
+    let none = refused(plan(ed, "# mx1:22 SSH-2.0-OpenSSH_9.6\n", false));
+    assert!(none.contains("offered no SSH key"), "{none}");
+    assert!(
+        host_key::Enrollment::plan_with("MX1", ed, &target, false, scan(offered), print).is_err()
+    );
+    // An enrolled file decides unchanged, repaired or, with the other
+    // key, refused unless replaced.
+    fs::write(&file, "mx1 ssh-ed25519 AAAAC3k\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        plan(ed, offered, false).unwrap().result,
+        "host-key-unchanged"
+    );
+    let differs = refused(plan(ec, offered, false));
+    assert_eq!(differs, host_key::KEY_DIFFERS);
+    assert_eq!(plan(ec, offered, true).unwrap().result, "host-key-replaced");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        plan(ed, offered, false).unwrap().result,
+        "host-key-repaired"
+    );
+    // A known_hosts path that is no regular file is refused.
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+    assert!(refused(plan(ed, offered, true)).contains("not a regular file"));
+}
+
+#[test]
 fn the_enrolled_key_lives_beside_the_target_and_pins_ssh() {
     let dir = TempDir::new("known-hosts").unwrap();
     let target = dir.path().join("target.json");
@@ -926,7 +1039,92 @@ fn a_refusal_names_the_command_it_asks_for() {
         Some(vec!["--postgres-binaries", "--to-debian"])
     );
     assert_eq!(named("run td-mta/deploy 5 --x"), None);
+    // The controller's own wording on loopback TLS names plain deploy.
+    assert_eq!(
+        named("PostgreSQL still uses loopback TLS: run td-mta/deploy, which names the next step"),
+        Some(vec![])
+    );
+    assert_eq!(named("wait, then run td-mta/deploy again"), None);
     assert_eq!(named("production release changed"), None);
+    // The controller's refusal reads back, whatever migrates.
+    let rev = "ab".repeat(20);
+    for (before, target, identities) in [(3, 4, false), (4, 4, true), (4, 4, false)] {
+        let refusal = crate::activate::migrates(before, target, identities, &rev).unwrap();
+        assert!(refusal.starts_with(crate::activate::MIGRATES));
+        assert_eq!(named(&refusal), None);
+        let target = target.to_string();
+        assert_eq!(migration(&refusal), Some((target.as_str(), rev.as_str())));
+    }
+    let unchanged = crate::activate::migrates(4, 4, false, &rev).unwrap();
+    assert!(unchanged.contains("schema 4 unchanged; grants change"));
+    let identity = crate::activate::migrates(4, 4, true, &rev).unwrap();
+    assert!(identity.contains("schema 4 unchanged, isolating the service identities"));
+    // Main moved past the authorised revision: rerun without it.
+    let moved: Vec<String> = [
+        "--irreversible",
+        "--schema-target",
+        "4",
+        "--revision",
+        &rev,
+        "--config",
+        "/t.json",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    assert_eq!(
+        refused_next(MOVED, &moved).unwrap().unwrap(),
+        ["td-mta/deploy", "--config", "/t.json"]
+    );
+    assert!(refused_next("other", &moved).unwrap().is_none());
+    // A run that skipped tests is offered again only for approval.
+    let skipped: Vec<String> = [
+        "--skip-tests",
+        "--irreversible",
+        "--schema-target",
+        "4",
+        "--revision",
+        &rev,
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    let end = held(Ended {
+        result: "refused",
+        error: Some(MOVED.to_string()),
+        next: refused_next(MOVED, &skipped).unwrap(),
+        approve: None,
+        not_before: None,
+    });
+    assert!(end.next.is_none());
+    let (argv, needs) = end.approve.unwrap();
+    assert_eq!(argv, ["td-mta/deploy", "--skip-tests"]);
+    assert_eq!(needs, ["skip-tests-approval"]);
+    for broken in [
+        "run td-mta/deploy --irreversible --schema-target 4",
+        "run td-mta/deploy --irreversible --schema-target 4 --revision abc",
+        "run td-mta/deploy --irreversible --schema-target x --revision 0000000000000000000000000000000000000000",
+    ] {
+        assert_eq!(migration(broken), None, "{broken}");
+    }
+    // Only the authorisation is dropped, not values that look like it.
+    let given: Vec<String> = [
+        "--config",
+        "--irreversible",
+        "--irreversible",
+        "--schema-target",
+        "3",
+        "--revision",
+        &rev,
+        "--skip-tests",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    assert_eq!(
+        unauthorised(&given).unwrap(),
+        ["--config", "--irreversible", "--skip-tests"]
+    );
     assert_eq!(
         named("cannot be undone: run td-mta/deploy --retire-rollback --irreversible"),
         None
@@ -954,6 +1152,12 @@ fn a_job_outcome_names_what_follows_from_its_end() {
     };
     let at_deploy = |j: &Job| ended(&deploy, deploy_args, j).unwrap();
     let argv = |end: &Ended| end.next.clone().unwrap_or_default().join(" ");
+    // A command that takes a decision is offered only as `approve`.
+    let approval = |end: &Ended| {
+        assert!(end.next.is_none());
+        let (argv, needs) = end.approve.clone().unwrap();
+        (argv.join(" "), needs)
+    };
     let verified = job(
         Some(0),
         r#"{"status":"verified deployment"}"#,
@@ -981,6 +1185,12 @@ fn a_job_outcome_names_what_follows_from_its_end() {
         Some(verified.receipt.as_str())
     );
     assert!(json.get("next").unwrap().is_null());
+    // Without a record read, the outcome names no record.
+    let silent = job(Some(1), "", Some(false), Some(true));
+    let mut written = Vec::new();
+    write_job_outcome(&mut written, &at_deploy(&silent), &silent).unwrap();
+    let line = String::from_utf8(written).unwrap();
+    assert!(!line.contains("\"receipt\""), "{line}");
     // A failed public check after a finished activation leaves the
     // rollback to the operator; after another job it keeps what follows
     // that job.
@@ -1032,22 +1242,77 @@ fn a_job_outcome_names_what_follows_from_its_end() {
     let waits = at_recover(&job(Some(1), &locked, Some(true), Some(true)));
     assert_eq!(waits.result, "busy");
     assert_eq!(argv(&waits), "td-mta/deploy --recover");
-    // Another job holding the host: this one is repeated as it was.
+    assert!(waits.approve.is_none());
+    // Another job holding the host: this one is repeated as it was, and
+    // skipping its tests again is the operator's decision.
     let busy = at_deploy(&job(Some(1), &locked, Some(true), Some(true)));
     assert_eq!(busy.result, "busy");
     assert_eq!(
-        argv(&busy),
-        "td-mta/deploy --skip-tests --window-seconds 90"
+        approval(&busy),
+        (
+            "td-mta/deploy --skip-tests --window-seconds 90".to_string(),
+            vec!["skip-tests-approval"]
+        )
     );
     // The migration refusal is a decision the next command takes; it
-    // keeps the run's own options.
-    let migrates = format!(r#"{{"error":"{}"}}"#, crate::activate::MIGRATES);
+    // keeps the run's own options and authorises exactly that migration,
+    // replacing one the run authorised that the release does not make.
+    let rev = "c".repeat(40);
+    let message = crate::activate::migrates(3, 4, false, &rev).unwrap();
+    let migrates = format!(r#"{{"error":"{message}"}}"#);
     let refused = at_deploy(&job(Some(1), &migrates, Some(false), Some(true)));
     assert_eq!(refused.result, "refused-irreversible");
-    assert_eq!(
-        argv(&refused),
-        "td-mta/deploy --skip-tests --window-seconds 90 --irreversible"
+    let authorised = format!(
+        "td-mta/deploy --skip-tests --window-seconds 90 --irreversible --schema-target 4 --revision {rev}"
     );
+    let both = vec!["irreversible-approval", "skip-tests-approval"];
+    assert_eq!(approval(&refused), (authorised.clone(), both.clone()));
+    let mut written = Vec::new();
+    write_job_outcome(
+        &mut written,
+        &refused,
+        &job(Some(1), &migrates, Some(false), Some(true)),
+    )
+    .unwrap();
+    let line = String::from_utf8(written).unwrap();
+    let json = line
+        .trim()
+        .strip_prefix("td-mta-deploy-outcome ")
+        .map(td_json::parse)
+        .unwrap()
+        .unwrap();
+    assert!(json.get("next").unwrap().is_null());
+    let approve = json.get("approve").unwrap();
+    assert_eq!(
+        approve.get("needs").unwrap().to_string(),
+        r#"["irreversible-approval","skip-tests-approval"]"#
+    );
+    assert_eq!(
+        approve
+            .get("argv")
+            .and_then(Json::as_array)
+            .map(<[Json]>::len),
+        Some(9)
+    );
+    let stale_rev = "d".repeat(40);
+    let (stale_args, stale) = run_of(&[
+        "--irreversible",
+        "--schema-target",
+        "3",
+        "--revision",
+        &stale_rev,
+        "--skip-tests",
+        "--window-seconds",
+        "90",
+    ]);
+    let stale = ended(
+        &stale.unwrap(),
+        stale_args,
+        &job(Some(1), &migrates, Some(false), Some(true)),
+    )
+    .unwrap();
+    assert_eq!(stale.result, "refused-irreversible");
+    assert_eq!(approval(&stale), (authorised, both));
     // Retirement inside the window, after it with material left, and
     // keeping the Debian tree.
     let window = format!(
@@ -1058,19 +1323,20 @@ fn a_job_outcome_names_what_follows_from_its_end() {
     let deferred = at_retire(&job(Some(1), &window, Some(false), Some(true)));
     assert_eq!(deferred.result, "deferred");
     assert_eq!(deferred.not_before, Some(1_700_000_000));
-    assert_eq!(
-        argv(&deferred),
-        "td-mta/deploy --retire-rollback --irreversible --config /t.json"
+    let retirement = (
+        "td-mta/deploy --retire-rollback --irreversible --config /t.json".to_string(),
+        vec!["irreversible-approval"],
     );
+    assert_eq!(approval(&deferred), retirement);
     let left = r#"{"rollback_retire_not_before":1700000000}"#;
     let partial = at_retire(&job(Some(0), left, Some(false), Some(true)));
     assert_eq!(partial.result, "succeeded");
     assert_eq!(partial.not_before, Some(1_700_000_000));
-    assert_eq!(argv(&partial), argv(&deferred));
+    assert_eq!(approval(&partial), retirement);
     let checked = at_retire(&job(Some(0), left, Some(false), Some(false)));
     assert_eq!(checked.result, "check-failed");
     assert_eq!(checked.not_before, Some(1_700_000_000));
-    assert_eq!(argv(&checked), argv(&deferred));
+    assert_eq!(approval(&checked), retirement);
     let tree = r#"{"debian_tree_kept":"why"}"#;
     let kept = at_retire(&job(Some(0), tree, Some(false), Some(true)));
     assert_eq!(
@@ -1083,6 +1349,10 @@ fn a_job_outcome_names_what_follows_from_its_end() {
     let named = at_deploy(&job(Some(1), socket, Some(false), Some(true)));
     assert_eq!(named.result, "failed");
     assert_eq!(argv(&named), "td-mta/deploy --postgres-socket");
+    let tls = r#"{"status":"refused","error":"PostgreSQL still uses loopback TLS: run td-mta/deploy, which names the next step"}"#;
+    let plain = at_deploy(&job(Some(1), tls, Some(false), Some(true)));
+    assert_eq!(plain.result, "failed");
+    assert_eq!(argv(&plain), "td-mta/deploy");
     let changed = r#"{"error":"production release changed"}"#;
     let other = at_deploy(&job(Some(1), changed, Some(false), Some(true)));
     assert_eq!(other.result, "failed");
@@ -1093,7 +1363,8 @@ fn a_job_outcome_names_what_follows_from_its_end() {
 
 #[test]
 fn a_stepping_stone_job_ends_naming_the_socket_or_nothing_recover_would_misjudge() {
-    let (args, opts) = run_of(&["--irreversible", "--config", "/t.json"]);
+    let stone = "290c6de7d4f370e85721b970d4d2c17344423aae";
+    let (args, opts) = run_of(&["--irreversible", "--revision", stone, "--config", "/t.json"]);
     let opts = opts.unwrap();
     let job = |exit: Option<i32>, fence: Option<bool>, post: Option<bool>| Job {
         receipt: "/var/lib/td-mta-operator/deploy-abcdefgh/receipt.json".to_string(),
@@ -1125,6 +1396,39 @@ fn a_stepping_stone_job_ends_naming_the_socket_or_nothing_recover_would_misjudge
         assert!(end.next.is_none());
         assert!(end.error.unwrap().contains("Leaving loopback TLS"));
     }
+    // A stone job that failed without its fence ends as any other job.
+    let fenceless = at(&job(Some(1), Some(false), Some(true)));
+    assert_eq!(fenceless.result, "failed");
+    assert!(fenceless.next.is_none());
+    assert!(fenceless.error.unwrap().contains("journal"));
+    // A socket cutover that left its fence is not --recover's either.
+    let (args, opts) = run_of(&["--postgres-socket", "--config", "/t.json"]);
+    let opts = opts.unwrap();
+    let left = Job {
+        stepping: false,
+        record: td_json::parse(r#"{"status":"failed","error":"cutover probe failed"}"#).ok(),
+        ..job(Some(1), Some(true), Some(true))
+    };
+    let end = ended(&opts, args, &left).unwrap();
+    assert_eq!(end.result, "failed");
+    assert!(end.next.is_none() && end.approve.is_none());
+    let error = end.error.unwrap();
+    assert!(error.starts_with("cutover probe failed; "), "{error}");
+    assert!(error.contains("socket_originals"));
+    // A fence the cutover found held, an activation's, is --recover's.
+    let found = Job {
+        record: td_json::parse(
+            r#"{"status":"refused","error":"unfinished deployment fence: run td-mta/deploy --recover"}"#,
+        )
+        .ok(),
+        ..left
+    };
+    let end = ended(&opts, args, &found).unwrap();
+    assert_eq!(end.result, "failed");
+    assert_eq!(
+        end.next.unwrap().join(" "),
+        "td-mta/deploy --recover --config /t.json"
+    );
 }
 
 #[test]

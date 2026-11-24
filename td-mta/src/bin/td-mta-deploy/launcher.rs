@@ -1,6 +1,9 @@
 //! Select a tested main revision and submit a pinned, standalone operator job.
 use crate::{
-    activate::binaries::{dropin_program, BINARIES_DROPIN, DEBIAN_SOURCE},
+    activate::{
+        binaries::{dropin_program, BINARIES_DROPIN, DEBIAN_SOURCE},
+        FENCE,
+    },
     common::{
         banner_minor, child, digest, fmt, owned, postgres_minor, require, set, store_basename,
         Host, DEBIAN_LIBRARIES, DEBIAN_TOOLS,
@@ -30,9 +33,14 @@ mod transport;
 
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
-const FENCE: &str = "/var/lib/td-mta-operator/deployment-fence";
+/// A socket cutover that left its fence.
+const SOCKET_LEFT: &str = "the socket cutover left the deployment fence, which --recover does not model: its receipt's socket_files and socket_originals name what it changed (td-mta/PRODUCTION.md, \"Leaving loopback TLS\")";
 /// A stepping-stone job that ended unseen or left its fence.
 const STEPPING_LEFT: &str = "the stepping-stone job ended unseen or left the deployment fence, and --recover does not model the loopback-TLS controller's jobs: td-mta/deploy reports whether it still runs or what its fence needs (td-mta/PRODUCTION.md, \"Leaving loopback TLS\")";
+/// The refusal of an irreversible deployment that names no migration.
+const UNNAMED: &str = "an irreversible deployment names its migration: pass --irreversible --schema-target N --revision HEX together";
+/// The refusal when main no longer selects an authorised revision.
+const MOVED: &str = "main no longer selects the revision --revision authorised: its migration needs its own decision";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [OPTIONS]
        td-mta/deploy --postgres-binaries [--to-debian] [OPTIONS]
@@ -48,7 +56,10 @@ const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --provision-host --build-account ACCOUNT --build-home DIR
          --public-name NAME [--config FILE] [--replace]
 Options: [--window-seconds 1..3600] [--jmap-account ACCOUNT] [--config FILE]
-  [--irreversible] (required by a deployment that migrates the database)
+  [--irreversible --schema-target N --revision HEX] (required by a
+  deployment that migrates the database: authorises the migration of
+  that revision to schema N, as the refusal names it; a stepping stone
+  takes --irreversible --revision HEX naming the stone)
 Select a verified origin/main revision and deploy it to the configured host,
 move the live release's database from loopback TLS to its private socket, or
 switch it from the Debian PostgreSQL or another td closure to td's
@@ -70,7 +81,8 @@ defaults plus its td-mta/production-overrides.conf; --plan only reports, and
 While PostgreSQL still uses loopback TLS and the live release predates
 group-socket admission, a deploy installs the newest verified stepping
 stone (td-mta/PRODUCTION.md, \"Leaving loopback TLS\") with the
-loopback-TLS controller; it needs --irreversible, and --skip-tests when no
+loopback-TLS controller; it needs --irreversible --revision naming the
+stone, and --skip-tests when no
 stepping stone has a verdict. Every other operation there refuses and
 names the step that comes next.
 Every command ends with a td-mta-deploy-outcome JSON line.
@@ -100,6 +112,10 @@ struct Options<'a> {
     converge: bool,
     plan: bool,
     expect: Option<&'a str>,
+    /// The schema version an irreversible deployment may migrate to.
+    schema_target: Option<u64>,
+    /// The revision an irreversible deployment authorises.
+    revision: Option<&'a str>,
 }
 fn parse(args: &[String]) -> R<Options<'_>> {
     let mut out = Options {
@@ -120,6 +136,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         converge: false,
         plan: false,
         expect: None,
+        schema_target: None,
+        revision: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -156,6 +174,25 @@ fn parse(args: &[String]) -> R<Options<'_>> {
                     "invalid expected digest",
                 )?;
                 out.expect = Some(digest);
+            }
+            "--schema-target" => {
+                let target = it.next().ok_or("missing schema target")?;
+                require(
+                    !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()),
+                    "invalid schema target",
+                )?;
+                out.schema_target = Some(target.parse().map_err(|_| "invalid schema target")?);
+            }
+            "--revision" => {
+                let revision = it.next().ok_or("missing revision")?;
+                require(
+                    revision.len() == 40
+                        && revision
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "--revision takes the 40-hex revision the refusal names",
+                )?;
+                out.revision = Some(revision);
             }
             other => {
                 return Err(fmt(format_args!(
@@ -245,7 +282,22 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         !(out.plan && out.expect.is_some()),
         "--expect-digest binds an apply to a plan",
     )?;
+    let deploying = out.irreversible && !out.retire;
+    // A stepping stone's controller reads no schema target; `deploy`
+    // requires one for every other deployment once it knows which.
+    require(
+        deploying == out.revision.is_some() && (deploying || out.schema_target.is_none()),
+        UNNAMED,
+    )?;
     Ok(out)
+}
+/// A deployment's authorisation names its migration's schema target,
+/// except a stepping stone's, whose controller reads none.
+fn named_migration(opts: &Options<'_>, stepping: bool) -> R<()> {
+    require(
+        stepping || !opts.irreversible || opts.retire || opts.schema_target.is_some(),
+        UNNAMED,
+    )
 }
 /// A file's text as the remote command printed it, which loses its final
 /// newline.
@@ -854,27 +906,13 @@ pub(super) fn run(args: &[String]) -> R<()> {
                         )?;
                         return Err(error);
                     }
-                    (message, None)
+                    let next = refused_next(&message, args)?;
+                    (message, next)
                 }
             };
-            let mut words = Vec::new();
-            for word in next.iter().flatten() {
-                td_alloc::push(&mut words, word.as_str())?;
-            }
-            write_outcome(
-                &mut out,
-                &Outcome {
-                    result: "refused",
-                    host_key: None,
-                    error: Some(&message),
-                    details: None,
-                    next: next.as_ref().map(|_| Next {
-                        argv: &words,
-                        needs: &[],
-                    }),
-                },
-            )?;
-            return Err(message.into());
+            let end = refused_end(message, next, args)?;
+            write_ended(&mut out, &end, Json::Obj(Vec::new()))?;
+            return Err(end.error.unwrap_or_default().into());
         }
     };
     write_job_outcome(&mut std::io::stdout().lock(), &end, &job)?;
@@ -896,9 +934,21 @@ fn write_job_outcome(out: &mut impl std::io::Write, end: &Ended, job: &Job) -> R
     {
         set(&mut details, "status", Json::Str(owned(status)?))?;
     }
-    set(&mut details, "receipt", Json::Str(owned(&job.receipt)?))?;
+    // Only a record read names where it came from.
+    if job.record.is_some() {
+        set(&mut details, "receipt", Json::Str(owned(&job.receipt)?))?;
+    }
     if let Some(time) = end.not_before {
         set(&mut details, "not_before", Json::from(time))?;
+    }
+    write_ended(out, end, details)
+}
+
+/// The shared outcome line of `end`, with `details` (a JSON object) and,
+/// for a decision, `approve` among them.
+fn write_ended(out: &mut impl std::io::Write, end: &Ended, mut details: Json) -> R<()> {
+    if let Some((argv, needs)) = &end.approve {
+        set(&mut details, "approve", command_json(argv, needs)?)?;
     }
     let mut words = Vec::new();
     for word in end.next.iter().flatten() {
@@ -944,6 +994,7 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
     let verdicts = child(&base, "verdicts")?;
     let stone = transport::plan(&local, opts, &site, &tip, live, &verdicts)?;
     let stepping = stone.is_some();
+    named_migration(opts, stepping)?;
     let controller = if stepping {
         owned(transport::TLS_CONTROLLER)?
     } else {
@@ -968,6 +1019,9 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
     } else {
         local.select(&tip, live, opts.skip, &verdicts)?
     };
+    // An authorisation covers the revision it was given for, never one
+    // main moved to since.
+    require(opts.revision.is_none_or(|r| r == selected), MOVED)?;
     let tree = local.host.out(
         local
             .git()
@@ -1142,6 +1196,16 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
         )?;
     }
     set(&mut spec, "irreversible", Json::Bool(opts.irreversible))?;
+    if let Some(target) = opts.schema_target {
+        set(&mut spec, "schema_target", Json::from(target))?;
+    }
+    if let Some(revision) = opts.revision {
+        set(
+            &mut spec,
+            "authorised_revision",
+            Json::Str(owned(revision)?),
+        )?;
+    }
     if let Some((source, live_minor)) = &live_server {
         // What the launcher read; the controller requires the same.
         set(
@@ -1414,7 +1478,50 @@ struct Ended {
     result: &'static str,
     error: Option<String>,
     next: Option<Vec<String>>,
+    /// A command that takes a decision `next` never takes for an agent,
+    /// and the decisions it takes.
+    approve: Option<(Vec<String>, Vec<&'static str>)>,
     not_before: Option<u64>,
+}
+
+/// The flags that each take a decision an agent takes only on purpose,
+/// and the name `needs` gives that decision.
+const DECISIONS: &[(&str, &str)] = &[
+    ("--irreversible", "irreversible-approval"),
+    ("--skip-tests", "skip-tests-approval"),
+];
+
+/// `end` with a `next` that takes a decision moved to `approve`: what
+/// follows is never a decision an agent takes by following it.
+fn held(mut end: Ended) -> Ended {
+    let Some(argv) = end.next.take() else {
+        return end;
+    };
+    let mut needs = Vec::new();
+    for (flag, decision) in DECISIONS {
+        if argv.iter().any(|word| word == flag) && td_alloc::push(&mut needs, *decision).is_err() {
+            // Without room to name the decision, offer no command at all.
+            return end;
+        }
+    }
+    if needs.is_empty() {
+        end.next = Some(argv);
+    } else {
+        end.approve = Some((argv, needs));
+    }
+    end
+}
+
+/// `{"argv": [...], "needs": [...]}`.
+fn command_json(argv: &[String], needs: &[&str]) -> R<Json> {
+    let mut words = Vec::new();
+    for word in argv {
+        td_alloc::push(&mut words, word.as_str())?;
+    }
+    let mut object = Json::Obj(Vec::new());
+    set(&mut object, "argv", strings(&words)?)?;
+    set(&mut object, "needs", strings(needs)?)?;
+    Ok(object)
 }
 
 /// `td-mta/deploy`, `flags`, and the options this run was given that
@@ -1461,10 +1568,75 @@ fn again(args: &[String], extra: &[&str]) -> R<Vec<String>> {
     Ok(argv)
 }
 
+/// The end of a run refused before its job, naming `next`: `busy`, and
+/// this run again, while another job runs on a loopback-TLS host.
+fn refused_end(error: String, next: Option<Vec<String>>, args: &[String]) -> R<Ended> {
+    let busy = error == transport::RUNNING;
+    Ok(held(Ended {
+        result: if busy { "busy" } else { "refused" },
+        next: if busy { Some(again(args, &[])?) } else { next },
+        error: Some(error),
+        approve: None,
+        not_before: None,
+    }))
+}
+
+/// What follows a refusal before any job: after main moved past an
+/// authorised revision, the run without the authorisation, which finds
+/// what the new one migrates; otherwise nothing.
+fn refused_next(message: &str, args: &[String]) -> R<Option<Vec<String>>> {
+    if message == MOVED {
+        Ok(Some(again(&unauthorised(args)?, &[])?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The schema version and revision the controller's migration refusal
+/// names, in the order `activate::migrates` writes them.
+fn migration(error: &str) -> Option<(&str, &str)> {
+    let (_, flags) = error.rsplit_once("run td-mta/deploy --irreversible --schema-target ")?;
+    let (target, revision) = flags.split_once(" --revision ")?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let hex = revision.len() == 40
+        && revision
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (digits(target) && hex).then_some((target, revision))
+}
+
+/// This run's arguments without the migration it authorised.
+fn unauthorised(args: &[String]) -> R<Vec<String>> {
+    let mut kept = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--irreversible" => {}
+            "--schema-target" | "--revision" => {
+                it.next();
+            }
+            // Values of the options that take one are kept as given.
+            "--config" | "--jmap-account" | "--window-seconds" => {
+                td_alloc::push(&mut kept, owned(arg)?)?;
+                if let Some(value) = it.next() {
+                    td_alloc::push(&mut kept, owned(value)?)?;
+                }
+            }
+            _ => td_alloc::push(&mut kept, owned(arg)?)?,
+        }
+    }
+    Ok(kept)
+}
+
 /// The flags of the command a refusal names in its `run td-mta/deploy
 /// --FLAG [VALUE]...`, up to the first word that is neither.
 fn named(error: &str) -> Option<Vec<&str>> {
-    let (_, rest) = error.split_once("run td-mta/deploy ")?;
+    let (_, rest) = error.split_once("run td-mta/deploy")?;
+    // Bare, it names plain td-mta/deploy, which names the step itself.
+    if rest.is_empty() || rest.starts_with([',', '.', ';', ':']) {
+        return Some(Vec::new());
+    }
+    let rest = rest.strip_prefix(' ')?;
     let mut flags = Vec::new();
     for word in rest.split_ascii_whitespace() {
         let value = word.bytes().all(|b| b.is_ascii_digit());
@@ -1501,6 +1673,7 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             result: "unknown",
             error: Some(owned(why)?),
             next: Some(recover()?),
+            approve: None,
             not_before: None,
         })
     };
@@ -1508,6 +1681,10 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
     let unrecoverable = error
         .as_deref()
         .is_some_and(|e| crate::activate::UNRECOVERABLE.contains(&e));
+    let names_recover = error
+        .as_deref()
+        .and_then(named)
+        .is_some_and(|flags| flags == ["--recover"]);
     // What a finished job leaves to do: the switch it kept the Debian
     // tree for, or the retirement still to come.
     let finished = || -> R<Option<Vec<String>>> {
@@ -1520,7 +1697,7 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
         })
     };
     let lost = matches!(job.exit, None | Some(255));
-    Ok(match (job.exit, job.fence) {
+    let end = match (job.exit, job.fence) {
         // The stepping stone ran under the loopback-TLS controller, whose
         // jobs and fence --recover does not model.
         (exit, fence) if job.stepping && exit != Some(0) && (lost || fence != Some(false)) => {
@@ -1528,6 +1705,7 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
                 result: if lost { "unknown" } else { "failed" },
                 error: Some(owned(STEPPING_LEFT)?),
                 next: None,
+                approve: None,
                 not_before: None,
             }
         }
@@ -1537,12 +1715,14 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
                 "the stepping stone is deployed but the public JMAP check after it failed",
             )?),
             next: None,
+            approve: None,
             not_before: None,
         },
         (Some(0), _) if job.stepping => Ended {
             result: "stepping-stone-deployed",
             error: None,
             next: Some(command(opts, &["--postgres-socket"])?),
+            approve: None,
             not_before: None,
         },
         (None | Some(255), _) => unknown(
@@ -1555,6 +1735,7 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
                 "the deployment finished but the public JMAP check after it failed: if the failure persists, td-mta/deploy --rollback returns to the release before the live one",
             )?),
             next: None,
+            approve: None,
             not_before: None,
         },
         (Some(0), _) if job.post == Some(false) => Ended {
@@ -1563,12 +1744,14 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
                 "the job finished but the public JMAP check after it failed",
             )?),
             next: finished()?,
+            approve: None,
             not_before,
         },
         (Some(0), _) => Ended {
             result: "succeeded",
             error: None,
             next: finished()?,
+            approve: None,
             not_before,
         },
         // Another job holds the host: this one changed nothing.
@@ -1576,6 +1759,19 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             result: "busy",
             error,
             next: Some(again(args, &[])?),
+            approve: None,
+            not_before: None,
+        },
+        // --recover does not model the socket cutover's fence; a fence
+        // the cutover found held, and names --recover for, it does.
+        (Some(_), Some(true)) if opts.socket && !names_recover => Ended {
+            result: "failed",
+            error: Some(fmt(format_args!(
+                "{}; {SOCKET_LEFT}",
+                error.as_deref().unwrap_or("the job failed")
+            ))?),
+            next: None,
+            approve: None,
             not_before: None,
         },
         (Some(_), Some(true)) => Ended {
@@ -1586,6 +1782,7 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             } else {
                 Some(recover()?)
             },
+            approve: None,
             not_before: None,
         },
         (Some(_), None) => unknown(
@@ -1593,9 +1790,22 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
         )?,
         (Some(_), _) => {
             let (result, next) = match error.as_deref() {
-                Some(crate::activate::MIGRATES) => {
-                    ("refused-irreversible", Some(again(args, &["--irreversible"])?))
-                }
+                Some(e) if e.starts_with(crate::activate::MIGRATES) => (
+                    "refused-irreversible",
+                    match migration(e) {
+                        Some((target, revision)) => Some(again(
+                            &unauthorised(args)?,
+                            &[
+                                "--irreversible",
+                                "--schema-target",
+                                target,
+                                "--revision",
+                                revision,
+                            ],
+                        )?),
+                        None => None,
+                    },
+                ),
                 Some(crate::activate::INSIDE_WINDOW) => ("deferred", Some(again(args, &[])?)),
                 Some(e) => match named(e) {
                     Some(flags) if !(unrecoverable || opts.recover && flags == ["--recover"]) => {
@@ -1612,6 +1822,7 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
                     Ok,
                 )?),
                 next,
+                approve: None,
                 not_before: if result == "deferred" {
                     not_before
                 } else {
@@ -1619,7 +1830,8 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
                 },
             }
         }
-    })
+    };
+    Ok(held(end))
 }
 
 #[cfg(test)]

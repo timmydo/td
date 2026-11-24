@@ -63,8 +63,7 @@ pub(crate) const SOCKET_FENCE: &str = "the fence belongs to the loopback-TLS soc
 pub(crate) const NO_FENCE: &str = "the fenced job's operation never holds a deployment fence";
 pub(crate) const UNRECOVERABLE: &[&str] = &[SOCKET_FENCE, NO_FENCE];
 /// The refusals whose outcome names the command that follows.
-pub(crate) const MIGRATES: &str =
-    "this release migrates the database, which cannot be rolled back: run td-mta/deploy --irreversible";
+pub(crate) const MIGRATES: &str = "this release migrates the database, which cannot be rolled back";
 pub(crate) const INSIDE_WINDOW: &str = "all rollback material is inside its 7-day window: run td-mta/deploy --retire-rollback --irreversible after rollback_retire_not_before";
 const SELECTED: &str = "SELECT encode(version_id,'hex') FROM td_mta.config_selection";
 
@@ -122,6 +121,34 @@ fn parent(path: &Path) -> R<&Path> {
     path.parent()
         .ok_or_else(|| "missing parent directory".into())
 }
+/// Whether the job authorised the migration of its revision to schema
+/// `target`: it is irreversible and names that target and revision.
+pub(crate) fn authorised(job: &Json, target: u64) -> bool {
+    job.get("irreversible").and_then(Json::as_bool) == Some(true)
+        && job.get("schema_target").and_then(Json::as_u64) == Some(target)
+        && job.get("revision").and_then(Json::as_str).is_some()
+        && job.get("authorised_revision").and_then(Json::as_str)
+            == job.get("revision").and_then(Json::as_str)
+}
+
+/// The migration refusal: what migrates, and the command that
+/// authorises exactly it, which the launcher's `migration` reads.
+pub(crate) fn migrates(before: u64, target: u64, identities: bool, revision: &str) -> R<String> {
+    let identities = if identities {
+        ", isolating the service identities"
+    } else {
+        ""
+    };
+    let what = match (target == before, identities.is_empty()) {
+        (true, true) => fmt(format_args!("schema {before} unchanged; grants change"))?,
+        (true, false) => fmt(format_args!("schema {before} unchanged{identities}"))?,
+        (false, _) => fmt(format_args!("schema {before} to {target}{identities}"))?,
+    };
+    fmt(format_args!(
+        "{MIGRATES} ({what}): run td-mta/deploy --irreversible --schema-target {target} --revision {revision}"
+    ))
+}
+
 fn start_receipt(path: &Path, record: &Json) -> R<()> {
     // The per-host activation lock serializes the existence check and publish.
     require(!path.try_exists()?, "job already has an activation receipt")?;
@@ -405,10 +432,15 @@ impl Deployment {
             !migrate || !self.rolling_back(),
             "the release rolled back to would migrate the database: deploy a forward fix",
         )?;
-        require(
-            !migrate || self.record.get("irreversible").and_then(Json::as_bool) == Some(true),
-            MIGRATES,
-        )?;
+        if migrate && !authorised(&self.record, target) {
+            return Err(migrates(
+                self.old_version,
+                target,
+                self.isolation_change,
+                field(&self.record, "revision")?,
+            )?
+            .into());
+        }
         let mut recovery = None;
         let result = self.cutover(migrate, &mut recovery);
         let result = if result.is_err() {
@@ -744,6 +776,30 @@ impl SharedRollback for Deployment {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_migration_runs_only_with_its_own_schema_target_and_revision() {
+        let job = |text: &str| td_json::parse(text).unwrap();
+        assert!(authorised(
+            &job(
+                r#"{"revision":"a","authorised_revision":"a","irreversible":true,"schema_target":7}"#
+            ),
+            7
+        ));
+        for refused in [
+            r#"{"revision":"a","authorised_revision":"a","irreversible":true,"schema_target":6}"#,
+            r#"{"revision":"a","authorised_revision":"b","irreversible":true,"schema_target":7}"#,
+            r#"{"revision":"a","irreversible":true,"schema_target":7}"#,
+            r#"{"irreversible":true,"schema_target":7}"#,
+            r#"{"revision":"a","authorised_revision":"a","irreversible":true}"#,
+            r#"{"revision":"a","authorised_revision":"a","irreversible":false,"schema_target":7}"#,
+            r#"{"revision":"a","authorised_revision":"a","schema_target":7}"#,
+            r#"{"revision":"a","authorised_revision":"a","irreversible":true,"schema_target":"7"}"#,
+        ] {
+            assert!(!authorised(&job(refused), 7), "{refused}");
+        }
+    }
+
     struct Reversal {
         transitions: Vec<&'static str>,
         fault: Option<&'static str>,

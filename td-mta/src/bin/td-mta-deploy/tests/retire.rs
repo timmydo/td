@@ -229,3 +229,53 @@ fn a_switch_takes_the_window_and_only_verification_or_rollback_writes_it() {
     assert!(!put_back(&record, &tree, true, Some(100)).unwrap());
     assert!(!record.exists());
 }
+
+#[test]
+fn retirement_needs_the_flag_no_fence_and_the_live_release() {
+    let named = td_json::parse(r#"{"irreversible":true}"#).unwrap();
+    let is = |v: bool| move || -> R<bool> { Ok(v) };
+    let broken = || -> R<bool> { Err("ENOENT".into()) };
+    let refusal = |r: R<()>| r.unwrap_err().to_string();
+    preflight(&named, is(false), is(true)).unwrap();
+    for job in [
+        r#"{"irreversible":false}"#,
+        "{}",
+        r#"{"irreversible":"yes"}"#,
+    ] {
+        let refused = refusal(preflight(
+            &td_json::parse(job).unwrap(),
+            is(false),
+            is(true),
+        ));
+        assert!(refused.contains("--irreversible"), "{refused}");
+    }
+    let fenced = refusal(preflight(&named, is(true), is(true)));
+    assert!(fenced.contains("--recover"), "{fenced}");
+    let moved = refusal(preflight(&named, is(false), is(false)));
+    assert!(moved.contains("keeps the live release"), "{moved}");
+    // In order, each check before what the next one reads: the flag
+    // before the fence, the fence before the live release.
+    let unflagged = td_json::parse("{}").unwrap();
+    assert!(refusal(preflight(&unflagged, broken, broken)).contains("cannot be undone"));
+    assert!(refusal(preflight(&named, is(true), broken)).contains("--recover"));
+    assert_eq!(refusal(preflight(&named, is(false), broken)), "ENOENT");
+}
+
+#[test]
+fn the_debian_tree_stays_while_anything_could_still_use_it() {
+    // On the Debian server the tree is what runs: no reason recorded.
+    assert_eq!(tree_kept(false, &Ok(()), true).unwrap(), (false, None));
+    // td's server selected and running alone with a recorded window.
+    assert_eq!(tree_kept(true, &Ok(()), true).unwrap(), (true, None));
+    // Not what runs: kept, naming the switch to run.
+    let stray: R<()> = Err("the running server maps the Debian tree".into());
+    let (selected, why) = tree_kept(true, &stray, true).unwrap();
+    assert!(!selected);
+    let why = why.unwrap();
+    assert!(why.starts_with("the running server maps the Debian tree"));
+    assert!(why.ends_with("--postgres-binaries"));
+    // No verified switch recorded its window.
+    let (selected, why) = tree_kept(true, &Ok(()), false).unwrap();
+    assert!(selected);
+    assert!(why.unwrap().contains("no verified switch"));
+}

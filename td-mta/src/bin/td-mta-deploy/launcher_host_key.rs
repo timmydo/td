@@ -140,6 +140,44 @@ pub(super) struct Enrollment {
 
 impl Enrollment {
     pub(super) fn plan(host: &str, expected: &str, target: &Path, replace: bool) -> R<Self> {
+        let local = Host::default();
+        let scan = |host: &str| -> R<Vec<u8>> {
+            Ok(local
+                .exec(
+                    Command::new("ssh-keyscan").args(["-T", "10", "--", host]),
+                    &[],
+                    Duration::from_secs(30),
+                    false,
+                )
+                .map_err(|_| {
+                    "ssh-keyscan did not finish: OpenSSH's client tools must be installed and the host name must resolve"
+                })?
+                .stdout)
+        };
+        let fingerprint = |line: &str| -> R<Vec<u8>> {
+            Ok(local
+                .exec(
+                    Command::new("ssh-keygen").args(["-l", "-E", "sha256", "-f", "-"]),
+                    line.as_bytes(),
+                    Duration::from_secs(10),
+                    true,
+                )
+                .map_err(|_| "ssh-keygen could not fingerprint a key the host offered")?
+                .stdout)
+        };
+        Self::plan_with(host, expected, target, replace, scan, fingerprint)
+    }
+
+    /// `plan` with what ssh-keyscan prints for a host (`scan`) and what
+    /// ssh-keygen prints for one known_hosts line (`fingerprint`).
+    pub(super) fn plan_with(
+        host: &str,
+        expected: &str,
+        target: &Path,
+        replace: bool,
+        scan: impl FnOnce(&str) -> R<Vec<u8>>,
+        fingerprint: impl Fn(&str) -> R<Vec<u8>>,
+    ) -> R<Self> {
         // ssh names hosts in lowercase in what it prints and looks up.
         require(
             !host.bytes().any(|b| b.is_ascii_uppercase()),
@@ -147,18 +185,8 @@ impl Enrollment {
         )?;
         // Before anything is written: the path later connections can use.
         let file = known_hosts(target)?;
-        let local = Host::default();
-        let scan = local
-            .exec(
-                Command::new("ssh-keyscan").args(["-T", "10", "--", host]),
-                &[],
-                Duration::from_secs(30),
-                false,
-            )
-            .map_err(|_| {
-                "ssh-keyscan did not finish: OpenSSH's client tools must be installed and the host name must resolve"
-            })?;
-        let keys = scanned(std::str::from_utf8(&scan.stdout)?, host)?;
+        let scan = scan(host)?;
+        let keys = scanned(std::str::from_utf8(&scan)?, host)?;
         require(
             !keys.is_empty(),
             "the host offered no SSH key: it must be reachable on SSH's port",
@@ -166,15 +194,8 @@ impl Enrollment {
         let mut chosen = None;
         for key in keys {
             let candidate = line(host, &key)?;
-            let printed = local
-                .exec(
-                    Command::new("ssh-keygen").args(["-l", "-E", "sha256", "-f", "-"]),
-                    candidate.as_bytes(),
-                    Duration::from_secs(10),
-                    true,
-                )
-                .map_err(|_| "ssh-keygen could not fingerprint a key the host offered")?;
-            let printed = std::str::from_utf8(&printed.stdout)?;
+            let printed = fingerprint(&candidate)?;
+            let printed = std::str::from_utf8(&printed)?;
             if printed.split_ascii_whitespace().nth(1) == Some(expected) {
                 chosen = Some(candidate);
                 break;

@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::panic)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
 use crate::common::Host;
 use std::{fs, path::PathBuf, process::Command};
@@ -13,7 +13,15 @@ const OPERATIONS: &[Operation] = &[
     Operation::Recover,
     Operation::Rollback,
     Operation::Converge,
+    Operation::Restore,
+    Operation::Refresh,
 ];
+
+const STONE: &str = "290c6de7d4f370e85721b970d4d2c17344423aae";
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| (*a).to_owned()).collect()
+}
 
 #[test]
 fn a_loopback_tls_host_takes_the_stone_then_the_socket_and_nothing_else() {
@@ -69,6 +77,46 @@ fn facts(operation: Operation) -> Facts {
     }
 }
 
+/// What `run` writes for a refusal naming `flags`: (`next`, `approve`
+/// and its needs). A command taking a decision is `approve`, never `next`.
+type Routed = (
+    Option<Vec<String>>,
+    Option<(Vec<String>, Vec<&'static str>)>,
+);
+fn routed(flags: &[&str]) -> Routed {
+    let opts = strings(&[]);
+    let words = named_command(flags, None, &super::super::parse(&opts).unwrap()).unwrap();
+    let end = super::super::refused_end(owned(STONE_FIRST).unwrap(), Some(words), &opts).unwrap();
+    assert_eq!(end.result, "refused");
+    (end.next, end.approve)
+}
+
+/// `flags` reach the operator as `approve`, needing exactly `needs`.
+fn approved(flags: &[&str], needs: &[&str]) {
+    let (next, approve) = routed(flags);
+    assert_eq!(next, None, "{flags:?}");
+    let (argv, held) = approve.unwrap();
+    assert_eq!(argv.first().map(String::as_str), Some("td-mta/deploy"));
+    assert_eq!(&argv[1..], flags);
+    assert_eq!(held, needs, "{flags:?}");
+}
+
+/// `flags` reach the operator as `next`, with no approval.
+fn followed(flags: &[&str]) {
+    let (next, approve) = routed(flags);
+    assert!(approve.is_none(), "{flags:?}");
+    assert_eq!(&next.unwrap()[1..], flags);
+}
+
+/// The needs of a stepping-stone command with `flags`.
+fn stone_needs(flags: &[&str]) -> Vec<&'static str> {
+    let mut needs = vec!["irreversible-approval"];
+    if flags.contains(&"--skip-tests") {
+        needs.push("skip-tests-approval");
+    }
+    needs
+}
+
 #[test]
 fn every_refusal_names_a_command_that_is_then_accepted() {
     // A held fence on loopback TLS: nothing, and no next step; a job
@@ -81,7 +129,18 @@ fn every_refusal_names_a_command_that_is_then_accepted() {
         assert_eq!(decide(&f), Decision::Refuse(FENCED, None));
         let f = Facts { running: true, ..f };
         assert_eq!(decide(&f), Decision::Refuse(RUNNING, None));
+        // Running before it takes its fence, too.
+        let f = Facts { fenced: false, ..f };
+        assert_eq!(decide(&f), Decision::Refuse(RUNNING, None));
     }
+    // Waiting is `busy`, and repeats this run once the job has ended.
+    let args = strings(&["--postgres-socket", "--config", "/t.json"]);
+    let busy = super::super::refused_end(owned(RUNNING).unwrap(), None, &args).unwrap();
+    assert_eq!(busy.result, "busy");
+    assert_eq!(
+        busy.next.unwrap(),
+        ["td-mta/deploy", "--postgres-socket", "--config", "/t.json"]
+    );
     for stones in [Stones::Verified, Stones::Unverified] {
         let verified = stones == Stones::Verified;
         // Before the stone, every other operation names the stone deploy...
@@ -97,6 +156,7 @@ fn every_refusal_names_a_command_that_is_then_accepted() {
                 panic!("{operation:?}");
             };
             assert_eq!((error, flags), (STONE_FIRST, stone_flags(verified)));
+            approved(flags, &stone_needs(flags));
             // ...which, run as named, deploys the stone.
             let named = Facts {
                 stones,
@@ -117,6 +177,7 @@ fn every_refusal_names_a_command_that_is_then_accepted() {
             match decide(&f) {
                 Decision::Refuse(error, Some(flags)) => {
                     assert!([NO_VERDICT, IRREVERSIBLE].contains(&error));
+                    approved(flags, &stone_needs(flags));
                     let named = Facts {
                         skip: flags.contains(&"--skip-tests"),
                         irreversible: flags.contains(&"--irreversible"),
@@ -154,6 +215,7 @@ fn every_refusal_names_a_command_that_is_then_accepted() {
         };
         assert_eq!(decide(&f), expected, "{operation:?}");
     }
+    followed(&["--postgres-socket"]);
     // On the socket under the stone, the binary switch and convergence
     // name main, with --skip-tests when no newer main revision has a
     // verdict; that deploy proceeds.
@@ -173,6 +235,8 @@ fn every_refusal_names_a_command_that_is_then_accepted() {
             decide(&under_stone(false)),
             Decision::Refuse(MAIN_UNVERIFIED, Some(&["--skip-tests"]))
         );
+        followed(&[]);
+        approved(&["--skip-tests"], &["skip-tests-approval"]);
         let main = Facts {
             operation: Operation::Deploy,
             skip: true,
@@ -197,7 +261,10 @@ fn the_operation_is_the_first_named_mode() {
         operation(&super::super::parse(&args).unwrap())
     };
     assert_eq!(of(&[]), Operation::Deploy);
-    assert_eq!(of(&["--skip-tests", "--irreversible"]), Operation::Deploy);
+    assert_eq!(
+        of(&["--skip-tests", "--irreversible", "--revision", STONE]),
+        Operation::Deploy
+    );
     assert_eq!(of(&["--postgres-socket"]), Operation::Socket);
     assert_eq!(of(&["--postgres-binaries"]), Operation::Binaries);
     assert_eq!(
@@ -212,6 +279,8 @@ fn the_operation_is_the_first_named_mode() {
     assert_eq!(of(&["--rollback"]), Operation::Rollback);
     assert_eq!(of(&["--converge-config"]), Operation::Converge);
     assert_eq!(of(&["--converge-config", "--plan"]), Operation::Converge);
+    assert_eq!(of(&["--restore-shared-services"]), Operation::Restore);
+    assert_eq!(of(&["--refresh-notifications"]), Operation::Refresh);
 }
 
 #[test]
@@ -231,16 +300,51 @@ fn the_tls_controller_host_is_read_from_its_own_sources() {
 fn the_named_stepping_stone_command_carries_its_consents() {
     assert_eq!(stone_flags(true), ["--irreversible"]);
     assert_eq!(stone_flags(false), ["--skip-tests", "--irreversible"]);
+    // The run's target and account travel with the named step; its
+    // window only to its own operation.
+    let args = strings(&[
+        "--postgres-binaries",
+        "--window-seconds",
+        "900",
+        "--jmap-account",
+        "ops",
+        "--config",
+        "/home/alice/t.json",
+    ]);
+    let opts = super::super::parse(&args).unwrap();
     assert_eq!(
-        argv(&["--postgres-socket"], Some("/home/alice/t.json")).unwrap(),
+        named_command(&["--postgres-socket"], None, &opts).unwrap(),
         [
             "td-mta/deploy",
             "--postgres-socket",
             "--config",
-            "/home/alice/t.json"
+            "/home/alice/t.json",
+            "--jmap-account",
+            "ops"
         ]
     );
-    assert_eq!(argv(&[], None).unwrap(), ["td-mta/deploy"]);
+    let deploy = strings(&["--window-seconds", "900", "--config", "/home/alice/t.json"]);
+    let opts = super::super::parse(&deploy).unwrap();
+    let plain = super::super::parse(&[]).unwrap();
+    assert_eq!(named_command(&[], None, &plain).unwrap(), ["td-mta/deploy"]);
+    // An authorisation names its stone, and that run authorises exactly
+    // it: not another revision, and not with a schema target.
+    for flags in [stone_flags(true), stone_flags(false)] {
+        let named = named_command(flags, Some(STONE), &opts).unwrap();
+        let rerun = super::super::parse(&named[1..]).unwrap();
+        assert!(authorises(&rerun, Some(STONE)), "{named:?}");
+        assert_eq!(rerun.skip, flags.contains(&"--skip-tests"));
+        assert_eq!(rerun.budget, 900);
+        assert!(!authorises(&rerun, Some(GROUP_SOCKET)));
+        assert!(!authorises(&rerun, None));
+        let mut targeted = named[1..].to_vec();
+        targeted.extend(strings(&["--schema-target", "46"]));
+        assert!(!authorises(
+            &super::super::parse(&targeted).unwrap(),
+            Some(STONE)
+        ));
+    }
+    assert!(!authorises(&plain, Some(STONE)));
 }
 
 #[test]

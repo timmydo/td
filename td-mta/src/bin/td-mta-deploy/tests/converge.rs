@@ -382,3 +382,33 @@ fn a_job_refused_before_its_receipt_reports_why_and_the_lock_is_busy() {
     );
     assert!(refused.get("next").unwrap().is_null());
 }
+
+#[test]
+fn a_convergence_next_never_takes_a_decision() {
+    // Convergence takes neither decision flag, so no `next` it derives
+    // from its own run can carry one.
+    for decision in ["--irreversible", "--skip-tests"] {
+        let args: Vec<String> = ["--converge-config", decision]
+            .iter()
+            .map(|a| (*a).to_owned())
+            .collect();
+        assert!(super::super::parse(&args).is_err(), "{decision}");
+    }
+    let planned = format!(
+        r#"{{"converge_result":"planned","config_digest":"{DIGEST}","config_selected":"01","config_changes":[]}}"#
+    );
+    let locked = format!("refused:{}", crate::LOCKED);
+    for (receipt, job, expected) in [
+        (planned.as_str(), Job::Succeeded, "planned"),
+        (locked.as_str(), Job::Failed, "busy"),
+    ] {
+        let (line, _) = finished(Some(receipt), job, Ok(1.0));
+        assert_eq!(result(&line), expected);
+        let argv = line.get("next").unwrap().get("argv").unwrap().to_string();
+        assert!(argv.contains("--converge-config"), "{argv}");
+        for decision in ["--irreversible", "--skip-tests"] {
+            assert!(!argv.contains(decision), "{argv}");
+        }
+        assert!(line.get("approve").is_none());
+    }
+}

@@ -517,9 +517,17 @@ change) cannot be rolled back once writers return except by restoring
 the recovery copy the deployment took and replayed first, losing the
 mail accepted since. A deployment that migrates therefore refuses after
 building the candidate, before that backup and before any fence, unless
-it runs as `./td-mta/deploy --irreversible`; the refused receipt names
-`schema_before` and `schema_after`. The flag is recorded in job.json and
-applies to that run only.
+it runs as `./td-mta/deploy --irreversible --schema-target N --revision
+HEX`: the revision the refusal was for and the schema version its
+migration reaches (the current one for an identity or grant change
+alone). The refusal names that exact command and what migrates, and the
+refused receipt names `schema_before` and `schema_after`. The flags are
+recorded in job.json and apply to that run only. If main has since moved
+to another revision the launcher refuses before any job, and `next` (or
+`approve`, when the run skipped tests) is the run without the flags,
+which finds what the new revision migrates; a
+run whose release migrates to another version refuses as though it had
+none.
 
 The default forward activation budget is 60 seconds. On expiry the job
 restores service and records the observed outage. Recovery and clean
@@ -731,9 +739,10 @@ isolated services could not reach the socket `--postgres-socket`
 installs. The launcher therefore enforces one order, from the
 development checkout:
 
-1. `./td-mta/deploy --irreversible`, adding `--skip-tests` when no
-   stepping stone has a verdict: deploys the stepping stone. Its outcome
-   names step 2.
+1. `./td-mta/deploy --irreversible --revision STONE`, adding
+   `--skip-tests` when no stepping stone has a verdict: deploys the
+   stepping stone. A plain `./td-mta/deploy` refuses and names this
+   command, with STONE filled in, as `approve`. Its outcome names step 2.
 2. `./td-mta/deploy --postgres-socket`: the fenced transport cutover,
    under the stepping stone.
 3. `./td-mta/deploy`: the newest verified main, as for any update. With
@@ -789,7 +798,8 @@ the launcher does not compare with `host.json`, since a certificate may
 carry several names; if the certificate lacks it, the job fails at its
 preflight probes, before any fence. It also predates the
 `--irreversible` consent and migrates the database without asking
-(schema 45 to 46 here), so the launcher requires the flag; budget the
+(schema 45 to 46 here), so the launcher requires the flag, with
+`--revision` naming the stone and no `--schema-target`; budget the
 writer window as for any migration (`--window-seconds`). Budget disk
 too: the stepping stone keeps its `original-pgdata` and recovery copy,
 step 2 takes another base backup, and `--retire-rollback`, refused on a
@@ -899,8 +909,10 @@ with the outcome line of "Command outcomes"; a failure also prints
   - `refused`: the launcher, or the host job's preflight, refused
     before changing anything; a preflight that refused before its
     receipt names why from its `refusal.json`;
-  - `busy`: another job held the host's activation lock, so this one
-    changed nothing; `next` repeats it once that job has ended;
+  - `busy`: another job held the host's activation lock, or, on a host
+    still on loopback TLS, the launcher found a deployment job running,
+    so this one changed nothing; `next` repeats it once that job has
+    ended;
   - `unknown`: the job settled no result the launcher could read: the
     connection was lost, the receipt could not be read, or the job died
     or still runs. Read `receipt` on the host and the journal of `unit`;
@@ -912,9 +924,12 @@ with the outcome line of "Command outcomes"; a failure also prints
   `previous_config_version`, `reload_seconds`, `restarted_units`,
   `request`, `receipt` and `unit`, when known.
 - `next`: after a successful plan, the apply command bound to its digest
-  with the plan's `--config` and `--jmap-account`, needing nothing; for a
-  refusal by the host's transport, the step that comes first ([Leaving
-  loopback TLS](#leaving-loopback-tls)), with `--config` only; else null.
+  with the plan's `--config` and `--jmap-account`, needing nothing; after
+  `busy`, the same run; for a refusal by the host's transport, the step
+  that comes first ([Leaving loopback TLS](#leaving-loopback-tls)) with
+  `--config` and `--jmap-account`; else null. Convergence takes no
+  decision, so its own `next` never does; a transport step that takes
+  one is `approve` instead, as under "Command outcomes".
 
 To return to the previous configuration by hand, select the receipt's
 `config_previous_version` against the current generation with
@@ -1098,43 +1113,61 @@ configuration"; every other mode holds the following:
   - `unknown`: the SSH connection ended before the job reported, or the
     job failed and whether it left the deployment fence could not be
     read;
-  - `busy`: another job held the host's activation lock, so this one
-    changed nothing; `next` repeats it once that job has ended. Each
+  - `busy`: another job held the host's activation lock, or, on a host
+    still on loopback TLS, the launcher found a deployment job running
+    before it started its own, so this one changed nothing; `next`
+    repeats it once that job has ended (or `approve` does, when the run
+    took a decision). Each
     run builds and uploads the controller again and leaves a job
     directory, so wait for the running job (minutes, its window)
     rather than retrying at once;
   - `refused`: the launcher refused before it started a job. A
     transport refusal ([Leaving loopback TLS](#leaving-loopback-tls))
-    names the step to run instead as `next`;
+    names the step to run instead, as `next`, or as `approve` when that
+    step takes `--irreversible` or `--skip-tests`. When main no longer
+    selects an authorised `--revision`, `next` (or `approve`, when the
+    run skipped tests) is the run without the authorisation;
   - `stepping-stone-deployed`: a stepping-stone deploy verified; `next`
     is `--postgres-socket`. A stepping-stone job that ends unseen or
     leaves its fence is `unknown` or `failed` with `next` null, since
     `--recover` does not model the loopback-TLS controller's jobs;
   - `refused-irreversible`: the deployment would migrate the database
-    and was not given `--irreversible`, a decision for the operator;
-    `next` repeats the command with it. The repeat resolves `main`
-    again, so it authorises whatever migration `main` then needs;
+    and was not given `--irreversible --schema-target N --revision HEX`
+    for that migration. `next` is null; `approve` is the command that
+    authorises exactly that revision's migration;
   - `deferred`: `--retire-rollback` found all its material inside the
-    window; `next` repeats it, not before `not_before`.
+    window; `approve` repeats it, not before `not_before`.
 - `error`: on a refusal or failure, the message, which the command also
   prints on standard error before exiting nonzero. A job refused before
   it reserved its receipt records why in `refusal.json` in its job
   directory, which the launcher reads in its place;
 - `next`: the command that follows, as `{"argv": [...], "needs":
   [...]}` with the options whose values the operator supplies, or
-  `null`. A job that leaves the deployment fence held, or whose outcome
-  is unknown, is followed by `--recover`, which waits for no running
+  `null`. It never takes a decision: a command that would is `approve`
+  instead. A job that leaves the deployment fence held, or whose outcome
+  is unknown, is followed by `--recover` (except the stepping stone's,
+  and a socket cutover that left its fence, which `--recover` does not
+  model: their `next` is null), which waits for no running
   job: it refuses while one holds the activation lock. A recovery that
   leaves the fence is followed by itself too, unless it refused the
   fence's kind, which no rerun changes.
   A retirement that kept the Debian tree is followed by
-  `--postgres-binaries`, one that left material inside its window by
-  itself. Every retirement leaves its own job directory as material, so
-  that `next` never ends; following it is optional;
+  `--postgres-binaries`; one that left material inside its window
+  offers itself as `approve`. Every retirement leaves its own job
+  directory as material, so that offer never ends; taking it is
+  optional;
+- `approve`: present instead of `next` when the command that follows
+  takes a decision an agent takes only on purpose, in the same
+  `{"argv": [...], "needs": [...]}` shape. `needs` names each decision:
+  `irreversible-approval` for `--irreversible` (a migration, or
+  retiring rollback material) and `skip-tests-approval` for
+  `--skip-tests`. An agent runs it only when the operator made that
+  decision for this run;
 - `status`: a job's last receipt status, such as `verified deployment`,
   `already deployed and healthy`, `recovered` or `nothing to recover`;
 - `receipt`: the host path of the record the outcome was read from:
-  the job's receipt, or its `refusal.json`;
+  the job's receipt, or its `refusal.json`; absent when neither was
+  read;
 - `not_before`: with `deferred` or a retirement that left material, the
   Unix time the next retirement may remove some;
 - `host_key`: with `--write-target --host-key-sha256`, what happened to

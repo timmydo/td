@@ -35,6 +35,8 @@ pub(super) enum Operation {
     Recover,
     Rollback,
     Converge,
+    Restore,
+    Refresh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +85,10 @@ fn operation(opts: &Options<'_>) -> Operation {
         Operation::Rollback
     } else if opts.converge {
         Operation::Converge
+    } else if opts.restore {
+        Operation::Restore
+    } else if opts.refresh {
+        Operation::Refresh
     } else {
         Operation::Deploy
     }
@@ -99,29 +105,42 @@ pub(super) const RANGE: Range<'static> = Range {
     last_tls: LAST_TCP_TLS,
 };
 
-/// `td-mta/deploy` with `flags` and the operator's `--config`.
-fn argv<'a>(flags: &[&'a str], config: Option<&'a str>) -> R<Vec<&'a str>> {
-    let mut out = Vec::new();
-    td_alloc::push(&mut out, "td-mta/deploy")?;
-    td_alloc::extend_from_slice(&mut out, flags)?;
-    if let Some(config) = config {
-        td_alloc::extend_from_slice(&mut out, &["--config", config])?;
+/// The `td-mta/deploy` a refusal names: `flags`, `--revision` naming the
+/// `stone` an `--irreversible` among them authorises, and this run's
+/// `--config` and `--jmap-account`. The steps named are a deploy and the
+/// socket cutover; this run's `--window-seconds` goes only to its own
+/// operation, since a window sized for one step is no budget for another.
+pub(super) fn named_command(
+    flags: &[&str],
+    stone: Option<&str>,
+    opts: &Options<'_>,
+) -> R<Vec<String>> {
+    let budget = fmt(format_args!("{}", opts.budget))?;
+    let mut words = Vec::new();
+    td_alloc::extend_from_slice(&mut words, flags)?;
+    if let Some(stone) = stone {
+        td_alloc::extend_from_slice(&mut words, &["--revision", stone])?;
     }
-    Ok(out)
+    let named = if flags.contains(&"--postgres-socket") {
+        Operation::Socket
+    } else {
+        Operation::Deploy
+    };
+    if opts.window && operation(opts) == named {
+        td_alloc::extend_from_slice(&mut words, &["--window-seconds", budget.as_str()])?;
+    }
+    super::command(opts, &words)
+}
+
+/// Whether `opts` authorises deploying `stone`: `--irreversible` with
+/// `--revision` naming it, and no `--schema-target`, which its controller
+/// does not read.
+pub(super) fn authorises(opts: &Options<'_>, stone: Option<&str>) -> bool {
+    opts.irreversible && opts.schema_target.is_none() && stone.is_some() && opts.revision == stone
 }
 
 /// The refusal, naming `next` if any, whose outcome line `run` writes.
-fn refuse<T>(error: &str, next: Option<&[&str]>) -> R<T> {
-    let next = match next {
-        Some(argv) => {
-            let mut words = Vec::new();
-            for word in argv {
-                td_alloc::push(&mut words, owned(word)?)?;
-            }
-            Some(words)
-        }
-        None => None,
-    };
+fn refuse<T>(error: &str, next: Option<Vec<String>>) -> R<T> {
     Err(Refusal {
         error: owned(error)?,
         next,
@@ -141,10 +160,10 @@ pub(super) fn stone_flags(verified: bool) -> &'static [&'static str] {
 
 const NO_VERDICT: &str = "no stepping-stone revision (a first-parent origin/main revision after the live release, from daceb7309 through 290c6de7d) has a passing main-integration verdict on this machine, and the runner records verdicts only for the newest main head: deploy the newest stepping stone without one by adding --skip-tests";
 const NO_STONE: &str = "PostgreSQL still uses loopback TLS and no first-parent origin/main revision from daceb7309 through 290c6de7d descends from the live release, so no stepping stone can follow it";
-const IRREVERSIBLE: &str = "the stepping stone runs the loopback-TLS generation's controller, which migrates the database without asking: add --irreversible";
+const IRREVERSIBLE: &str = "the stepping stone runs the loopback-TLS generation's controller, which migrates the database without asking or reading a schema target: authorise it with --irreversible --revision naming the stone, and no --schema-target";
 const FENCED: &str = "a deployment fence is held on a host still on loopback TLS: its job (the stepping stone or the socket cutover) is outside what --recover models; the fence file names it, and its receipt what it changed (td-mta/PRODUCTION.md, \"Leaving loopback TLS\")";
-const RUNNING: &str = "a deployment job is still running on a host still on loopback TLS (its unit is printed above): wait for it to finish, following its journal, then run td-mta/deploy again; recover nothing by hand while it runs";
-const STONE_FIRST: &str = "PostgreSQL still uses loopback TLS and the live release predates group-socket admission, so its isolated services could not reach the socket --postgres-socket installs: deploy the stepping-stone release first";
+pub(super) const RUNNING: &str = "a deployment job is still running on a host still on loopback TLS (its unit is printed above): wait for it to finish, following its journal, then run td-mta/deploy again; recover nothing by hand while it runs";
+const STONE_FIRST: &str = "PostgreSQL still uses loopback TLS and the live release predates group-socket admission, so its isolated services could not reach the socket --postgres-socket installs: deploy the stepping-stone release first, which migrates the database";
 const SOCKET_FIRST: &str =
     "PostgreSQL still uses loopback TLS: move it to the private socket first";
 const MAIN_FIRST: &str = "the live release is the loopback-TLS stepping stone: deploy main before switching the PostgreSQL binaries or converging the configuration";
@@ -165,7 +184,7 @@ pub(super) struct Facts {
     pub(super) irreversible: bool,
     pub(super) tls: bool,
     pub(super) fenced: bool,
-    /// A `td-mta-deploy-*` unit is active (read only when fenced).
+    /// A `td-mta-deploy-*` unit is active (read on loopback TLS).
     pub(super) running: bool,
     /// The live release contains GROUP_SOCKET.
     pub(super) admits: bool,
@@ -188,9 +207,9 @@ pub(super) enum Decision {
 }
 
 pub(super) fn decide(f: &Facts) -> Decision {
-    if f.tls && f.fenced {
-        // A running job holds its own fence; once it has died, each step
-        // would refuse in turn and name the other.
+    if f.tls && (f.fenced || f.running) {
+        // A running job is waited for, fenced or not; once a fenced one
+        // has died, each step would refuse in turn and name the other.
         return Decision::Refuse(if f.running { RUNNING } else { FENCED }, None);
     }
     let stepping = match step(f.operation, f.tls, f.admits, f.stone_live) {
@@ -227,7 +246,7 @@ pub(super) fn plan(
     let operation = operation(opts);
     let tls = local.loopback_tls()?;
     let fenced = tls && local.fenced()?;
-    let running = fenced && local.running_jobs()?;
+    let running = tls && local.running_jobs()?;
     let admits = local.is_ancestor(GROUP_SOCKET, live)?;
     let stone_live =
         !tls && matches!(
@@ -242,16 +261,18 @@ pub(super) fn plan(
             None => false,
         };
     let (mut verified, mut newest) = (None, None);
-    if tls && !admits && !fenced {
+    if tls && !admits && !fenced && !running {
         verified = local.stepping_stone(tip, live, false, verdicts, &RANGE)?;
         if verified.is_none() || opts.skip {
             newest = local.stepping_stone(tip, live, true, verdicts, &RANGE)?;
         }
     }
+    // The stone the run would take; its authorisation names it.
+    let taken = if opts.skip { &newest } else { &verified };
     let facts = Facts {
         operation,
         skip: opts.skip,
-        irreversible: opts.irreversible,
+        irreversible: authorises(opts, taken.as_ref().map(|stone| stone.0.as_str())),
         tls,
         fenced,
         running,
@@ -273,10 +294,27 @@ pub(super) fn plan(
         }
         Decision::Refuse(error, next) => {
             let next = match next {
-                Some(flags) => Some(argv(flags, opts.config)?),
+                Some(flags) => {
+                    // An --irreversible authorises the stone those flags
+                    // take, by name.
+                    let stone = if !flags.contains(&"--irreversible") {
+                        None
+                    } else if flags.contains(&"--skip-tests") {
+                        Some(&newest)
+                    } else {
+                        Some(&verified)
+                    };
+                    let stone = match stone {
+                        Some(named) => {
+                            Some(named.as_ref().ok_or("missing stepping stone")?.0.as_str())
+                        }
+                        None => None,
+                    };
+                    Some(named_command(flags, stone, opts)?)
+                }
                 None => None,
             };
-            refuse(error, next.as_deref())
+            refuse(error, next)
         }
         Decision::Stone => {
             require(
