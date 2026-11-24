@@ -380,10 +380,22 @@ fn human_uptime(secs: u64) -> String {
     }
 }
 
+/// The status line and where its audio field is: the byte range of the
+/// field's own text, the gap after it left out. Kept together so the hit
+/// test asks of the line the bar is showing, not of a newer reading.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Status {
+    pub text: String,
+    pub audio: Option<std::ops::Range<usize>>,
+}
+
+/// The gap after each field but the clock.
+const GAP: &str = "  ";
+
 /// The line, left to right. A reading that could not be taken shows its
 /// label with `?` rather than vanishing, so a bar with a broken source looks
 /// broken instead of looking like a machine with less to report.
-fn line(clock: &Clock, readings: &Readings) -> Result<String, crate::allocation::FormatError> {
+fn line(clock: &Clock, readings: &Readings) -> Result<Status, crate::allocation::FormatError> {
     let load = readings.load_centi.map_or_else(
         || "LOAD ?".to_string(),
         |centi| format!("LOAD {}.{:02}", centi / 100, centi % 100),
@@ -428,9 +440,33 @@ fn line(clock: &Clock, readings: &Readings) -> Result<String, crate::allocation:
     };
     let temperature = readings.temperature;
     let audio = AudioField(readings.audio);
-    crate::allocation::format(format_args!(
+    let text = crate::allocation::format(format_args!(
         "{net}  {load}  TEMP {temperature}  {memory}  {uptime}  {audio}{clock}"
-    ))
+    ))?;
+    // The field ends where the gap before the clock begins.
+    let audio = readings.audio.and_then(|reading| {
+        let end = text
+            .len()
+            .checked_sub(clock.len())?
+            .checked_sub(GAP.len())?;
+        let start = end.checked_sub(displayed_len(reading.field()))?;
+        Some(start..end)
+    });
+    Ok(Status { text, audio })
+}
+
+/// How many bytes `shown` displays as, counted without keeping them.
+fn displayed_len(shown: impl std::fmt::Display) -> usize {
+    struct Count(usize);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self.0.saturating_add(text.len());
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = std::fmt::Write::write_fmt(&mut count, format_args!("{shown}"));
+    count.0
 }
 
 /// The audio field and the gap after it, or nothing: just before the
@@ -440,7 +476,7 @@ struct AudioField(Option<crate::audio::Reading>);
 impl std::fmt::Display for AudioField {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            Some(reading) => write!(out, "{}  ", reading.field()),
+            Some(reading) => write!(out, "{}{GAP}", reading.field()),
             None => Ok(()),
         }
     }
@@ -509,6 +545,53 @@ pub fn desk_at(desks: &[u8], x: usize, y: usize) -> Option<u8> {
 /// `desk_at` answers `None` there and a drag released on it is cancelled.
 pub fn launcher_at(x: usize, y: usize) -> bool {
     y < BAR_HEIGHT && x < LAUNCHER_WIDTH
+}
+
+/// Where the workspace strip ends.
+fn strip_end(desks: &[u8]) -> usize {
+    cells(desks).fold(LAUNCHER_WIDTH, |_, (_, at, width)| at.saturating_add(width))
+}
+
+/// A pending launch's cell as `(left, width)`, after the workspaces.
+fn launch_cell(desks: &[u8], launch: &str) -> (usize, usize) {
+    let strip = strip_end(desks);
+    let width = Text::width(launch).saturating_add(LAUNCH_PAD.saturating_mul(2));
+    (strip.saturating_add(TEXT_LEFT), width)
+}
+
+/// Where the status line starts: after the workspaces and any pending
+/// launch's cell. One answer for the painting and the hit test, as
+/// `cells` is for the strip.
+pub fn status_left(desks: &[u8], launch: Option<&str>) -> usize {
+    let left = match launch {
+        Some(launch) => {
+            let (at, width) = launch_cell(desks, launch);
+            at.saturating_add(width)
+        }
+        None => strip_end(desks),
+    };
+    left.saturating_add(TEXT_LEFT)
+}
+
+/// Whether the point is on the audio field, the `span` of the status line
+/// `text` drawn from `status_left`.
+pub fn audio_at(
+    desks: &[u8],
+    launch: Option<&str>,
+    text: &str,
+    span: &std::ops::Range<usize>,
+    x: usize,
+    y: usize,
+) -> bool {
+    if y >= BAR_HEIGHT {
+        return false;
+    }
+    let (Some(before), Some(field)) = (text.get(..span.start), text.get(span.start..span.end))
+    else {
+        return false;
+    };
+    let start = status_left(desks, launch).saturating_add(Text::width(before));
+    x >= start && x < start.saturating_add(Text::width(field))
 }
 
 /// The bars of the button's mark, as rectangles in the strip.
@@ -616,7 +699,6 @@ pub fn paint(
     for rect in launcher_mark() {
         ui::fill(frame, width, height, stride, rect, mark);
     }
-    let mut left = LAUNCHER_WIDTH;
     let mut label = [0u8; 3];
     for (number, at, cell_width) in cells(desks) {
         let cell = (at, 0, cell_width, BAR_HEIGHT);
@@ -641,14 +723,12 @@ pub fn paint(
             colors,
             cell,
         );
-        left = at.saturating_add(cell.2);
     }
     // A pending launch's state, in inverse video after the workspaces: it
     // is the one thing on the strip waiting on the operator's request, and
     // the status line, which gives way from the right, follows it.
     if let Some(launch) = launch {
-        let cell_width = Text::width(launch).saturating_add(LAUNCH_PAD.saturating_mul(2));
-        let at = left.saturating_add(TEXT_LEFT);
+        let (at, cell_width) = launch_cell(desks, launch);
         let cell = (at, 0, cell_width, BAR_HEIGHT);
         ui::fill(frame, width, height, stride, cell, INK);
         face.draw(
@@ -661,14 +741,13 @@ pub fn paint(
             (BACKGROUND, INK),
             cell,
         );
-        left = at.saturating_add(cell_width);
     }
     // What keeps the status line off the cells TODAY is where it starts: a
     // line is drawn rightwards from there and cannot reach back. The clip
     // rectangle is what keeps that true of a line positioned any other way —
     // right-aligned, say — and it costs nothing to narrow, since a narrower
     // clip can only ever remove drawing.
-    let text_left = left.saturating_add(TEXT_LEFT);
+    let text_left = status_left(desks, launch);
     face.draw(
         frame,
         width,
@@ -771,7 +850,7 @@ fn tick(
     // across that would stop the compositor over the least important thing on
     // the screen — the opposite of what the reporting is for.
     let outcome = match runtime.lock() {
-        Ok(mut runtime) => runtime.set_status(line),
+        Ok(mut runtime) => runtime.set_bar_status(line),
         Err(_) => return Tick::Poisoned,
     };
     Tick::Continue(reported.note(outcome.err().as_deref()))
@@ -861,7 +940,7 @@ mod tests {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     fn line(clock: &Clock, readings: &Readings) -> String {
-        super::line(clock, readings).unwrap()
+        super::line(clock, readings).unwrap().text
     }
 
     struct Fixture {
@@ -1687,12 +1766,16 @@ Local:
         );
         let mut expected = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
         expected.audio = Some(level);
-        let expected = line(&Clock::Utc, &expected);
-        assert!(expected.contains("VOL 45%"));
+        let expected = super::line(&Clock::Utc, &expected).unwrap();
+        assert_eq!(
+            expected.audio.clone().map(|span| &expected.text[span]),
+            Some("VOL 45%")
+        );
         let mut runtime = runtime.lock().unwrap();
         runtime.fail_next_repaint();
-        // Identical to what the tick published, so no paint is attempted.
-        assert!(runtime.set_status(expected).is_ok());
+        // Identical to what the tick published, its field's place included,
+        // so no paint is attempted.
+        assert!(runtime.set_bar_status(expected).is_ok());
     }
 
     #[test]
@@ -1899,6 +1982,79 @@ Local:
                 "{audio:?}: {shown}"
             );
         }
+    }
+
+    /// The audio field's span is its own text in each form, the gap after
+    /// it left out; with no audio thread there is none.
+    #[test]
+    fn the_audio_fields_span_is_its_text() {
+        let status = |audio| {
+            super::line(
+                &Clock::Utc,
+                &Readings {
+                    uptime_secs: Some(60),
+                    epoch_secs: Some(0),
+                    audio,
+                    ..Readings::default()
+                },
+            )
+            .unwrap()
+        };
+        for (audio, field) in [
+            (
+                crate::audio::Reading::Level {
+                    percent: 100,
+                    muted: false,
+                },
+                "VOL 100%",
+            ),
+            (
+                crate::audio::Reading::Level {
+                    percent: 5,
+                    muted: true,
+                },
+                "MUTE",
+            ),
+            (crate::audio::Reading::Unavailable, "NO AUDIO"),
+        ] {
+            let shown = status(Some(audio));
+            let span = shown.audio.clone().unwrap();
+            assert_eq!(&shown.text[span.clone()], field);
+            assert_eq!(&shown.text[span.end..span.end + 2], "  ");
+            assert_eq!(&shown.text[span.start - 2..span.start], "  ");
+        }
+        assert_eq!(status(None).audio, None);
+    }
+
+    /// The hit test finds the field where `paint` draws the line: after
+    /// the workspaces, and after a pending launch's cell when there is one.
+    #[test]
+    fn the_audio_field_is_hit_where_it_is_drawn() {
+        let desks = [1u8, 2];
+        let strip = LAUNCHER_WIDTH + desk_width(1) + desk_width(2);
+        assert_eq!(status_left(&desks, None), strip + TEXT_LEFT);
+        let launch = "FIREFOX STARTING 0:01";
+        assert_eq!(
+            status_left(&desks, Some(launch)),
+            strip + TEXT_LEFT + Text::width(launch) + LAUNCH_PAD * 2 + TEXT_LEFT
+        );
+        let text = "UP 00:01  VOL 45%  1970-01-01 00:00:00 UTC";
+        let span = 10..17;
+        for launch in [None, Some(launch)] {
+            let start = status_left(&desks, launch) + Text::width("UP 00:01  ");
+            let end = start + Text::width("VOL 45%");
+            let hit = |x| audio_at(&desks, launch, text, &span, x, BAR_HEIGHT / 2);
+            assert!(!hit(start - 1) && hit(start) && hit(end - 1) && !hit(end));
+            assert!(!audio_at(&desks, launch, text, &span, start, BAR_HEIGHT));
+        }
+        // Text before the field is measured in cells, not bytes: `É` is
+        // two bytes and one cell.
+        let multibyte = "É  VOL 45%  1970-01-01 00:00:00 UTC";
+        let start = status_left(&desks, None) + Text::width("É  ");
+        let hit = |x| audio_at(&desks, None, multibyte, &(4..11), x, 0);
+        assert!(!hit(start - 1) && hit(start));
+        // A span the text does not hold hits nothing.
+        assert!(!audio_at(&desks, None, "UP", &span, 0, 0));
     }
 
     #[test]

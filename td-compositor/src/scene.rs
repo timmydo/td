@@ -890,10 +890,13 @@ pub struct Scene {
     /// This attention lifetime left the lock surface: its success notice
     /// stays above the drain row, which cancels nothing.
     attention_unlocked: bool,
-    status: String,
+    status: bar::Status,
     /// A screenshot's outcome, which the bar shows in place of `status`
     /// until the runtime clears it.
     notice: Option<String>,
+    /// The notice is a volume key's outcome, which leaves the audio field
+    /// where it was drawn for the next notch and press.
+    notice_audio: bool,
     /// The configured application's pending launch, which the bar shows
     /// beside the workspaces until its window maps.
     launch: Option<String>,
@@ -943,8 +946,9 @@ impl Scene {
             revocation: None,
             hostnames: crate::authority::Hostnames::default(),
             attention_unlocked: false,
-            status: String::new(),
+            status: bar::Status::default(),
             notice: None,
+            notice_audio: false,
             launch: None,
             text: crate::text::Text::default(),
         }
@@ -2346,7 +2350,16 @@ impl Scene {
     pub(crate) fn set_notice(&mut self, notice: Option<String>) -> bool {
         let changed = self.notice != notice;
         self.notice = notice;
+        self.notice_audio = false;
         changed
+    }
+
+    /// Show a volume key's outcome in the status line's place. Unlike any
+    /// other notice it keeps the audio field live, so a run of notches
+    /// over the field is not ended by the first one's answer.
+    pub(crate) fn set_audio_notice(&mut self, notice: String) {
+        self.notice = Some(notice);
+        self.notice_audio = true;
     }
 
     #[cfg(test)]
@@ -2504,7 +2517,7 @@ impl Scene {
     /// the text it REPLACED when the line changed, so a caller whose paint
     /// fails can put it back: otherwise the scene holds a line the screen
     /// never showed, and the next identical sample repaints nothing.
-    pub fn set_status(&mut self, status: String) -> Option<String> {
+    pub fn set_status(&mut self, status: bar::Status) -> Option<bar::Status> {
         if self.status == status {
             return None;
         }
@@ -2759,6 +2772,51 @@ impl Scene {
             .is_some_and(|(x, y)| bar::launcher_at(x, y))
     }
 
+    /// Whether the pointer is on the bar's audio field as the line draws
+    /// it: not while another notice takes the line's place, but under the
+    /// volume's own, which a notch over the field just asked for.
+    fn audio_field_under_pointer(&self) -> bool {
+        let Some((x, y)) = self.pointer_at_usize() else {
+            return false;
+        };
+        if y >= BAR_HEIGHT || (self.notice.is_some() && !self.notice_audio) {
+            return false;
+        }
+        let Some(span) = self.status.audio.as_ref() else {
+            return false;
+        };
+        bar::audio_at(
+            &self.desks(),
+            self.launch.as_deref(),
+            &self.status.text,
+            span,
+            x,
+            y,
+        )
+    }
+
+    /// Whether a press here opens the sound panel: on the audio field, and
+    /// only with the authority that starts it, as the launcher's SOUND
+    /// entry is shown only then.
+    pub fn audio_pressed(&self) -> bool {
+        self.launcher.authority() && self.audio_field_under_pointer()
+    }
+
+    /// The volume step a wheel turned over the audio field asks: louder
+    /// pushed away, `vertical` positive. The vertical axis alone: a tilt
+    /// sideways is the strip's, as anywhere on the bar. One step for the
+    /// report, whatever its detents, as one key press is.
+    pub fn audio_scrolled(&self, vertical: i32) -> Option<crate::audio::Key> {
+        if vertical == 0 || !self.audio_field_under_pointer() {
+            return None;
+        }
+        Some(if vertical > 0 {
+            crate::audio::Key::Up
+        } else {
+            crate::audio::Key::Down
+        })
+    }
+
     /// What a press on the OPEN launcher asks of it, given where the pointer
     /// is: a row activates its entry, anywhere off the card closes it, and
     /// the card's own margins and title ask nothing.
@@ -2779,6 +2837,8 @@ impl Scene {
     /// and the row an operator flicks the wheel over is the bar rather than a
     /// twenty-pixel cell within it. Which is also why the strip is not what it
     /// walks — `layout::workspace_step` says what it walks instead, and why.
+    /// The one exception is the audio field, whose vertical notch steps the
+    /// volume (`audio_scrolled`, asked first).
     pub fn desk_scrolled(&self, notches: i32) -> Option<u8> {
         let (_, y) = self.pointer_at_usize()?;
         if y >= BAR_HEIGHT {
@@ -3859,8 +3919,8 @@ impl Scene {
             // A notice is the moment's furniture too: a second shot taken
             // within it shows the line, not the last one's outcome.
             match furniture {
-                Furniture::Drawn => self.notice.as_deref().unwrap_or(&self.status),
-                Furniture::Omitted => &self.status,
+                Furniture::Drawn => self.notice.as_deref().unwrap_or(&self.status.text),
+                Furniture::Omitted => &self.status.text,
             },
         );
     }

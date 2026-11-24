@@ -799,6 +799,9 @@ pub struct Runtime {
     /// same door `Super+Enter` uses, which is what keeps its keyboard capture
     /// and any launch outside this lock.
     launcher_button: bool,
+    /// A press on the bar's audio field, for the adapter to start the
+    /// sound panel as `launcher_button` asks it to open the launcher.
+    mixer_button: bool,
 }
 
 #[derive(Default)]
@@ -998,6 +1001,7 @@ impl Runtime {
             client_resources: BTreeMap::new(),
             dragging: None,
             launcher_button: false,
+            mixer_button: false,
         }
     }
 
@@ -3718,13 +3722,23 @@ impl Runtime {
         Ok(())
     }
 
-    /// Take a new status line. Repaints only when the TEXT changed, so a
-    /// sampler that ticks faster than the line does costs nothing — and the
-    /// clock's seconds are what make it change at all.
+    /// A status line with no audio field, as the tests set one.
+    #[cfg(test)]
+    pub fn set_status(&mut self, status: String) -> Result<(), String> {
+        self.set_bar_status(crate::bar::Status {
+            text: status,
+            audio: None,
+        })
+    }
+
+    /// Take a new status line, with where its audio field is, which the
+    /// press and the wheel over it ask of. Repaints only when the line
+    /// changed, so a sampler that ticks faster than the line does costs
+    /// nothing — and the clock's seconds are what make it change at all.
     ///
     /// The sampler's tick is also what ends a screenshot notice, so the
     /// line takes the bar back within a second of the notice's time.
-    pub fn set_status(&mut self, status: String) -> Result<(), String> {
+    pub fn set_bar_status(&mut self, status: crate::bar::Status) -> Result<(), String> {
         let expired = self
             .notice_until
             .is_some_and(|until| Instant::now() >= until);
@@ -3810,7 +3824,8 @@ impl Runtime {
         let Ok(text) = crate::allocation::format(format_args!("{}", reading.notice())) else {
             return Ok(());
         };
-        self.notice(text);
+        self.notice_until = Some(Instant::now() + NOTICE_TIME);
+        self.scene.set_audio_notice(text);
         self.repaint()
     }
 
@@ -3998,6 +4013,19 @@ impl Runtime {
         button.then_some(LauncherAction::Open)
     }
 
+    /// One report's answer: whatever the adapter did not collect is cleared
+    /// by the next report the runtime sees, a withheld one included.
+    fn forget_pointer_asks(&mut self) {
+        self.launcher_button = false;
+        self.mixer_button = false;
+    }
+
+    /// What the last pointer report asked to start: the sound panel, for a
+    /// press on the bar's audio field. Answered once.
+    pub fn pointer_launch(&mut self) -> Option<LaunchRequest> {
+        std::mem::take(&mut self.mixer_button).then_some(LaunchRequest::Mixer)
+    }
+
     /// The cheat sheet has no model to restore, unlike the launcher: it is one
     /// bit. Both failures put that bit back and repaint what was there —
     /// `refresh_focus` as well as the paint, since a scene showing a modal
@@ -4055,6 +4083,7 @@ impl Runtime {
         scroll: PointerScroll,
     ) -> Result<(), String> {
         if self.scene.private_screen() || self.resume_withholds() {
+            self.forget_pointer_asks();
             return Ok(());
         }
         // Whether the pointer MOVED, which a nonzero delta does not prove: an
@@ -4085,6 +4114,7 @@ impl Runtime {
     ) -> Result<(), String> {
         let size = self.backend.dimensions();
         if self.scene.private_screen() || self.resume_withholds() {
+            self.forget_pointer_asks();
             return Ok(());
         }
         let moved = self.scene.place_pointer(x, y, size.width, size.height);
@@ -4098,9 +4128,7 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
-        // One report's answer: whatever the adapter did not collect is
-        // cleared by the next report the runtime sees.
-        self.launcher_button = false;
+        self.forget_pointer_asks();
         let size = self.backend.dimensions();
         let overlay_modal = self.scene.modal();
         let portal_modal = self.scene.portal_modal().is_some();
@@ -4312,12 +4340,25 @@ impl Runtime {
         // beside it cannot. Refused too while a drag is still live,
         // that gesture being aimed at a cell and answering with a block which
         // switching underneath would move.
-        let desk_scroll = if scroll.is_still()
+        //
+        // Over the audio field a notch steps the volume instead, through the
+        // volume keys' queue, under the same gates.
+        let wheel_free = !(scroll.is_still()
             || input_modal
             || self.dragging.is_some()
             || named_workspace
-            || self.pointer.snapshot().focus.is_some()
-        {
+            || self.pointer.snapshot().focus.is_some());
+        let volume = wheel_free
+            .then(|| self.scene.audio_scrolled(scroll.vertical))
+            .flatten();
+        if let Some(key) = volume {
+            if let Err(error) = self.volume(key) {
+                // An error that cannot be held goes unreported; the key's
+                // notice already said what it could.
+                let _ = crate::allocation::push(&mut failures, error);
+            }
+        }
+        let desk_scroll = if !wheel_free || volume.is_some() {
             None
         } else {
             self.scene.desk_scrolled(scroll.notches())
@@ -4431,6 +4472,15 @@ impl Runtime {
                         // Spends a notch beside it, as a cell press does: the
                         // press is the deliberate half, and a switch under the
                         // opening overlay is not what it asked for.
+                        named_workspace = true;
+                        continue;
+                    } else if self.scene.audio_pressed() {
+                        // The bar's audio field opens the sound panel, as its
+                        // card does. Noted here and started by the adapter,
+                        // as the launcher's button is opened; nothing is
+                        // picked up and no client had the press.
+                        self.cancel_drag()?;
+                        self.mixer_button = true;
                         named_workspace = true;
                         continue;
                     } else if let Some(number) = self.scene.desk_pressed() {
@@ -9966,6 +10016,167 @@ mod tests {
         assert_eq!(visible, [2]);
         assert!(!runtime.scene.hint_is_live(), "the block was stranded");
         runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    /// A press on the bar's audio field asks for the sound panel, only with
+    /// the authority and never twice, and reaches no client; a vertical
+    /// notch over it steps the volume instead of switching workspace, under
+    /// the gates a workspace notch has. The volume's own notice keeps the
+    /// field; another notice, a sideways tilt, a client's grab and the line
+    /// beside it leave the wheel to the strip.
+    #[test]
+    fn the_bars_audio_field_opens_the_panel_and_its_wheel_steps_the_volume() {
+        use crate::audio::{Key, Reading};
+        let dir = crate::temp_dir::TempDir::new("td-runtime-audio-field").unwrap();
+        let (width, height) = (640usize, 480usize);
+        let framebuffer =
+            Framebuffer::test_file(&dir.path().join("fb"), width, height, width * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let goto = |runtime: &mut Runtime,
+                    x: usize,
+                    y: usize,
+                    buttons: &[PointerButtonInput],
+                    scroll: PointerScroll| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons, scroll).unwrap()
+        };
+        let still = PointerScroll::default();
+        let away = PointerScroll {
+            vertical: 1,
+            horizontal: 0,
+        };
+        let toward = PointerScroll {
+            vertical: -1,
+            horizontal: 0,
+        };
+        runtime
+            .set_bar_status(crate::bar::Status {
+                text: "UP 00:01  VOL 45%  1970-01-01 00:00:00 UTC".into(),
+                audio: Some(10..17),
+            })
+            .unwrap();
+        let place = |runtime: &Runtime, launch: Option<&str>| {
+            let left = crate::bar::status_left(&runtime.scene.desks(), launch);
+            (
+                left + crate::text::Text::width("UP 00:01  ") + 1,
+                crate::bar::BAR_HEIGHT / 2,
+            )
+        };
+        let field = place(&runtime, None);
+        let uptime = (field.0 - crate::text::Text::width("UP 00:01  "), field.1);
+        let (keys, queued) = mpsc::sync_channel(4);
+        runtime.enable_audio(keys);
+
+        // No authority, no panel: the SOUND entry is not shown either.
+        goto(&mut runtime, field.0, field.1, &[press(1)], still);
+        assert_eq!(runtime.pointer_launch(), None);
+        goto(&mut runtime, field.0, field.1, &[release(1)], still);
+
+        runtime.set_launcher_authority(true);
+        let before = runtime.pointer_snapshot().revision;
+        goto(&mut runtime, field.0, field.1, &[press(2)], still);
+        assert_eq!(
+            runtime.pointer_snapshot().revision,
+            before,
+            "the press on the field reached a client"
+        );
+        assert!(runtime.dragging.is_none());
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        assert_eq!(runtime.pointer_launch(), Some(LaunchRequest::Mixer));
+        assert_eq!(runtime.pointer_launch(), None, "answered twice");
+        goto(&mut runtime, field.0, field.1, &[release(2)], still);
+        assert_eq!(runtime.pointer_launch(), None, "the release asked");
+        // A press nobody collected is not carried into the next report.
+        goto(&mut runtime, field.0, field.1, &[press(3)], still);
+        goto(&mut runtime, field.0, field.1, &[release(3)], still);
+        assert_eq!(runtime.pointer_launch(), None, "carried over");
+        // A notch in the press's report is spent by it: no step, no switch.
+        goto(&mut runtime, field.0, field.1, &[press(4)], toward);
+        assert_eq!(runtime.pointer_launch(), Some(LaunchRequest::Mixer));
+        assert!(queued.try_recv().is_err(), "the press's notch stepped");
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        goto(&mut runtime, field.0, field.1, &[release(4)], still);
+        // Beside the field the status line opens nothing.
+        goto(&mut runtime, uptime.0, uptime.1, &[press(5)], still);
+        assert_eq!(runtime.pointer_launch(), None);
+        goto(&mut runtime, uptime.0, uptime.1, &[release(5)], still);
+
+        goto(&mut runtime, field.0, field.1, &[], away);
+        assert_eq!(queued.try_recv(), Ok(Key::Up));
+        goto(&mut runtime, field.0, field.1, &[], toward);
+        assert_eq!(queued.try_recv(), Ok(Key::Down));
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        goto(&mut runtime, uptime.0, uptime.1, &[], away);
+        assert!(queued.try_recv().is_err(), "the status line beside it");
+
+        // The step's own answer takes the line's place and keeps the field:
+        // the next notch steps again and a press still opens the panel.
+        runtime
+            .audio_notice(Reading::Level {
+                percent: 40,
+                muted: false,
+            })
+            .unwrap();
+        assert_eq!(runtime.scene.notice(), Some("VOLUME 40%"));
+        assert!(runtime.has_notice(), "the volume's notice never expires");
+        goto(&mut runtime, field.0, field.1, &[], toward);
+        assert_eq!(queued.try_recv(), Ok(Key::Down));
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        goto(&mut runtime, field.0, field.1, &[press(6)], still);
+        assert_eq!(runtime.pointer_launch(), Some(LaunchRequest::Mixer));
+        goto(&mut runtime, field.0, field.1, &[release(6)], still);
+
+        // A sideways tilt is the strip's; it steps nothing.
+        goto(
+            &mut runtime,
+            field.0,
+            field.1,
+            &[],
+            PointerScroll {
+                vertical: 0,
+                horizontal: -1,
+            },
+        );
+        assert!(queued.try_recv().is_err(), "a tilt stepped");
+
+        // A pending launch's cell moves the line, and the field with it.
+        let launch = "FIREFOX STARTING 0:01";
+        runtime.scene.set_launch(Some(launch.into()));
+        goto(&mut runtime, field.0, field.1, &[], away);
+        assert!(queued.try_recv().is_err(), "where the field was");
+        let moved = place(&runtime, Some(launch));
+        goto(&mut runtime, moved.0, moved.1, &[], away);
+        assert_eq!(queued.try_recv(), Ok(Key::Up));
+        runtime.scene.set_launch(None);
+
+        // A client holding a grab owns the notch, over the field too.
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        let inside = (rect.x + 2, rect.y + 2);
+        goto(&mut runtime, inside.0, inside.1, &[], still);
+        goto(&mut runtime, inside.0, inside.1, &[press(7)], still);
+        goto(&mut runtime, field.0, field.1, &[], toward);
+        assert!(queued.try_recv().is_err(), "a grab's notch stepped");
+        assert_eq!(runtime.scene.layout().active_workspace(), 1);
+        goto(&mut runtime, field.0, field.1, &[release(7)], still);
+        assert_eq!(runtime.pointer_launch(), None);
+
+        // Any other notice is drawn in the line's place: no field to press
+        // or turn, and the notch is the strip's.
+        runtime.scene.set_notice(Some("SCREENSHOT SAVED".into()));
+        goto(&mut runtime, field.0, field.1, &[press(8)], still);
+        assert_eq!(runtime.pointer_launch(), None);
+        goto(&mut runtime, field.0, field.1, &[release(8)], toward);
+        assert!(queued.try_recv().is_err());
+        assert_eq!(runtime.scene.layout().active_workspace(), 2);
     }
 
     #[test]

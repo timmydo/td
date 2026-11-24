@@ -1984,6 +1984,13 @@ trait InputTarget {
     fn pointer_launcher(&mut self, _pressed: bool) -> Result<Option<LauncherAction>, String> {
         Ok(None)
     }
+    /// What the pointer report just delivered asks to start, which the
+    /// adapter then launches as the launcher would: the sound panel, for a
+    /// press on the bar's audio field. A target with no bar answers
+    /// nothing.
+    fn pointer_launch(&mut self) -> Result<Option<LaunchRequest>, String> {
+        Ok(None)
+    }
     fn key(&mut self, input: KeyInput) -> Result<(), String>;
     fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String>;
     fn pointer_frame(
@@ -3085,6 +3092,14 @@ impl InputTarget for LiveInputTarget {
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .pointer_launcher(pressed))
+    }
+
+    fn pointer_launch(&mut self) -> Result<Option<LaunchRequest>, String> {
+        Ok(self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned")?
+            .pointer_launch())
     }
 
     fn key(&mut self, input: KeyInput) -> Result<(), String> {
@@ -4480,6 +4495,13 @@ fn deliver_pointer_frame<T: InputTarget>(
         if let Some(action) = runtime.pointer_launcher(launcher_press)? {
             let visible = runtime.launcher(action)?;
             bindings.settle_launcher(Some(visible));
+        }
+        // Started as the card's entry is; never under the lock, which runs
+        // no ordinary binding.
+        if let Some(request) = runtime.pointer_launch()? {
+            if !runtime.session_locked() {
+                runtime.launch(request)?;
+            }
         }
     }
     Ok(())
@@ -7968,6 +7990,8 @@ mod tests {
         /// What `pointer_launcher` answers, in order, and what it was asked.
         pointer_answers: std::collections::VecDeque<Option<LauncherAction>>,
         pointer_asks: Vec<bool>,
+        /// What `pointer_launch` answers, in order.
+        launch_answers: std::collections::VecDeque<LaunchRequest>,
     }
 
     impl LauncherModelTarget {
@@ -7977,6 +8001,7 @@ mod tests {
                 recording: RecordingTarget::default(),
                 pointer_answers: std::collections::VecDeque::new(),
                 pointer_asks: Vec::new(),
+                launch_answers: std::collections::VecDeque::new(),
             }
         }
     }
@@ -8015,6 +8040,14 @@ mod tests {
         fn pointer_launcher(&mut self, pressed: bool) -> Result<Option<LauncherAction>, String> {
             self.pointer_asks.push(pressed);
             Ok(self.pointer_answers.pop_front().flatten())
+        }
+
+        fn pointer_launch(&mut self) -> Result<Option<LaunchRequest>, String> {
+            Ok(self.launch_answers.pop_front())
+        }
+
+        fn session_locked(&mut self) -> bool {
+            self.recording.locked
         }
 
         fn key(&mut self, input: KeyInput) -> Result<(), String> {
@@ -8980,6 +9013,43 @@ mod tests {
         assert!(slash.launcher.is_none());
         assert!(slash.forward.is_none());
         assert!(!bindings.help_open);
+    }
+
+    /// A press the runtime says landed on the bar's audio field starts the
+    /// sound panel as the card's entry would, and nothing under the lock.
+    #[test]
+    fn a_press_on_the_audio_field_starts_the_panel_but_not_under_the_lock() {
+        let target = Mutex::new(LauncherModelTarget::new());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        let feed = |pointer: &mut PointerMotion, events: &[Event]| {
+            for event in events {
+                apply(&target, *event, 0, &bindings, pointer, None).unwrap();
+            }
+        };
+        target
+            .lock()
+            .unwrap()
+            .launch_answers
+            .push_back(LaunchRequest::Mixer);
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_PRESS), syn(1)]);
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(2)]);
+        assert_eq!(
+            target.lock().unwrap().recording.launched,
+            [LaunchRequest::Mixer]
+        );
+        assert!(!bindings.lock().unwrap().launcher_open);
+        {
+            let mut target = target.lock().unwrap();
+            target.recording.locked = true;
+            target.launch_answers.push_back(LaunchRequest::Mixer);
+        }
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_PRESS), syn(3)]);
+        assert_eq!(
+            target.lock().unwrap().recording.launched,
+            [LaunchRequest::Mixer],
+            "started under the lock"
+        );
     }
 
     #[test]
@@ -10498,6 +10568,67 @@ mod tests {
         .is_err());
         assert!(!runtime.lock().unwrap().launcher_visible());
         assert!(!bindings.lock().unwrap().launcher_open);
+    }
+
+    /// The live adapter collects the runtime's answer for a press on the
+    /// bar's audio field and asks the paired authority for the panel.
+    #[test]
+    fn a_click_on_the_audio_field_asks_the_live_authority_for_the_panel() {
+        let dir = crate::temp_dir::TempDir::new("td-input-audio-field").unwrap();
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&dir.path().join("fb"), 640, 480, 640 * 4)
+                .unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let field = {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.repaint().unwrap();
+            runtime.set_launcher_authority(true);
+            runtime
+                .set_bar_status(crate::bar::Status {
+                    text: "UP 00:01  VOL 45%  1970-01-01 00:00:00 UTC".into(),
+                    audio: Some(10..17),
+                })
+                .unwrap();
+            // The active workspace and the spare after it.
+            crate::bar::status_left(&[1, 2], None) + crate::text::Text::width("UP 00:01  ") + 1
+        };
+        let (launcher, queued) = crate::authority::Queued::launcher();
+        let target = Mutex::new(LiveInputTarget {
+            runtime: Arc::clone(&runtime),
+            launches: LaunchBackend::Authority(launcher),
+            secret_attempt: None,
+            seat: Seat::default(),
+        });
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        let feed = |pointer: &mut PointerMotion, events: &[Event]| {
+            for event in events {
+                apply(&target, *event, 0, &bindings, pointer, None).unwrap();
+            }
+        };
+        let rel = |code: u16, value: i32| Event {
+            timestamp: 0,
+            time: 0,
+            kind: EV_REL,
+            code,
+            value,
+        };
+        feed(
+            &mut pointer,
+            &[
+                rel(REL_X, i32::try_from(field).unwrap()),
+                rel(REL_Y, 4),
+                key(BTN_LEFT, KEY_PRESS),
+                syn(1),
+            ],
+        );
+        assert!(matches!(
+            queued.program(),
+            Some(crate::authority::Program::Mixer)
+        ));
+        feed(&mut pointer, &[key(BTN_LEFT, KEY_RELEASE), syn(2)]);
+        assert!(queued.program().is_none(), "the release asked");
+        assert!(!runtime.lock().unwrap().launcher_visible());
     }
 
     #[test]

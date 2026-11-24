@@ -201,8 +201,18 @@ The status line shows load, CPU temperature, memory, uptime, the audio
 output and a clock. The audio field, just before the clock, is what the
 volume threads last read: `VOL 45%`, `MUTE`, or `NO AUDIO` until the
 daemon answers and whenever the watcher loses it; a key that fails
-says so in its notice and leaves the field to the watcher. Scrolling or clicking it does
-nothing yet; a wheel over the bar still switches workspaces.
+says so in its notice and leaves the field to the watcher. A press on
+the field opens the sound panel, td-mixer, as the launcher's SOUND entry
+does and only when that entry is shown, with the authority there, a
+panel per press as per activation of the entry; a vertical wheel notch
+over it steps the volume through the volume keys' queue, louder pushed
+away, one step a report as one key press is, under the gates a
+workspace notch has. A sideways tilt over it is the strip's. The
+volume's own notice, which takes the line's place after each step, keeps
+the field where the line draws it, so a run of notches keeps stepping
+and a press still opens the panel; any other notice, a screenshot's,
+takes it away. A wheel anywhere else over the bar still switches
+workspaces.
 Load is the one-minute average. Temperature is the hottest readable Intel
 coretemp package or AMD k10temp die, rounded to whole degrees Celsius.
 On AMD the control temperature is the fallback when the die channel is
@@ -351,7 +361,8 @@ numbers when it turns toward the operator. Two things distinguish it from the
 press. The WHOLE BAR answers it, cells and status line alike: a notch names a
 direction rather than a target, so the line beside the cells has an answer for
 one and not for the other, and the row a hand flicks the wheel over is the bar
-rather than a twenty-pixel cell within it. And it reads the ACTIVE workspace
+rather than a twenty-pixel cell within it. The audio field alone keeps its
+vertical notch for the volume (above). And it reads the ACTIVE workspace
 rather than the cell under the pointer, being a relative gesture.
 
 It walks `1..=9` and not the strip, which is the correction of a draft that
@@ -4961,6 +4972,14 @@ The landing must prove:
   exchanged, the status line starts after the cells and leaves their pixels
   exactly as no status line would, and the mark is driven through the scene
   across two switches to prove it follows the layout rather than a constant;
+- the audio field's gestures are proved through the runtime's pointer
+  reports and both adapters: a press opens the panel only with the
+  authority, once, reaching no client, its report's notch spent; a vertical
+  notch steps either way and switches nothing, under the volume's own notice
+  too, while another notice, a client's grab, a sideways tilt and the line
+  beside the field step nothing; the field is found after a pending launch's
+  cell and after multibyte text; the live adapter asks the authority for
+  request 30's program and the locked session starts nothing;
 - the strip's pointer gestures are proved where the drop onto it is, through
   the real driver: a press on a cell switches to it and picks nothing up and
   reaches no client, a press on the active cell is refused where the state

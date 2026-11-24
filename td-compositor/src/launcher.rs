@@ -420,6 +420,12 @@ impl Launcher {
         launcher
     }
 
+    /// Whether the desktop programs can be started: the paired authority
+    /// is there.
+    pub(crate) fn authority(&self) -> bool {
+        self.authority
+    }
+
     pub(crate) fn set_authority(&mut self, available: bool) {
         self.authority = available;
         self.refresh_matches();

@@ -1418,6 +1418,14 @@ impl Queued {
         }
     }
 
+    /// The desktop program the queue holds, if that is what it holds.
+    pub(crate) fn program(&self) -> Option<Program> {
+        match self.0.try_recv() {
+            Ok(Work::Program(program)) => Some(program),
+            _ => None,
+        }
+    }
+
     /// Whether the queue holds the notebook's open request.
     pub(crate) fn notebook(&self) -> bool {
         matches!(self.0.try_recv(), Ok(Work::Notebook))

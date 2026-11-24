@@ -1528,8 +1528,8 @@ Request `30` is the task manager's shape for td-mixer, the sound panel
 (APPLICATIONS.md §K.5): it execs `/bin/td-mixer` with no arguments from
 `/`, adding only `WAYLAND_DISPLAY`. The panel is an ordinary controller
 of td-audio's socket, which admits the human's uid as one already, as it
-does `td-audio` run from a terminal: the card adds a way to start, not a
-new reach.
+does `td-audio` run from a terminal: the card and the bar's audio field
+add ways to start, not a new reach.
 
 An authority older than one of requests `07` through `0f`, `22`
 through `24` or `30`, or than `22`'s name form or the named `0d` and `0f`,

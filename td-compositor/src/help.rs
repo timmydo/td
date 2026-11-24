@@ -117,7 +117,9 @@ pub const POINTING: &[Row] = &[
     // key chord is not. Two rows for one effect, as HOVER and CLICK already
     // are — the strip answers a press on a NUMBER and a notch anywhere on the
     // bar, which is one sentence too long for one row and two gestures an
-    // operator reaches for at different moments.
+    // operator reaches for at different moments. The audio field is the
+    // notch's one exception and has no row: the card is pinned to fit
+    // 800x600, and the field shows its reading where it is pressed.
     Row {
         keys: "CLICK THE BAR",
         action: "SWITCH WORKSPACE",

@@ -9460,8 +9460,8 @@ with the compositor's control socket named in its environment
 (td-software/DESIGN.md); and td-mixer, the sound panel (§K.5), by request
 30, the task manager's shape: no argument, the display alone added, from
 `/`. It is an ordinary controller of td-audio's socket, which admits the
-human's uid as one already, so its SOUND card adds a way to start, not a
-new reach.
+human's uid as one already, so its SOUND card and the bar's audio field
+add ways to start, not a new reach.
 
 ### L.1 Elevation — consent without a secret
 
