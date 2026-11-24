@@ -707,12 +707,11 @@ what went (`rollback_retired`) and, while any remains,
 everything is inside its window it refuses and records that time. A
 piece it may not remove refuses the run with its path.
 
-Retiring a job directory also removes what host commands run from it:
-the identity change's job directory is where `--restore-shared-services`
-returns to the shared identities, so that return ends with it, and
-`--refresh-notifications` runs from an activation job directory, which
-a fresh `./td-mta/deploy` creates when none is left. A configuration
-convergence job's receipt is the only copy of its
+Retiring a job directory also removes what later jobs read from it:
+`--restore-shared-services` reads the identity change's receipt, so the
+return to the shared identities ends with that job's directory, and
+`--rollback` reads the receipt of the activation it undoes. A
+configuration convergence job's receipt is the only copy of its
 `config_previous_version` and, after `uncertain`, of the retained
 selection request: resolve an uncertain request before its job
 directory is seven days old.
@@ -898,7 +897,10 @@ with the outcome line of "Command outcomes"; a failure also prints
   - `uncertain`: a selection's outcome is unknown and `request` is its
     retained request;
   - `refused`: the launcher, or the host job's preflight, refused
-    before changing anything;
+    before changing anything; a preflight that refused before its
+    receipt names why from its `refusal.json`;
+  - `busy`: another job held the host's activation lock, so this one
+    changed nothing; `next` repeats it once that job has ended;
   - `unknown`: the job settled no result the launcher could read: the
     connection was lost, the receipt could not be read, or the job died
     or still runs. Read `receipt` on the host and the journal of `unit`;
@@ -1069,33 +1071,74 @@ in a file of another owner or mode) or `host-replaced`; its `next` is
 
 Every launcher mode first requires the SSH login, then reads `host.json`
 with `sudo cat` before building, to compare host names, find the mirror
-and print the host name. A current controller run in an older job
-directory (see "Isolating production service accounts") needs the file
-too.
+and print the host name.
 
 ### Command outcomes
 
-`--write-target`, `--provision-host` and `--converge-config` end their
-standard output with one line, `td-mta-deploy-outcome` followed by a JSON
-object, whether they changed something, found nothing to do or refused.
-All hold the following; `--converge-config` adds the members listed under
-"Converge the configuration":
+Every launcher command ends its standard output with one line,
+`td-mta-deploy-outcome` followed by a JSON object, whether it changed
+something, found nothing to do, failed or refused. `--converge-config`
+gives its own results and adds the members listed under "Converge the
+configuration"; every other mode holds the following:
 
-- `result`: what happened, one of the results named with each command,
-  `refused-differs` when only `--replace` would proceed (a decision for
-  whoever supplied the values), or `refused` for any other refusal;
-- `error`: on a refusal, the fixed message, which the command also
-  prints on standard error before exiting nonzero;
+- `result`: what happened. `--write-target` and `--provision-host` give
+  one of the results named with each command, `refused-differs` when
+  only `--replace` would proceed (a decision for whoever supplied the
+  values), or `refused` for any other refusal. Every other mode runs a
+  job and gives:
+  - `succeeded`: the job finished, and the launcher's public JMAP check
+    after it passed (`--refresh-notifications` touches no service and
+    makes none);
+  - `failed`: the job failed. A job refused with a message naming a
+    command (`run td-mta/deploy --FLAG`) has that command as `next`,
+    unless it names `--irreversible`;
+  - `check-failed`: the job finished but the public JMAP check after it
+    failed. After a deployment, `next` is null: whether to run
+    `--rollback` is the operator's decision, which the error names;
+  - `unknown`: the SSH connection ended before the job reported, or the
+    job failed and whether it left the deployment fence could not be
+    read;
+  - `busy`: another job held the host's activation lock, so this one
+    changed nothing; `next` repeats it once that job has ended. Each
+    run builds and uploads the controller again and leaves a job
+    directory, so wait for the running job (minutes, its window)
+    rather than retrying at once;
+  - `refused`: the launcher refused before it started a job. A
+    transport refusal ([Leaving loopback TLS](#leaving-loopback-tls))
+    names the step to run instead as `next`;
+  - `stepping-stone-deployed`: a stepping-stone deploy verified; `next`
+    is `--postgres-socket`. A stepping-stone job that ends unseen or
+    leaves its fence is `unknown` or `failed` with `next` null, since
+    `--recover` does not model the loopback-TLS controller's jobs;
+  - `refused-irreversible`: the deployment would migrate the database
+    and was not given `--irreversible`, a decision for the operator;
+    `next` repeats the command with it. The repeat resolves `main`
+    again, so it authorises whatever migration `main` then needs;
+  - `deferred`: `--retire-rollback` found all its material inside the
+    window; `next` repeats it, not before `not_before`.
+- `error`: on a refusal or failure, the message, which the command also
+  prints on standard error before exiting nonzero. A job refused before
+  it reserved its receipt records why in `refusal.json` in its job
+  directory, which the launcher reads in its place;
 - `next`: the command that follows, as `{"argv": [...], "needs":
   [...]}` with the options whose values the operator supplies, or
-  `null`;
+  `null`. A job that leaves the deployment fence held, or whose outcome
+  is unknown, is followed by `--recover`, which waits for no running
+  job: it refuses while one holds the activation lock. A recovery that
+  leaves the fence is followed by itself too, unless it refused the
+  fence's kind, which no rerun changes.
+  A retirement that kept the Debian tree is followed by
+  `--postgres-binaries`, one that left material inside its window by
+  itself. Every retirement leaves its own job directory as material, so
+  that `next` never ends; following it is optional;
+- `status`: a job's last receipt status, such as `verified deployment`,
+  `already deployed and healthy`, `recovered` or `nothing to recover`;
+- `receipt`: the host path of the record the outcome was read from:
+  the job's receipt, or its `refusal.json`;
+- `not_before`: with `deferred` or a retirement that left material, the
+  Unix time the next retirement may remove some;
 - `host_key`: with `--write-target --host-key-sha256`, what happened to
   the enrolled key.
-
-A deployment operation prints the same line when its host's transport
-refuses it (`refused`, naming the step to run instead) and when a
-stepping-stone deploy verifies (`stepping-stone-deployed`, naming
-`--postgres-socket`); see [Leaving loopback TLS](#leaving-loopback-tls).
 
 ### Isolating production service accounts
 
@@ -1131,11 +1174,13 @@ The controller stages the notification monitor and digest configuration from
 the existing private configuration. Its sudoers entry permits only the
 eight fixed readiness and performance commands as the four service UIDs.
 After changing notification recipients or checks in the managed `config.json`,
-run `sudo ./td-mta-deploy --refresh-notifications` from a root-owned
-isolated deployment job directory (after rollback material is retired,
-the one a fresh `./td-mta/deploy` leaves). It validates those eight
-commands and atomically refreshes the derived private configuration. The
-next monitor and digest invocation use the new settings.
+run `./td-mta/deploy --refresh-notifications` from the development
+checkout. It is a job of its own that keeps the live release and touches
+no service: under the activation lock it requires the isolated
+identities and no deployment fence, validates those eight commands and
+atomically refreshes the derived private configuration
+(`notifications refreshed`). The next monitor and digest invocation use
+the new settings.
 
 1. The controller saves root-only credentials in
    `/var/lib/td-mta-operator/service-passwords.json`. Every activation
@@ -1170,21 +1215,24 @@ next monitor and digest invocation use the new settings.
    `--certificate-profile production --require-ready
    --minimum-validity-seconds 2592000`.
 4. After writer admission, keep the selected primary and subsequent mail.
-   To return to the recorded shared deployment, run the following from
-   the root-owned directory of the **identity cutover** job while its
-   candidate is still the selected release. Inspect `shared-rollback.json`
-   and repeat the public JMAP and SMTP checks afterward.
+   To return to the recorded shared deployment, run from the development
+   checkout:
 
-   ```sh
-   sudo ./td-mta-deploy --restore-shared-services
+   ```text
+   ./td-mta/deploy --restore-shared-services
    ```
 
-   Older job directories contain a private receipt and a deployment archive.
-   For rollback or notification refresh in one of those directories, stay
-   in the original job directory and invoke the absolute path to
-   `td-mta-deploy` from a newer verified Rust job under
-   `/var/lib/td-mta-operator/`. The Rust controller recovers the original
-   job fields from the private receipt.
+   The controller finds the **identity cutover** job as `--rollback`
+   finds the job it undoes: the latest activation or rollback that
+   installed the live release and left it selected. That job must be the
+   one that isolated the identities (`isolation_change`); after a later
+   binary activation between isolated releases it is not, and the
+   restore refuses. A cutover a restore already returned from refuses
+   too. The new job records it as `restore_of`, takes the revisions to
+   switch between and the epoch from its receipt, and keeps its own
+   receipt, with the launcher's public JMAP checks before (which may
+   fail) and after, like every other job. The launcher checks no SMTP:
+   repeat the public SMTP check afterward.
 
    This command qualifies the previous binary against the current epoch,
    configuration and shared grants, fences the writers, restores the

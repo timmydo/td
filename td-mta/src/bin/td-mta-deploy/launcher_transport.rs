@@ -3,7 +3,7 @@
 //! connection files (the stepping stone), then `--postgres-socket`, then
 //! main. Every other operation there refuses and names the step that is
 //! next. The boundaries are main commits, checked by ancestry.
-use super::{outcome, verdict, Local, Next, Options, Outcome};
+use super::{verdict, Local, Options, Refusal};
 use crate::{
     activate::{redacted_runtime_tls, FENCE, REDACT_RUNTIME, RUNTIME_CONNECTION},
     common::{child, fmt, owned, require},
@@ -110,17 +110,23 @@ fn argv<'a>(flags: &[&'a str], config: Option<&'a str>) -> R<Vec<&'a str>> {
     Ok(out)
 }
 
-/// Print the refusal's outcome line, naming `next` if any, and return its
-/// error.
+/// The refusal, naming `next` if any, whose outcome line `run` writes.
 fn refuse<T>(error: &str, next: Option<&[&str]>) -> R<T> {
-    outcome(&Outcome {
-        result: "refused",
-        host_key: None,
-        error: Some(error),
-        details: None,
-        next: next.map(|argv| Next { argv, needs: &[] }),
-    })?;
-    Err(owned(error)?.into())
+    let next = match next {
+        Some(argv) => {
+            let mut words = Vec::new();
+            for word in argv {
+                td_alloc::push(&mut words, owned(word)?)?;
+            }
+            Some(words)
+        }
+        None => None,
+    };
+    Err(Refusal {
+        error: owned(error)?,
+        next,
+    }
+    .into())
 }
 
 /// The command a stepping-stone deploy needs: `--skip-tests` when no
@@ -208,8 +214,8 @@ pub(super) fn decide(f: &Facts) -> Decision {
 }
 
 /// The stepping stone `run` deploys with TLS_CONTROLLER, or `None` when
-/// the operation proceeds as requested; a refusal prints its outcome and
-/// sets `reported`, so that convergence prints no second line.
+/// the operation proceeds as requested; a refusal is a `Refusal`, whose
+/// one outcome line `run` writes for every mode, convergence included.
 pub(super) fn plan(
     local: &Local,
     opts: &Options<'_>,
@@ -217,7 +223,6 @@ pub(super) fn plan(
     tip: &str,
     live: &str,
     verdicts: &Path,
-    reported: &mut bool,
 ) -> R<Option<(String, Option<String>)>> {
     let operation = operation(opts);
     let tls = local.loopback_tls()?;
@@ -271,7 +276,6 @@ pub(super) fn plan(
                 Some(flags) => Some(argv(flags, opts.config)?),
                 None => None,
             };
-            *reported = true;
             refuse(error, next.as_deref())
         }
         Decision::Stone => {
@@ -300,20 +304,6 @@ pub(super) fn built(built: R<PathBuf>) -> R<PathBuf> {
             ))?,
             None,
         )
-    })
-}
-
-/// The outcome of a verified stepping-stone deployment.
-pub(super) fn deployed(config: Option<&str>) -> R<()> {
-    outcome(&Outcome {
-        result: "stepping-stone-deployed",
-        host_key: None,
-        error: None,
-        details: None,
-        next: Some(Next {
-            argv: &argv(&["--postgres-socket"], config)?,
-            needs: &[],
-        }),
     })
 }
 

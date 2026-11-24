@@ -27,62 +27,19 @@ use std::{
     process::ExitCode,
 };
 pub type R<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-fn load_job(work: &Path, mode: &str, owner: u32) -> R<td_json::Json> {
+fn load_job(work: &Path, owner: u32) -> R<td_json::Json> {
     let path = child(work, "job.json")?;
-    let (source, legacy) = match td_fs::open_real_file(&path, "job") {
-        Ok(source) => (source, false),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && matches!(mode, "restore-shared-services" | "refresh-notifications") =>
-        {
-            // The original controller retained these job fields in its private
-            // receipt. Recovery reads the receipt and never executes the archive.
-            let archive = fs::symlink_metadata(child(work, "deploy.pyz")?)?;
-            require(
-                archive.is_file() && archive.uid() == owner && archive.mode() & 0o7777 == 0o600,
-                "invalid legacy deployment archive",
-            )?;
-            (
-                td_fs::open_real_file(&child(work, "receipt.json")?, "legacy receipt")?,
-                true,
-            )
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let (mut file, meta) = source;
-    let limit = if legacy { 1024 * 1024 } else { 4096 };
+    let (mut file, meta) = td_fs::open_real_file(&path, "job")?;
     require(
-        meta.uid() == owner && meta.mode() & 0o7777 == 0o600 && meta.len() <= limit,
+        meta.uid() == owner && meta.mode() & 0o7777 == 0o600 && meta.len() <= 4096,
         "invalid production job",
     )?;
     let mut bytes = td_alloc::filled(usize::try_from(meta.len())?, 0)?;
     file.read_exact(&mut bytes)?;
     require(file.read(&mut [0])? == 0, "job changed while reading")?;
-    let mut record = td_json::parse_slice(&bytes)?;
-    if legacy {
-        let mut job = td_json::Json::Obj(Vec::new());
-        for key in [
-            "revision",
-            "previous",
-            "tree",
-            "main",
-            "controller",
-            "budget",
-            "verdict",
-            "skip_tests",
-        ] {
-            let value = record
-                .remove(key)
-                .ok_or("incomplete legacy deployment receipt")?;
-            common::set(&mut job, key, value)?;
-        }
-        return Ok(job);
-    }
-    Ok(record)
+    Ok(td_json::parse_slice(&bytes)?)
 }
-// Only the PostgreSQL socket and binary switches', the rollback
-// retirement's, recovery's, rollback's and configuration convergence's
-// jobs name their operation; an activation job does not.
+// Every job but an activation names its operation.
 fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     let declared = match job.get("mode") {
         None => None,
@@ -91,8 +48,15 @@ fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     require(
         declared
             == match mode {
-                "postgres-socket" | "postgres-binaries" | "postgres-to-debian"
-                | "retire-rollback" | "recover" | "rollback" | "converge-config" => Some(mode),
+                "postgres-socket"
+                | "postgres-binaries"
+                | "postgres-to-debian"
+                | "retire-rollback"
+                | "recover"
+                | "rollback"
+                | "restore-shared-services"
+                | "refresh-notifications"
+                | "converge-config" => Some(mode),
                 _ => None,
             },
         "job operation does not match the requested mode",
@@ -109,10 +73,41 @@ fn supervise(mode: &str) -> R<()> {
             && meta.mode() & 0o7777 == 0o700,
         "private production job required",
     )?;
-    operate(&work, operator, mode)
+    let result = operate(&work, operator, mode);
+    if let Err(error) = &result {
+        // The refusal matters more than a failure to record it.
+        if let Err(e) = common::fmt(format_args!("{error}")).and_then(|text| refused(&work, &text))
+        {
+            eprintln!("td-mta-deploy: the refusal was not recorded: {e}");
+        }
+    }
+    result
 }
+/// The launcher reads a job's end from its receipt. A job refused before
+/// it reserved one records why beside where the receipt would be.
+fn refused(work: &Path, error: &str) -> R<()> {
+    if child(work, "receipt.json")?.try_exists()? {
+        return Ok(());
+    }
+    let mut record = td_json::Json::Obj(Vec::new());
+    common::set(
+        &mut record,
+        "status",
+        td_json::Json::Str(common::owned("refused")?),
+    )?;
+    common::set(
+        &mut record,
+        "error",
+        td_json::Json::Str(common::owned(error)?),
+    )?;
+    common::durable(&child(work, REFUSAL)?, &record)
+}
+/// The record of a job refused before it reserved its receipt.
+const REFUSAL: &str = "refusal.json";
+/// Another job holds the host; the launcher reports it as busy.
+pub(crate) const LOCKED: &str = "another production operation owns the activation lock";
 fn operate(work: &Path, operator: &Path, mode: &str) -> R<()> {
-    let job = load_job(work, mode, 0)?;
+    let job = load_job(work, 0)?;
     check_mode(&job, mode)?;
     let lock = OpenOptions::new()
         .write(true)
@@ -120,7 +115,7 @@ fn operate(work: &Path, operator: &Path, mode: &str) -> R<()> {
         .create(true)
         .mode(0o600)
         .open(child(operator, "activation.lock")?)?;
-    File::try_lock(&lock).map_err(|_| "another production operation owns the activation lock")?;
+    File::try_lock(&lock).map_err(|_| LOCKED)?;
     common::block_signals()?;
     let result = activate::run(job, mode);
     if mode == "postgres-binaries" {
@@ -173,27 +168,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn archived_jobs_only_supply_recovery_fields() -> R<()> {
-        let scratch = td_fs::TempDir::new("deploy-job-record")?;
-        let work = scratch.path();
-        let owner = fs::metadata(work)?.uid();
-        let archive = work.join("deploy.pyz");
-        let _file = File::create_new(&archive)?;
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&archive, fs::Permissions::from_mode(0o600))?;
-        let receipt = work.join("receipt.json");
-        let legacy = r#"{"controller":"c","revision":"r","previous":"p","tree":"t","main":"m","budget":60,"verdict":null,"skip_tests":false,"status":"verified deployment","events":[]}"#;
-        fs::write(&receipt, legacy)?;
-        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600))?;
-        let job = load_job(work, "restore-shared-services", owner)?;
-        assert!(job.get("events").is_none());
+    fn a_refusal_before_the_receipt_is_recorded_beside_it() -> R<()> {
+        let dir = td_fs::TempDir::new("deploy-refusal")?;
+        refused(dir.path(), LOCKED)?;
+        let record = td_json::parse(&fs::read_to_string(dir.path().join(REFUSAL))?)?;
         assert_eq!(
-            job.get("revision").and_then(td_json::Json::as_str),
-            Some("r")
+            record.get("error").and_then(td_json::Json::as_str),
+            Some(LOCKED)
         );
-        assert!(load_job(work, "activate", owner).is_err());
-        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o644))?;
-        assert!(load_job(work, "refresh-notifications", owner).is_err());
+        assert_eq!(
+            record.get("status").and_then(td_json::Json::as_str),
+            Some("refused")
+        );
+        // Once the job has its receipt, the receipt says how it ended.
+        fs::remove_file(dir.path().join(REFUSAL))?;
+        fs::write(dir.path().join("receipt.json"), "{}")?;
+        refused(dir.path(), "later")?;
+        assert!(!dir.path().join(REFUSAL).exists());
         Ok(())
     }
 
@@ -202,14 +193,14 @@ mod tests {
         let plain = td_json::parse(r#"{"revision":"r"}"#)?;
         let socket = td_json::parse(r#"{"revision":"r","mode":"postgres-socket"}"#)?;
         let other = td_json::parse(r#"{"revision":"r","mode":"activate"}"#)?;
-        for mode in [
-            "activate",
-            "restore-shared-services",
-            "refresh-notifications",
-        ] {
-            check_mode(&plain, mode)?;
-            assert!(check_mode(&socket, mode).is_err());
-            assert!(check_mode(&other, mode).is_err());
+        check_mode(&plain, "activate")?;
+        assert!(check_mode(&socket, "activate").is_err());
+        assert!(check_mode(&other, "activate").is_err());
+        for mode in ["restore-shared-services", "refresh-notifications"] {
+            let named = td_json::parse(&format!(r#"{{"revision":"r","mode":"{mode}"}}"#))?;
+            check_mode(&named, mode)?;
+            assert!(check_mode(&plain, mode).is_err());
+            assert!(check_mode(&named, "activate").is_err());
         }
         check_mode(&socket, "postgres-socket")?;
         assert!(check_mode(&plain, "postgres-socket").is_err());

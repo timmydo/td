@@ -41,6 +41,8 @@ pub(super) struct Launch {
 pub(super) struct Session {
     pub(super) reported: bool,
     pub(super) launched: Option<Launch>,
+    /// This run's own command, which follows `busy`.
+    pub(super) again: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -77,8 +79,16 @@ pub(super) fn unreported(
         return Ok(());
     }
     match &session.launched {
-        None => write(out, "refused", Some(error), None, None, carried)?,
-        Some(launch) => write(out, "unknown", Some(error), None, Some(launch), carried)?,
+        None => write(out, "refused", Some(error), None, None, carried, &[])?,
+        Some(launch) => write(
+            out,
+            "unknown",
+            Some(error),
+            None,
+            Some(launch),
+            carried,
+            &[],
+        )?,
     }
     session.reported = true;
     Ok(())
@@ -89,6 +99,8 @@ pub(super) enum Receipt<'a> {
     Text(&'a str),
     /// The host has none: the supervisor refused before reserving it.
     Missing,
+    /// None, and the supervisor recorded why it refused in refusal.json.
+    Refused(&'a str),
     /// It could not be read, so nothing is known.
     Unreadable,
 }
@@ -107,7 +119,7 @@ pub(super) fn finish(
 ) -> R<()> {
     let record = match receipt {
         Receipt::Text(text) => td_json::parse(text).ok(),
-        Receipt::Missing | Receipt::Unreadable => None,
+        Receipt::Missing | Receipt::Refused(_) | Receipt::Unreadable => None,
     };
     let settled = record
         .as_ref()
@@ -125,6 +137,11 @@ pub(super) fn finish(
             (result, Some(recorded.unwrap_or("the host job failed")))
         }
         (Some(result), _, _) => (result, recorded),
+        // Another job held the host: this one changed nothing.
+        (None, Receipt::Refused(error), Job::Failed) if *error == crate::LOCKED => {
+            ("busy", Some(*error))
+        }
+        (None, Receipt::Refused(error), Job::Failed) => ("refused", Some(*error)),
         (None, Receipt::Missing, Job::Failed) => (
             "refused",
             Some("the host job refused before writing its receipt; see its unit's journal"),
@@ -156,6 +173,7 @@ pub(super) fn finish(
         record.as_ref(),
         session.launched.as_ref(),
         carried,
+        &session.again,
     )?;
     session.reported = true;
     match error {
@@ -166,8 +184,8 @@ pub(super) fn finish(
 
 /// The shared outcome line (`super::Outcome`) for a convergence: the
 /// selected version, what changed, the job's receipt and unit, any units
-/// the job restarted, and after a successful plan the apply command bound
-/// to its digest.
+/// the job restarted, after a successful plan the apply command bound to
+/// its digest, and after `busy` this run's own command, `again`.
 pub(super) fn write(
     out: &mut impl Write,
     result: &str,
@@ -175,6 +193,7 @@ pub(super) fn write(
     record: Option<&Json>,
     launch: Option<&Launch>,
     carried: &[&str],
+    again: &[String],
 ) -> R<()> {
     let mut details = Json::Obj(Vec::new());
     if let Some(launch) = launch {
@@ -220,6 +239,15 @@ pub(super) fn write(
                 ],
             )?;
             td_alloc::extend_from_slice(&mut argv, carried)?;
+            Some(Next {
+                argv: &argv,
+                needs: &[],
+            })
+        }
+        ("busy", _, _) if !again.is_empty() => {
+            for word in again {
+                td_alloc::push(&mut argv, word.as_str())?;
+            }
             Some(Next {
                 argv: &argv,
                 needs: &[],

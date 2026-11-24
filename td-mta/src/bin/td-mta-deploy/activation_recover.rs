@@ -14,7 +14,8 @@ const SEALED: &str = "exact recovery point verified";
 const FAILED: &str = "deployment failed";
 const FENCING: &str = "fencing";
 const VERIFIED: &str = "verified deployment";
-/// The record of a shared-service restore, in its deployment's directory.
+/// The record of a shared-service restore run by hand in its cutover's
+/// directory, before restores were jobs of their own.
 const SHARED: &str = "shared-rollback.json";
 const RECEIPT_BOUND: u64 = 1024 * 1024;
 /// In the fenced job's directory once a recovery chose to roll it back:
@@ -81,13 +82,8 @@ pub(super) fn classify(
             stopped: events.contains(&SEALED),
         },
         "postgres-binaries" | "postgres-to-debian" => Interrupted::Switch,
-        "postgres-socket" => {
-            return Err(
-                "the fence belongs to the loopback-TLS socket cutover, which --recover does not model: its receipt's socket_files and socket_originals name what it changed"
-                    .into(),
-            )
-        }
-        _ => return Err("the fenced job's operation never holds a deployment fence".into()),
+        "postgres-socket" => return Err(crate::activate::SOCKET_FENCE.into()),
+        _ => return Err(crate::activate::NO_FENCE.into()),
     })
 }
 
@@ -182,6 +178,53 @@ pub(super) fn rollback_job(mut job: Json, op: &Path, work: &Path, releases: &Pat
         Json::Str(owned(dir.to_str().ok_or("job path")?)?),
     )?;
     Ok(job)
+}
+
+/// `--restore-shared-services`: `job` (live release in `revision`) returns
+/// from the identity cutover, the latest activation or rollback in `op`
+/// that installed the live release, which must be the one that isolated
+/// the identities and one no restore has returned from yet. Its
+/// receipt's `previous` becomes the job's, as `restore_of` names it.
+pub(super) fn restore_job(mut job: Json, op: &Path, work: &Path) -> R<Json> {
+    let live = owned(field(&job, "revision")?)?;
+    let (dir, last) = installed(op, work, &live)?
+        .ok_or("no retained activation installed the live release: nothing to restore")?;
+    require(
+        last.get("isolation_change").and_then(Json::as_bool) == Some(true),
+        "the activation that installed the live release did not isolate the service identities: the shared identities return only from the identity cutover while its release is live",
+    )?;
+    require(
+        !restored(op, work, &dir)?,
+        "a restore already returned from this identity cutover",
+    )?;
+    let previous = owned(field(&last, "previous")?)?;
+    require(
+        lower_hex(&previous, 40),
+        "invalid recorded previous release",
+    )?;
+    set(&mut job, "previous", Json::Str(previous))?;
+    set(
+        &mut job,
+        "restore_of",
+        Json::Str(owned(dir.to_str().ok_or("job path")?)?),
+    )?;
+    Ok(job)
+}
+
+/// Whether a restore verified the shared identities from `cutover`: a
+/// restore run by hand in its directory, or a restore or recovery job
+/// naming it.
+fn restored(op: &Path, exclude: &Path, cutover: &Path) -> R<bool> {
+    let verified = |record: &Json| -> R<bool> { Ok(messages(record)?.contains(&SHARED_RESTORED)) };
+    let beside = child(cutover, SHARED)?;
+    if beside.try_exists()? && verified(&read_json(&beside, RECEIPT_BOUND)?)? {
+        return Ok(true);
+    }
+    let named = cutover.to_str().ok_or("job path")?;
+    Ok(latest(op, exclude, false, |record| {
+        Ok(record.get("restore_of").and_then(Json::as_str) == Some(named) && verified(record)?)
+    })?
+    .is_some())
 }
 
 /// The latest activation or rollback whose `revision` is `live` and that
@@ -328,8 +371,11 @@ impl Deployment {
         };
         let events = messages(&receipt)?;
         // Every migration and switch closes the socket; nothing else does.
-        let socket_fence = !shared
-            && (!matches!(mode, "activate" | "rollback") || receipt.get("recovery").is_some());
+        let socket_fence = match mode {
+            "restore-shared-services" => false,
+            "activate" | "rollback" => receipt.get("recovery").is_some(),
+            _ => true,
+        };
         let pg_fence = Path::new(PG_FENCE).try_exists()?;
         let decided = child(&job, DECIDED)?;
         let state = classify(mode, &events, socket_fence, pg_fence, decided.try_exists()?)?;
@@ -549,8 +595,19 @@ impl Deployment {
             Path::new(RELEASES),
             &fmt(format_args!("git-{}/td-mta", field(receipt, "previous")?))?,
         )?;
-        // The deployment's receipt holds the epoch; the restore's does not.
-        let deployment = read_json(&child(job, "receipt.json")?, RECEIPT_BOUND)?;
+        // The cutover's receipt holds the epoch; the restore's does not. A
+        // restore job names it; a restore run by hand wrote its record in it.
+        let cutover = receipt
+            .get("restore_of")
+            .and_then(Json::as_str)
+            .map_or(job, Path::new);
+        let deployment = read_json(&child(cutover, "receipt.json")?, RECEIPT_BOUND)?;
+        // A restore this finishes is one restore_job sees.
+        set(
+            &mut self.record,
+            "restore_of",
+            Json::Str(owned(cutover.to_str().ok_or("job path")?)?),
+        )?;
         self.journal_identity()?;
         require(
             self.epoch == field(&deployment, "store_epoch")?,

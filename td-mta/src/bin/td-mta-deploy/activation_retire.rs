@@ -321,7 +321,7 @@ impl Deployment {
         }
         require(
             !past.is_empty() || !tombstones.is_empty() || next.is_none(),
-            "all rollback material is inside its 7-day window: run td-mta/deploy --retire-rollback --irreversible after rollback_retire_not_before",
+            INSIDE_WINDOW,
         )?;
         // Every check before the first removal.
         let bound = 1024 * 1024;

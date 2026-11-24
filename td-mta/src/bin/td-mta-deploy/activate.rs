@@ -58,6 +58,14 @@ const UNITS: &[&str] = &[
     ACME,
 ];
 const SHARED_RESTORED: &str = "shared release verified against current primary";
+/// The fences --recover refuses by their kind: no rerun finishes them.
+pub(crate) const SOCKET_FENCE: &str = "the fence belongs to the loopback-TLS socket cutover, which --recover does not model: its receipt's socket_files and socket_originals name what it changed";
+pub(crate) const NO_FENCE: &str = "the fenced job's operation never holds a deployment fence";
+pub(crate) const UNRECOVERABLE: &[&str] = &[SOCKET_FENCE, NO_FENCE];
+/// The refusals whose outcome names the command that follows.
+pub(crate) const MIGRATES: &str =
+    "this release migrates the database, which cannot be rolled back: run td-mta/deploy --irreversible";
+pub(crate) const INSIDE_WINDOW: &str = "all rollback material is inside its 7-day window: run td-mta/deploy --retire-rollback --irreversible after rollback_retire_not_before";
 const SELECTED: &str = "SELECT encode(version_id,'hex') FROM td_mta.config_selection";
 
 fn now() -> R<f64> {
@@ -120,30 +128,6 @@ fn start_receipt(path: &Path, record: &Json) -> R<()> {
     durable(path, record)
 }
 
-fn require_pending_rollback(work: &Path) -> R<()> {
-    let path = child(work, "shared-rollback.json")?;
-    if path.try_exists()? {
-        let prior = read_json(&path, 1024 * 1024)?;
-        let verified = prior
-            .get("events")
-            .and_then(Json::as_arr)
-            .is_some_and(|events| {
-                events.iter().any(|event| {
-                    event
-                        .as_arr()
-                        .and_then(|row| row.get(1))
-                        .and_then(Json::as_str)
-                        == Some(SHARED_RESTORED)
-                })
-            });
-        require(
-            field(&prior, "status")? != SHARED_RESTORED && !verified,
-            "this job already completed shared rollback",
-        )?;
-    }
-    Ok(())
-}
-
 fn parse_output(out: &std::process::Output) -> R<Json> {
     Ok(td_json::parse_slice(&out.stdout)?)
 }
@@ -199,44 +183,17 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "PostgreSQL still uses loopback TLS: run td-mta/deploy, which names the next step",
     )?;
     host.select_tools(binaries::selected()?);
-    let job = if mode == "rollback" {
-        recover::rollback_job(job, Path::new(OP), &work, Path::new(RELEASES))?
-    } else {
-        job
+    let job = match mode {
+        "rollback" => recover::rollback_job(job, Path::new(OP), &work, Path::new(RELEASES))?,
+        "restore-shared-services" => recover::restore_job(job, Path::new(OP), &work)?,
+        _ => job,
     };
     let mut deployment = Deployment::new(host, work, job, tls, &config, mode == "recover")?;
-    if mode == "refresh-notifications" {
-        require(
-            deployment.isolated && !Path::new(FENCE).try_exists()?,
-            "active isolated service settings required",
-        )?;
-        return isolation::prepare_notifications(&deployment.host);
-    }
-    if mode == "restore-shared-services" {
-        // Check job history under the host lock even if a later job isolated
-        // the same release again. This precedes the rollback failure writer.
-        require_pending_rollback(&deployment.work)?;
-        require(
-            deployment.isolated,
-            "shared service identities are already selected",
-        )?;
-    }
-    if matches!(
-        mode,
-        "activate"
-            | "postgres-socket"
-            | "postgres-binaries"
-            | "postgres-to-debian"
-            | "retire-rollback"
-            | "recover"
-            | "rollback"
-            | "converge-config"
-    ) {
-        // Reserve the first activation receipt under the host lock. A repeated
-        // invocation must leave the original event and recovery evidence intact.
-        start_receipt(&deployment.receipt, &deployment.record)?;
-    }
+    // Reserve the job's receipt under the host lock. A repeated invocation
+    // must leave the original event and recovery evidence intact.
+    start_receipt(&deployment.receipt, &deployment.record)?;
     let result = match mode {
+        "refresh-notifications" => deployment.refresh_notifications(),
         "restore-shared-services" => deployment.restore_shared_services(),
         "activate" | "rollback" => deployment.execute(),
         "postgres-socket" => deployment.postgres_socket(),
@@ -450,7 +407,7 @@ impl Deployment {
         )?;
         require(
             !migrate || self.record.get("irreversible").and_then(Json::as_bool) == Some(true),
-            "this release migrates the database, which cannot be rolled back: run td-mta/deploy --irreversible",
+            MIGRATES,
         )?;
         let mut recovery = None;
         let result = self.cutover(migrate, &mut recovery);
@@ -626,10 +583,25 @@ impl Deployment {
         Ok(())
     }
 
+    fn refresh_notifications(&mut self) -> R<()> {
+        require(
+            self.isolated && !Path::new(FENCE).try_exists()?,
+            "refreshing notifications needs the isolated service identities and no deployment fence",
+        )?;
+        require(
+            self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous,
+            "refreshing notifications keeps the live release",
+        )?;
+        isolation::prepare_notifications(&self.host)?;
+        self.event("notifications refreshed")?;
+        Ok(())
+    }
+
+    /// The identity cutover `restore_of` names, which `restore_job` chose
+    /// and checked, back to the shared identities on the same primary.
     fn restore_shared_services(&mut self) -> R<()> {
-        let rollback = child(&self.work, "shared-rollback.json")?;
-        let deployment_receipt = std::mem::replace(&mut self.receipt, rollback);
-        let original = read_json(&deployment_receipt, 1024 * 1024)?;
+        let cutover = PathBuf::from(owned(field(&self.record, "restore_of")?)?);
+        let original = read_json(&child(&cutover, "receipt.json")?, 1024 * 1024)?;
         require(
             original.get("isolation_change").and_then(Json::as_bool) == Some(true)
                 && field(&original, "revision")? == field(&self.record, "revision")?
@@ -637,9 +609,11 @@ impl Deployment {
             "incorrect cutover receipt",
         )?;
         require(
-            self.isolated
-                && !Path::new(FENCE).try_exists()?
-                && fs::canonicalize(ACTIVE)? == self.candidate,
+            self.isolated,
+            "shared service identities are already selected",
+        )?;
+        require(
+            !Path::new(FENCE).try_exists()? && fs::canonicalize(ACTIVE)? == self.candidate,
             "active release or identity state changed",
         )?;
         self.check_source()?;
@@ -814,35 +788,6 @@ mod tests {
         fn recovery_state(&mut self) -> Writers {
             self.writers
         }
-    }
-
-    #[test]
-    fn completed_job_cannot_repeat_shared_rollback() -> R<()> {
-        let temp = td_fs::TempDir::new("deployment-shared-retry")?;
-        require_pending_rollback(temp.path())?;
-        let path = temp.path().join("shared-rollback.json");
-        let mut receipt = Json::Obj(Vec::new());
-        set(&mut receipt, "status", "deployment failed".into())?;
-        durable(&path, &receipt)?;
-        require_pending_rollback(temp.path())?;
-        set(&mut receipt, "status", SHARED_RESTORED.into())?;
-        durable(&path, &receipt)?;
-        assert!(require_pending_rollback(temp.path()).is_err());
-        assert_eq!(read_json(&path, 4096)?, receipt);
-        // Diagnostics or cleanup can fail after services have been verified.
-        set(&mut receipt, "status", "deployment failed".into())?;
-        set(
-            &mut receipt,
-            "events",
-            Json::Arr(vec![
-                Json::Arr(vec![1_u64.into(), SHARED_RESTORED.into()]),
-                Json::Arr(vec![2_u64.into(), "deployment failed".into()]),
-            ]),
-        )?;
-        durable(&path, &receipt)?;
-        assert!(require_pending_rollback(temp.path()).is_err());
-        assert_eq!(read_json(&path, 4096)?, receipt);
-        Ok(())
     }
 
     #[test]

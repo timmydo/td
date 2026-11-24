@@ -423,3 +423,100 @@ fn a_fenced_rollback_recovers_as_an_activation() {
         Interrupted::Activation { stopped: true }
     );
 }
+
+#[test]
+fn a_restore_returns_only_from_the_live_identity_cutover_once() {
+    let dir = td_fs::TempDir::new("recover-restore").unwrap();
+    let op = dir.path().join("op");
+    fs::create_dir_all(&op).unwrap();
+    let me = op.join("deploy-restore0");
+    let (old, live) = ("a".repeat(40), "b".repeat(40));
+    let spec =
+        format!(r#"{{"previous":"{live}","revision":"{live}","mode":"restore-shared-services"}}"#);
+    let attempt = || restore_job(td_json::parse(&spec).unwrap(), &op, &me);
+    let activation = |started: f64, isolating: bool| {
+        let mut record = receipt(started, &["fencing", OPENING, VERIFIED]);
+        set(&mut record, "revision", Json::Str(live.clone())).unwrap();
+        set(&mut record, "previous", Json::Str(old.clone())).unwrap();
+        set(&mut record, "isolation_change", Json::Bool(isolating)).unwrap();
+        record
+    };
+    assert!(attempt()
+        .unwrap_err()
+        .to_string()
+        .contains("nothing to restore"));
+    let cutover = job(
+        &op,
+        "deploy-isolate0",
+        "receipt.json",
+        &activation(1.0, true),
+    );
+    let restore = attempt().unwrap();
+    assert_eq!(field(&restore, "previous").unwrap(), old);
+    assert_eq!(field(&restore, "revision").unwrap(), live);
+    assert_eq!(
+        field(&restore, "restore_of").unwrap(),
+        cutover.to_str().unwrap()
+    );
+    // A failed restore leaves it to return from; a verified one does not,
+    // whether a restore job or the first controllers' record says so.
+    let mut failed = receipt(2.0, &["fencing", FAILED]);
+    set(
+        &mut failed,
+        "restore_of",
+        Json::Str(cutover.to_str().unwrap().to_string()),
+    )
+    .unwrap();
+    set(
+        &mut failed,
+        "mode",
+        Json::Str("restore-shared-services".to_string()),
+    )
+    .unwrap();
+    let earlier = job(&op, "deploy-restore1", "receipt.json", &failed);
+    assert!(attempt().is_ok());
+    let mut verified = failed.clone();
+    set(
+        &mut verified,
+        "events",
+        receipt(2.0, &["fencing", SHARED_RESTORED])
+            .get("events")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    durable(&earlier.join("receipt.json"), &verified).unwrap();
+    assert!(attempt()
+        .unwrap_err()
+        .to_string()
+        .contains("already returned"));
+    fs::remove_dir_all(&earlier).unwrap();
+    assert!(attempt().is_ok());
+    // A recovery that finished an interrupted restore names it too.
+    set(&mut verified, "mode", Json::Str("recover".to_string())).unwrap();
+    let recovery = job(&op, "deploy-recover0", "receipt.json", &verified);
+    assert!(attempt()
+        .unwrap_err()
+        .to_string()
+        .contains("already returned"));
+    fs::remove_dir_all(&recovery).unwrap();
+    assert!(attempt().is_ok());
+    durable(&cutover.join(SHARED), &receipt(3.0, &[SHARED_RESTORED])).unwrap();
+    assert!(attempt()
+        .unwrap_err()
+        .to_string()
+        .contains("already returned"));
+    fs::remove_file(cutover.join(SHARED)).unwrap();
+    // A later binary activation between isolated releases installed the
+    // live release: the cutover is no longer what returns.
+    job(
+        &op,
+        "deploy-binary00",
+        "receipt.json",
+        &activation(4.0, false),
+    );
+    assert!(attempt()
+        .unwrap_err()
+        .to_string()
+        .contains("did not isolate"));
+}

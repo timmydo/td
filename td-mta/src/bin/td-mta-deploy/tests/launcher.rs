@@ -863,3 +863,283 @@ fn the_live_drop_in_reads_back_as_the_controller_wrote_it() {
     );
     assert_eq!(remote_text("").unwrap(), "\n");
 }
+
+/// A run's arguments and what they parse to.
+fn run_of(args: &[&str]) -> (&'static [String], R<Options<'static>>) {
+    let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let leaked: &'static [String] = Vec::leak(owned);
+    (leaked, parse(leaked))
+}
+
+fn options(args: &[&str]) -> R<Options<'static>> {
+    run_of(args).1
+}
+
+#[test]
+fn the_restore_and_the_refresh_are_jobs_of_their_own() {
+    let one = |args: &[&str]| options(args).is_ok();
+    assert!(options(&["--restore-shared-services"]).unwrap().restore);
+    assert!(one(&[
+        "--restore-shared-services",
+        "--window-seconds",
+        "90",
+        "--jmap-account",
+        "a"
+    ]));
+    assert!(
+        options(&["--refresh-notifications", "--config", "/t.json"])
+            .unwrap()
+            .refresh
+    );
+    for args in [
+        &["--restore-shared-services", "--rollback"][..],
+        &["--restore-shared-services", "--irreversible"],
+        &["--restore-shared-services", "--refresh-notifications"],
+        &["--refresh-notifications", "--window-seconds", "90"],
+        &["--refresh-notifications", "--jmap-account", "a"],
+        &["--refresh-notifications", "--recover"],
+        &["--restore-shared-services", "--converge-config"],
+        &["--refresh-notifications", "--converge-config"],
+    ] {
+        assert!(!one(args), "{args:?}");
+    }
+    // An unknown option is named, not answered with the whole help.
+    let unknown = options(&["--restore"]).err().unwrap().to_string();
+    assert_eq!(
+        unknown,
+        "unknown option --restore: td-mta/deploy --help lists them"
+    );
+}
+
+#[test]
+fn a_refusal_names_the_command_it_asks_for() {
+    assert_eq!(
+        named("PostgreSQL still uses loopback TLS: run td-mta/deploy --postgres-socket"),
+        Some(vec!["--postgres-socket"])
+    );
+    assert_eq!(
+        named("too slow: run td-mta/deploy --postgres-binaries --window-seconds 1320"),
+        Some(vec!["--postgres-binaries", "--window-seconds", "1320"])
+    );
+    assert_eq!(
+        named("x: run td-mta/deploy --postgres-binaries --to-debian again"),
+        Some(vec!["--postgres-binaries", "--to-debian"])
+    );
+    assert_eq!(named("run td-mta/deploy 5 --x"), None);
+    assert_eq!(named("production release changed"), None);
+    assert_eq!(
+        named("cannot be undone: run td-mta/deploy --retire-rollback --irreversible"),
+        None
+    );
+}
+
+#[test]
+fn a_job_outcome_names_what_follows_from_its_end() {
+    let (retire_args, retire) =
+        run_of(&["--retire-rollback", "--irreversible", "--config", "/t.json"]);
+    let retire = retire.unwrap();
+    let (deploy_args, deploy) = run_of(&["--skip-tests", "--window-seconds", "90"]);
+    let deploy = deploy.unwrap();
+    let (recover_args, recover) = run_of(&["--recover"]);
+    let recover = recover.unwrap();
+    let (restore_args, restore) = run_of(&["--restore-shared-services"]);
+    let restore = restore.unwrap();
+    let job = |exit: Option<i32>, record: &str, fence: Option<bool>, post: Option<bool>| Job {
+        receipt: "/var/lib/td-mta-operator/deploy-abcdefgh/receipt.json".to_string(),
+        record: td_json::parse(record).ok(),
+        exit,
+        fence,
+        post,
+        stepping: false,
+    };
+    let at_deploy = |j: &Job| ended(&deploy, deploy_args, j).unwrap();
+    let argv = |end: &Ended| end.next.clone().unwrap_or_default().join(" ");
+    let verified = job(
+        Some(0),
+        r#"{"status":"verified deployment"}"#,
+        Some(false),
+        Some(true),
+    );
+    let done = at_deploy(&verified);
+    assert_eq!(done.result, "succeeded");
+    assert!(done.next.is_none() && done.error.is_none());
+    let mut written = Vec::new();
+    write_job_outcome(&mut written, &done, &verified).unwrap();
+    let line = String::from_utf8(written).unwrap();
+    let json = line
+        .trim()
+        .strip_prefix("td-mta-deploy-outcome ")
+        .map(td_json::parse)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        json.get("status").and_then(Json::as_str),
+        Some("verified deployment")
+    );
+    assert_eq!(
+        json.get("receipt").and_then(Json::as_str),
+        Some(verified.receipt.as_str())
+    );
+    assert!(json.get("next").unwrap().is_null());
+    // A failed public check after a finished activation leaves the
+    // rollback to the operator; after another job it keeps what follows
+    // that job.
+    let unchecked = at_deploy(&job(Some(0), "{}", Some(false), Some(false)));
+    assert_eq!(unchecked.result, "check-failed");
+    assert!(unchecked.next.is_none());
+    assert!(unchecked.error.unwrap().contains("--rollback"));
+    let restored = ended(
+        &restore,
+        restore_args,
+        &job(Some(0), "{}", Some(false), Some(false)),
+    )
+    .unwrap();
+    assert_eq!(restored.result, "check-failed");
+    assert!(restored.next.is_none());
+    // A held fence and an unknown end are followed by recovery, a
+    // recovery's own too.
+    let at_recover = |j: &Job| ended(&recover, recover_args, j).unwrap();
+    for end in [
+        at_deploy(&job(Some(1), r#"{"error":"x"}"#, Some(true), Some(false))),
+        at_deploy(&job(Some(255), "{}", Some(false), Some(false))),
+        at_deploy(&job(None, "{}", None, None)),
+        at_deploy(&job(Some(1), r#"{"error":"x"}"#, None, Some(true))),
+        at_recover(&job(Some(255), "{}", None, Some(true))),
+        at_recover(&job(
+            Some(1),
+            r#"{"error":"timed out"}"#,
+            Some(true),
+            Some(true),
+        )),
+    ] {
+        assert_eq!(argv(&end), "td-mta/deploy --recover");
+        assert!(end.error.is_some());
+    }
+    let unknown = at_deploy(&job(Some(255), "{}", None, None));
+    assert_eq!(unknown.result, "unknown");
+    // A fence recovery refuses by its kind is not rerun, and a recovery
+    // that left no fence does not follow its own refusal.
+    for refusal in crate::activate::UNRECOVERABLE {
+        let record = format!(r#"{{"error":"{refusal}"}}"#);
+        let end = at_recover(&job(Some(1), &record, Some(true), Some(true)));
+        assert_eq!((end.result, end.next.is_none()), ("failed", true));
+    }
+    let fenced = r#"{"error":"unfinished deployment fence: run td-mta/deploy --recover"}"#;
+    assert!(at_recover(&job(Some(1), fenced, Some(false), Some(true)))
+        .next
+        .is_none());
+    let locked = format!(r#"{{"status":"refused","error":"{}"}}"#, crate::LOCKED);
+    let waits = at_recover(&job(Some(1), &locked, Some(true), Some(true)));
+    assert_eq!(waits.result, "busy");
+    assert_eq!(argv(&waits), "td-mta/deploy --recover");
+    // Another job holding the host: this one is repeated as it was.
+    let busy = at_deploy(&job(Some(1), &locked, Some(true), Some(true)));
+    assert_eq!(busy.result, "busy");
+    assert_eq!(
+        argv(&busy),
+        "td-mta/deploy --skip-tests --window-seconds 90"
+    );
+    // The migration refusal is a decision the next command takes; it
+    // keeps the run's own options.
+    let migrates = format!(r#"{{"error":"{}"}}"#, crate::activate::MIGRATES);
+    let refused = at_deploy(&job(Some(1), &migrates, Some(false), Some(true)));
+    assert_eq!(refused.result, "refused-irreversible");
+    assert_eq!(
+        argv(&refused),
+        "td-mta/deploy --skip-tests --window-seconds 90 --irreversible"
+    );
+    // Retirement inside the window, after it with material left, and
+    // keeping the Debian tree.
+    let window = format!(
+        r#"{{"error":"{}","rollback_retire_not_before":1700000000}}"#,
+        crate::activate::INSIDE_WINDOW
+    );
+    let at_retire = |j: &Job| ended(&retire, retire_args, j).unwrap();
+    let deferred = at_retire(&job(Some(1), &window, Some(false), Some(true)));
+    assert_eq!(deferred.result, "deferred");
+    assert_eq!(deferred.not_before, Some(1_700_000_000));
+    assert_eq!(
+        argv(&deferred),
+        "td-mta/deploy --retire-rollback --irreversible --config /t.json"
+    );
+    let left = r#"{"rollback_retire_not_before":1700000000}"#;
+    let partial = at_retire(&job(Some(0), left, Some(false), Some(true)));
+    assert_eq!(partial.result, "succeeded");
+    assert_eq!(partial.not_before, Some(1_700_000_000));
+    assert_eq!(argv(&partial), argv(&deferred));
+    let checked = at_retire(&job(Some(0), left, Some(false), Some(false)));
+    assert_eq!(checked.result, "check-failed");
+    assert_eq!(checked.not_before, Some(1_700_000_000));
+    assert_eq!(argv(&checked), argv(&deferred));
+    let tree = r#"{"debian_tree_kept":"why"}"#;
+    let kept = at_retire(&job(Some(0), tree, Some(false), Some(true)));
+    assert_eq!(
+        argv(&kept),
+        "td-mta/deploy --postgres-binaries --config /t.json"
+    );
+    // A refusal naming a command, whether recorded in the receipt or
+    // before it, is followed by that command; any other names none.
+    let socket = r#"{"status":"refused","error":"PostgreSQL still uses loopback TLS: run td-mta/deploy --postgres-socket"}"#;
+    let named = at_deploy(&job(Some(1), socket, Some(false), Some(true)));
+    assert_eq!(named.result, "failed");
+    assert_eq!(argv(&named), "td-mta/deploy --postgres-socket");
+    let changed = r#"{"error":"production release changed"}"#;
+    let other = at_deploy(&job(Some(1), changed, Some(false), Some(true)));
+    assert_eq!(other.result, "failed");
+    assert!(other.next.is_none());
+    let silent = at_deploy(&job(Some(1), "", Some(false), Some(true)));
+    assert!(silent.error.unwrap().contains("journal"));
+}
+
+#[test]
+fn a_stepping_stone_job_ends_naming_the_socket_or_nothing_recover_would_misjudge() {
+    let (args, opts) = run_of(&["--irreversible", "--config", "/t.json"]);
+    let opts = opts.unwrap();
+    let job = |exit: Option<i32>, fence: Option<bool>, post: Option<bool>| Job {
+        receipt: "/var/lib/td-mta-operator/deploy-abcdefgh/receipt.json".to_string(),
+        record: td_json::parse(r#"{"status":"verified deployment"}"#).ok(),
+        exit,
+        fence,
+        post,
+        stepping: true,
+    };
+    let at = |j: &Job| ended(&opts, args, j).unwrap();
+    let done = at(&job(Some(0), Some(false), Some(true)));
+    assert_eq!(done.result, "stepping-stone-deployed");
+    assert_eq!(
+        done.next.unwrap().join(" "),
+        "td-mta/deploy --postgres-socket --config /t.json"
+    );
+    let checked = at(&job(Some(0), Some(false), Some(false)));
+    assert_eq!(checked.result, "check-failed");
+    assert!(checked.next.is_none());
+    // Lost, fenced or unknown: never --recover, which does not model it.
+    for (exit, fence, result) in [
+        (None, None, "unknown"),
+        (Some(255), Some(false), "unknown"),
+        (Some(1), Some(true), "failed"),
+        (Some(1), None, "failed"),
+    ] {
+        let end = at(&job(exit, fence, Some(true)));
+        assert_eq!(end.result, result);
+        assert!(end.next.is_none());
+        assert!(end.error.unwrap().contains("Leaving loopback TLS"));
+    }
+}
+
+#[test]
+fn a_refusal_before_the_job_carries_its_next_command() {
+    let refusal: Box<dyn std::error::Error + Send + Sync> = Box::new(Refusal {
+        error: "deploy the stepping-stone release first".to_string(),
+        next: Some(vec![
+            "td-mta/deploy".to_string(),
+            "--irreversible".to_string(),
+        ]),
+    });
+    assert_eq!(
+        refusal.to_string(),
+        "deploy the stepping-stone release first"
+    );
+    let refusal = refusal.downcast::<Refusal>().unwrap();
+    assert_eq!(refusal.next.unwrap(), ["td-mta/deploy", "--irreversible"]);
+}

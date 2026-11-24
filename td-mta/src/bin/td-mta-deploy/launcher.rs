@@ -30,12 +30,17 @@ mod transport;
 
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
+const FENCE: &str = "/var/lib/td-mta-operator/deployment-fence";
+/// A stepping-stone job that ended unseen or left its fence.
+const STEPPING_LEFT: &str = "the stepping-stone job ended unseen or left the deployment fence, and --recover does not model the loopback-TLS controller's jobs: td-mta/deploy reports whether it still runs or what its fence needs (td-mta/PRODUCTION.md, \"Leaving loopback TLS\")";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [OPTIONS]
        td-mta/deploy --postgres-binaries [--to-debian] [OPTIONS]
        td-mta/deploy --retire-rollback --irreversible [OPTIONS]
        td-mta/deploy --recover [OPTIONS]
        td-mta/deploy --rollback [OPTIONS]
+       td-mta/deploy --restore-shared-services [OPTIONS]
+       td-mta/deploy --refresh-notifications [--config FILE]
        td-mta/deploy --converge-config [--plan | --expect-digest HEX] [OPTIONS]
        td-mta/deploy --write-target --host HOST --host-name NAME --account ACCOUNT
          --identity KEY --jmap-account ACCOUNT --jmap-url URL
@@ -55,7 +60,10 @@ once a verified switch left it. --recover finishes or rolls back a job
 whose controller stopped inside its writer fence, as that controller
 would have, keeping the live release otherwise. --rollback reactivates
 the release replaced by the activation that installed the live one,
-when that activation migrated nothing.
+when that activation migrated nothing. --restore-shared-services returns
+from the identity cutover that installed the live release to the shared
+service identities; --refresh-notifications rederives the isolated
+notification configuration from the managed config.json.
 --converge-config converges the selected configuration to the live release's
 defaults plus its td-mta/production-overrides.conf; --plan only reports, and
 --expect-digest applies only the configuration a plan reported.
@@ -65,6 +73,7 @@ stone (td-mta/PRODUCTION.md, \"Leaving loopback TLS\") with the
 loopback-TLS controller; it needs --irreversible, and --skip-tests when no
 stepping stone has a verdict. Every other operation there refuses and
 names the step that comes next.
+Every command ends with a td-mta-deploy-outcome JSON line.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
@@ -85,6 +94,8 @@ struct Options<'a> {
     retire: bool,
     recover: bool,
     rollback: bool,
+    restore: bool,
+    refresh: bool,
     irreversible: bool,
     converge: bool,
     plan: bool,
@@ -103,6 +114,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         retire: false,
         recover: false,
         rollback: false,
+        restore: false,
+        refresh: false,
         irreversible: false,
         converge: false,
         plan: false,
@@ -128,6 +141,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--retire-rollback" => out.retire = true,
             "--recover" => out.recover = true,
             "--rollback" => out.rollback = true,
+            "--restore-shared-services" => out.restore = true,
+            "--refresh-notifications" => out.refresh = true,
             "--irreversible" => out.irreversible = true,
             "--converge-config" => out.converge = true,
             "--plan" => out.plan = true,
@@ -142,7 +157,12 @@ fn parse(args: &[String]) -> R<Options<'_>> {
                 )?;
                 out.expect = Some(digest);
             }
-            _ => return Err(HELP.into()),
+            other => {
+                return Err(fmt(format_args!(
+                    "unknown option {other}: td-mta/deploy --help lists them"
+                ))?
+                .into())
+            }
         }
     }
     require(
@@ -180,6 +200,22 @@ fn parse(args: &[String]) -> R<Options<'_>> {
                 || out.recover
                 || out.irreversible)),
         "a rollback is its own binary-only activation",
+    )?;
+    let others = out.socket
+        || out.binaries
+        || out.skip
+        || out.retire
+        || out.recover
+        || out.rollback
+        || out.irreversible
+        || out.converge;
+    require(
+        !(out.restore && (others || out.refresh)),
+        "restoring the shared service identities is its own job",
+    )?;
+    require(
+        !(out.refresh && (others || out.window || out.account.is_some())),
+        "refreshing notifications is its own job and touches no service",
     )?;
     require(
         out.irreversible || !out.retire,
@@ -780,26 +816,6 @@ fn write_outcome(out: &mut impl std::io::Write, outcome: &Outcome<'_>) -> R<()> 
     Ok(())
 }
 pub(super) fn run(args: &[String]) -> R<()> {
-    let mut session = converge::Session::default();
-    let result = deploy(args, &mut session);
-    if let Err(error) = &result {
-        // The file commands report their own outcome.
-        let file_command = matches!(
-            args.first().map(String::as_str),
-            Some("--write-target" | "--provision-host")
-        );
-        if !file_command && args.iter().any(|arg| arg == "--converge-config") {
-            converge::unreported(
-                &mut std::io::stdout().lock(),
-                &mut session,
-                &fmt(format_args!("{error}"))?,
-                &converge::carried(args)?,
-            )?;
-        }
-    }
-    result
-}
-fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
     if matches!(args,[s] if s=="--help"||s=="-h") {
         println!("{HELP}");
         return Ok(());
@@ -809,7 +825,103 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
         Some((first, rest)) if first == "--provision-host" => return files::provision_host(rest),
         _ => (),
     }
-    let opts = parse(args)?;
+    let mut session = converge::Session {
+        again: again(args, &[])?,
+        ..converge::Session::default()
+    };
+    let result = parse(args).and_then(|opts| match deploy(&opts, args, &mut session)? {
+        Some(job) => Ok(Some((ended(&opts, args, &job)?, job))),
+        None => Ok(None),
+    });
+    let (end, job) = match result {
+        // A convergence reports its own outcome.
+        Ok(None) => return Ok(()),
+        Ok(Some(done)) => done,
+        Err(error) => {
+            let mut out = std::io::stdout().lock();
+            // A refusal naming what follows is this run's one line, for
+            // every mode; any other error of a convergence is its own.
+            let (message, next) = match error.downcast::<Refusal>() {
+                Ok(refusal) => (refusal.error, refusal.next),
+                Err(error) => {
+                    let message = fmt(format_args!("{error}"))?;
+                    if args.iter().any(|arg| arg == "--converge-config") {
+                        converge::unreported(
+                            &mut out,
+                            &mut session,
+                            &message,
+                            &converge::carried(args)?,
+                        )?;
+                        return Err(error);
+                    }
+                    (message, None)
+                }
+            };
+            let mut words = Vec::new();
+            for word in next.iter().flatten() {
+                td_alloc::push(&mut words, word.as_str())?;
+            }
+            write_outcome(
+                &mut out,
+                &Outcome {
+                    result: "refused",
+                    host_key: None,
+                    error: Some(&message),
+                    details: None,
+                    next: next.as_ref().map(|_| Next {
+                        argv: &words,
+                        needs: &[],
+                    }),
+                },
+            )?;
+            return Err(message.into());
+        }
+    };
+    write_job_outcome(&mut std::io::stdout().lock(), &end, &job)?;
+    match end.error {
+        None => Ok(()),
+        Some(error) => Err(error.into()),
+    }
+}
+
+/// A job's outcome line: the shared fields, with the job's last status,
+/// receipt path and, for retirement, its next time as details.
+fn write_job_outcome(out: &mut impl std::io::Write, end: &Ended, job: &Job) -> R<()> {
+    let mut details = Json::Obj(Vec::new());
+    if let Some(status) = job
+        .record
+        .as_ref()
+        .and_then(|r| r.get("status"))
+        .and_then(Json::as_str)
+    {
+        set(&mut details, "status", Json::Str(owned(status)?))?;
+    }
+    set(&mut details, "receipt", Json::Str(owned(&job.receipt)?))?;
+    if let Some(time) = end.not_before {
+        set(&mut details, "not_before", Json::from(time))?;
+    }
+    let mut words = Vec::new();
+    for word in end.next.iter().flatten() {
+        td_alloc::push(&mut words, word.as_str())?;
+    }
+    write_outcome(
+        out,
+        &Outcome {
+            result: end.result,
+            host_key: None,
+            error: end.error.as_deref(),
+            details: Some(&details),
+            next: end.next.as_ref().map(|_| Next {
+                argv: &words,
+                needs: &[],
+            }),
+        },
+    )
+}
+
+/// Everything up to and including the job: refusals before it are the
+/// caller's to report. A convergence reports its own end and gives None.
+fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) -> R<Option<Job>> {
     let (local, target, home) = session(opts.config)?;
     let account = opts.account.unwrap_or(&target.jmap_account);
     local.login()?;
@@ -830,15 +942,7 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
         None => child(&home, ".local/state/td/main-integration")?,
     };
     let verdicts = child(&base, "verdicts")?;
-    let stone = transport::plan(
-        &local,
-        &opts,
-        &site,
-        &tip,
-        live,
-        &verdicts,
-        &mut state.reported,
-    )?;
+    let stone = transport::plan(&local, opts, &site, &tip, live, &verdicts)?;
     let stepping = stone.is_some();
     let controller = if stepping {
         owned(transport::TLS_CONTROLLER)?
@@ -853,6 +957,8 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
         || opts.recover
         || opts.rollback
         || opts.converge
+        || opts.restore
+        || opts.refresh
     {
         require(
             local.is_ancestor(live, &tip)?,
@@ -919,9 +1025,9 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
     };
     // A held fence keeps the services, and so public JMAP, down; a
     // rollback may be leaving a failing release.
-    let before = if opts.recover {
+    let before = if opts.recover || opts.refresh {
         None
-    } else if opts.rollback {
+    } else if opts.rollback || opts.restore {
         local.qualify_jmap(account, &target.jmap_url).ok()
     } else {
         Some(local.qualify_jmap(account, &target.jmap_url)?)
@@ -1020,6 +1126,20 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
     }
     if opts.rollback {
         set(&mut spec, "mode", Json::Str(owned("rollback")?))?;
+    }
+    if opts.restore {
+        set(
+            &mut spec,
+            "mode",
+            Json::Str(owned("restore-shared-services")?),
+        )?;
+    }
+    if opts.refresh {
+        set(
+            &mut spec,
+            "mode",
+            Json::Str(owned("refresh-notifications")?),
+        )?;
     }
     set(&mut spec, "irreversible", Json::Bool(opts.irreversible))?;
     if let Some((source, live_minor)) = &live_server {
@@ -1121,32 +1241,36 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
                 "--rollback"
             } else if opts.converge {
                 "--converge-config"
+            } else if opts.restore {
+                "--restore-shared-services"
+            } else if opts.refresh {
+                "--refresh-notifications"
             } else {
                 "--activate"
             },
         ])?
         .stdin(Stdio::null())
         .status()?;
-    set(
-        &mut probe,
-        "job",
-        Json::Str(owned(if status.code() == Some(255) {
-            "unknown"
-        } else if status.success() {
-            "succeeded"
-        } else {
-            "failed"
-        })?),
-    )?;
-    let post = local.qualify_jmap(account, &target.jmap_url);
-    set(&mut probe, "after", Json::from(now()?))?;
-    set(
-        &mut probe,
-        "after_result",
-        Json::Str(owned(if post.is_ok() { "passed" } else { "failed" })?),
-    )?;
-    local.save(&probe_path, &probe)?;
     if opts.converge {
+        set(
+            &mut probe,
+            "job",
+            Json::Str(owned(if status.code() == Some(255) {
+                "unknown"
+            } else if status.success() {
+                "succeeded"
+            } else {
+                "failed"
+            })?),
+        )?;
+        let post = local.qualify_jmap(account, &target.jmap_url);
+        set(&mut probe, "after", Json::from(now()?))?;
+        set(
+            &mut probe,
+            "after_result",
+            Json::Str(owned(if post.is_ok() { "passed" } else { "failed" })?),
+        )?;
+        local.save(&probe_path, &probe)?;
         let printed = local.sudo(&["cat", &receipt]);
         if let Ok(printed) = &printed {
             println!("{printed}");
@@ -1159,10 +1283,22 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
                 .status()?
                 .code()
                 == Some(1);
-        let receipt = match &printed {
-            Ok(text) => converge::Receipt::Text(text),
-            Err(_) if missing => converge::Receipt::Missing,
-            Err(_) => converge::Receipt::Unreadable,
+        // A job refused before its receipt records why beside it.
+        let refusal = if missing {
+            fmt(format_args!("{job}/refusal.json"))
+                .ok()
+                .and_then(|path| local.sudo(&["cat", &path]).ok())
+                .and_then(|text| td_json::parse(&text).ok())
+                .and_then(|record| record.get("error").and_then(Json::as_str).map(owned))
+                .transpose()?
+        } else {
+            None
+        };
+        let receipt = match (&printed, &refusal) {
+            (Ok(text), _) => converge::Receipt::Text(text),
+            (Err(_), Some(error)) => converge::Receipt::Refused(error),
+            (Err(_), None) if missing => converge::Receipt::Missing,
+            (Err(_), None) => converge::Receipt::Unreadable,
         };
         // A signal or a lost connection: the detached job may still run.
         let job = if matches!(status.code(), Some(255) | None) {
@@ -1179,20 +1315,313 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
             job,
             post,
             &converge::carried(args)?,
-        );
+        )
+        .map(|()| None);
     }
-    let printed = local.sudo(&["cat", &receipt])?;
-    println!("{printed}");
-    require(
-        status.success(),
-        "remote job failed or disconnected; inspect the job receipt",
-    )?;
-    post?;
-    if stepping {
-        transport::deployed(opts.config)?;
+    // The job ran: nothing from here may end the command without its
+    // outcome, so what cannot be read is reported as not known.
+    let exit = status.code();
+    let post = if opts.refresh {
+        // Touching no service, a notification refresh makes no check after.
+        None
+    } else {
+        Some(local.qualify_jmap(account, &target.jmap_url).is_ok())
+    };
+    let saved = (|| -> R<()> {
+        let job = match exit {
+            Some(255) | None => "unknown",
+            Some(0) => "succeeded",
+            Some(_) => "failed",
+        };
+        set(&mut probe, "job", Json::Str(owned(job)?))?;
+        if let Some(post) = post {
+            set(&mut probe, "after", Json::from(now()?))?;
+            let after = if post { "passed" } else { "failed" };
+            set(&mut probe, "after_result", Json::Str(owned(after)?))?;
+        }
+        local.save(&probe_path, &probe)
+    })();
+    if let Err(e) = saved {
+        eprintln!("td-mta-deploy: the public check record was not saved: {e}");
     }
-    Ok(())
+    let read = |path: &str| {
+        local
+            .sudo(&["cat", path])
+            .ok()
+            .and_then(|text| td_json::parse(&text).ok())
+    };
+    let mut record = read(&receipt);
+    let mut receipt = receipt;
+    if record.is_none() {
+        if let Ok(refusal) = fmt(format_args!("{job}/refusal.json")) {
+            record = read(&refusal);
+            if record.is_some() {
+                receipt = refusal;
+            }
+        }
+    }
+    if let Some(record) = &record {
+        println!("{record}");
+    }
+    let fence = match local.remote_status(&["sudo", "-n", "test", "-e", FENCE]) {
+        Ok(Some(0)) => Some(true),
+        Ok(Some(1)) => Some(false),
+        _ => None,
+    };
+    Ok(Some(Job {
+        receipt,
+        record,
+        exit,
+        fence,
+        post,
+        stepping,
+    }))
 }
+
+/// How a job ended, as the launcher saw it.
+struct Job {
+    receipt: String,
+    record: Option<Json>,
+    /// The remote command's exit code; ssh's 255 is its own failure.
+    exit: Option<i32>,
+    /// Whether the deployment fence was held afterwards, if known.
+    fence: Option<bool>,
+    /// The public JMAP check after the job, when one was made.
+    post: Option<bool>,
+    /// The job deployed a stepping stone under the loopback-TLS
+    /// controller, which --recover does not model.
+    stepping: bool,
+}
+
+/// A refusal before a job and the command that follows it, if any;
+/// `run` writes its outcome line.
+#[derive(Debug)]
+pub(super) struct Refusal {
+    pub(super) error: String,
+    pub(super) next: Option<Vec<String>>,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// A job's outcome: what happened and the command that follows.
+struct Ended {
+    result: &'static str,
+    error: Option<String>,
+    next: Option<Vec<String>>,
+    not_before: Option<u64>,
+}
+
+/// `td-mta/deploy`, `flags`, and the options this run was given that
+/// every mode shares.
+fn command(opts: &Options<'_>, flags: &[&str]) -> R<Vec<String>> {
+    let mut argv = Vec::new();
+    td_alloc::push(&mut argv, owned("td-mta/deploy")?)?;
+    for flag in flags {
+        td_alloc::push(&mut argv, owned(flag)?)?;
+    }
+    if let Some(config) = opts.config {
+        td_alloc::push(&mut argv, owned("--config")?)?;
+        td_alloc::push(&mut argv, owned(config)?)?;
+    }
+    if let Some(account) = opts.account {
+        td_alloc::push(&mut argv, owned("--jmap-account")?)?;
+        td_alloc::push(&mut argv, owned(account)?)?;
+    }
+    Ok(argv)
+}
+
+/// Whether `opts` deploys a release: no other mode is named.
+fn activation(opts: &Options<'_>) -> bool {
+    !(opts.socket
+        || opts.binaries
+        || opts.retire
+        || opts.recover
+        || opts.rollback
+        || opts.restore
+        || opts.refresh
+        || opts.converge)
+}
+
+/// This run's own command again, with `extra` after its arguments.
+fn again(args: &[String], extra: &[&str]) -> R<Vec<String>> {
+    let mut argv = Vec::new();
+    td_alloc::push(&mut argv, owned("td-mta/deploy")?)?;
+    for arg in args {
+        td_alloc::push(&mut argv, owned(arg)?)?;
+    }
+    for arg in extra {
+        td_alloc::push(&mut argv, owned(arg)?)?;
+    }
+    Ok(argv)
+}
+
+/// The flags of the command a refusal names in its `run td-mta/deploy
+/// --FLAG [VALUE]...`, up to the first word that is neither.
+fn named(error: &str) -> Option<Vec<&str>> {
+    let (_, rest) = error.split_once("run td-mta/deploy ")?;
+    let mut flags = Vec::new();
+    for word in rest.split_ascii_whitespace() {
+        let value = word.bytes().all(|b| b.is_ascii_digit());
+        if !(word.starts_with("--") || (value && !flags.is_empty())) {
+            break;
+        }
+        td_alloc::push(&mut flags, word).ok()?;
+    }
+    // An irreversible step is never a follow-up a message can name.
+    (!flags.is_empty() && !flags.contains(&"--irreversible")).then_some(flags)
+}
+
+/// What `job`'s end says: its receipt's error and fields, the fence, the
+/// exit code and the public check after it. `args` repeats this run.
+fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
+    let text = |key| {
+        job.record
+            .as_ref()
+            .and_then(|r| r.get(key))
+            .and_then(Json::as_str)
+    };
+    let not_before = job
+        .record
+        .as_ref()
+        .and_then(|r| r.get("rollback_retire_not_before"))
+        .and_then(Json::as_u64);
+    let error = match text("error") {
+        Some(e) => Some(owned(e)?),
+        None => None,
+    };
+    let recover = || command(opts, &["--recover"]);
+    let unknown = |why: &str| -> R<Ended> {
+        Ok(Ended {
+            result: "unknown",
+            error: Some(owned(why)?),
+            next: Some(recover()?),
+            not_before: None,
+        })
+    };
+    // A fence recovery refuses by its kind is not one a rerun finishes.
+    let unrecoverable = error
+        .as_deref()
+        .is_some_and(|e| crate::activate::UNRECOVERABLE.contains(&e));
+    // What a finished job leaves to do: the switch it kept the Debian
+    // tree for, or the retirement still to come.
+    let finished = || -> R<Option<Vec<String>>> {
+        Ok(if text("debian_tree_kept").is_some() {
+            Some(command(opts, &["--postgres-binaries"])?)
+        } else if not_before.is_some() {
+            Some(again(args, &[])?)
+        } else {
+            None
+        })
+    };
+    let lost = matches!(job.exit, None | Some(255));
+    Ok(match (job.exit, job.fence) {
+        // The stepping stone ran under the loopback-TLS controller, whose
+        // jobs and fence --recover does not model.
+        (exit, fence) if job.stepping && exit != Some(0) && (lost || fence != Some(false)) => {
+            Ended {
+                result: if lost { "unknown" } else { "failed" },
+                error: Some(owned(STEPPING_LEFT)?),
+                next: None,
+                not_before: None,
+            }
+        }
+        (Some(0), _) if job.stepping && job.post == Some(false) => Ended {
+            result: "check-failed",
+            error: Some(owned(
+                "the stepping stone is deployed but the public JMAP check after it failed",
+            )?),
+            next: None,
+            not_before: None,
+        },
+        (Some(0), _) if job.stepping => Ended {
+            result: "stepping-stone-deployed",
+            error: None,
+            next: Some(command(opts, &["--postgres-socket"])?),
+            not_before: None,
+        },
+        (None | Some(255), _) => unknown(
+            "the SSH connection ended before the job reported: --recover finishes it once it stops",
+        )?,
+        // Whether to roll back is the operator's decision, not a step.
+        (Some(0), _) if job.post == Some(false) && activation(opts) => Ended {
+            result: "check-failed",
+            error: Some(owned(
+                "the deployment finished but the public JMAP check after it failed: if the failure persists, td-mta/deploy --rollback returns to the release before the live one",
+            )?),
+            next: None,
+            not_before: None,
+        },
+        (Some(0), _) if job.post == Some(false) => Ended {
+            result: "check-failed",
+            error: Some(owned(
+                "the job finished but the public JMAP check after it failed",
+            )?),
+            next: finished()?,
+            not_before,
+        },
+        (Some(0), _) => Ended {
+            result: "succeeded",
+            error: None,
+            next: finished()?,
+            not_before,
+        },
+        // Another job holds the host: this one changed nothing.
+        (Some(_), _) if error.as_deref() == Some(crate::LOCKED) => Ended {
+            result: "busy",
+            error,
+            next: Some(again(args, &[])?),
+            not_before: None,
+        },
+        (Some(_), Some(true)) => Ended {
+            result: "failed",
+            error: Some(error.map_or_else(|| owned("the job failed"), Ok)?),
+            next: if unrecoverable {
+                None
+            } else {
+                Some(recover()?)
+            },
+            not_before: None,
+        },
+        (Some(_), None) => unknown(
+            "the job failed and whether it left the deployment fence could not be read: --recover finishes it if it did",
+        )?,
+        (Some(_), _) => {
+            let (result, next) = match error.as_deref() {
+                Some(crate::activate::MIGRATES) => {
+                    ("refused-irreversible", Some(again(args, &["--irreversible"])?))
+                }
+                Some(crate::activate::INSIDE_WINDOW) => ("deferred", Some(again(args, &[])?)),
+                Some(e) => match named(e) {
+                    Some(flags) if !(unrecoverable || opts.recover && flags == ["--recover"]) => {
+                        ("failed", Some(command(opts, &flags)?))
+                    }
+                    _ => ("failed", None),
+                },
+                None => ("failed", None),
+            };
+            Ended {
+                result,
+                error: Some(error.map_or_else(
+                    || owned("the job failed before it wrote a record: see the host's journal for its unit"),
+                    Ok,
+                )?),
+                next,
+                not_before: if result == "deferred" {
+                    not_before
+                } else {
+                    None
+                },
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 #[path = "tests/launcher.rs"]
 mod tests;

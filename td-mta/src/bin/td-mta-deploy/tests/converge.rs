@@ -20,6 +20,16 @@ fn launched() -> Session {
             receipt: "/var/lib/td-mta-operator/deploy-00000001/receipt.json".into(),
             unit: "td-mta-deploy-0001".into(),
         }),
+        again: [
+            "td-mta/deploy",
+            "--converge-config",
+            "--plan",
+            "--config",
+            "/t.json",
+        ]
+        .iter()
+        .map(|w| w.to_string())
+        .collect(),
     }
 }
 
@@ -30,6 +40,7 @@ fn finished(receipt: Option<&str>, job: Job, public: R<f64>) -> (Json, bool) {
     let carried = ["--config", "/t.json", "--jmap-account", "ops"];
     let receipt = match receipt {
         Some("unreadable") => Receipt::Unreadable,
+        Some(text) if text.starts_with("refused:") => Receipt::Refused(&text[8..]),
         Some(text) => Receipt::Text(text),
         None => Receipt::Missing,
     };
@@ -342,4 +353,32 @@ fn the_reviewed_policy_parses_and_names_only_production_profiles() {
     assert!(policy.len() <= MAX_POLICY_BYTES);
     let policy = td_mta::config::converge::Policy::parse(policy).unwrap();
     policy.check_profiles(crate::activate::PROFILES).unwrap();
+}
+
+#[test]
+fn a_job_refused_before_its_receipt_reports_why_and_the_lock_is_busy() {
+    let locked = format!("refused:{}", crate::LOCKED);
+    let (busy, failed) = finished(Some(&locked), Job::Failed, Ok(1.0));
+    assert!(failed);
+    assert_eq!(result(&busy), "busy");
+    assert_eq!(
+        busy.get("error").and_then(Json::as_str),
+        Some(crate::LOCKED)
+    );
+    assert_eq!(
+        busy.get("next").unwrap().get("argv").unwrap().to_string(),
+        r#"["td-mta/deploy","--converge-config","--plan","--config","/t.json"]"#
+    );
+    let (refused, failed) = finished(
+        Some("refused:job operation does not match the requested mode"),
+        Job::Failed,
+        Ok(1.0),
+    );
+    assert!(failed);
+    assert_eq!(result(&refused), "refused");
+    assert_eq!(
+        refused.get("error").and_then(Json::as_str),
+        Some("job operation does not match the requested mode")
+    );
+    assert!(refused.get("next").unwrap().is_null());
 }
