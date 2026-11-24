@@ -25,6 +25,8 @@ mod converge;
 mod files;
 #[path = "launcher_host_key.rs"]
 mod host_key;
+#[path = "launcher_transport.rs"]
+mod transport;
 
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
@@ -57,6 +59,12 @@ when that activation migrated nothing.
 --converge-config converges the selected configuration to the live release's
 defaults plus its td-mta/production-overrides.conf; --plan only reports, and
 --expect-digest applies only the configuration a plan reported.
+While PostgreSQL still uses loopback TLS and the live release predates
+group-socket admission, a deploy installs the newest verified stepping
+stone (td-mta/PRODUCTION.md, \"Leaving loopback TLS\") with the
+loopback-TLS controller; it needs --irreversible, and --skip-tests when no
+stepping stone has a verdict. Every other operation there refuses and
+names the step that comes next.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
 writes that file; --provision-host then prepares the host's build account
@@ -388,6 +396,17 @@ impl Local {
             println!("Skipping the main-integration verdict check for fetched origin/main.");
             return Ok((owned(tip)?, None));
         }
+        if let Some((rev, row)) = self.verified_after(tip, live, state)? {
+            return Ok((rev, Some(row)));
+        }
+        if live != tip {
+            println!("No newer landed revision has a passing main-integration verdict. Checking the deployed release.");
+        }
+        Ok((owned(live)?, None))
+    }
+    /// The newest first-parent descendant of `live` up to `tip` with a
+    /// passing verdict in `state`, and that verdict.
+    fn verified_after(&self, tip: &str, live: &str, state: &Path) -> R<Option<(String, String)>> {
         let revs = self.host.out(self.git().args([
             "rev-list",
             "--first-parent",
@@ -398,14 +417,11 @@ impl Local {
             revision(rev)?;
             if self.is_ancestor(live, rev)? {
                 if let Some(row) = verdict(&child(state, rev)?)? {
-                    return Ok((owned(rev)?, Some(row)));
+                    return Ok(Some((owned(rev)?, row)));
                 }
             }
         }
-        if !revs.is_empty() {
-            println!("No newer landed revision has a passing main-integration verdict. Checking the deployed release.");
-        }
-        Ok((owned(live)?, None))
+        Ok(None)
     }
     fn save(&self, path: &str, value: &Json) -> R<()> {
         self.save_bytes(path, fmt(format_args!("{value}"))?.as_bytes())
@@ -813,7 +829,25 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
         Some(p) => PathBuf::from(p),
         None => child(&home, ".local/state/td/main-integration")?,
     };
-    let (selected, verdict) = if opts.socket
+    let verdicts = child(&base, "verdicts")?;
+    let stone = transport::plan(
+        &local,
+        &opts,
+        &site,
+        &tip,
+        live,
+        &verdicts,
+        &mut state.reported,
+    )?;
+    let stepping = stone.is_some();
+    let controller = if stepping {
+        owned(transport::TLS_CONTROLLER)?
+    } else {
+        controller
+    };
+    let (selected, verdict) = if let Some(stone) = stone {
+        stone
+    } else if opts.socket
         || opts.binaries
         || opts.retire
         || opts.recover
@@ -826,7 +860,7 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
         )?;
         (owned(live)?, None)
     } else {
-        local.select(&tip, live, opts.skip, &child(&base, "verdicts")?)?
+        local.select(&tip, live, opts.skip, &verdicts)?
     };
     let tree = local.host.out(
         local
@@ -865,7 +899,12 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
     let cache = child(&local.root, ".td-build-cache")?;
     fs::create_dir_all(&cache)?;
     let scratch = td_fs::TempDir::new_in(&cache, "mta-deploy")?;
-    let binary = local.artifact(scratch.path(), &controller)?;
+    let binary = local.artifact(scratch.path(), &controller);
+    let binary = if stepping {
+        transport::built(binary)?
+    } else {
+        binary?
+    };
     let closure = match &live_server {
         Some((_, live_minor)) if !opts.to_debian => {
             let live_minor = *live_minor;
@@ -955,6 +994,9 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
         }
         None => None,
     };
+    // A stepping-stone job's spec is read by TLS_CONTROLLER: its load_job
+    // takes at most 4096 bytes and Deployment::new reads revision,
+    // previous, tree, main, controller and budget, keeping the rest.
     let mut spec = Json::Obj(Vec::new());
     for (k, v) in [
         ("previous", live),
@@ -1024,6 +1066,10 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
     }
     set(&mut spec, "budget", Json::from(opts.budget))?;
     set(&mut spec, "verdict", verdict.map_or(Json::Null, Json::Str))?;
+    require(
+        !stepping || fmt(format_args!("{spec}"))?.len() <= 4096,
+        "the stepping-stone job exceeds what the loopback-TLS controller reads",
+    )?;
     local.save(&fmt(format_args!("{job}/job.json"))?, &spec)?;
     let receipt = fmt(format_args!("{job}/receipt.json"))?;
     println!("Production receipt: {receipt}");
@@ -1142,6 +1188,9 @@ fn deploy(args: &[String], state: &mut converge::Session) -> R<()> {
         "remote job failed or disconnected; inspect the job receipt",
     )?;
     post?;
+    if stepping {
+        transport::deployed(opts.config)?;
+    }
     Ok(())
 }
 #[cfg(test)]

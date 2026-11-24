@@ -39,11 +39,12 @@ mod transport;
 
 pub(crate) use binaries::{discard_nars, selected_store, BACKUP_DROPIN, BINARIES_DROPIN};
 pub(crate) use config::RESULTS as CONVERGE_RESULTS;
+pub(crate) use transport::{redacted_runtime_tls, REDACT_RUNTIME, RUNTIME_CONNECTION};
 
 const OP: &str = "/var/lib/td-mta-operator";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases";
 const ACTIVE: &str = "/opt/td-mta/bin/td-mta";
-const FENCE: &str = "/var/lib/td-mta-operator/deployment-fence";
+pub(crate) const FENCE: &str = "/var/lib/td-mta-operator/deployment-fence";
 const PERMIT: &str = "/run/td-mta-deployment-primary.permit";
 const UNIT_DIR: &str = "/etc/systemd/system";
 const PG: &str = "td-mta-postgres.service";
@@ -190,11 +191,12 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
     )?;
     let work = std::env::current_dir()?;
     // Settings of the loopback TLS layout differ from those this controller
-    // installs, so only the transport cutover may run against it.
+    // installs, so only the transport cutover may run against it. The
+    // launcher names the step a TLS host takes first (launcher_transport.rs).
     let tls = transport::loopback_tls()?;
     require(
         !tls || mode == "postgres-socket",
-        "PostgreSQL still uses loopback TLS: run td-mta/deploy --postgres-socket",
+        "PostgreSQL still uses loopback TLS: run td-mta/deploy, which names the next step",
     )?;
     host.select_tools(binaries::selected()?);
     let job = if mode == "rollback" {

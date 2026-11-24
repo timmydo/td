@@ -10,7 +10,12 @@ use database::{CONTROL_SERVICE, OWNER_SERVICE};
 use fence::{open_socket, LiveSocket, SocketFence, PG_FENCE};
 use std::{io::Read, os::unix::fs::FileTypeExt};
 
-const RUNTIME_CONNECTION: &str = "/var/lib/td-mta/mail/runtime-connection";
+pub(crate) const RUNTIME_CONNECTION: &str = "/var/lib/td-mta/mail/runtime-connection";
+/// `sed -n` program printing the runtime connection URI after its
+/// `USER:PASSWORD@`, so the launcher reads the transport without the
+/// password; a line not of that form, or with another `@`, prints nothing.
+pub(crate) const REDACT_RUNTIME: &str =
+    "s|^postgresql://td_mta_runtime:[A-Za-z0-9._~-]\\{1,128\\}@\\([^@]*\\)$|\\1|p";
 const OWNER_CONNECTION: &str = "/var/lib/td-mta/mail/owner-connection";
 const MAIL_CA: &str = "/var/lib/td-mta/mail/tls/ca.pem";
 const PG_DROPIN_TEXT: &str = "[Service]\nSupplementaryGroups=td-mta-db\n";
@@ -90,11 +95,23 @@ pub(super) fn loopback_tls() -> R<bool> {
         FILE_LIMIT,
     )?;
     let (uri, _) = split_newline(std::str::from_utf8(&bytes)?);
+    runtime_tls(uri)
+}
+
+fn runtime_tls(uri: &str) -> R<bool> {
     if isolation::socket_password(uri, "td_mta_runtime").is_ok() {
         return Ok(false);
     }
     legacy_password(uri, "td_mta_runtime", MAIL_CA)?;
     Ok(true)
+}
+
+/// `loopback_tls` for what `REDACT_RUNTIME` printed: the same two forms,
+/// judged by the same parser under a stand-in password.
+pub(crate) fn redacted_runtime_tls(location: &str) -> R<bool> {
+    runtime_tls(&fmt(format_args!(
+        "postgresql://td_mta_runtime:redacted@{location}"
+    ))?)
 }
 
 /// The same credentials over the private socket.

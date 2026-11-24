@@ -37,7 +37,7 @@ decision.
 | Installed maintenance helper | `/opt/td-mta/bin/td-mta-operator` |
 | Mail state root | `/var/lib/td-mta/mail` |
 | Private PostgreSQL connection files | `/var/lib/td-mta/mail/runtime-connection`, `/var/lib/td-mta/mail/owner-connection` |
-| PostgreSQL socket directory | `/var/lib/td-mta-postgres` (`td-mta:td-mta-db` 0750) |
+| PostgreSQL socket directory, once cut over | `/var/lib/td-mta-postgres` (`td-mta:td-mta-db` 0750) |
 | Database writer fence (present only while fenced) | `/etc/td-mta/postgres-fence.conf` |
 | PostgreSQL server and tools, once switched | `/td/store/HASH-postgresql-x86-64-17.N/bin`, with td glibc in `/td/store/HASH-glibc-x86-64-VERSION` |
 | Retained Debian PostgreSQL, until retired | `/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` |
@@ -106,7 +106,10 @@ delayed mail from that provider mean its traffic, or one of its users, has
 reached the limit. The bounds are fixed constants, so raising them is a code
 change (DESIGN.md section 9).
 
-`td-mta-postgres.service` separately runs PostgreSQL 17 on the private
+`td-mta-postgres.service` separately runs PostgreSQL 17. Production
+still serves it on loopback TCP 35432 with TLS, verified against a
+private CA under `/var/lib/td-mta/mail/tls`, until the pending cutover
+([Leaving loopback TLS](#leaving-loopback-tls)) moves it to the private
 Unix socket `/var/lib/td-mta-postgres/.s.PGSQL.35432`, with no TCP
 listener and no TLS. The socket is `td-mta:td-mta-db` mode 0660 in a
 0750 directory; PostgreSQL runs as `td-mta` and joins the memberless
@@ -170,8 +173,9 @@ before touching the live installation.
 
 Public certificates renew through `td-mta-acme-production.service`, without
 certbot. Leave public TCP 80 reachable for HTTP-01 renewal, as well as SMTP 25
-and HTTPS 443. The database has no certificate to renew: production
-reaches PostgreSQL only over its private socket. Certificate management
+and HTTPS 443. Until the socket cutover the database's loopback TLS leaf
+renews through `td-mta-maint-postgres-tls-renew.timer`, which the cutover
+retires; on the private socket the database has no certificate. Certificate management
 and software updates are independent.
 
 Scheduled backups use `td-mta-maint-backup.timer`, retaining at most seven
@@ -327,7 +331,10 @@ its HBA entry to `local replication` and that role. Reload HBA and verify
 a replication connection whose libpq service names
 `host=/var/lib/td-mta-postgres` and `port=35432`. The mode-0600 passfile
 entry names that directory as its host, the PostgreSQL port, `replication`
-and the backup role. Keep the credential with the backup operator. The streaming procedure uses no permanent replication
+and the backup role. Until the socket cutover
+([Leaving loopback TLS](#leaving-loopback-tls)) production's entry is a
+loopback `hostssl` rule and its service and passfile name the loopback
+TLS server; the cutover rewrites them. Keep the credential with the backup operator. The streaming procedure uses no permanent replication
 slot and requires no change to `archive_mode`.
 
 Stage both binaries, the migration commands and the comparison queries.
@@ -465,6 +472,8 @@ and pushes that exact Git object into the host's build mirror over the SSH
 identity its [target configuration](#deploy-target-configuration) names.
 It checks the deployed tree and refuses divergent history. When no newer
 revision qualifies it checks the running release and leaves mail online.
+A host whose PostgreSQL still uses loopback TLS first takes a stepping
+stone instead ([Leaving loopback TLS](#leaving-loopback-tls)).
 The main-integration runner owns the verdicts (see DEVELOPMENT.md).
 To deploy the fetched main tip even when its integration verdict is missing
 or failed, run `./td-mta/deploy --skip-tests`. The deployment receipt records
@@ -643,8 +652,8 @@ recover`). Once the fence is gone
 it removes the candidate copy, the start permit, the fence conditions,
 the working parts of a recovery copy and the decision, then records
 `recovered`. The
-loopback-TLS socket cutover, which production has completed, is the one
-fenced job it refuses. A switch recovered forward leaves no Debian tree
+loopback-TLS socket cutover is the one fenced job it refuses
+([Leaving loopback TLS](#leaving-loopback-tls)). A switch recovered forward leaves no Debian tree
 window: `--postgres-binaries` naming the running closure verifies it and
 records one.
 
@@ -709,15 +718,111 @@ selection request: resolve an uncertain request before its job
 directory is seven days old.
 
 
-### The finished socket cutover
+### Leaving loopback TLS
 
-Production moved PostgreSQL from loopback TLS to its private socket with
-`td-mta/deploy --postgres-socket`. That job's directory under
-`/var/lib/td-mta-operator` keeps the replaced settings
+Production's move to the private socket is pending. Its PostgreSQL
+still listens on loopback TCP 35432 with TLS (`listen_addresses =
+'127.0.0.1'`, `ssl = on`, no Unix socket), `td-mta-maint-postgres-tls-renew.timer`
+renews the server's leaf, and the live release predates daceb7309, the
+first main commit whose td-mta admits the group-shared socket
+(`td_fs::check_server_socket`). Every main revision from c8f8e087d on
+refuses TCP+TLS connection files, and this controller activates no
+release on a loopback-TLS host; under a release older than daceb7309 the
+isolated services could not reach the socket `--postgres-socket`
+installs. The launcher therefore enforces one order, from the
+development checkout:
+
+1. `./td-mta/deploy --irreversible`, adding `--skip-tests` when no
+   stepping stone has a verdict: deploys the stepping stone. Its outcome
+   names step 2.
+2. `./td-mta/deploy --postgres-socket`: the fenced transport cutover,
+   under the stepping stone.
+3. `./td-mta/deploy`: the newest verified main, as for any update. With
+   no passing verdict after 290c6de7d here it stays in the stepping-stone
+   range and says so; wait for the runner's verdict on a newer head, or
+   add `--skip-tests` to take the tip untested.
+4. `./td-mta/deploy --postgres-binaries`
+   ([Switch PostgreSQL to the td-built binaries](#switch-postgresql-to-the-td-built-binaries)).
+
+The launcher reads the host's state before building anything. The
+transport is the runtime connection file the controller judges, which
+`sudo sed` prints on the host with its password removed and the launcher
+parses as the controller does; the live release's capabilities are its
+ancestry, in the fetched history, against three reviewed constants in
+`td-mta/src/bin/td-mta-deploy/launcher_transport.rs`: daceb7309, 290c6de7d
+(c8f8e087d's parent, the last release that still reads TCP+TLS files)
+and the loopback-TLS controller below. While the host is on loopback TLS
+and the live release lacks daceb7309, every operation but a deploy
+refuses and names step 1; once it has it, every operation but
+`--postgres-socket` refuses and names step 2; `--converge-config` is
+among them, since the controller judges the transport before any mode.
+On the socket, `--postgres-binaries` and `--converge-config` refuse and
+name step 3 while the live release is a stepping stone (`--to-debian`
+stays open; convergence reads `td-mta/production-overrides.conf` from
+the live release, which no stepping stone has), adding `--skip-tests`
+when no main revision after 290c6de7d has a verdict here. Each refusal prints a
+`td-mta-deploy-outcome` line ([Command outcomes](#command-outcomes)).
+
+The stepping stone is the newest first-parent origin/main revision after
+the live release that contains daceb7309, is 290c6de7d or older, and has
+a passing main-integration verdict on this machine. The runner records
+verdicts only for the newest main head, so none can be produced for an
+older revision; with none in that range the deploy refuses and names
+`--skip-tests`, which takes the newest revision in the range, 290c6de7d,
+and records the override as for main. Newest, as for main: the oldest,
+daceb7309, would change the least, while every revision in the range
+from e691e72b7 on reaches the database through td-postgres's TLS client,
+which production has not run; the controller qualifies the candidate
+against the live database, and rehearses its migration on a copy, before
+any fence. It runs under the controller of daceb7309, the last
+one that activates a release on a loopback-TLS host, whose controller
+sources are the live release's own. The launcher builds it like any
+controller, from Cargo's frozen dependency set; that set includes
+tokio-postgres and its closure, which main no longer locks, so when the
+Cargo cache has lost them the deploy refuses and says to run `cargo
+fetch --locked --manifest-path td-mta/Cargo.toml` in a checkout of
+daceb7309. That controller predates `host.json` and fixes this host's
+name, build account and source mirror in its sources; the launcher reads
+them from there and refuses, naming the `host.json` field that differs,
+before anything reaches the host. Its probes also verify the listeners'
+certificate against its fixed public name (`mx.timmydouglas.com`), which
+the launcher does not compare with `host.json`, since a certificate may
+carry several names; if the certificate lacks it, the job fails at its
+preflight probes, before any fence. It also predates the
+`--irreversible` consent and migrates the database without asking
+(schema 45 to 46 here), so the launcher requires the flag; budget the
+writer window as for any migration (`--window-seconds`). Budget disk
+too: the stepping stone keeps its `original-pgdata` and recovery copy,
+step 2 takes another base backup, and `--retire-rollback`, refused on a
+loopback-TLS host, retires only material older than seven days.
+
+It has no `--recover`. While its fence is held, its writer fence also
+includes an nftables table `td_mta_deploy_SUFFIX` (the job directory's
+suffix), which reserves the loopback database connection for root and
+does not survive a reboot. A stepping-stone job whose controller dies
+inside its fence is outside what `--recover` models, as is the socket
+cutover's, and while a fence is held on a loopback-TLS host every
+operation refuses and names no next step. While a `td-mta-deploy-*` unit
+is still active the launcher says so and prints it instead: the job owns
+its fence, so follow its journal and wait; touch nothing by hand while
+it runs. A job that hangs stays listed until its unit is stopped
+(`systemctl stop UNIT`), and a controller run by hand in a job
+directory is no unit, so its fence reads as held. Once none is
+running, recover it by hand:
+`/var/lib/td-mta-operator/deployment-fence` names the job. Check its
+receipt's events, the unit states, the selected executable, both PGDATA
+directories (the live one and the job's `original-pgdata`) and the
+recovery copy's receipt before reopening writers, and never restore a
+retained cluster after writers may have reopened without reconciling
+the mail accepted since.
+
+`--postgres-socket` then rehearses the cutover with the live release on
+a fresh copy before it changes production, and refuses there too if
+that release cannot reach the group-shared socket. Its job directory
+under `/var/lib/td-mta-operator` keeps the replaced settings
 (`postgres-socket/original/`) and the retired TLS material, CA key
-included (`postgres-socket/retired/`), until the operator accepts the
-cutover. The mode remains for a host still on loopback TLS, where the
-controller refuses every other mode and names it.
+included (`postgres-socket/retired/`), for the rollback window
+([Retiring rollback material](#retiring-rollback-material)).
 
 ### Converge the configuration
 
@@ -805,8 +910,9 @@ with the outcome line of "Command outcomes"; a failure also prints
   `previous_config_version`, `reload_seconds`, `restarted_units`,
   `request`, `receipt` and `unit`, when known.
 - `next`: after a successful plan, the apply command bound to its digest
-  with the plan's `--config` and `--jmap-account`, needing nothing; else
-  null.
+  with the plan's `--config` and `--jmap-account`, needing nothing; for a
+  refusal by the host's transport, the step that comes first ([Leaving
+  loopback TLS](#leaving-loopback-tls)), with `--config` only; else null.
 
 To return to the previous configuration by hand, select the receipt's
 `config_previous_version` against the current generation with
@@ -986,6 +1092,11 @@ All hold the following; `--converge-config` adds the members listed under
 - `host_key`: with `--write-target --host-key-sha256`, what happened to
   the enrolled key.
 
+A deployment operation prints the same line when its host's transport
+refuses it (`refused`, naming the step to run instead) and when a
+stepping-stone deploy verifies (`stepping-stone-deployed`, naming
+`--postgres-socket`); see [Leaving loopback TLS](#leaving-loopback-tls).
+
 ### Isolating production service accounts
 
 Use the supervised `td-mta/deploy` path for the first release with
@@ -1097,9 +1208,10 @@ On this host the root-only libpq service file is
 `/var/lib/td-mta-operator/physical-backup/service.conf`. Its
 `cutover_repl` profile uses `td_mta_cutover_backup` and `repl.pass`.
 The ordinary `cutover_marker` profile uses `td_mta_cutover_marker`,
-`marker.pass` and the `postgres` database. Both name
-`host=/var/lib/td-mta-postgres` and `port=35432`, and their passfile
-entries name that directory as the host. The controller passes each
+`marker.pass` and the `postgres` database. On the private socket both
+name `host=/var/lib/td-mta-postgres` and `port=35432`, and their
+passfile entries name that directory as the host; until then they name
+the loopback TLS server, and the socket cutover rewrites them. The controller passes each
 service file to `psql` explicitly through `PGSERVICEFILE`.
 The same operator directory supplies `compare-selected.sql`, a bounded
 read-only transaction producing deterministic rows for schema, epoch,
@@ -1118,7 +1230,10 @@ packages under `/opt/td-mta/postgresql`. td builds its own
 (`postgresql-x86-64`: no ICU, OpenSSL, lz4 or zstd), and TRUST.md, "td
 store on a foreign deployment host", says what enters the host's
 `/td/store` and what runs it. The switch keeps the live release and the
-data directory in place. The host must already use the private socket.
+data directory in place. The host must already use the private socket,
+and its live release must not be the loopback-TLS stepping stone (one
+from daceb7309 through 290c6de7d); the launcher refuses otherwise and
+names the step.
 
 What updating across each PostgreSQL 17 minor release asks of an
 installation is a reviewed table in the controller,

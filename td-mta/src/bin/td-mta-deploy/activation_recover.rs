@@ -83,7 +83,7 @@ pub(super) fn classify(
         "postgres-binaries" | "postgres-to-debian" => Interrupted::Switch,
         "postgres-socket" => {
             return Err(
-                "the fence belongs to the loopback-TLS socket cutover, which --recover does not model: production has completed that cutover once"
+                "the fence belongs to the loopback-TLS socket cutover, which --recover does not model: its receipt's socket_files and socket_originals name what it changed"
                     .into(),
             )
         }
