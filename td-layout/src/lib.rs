@@ -332,6 +332,9 @@ pub struct StyledDocument<'d> {
     /// Whether any box is an inline-block or an inline table
     /// (`inline_block`); layout lays boxes apart in a line only then.
     inline_blocks: bool,
+    /// Whether any block box is a flex container (`flex_container`);
+    /// layout lays flex lines only then.
+    flex: bool,
 }
 enum DocumentOwner<'d> {
     Borrowed(&'d Document),
@@ -496,6 +499,7 @@ impl<'d> StyledDocument<'d> {
             tables: false,
             floats: false,
             inline_blocks: false,
+            flex: false,
         };
         let mut numbering = list::Numbering::new(memory)?;
         // List items are admitted while the index and scratch live.
@@ -570,6 +574,7 @@ impl<'d> StyledDocument<'d> {
                 }
                 out.floats |= parent.is_some() && float_side(computed, kind).is_some();
                 out.inline_blocks |= parent.is_some() && inline_block(computed, kind);
+                out.flex |= flex_container(computed, kind);
                 if let Some(element) = node.element() {
                     if kind == BoxKind::Block && keyword(computed, Property::Display) == "list-item"
                     {
@@ -789,6 +794,10 @@ impl<'d> StyledDocument<'d> {
     pub fn has_nested_lines(&self) -> bool {
         self.floats || self.inline_blocks
     }
+    /// Whether any box is a flex container (DESIGN.md §5, "Flex").
+    pub fn has_flex(&self) -> bool {
+        self.flex
+    }
 }
 impl StyledDocument<'static> {
     /// Own the immutable document without a self-referential borrow.
@@ -815,6 +824,7 @@ impl StyledDocument<'static> {
             tables,
             floats,
             inline_blocks,
+            flex,
             ..
         } = built;
         Ok(Self {
@@ -833,6 +843,7 @@ impl StyledDocument<'static> {
             tables,
             floats,
             inline_blocks,
+            flex,
         })
     }
 }
@@ -863,6 +874,12 @@ pub(crate) fn inline_block(style: &ComputedStyle, kind: BoxKind) -> bool {
             keyword(style, Property::Display),
             "inline-block" | "inline-table"
         )
+}
+/// Whether a box of `kind` is a flex container: a block whose display is
+/// `flex` or `inline-flex`, the latter laid as the former for now
+/// (DESIGN.md §5, "Flex").
+pub(crate) fn flex_container(style: &ComputedStyle, kind: BoxKind) -> bool {
+    kind == BoxKind::Block && matches!(keyword(style, Property::Display), "flex" | "inline-flex")
 }
 /// The side a float is on, or a clear applies to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

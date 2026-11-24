@@ -1698,7 +1698,10 @@ CSS background images and SVG are not fetched.
 byte offset in its decoded text on a scalar boundary, or before or
 after a replaced element. Places are ordered by the tree-order table,
 four bytes a node (1 MiB at td-html's `MAX_NODES`). td-layout lays
-normal flow and tables in tree order, puts a float's lines after
+normal flow, tables and flex rows in tree order (a flex item's lines,
+as a table cell's, item by item whatever its alignment moved; an
+anonymous item's naming its container and ending its paragraph,
+td-layout/DESIGN.md §5, "Flex"), puts a float's lines after
 the line it was met in (td-layout/DESIGN.md §5, "Floats") and an
 inline-block's after the line holding it ("Inline-blocks"; an inline
 table is an inline-block here and below, its cells' lines its own), so
@@ -1848,7 +1851,11 @@ exactly when the next scalar would be copied after one, so not
 mid-paragraph at a wrap (where the line starts with an inline-block,
 it may not yet: §11); and
 for a
-replaced element its `alt` text when the selection holds it whole; at
+replaced element its `alt` text when the selection holds it whole (a
+picture in a line: a block-level one, `img{display:block}` or a flex
+item, which td-css blockifies, lays no fragment, so it has no place
+and nothing of it is copied:
+`<div style=display:flex>ab <img alt=IMG> cd</div>` copies as `ab\ncd`); at
 most `MAX_COPY`, measured before it is gathered. A list item's
 marker, td-layout's `MarkerFragment` (generated text naming its item and
 no byte, td-layout/DESIGN.md §5, "List markers"), is copied as its
@@ -2215,9 +2222,12 @@ Not shown, each a later amendment: script (§1); forms beyond what
 their elements lay out (a `button`'s or `textarea`'s text shows, an
 `input` nothing, and nothing is submitted); positioning other than
 static and relative (td-css computes no other, so `absolute`, `fixed`
-and `sticky` stay in flow); flex and grid until
-td-layout has them, laid in normal flow as td-layout specifies, nothing
-hidden by it; floats and inline-blocks, inline tables among them, are
+and `sticky` stay in flow); flex layout beyond td-layout's single
+row (a column, and a wrapping row whose items do not fit one line,
+laid as block flow, `order` and baseline alignment unread,
+td-layout/DESIGN.md §5, "Flex"), and grid
+until td-layout has it, laid in normal flow as td-layout specifies,
+nothing hidden by it; floats and inline-blocks, inline tables among them, are
 td-layout's
 (td-layout/DESIGN.md §5, "Floats", "Inline-blocks"), their boxes
 painted after the in-flow boxes around them ("Painting") but their
@@ -2548,8 +2558,9 @@ order; each is its own design amendment when it starts:
 - **Layout beyond normal flow**, as td-layout gains it: inline-block's
   `vertical-align`, find across an inline-block's edge (a browser's
   text runs on into it), a copy ending where a line starts with an
-  inline-block taking the newline its first text would, then
-  flexbox and grid; pseudo-elements and
+  inline-block taking the newline its first text would, then the rest
+  of flexbox (wrapping, columns, inline-flex's baseline, `order`) and
+  grid; pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.
 - **Pictures.** `srcset` and `<picture>`; an SVG subset.

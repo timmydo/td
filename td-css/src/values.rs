@@ -1296,6 +1296,9 @@ fn unit_px(unit: Unit, em: f64, root_font_size: f64) -> f64 {
     }
 }
 
-pub(crate) fn finish(style: &mut ComputedStyle, root: bool) -> Result<(), Error> {
-    layout::finish(style, root)
+pub(crate) fn finish(
+    style: &mut ComputedStyle,
+    parent: Option<&ComputedStyle>,
+) -> Result<(), Error> {
+    layout::finish(style, parent)
 }

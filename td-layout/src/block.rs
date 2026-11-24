@@ -18,6 +18,9 @@ use td_html::document::NodeId;
 
 #[cfg(test)]
 mod ends;
+mod flex;
+#[cfg(test)]
+mod flex_tests;
 pub(crate) mod float;
 #[cfg(test)]
 mod float_tests;
@@ -257,6 +260,7 @@ pub fn layout_with_budget(
         tables: table::Scratch::new(memory)?,
         floats: Floats::new(memory)?,
         nested: BudgetVec::new(memory)?,
+        flex: BudgetVec::new(memory)?,
         last_baseline: None,
         left: 0.0,
         top: 0.0,
@@ -343,6 +347,9 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// The boxes inline sequences laid apart and have not yet placed, a
     /// stack: a nested sequence's after its ancestors' (§5, "Floats").
     nested: BudgetVec<Item>,
+    /// The flex items of the containers being laid, a stack: a nested
+    /// container's after its ancestors' (§5, "Flex").
+    flex: BudgetVec<flex::FlexItem>,
     /// The baseline of the last line laid in flow, on a page with
     /// inline-blocks: an inline-block's own is its last line's (§5,
     /// "Inline-blocks"). Nested items and tables keep it as they found it.
@@ -801,9 +808,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     }
     /// Whether `b` roots a block formatting context of its own, whose
     /// floats its lines alone see and its auto height holds: the root, a
-    /// float, an inline-block, a caption, or a block whose overflow is
-    /// neither visible nor clip (a table cell is one too, which its table
-    /// opens).
+    /// float, an inline-block, a caption, a flex container or item, or a
+    /// block whose overflow is neither visible nor clip (a table cell is
+    /// one too, which its table opens).
     fn opens_context(&self, b: &BoxNode) -> Result<bool, Error> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         Ok(b.kind == BoxKind::Block
@@ -814,7 +821,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     "table-caption" | "inline-block"
                 )
                 || !matches!(keyword(style, Property::OverflowX), "visible" | "clip")
-                || !matches!(keyword(style, Property::OverflowY), "visible" | "clip")))
+                || !matches!(keyword(style, Property::OverflowY), "visible" | "clip")
+                || (self.styled.has_flex() && (self.flex_container(b)? || self.flex_item(b)?))))
     }
     /// A block met in a context with floats: below those it clears, and
     /// a context's root (not a table) or a picture beside those at its
@@ -1161,7 +1169,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let low = length(style, Property::MinWidth, Some(width)).map_or(0.0, content);
         let high = length(style, Property::MaxWidth, Some(width)).map_or(f64::INFINITY, content);
         let lead = self.inside_marker(id, b)?;
-        let (least, most) = self.content_with(b.first_child, None, b.style, lead, depth + 1)?;
+        let (least, most) = self.box_content(b, lead, depth + 1)?;
         let room = (width - decoration - dims.margin.horizontal()).max(0.0);
         let fit = (most as f64 / 64.0).min((least as f64 / 64.0).max(room));
         dims.width = fit.min(high).max(low);
@@ -1436,6 +1444,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         let mut natural = if b.kind == BoxKind::Image {
             dims.height.unwrap_or(0.0)
+        } else if self.styled.has_flex() && self.flex_container(&b)? {
+            self.flex_content(id, &b, &dims, (content_x, content_y, offset), depth)?
         } else {
             self.children(
                 b.first_child,

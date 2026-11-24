@@ -442,8 +442,8 @@ padding/margins use the containing content width. Percent heights need a
 definite containing height; otherwise height is auto and percentage
 min/max height has the corresponding unconstrained initial behavior.
 A min-width or min-height of `auto`, td-css's initial value, is 0
-everywhere it is read, as CSS 2.2's initial 0 was: Flexbox 1's automatic
-minimum is a flex item's, and no box is laid as one.
+everywhere it is read, as CSS 2.2's initial 0 was, but for a flex
+item's `min-width`, where it is its automatic minimum (below, "Flex").
 Auto horizontal margins divide positive free space. Over-constrained
 left-to-right boxes adjust the used right margin. Negative margins remain
 signed. Adjacent block sibling margins collapse by largest positive plus
@@ -453,9 +453,8 @@ in flow. Overflow is reported geometrically; clipping,
 scroll containers and stacking contexts are consumer/future work.
 
 Tables are laid as grids (below, "Tables"). Inline-blocks are laid
-whole in their lines (below, "Inline-blocks"). Flex formatting is not
-implemented: a flex container uses ordinary block flow and its
-descendants remain visible. List items use block flow, with
+whole in their lines (below, "Inline-blocks"). Flex containers lay
+their items in one row (below, "Flex"). List items use block flow, with
 the markers below. visibility:hidden
 retains geometry and style so the eventual painter can suppress it.
 Floats are placed beside the lines they shorten, and `clear` moves a
@@ -472,7 +471,8 @@ the CSS values; attributes and intrinsic sizes are content sizes.
 **Intrinsic sizes.** `Request::intrinsic` names the caller's
 `IntrinsicSizes` lookup, `Sync` so a request stays `Send` and `Sync`,
 which a layout asks once for each image box it sizes, and again for
-each time a table measures that box's widths (below, "Tables"), by the
+each time a table measures that box's widths (below, "Tables") or a
+flex container sizes it as an item (below, "Flex"), by the
 img's NodeId and StyleId, and no other node: the style lets a caller measure
 a stand-in in the image's own font. Layout holds the caller's
 FontMetrics mutably while it asks, so a lookup cannot borrow them: it
@@ -739,8 +739,9 @@ formatting contexts and §10.3.5's shrink-to-fit width.
 **Formatting contexts.** Floats belong to the block formatting context
 their box is in, and a context's floats shorten only the lines of
 blocks in it, not those in a context nested in it. Contexts are rooted
-by the root, each float, each table cell and caption, and each block
-whose `overflow-x` or `overflow-y` is neither `visible` nor `clip`;
+by the root, each float, each table cell and caption, each flex
+container and flex item (below, "Flex"), and each block whose
+`overflow-x` or `overflow-y` is neither `visible` nor `clip`;
 td-css has no `flow-root`. A root's auto height reaches its floats' bottom margin
 edges (§10.6.7); an ordinary block's does not, and its floats hang out
 of it, shortening lines after it.
@@ -1297,6 +1298,204 @@ tables, at 84 ns a unit, is §6's own and unchanged. Before measuring's
 child lists were charged at their peak, the 45-deep divs were refused
 `Limit("MAX_PAGE_BYTES")`.
 
+### Flex
+
+A block box whose computed display is `flex` or `inline-flex` is a
+**flex container**, an `inline-flex` one laid as `flex`, block-level,
+for now. `StyledDocument::has_flex` says whether any box is one, set
+while boxes are generated, so a page without one takes none of what
+follows: its geometry, lines, work and charges are those of a layout
+without flex. A row container (`flex-direction` `row`, or
+`row-reverse` read as `row`) that does not wrap lays its items in a
+single row by [CSS Flexbox 1][flexbox] (§4's items, §8's alignment,
+§9's algorithm) and Box Alignment 3's values; `order`, `align-content`
+and `row-gap` are not read. A wrapping row (`flex-wrap` `wrap` or
+`wrap-reverse`) lays that row where its items' hypothetical outer main
+sizes (§9.2 step 3 on, below) and the gaps between them fit its content
+width, which is where Flexbox's one line holds them all as laid here,
+and a column (`column` or `column-reverse`) never does. They fit
+within two 1/64 px units an item and one more: each item's base size,
+margins and padding with border are rounded to 1/64 px apart and the
+room down, so percentages summing to 100% (Bootstrap's thirds and
+sixths, with or without its gutters) fit at every width, where a
+browser keeps them one row; an item that cannot shrink may overflow
+by that rounding. The decision reads sizes alone, so it is alike at
+every window, and a measured row's contributions, rounded up, fit
+it. A column, and a wrapping row that does not fit, lay their
+children as block flow, as a layout
+without flex did: still blockified, still roots of their own contexts
+(below), each laid at its own width, `flex-basis`, the factors and
+alignment unread and the margins between them collapsing, where
+Flexbox's lines would stack a column's items and wrap a row's.
+
+[flexbox]: https://www.w3.org/TR/css-flexbox-1/
+
+**Items** (§4). td-css blockifies a container's children as it does a
+float (td-css/DESIGN.md §4) and computes their `float` to `none`, so
+no item floats or is an inline-block, and a table display other than
+`table` is `block`. Each element child is an item: a block, a table,
+or a picture laid as a block. Each run of other children between them,
+text and breaks, is one anonymous item laid as an anonymous table
+cell's run is (§5, "Tables"), in the container's style, its lines
+naming the container; a run holding only HTML white space, whatever
+its `white-space`, is none, as §4 has it. The container and each item
+root a block formatting context (above, "Floats", "Formatting
+contexts"): an item's floats stay in it, no float outside shortens an
+item's lines, and a container meeting floats is placed beside them as
+any root is.
+
+**Main sizes** (§9.2, §9.7), in whole 1/64 px. An item's flex base
+size is its definite `flex-basis` (a length, or a percentage of the
+container's content width), else its `width`, else (an auto width, or
+`flex-basis: content`) its max-content width; `box-sizing` applies to
+both. Its main size is bounded by its `max-width` and by its
+`min-width`, a minimum winning, or, where `min-width` is `auto` and the
+item is no scroll container (its `overflow-x` visible or clip), by its
+automatic minimum (§4.5): its min-content width, or its width where
+that is less, within its maximum; a scroll container's is 0. A
+picture's base size and automatic minimum are its used width, a
+table's its table's max- and min-content widths (§5, "Tables",
+"Widths"), of its border box. Content is measured as a cell's is, a
+flex container's as below, at most once an item and only where needed:
+for a base size from content, or an automatic minimum that may exceed a
+definite basis; an automatic minimum that can only bound a shrink is
+measured once the line is known to shrink, and only for a flexible
+item. Flexible lengths are resolved by §9.7's loop: items of factor 0,
+and those their bounds hold off the base size the way the line flexes,
+are frozen at their hypothetical size; each pass gives the remaining
+free space to the unfrozen items by `flex-grow`, or takes it by
+`flex-shrink` times base size, factors kept as multiples of 2^-20;
+factors summing under one, beyond their half-unit roundings, give
+that share of the initial free space to the nearest 1/64 px;
+each share is the step between floors of the cumulative shares, so
+each is within 1/64 px of its exact share and they sum exactly; the
+items are clamped and those violating as the total violation's sign
+does are frozen, all where it is zero.
+
+**Main axis** (§8.1, §8.2, §9.5). `column-gap` (a length, or a
+percentage of the container's content width; `normal` is 0) lies
+between items. Auto margins take positive free space first, in equal
+shares by cumulative floors; else they are 0 and `justify-content`
+places the items: `normal`, `stretch`, `start`, `flex-start` and `left`
+at the start, `end`, `flex-end` and `right` at the end, `center`,
+`space-between`, `space-around` and `space-evenly`, each space a step
+between cumulative floors. Where the free space is negative, the start
+overflows the end, the end and `center` overflow the start, `center`
+both sides alike, `space-between` lies at the start and `space-around`
+and `space-evenly` centre, as Flexbox 1 states their fallbacks. td-css
+drops `safe` and `unsafe` (td-css/DESIGN.md §4): on the main axis
+every value is unsafe. Nothing moves across the line once laid.
+
+**Laying.** Each item is laid once, at its final x and the line's top:
+a block in its own context at its resolved main size, its used
+margins, its own height (a percentage of the container's definite
+height, else auto), and its percentages against the container's
+content width; an anonymous item as a cell's run, at its main size; a
+table by its table, as an inline table is laid (§5, "Inline-blocks"),
+in the room its main size and margins leave.
+
+**Cross axis** (§9.4, §8.3). The line's cross size is the container's
+definite height, else its tallest item's margin box within the
+container's min and max heights, which a single line takes (§9.4 step
+8); the container's content height is the line's, rounded up to
+whole 1/64 px so that it holds its tallest item. An item whose
+`align-self` (its `auto` the container's `align-items`) is `stretch` or
+`normal`, whose height and vertical margins are auto, and which is a
+block, keeps what it laid and has its content and border heights
+rewritten to the line's less its margins, within its own min and max
+heights, as a cell takes its row's height; it is not laid again.
+Every other item is aligned in the line: `center`, `end`, `flex-end`
+and `self-end` move it down, auto vertical margins share positive
+free space as `margin: auto` centres, and the rest, `baseline` and
+`last baseline` among them, leave it at the top. An item moves down
+only, its lines, boxes and markers with it as a cell's content moves
+(§5, "Tables", "Rows and cells"): one taller than the line stays at
+its top, as `safe` alignment has it.
+
+**Output and lines.** Geometry is in postorder: each item's, then the
+container's. Lines are in tree order, item by item, as a table's cells'
+are (§5, "Tables", "Output and lines"), so line order is not y order
+in a line whose items moved: a centred item's first line can lie below
+its neighbour's second. An anonymous item has no geometry; its last
+line ends its paragraph (`LineEnd::End`), so text either side of an
+element item is two paragraphs, though both name the container.
+
+**Measured widths.** Measured for a cell, a float, an inline-block or
+an item, a row's max-content width is the sum of its items'
+max-content contributions and its gaps, a percentage one 0; its
+min-content width is the sum of their min-content contributions and
+the gaps where it does not wrap, else the largest of them, each item
+then on its own line (§9.9.1). A column measures as block flow. An
+element item's contribution is its own as block flow measures it
+(above, "Tables", "Widths": its content's, or its px width), with its
+padding, border and margins, clamped as §9.9.3 has it by its flex base
+size (a px `flex-basis`, else its width, else, for `content` or an
+auto width, its max-content width): as a maximum where its
+`flex-grow` is 0, as a minimum where its `flex-shrink` is, and, where
+that lowered it, never below its automatic minimum, its min-content
+width or its width where that is less; then within its min and max
+widths. So a `flex: 1 1 0px` item contributes its content's widths.
+
+**Departures and later increments.** Wrapping onto lines, columns laid
+as flex and the reverse directions' order, which lay as above;
+inline-flex's own baseline and paint order; `order`, baseline
+alignment and `align-content` are later increments. A
+stretched item's content is not laid at its stretched height, so a
+percentage height in it stays auto, where §9.8 makes it definite. A
+picture keeps the height its own size gives whatever width it flexes
+to, and a picture and a table are not stretched; a table item is never
+wider than its columns' preferred width, nor narrower than their
+minimum. Cross-axis alignment is safe, as above. A container's lines,
+like a table's, are no inline-block's last in flow: `last_baseline`
+is restored around it (§5, "Inline-blocks", "Baseline").
+
+**Windows.** Whether any item will move down is decided from styles
+before any is laid: one aligned `center` or at the end, or with an
+auto vertical margin. Where none will, lines are kept for the window
+as everywhere. Whether a wrapping row lays as a row is decided from
+its items' sizes before any is laid, and alike at every window. Where
+one may, the container's lines and markers are
+kept whatever the window above its end while it is laid, as a table's
+are, and the outermost such container or table keeps the window's once
+its items have moved (§5, "Tables", "Windows"). A windowed layout
+equals the filtered whole one.
+
+**Bounds.** Each item is a 216-byte record in one budgeted stack a
+nested container extends after its ancestors' and truncates when done,
+charged with the layout's output as it grows. Each child looked at is a
+unit of work and blank text its bytes; each item is measured at most
+once, charged as measuring is (`MEASURE_BOX` and its scalars), laid
+once and moved at most once, its lines, boxes and markers a unit each.
+Every size is clamped to `MAX_COORDINATE` and every factor to 2^40
+units of 2^-20, and the weights a share is taken by are scaled to fit
+2^68 together, so every share is exact integer arithmetic within i128
+whatever a page sets. Resolving charges a unit an item, and each pass
+of §9.7's loop three units an item, frozen or not:
+a pass freezes one item at least, so n items take n passes at most,
+but in 1/64 px each pass freezing one leaves the next a gap smaller by
+its share, and a cascade built to freeze one an item, factors halving,
+runs some 17 passes for 16 items. Nested containers of auto width
+measure their content once a level, as nested floats and tables do (§5,
+"Tables", "Bounds"): charged, and refused by name past
+`MAX_LAYOUT_WORK`. A container's items are laid one level below it, as
+a block's children are, and `MAX_DEPTH` bounds the nesting.
+
+**Measured.** Release, the host of §6, §6's deterministic metrics,
+2026-11-24 under a load average of about 3.5, pinned to one CPU,
+medians of nine layouts. Nine 2 MiB shapes without flex (prose, one
+word, blocks, table rows, nested tables, floats, inline-blocks, nested
+lists, inline tables; those of many elements cut to stay under
+td-html's `MAX_NODES`) give identical boxes, lines, markers, height,
+overflow, cuts, work and charges, whole and windowed at 1280, 832 and
+200 px, against the build before. Pages whose flex containers laid as
+blocks before now lay their items in a row: 1.8 MiB of 16,000 navbars
+of four links each (`column-gap`, `align-items: center`, the last link
+`margin-left: auto`) lays 64,000 items in 58 ms at 1280 px, 1,810,300
+work, charging 112.5 MiB with the tree and styled document (23 ms,
+16,000 lines and 94.9 MiB as inline text before); 1.4 MiB of 16,000
+rows of three `flex: 1` cards with padding and borders, 52 ms, 2,446,860
+work, 83.7 MiB (32 ms in block flow, charging 1.8 KiB less).
+
 ## 6. Work bounds, resize and validation
 
 All limits are named constants and tested at and beyond their edges.
@@ -1663,9 +1862,9 @@ Lines past `Limits::lines` refuse `MAX_LINES` as layout's do, so a cap
 within that of them can be refused rather than cut. A text page here
 is one text node laid `pre-wrap` or `break-spaces` in an ordinary
 block, every other box an ordinary block (no inline box, image, `<br>`,
-table, float, inline-block or list marker, which would put items or
-lines in the flow
-the count does not see), and its text holds no control scalar but tab,
+table, float, inline-block, flex container or list marker, which would
+put items or lines in the flow the count does not see, or lay its text
+at another width), and its text holds no control scalar but tab,
 newline and carriage return: any other shows as U+FFFD, a fragment of
 its own (§3), so a line of them would hold several. `fit` refuses
 anything else (`Invalid`); td-web's text, its controls but the tab
@@ -2006,8 +2205,12 @@ distinct maps (td-css/DESIGN.md, "Computed-style sharing").
 5. Real-page and 2 MiB cost validation, synthetic regressions and measured
    memory/latency table. Reconcile the 132 MiB baseline after interning.
 
-Flexbox and advanced text need subsequent designs;
-painting and td-web's integration are td-web/DESIGN.md §10's. Open for
+Advanced text needs a subsequent design;
+painting and td-web's integration are td-web/DESIGN.md §10's. Flexbox
+lands in increments: td-css's properties, then one row with
+blockified items (§5, "Flex"), then wrapping, columns and the reverse
+directions, then inline-flex's own baseline and paint order; `order`,
+baseline alignment and `align-content` after. Open for
 tables: a windowed layout
 holds the lines above its window in the row being laid and in rows a
 rowspan holds open (§5, "Tables", "Windows"). A window past 524,288

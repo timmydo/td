@@ -94,7 +94,11 @@ pub fn fit(
 /// The text node's run and the block it is laid in, if the document is a
 /// text page.
 fn page_text(styled: &StyledDocument<'_>) -> Result<Option<(TextRun, BoxId)>, Error> {
-    if styled.has_tables() || styled.has_nested_lines() || styled.marker_count() != 0 {
+    if styled.has_tables()
+        || styled.has_nested_lines()
+        || styled.has_flex()
+        || styled.marker_count() != 0
+    {
         return Err(Error::Invalid);
     }
     let mut found = None;

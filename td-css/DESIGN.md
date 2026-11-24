@@ -334,12 +334,14 @@ here is the line-set subset, without style, color or thickness. Its propagation 
 descendants is a layout/painting concern, not inheritance. Border widths
 compute to zero for none/hidden styles. Border colors default to the
 computed color and resolve currentcolor after color. Display blockifies
-for the root (absent parent style) and floats: inline/inline-block and
-table-internal displays become block, inline-table becomes table and
-inline-flex becomes flex. None, list-item, table, block and flex remain.
-Flex-item blockification and unsupported positioning modes are deferred:
-until td-layout lays flex rows, blockifying a flex container's children
-would stack an inline navigation bar's links as blocks.
+for the root (absent parent style), floats and flex items, the children
+of a box whose computed display is flex or inline-flex (Flexbox 1 §4):
+inline/inline-block and table-internal displays become block,
+inline-table becomes table and inline-flex becomes flex. None,
+list-item, table, block and flex remain. A flex item's `float` computes
+to none, so no flex item floats, and `clear` is left as it is, which
+td-layout does not read for one (td-layout/DESIGN.md §5, "Flex"); the
+root's `float` is its own. Unsupported positioning modes are deferred.
 Overflow visible/clip computes to auto/hidden when the opposite axis is
 neither visible nor clip. No scrolling or box generation occurs here.
 Font keyword sizes are 9, 10, 13, 16,
@@ -462,12 +464,17 @@ percentages retain their line-height basis for layout; all other newly
 admitted percentages except line-height remain unresolved. Min/max sizes
 use the CSS 2.2 subset, without intrinsic sizing or fit-content, and
 with Flexbox 1's `auto` as the minimum's initial value, computing to
-`Length::Auto`; td-layout reads it as CSS 2.2's initial 0, the automatic
-minimum being a flex item's (td-layout/DESIGN.md §5).
+`Length::Auto`; td-layout reads it as CSS 2.2's initial 0 but in a flex
+item's main axis, where it is the automatic minimum (td-layout/DESIGN.md
+§5, "Flex").
 
 The flex and alignment longhands compute to keywords, numbers and
-lengths only: no td-css computation depends on them, and td-layout
-does not read them yet. A flex factor clamps to MAX_ABSOLUTE_VALUE and
+lengths only: no td-css computation depends on them but blockification
+on a parent's `display`. td-layout lays one row (td-layout/DESIGN.md
+§5, "Flex"): a column, and a wrapping row whose items do not fit
+one line, it lays as block flow for now, and it does not read
+`order`, `align-content` or `row-gap`. A flex factor clamps to
+MAX_ABSOLUTE_VALUE and
 `order`, an integer token, to the 32-bit range browsers keep it in.
 `flex-basis: content` is a keyword, auto and a length-percentage are
 lengths, as width's are; a gap's `normal` stays a keyword. Box Alignment

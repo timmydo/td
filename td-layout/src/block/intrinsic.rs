@@ -195,6 +195,21 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         role: Option<TableRole>,
         depth: usize,
     ) -> Result<(i64, i64), Error> {
+        self.block_contribution(id, b, role, None, depth)
+    }
+    /// block_intrinsic(), or a flex item's contribution (Flexbox 1
+    /// §9.9.3) where `flex` is given: a block's widths clamped by its flex
+    /// base size, as a maximum where it cannot grow and a minimum where it
+    /// cannot shrink, never below its automatic minimum, then within its
+    /// min and max widths.
+    pub(super) fn block_contribution(
+        &mut self,
+        id: BoxId,
+        b: BoxNode,
+        role: Option<TableRole>,
+        flex: Option<flex::Contribution>,
+        depth: usize,
+    ) -> Result<(i64, i64), Error> {
         self.counters.step(MEASURE_BOX)?;
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         let margin = edges(
@@ -228,18 +243,63 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             let low = length(style, Property::MinWidth, None).map_or(0.0, to_content);
             let high = length(style, Property::MaxWidth, None).map_or(f64::INFINITY, to_content);
             let bound = |w: i64| units((w as f64 / 64.0).min(high).max(low));
-            let (least, most) = match length(style, Property::Width, None) {
-                Some(width) => {
-                    let w = bound(up(to_content(width)));
-                    (w, w)
-                }
-                None => {
-                    let lead = self.inside_marker(id, &b)?;
-                    let (least, most) =
-                        self.content_with(b.first_child, None, b.style, lead, depth)?;
-                    (bound(least), bound(most))
-                }
+            let preferred = length(style, Property::Width, None).map(|w| up(to_content(w)));
+            let base = flex.map(|f| match f.basis {
+                flex::Basis::Length(v) => Some(up(to_content(v))),
+                flex::Basis::Width => preferred,
+                flex::Basis::Content => None,
+            });
+            // Content is measured where no width stands for it.
+            let content = if preferred.is_none() || base == Some(None) {
+                let lead = self.inside_marker(id, &b)?;
+                Some(self.box_content(&b, lead, depth)?)
+            } else {
+                None
             };
+            let (least, most) = match (preferred, content) {
+                (Some(w), _) => (w, w),
+                (None, Some(measured)) => measured,
+                (None, None) => return Err(Error::Invalid),
+            };
+            let (least, most) = match flex {
+                Some(item) => {
+                    let base = match (base.flatten(), content) {
+                        (Some(base), _) => base,
+                        (None, Some((_, most))) => most,
+                        (None, None) => return Err(Error::Invalid),
+                    };
+                    let (mut l, mut m) = (least, most);
+                    if !item.growable {
+                        (l, m) = (l.min(base), m.min(base));
+                    }
+                    if !item.shrinkable {
+                        (l, m) = (l.max(base), m.max(base));
+                    }
+                    // Lowered by its base size: its automatic minimum, its
+                    // min-content width or its width where that is less,
+                    // holds it (§4.5), where its min-width is auto and it
+                    // is no scroll container.
+                    let automatic =
+                        matches!(
+                            style.get(Property::MinWidth),
+                            Some(ComputedValue::Length(Length::Auto)) | None
+                        ) && matches!(keyword(style, Property::OverflowX), "visible" | "clip");
+                    if automatic && (l < least || m < most) {
+                        let (low, _) = match content {
+                            Some(measured) => measured,
+                            None => {
+                                let lead = self.inside_marker(id, &b)?;
+                                self.box_content(&b, lead, depth)?
+                            }
+                        };
+                        let floor = low.min(preferred.unwrap_or(low));
+                        (l, m) = (l.max(floor), m.max(floor));
+                    }
+                    (l, m)
+                }
+                None => (least, most),
+            };
+            let (least, most) = (bound(least), bound(most));
             (least + up(decoration), most + up(decoration))
         };
         Ok(((least + around).max(0), (most + around).max(0)))

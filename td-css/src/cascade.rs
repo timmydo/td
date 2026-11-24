@@ -551,7 +551,7 @@ impl StyleSet {
             }
             style.values.try_insert(property, value)?;
         }
-        values::finish(&mut style, parent.is_none())?;
+        values::finish(&mut style, parent)?;
         Ok(style)
     }
 }

@@ -732,7 +732,14 @@ fn word(style: &ComputedStyle, p: Property) -> Option<&'static str> {
         _ => None,
     }
 }
-pub(super) fn finish(style: &mut ComputedStyle, root: bool) -> Result<(), Error> {
+/// What computing a style ends with: border widths of invisible styles,
+/// overflow pairs, and blockification of the root, a float and a flex
+/// item, a child of a `flex` or `inline-flex` box (`parent` its computed
+/// style), whose `float` computes to `none` (Flexbox 1 §4).
+pub(super) fn finish(
+    style: &mut ComputedStyle,
+    parent: Option<&ComputedStyle>,
+) -> Result<(), Error> {
     for (width, kind) in BORDERS.iter().zip(BORDER_STYLES) {
         if matches!(word(style, *kind), Some("none" | "hidden")) {
             style
@@ -754,7 +761,14 @@ pub(super) fn finish(style: &mut ComputedStyle, root: bool) -> Result<(), Error>
             }
         }
     }
-    if root || matches!(word(style, Float), Some("left" | "right")) {
+    let floated = matches!(word(style, Float), Some("left" | "right"));
+    let item = parent.is_some_and(|p| matches!(word(p, Display), Some("flex" | "inline-flex")));
+    if item && floated {
+        style
+            .values
+            .try_insert(Float, ComputedValue::Keyword("none"))?;
+    }
+    if parent.is_none() || floated || item {
         let next = match word(style, Display) {
             Some("inline-table") => Some("table"),
             Some("inline-flex") => Some("flex"),

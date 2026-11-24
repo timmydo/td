@@ -1,6 +1,6 @@
 //! A generated oracle for copying (td-web/DESIGN.md §10, "Copying"):
-//! seeded pages of floats, inline-blocks, tables, inline tables and
-//! lists, and what a copy of them holds, worked from the lines and the
+//! seeded pages of floats, inline-blocks, tables, inline tables, lists
+//! and flex rows and columns, and what a copy of them holds, worked from the lines and the
 //! boxes they lie in rather than from what `copy` keeps as it walks; the
 //! marker checks alone read the walk, for the order lines begin in. A
 //! failing check names the generator, the page's seed and the selection,
@@ -594,6 +594,133 @@ mod cases {
                     wrapped(out, "<p style=margin:0>", "</p>", |out| words(&mut r, out));
                     list(&mut r, 0, out);
                     wrapped(out, "<p style=margin:0>", "</p>", |out| words(&mut r, out));
+                }),
+            }
+        }
+        out
+    }
+
+    // Flex pages: rows of links, words and boxes, items moved by their
+    // alignment and auto margins, nested rows, and rows in floats, cells,
+    // inline-blocks and list items, with floats, inline-blocks, tables
+    // and lists in their items.
+
+    fn flex_item(r: &mut Rng, depth: usize, out: &mut String) {
+        match r.below(16) {
+            0..=2 => words(r, out),
+            3 | 4 => {
+                let _ = write!(out, "<a href=/l>{}</a>", r.word());
+            }
+            5 => wrapped(out, "<span>", "</span>", |out| {
+                words(r, out);
+                out.push_str("<br>");
+                words(r, out);
+            }),
+            6 => wrapped(out, "<div style=margin:auto>", "</div>", |out| {
+                words(r, out)
+            }),
+            7 => wrapped(out, "<p style=margin:0;align-self:center>", "</p>", |out| {
+                inline(r, 2, out);
+            }),
+            8 if depth < 2 => flex(r, depth + 1, out),
+            9 => wrapped(out, "<div>", "</div>", |out| {
+                words(r, out);
+                wrapped(out, "<span style=float:left>", "</span>", |out| {
+                    words(r, out)
+                });
+                words(r, out);
+            }),
+            10 => wrapped(out, "<div>", "</div>", |out| {
+                words(r, out);
+                wrapped(out, "<span style=display:inline-block>", "</span>", |out| {
+                    words(r, out);
+                });
+                words(r, out);
+            }),
+            11 => wrapped(out, "<ul style=margin:0>", "</ul>", |out| {
+                for _ in 0..1 + r.below(3) {
+                    wrapped(out, "<li>", "</li>", |out| words(r, out));
+                }
+            }),
+            12 if depth < 2 => wrapped(out, "<table>", "</table>", |out| {
+                wrapped(out, "<tr>", "</tr>", |out| {
+                    for _ in 0..1 + r.below(2) {
+                        wrapped(out, "<td>", "</td>", |out| {
+                            if r.below(3) == 0 {
+                                flex(r, depth + 1, out);
+                            } else {
+                                words(r, out);
+                            }
+                        });
+                    }
+                });
+            }),
+            13 => wrapped(
+                out,
+                "<span style=visibility:hidden;align-self:end>",
+                "</span>",
+                |out| words(r, out),
+            ),
+            14 => out.push_str("<img width=12 height=8 alt=IMG>"),
+            _ => wrapped(out, "<b style=flex:1;min-width:0>", "</b>", |out| {
+                inline(r, 2, out);
+            }),
+        }
+        if r.below(3) == 0 {
+            out.push(' ');
+        }
+    }
+
+    fn flex(r: &mut Rng, depth: usize, out: &mut String) {
+        let align = ["center", "end", "start", "stretch"][r.below(4) as usize];
+        let justify = ["normal", "center", "space-between", "end"][r.below(4) as usize];
+        // Rows, wrapping rows that fit one line or not, and columns.
+        let lay = ["", "", "flex-wrap:wrap;", "flex-direction:column;"][r.below(4) as usize];
+        let _ = write!(
+            out,
+            "<div style=display:flex;{lay}align-items:{align};justify-content:{justify};column-gap:{}px>",
+            r.below(3) * 4
+        );
+        for _ in 0..1 + r.below(5) {
+            flex_item(r, depth, out);
+        }
+        out.push_str("</div>");
+    }
+
+    fn flex_page(seed: u64) -> String {
+        let mut r = Rng::new(seed, 0xf1e_c5ed);
+        let mut out = body(&mut r, 60, 400);
+        for _ in 0..1 + r.below(3) {
+            match r.below(10) {
+                0..=3 => flex(&mut r, 0, &mut out),
+                4 => wrapped(&mut out, "<div style=float:left>", "</div>", |out| {
+                    flex(&mut r, 1, out);
+                }),
+                5 => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                    words(&mut r, out);
+                    wrapped(out, "<span style=display:inline-block>", "</span>", |out| {
+                        flex(&mut r, 1, out);
+                    });
+                    words(&mut r, out);
+                }),
+                6 => wrapped(&mut out, "<ul>", "</ul>", |out| {
+                    for _ in 0..1 + r.below(3) {
+                        wrapped(out, "<li>", "</li>", |out| {
+                            if r.below(2) == 0 {
+                                words(&mut r, out);
+                            }
+                            flex(&mut r, 1, out);
+                        });
+                    }
+                }),
+                7 => wrapped(&mut out, "<table>", "</table>", |out| {
+                    wrapped(out, "<tr>", "</tr>", |out| {
+                        wrapped(out, "<td>", "</td>", |out| flex(&mut r, 1, out));
+                        wrapped(out, "<td>", "</td>", |out| words(&mut r, out));
+                    });
+                }),
+                _ => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                    inline(&mut r, 0, out);
                 }),
             }
         }
@@ -1488,5 +1615,10 @@ mod cases {
     #[test]
     fn inline_table_pages_copy_as_they_are_painted() {
         run("inline-table", 3_000_000, inline_table_page);
+    }
+
+    #[test]
+    fn flex_pages_copy_as_they_are_painted() {
+        run("flex", 4_000_000, flex_page);
     }
 }

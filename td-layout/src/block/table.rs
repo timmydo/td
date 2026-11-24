@@ -302,12 +302,12 @@ pub(super) fn up(px: f64) -> i64 {
 }
 /// 1/64 px, rounded down: a width taken from the room a container
 /// leaves, so the columns never overflow it.
-fn down(px: f64) -> i64 {
+pub(super) fn down(px: f64) -> i64 {
     (px * 64.0)
         .floor()
         .clamp(-MAX_COORDINATE * 64.0, MAX_COORDINATE * 64.0) as i64
 }
-fn px(units: i64) -> f64 {
+pub(super) fn px(units: i64) -> f64 {
     units as f64 / 64.0
 }
 const PADDING: [Property; 4] = [
@@ -371,7 +371,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         Ok(TableRole::of(keyword(style, Property::Display)))
     }
     /// Text of HTML white space alone; charged the bytes looked at.
-    fn blank(&mut self, b: &BoxNode) -> Result<bool, Error> {
+    pub(super) fn blank(&mut self, b: &BoxNode) -> Result<bool, Error> {
         if b.kind != BoxKind::Text {
             return Ok(false);
         }
@@ -2089,30 +2089,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// rows' height.
     fn finish_cell(&mut self, laid: &Laid, height: f64, shift: f64) -> Result<(), Error> {
         if shift != 0.0 {
-            let (lines, boxes, markers) = (laid.lines, laid.boxes, laid.markers);
-            self.counters
-                .step((lines.1 - lines.0) + (boxes.1 - boxes.0) + (markers.1 - markers.0))?;
-            for line in self.lines.get_mut(lines.0..lines.1).ok_or(Error::Invalid)? {
-                line.y += shift;
-                for image in &mut line.replaced {
-                    image.y += shift;
-                }
-                if !coordinate(line.y + line.height) {
-                    return Err(Error::Limit("MAX_COORDINATE"));
-                }
-            }
-            for geometry in self.boxes.get_mut(boxes.0..boxes.1).ok_or(Error::Invalid)? {
-                geometry.content.y += shift;
-                geometry.border.y += shift;
-            }
-            for marker in self
-                .markers
-                .get_mut(markers.0..markers.1)
-                .ok_or(Error::Invalid)?
-            {
-                marker.y += shift;
-                marker.baseline += shift;
-            }
+            self.move_down((laid.lines, laid.boxes, laid.markers), shift)?;
         }
         if let Some(at) = laid.geometry {
             let geometry = self.boxes.get_mut(at).ok_or(Error::Invalid)?;
@@ -2127,6 +2104,39 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 y: rect.y + shift,
                 ..rect
             })?;
+        }
+        Ok(())
+    }
+    /// Moves what was laid, the `lines`, `boxes` and `markers` ranges, down
+    /// by `shift`: a cell's content by its alignment, or a flex item by
+    /// its own (DESIGN.md §5, "Flex").
+    pub(super) fn move_down(
+        &mut self,
+        (lines, boxes, markers): ((usize, usize), (usize, usize), (usize, usize)),
+        shift: f64,
+    ) -> Result<(), Error> {
+        self.counters
+            .step((lines.1 - lines.0) + (boxes.1 - boxes.0) + (markers.1 - markers.0))?;
+        for line in self.lines.get_mut(lines.0..lines.1).ok_or(Error::Invalid)? {
+            line.y += shift;
+            for image in &mut line.replaced {
+                image.y += shift;
+            }
+            if !coordinate(line.y + line.height) {
+                return Err(Error::Limit("MAX_COORDINATE"));
+            }
+        }
+        for geometry in self.boxes.get_mut(boxes.0..boxes.1).ok_or(Error::Invalid)? {
+            geometry.content.y += shift;
+            geometry.border.y += shift;
+        }
+        for marker in self
+            .markers
+            .get_mut(markers.0..markers.1)
+            .ok_or(Error::Invalid)?
+        {
+            marker.y += shift;
+            marker.baseline += shift;
         }
         Ok(())
     }

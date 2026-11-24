@@ -729,4 +729,73 @@ mod tests {
         let next = target_place(&laid, empty).unwrap();
         assert_eq!(text::line_of(&laid, next), 2);
     }
+
+    /// Flex items' lines are in tree order, as table cells' are, an
+    /// anonymous item's naming its container: every place is on the line
+    /// laying it, items moved down included, and a copy parts the items'
+    /// text as paragraphs.
+    #[test]
+    fn places_and_copies_across_flex_items() {
+        let laid = laid(
+            "<body style=margin:0><nav style=display:flex;align-items:center;column-gap:8px>\
+             one <a href=/a>two<br>lines</a> three <b style=margin:auto>four</b>\
+             <span style=display:flex;align-items:end><i>five</i><i>six<br>more</i></span> seven\
+             </nav><p style=margin:0>after",
+        );
+        let lines = laid.lines();
+        let shown = |line: &td_layout::inline::Line| {
+            line.fragments
+                .iter()
+                .map(|f| text::fragment_text(&laid, f))
+                .collect::<String>()
+        };
+        let texts: Vec<String> = lines.iter().map(shown).collect();
+        assert_eq!(
+            texts,
+            ["one", "two", "lines", "three", "four", "five", "six", "more", "seven", "after"]
+        );
+        // Moved down: "one" centred beside the two-line link, "five" at
+        // its container's end.
+        assert!(lines[0].y > lines[1].y);
+        assert!(lines[5].y > lines[6].y);
+        for (at, line) in lines.iter().enumerate() {
+            for item in text::items(&laid, line) {
+                assert_eq!(text::line_of(&laid, item.start), at, "{item:?}");
+                assert_eq!(text::line_of(&laid, item.end), at, "{item:?}");
+            }
+            assert_eq!(laid.outer(at), None);
+        }
+        // Two anonymous items name the container, and are two paragraphs.
+        assert_eq!(lines[0].block(), lines[3].block());
+        assert_eq!(text::paragraph(&laid, 0), (0, 0));
+        assert_eq!(text::paragraph(&laid, 3), (3, 3));
+        let mut out = String::new();
+        let (first, last) = text::page_bounds(&laid);
+        let _ = text::copy(&laid, first, last, &mut |t| {
+            out.push_str(t);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert_eq!(
+            out,
+            "one\ntwo\nlines\nthree\nfour\nfive\nsix\nmore\nseven\nafter"
+        );
+    }
+
+    /// A picture item is blockified, so it lays no fragment and has no
+    /// place: its alt text is not copied, as a block picture's is not.
+    #[test]
+    fn a_picture_item_is_not_copied() {
+        for (div, img) in [("display:flex", ""), ("", "display:block")] {
+            let picture = laid(&format!(
+                "<body style=margin:0><div style='{div}'>ab <img style='{img}' alt=IMG> cd</div>"
+            ));
+            let mut out = String::new();
+            let (first, last) = text::page_bounds(&picture);
+            let _ = text::copy(&picture, first, last, &mut |t| {
+                out.push_str(t);
+                std::ops::ControlFlow::Continue(())
+            });
+            assert_eq!(out, "ab\ncd", "{div} {img}");
+        }
+    }
 }

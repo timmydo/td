@@ -360,4 +360,66 @@ mod cases {
             assert_eq!(style("", Some(&parent)).get(p), Some(&auto), "{name}");
         }
     }
+    /// A flex container's children are blockified as floats are, and do
+    /// not float; its grandchildren, a block's children and the root are
+    /// computed as before.
+    #[test]
+    fn flex_items_are_blockified_and_do_not_float() {
+        let display = |s: &ComputedStyle| match s.get(Display) {
+            Some(ComputedValue::Keyword(k)) => *k,
+            other => panic!("{other:?}"),
+        };
+        let float = |s: &ComputedStyle| match s.get(Float) {
+            Some(ComputedValue::Keyword(k)) => *k,
+            other => panic!("{other:?}"),
+        };
+        for container in ["display:flex", "display:inline-flex"] {
+            let parent = child(container);
+            for (own, want) in [
+                ("inline", "block"),
+                ("inline-block", "block"),
+                ("inline-table", "table"),
+                ("inline-flex", "flex"),
+                ("table-row-group", "block"),
+                ("table-header-group", "block"),
+                ("table-footer-group", "block"),
+                ("table-row", "block"),
+                ("table-cell", "block"),
+                ("table-column-group", "block"),
+                ("table-column", "block"),
+                ("table-caption", "block"),
+                ("block", "block"),
+                ("list-item", "list-item"),
+                ("table", "table"),
+                ("flex", "flex"),
+                ("none", "none"),
+            ] {
+                let s = style(&format!("display:{own}"), Some(&parent));
+                assert_eq!(display(&s), want, "{container} {own}");
+                assert_eq!(float(&s), "none", "{container} {own}");
+                let s = style(&format!("display:{own};float:right"), Some(&parent));
+                assert_eq!(display(&s), want, "{container} {own} floated");
+                assert_eq!(float(&s), "none", "{container} {own} floated");
+                // Its own children are not flex items.
+                let grandchild = style("display:inline;float:none", Some(&s));
+                let blockified = matches!(want, "flex");
+                assert_eq!(
+                    display(&grandchild),
+                    if blockified { "block" } else { "inline" },
+                    "{container} {own}"
+                );
+            }
+        }
+        // A block's children, and a float in one, as before.
+        let parent = child("display:block");
+        let s = style("display:inline", Some(&parent));
+        assert_eq!(display(&s), "inline");
+        let s = style("display:inline;float:left", Some(&parent));
+        assert_eq!((display(&s), float(&s)), ("block", "left"));
+        // The root: blockified as a root, floating as it is said to.
+        let s = style("display:inline-flex;float:left", None);
+        assert_eq!((display(&s), float(&s)), ("flex", "left"));
+        let s = style("display:inline", None);
+        assert_eq!((display(&s), float(&s)), ("block", "none"));
+    }
 }
