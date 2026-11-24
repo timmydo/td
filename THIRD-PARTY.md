@@ -36,8 +36,9 @@ Permissive terms, which ask that the notice travel with the code.
 | `td-photo/src/camera.rs` (the Nikon Z 8 entry) | black and white levels and the XYZ-to-camera matrix, mode `14bit-compressed` | RawSpeed, `data/cameras.xml` | CC-BY-SA-3.0 (<https://creativecommons.org/licenses/by-sa/3.0/>) |
 
 The programs that embed the Unifont data print its notices with
-`--font-license` where they offer that flag (td-dua, td-editor, td-setup,
-td-software, td-taskmgr); td-compositor embeds it and does not yet.
+`--font-license` where they offer that flag (td-dua, td-editor, td-mixer,
+td-setup, td-software, td-taskmgr); td-compositor embeds it and does not
+yet.
 
 ## Test corpora and fixtures
 

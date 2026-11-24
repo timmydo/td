@@ -117,6 +117,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-login",
     "td-luks",
     "td-mail",
+    "td-mixer",
     "td-net",
     "td-netd",
     "td-news",

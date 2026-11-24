@@ -9454,10 +9454,14 @@ its fixed `--choose-repo` so the human picks the repository (see
 td-authd/DESIGN.md); td-dua by request 0b, the same way, scanning the
 account home; td-agent by request 0c, the same way, with its runtime
 directory and the image's td-jail and td-txt named in its environment,
-running its tools through the workspace kind (§C); and td-software by
+running its tools through the workspace kind (§C); td-software by
 request 22, under the same checks but from `/` as the task manager is,
 with the compositor's control socket named in its environment
-(td-software/DESIGN.md).
+(td-software/DESIGN.md); and td-mixer, the sound panel (§K.5), by request
+30, the task manager's shape: no argument, the display alone added, from
+`/`. It is an ordinary controller of td-audio's socket, which admits the
+human's uid as one already, so its SOUND card adds a way to start, not a
+new reach.
 
 ### L.1 Elevation — consent without a secret
 

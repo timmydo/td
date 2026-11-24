@@ -8565,6 +8565,7 @@ mod tests {
                 "td-login",
                 "td-luks",
                 "td-mail",
+                "td-mixer",
                 "td-net",
                 "td-netd",
                 "td-news",

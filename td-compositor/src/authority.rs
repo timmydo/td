@@ -1468,6 +1468,7 @@ pub(crate) enum Program {
     Dua,
     Agent,
     Software,
+    Mixer,
 }
 
 fn startup() -> Result<(), String> {
@@ -1628,6 +1629,7 @@ impl Processes {
             Program::Dua => 0x0b,
             Program::Agent => 0x0c,
             Program::Software => 0x22,
+            Program::Mixer => 0x30,
         };
         self.request(wire, &[request])
     }
@@ -2548,6 +2550,7 @@ mod tests {
             (Program::Dua, 0x0b),
             (Program::Agent, 0x0c),
             (Program::Software, 0x22),
+            (Program::Mixer, 0x30),
         ] {
             let mut processes = Processes::new();
             let mut wire = wire(vec![handle(1)]);

@@ -3010,8 +3010,10 @@ three fixed environment variables, each started in the verified account
 home. Request `22` is the same fixed exec of /bin/td-software, started
 at / with one fixed environment variable and either no arguments or the
 one pair `--select NAME`, for an application name in the registry
-grammar that root checks and terminal-exec checks again. They add no
-raw syscall, descriptor or credential operation.
+grammar that root checks and terminal-exec checks again. Request `30`
+is the task manager's fixed exec of /bin/td-mixer, the sound panel, with
+no arguments and the fixed human Wayland socket. They add no raw
+syscall, descriptor or credential operation.
 Request 0d starts no human program: root itself runs the fixed
 /bin/td-svc client with `start NAME`, for an application name in the
 registry grammar that root's immutable registry holds, through the same

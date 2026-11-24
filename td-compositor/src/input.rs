@@ -8722,6 +8722,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::Dua) => "DISK USAGE",
                 Bound::Launch(LaunchRequest::Agent) => "CODING AGENT",
                 Bound::Launch(LaunchRequest::Software) => "SOFTWARE",
+                Bound::Launch(LaunchRequest::Mixer) => "SOUND",
                 Bound::Launch(LaunchRequest::Notebook) => "PASSWORD NOTEBOOK",
                 Bound::Launch(LaunchRequest::Application(_)) => "APPLICATION",
                 Bound::Launch(LaunchRequest::Install(_)) => "INSTALL",

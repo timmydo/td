@@ -1316,6 +1316,7 @@ Subsequent payloads are exact byte records:
 | `23` | `88` and which of the registry's Flathub declarations are installed ("Application requests") |
 | `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
 | `2c` plus a verb, the kind, an application name and a start row or path | a grant request ("Grant requests"): `89` a page of the account's directory rows, `8a` what a change did, or `8b` the writer's refusal |
+| `30` | `81` plus a process handle for the human sound panel, td-mixer |
 
 `0d` and `0f` name an application: the rest of the frame, one to 64
 bytes in the registry grammar (anything else is malformed and ends the
@@ -1402,9 +1403,9 @@ receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|sandbox|taskmgr|editor|photo|review|dua|agent|software [APP]]` in a new
-process group. The optional literal selects requests `04`, `07` through
-`0c`, `22` and `27`; it is not a pathname. `APP` follows `software` alone,
+[task|sandbox|taskmgr|editor|photo|review|dua|agent|mixer|software [APP]]` in
+a new process group. The optional literal selects requests `04`, `07`
+through `0c`, `22`, `27` and `30`; it is not a pathname. `APP` follows `software` alone,
 for a `22` that names one.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
@@ -1523,15 +1524,22 @@ selects td-software's own entry and nothing else: it names no program,
 path or file, and td-software leaves its selection where it was for a
 name its registry lacks, so root does not look it up.
 
-An authority older than one of requests `07` through `0f` or `22`
-through `24`, or than `22`'s name form or the named `0d` and `0f`,
+Request `30` is the task manager's shape for td-mixer, the sound panel
+(APPLICATIONS.md §K.5): it execs `/bin/td-mixer` with no arguments from
+`/`, adding only `WAYLAND_DISPLAY`. The panel is an ordinary controller
+of td-audio's socket, which admits the human's uid as one already, as it
+does `td-audio` run from a terminal: the card adds a way to start, not a
+new reach.
+
+An authority older than one of requests `07` through `0f`, `22`
+through `24` or `30`, or than `22`'s name form or the named `0d` and `0f`,
 closes the entire launch channel on it, as an authority newer than the
 compositor closes it on a bare `0d` or `0f`; its paired compositor then
 restarts. The image ships both peers atomically. Requests `07` through
 `0b` were additive within TDLA002, without negotiation or mixed-version
 compatibility. The login requests `1b` and `1c` came with the bump to
 TDLA003, because `1c` carries a PIN; `0c` through `0f`, `22` through
-`24`, `2c` and `22`'s name were added within it later, and `0d` and `0f`
+`24`, `2c`, `30` and `22`'s name were added within it later, and `0d` and `0f`
 took their names within it. Both peers again ship together, without
 negotiation.
 
@@ -3411,7 +3419,8 @@ and its "Elevation increments" which commit lands each part;
 `td-compositor/DESIGN.md`, "Elevation consent", says which presses
 confirm. At `10` and above the private channel routes requests `10` to
 `21`, `25`, `26`, `28` to `2b` and `2d` to `2f` to the secret session, and
-`22` to `24`, `27` and `2c` to their own handlers, and refuses the rest;
+`22` to `24`, `27`, `2c` and `30` to their own handlers, and refuses the
+rest;
 ENCRYPTION.md increment 8e's storage commit first routed `20` there
 ("Login keys and session lock", amendment 10).
 

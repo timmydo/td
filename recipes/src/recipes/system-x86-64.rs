@@ -5688,6 +5688,16 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             target: "{in:td-software}/bin/td-software".into(),
             link: "{root}/real-root/bin/td-software".into(),
         });
+        // td-mixer, the sound panel, a static system-tree program the
+        // launcher's SOUND entry starts (APPLICATIONS.md §K.5).
+        steps.push(Step::CopyTree {
+            from: "{in:td-mixer}".into(),
+            dest: "{root}/real-root{in:td-mixer}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-mixer}/bin/td-mixer".into(),
+            link: "{root}/real-root/bin/td-mixer".into(),
+        });
         // td-editor, the text editor, a static system-tree program run from the
         // terminal (td-editor/DESIGN.md).
         steps.push(Step::CopyTree {
@@ -6841,6 +6851,7 @@ const DESKTOP_INPUTS: &[&str] = &[
     "td-pass",
     "td-dua",
     "td-software",
+    "td-mixer",
     "td-seatd",
     "td-vm-guest",
     "td-update",
@@ -7165,6 +7176,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "td-pass",
                 "td-dua",
                 "td-software",
+                "td-mixer",
                 "td-jail",
                 "td-seatd",
                 "td-vm-guest",
@@ -9361,6 +9373,7 @@ mod tests {
             ("td-pass", "td-pass"),
             ("td-dua", "td-dua"),
             ("td-software", "td-software"),
+            ("td-mixer", "td-mixer"),
         ] {
             assert!(steps.iter().any(|step| matches!(step,
                 Step::Symlink { link, target }
@@ -18323,6 +18336,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             "td-pass",
             "td-dua",
             "td-software",
+            "td-mixer",
             "td-sandbox",
         ] {
             assert!(
@@ -18847,6 +18861,7 @@ mod server_tests {
             "td-pass",
             "td-dua",
             "td-software",
+            "td-mixer",
             "td-editor",
             "td-fetchd",
             "td-app",

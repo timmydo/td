@@ -1,4 +1,5 @@
-//! td-mixer: the sound panel, run as the human (APPLICATIONS.md §K.5).
+//! td-mixer: the sound panel, a fixed desktop program td-authd starts as
+//! the human by request `30` (APPLICATIONS.md §K.5).
 //! An ordinary controller of td-audio's
 //! socket through td-pulse: what it reads and writes (`model`), the two
 //! threads that talk to the daemon (`worker`), and the panel (`app`).

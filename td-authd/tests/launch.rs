@@ -144,6 +144,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[0x0a]).unwrap(), Request::Start(Program::Review));
     assert_eq!(request(&[0x0b]).unwrap(), Request::Start(Program::Dua));
     assert_eq!(request(&[0x0c]).unwrap(), Request::Start(Program::Agent));
+    assert_eq!(request(&[0x30]).unwrap(), Request::Start(Program::Mixer));
     assert_eq!(
         request(b"\x0dfirefox").unwrap(),
         Request::Supervised(Supervised::Start("firefox".into()))
@@ -649,6 +650,37 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
     );
 }
 
+/// The sound panel is the task manager's shape: the fixed binary, no
+/// argument, the display alone added, started as the human.
+#[test]
+fn the_sound_panel_has_fixed_unprivileged_exec_and_display_only() {
+    let wrapper = config().terminal(
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        &Launch::Fixed(Program::Mixer),
+    );
+    assert_eq!(wrapper.get_program(), "/bin/td-login");
+    assert_eq!(wrapper.get_args().last().unwrap(), "mixer");
+    let command = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        Program::Mixer,
+        None,
+        || Ok(primary("tester")),
+    )
+    .unwrap();
+    assert_eq!(command.get_program(), "/bin/td-mixer");
+    assert_eq!(command.get_args().count(), 0);
+    assert_eq!(
+        command.get_envs().collect::<Vec<_>>(),
+        vec![(
+            std::ffi::OsStr::new("WAYLAND_DISPLAY"),
+            Some(std::ffi::OsStr::new("/run/td-compositor/1000/wayland-0"))
+        )]
+    );
+}
+
 /// The helper adds the display and the session's runtime directory, and
 /// no other variable, to the five exec-as passes on: td-pass refuses to
 /// draw unless its frames can live on a memory filesystem.
@@ -729,6 +761,7 @@ fn software_opens_at_an_application_named_in_the_registry_grammar() {
         (Program::Home, "firefox"),
         (Program::Software, "Firefox"),
         (Program::Software, "--help"),
+        (Program::Mixer, "firefox"),
     ] {
         assert!(
             terminal_command(
@@ -758,6 +791,7 @@ fn terminal_exec_takes_an_application_only_for_td_software() {
     };
     for bad in [
         &["editor", "firefox"][..],
+        &["mixer", "firefox"],
         &["software", "Firefox"],
         &["software", "firefox", "mail"],
         &["software", ""],
@@ -832,6 +866,7 @@ fn every_selection_literal_names_its_program_back() {
         Program::Dua,
         Program::Agent,
         Program::Software,
+        Program::Mixer,
     ] {
         let literal = program.selection().unwrap();
         assert_eq!(Program::from_selection(literal), Some(program), "{literal}");
@@ -848,6 +883,8 @@ fn every_selection_literal_names_its_program_back() {
         "td-dua",
         "td-agent",
         "td-software",
+        "td-mixer",
+        "sound",
     ] {
         assert_eq!(Program::from_selection(literal), None, "{literal:?}");
     }
@@ -948,6 +985,7 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         Program::Dua,
         Program::Agent,
         Program::Software,
+        Program::Mixer,
     ] {
         let mut loaded = false;
         let result = terminal_command(
@@ -963,7 +1001,7 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         );
         let requires_account = !matches!(
             program,
-            Program::Home | Program::TaskManager | Program::Software
+            Program::Home | Program::TaskManager | Program::Software | Program::Mixer
         );
         assert_eq!(loaded, requires_account);
         assert_eq!(result.is_err(), requires_account);

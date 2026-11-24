@@ -657,7 +657,7 @@ recipes/src/recipes/system-x86-64.rs	allocating-constructor	1
 recipes/src/recipes/system-x86-64.rs	allocating-conversion	95
 recipes/src/recipes/system-x86-64.rs	allocation-macro	166
 recipes/src/recipes/system-x86-64.rs	heap-owner	6
-recipes/src/recipes/system-x86-64.rs	unchecked-growth-or-clone	279
+recipes/src/recipes/system-x86-64.rs	unchecked-growth-or-clone	281
 recipes/src/recipes/td-agent-test.rs	allocation-macro	4
 recipes/src/recipes/td-audio.rs	allocating-conversion	5
 recipes/src/recipes/td-audio.rs	allocation-macro	3
@@ -720,6 +720,7 @@ recipes/src/recipes/td-login.rs	unchecked-growth-or-clone	9
 recipes/src/recipes/td-luks.rs	allocating-conversion	1
 recipes/src/recipes/td-luks.rs	allocation-macro	1
 recipes/src/recipes/td-luks.rs	unchecked-growth-or-clone	11
+recipes/src/recipes/td-mixer-test.rs	allocation-macro	4
 recipes/src/recipes/td-netd-test.rs	allocation-macro	5
 recipes/src/recipes/td-netd-test.rs	unchecked-growth-or-clone	6
 recipes/src/recipes/td-netd.rs	allocation-macro	1

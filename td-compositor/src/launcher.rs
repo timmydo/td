@@ -53,6 +53,8 @@ pub enum LaunchRequest {
     Dua,
     Agent,
     Software,
+    /// The sound panel, td-mixer (APPLICATIONS.md §K.5).
+    Mixer,
     /// The password notebook, which root opens (td-pass/DESIGN.md).
     Notebook,
     /// The launcher table's application at this position in the card's
@@ -75,6 +77,7 @@ impl LaunchRequest {
             Self::Dua => Some(crate::authority::Program::Dua),
             Self::Agent => Some(crate::authority::Program::Agent),
             Self::Software => Some(crate::authority::Program::Software),
+            Self::Mixer => Some(crate::authority::Program::Mixer),
             Self::UiDemo
             | Self::Terminal
             | Self::Notebook
@@ -123,6 +126,11 @@ const AUTHORITY_ENTRIES: &[Entry] = &[
         label: "TASK MANAGER",
         search: "task manager processes cpu memory network disk",
         request: Some(LaunchRequest::TaskManager),
+    },
+    Entry {
+        label: "SOUND",
+        search: "sound audio volume output speakers headphones hdmi mute mixer",
+        request: Some(LaunchRequest::Mixer),
     },
     Entry {
         label: "TEXT EDITOR",
@@ -890,7 +898,8 @@ pub(crate) fn launch_command(
         | LaunchRequest::Review
         | LaunchRequest::Dua
         | LaunchRequest::Agent
-        | LaunchRequest::Software => {
+        | LaunchRequest::Software
+        | LaunchRequest::Mixer => {
             return Err("desktop programs are not configured for this development launcher".into());
         }
         LaunchRequest::Application(_) | LaunchRequest::Install(_) => {
@@ -1741,6 +1750,7 @@ mod authority_entry_tests {
         "SOFTWARE",
         "td-term (sandbox)",
         "TASK MANAGER",
+        "SOUND",
         "TEXT EDITOR",
         "PHOTOS",
         "CODE REVIEW",
@@ -1896,6 +1906,24 @@ mod authority_entry_tests {
         assert!(queued.notebook());
     }
 
+    /// The authority program a desktop entry's request names is that
+    /// entry's own: no card starts another's program.
+    fn starts_its_own_program(request: LaunchRequest) -> bool {
+        use crate::authority::Program;
+        matches!(
+            (request, request.authority_program()),
+            (LaunchRequest::Sandbox, Some(Program::Sandbox))
+                | (LaunchRequest::TaskManager, Some(Program::TaskManager))
+                | (LaunchRequest::Editor, Some(Program::Editor))
+                | (LaunchRequest::Photo, Some(Program::Photo))
+                | (LaunchRequest::Review, Some(Program::Review))
+                | (LaunchRequest::Dua, Some(Program::Dua))
+                | (LaunchRequest::Agent, Some(Program::Agent))
+                | (LaunchRequest::Software, Some(Program::Software))
+                | (LaunchRequest::Mixer, Some(Program::Mixer))
+        )
+    }
+
     #[test]
     fn desktop_program_entries_are_enabled_only_for_the_fixed_authority() {
         let mut launcher = Launcher::new();
@@ -1916,6 +1944,8 @@ mod authority_entry_tests {
             ("storage", "DISK USAGE", LaunchRequest::Dua),
             ("coding", "CODING AGENT", LaunchRequest::Agent),
             ("flathub", "SOFTWARE", LaunchRequest::Software),
+            ("headphones", "SOUND", LaunchRequest::Mixer),
+            ("volume", "SOUND", LaunchRequest::Mixer),
         ] {
             launcher.apply(LauncherAction::Open);
             for character in word.chars() {
@@ -1923,7 +1953,7 @@ mod authority_entry_tests {
             }
             assert_eq!(launcher.matched_labels(), [label], "{word}");
             assert_eq!(launcher.apply(LauncherAction::Activate), Some(request));
-            assert!(request.authority_program().is_some());
+            assert!(starts_its_own_program(request), "{request:?}");
         }
         // Root opens the notebook itself: no program is started for it.
         launcher.apply(LauncherAction::Open);
@@ -2030,6 +2060,7 @@ mod authority_entry_tests {
             LaunchRequest::Dua,
             LaunchRequest::Agent,
             LaunchRequest::Software,
+            LaunchRequest::Mixer,
             LaunchRequest::Notebook,
         ] {
             assert!(launch_command(&options, request, 1).is_err(), "{request:?}");

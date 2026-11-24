@@ -16,6 +16,7 @@ td-dua-source td-dua td-civil,td-json,td-alloc,td-ui,td-compositor
 td-editor-source td-editor td-civil,td-remote,td-alloc,td-ui,td-compositor,td-fs,td-test-compositor
 td-install-qemu-test-source td-install-qemu-test
 td-mail-source td-mail td-charset,td-civil,td-css,td-dom,td-encoding,td-fetch-client,td-fs,td-html,td-json,td-kv,td-layout,td-page,td-picture,td-av1,td-avif,td-gif,td-jpeg,td-png,td-webp,engine,td-inflate,td-util,td-regex,td-toml,td-alloc,td-ui,td-url,td-compositor,td-test-compositor
+td-mixer-source td-mixer td-alloc,td-pulse,td-ui,td-compositor
 td-net-source net engine,td-alloc,td-inflate,td-fs,td-civil,td-primitives,td-tls-provider
 td-news-source td-news td-civil,td-fetch-client,td-html,td-json,td-kv,td-toml,td-alloc,td-ui,td-compositor
 td-open-source td-open td-busd,td-secret

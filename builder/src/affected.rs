@@ -1573,6 +1573,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The sound panel the same way: td-mixer-test runs the static
+    // binary's usage and font notices.
+    if p.starts_with("td-mixer/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
     // The disk usage analyzer the same way: td-dua-test runs the static
     // binary's headless modes, a scanned preview frame among them.
     if p.starts_with("td-dua/") && !p.contains("..") {
@@ -3078,6 +3087,10 @@ fn run_self_test_over(root: &Path) -> Vec<String> {
     assert_preflight!("td-software/src/app.rs", "cargo-test");
     assert_target!("td-software/src/worker.rs", "check");
     assert_target!("td-software/Cargo.lock", "recipe-checks");
+    // The sound panel as well: td-mixer-test runs its headless modes.
+    assert_preflight!("td-mixer/src/app.rs", "cargo-test");
+    assert_target!("td-mixer/src/worker.rs", "check");
+    assert_target!("td-mixer/Cargo.lock", "recipe-checks");
     // The disk usage analyzer as well: td-dua-test runs its headless modes.
     assert_target!("td-dua/src/window.rs", "check");
     assert_target!("td-dua/src/treemap.rs", "recipe-checks");

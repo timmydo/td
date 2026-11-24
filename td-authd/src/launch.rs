@@ -336,6 +336,7 @@ fn terminal_command(
         | Program::Review
         | Program::Dua
         | Program::Agent
+        | Program::Mixer
         | Program::Software => {}
     }
     Ok(command)
@@ -406,7 +407,7 @@ fn terminal_arguments(
     arguments: &[String],
 ) -> Result<(u32, &str, u64, Program, Option<&str>), String> {
     const USAGE: &str = "terminal-exec requires UID GENERATION HANDLE \
-                         [task|taskmgr|editor|photo|review|dua|agent|software [APP]]";
+                         [task|taskmgr|editor|photo|review|dua|agent|mixer|software [APP]]";
     let (uid, generation, handle, terminal, select) = match arguments {
         [uid, generation, handle] => (uid, generation, handle, Some(Program::Home), None),
         [uid, generation, handle, literal] => (
@@ -784,6 +785,7 @@ enum Program {
     Dua,
     Agent,
     Software,
+    Mixer,
 }
 
 impl Program {
@@ -799,6 +801,7 @@ impl Program {
             Self::Dua => Some("dua"),
             Self::Agent => Some("agent"),
             Self::Software => Some("software"),
+            Self::Mixer => Some("mixer"),
         }
     }
 
@@ -815,6 +818,7 @@ impl Program {
             "dua" => Self::Dua,
             "agent" => Self::Agent,
             "software" => Self::Software,
+            "mixer" => Self::Mixer,
             _ => return None,
         })
     }
@@ -830,6 +834,7 @@ impl Program {
             Self::Dua => Some("/bin/td-dua"),
             Self::Agent => Some("/bin/td-agent"),
             Self::Software => Some("/bin/td-software"),
+            Self::Mixer => Some("/bin/td-mixer"),
             Self::Home | Self::Task | Self::Sandbox => None,
         }
     }
@@ -847,7 +852,8 @@ impl Program {
             | Self::Photo
             | Self::Dua
             | Self::Agent
-            | Self::Software => &[],
+            | Self::Software
+            | Self::Mixer => &[],
         }
     }
 
@@ -874,18 +880,24 @@ impl Program {
             | Self::Editor
             | Self::Photo
             | Self::Review
-            | Self::Dua => Vec::new(),
+            | Self::Dua
+            | Self::Mixer => Vec::new(),
         }
     }
 
     /// Whether a desktop program starts in the account home, where its file
     /// dialogs begin, the disk usage analyzer scans and td-agent's state
-    /// and configuration are found. The task manager and td-software have
-    /// no files to open.
+    /// and configuration are found. The task manager, td-software and the
+    /// sound panel have no files to open.
     fn starts_in_account_home(self) -> bool {
         match self {
             Self::Editor | Self::Photo | Self::Review | Self::Dua | Self::Agent => true,
-            Self::Home | Self::Sandbox | Self::Task | Self::TaskManager | Self::Software => false,
+            Self::Home
+            | Self::Sandbox
+            | Self::Task
+            | Self::TaskManager
+            | Self::Software
+            | Self::Mixer => false,
         }
     }
 }
@@ -931,6 +943,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             }
             Ok(Request::SoftwareAt(name.to_string()))
         }
+        [0x30] => Ok(Request::Start(Program::Mixer)),
         [0x23] => Ok(Request::Installed),
         [0x2c, operands @ ..] => Ok(Request::Grants(crate::grant_requests::Request::decode(
             operands,
@@ -1343,7 +1356,14 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         request(&[0x2f])?,
         Request::Secret(crate::session::Request::MenuState)
     );
-    for bad in [&[0x2e][..], &[0x2e, 2], &[0x2e, 0, 0], &[0x2f, 0], &[0x30]] {
+    for bad in [
+        &[0x2e][..],
+        &[0x2e, 2],
+        &[0x2e, 0, 0],
+        &[0x2f, 0],
+        &[0x30, 0],
+        &[0x31],
+    ] {
         assert!(request(bad).is_err(), "{bad:?}");
     }
     // `2c` reaches the grant decoder, which takes nothing malformed.

@@ -2904,8 +2904,9 @@ after them each application of the image's launcher table,
 is installed, sorted by display name and labelled with it uppercased, its
 search text the display name, the row's terms and the registry name. The
 desktop programs are system tools the image ships beside the terminal:
-Software, Task Manager, Text Editor, Photos, Code Review, Disk Usage and
-Coding Agent issue fixed private requests 22, 07, 08, 09, 0a, 0b and 0c, and
+Software, Task Manager, Sound, Text Editor, Photos, Code Review, Disk
+Usage and Coding Agent issue fixed private requests 22, 07, 30, 08, 09, 0a,
+0b and 0c, and
 run with the human credentials described in td-authd/DESIGN.md (the task
 manager with its system PID view). No request carries a path; Code Review's
 fixed `--choose-repo`, added by the authority, has td-review ask which
