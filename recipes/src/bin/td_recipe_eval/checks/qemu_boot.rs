@@ -253,12 +253,53 @@ const TD_APPLICATION_CURSOR_PREFIX: &str =
 /// The compositor's console line for each volume-down step, from unity: the
 /// controller presses the next only once the last was applied, because the
 /// compositor's key queue drops what outruns its round trips.
-const TD_VOLUME_STEP_MARKERS: [&str; FIREFOX_AUDIO_VOLUME_STEPS] = [
+const TD_VOLUME_STEPS_FROM_UNITY: [&str; FIREFOX_AUDIO_VOLUME_STEPS] = [
     "TD-VOLUME level=95 muted=no",
     "TD-VOLUME level=90 muted=no",
     "TD-VOLUME level=85 muted=no",
     "TD-VOLUME level=80 muted=no",
 ];
+/// The same presses from the level the unity steps leave, as td-audio keeps
+/// it across a restart.
+const TD_VOLUME_STEPS_FROM_KEPT: [&str; FIREFOX_AUDIO_VOLUME_STEPS] = [
+    "TD-VOLUME level=75 muted=no",
+    "TD-VOLUME level=70 muted=no",
+    "TD-VOLUME level=65 muted=no",
+    "TD-VOLUME level=60 muted=no",
+];
+
+/// What td-audio's output level is when a physical-input boot's first
+/// volume key lands, which its steps count down from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum VolumeFrom {
+    /// A volume no level was kept on: the output starts at unity.
+    #[default]
+    Unity,
+    /// The level an earlier physical-input boot's keys left on the same
+    /// volume, which td-audio keeps in `/var/lib/td-audio/state` across the
+    /// restart (APPLICATIONS.md §K.4, "Kept across restarts").
+    Kept,
+}
+
+impl VolumeFrom {
+    /// What a wrong level from here may mean beyond the key itself.
+    fn why(self) -> &'static str {
+        match self {
+            Self::Unity => "",
+            Self::Kept => {
+                " (this boot follows the install boot on the same volume: td-audio was to \
+                 keep its 80% in /var/lib/td-audio/state)"
+            }
+        }
+    }
+
+    fn steps(self) -> &'static [&'static str; FIREFOX_AUDIO_VOLUME_STEPS] {
+        match self {
+            Self::Unity => &TD_VOLUME_STEPS_FROM_UNITY,
+            Self::Kept => &TD_VOLUME_STEPS_FROM_KEPT,
+        }
+    }
+}
 /// A volume key that found no audio: the compositor was not admitted to
 /// td-audio, or the daemon is gone. The tone would play at unity.
 const TD_VOLUME_UNAVAILABLE_MARKER: &str = "TD-VOLUME unavailable";
@@ -688,6 +729,8 @@ struct ConsoleEvidence {
     td_firefox_file_chooser_pixels: bool,
     td_firefox_file_chooser: bool,
     td_application_cursor: bool,
+    /// Where this boot's volume steps start, which names the lines below.
+    volume_from: VolumeFrom,
     /// Each volume-down step the compositor reported applied, in order.
     td_volume_steps: [bool; FIREFOX_AUDIO_VOLUME_STEPS],
     td_volume_unavailable: bool,
@@ -722,6 +765,17 @@ struct ConsoleEvidence {
     firefox_network: bool,
     kexec_stage1: bool,
     kernel_panic: bool,
+}
+
+impl ConsoleEvidence {
+    /// The evidence a boot starts from: empty, its volume steps counted from
+    /// where its plan's physical input starts them.
+    fn for_input(physical_input: Option<VolumeFrom>) -> Self {
+        Self {
+            volume_from: physical_input.unwrap_or_default(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -817,7 +871,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             extra_append: "",
             user_net: false,
             audio: false,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: None,
             tpm_socket: None,
@@ -883,7 +937,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             extra_append: "",
             user_net: false,
             audio: false,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: None,
             tpm_socket: None,
@@ -1033,7 +1087,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             extra_append: "",
             user_net: false,
             audio: false,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: None,
             tpm_socket: None,
@@ -1176,6 +1230,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     // notice records stay off the serial console. The first boot above is the
     // audio authority; this boot repeats the real Firefox workload with the
     // exact LOG filter and audit oracle, but uses the host-silent audio backend.
+    // Its volume keys start from the 80% the first boot's left, which td-audio
+    // kept on this volume through the boots between: the restart proof of
+    // its kept levels.
     let audit_tokens = firefox_audit_boot_tokens(&healthy_tokens);
     let seccomp_audit = boot_system_once(
         &qemu,
@@ -1560,14 +1617,24 @@ fn firefox_audit_boot_tokens(prefix: &str) -> String {
     )
 }
 
-fn firefox_boot_oracles(tokens: &str) -> (bool, bool) {
+/// The Firefox oracles a system boot's tokens ask for: physical input, with
+/// where its volume keys start, and the WAV capture. The audio-authority
+/// input boot is the install boot, on a fresh volume, so its keys start at
+/// unity; the audit boot repeats that input on the same volume later, so its
+/// keys start where the install boot's left the level td-audio kept.
+fn firefox_boot_oracles(tokens: &str) -> (Option<VolumeFrom>, bool) {
     let physical_input = tokens
         .split_ascii_whitespace()
         .any(|token| token == FIREFOX_INPUT_CMDLINE_TOKEN);
     let audit = tokens
         .split_ascii_whitespace()
         .any(|token| token == FIREFOX_AUDIT_CMDLINE_TOKEN);
-    (physical_input, physical_input && !audit)
+    let volume_from = match (physical_input, audit) {
+        (false, _) => None,
+        (true, false) => Some(VolumeFrom::Unity),
+        (true, true) => Some(VolumeFrom::Kept),
+    };
+    (volume_from, physical_input && !audit)
 }
 
 /// The description of the live medium's boot entry.
@@ -1683,7 +1750,7 @@ fn boot_failed_target_once(
             extra_append: tokens,
             user_net: false,
             audio: true,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: None,
             tpm_socket: None,
@@ -3015,7 +3082,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
             extra_append: &tokens,
             user_net: false,
             audio: true,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: None,
             tpm_socket: None,
@@ -3233,7 +3300,7 @@ pub(crate) fn run_audio(runner: &RecipeCheckRunner) -> Result<(), String> {
             extra_append: "",
             user_net: false,
             audio: true,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: Some(AudioSwitch {
                 hda: &hda_wav,
@@ -3580,7 +3647,7 @@ pub(crate) fn run_audio_hotplug(runner: &RecipeCheckRunner) -> Result<(), String
             extra_append: "",
             user_net: false,
             audio: true,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: Some(AudioSwitch {
                 hda: &hda_wav,
@@ -3708,7 +3775,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             extra_append: &tokens,
             user_net: true,
             audio: true,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: None,
             tpm_socket: None,
@@ -3864,7 +3931,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             extra_append: "",
             user_net: false,
             audio: false,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: None,
             tpm_socket: None,
@@ -5303,8 +5370,9 @@ struct BootPlan<'a> {
     /// Attach the exact HDA playback device the system audio service owns.
     audio: bool,
     /// Ask the bounded QMP controller to inject the first boot's staged
-    /// Firefox keyboard, tablet, wheel, and outside-click sequence.
-    physical_input: bool,
+    /// Firefox keyboard, tablet, wheel, and outside-click sequence, its
+    /// volume keys stepping down from the level named.
+    physical_input: Option<VolumeFrom>,
     /// Record and validate the physical Firefox WebAudio path. The separate
     /// audit workload remains real physical input but uses the host-silent
     /// backend so audit scheduling cannot invalidate the HDA timing oracle.
@@ -5689,7 +5757,7 @@ fn boot_source(
         ));
     }
     if matches!(source, BootSource::LiveSetup { .. })
-        && (plan.physical_input
+        && (plan.physical_input.is_some()
             || plan.kill_on_marker
             || !plan.disk.as_ref().is_some_and(|disk| disk.read_only))
     {
@@ -5709,7 +5777,7 @@ fn boot_source(
     ) {
         return Err("reordered fixture requires a private decoy disk".into());
     }
-    if plan.capture_firefox_audio && (!plan.audio || !plan.physical_input) {
+    if plan.capture_firefox_audio && (!plan.audio || plan.physical_input.is_none()) {
         return Err(
             "Firefox audio capture requires both system audio and physical input".to_string(),
         );
@@ -5815,7 +5883,7 @@ fn boot_source(
     let serial = format!("file:{}", console_path.display());
     static QMP_SEQ: AtomicU64 = AtomicU64::new(0);
     // QEMU's QMP socket serves one client at a time.
-    let input = plan.physical_input || matches!(source, BootSource::LiveSetup { .. });
+    let input = plan.physical_input.is_some() || matches!(source, BootSource::LiveSetup { .. });
     // The live wizard's greeter parks rather than log in on ttyS0.
     if plan.shell.is_some() && matches!(source, BootSource::LiveSetup { .. }) {
         return Err("a serial shell cannot drive the live wizard's boot".into());
@@ -5842,7 +5910,7 @@ fn boot_source(
     if !plan.devices.display && (plan.screen.is_some() || plan.screens.is_some()) {
         return Err("a screen expectation needs the display device".into());
     }
-    if !plan.devices.keyboard && (input || plan.physical_input) {
+    if !plan.devices.keyboard && (input || plan.physical_input.is_some()) {
         return Err("physical input needs the keyboard".into());
     }
     let qmp_scratch = if input
@@ -6204,10 +6272,10 @@ fn boot_source(
     let marker_bytes = plan.target_marker.as_bytes();
     let mut console_file: Option<File> = None;
     let mut buf: Vec<u8> = Vec::new();
-    let mut evidence = ConsoleEvidence::default();
+    let mut evidence = ConsoleEvidence::for_input(plan.physical_input);
     let mut physical_input = qmp_path
         .clone()
-        .filter(|_| plan.physical_input)
+        .filter(|_| plan.physical_input.is_some())
         .map(PhysicalInputController::new);
     let mut screen = plan
         .screen
@@ -8188,11 +8256,8 @@ fn latch_console_evidence_from(
         buf,
         starts_at_stream_boundary,
     );
-    for (found, marker) in evidence
-        .td_volume_steps
-        .iter_mut()
-        .zip(TD_VOLUME_STEP_MARKERS)
-    {
+    let steps = evidence.volume_from.steps();
+    for (found, marker) in evidence.td_volume_steps.iter_mut().zip(steps) {
         latch_prefixed_line_marker(
             found,
             buf,
@@ -8211,6 +8276,7 @@ fn latch_console_evidence_from(
     latch_unexpected_volume(
         &mut evidence.td_volume_unexpected,
         buf,
+        steps,
         starts_at_stream_boundary,
     );
     latch_prefixed_line_marker(
@@ -8426,7 +8492,12 @@ fn latch_prefixed_line_marker(
 /// of the expected steps. Only a line that ends and reads exactly so counts:
 /// one torn by a kernel record, or not yet ended, is left to the step latches
 /// and the phase's deadline rather than read as a wrong level.
-fn latch_unexpected_volume(found: &mut bool, haystack: &[u8], starts_at_stream_boundary: bool) {
+fn latch_unexpected_volume(
+    found: &mut bool,
+    haystack: &[u8],
+    steps: &[&str],
+    starts_at_stream_boundary: bool,
+) {
     if *found {
         return;
     }
@@ -8461,11 +8532,7 @@ fn latch_unexpected_volume(found: &mut bool, haystack: &[u8], starts_at_stream_b
                 reading.get(digits..),
                 Some(b" muted=no") | Some(b" muted=yes")
             );
-        if well_formed
-            && !TD_VOLUME_STEP_MARKERS
-                .iter()
-                .any(|marker| marker.as_bytes() == line)
-        {
+        if well_formed && !steps.iter().any(|marker| marker.as_bytes() == line) {
             *found = true;
             return;
         }
@@ -9300,8 +9367,11 @@ impl PhysicalInputController {
             }
             if evidence.td_volume_unexpected {
                 return Err(td_engine::allocation::format(format_args!(
-                    "the compositor's volume key left a level other than the steps {TD_VOLUME_STEP_MARKERS:?}; \
-                     the console tail has its TD-VOLUME line"
+                    "the compositor's volume key left a level other than the steps from {:?} {:?}{}; \
+                     the console tail has its TD-VOLUME line",
+                    evidence.volume_from,
+                    evidence.volume_from.steps(),
+                    evidence.volume_from.why()
                 ))
                 .unwrap_or_default());
             }
@@ -9316,7 +9386,7 @@ impl PhysicalInputController {
                     .is_none_or(|until| Instant::now() >= until)
             {
                 let marker = awaited
-                    .and_then(|step| TD_VOLUME_STEP_MARKERS.get(step))
+                    .and_then(|step| evidence.volume_from.steps().get(step))
                     .copied()
                     .unwrap_or_default();
                 return Err(td_engine::allocation::format(format_args!(
@@ -11603,7 +11673,7 @@ mod tests {
         assert!(error.contains(TD_VOLUME_UNAVAILABLE_MARKER), "{error}");
 
         let mut found = false;
-        let marker = TD_VOLUME_STEP_MARKERS[0].as_bytes();
+        let marker = TD_VOLUME_STEPS_FROM_UNITY[0].as_bytes();
         let prefix = WAYLAND_CONSOLE_PREFIX.as_bytes();
         latch_prefixed_line_marker(
             &mut found,
@@ -11678,25 +11748,90 @@ mod tests {
         controller.volume_until = Some(Instant::now());
         let error = controller.progress(&mut evidence).unwrap_err();
         assert!(error.contains("press 2 of 4"), "{error}");
-        assert!(error.contains(TD_VOLUME_STEP_MARKERS[1]), "{error}");
+        assert!(error.contains(TD_VOLUME_STEPS_FROM_UNITY[1]), "{error}");
 
         controller.volume_until = Instant::now().checked_add(Duration::from_secs(60));
         evidence.td_volume_unexpected = true;
         let error = controller.progress(&mut evidence).unwrap_err();
-        assert!(error.contains("other than the steps"), "{error}");
+        assert!(error.contains("other than the steps from Unity"), "{error}");
+
+        // A boot whose keys start at the kept level names its own steps.
+        let mut controller = PhysicalInputController::new(PathBuf::from("/nonexistent"));
+        controller.phase = PhysicalInputPhase::Volume;
+        controller.volume_pressed = 2;
+        controller.volume_until = Some(Instant::now());
+        let mut evidence = ConsoleEvidence {
+            volume_from: VolumeFrom::Kept,
+            ..ConsoleEvidence::default()
+        };
+        evidence.td_volume_steps[0] = true;
+        let error = controller.progress(&mut evidence).unwrap_err();
+        assert!(error.contains(TD_VOLUME_STEPS_FROM_KEPT[1]), "{error}");
+
+        // An off-grid line there says what td-audio was to keep.
+        controller.volume_until = Instant::now().checked_add(Duration::from_secs(60));
+        evidence.td_volume_unexpected = true;
+        let error = controller.progress(&mut evidence).unwrap_err();
+        assert!(error.contains("other than the steps from Kept"), "{error}");
+        assert!(error.contains("/var/lib/td-audio/state"), "{error}");
+    }
+
+    /// A boot's evidence counts its volume steps from where its plan's
+    /// physical input starts them, and from unity with no input at all.
+    #[test]
+    fn a_boot_plans_volume_start_reaches_its_evidence() {
+        for (input, from) in [
+            (None, VolumeFrom::Unity),
+            (Some(VolumeFrom::Unity), VolumeFrom::Unity),
+            (Some(VolumeFrom::Kept), VolumeFrom::Kept),
+        ] {
+            assert_eq!(ConsoleEvidence::for_input(input).volume_from, from);
+        }
+    }
+
+    /// The audit boot follows the install boot's four presses on the same
+    /// volume, and td-audio keeps the level they left: its keys step down
+    /// from 80%, so its first line is 75%, which the unity steps call off
+    /// the grid, and a step from unity is off its grid.
+    #[test]
+    fn a_boot_on_a_kept_level_latches_the_steps_below_it() {
+        let latch = |from: VolumeFrom, console: &[u8]| {
+            let mut evidence = ConsoleEvidence {
+                volume_from: from,
+                ..ConsoleEvidence::default()
+            };
+            latch_console_evidence_from(&mut evidence, console, b"", true);
+            evidence
+        };
+        let line = b"boot\nwayland: TD-VOLUME level=75 muted=no\n";
+        let kept = latch(VolumeFrom::Kept, line);
+        assert_eq!(kept.td_volume_steps, [true, false, false, false]);
+        assert!(!kept.td_volume_unexpected);
+        let unity = latch(VolumeFrom::Unity, line);
+        assert_eq!(unity.td_volume_steps, [false; FIREFOX_AUDIO_VOLUME_STEPS]);
+        assert!(unity.td_volume_unexpected);
+        let kept = latch(
+            VolumeFrom::Kept,
+            b"boot\nwayland: TD-VOLUME level=95 muted=no\n",
+        );
+        assert_eq!(kept.td_volume_steps, [false; FIREFOX_AUDIO_VOLUME_STEPS]);
+        assert!(kept.td_volume_unexpected);
     }
 
     /// The steps, the keyed level and the press count are one grid: five
-    /// points each, from unity, ending at the level the tone is judged at.
+    /// points each, from unity, ending at the level the tone is judged at,
+    /// and from there, the level td-audio keeps, for the boot that follows.
     #[test]
     fn the_volume_steps_end_at_the_keyed_level() {
-        assert_eq!(TD_VOLUME_STEP_MARKERS.len(), FIREFOX_AUDIO_VOLUME_STEPS);
-        for (step, marker) in TD_VOLUME_STEP_MARKERS.iter().enumerate() {
-            let level = 100 - 5 * (step + 1);
-            assert_eq!(*marker, format!("{TD_VOLUME_LEVEL_PREFIX}{level} muted=no"));
+        assert_eq!(VolumeFrom::default(), VolumeFrom::Unity);
+        let keyed = 100 - 5 * FIREFOX_AUDIO_VOLUME_STEPS;
+        for (from, start) in [(VolumeFrom::Unity, 100), (VolumeFrom::Kept, keyed)] {
+            for (step, marker) in from.steps().iter().enumerate() {
+                let level = start - 5 * (step + 1);
+                assert_eq!(*marker, format!("{TD_VOLUME_LEVEL_PREFIX}{level} muted=no"));
+            }
         }
-        let keyed = (FIREFOX_AUDIO_KEYED_LEVEL * 100.0).round();
-        assert_eq!(keyed, (100 - 5 * FIREFOX_AUDIO_VOLUME_STEPS) as f64);
+        assert_eq!((FIREFOX_AUDIO_KEYED_LEVEL * 100.0).round(), keyed as f64);
     }
 
     /// A verified tone at unity fails the input boot: the volume keys did
@@ -14615,14 +14750,14 @@ mod tests {
              audit=1 \
              audit_backlog_limit=8192 log_buf_len=8M"
         );
-        assert_eq!(firefox_boot_oracles("td.autotest=1"), (false, false));
+        assert_eq!(firefox_boot_oracles("td.autotest=1"), (None, false));
         assert_eq!(
             firefox_boot_oracles(&firefox_input_boot_tokens("td.autotest=1")),
-            (true, true)
+            (Some(VolumeFrom::Unity), true)
         );
         assert_eq!(
             firefox_boot_oracles(&firefox_audit_boot_tokens("td.autotest=1")),
-            (true, false)
+            (Some(VolumeFrom::Kept), false)
         );
         assert_eq!(
             kernel_append("td.autotest=1"),
@@ -15494,7 +15629,7 @@ mod tests {
             extra_append: append,
             user_net: false,
             audio: false,
-            physical_input: false,
+            physical_input: None,
             capture_firefox_audio: false,
             audio_switch: None,
             tpm_socket: None,
@@ -15580,7 +15715,7 @@ mod tests {
                 extra_append: "",
                 user_net: false,
                 audio: false,
-                physical_input: other == "input",
+                physical_input: (other == "input").then_some(VolumeFrom::Unity),
                 capture_firefox_audio: false,
                 audio_switch: None,
                 tpm_socket: None,

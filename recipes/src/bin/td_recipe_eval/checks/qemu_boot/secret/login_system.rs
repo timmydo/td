@@ -580,7 +580,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 extra_append: &tokens,
                 user_net: false,
                 audio: true,
-                physical_input: false,
+                physical_input: None,
                 capture_firefox_audio: false,
                 audio_switch: None,
                 tpm_socket: None,

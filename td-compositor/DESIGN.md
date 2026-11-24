@@ -175,7 +175,9 @@ volume control and no field. A key's outcome is a notice,
 one write beginning a line of its own. The physical-input boot waits on
 those lines: it presses volume-down four times, each after the last was
 applied, before Firefox's tone, and requires the recorded tone at 80%,
-the cube of which is the amplitude td-audio plays.
+the cube of which is the amplitude td-audio plays. The audit boot that
+repeats that input later on the same volume steps down from the 80%
+td-audio kept, so its lines read 75% to 60%.
 
 A status bar owns the top 24 rows. It is BUILT IN rather than a client,
 because a client would need a way to be placed and to reserve space —

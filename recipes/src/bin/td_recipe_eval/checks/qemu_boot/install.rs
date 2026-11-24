@@ -2608,7 +2608,7 @@ pub(super) fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> Boot
         extra_append: "",
         user_net: false,
         audio: false,
-        physical_input: false,
+        physical_input: None,
         capture_firefox_audio: false,
         audio_switch: None,
         tpm_socket: None,

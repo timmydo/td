@@ -8832,7 +8832,10 @@ leaves the old file or the new one. td-svc stops the daemon with
 or a power-off loses at most that window; only the daemon's own end,
 every output gone, hands over what is unwritten and waits for the write.
 A failed write is said once until one succeeds, a missing directory is
-said at start, and the daemon plays on either way.
+said at start, and the daemon plays on either way. `qemu-boot-system`
+proves a level kept: its install boot's four volume-down keys leave the
+HDA output at 80%, and its audit boot, four boots later on the same
+volume, requires its own four keys to read 75% down to 60%.
 
 The host oracle `qemu-boot-audio`, an integration-tier step, proves a
 switch on emulated hardware. Its machine has QEMU's HDA output and a USB
