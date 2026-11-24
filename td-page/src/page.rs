@@ -315,6 +315,10 @@ pub struct Laid {
     /// within: a float's lines lie within the line it was met in, an
     /// inline-block's within the line holding it.
     outer: BudgetVec<u32>,
+    /// Each line's lines before and after it in its paragraph, or `NONE`,
+    /// on a page with floats or inline-blocks, whose lines can lie between
+    /// two of a paragraph's (`text::joined_before`).
+    joins: BudgetVec<(u32, u32)>,
     /// Each inline picture laid, fitted to its box, by node index.
     fits: BudgetVec<Fit>,
     /// The node indices of pictures whose copy was refused, for room or
@@ -786,13 +790,22 @@ impl Laid {
             node_geometry,
             links,
             outer: BudgetVec::new(memory)?,
+            joins: BudgetVec::new(memory)?,
             fits,
             short,
         };
         if laid.styled.styled().has_nested_lines() {
-            laid.outer = crate::text::nesting(&laid, memory)?;
+            (laid.outer, laid.joins) = crate::text::nesting(&laid, memory)?;
         }
         Ok(laid)
+    }
+
+    /// Line `line`'s lines before and after it in its paragraph, where
+    /// the page keeps them (one with floats or inline-blocks).
+    pub fn joins(&self, line: usize) -> Option<(Option<usize>, Option<usize>)> {
+        let &(before, after) = self.joins.get(line)?;
+        let line = |at: u32| (at != NONE).then_some(at as usize);
+        Some((line(before), line(after)))
     }
 
     /// The line `line` lies within, if any: the one a float whose line
@@ -970,6 +983,7 @@ impl Laid {
                     + self.clips.capacity() * std::mem::size_of::<Clip>()
                     + self.links.capacity() * std::mem::size_of::<(NodeId, u32)>()
                     + self.outer.capacity() * 4
+                    + self.joins.capacity() * 8
                     + self.fits.capacity() * std::mem::size_of::<Fit>()
                     + self.short.capacity() * std::mem::size_of::<usize>(),
             )

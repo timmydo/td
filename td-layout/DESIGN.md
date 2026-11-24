@@ -393,9 +393,11 @@ laid, past a cut only what layout dropped as space. A last `br` or
 preserved newline leaves an empty line after it, ended `End`. A
 consumer reads paragraphs, copy separators and selection moves from
 these and `Line::block` rather than from gaps between lines: in a
-whole layout a paragraph is a run of lines ended by one that ends
-`Newline`, `Break` or `End` (a window can leave two runs' lines
-adjacent).
+whole layout a paragraph is a run of one block's lines ended by one
+that ends `Newline`, `Break` or `End`, the lines of the floats and
+inline-blocks it holds lying between two of them, laid after the line
+they are met in (§5, "Floats", "Inline-blocks"); a window can leave
+two runs' lines adjacent.
 
 `inline::wrap_text` accepts source TextRuns, a whole-pixel width and a
 StyleId for the line strut, which also sets the tab interval. It returns
@@ -964,10 +966,10 @@ that nothing breaks and its max-content width to the line.
 **Departures and later increments.** `vertical-align` other than
 `baseline` is not read. `inline-table` is laid as a block-level table
 where its box is (below, "Tables"). A table never gives the baseline.
-A consumer sees an inline-block's lines as their own block's
-paragraphs, between two places of the line holding it, so its text is
-a paragraph apart from the text around it, not one with it, and find
-matches nothing across it (td-web/DESIGN.md §10, "Places", "Find").
+Its lines are their own block's paragraphs, between two places of the
+line holding it: td-web reads its text where it lies in that line and
+the line's paragraph as going on past it, but finds nothing across it
+(td-web/DESIGN.md §10, "Places", "Find").
 
 **Bounds.** It takes the floats' paths: an item laid apart is 136
 bytes (160 before inline-blocks, a float's too: an inline-block's

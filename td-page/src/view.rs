@@ -372,9 +372,11 @@ pub fn target_place(laid: &Laid, target: NodeId) -> Option<Place> {
             node: Some(target),
         },
     );
-    // Lines are in the order of their starts, but a float's lie within
-    // the line it was met in, after it: the least start at or after the
-    // target, among the lines until one starts past the best.
+    // Lines are in the order of their starts, but a float's or an
+    // inline-block's lie within the line it was met in, after it: the
+    // least start at or after the target, among the lines from the
+    // outermost one it lies in until one starts past the best.
+    let at = text::outermost(laid, at);
     let mut best: Option<Place> = None;
     for line in laid.lines().get(at..)? {
         let start = text::bounds(laid, line).map(|(start, _)| start);
@@ -693,6 +695,28 @@ mod tests {
         let (link, line) = laid.links()[1];
         let place = first_place(&laid, link, line as usize).unwrap();
         assert_eq!(text::line_of(&laid, place), 0);
+    }
+
+    /// An empty target between two floats' or inline-blocks' places in
+    /// one line is the line's next piece after it, not a later box's.
+    #[test]
+    fn a_target_between_two_nested_boxes_of_a_line() {
+        for markup in [
+            "<p>foo<span style=display:inline-block>ab<br></span><a id=t></a>bar\
+             <span style=float:left>F</span>baz",
+            "<p>foo<span style=float:left>A</span><a id=t></a>bar<span style=float:left>B</span>baz",
+        ] {
+            let laid = laid(markup);
+            let t = laid.tree().target("t").unwrap();
+            let at = target_place(&laid, t).unwrap();
+            let line = &laid.lines()[text::line_of(&laid, at)];
+            let piece = text::items(&laid, line).find(|item| item.start == at).unwrap();
+            let text = match piece.piece {
+                Piece::Text(i) => text::fragment_text(&laid, &line.fragments[i]),
+                Piece::Replaced(_) => "",
+            };
+            assert!(text.starts_with("bar"), "{markup}: {text:?}");
+        }
     }
 
     #[test]

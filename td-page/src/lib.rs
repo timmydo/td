@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod charset;
+mod copy_oracle;
 pub mod fonts;
 pub mod gather;
 pub mod inline;

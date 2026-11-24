@@ -1,9 +1,10 @@
 //! Places in a laid page and the text between them (td-web/DESIGN.md §10,
 //! "Places, find, selection and links"): a place is a DOM position, a
-//! paragraph a run of lines one block lays up to a line ended by a
-//! newline, a `br` or its block (`Line::end`), and the text find searches
-//! and a copy takes is the fragments' displayed text with the white space
-//! a `Wrap` leaves between lines put back.
+//! paragraph the lines one block lays up to a line ended by a newline, a
+//! `br` or its block (`Line::end`), past the lines of floats and
+//! inline-blocks laid between them, and the text find searches and a copy
+//! takes is the fragments' displayed text in tree order with the white
+//! space a `Wrap` leaves between lines put back.
 
 use std::ops::ControlFlow;
 
@@ -16,7 +17,7 @@ use td_html::document::NodeId;
 use td_layout::inline::{
     replay_until, DisplayText, Line, LineEnd, ReplacedFragment, TextFragment, UNIT,
 };
-use td_layout::{StyleId, TableRole};
+use td_layout::{BoxKind, StyleId, TableRole};
 
 /// A DOM position: a node's place in tree order and a byte offset in its
 /// text, or for a replaced element 0 before it and 1 after. Ordered by
@@ -160,56 +161,182 @@ pub fn ends_paragraph(line: &Line) -> bool {
     matches!(line.end(), LineEnd::Newline | LineEnd::Break | LineEnd::End)
 }
 
+/// The line before `at` in its paragraph, if any: the last line its
+/// block laid before it, where that line does not end a paragraph. A
+/// float's or an inline-block's lines between them, laid after the line
+/// holding it, do not part them (`Laid::joins`).
+pub fn joined_before(laid: &Laid, at: usize) -> Option<usize> {
+    if let Some((before, _)) = laid.joins(at) {
+        return before;
+    }
+    let lines = laid.lines();
+    let before = at.checked_sub(1)?;
+    let line = lines.get(before)?;
+    (!ends_paragraph(line) && line.block() == lines.get(at)?.block()).then_some(before)
+}
+
+/// The line after `at` in its paragraph, if any (`joined_before`).
+pub fn joined_after(laid: &Laid, at: usize) -> Option<usize> {
+    if let Some((_, after)) = laid.joins(at) {
+        return after;
+    }
+    let lines = laid.lines();
+    let line = lines.get(at)?;
+    let next = lines.get(at + 1)?;
+    (!ends_paragraph(line) && next.block() == line.block()).then_some(at + 1)
+}
+
 /// The first and last lines of the paragraph line `at` lies in.
 pub fn paragraph(laid: &Laid, at: usize) -> (usize, usize) {
-    let lines = laid.lines();
-    let block = lines.get(at).and_then(Line::block);
     let mut first = at;
-    while let Some(before) = first.checked_sub(1).and_then(|b| lines.get(b)) {
-        if ends_paragraph(before) || before.block() != block {
-            break;
-        }
-        first -= 1;
+    while let Some(before) = joined_before(laid, first) {
+        first = before;
     }
     let mut last = at;
-    while let Some(line) = lines.get(last) {
-        if ends_paragraph(line) || lines.get(last + 1).is_none_or(|next| next.block() != block) {
-            break;
-        }
-        last += 1;
+    while let Some(after) = joined_after(laid, last) {
+        last = after;
     }
-    (first, last.min(lines.len().saturating_sub(1)))
+    (first, last.min(laid.lines().len().saturating_sub(1)))
+}
+
+/// Each line's enclosing line and its paragraph's lines before and after
+/// it (`nesting`).
+pub(crate) type Nesting = (BudgetVec<u32>, BudgetVec<(u32, u32)>);
+
+/// Where a walk meeting line `line` in tree order starts: the first line
+/// of the paragraph of the outermost line it lies in.
+fn walk_start(laid: &Laid, line: usize) -> usize {
+    paragraph(laid, outermost(laid, line)).0
 }
 
 /// Each line's enclosing line (`Laid::outer`), `NONE` for none: lines are
 /// in the tree order of their starts, and the lines of a float met within
 /// a line, or of an inline-block in it, follow it, starting and ending
-/// within it. A line with no item takes the next line's with one, as it
-/// takes its start; those ending the page none. Each line is set once.
-pub(crate) fn nesting(laid: &Laid, memory: &Budget) -> Result<BudgetVec<u32>, BudgetError> {
+/// within it. A line with no item (a `<br>`'s, or one holding only a
+/// float) lies in the line holding its block's box, none for a box no
+/// line holds. Each line is set once.
+/// And each line's paragraph neighbours (`Laid::joins`): a line not
+/// ending its paragraph waits for its block's next line, past the lines
+/// of the floats and inline-blocks it holds, which wait above it.
+pub(crate) fn nesting(laid: &Laid, memory: &Budget) -> Result<Nesting, BudgetError> {
     let lines = laid.lines();
     let mut outer = td_alloc::BudgetVec::with_capacity(memory, lines.len())?;
-    let mut open: BudgetVec<(u32, Place)> = BudgetVec::new(memory)?;
-    // Item-less lines waiting for the next line with an item, whose
-    // enclosing line they take, as they take its start (`line_of`).
-    let mut waiting = 0;
+    let mut joins = BudgetVec::filled(memory, lines.len(), (NONE, NONE))?;
+    // The lines that may hold the lines after, each within the one
+    // before it, with their first and last places.
+    let mut open: BudgetVec<(u32, Place, Place)> = BudgetVec::new(memory)?;
+    // Lines whose paragraph goes on, by their block, innermost last.
+    let mut waiting_for: BudgetVec<(u32, u32)> = BudgetVec::new(memory)?;
     for (at, line) in lines.iter().enumerate() {
+        let index = u32::try_from(at).unwrap_or(NONE);
+        let block = line
+            .block()
+            .and_then(|b| u32::try_from(b.index()).ok())
+            .unwrap_or(NONE);
+        if let Some(found) = waiting_for.iter().rposition(|&(b, _)| b == block) {
+            if let Some(&(_, before)) = waiting_for.get(found) {
+                if let Some(slot) = joins.get_mut(before as usize) {
+                    slot.1 = index;
+                }
+                if let Some(slot) = joins.get_mut(at) {
+                    slot.0 = before;
+                }
+            }
+            waiting_for.truncate(found);
+        }
+        if !ends_paragraph(line) {
+            waiting_for.try_push((block, index))?;
+        }
         let Some((start, end)) = bounds(laid, line) else {
-            outer.try_push(NONE)?;
+            // The innermost line holding its block's box: those holding a
+            // place are the first of the chain.
+            let within = box_start(laid, line).map_or(NONE, |place| {
+                let held = open.partition_point(|&(_, start, end)| start <= place && place < end);
+                held.checked_sub(1)
+                    .and_then(|top| open.get(top))
+                    .map_or(NONE, |&(line, _, _)| line)
+            });
+            outer.try_push(within)?;
             continue;
         };
-        while open.last().is_some_and(|&(_, end)| end <= start) {
+        while open.last().is_some_and(|&(_, _, end)| end <= start) {
             open.pop();
         }
-        let within = open.last().map_or(NONE, |&(line, _)| line);
-        for slot in outer.get_mut(waiting..).unwrap_or(&mut []) {
-            *slot = within;
-        }
+        let within = open.last().map_or(NONE, |&(line, _, _)| line);
         outer.try_push(within)?;
-        waiting = outer.len();
-        open.try_push((u32::try_from(at).unwrap_or(NONE), end))?;
+        open.try_push((index, start, end))?;
     }
-    Ok(outer)
+    Ok((outer, joins))
+}
+
+/// The place before the box that laid line `line`, whose places all
+/// follow it: where a line with no item lies.
+fn box_start(laid: &Laid, line: &Line) -> Option<Place> {
+    let node = laid.styled().node_of(line.block()?.index())?.node;
+    Some(Place::new(laid, node, 0))
+}
+
+/// The float or inline-block box `index` is, if any, and whether it
+/// floats; with it, its parent's index.
+fn own_box(laid: &Laid, index: usize) -> (Option<(usize, bool)>, Option<usize>) {
+    let styled = laid.styled();
+    let Some(node) = styled.node_of(index) else {
+        return (None, None);
+    };
+    let parent = node.parent.map(|parent| parent.index());
+    if node.kind != BoxKind::Block {
+        return (None, parent);
+    }
+    let keyword = |property| match styled.style(node.style).and_then(|s| s.get(property)) {
+        Some(ComputedValue::Keyword(word)) => word,
+        _ => "",
+    };
+    if matches!(keyword(Property::Float), "left" | "right") {
+        (Some((index, true)), parent)
+    } else if keyword(Property::Display) == "inline-block" {
+        (Some((index, false)), parent)
+    } else {
+        (None, parent)
+    }
+}
+
+/// The float or inline-block whose lines are those of the boxes from
+/// `index` up, the first of them, and whether it floats; none for the
+/// page's. A float met before anything on a line lays its lines before
+/// that line, and one met after its last piece after it, as paragraphs
+/// of the lines around them (`Walker::range`).
+fn nested_box(laid: &Laid, mut index: Option<usize>) -> Option<(usize, bool)> {
+    while let Some(at) = index {
+        #[cfg(test)]
+        tests::visit();
+        let (own, parent) = own_box(laid, at);
+        if own.is_some() {
+            return own;
+        }
+        index = parent;
+    }
+    None
+}
+
+/// Whether line `line` holds a unit of a walk: shown text or a picture,
+/// not an inline-block, whose lines are their own.
+fn holds_unit(laid: &Laid, line: &Line) -> bool {
+    items(laid, line).any(|item| {
+        let style = match item.piece {
+            Piece::Text(i) => line.fragments.get(i).map(|f| f.style),
+            Piece::Replaced(i) => line.replaced.get(i).filter(|r| !r.atomic).map(|r| r.style),
+        };
+        style.is_some_and(|style| !hidden(laid, style))
+    })
+}
+
+/// Where a line lies among the pieces of the line holding it: its first
+/// piece's start, or, with no piece, its box's.
+fn line_start(laid: &Laid, line: &Line) -> Option<Place> {
+    items(laid, line)
+        .next()
+        .map(|item| item.start)
+        .or_else(|| box_start(laid, line))
 }
 
 /// The line holding `place`, or the last line starting before it; the
@@ -221,9 +348,24 @@ pub(crate) fn nesting(laid: &Laid, memory: &Budget) -> Result<BudgetVec<u32>, Bu
 pub fn line_of(laid: &Laid, place: Place) -> usize {
     let lines = laid.lines();
     let mut at = starting_past(laid, place, true).saturating_sub(1);
-    // The line after the one climbed from: a sibling of `at` where its
-    // float's lines go on.
-    let next = at + 1;
+    // The line with an item after the one climbed from: a sibling of `at`
+    // where its float's lines go on. One with no item takes its start
+    // (`starting_past`).
+    let from = at;
+    let next = || {
+        lines
+            .iter()
+            .enumerate()
+            .skip(from + 1)
+            .find(|(_, line)| {
+                #[cfg(test)]
+                tests::visit();
+                items(laid, line).next().is_some()
+            })
+            .map_or(lines.len(), |(next, _)| next)
+    };
+    // Found once, where a climb needs it.
+    let mut found = None;
     let end = |line: usize| {
         lines
             .get(line)
@@ -242,7 +384,7 @@ pub fn line_of(laid: &Laid, place: Place) -> usize {
         let held = lines.get(outer).is_some_and(|line| {
             items(laid, line).any(|item| item.start <= place && place <= item.end)
         });
-        if !held && laid.outer(next) == laid.outer(at) {
+        if !held && laid.outer(*found.get_or_insert_with(next)) == laid.outer(at) {
             break;
         }
         at = outer;
@@ -293,31 +435,42 @@ fn preserves(laid: &Laid, f: &TextFragment) -> bool {
 
 /// What the text between two lines is, after a `Wrap`: the source between
 /// the last piece of one and the first of the next, a space where spaces
-/// collapse, the run where they are kept, none at an edge.
+/// collapse, the run where they are kept, none at an edge. Beside a
+/// replaced piece (an image, an inline-block's placeholder), the text
+/// node's on the other side.
 fn gap<'a>(laid: &'a Laid, a: &Line, b: &Line) -> Option<(&'a str, Place, Place)> {
     let last = shown_items(laid, a).last()?;
     let next = shown_items(laid, b).next()?;
-    let (Piece::Text(i), Piece::Text(j)) = (last.piece, next.piece) else {
-        return None;
+    let fa = match last.piece {
+        Piece::Text(i) => a.fragments.get(i),
+        Piece::Replaced(_) => None,
     };
-    let fa = a.fragments.get(i)?;
-    let fb = b.fragments.get(j)?;
+    let fb = match next.piece {
+        Piece::Text(j) => b.fragments.get(j),
+        Piece::Replaced(_) => None,
+    };
     let document = laid.tree().document();
-    let tail = document.node(fa.node)?.text()?.get(fa.range.end..)?;
-    let head = document.node(fb.node)?.text()?.get(..fb.range.start)?;
-    let between: &str = if fa.node == fb.node {
-        tail.get(..fb.range.start.checked_sub(fa.range.end)?)?
-    } else if tail.trim().is_empty() && !tail.is_empty() {
-        tail
-    } else {
-        head
+    let tail = |f: &TextFragment| document.node(f.node)?.text()?.get(f.range.end..);
+    let head = |f: &TextFragment| document.node(f.node)?.text()?.get(..f.range.start);
+    let between: &str = match (fa, fb) {
+        (Some(fa), Some(fb)) if fa.node == fb.node => {
+            tail(fa)?.get(..fb.range.start.checked_sub(fa.range.end)?)?
+        }
+        (Some(fa), Some(fb)) => match tail(fa)? {
+            tail if tail.trim().is_empty() && !tail.is_empty() => tail,
+            _ => head(fb)?,
+        },
+        (Some(fa), None) => tail(fa)?,
+        (None, Some(fb)) => head(fb)?,
+        (None, None) => return None,
     };
     // Past a cut only what was dropped as space.
     let space = between.trim_start_matches(|c: char| !c.is_whitespace() || c == '\u{a0}');
     if space.is_empty() {
         return None;
     }
-    let shown = if preserves(laid, fa) { space } else { " " };
+    let style = fa.or(fb)?;
+    let shown = if preserves(laid, style) { space } else { " " };
     Some((shown, last.end, next.start))
 }
 
@@ -333,139 +486,420 @@ pub enum Event<'a> {
     Alt(&'a str, Place, Place),
     /// The white space a `Wrap` left between two lines.
     Gap(&'a str, Place, Place),
-    /// A float's or an inline-block's lines lie here, within the line
-    /// walked, or an inline-block's placeholder: find matches nothing
-    /// across it.
-    Break,
+    /// The lines of floats, or of an inline-block, lying here within the
+    /// paragraph walked begin: their paragraphs follow, and then the
+    /// paragraph walked goes on. Find matches nothing across them.
+    Enter(Nested),
+    /// They end, and the walk goes back to the line holding them, where
+    /// it does (not past a run of floats' paragraphs among others).
+    Leave(Nested, Option<usize>),
     /// The paragraph ends.
     End,
 }
 
-/// The first place of each line lying directly within line `at`, in
-/// order: where the floats and inline-blocks met in it lie between its
-/// pieces. The lines within it, at any depth, follow it as one run,
-/// each within it or within one of that run before it (`nesting`), a
-/// line with no item (a `<br>`'s) within the next line's.
-fn inner_starts(laid: &Laid, at: usize) -> impl Iterator<Item = Place> + '_ {
-    laid.lines()
-        .iter()
-        .enumerate()
-        .skip(at + 1)
-        .take_while(move |&(line, _)| laid.outer(line).is_some_and(|outer| outer >= at))
-        .filter(move |&(line, _)| laid.outer(line) == Some(at))
-        .filter_map(move |(_, line)| bounds(laid, line).map(|(start, _)| start))
+/// What lines lie within a paragraph's: those of the floats met where
+/// they lie, or those of an inline-block, by its placeholder, which give
+/// text in its line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Nested {
+    Float,
+    Inline,
 }
 
-/// Each event of lines `from..` in order, until `each` breaks; hidden
-/// pieces give none. With the layout's measure each scalar's advance is
-/// replayed.
+/// Each event from line `from` on in tree order, until `each` breaks;
+/// hidden pieces give none. A paragraph's lines are walked in order, a
+/// float's or an inline-block's lines where they lie among its pieces
+/// (`Event::Enter`), and the float's lines laid after a line, past its
+/// last piece, before its next line; a walk from a line within another
+/// goes on with the rest of the lines enclosing it. With the layout's
+/// measure each scalar's advance is replayed.
 pub fn walk<'a>(
     laid: &'a Laid,
     measure: Option<&mut Measure>,
     from: usize,
     each: impl FnMut(Event<'a>) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
-    walk_to(laid, measure, from, laid.lines().len(), each)
+    let top = outermost(laid, from);
+    let mut walker = Walker {
+        laid,
+        measure,
+        each,
+        from,
+        quiet: top != from,
+        boxes: [(usize::MAX, None); BOXES],
+    };
+    walker.range(top, laid.lines().len(), None)
 }
 
-/// As `walk`, of lines `from..until`.
-fn walk_to<'a>(
+/// A walk's state (`walk`). It recurses once for each line enclosing the
+/// one walked, which `nesting` bounds by the layout's depth.
+struct Walker<'a, 'm, F> {
     laid: &'a Laid,
-    mut measure: Option<&mut Measure>,
+    measure: Option<&'m mut Measure>,
+    each: F,
     from: usize,
-    until: usize,
-    mut each: impl FnMut(Event<'a>) -> ControlFlow<()>,
-) -> ControlFlow<()> {
-    let lines = laid.lines();
-    let mut begun = false;
-    let mut wrapped: Option<&Line> = None;
-    for (at, line) in lines.iter().enumerate().take(until).skip(from) {
-        if !begun {
-            each(Event::Begin(at))?;
-            begun = true;
+    /// Before line `from` is reached, which a walk from within another
+    /// line reaches through the lines enclosing it: no events.
+    quiet: bool,
+    /// Boxes `float_of` climbed through, by `box_slot`, and the float or
+    /// inline-block each lies in (`nested_box`), which is the box's alone:
+    /// paragraphs share the ancestors they climb to.
+    boxes: [(usize, Option<(usize, bool)>); BOXES],
+}
+
+/// The slots of `Walker::boxes`; a climb's boxes evict others in theirs.
+const BOXES: usize = 128;
+
+/// Box `index`'s slot in `Walker::boxes`, spread so that the boxes of a
+/// chain of ancestors fall apart.
+fn box_slot(index: usize) -> usize {
+    ((index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) as usize % BOXES
+}
+
+impl<'a, F: FnMut(Event<'a>) -> ControlFlow<()>> Walker<'a, '_, F> {
+    /// The float whose lines line `at` is, if no inline-block is nearer.
+    fn float_of(&mut self, at: usize) -> Option<usize> {
+        let laid = self.laid;
+        let block = laid.lines().get(at)?.block()?.index();
+        let (own, parent) = own_box(laid, block);
+        let found = match own {
+            Some(own) => Some(own),
+            None => self.box_above(parent),
+        };
+        found.and_then(|(index, floats)| floats.then_some(index))
+    }
+
+    /// `nested_box(from)`, climbing only to a box climbed through before;
+    /// the boxes climbed are kept.
+    fn box_above(&mut self, from: Option<usize>) -> Option<(usize, bool)> {
+        let laid = self.laid;
+        let mut index = from;
+        let mut stop = None;
+        let found = loop {
+            let Some(at) = index else { break None };
+            stop = Some(at);
+            if let Some(&(key, found)) = self.boxes.get(box_slot(at)) {
+                if key == at {
+                    break found;
+                }
+            }
+            #[cfg(test)]
+            tests::visit();
+            let (own, parent) = own_box(laid, at);
+            if own.is_some() {
+                break own;
+            }
+            index = parent;
+        };
+        let mut index = from;
+        while let Some(at) = index {
+            #[cfg(test)]
+            tests::visit();
+            if let Some(slot) = self.boxes.get_mut(box_slot(at)) {
+                *slot = (at, found);
+            }
+            if Some(at) == stop {
+                break;
+            }
+            index = laid
+                .styled()
+                .node_of(at)
+                .and_then(|node| node.parent)
+                .map(|parent| parent.index());
+        }
+        found
+    }
+
+    /// The first line from `at + 1` not within line `at`, at most `hi`:
+    /// the lines within a line follow it as one run (`nesting`).
+    fn past(&self, at: usize, hi: usize) -> usize {
+        let mut k = at + 1;
+        while k < hi && self.laid.outer(k).is_some_and(|outer| outer >= at) {
+            #[cfg(test)]
+            tests::visit();
+            k += 1;
+        }
+        k
+    }
+
+    /// The first line from `k` on lying where no line before `limit`
+    /// does, of lines `k..hi` within one line: its lines run from `k`
+    /// until one starts at or past `limit` (`line_start`), each looked at
+    /// once.
+    fn before(&self, mut k: usize, hi: usize, limit: Place) -> usize {
+        let lines = self.laid.lines();
+        while k < hi {
+            #[cfg(test)]
+            tests::visit();
+            let start = lines.get(k).and_then(|line| line_start(self.laid, line));
+            if start.is_none_or(|start| start >= limit) {
+                break;
+            }
+            k = self.past(k, hi);
+        }
+        k
+    }
+
+    /// White space `space`, owed before a piece that lines `lo..hi` lie
+    /// ahead of: emitted before them where it lies before them; whether
+    /// it lies past them, to go after them, or else, among them, none.
+    fn gap_ahead(
+        &mut self,
+        lo: usize,
+        hi: usize,
+        (text, start, end): (&'a str, Place, Place),
+    ) -> ControlFlow<(), bool> {
+        let mut first: Option<Place> = None;
+        let mut last: Option<Place> = None;
+        for line in self.laid.lines().get(lo..hi).unwrap_or(&[]) {
+            if let Some((s, e)) = bounds(self.laid, line) {
+                first = Some(first.map_or(s, |f| f.min(s)));
+                last = Some(last.map_or(e, |l| l.max(e)));
+            }
+        }
+        if first.is_none_or(|first| end <= first) {
+            (self.each)(Event::Gap(text, start, end))?;
+            return ControlFlow::Continue(false);
+        }
+        ControlFlow::Continue(last.is_some_and(|last| start >= last))
+    }
+
+    /// The float whose lines a walk of floats' lines from line `at` walks
+    /// first, entered already.
+    fn owner(&self, at: usize) -> Option<usize> {
+        if !self.laid.styled().styled().has_floats() {
+            return None;
+        }
+        let line = self.laid.lines().get(at)?;
+        nested_box(self.laid, line.block().map(|b| b.index())).map(|(index, _)| index)
+    }
+
+    /// Lines `lo..hi`, which lie in one line or none, as paragraphs, those
+    /// of float `owner` entered already.
+    fn range(&mut self, lo: usize, hi: usize, owner: Option<usize>) -> ControlFlow<()> {
+        let floats = self.laid.styled().styled().has_floats();
+        // The float whose run of paragraphs is entered: a float's text met
+        // as paragraphs of another's is a float's still, entered once.
+        let mut entered: Option<usize> = None;
+        let mut at = lo;
+        while at < hi {
+            if floats && !self.quiet {
+                let float = self.float_of(at).filter(|&float| Some(float) != owner);
+                if float != entered {
+                    if entered.is_some() {
+                        (self.each)(Event::Leave(Nested::Float, None))?;
+                    }
+                    if float.is_some() {
+                        (self.each)(Event::Enter(Nested::Float))?;
+                    }
+                    entered = float;
+                }
+            }
+            if !self.quiet {
+                (self.each)(Event::Begin(at))?;
+            }
+            // The line whose `Wrap` leaves white space before the next.
+            let mut wrapped: Option<usize> = None;
+            loop {
+                let past = self.past(at, hi);
+                let laid_any = self.line(at, past, wrapped)?;
+                if laid_any {
+                    wrapped = None;
+                }
+                match self.laid.lines().get(at).map(Line::end) {
+                    Some(LineEnd::Wrap) if laid_any => wrapped = Some(at),
+                    Some(LineEnd::Wrap) => {}
+                    _ => wrapped = None,
+                }
+                let next = joined_after(self.laid, at).filter(|&next| next >= past && next < hi);
+                let Some(next) = next else {
+                    if !self.quiet {
+                        (self.each)(Event::End)?;
+                    }
+                    at = past;
+                    break;
+                };
+                // A float's lines laid past this line's last piece lie
+                // before its next line, as they do in tree order, and the
+                // white space of a wrap before them where it lies.
+                if next > past {
+                    let lines = self.laid.lines();
+                    let space = match (wrapped, lines.get(at), lines.get(next)) {
+                        (Some(_), Some(line), Some(after))
+                            if !self.quiet && shown_items(self.laid, after).next().is_some() =>
+                        {
+                            gap(self.laid, line, after)
+                        }
+                        _ => None,
+                    };
+                    if let Some(space) = space {
+                        if !self.gap_ahead(past, next, space)? {
+                            wrapped = None;
+                        }
+                    } else {
+                        wrapped = None;
+                    }
+                    self.nested(past, next, Nested::Float, at)?;
+                }
+                at = next;
+            }
+        }
+        if entered.is_some() {
+            (self.each)(Event::Leave(Nested::Float, None))?;
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Lines `lo..hi` within line `holder`, of `kind`; while quiet, only
+    /// where they hold line `from`.
+    fn nested(&mut self, lo: usize, hi: usize, kind: Nested, holder: usize) -> ControlFlow<()> {
+        if self.quiet && !(lo..hi).contains(&self.from) {
+            return ControlFlow::Continue(());
+        }
+        if !self.quiet {
+            (self.each)(Event::Enter(kind))?;
+        }
+        let owner = match kind {
+            Nested::Float => self.owner(lo),
+            Nested::Inline => None,
+        };
+        self.range(lo, hi, owner)?;
+        if self.quiet {
+            return ControlFlow::Continue(());
+        }
+        (self.each)(Event::Leave(kind, Some(holder)))
+    }
+
+    /// Line `at`'s pieces, the white space after line `wrapped` before
+    /// them, with the lines within it, `at + 1..past`, where they lie;
+    /// whether it laid any piece shown.
+    fn line(&mut self, at: usize, past: usize, wrapped: Option<usize>) -> ControlFlow<(), bool> {
+        let laid = self.laid;
+        let lines = laid.lines();
+        let Some(line) = lines.get(at) else {
+            return ControlFlow::Continue(false);
+        };
+        let mut wrapped = wrapped;
+        if self.quiet && at == self.from {
+            self.quiet = false;
+            wrapped = None;
+            (self.each)(Event::Begin(at))?;
         }
         let laid_any = shown_items(laid, line).next().is_some();
-        if laid_any {
-            if let Some(before) = wrapped.take() {
-                if let Some((text, start, end)) = gap(laid, before, line) {
-                    each(Event::Gap(text, start, end))?;
+        // The white space after line `wrapped`, before the first piece
+        // shown, or before or after lines lying ahead of it, where tree
+        // order puts it.
+        let mut space = match wrapped.and_then(|before| lines.get(before)) {
+            Some(before) if laid_any && !self.quiet => gap(laid, before, line),
+            _ => None,
+        };
+        // The next line within it not walked.
+        let mut inner = at + 1;
+        for item in items(laid, line) {
+            let floats = self.before(inner, past, item.start);
+            if floats > inner {
+                if let Some(gap) = space {
+                    if !self.gap_ahead(inner, floats, gap)? {
+                        space = None;
+                    }
+                }
+                self.nested(inner, floats, Nested::Float, at)?;
+                inner = floats;
+            }
+            let (atomic, style) = match item.piece {
+                Piece::Replaced(i) => line
+                    .replaced
+                    .get(i)
+                    .map_or((false, None), |r| (r.atomic, Some(r.style))),
+                Piece::Text(i) => (false, line.fragments.get(i).map(|f| f.style)),
+            };
+            let shown = style.is_some_and(|style| !hidden(laid, style));
+            if shown {
+                if let Some((text, start, end)) = space.take() {
+                    (self.each)(Event::Gap(text, start, end))?;
                 }
             }
-        }
-        let mut inner = inner_starts(laid, at).peekable();
-        for item in shown_items(laid, line) {
-            let mut broken = false;
-            while inner.next_if(|start| *start < item.start).is_some() {
-                broken = true;
-            }
-            if broken {
-                each(Event::Break)?;
-            }
-            match item.piece {
-                Piece::Text(i) => {
-                    let Some(f) = line.fragments.get(i) else {
-                        continue;
-                    };
-                    if f.display == DisplayText::Space {
-                        each(Event::Scalar(' ', item.start, item.end, false))?;
-                        continue;
+            if atomic {
+                // Its lines, laid or not, shown or not: none matches
+                // across it, and its text lies in this line.
+                let own = self.before(inner, past, item.end);
+                if self.quiet {
+                    if own > inner {
+                        self.nested(inner, own, Nested::Inline, at)?;
                     }
-                    if let Some(measure) = measure.as_deref_mut() {
-                        let mut flow = ControlFlow::Continue(());
-                        let mut reported = false;
-                        extents(laid, measure, line, f, |e| {
-                            reported = true;
-                            if flow.is_continue() {
-                                flow = each(Event::Scalar(e.shown, e.start, e.end, e.width == 0.0));
-                            }
-                        });
-                        flow?;
-                        // A replay refused before any scalar gives them
-                        // unmeasured.
-                        if reported {
-                            continue;
+                } else {
+                    (self.each)(Event::Enter(Nested::Inline))?;
+                    self.range(inner, own, None)?;
+                    (self.each)(Event::Leave(Nested::Inline, Some(at)))?;
+                }
+                if own > inner {
+                    space = None;
+                }
+                inner = own;
+                continue;
+            }
+            if self.quiet || !shown {
+                continue;
+            }
+            self.piece(line, item)?;
+        }
+        if inner < past {
+            self.nested(inner, past, Nested::Float, at)?;
+        }
+        ControlFlow::Continue(laid_any)
+    }
+
+    /// A text or replaced piece's events.
+    fn piece(&mut self, line: &'a Line, item: Item) -> ControlFlow<()> {
+        #[cfg(test)]
+        tests::piece();
+        let laid = self.laid;
+        match item.piece {
+            Piece::Text(i) => {
+                let Some(f) = line.fragments.get(i) else {
+                    return ControlFlow::Continue(());
+                };
+                if f.display == DisplayText::Space {
+                    return (self.each)(Event::Scalar(' ', item.start, item.end, false));
+                }
+                if let Some(measure) = self.measure.as_deref_mut() {
+                    let mut flow = ControlFlow::Continue(());
+                    let mut reported = false;
+                    let each = &mut self.each;
+                    extents(laid, measure, line, f, |e| {
+                        reported = true;
+                        if flow.is_continue() {
+                            flow = each(Event::Scalar(e.shown, e.start, e.end, e.width == 0.0));
                         }
-                    }
-                    for (offset, c) in fragment_text(laid, f).char_indices() {
-                        let shown = match f.display {
-                            DisplayText::Replacement => '\u{fffd}',
-                            _ => c,
-                        };
-                        let at = f.range.start + offset;
-                        let start = Place::new(laid, f.node, at);
-                        let end = Place::new(laid, f.node, at + c.len_utf8());
-                        each(Event::Scalar(shown, start, end, false))?;
+                    });
+                    flow?;
+                    // A replay refused before any scalar gives them
+                    // unmeasured.
+                    if reported {
+                        return ControlFlow::Continue(());
                     }
                 }
-                Piece::Replaced(i) => {
-                    let Some(r) = line.replaced.get(i) else {
-                        continue;
+                for (offset, c) in fragment_text(laid, f).char_indices() {
+                    let shown = match f.display {
+                        DisplayText::Replacement => '\u{fffd}',
+                        _ => c,
                     };
-                    // An inline-block's text is its own lines'.
-                    if r.atomic {
-                        each(Event::Break)?;
-                        continue;
-                    }
-                    let alt = laid.tree().alt(r.node).unwrap_or("");
-                    each(Event::Alt(alt, item.start, item.end))?;
+                    let at = f.range.start + offset;
+                    let start = Place::new(laid, f.node, at);
+                    let end = Place::new(laid, f.node, at + c.len_utf8());
+                    (self.each)(Event::Scalar(shown, start, end, false))?;
                 }
+                ControlFlow::Continue(())
             }
-        }
-        match line.end() {
-            LineEnd::Wrap if laid_any => wrapped = Some(line),
-            LineEnd::Wrap => {}
-            _ => wrapped = None,
-        }
-        let block_ends = lines
-            .get(at + 1)
-            .is_none_or(|next| next.block() != line.block());
-        if ends_paragraph(line) || block_ends {
-            wrapped = None;
-            begun = false;
-            each(Event::End)?;
+            Piece::Replaced(i) => {
+                let Some(r) = line.replaced.get(i) else {
+                    return ControlFlow::Continue(());
+                };
+                let alt = laid.tree().alt(r.node).unwrap_or("");
+                (self.each)(Event::Alt(alt, item.start, item.end))
+            }
         }
     }
-    ControlFlow::Continue(())
 }
 
 fn word_char(c: char) -> bool {
@@ -489,8 +923,9 @@ fn joins(c: char, flat: bool) -> bool {
     flat && !c.is_whitespace() && !c.is_control()
 }
 
-/// Each unit a caret steps over from line `from` on, with whether a
-/// paragraph ended since the unit before it: a scalar with the marks of
+/// Each unit a caret steps over from line `from` on, in tree order, with
+/// whether a paragraph ended or was entered or left for a float's or an
+/// inline-block's since the unit before it: a scalar with the marks of
 /// no advance that follow it, an image whole, the white space a wrap
 /// left.
 fn units(
@@ -508,8 +943,8 @@ fn units(
             Event::Scalar(c, s, e, flat) => (c, s, e, Some(flat)),
             Event::Alt(_, s, e) => ('\u{fffc}', s, e, None),
             Event::Gap(_, s, e) => (' ', s, e, None),
-            Event::Begin(_) | Event::Break => return ControlFlow::Continue(()),
-            Event::End => {
+            Event::Begin(_) => return ControlFlow::Continue(()),
+            Event::End | Event::Enter(_) | Event::Leave(..) => {
                 ended = true;
                 return ControlFlow::Continue(());
             }
@@ -540,9 +975,31 @@ fn units(
 /// At the page's edges it stays. A scalar's marks of no advance move
 /// with it.
 pub fn moved(laid: &Laid, measure: &mut Measure, at: Place, motion: Move) -> Place {
+    let lines = laid.lines();
     let line = line_of(laid, at);
-    let (first, last) = paragraph(laid, line);
-    let before = paragraph(laid, first.saturating_sub(1)).0;
+    let (first, _) = paragraph(laid, line);
+    // Where a walk back starts: `at`'s own paragraph, else the paragraph
+    // of the line before it, else the last outermost paragraph whose
+    // lines, its nested ones included, hold a unit before the one `at`
+    // lies in, so the unit before `at` in tree order, and the start of
+    // each paragraph after it, are met, each line looked at once. A walk
+    // goes on in tree order from where it starts, so a later start that
+    // meets a unit before `at` meets the latest.
+    let outermost_before = || {
+        let mut before = walk_start(laid, first);
+        while let Some(line) = before.checked_sub(1) {
+            let start = walk_start(laid, line).min(line);
+            let held = lines
+                .get(start..before)
+                .is_some_and(|run| run.iter().any(|line| holds_unit(laid, line)));
+            before = start;
+            if held {
+                break;
+            }
+        }
+        before
+    };
+    let line_before = first.checked_sub(1).map(|line| paragraph(laid, line).0);
     let mut found = None;
     match motion {
         Move::Right => units(laid, measure, first, |_, s, e, crossed| {
@@ -554,19 +1011,27 @@ pub fn moved(laid: &Laid, measure: &mut Measure, at: Place, motion: Move) -> Pla
             ControlFlow::Break(())
         }),
         Move::Left => {
-            let mut previous: Option<(Place, Place)> = None;
-            units(laid, measure, before, |_, s, e, crossed| {
-                if s >= at {
-                    // At a paragraph's start: the end of the one before.
-                    if crossed && s == at {
-                        found = previous.map(|(_, pe)| pe);
+            let mut back = |from: usize| {
+                let mut found = None;
+                let mut previous: Option<(Place, Place)> = None;
+                units(laid, measure, from, |_, s, e, crossed| {
+                    if s >= at {
+                        // At a paragraph's or a box's start, past where
+                        // the unit before ends: that end.
+                        if crossed && previous.is_some_and(|(_, pe)| pe < at) {
+                            found = previous.map(|(_, pe)| pe);
+                        }
+                        return ControlFlow::Break(());
                     }
-                    return ControlFlow::Break(());
-                }
-                previous = Some((s, e));
-                found = Some(s);
-                ControlFlow::Continue(())
-            });
+                    previous = Some((s, e));
+                    found = Some(s);
+                    ControlFlow::Continue(())
+                });
+                found
+            };
+            found = back(first)
+                .or_else(|| line_before.and_then(&mut back))
+                .or_else(|| back(outermost_before()));
         }
         Move::WordRight => {
             let mut in_word = false;
@@ -590,41 +1055,86 @@ pub fn moved(laid: &Laid, measure: &mut Measure, at: Place, motion: Move) -> Pla
             }
         }
         Move::WordLeft => {
-            let mut previous_word = false;
-            units(laid, measure, before, |c, s, _, crossed| {
-                if s >= at {
-                    return ControlFlow::Break(());
-                }
-                let word = word_char(c);
-                if word && (!previous_word || crossed) {
-                    found = Some(s);
-                }
-                previous_word = word;
-                ControlFlow::Continue(())
-            });
+            let mut back = |from: usize| {
+                let mut found = None;
+                let mut previous_word = false;
+                units(laid, measure, from, |c, s, _, crossed| {
+                    if s >= at {
+                        return ControlFlow::Break(());
+                    }
+                    let word = word_char(c);
+                    if word && (!previous_word || crossed) {
+                        found = Some(s);
+                    }
+                    previous_word = word;
+                    ControlFlow::Continue(())
+                });
+                found
+            };
+            found = back(first)
+                .or_else(|| line_before.and_then(&mut back))
+                .or_else(|| back(outermost_before()));
         }
         Move::Up => {
             let start = paragraph_places(laid, at).map(|(start, _)| start);
             found = match start {
                 Some(start) if start < at => Some(start),
-                _ if first > 0 => paragraph_places_of_line(laid, first - 1).map(|(s, _)| s),
-                _ => None,
+                // The latest paragraph start before `at` in tree order: a
+                // float's or an inline-block's lies within another's.
+                _ => {
+                    let back = |from: usize| {
+                        let mut latest = None;
+                        let mut begun = false;
+                        let _ = walk(laid, None, from, |event| {
+                            let s = match event {
+                                Event::Begin(_) => {
+                                    begun = true;
+                                    return ControlFlow::Continue(());
+                                }
+                                Event::Scalar(_, s, _, _)
+                                | Event::Alt(_, s, _)
+                                | Event::Gap(_, s, _) => s,
+                                _ => return ControlFlow::Continue(()),
+                            };
+                            if s >= at {
+                                return ControlFlow::Break(());
+                            }
+                            if std::mem::take(&mut begun) {
+                                latest = Some(s);
+                            }
+                            ControlFlow::Continue(())
+                        });
+                        latest
+                    };
+                    line_before
+                        .and_then(back)
+                        .or_else(|| back(outermost_before()))
+                }
             };
         }
         Move::Down => {
             let end = paragraph_places(laid, at).map(|(_, end)| end);
             found = match end {
                 Some(end) if end > at => Some(end),
+                // The first paragraph end past `at` in tree order.
                 _ => {
-                    let mut next = last + 1;
+                    let mut last = None;
                     let mut after = None;
-                    while next < laid.lines().len() {
-                        if let Some((_, end)) = paragraph_places_of_line(laid, next) {
-                            after = Some(end);
-                            break;
+                    let _ = walk(laid, None, first, |event| {
+                        match event {
+                            Event::Scalar(_, _, e, _)
+                            | Event::Alt(_, _, e)
+                            | Event::Gap(_, _, e) => {
+                                last = Some(e);
+                            }
+                            Event::End if last.is_some_and(|e| e > at) => {
+                                after = last;
+                                return ControlFlow::Break(());
+                            }
+                            _ => {}
                         }
-                        next = paragraph(laid, next).1 + 1;
-                    }
+                        ControlFlow::Continue(())
+                    });
                     after
                 }
             };
@@ -657,15 +1167,21 @@ pub fn page_bounds(laid: &Laid) -> (Place, Place) {
 }
 
 /// The word under `at`, or none off a word: a run of letters, digits
-/// and `_`, each with the marks of no advance after it.
+/// and `_`, each with the marks of no advance after it, within a
+/// paragraph and not across a float's or an inline-block's lines.
 pub fn word(laid: &Laid, measure: &mut Measure, at: Place) -> Option<(Place, Place)> {
     let line = line_of(laid, at);
     let (first, _) = paragraph(laid, line);
     let mut run: Option<(Place, Place)> = None;
     let mut found = None;
     units(laid, measure, first, |c, s, e, crossed| {
+        // A run a paragraph or a nested box ends holds its end too.
         if crossed {
-            return ControlFlow::Break(());
+            if let Some(run) = run.filter(|run| run.0 <= at && at <= run.1) {
+                found = Some(run);
+                return ControlFlow::Break(());
+            }
+            run = None;
         }
         if word_char(c) {
             run = Some(run.map_or((s, e), |(start, _)| (start, e)));
@@ -676,19 +1192,27 @@ pub fn word(laid: &Laid, measure: &mut Measure, at: Place) -> Option<(Place, Pla
             }
             run = None;
         }
+        // Units are in tree order: none after this holds `at`.
+        if s > at && run.is_none_or(|run| run.0 > at) {
+            return ControlFlow::Break(());
+        }
         ControlFlow::Continue(())
     });
-    // The paragraph's last run holds its end too.
     found.or(run.filter(|run| run.0 <= at && at <= run.1))
 }
 
 /// The paragraph line `line` lies in, start to end.
 pub fn paragraph_places_of_line(laid: &Laid, line: usize) -> Option<(Place, Place)> {
-    let (first, last) = paragraph(laid, line);
-    let lines = laid.lines().get(first..=last)?;
-    let start = lines.iter().find_map(|l| bounds(laid, l))?;
-    let end = lines.iter().rev().find_map(|l| bounds(laid, l))?;
-    Some((start.0, end.1))
+    let (first, _) = paragraph(laid, line);
+    let mut places: Option<(Place, Place)> = None;
+    let mut at = Some(first);
+    while let Some(line) = at {
+        if let Some((start, end)) = laid.lines().get(line).and_then(|l| bounds(laid, l)) {
+            places = Some(places.map_or((start, end), |(first, _)| (first, end)));
+        }
+        at = joined_after(laid, line);
+    }
+    places
 }
 
 /// The paragraph `at` lies in, start to end.
@@ -743,11 +1267,15 @@ struct Copier<'a> {
     /// or a newline.
     owed: Option<Owed>,
     started: bool,
+    /// Whether the text put last ends in a space.
+    spaced: bool,
 }
 
 #[derive(Clone, Copy)]
 enum Owed {
     Newline,
+    /// A float's edge: a newline, unless a cell's tabs are owed.
+    Edge,
     Space,
     Tabs(usize),
 }
@@ -756,7 +1284,7 @@ impl Copier<'_> {
     fn put(&mut self, text: &str) -> ControlFlow<()> {
         if self.started {
             match self.owed.take() {
-                Some(Owed::Newline) => (self.out)("\n")?,
+                Some(Owed::Newline | Owed::Edge) => (self.out)("\n")?,
                 Some(Owed::Space) => (self.out)(" ")?,
                 Some(Owed::Tabs(n)) => {
                     for _ in 0..n {
@@ -768,12 +1296,13 @@ impl Copier<'_> {
         }
         self.owed = None;
         self.started = true;
+        self.spaced = text.ends_with(' ');
         (self.out)(text)
     }
     /// The copy ends at the next piece: a selection ending at a
     /// paragraph's start holds the newline before it.
     fn close(&mut self, at_start: bool) -> ControlFlow<()> {
-        if at_start && self.started && matches!(self.owed, Some(Owed::Newline)) {
+        if at_start && self.started && matches!(self.owed, Some(Owed::Newline | Owed::Edge)) {
             (self.out)("\n")?;
         }
         ControlFlow::Break(())
@@ -782,8 +1311,77 @@ impl Copier<'_> {
         self.owed = Some(match (self.owed, owed) {
             (Some(Owed::Newline), _) | (_, Owed::Newline) => Owed::Newline,
             (Some(Owed::Tabs(a)), Owed::Tabs(b)) => Owed::Tabs(a + b),
-            (Some(Owed::Tabs(a)), Owed::Space) => Owed::Tabs(a),
+            (Some(Owed::Tabs(a)), Owed::Space | Owed::Edge) => Owed::Tabs(a),
+            (Some(Owed::Edge), Owed::Space) => Owed::Edge,
             (_, owed) => owed,
+        });
+    }
+}
+
+/// A float's separators, owed only between pieces copied: two pieces
+/// have a float's edge between them where either lies in a float the
+/// walk left between them, so a float with nothing shown parts nothing.
+#[derive(Default)]
+struct Floats {
+    /// How many floats the walk is in.
+    depth: usize,
+    /// The fewest it was in since the last piece.
+    low: usize,
+    /// How many the last piece was in, and its cell.
+    last: (usize, Option<usize>),
+    /// What a float's paragraph's end owes, held until more of its
+    /// text, and how many floats the walk was in.
+    end: Option<(Owed, usize)>,
+}
+
+impl Floats {
+    /// A piece in cell `cell` is copied: what is owed before it. Within
+    /// one cell a float's edge is a space, as its paragraphs' ends are.
+    fn put(&mut self, copier: &mut Copier, cell: Option<usize>) {
+        if let Some((end, _)) = self.end.take() {
+            copier.owe(end);
+        }
+        if self.at_edge() {
+            if cell.is_none() || cell != self.last.1 {
+                copier.owe(Owed::Edge);
+            } else if !copier.spaced {
+                copier.owe(Owed::Space);
+            }
+        }
+        self.low = self.depth;
+        self.last = (self.depth, cell);
+    }
+
+    /// Whether a float's edge lies before the next piece.
+    fn at_edge(&self) -> bool {
+        self.last.0 > self.low || self.depth > self.low
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+        self.low = self.low.min(self.depth);
+        if self.end.is_some_and(|(_, depth)| depth > self.depth) {
+            self.end = None;
+        }
+    }
+
+    /// A paragraph ends owing `owed`: held in a float.
+    fn end(&mut self, copier: &mut Copier, owed: Owed) {
+        if self.depth == 0 {
+            copier.owe(owed);
+            return;
+        }
+        // Held across a float with nothing shown, at the fewest floats.
+        self.end = Some(match self.end {
+            Some((held, depth)) => (
+                if matches!(held, Owed::Newline) {
+                    held
+                } else {
+                    owed
+                },
+                depth.min(self.depth),
+            ),
+            None => (owed, self.depth),
         });
     }
 }
@@ -804,6 +1402,10 @@ fn empty_held(
     (top || start.rank < rank) && (bottom || rank < end.rank)
 }
 
+/// Where a paragraph in an inline-block ended since `copy`'s last piece:
+/// the first such end's depth and what was owed before it.
+type Ended = Option<(usize, Option<Owed>)>;
+
 /// The text between `start` and `end` as a copy takes it, handed to `out`
 /// a piece at a time until it breaks.
 pub fn copy(
@@ -814,9 +1416,9 @@ pub fn copy(
 ) -> ControlFlow<()> {
     let lines = laid.lines();
     // The scalars painted selected, those starting from `start` to before
-    // `end`, in line order: from the outermost line the start's lies in,
-    // whose tail after a float may hold some, to the last line starting
-    // at or before the end, whose markers a line starting there holds.
+    // `end`, in tree order (`walk`): from the outermost line the start's
+    // lies in until a piece shown starts at or past the end. A selection
+    // ending where a line starts holds the newline before it.
     let to = line_of(laid, end);
     let from = outermost(laid, line_of(laid, start));
     let until = starting_past(laid, end, true);
@@ -830,6 +1432,7 @@ pub fn copy(
         out,
         owed: None,
         started: false,
+        spaced: false,
     };
     let mut cell: Option<(usize, Option<usize>)> = None;
     let mut buffer = [0u8; 4];
@@ -838,12 +1441,53 @@ pub fn copy(
     let (first, last) = page_bounds(laid);
     let whole = start <= first && end >= last;
     let (top, bottom) = ((start, whole), (end, whole));
-    // What was owed before the last paragraph end walked: a line starting
-    // at the end owes nothing for its own.
-    let mut ended: Option<Option<Owed>> = None;
-    let flow = walk_to(laid, None, from, until, |event| match event {
+    // How many inline-blocks the walk is in, and, where a paragraph in
+    // one ended since the last piece, the first such end's depth and what
+    // was owed before it: leaving that inline-block owes that again, as
+    // its text lies in its line, and no more.
+    let mut depth = 0usize;
+    let mut ended: Ended = None;
+    let mut floats = Floats::default();
+    // The line the last paragraph walked began on, and, where it ended
+    // and began before `until` with no piece put since, what was owed
+    // before its end: a line starting at the end, its first piece not
+    // shown, owes nothing for its own paragraph's end.
+    let mut begun = 0usize;
+    let mut tail: Option<Option<Owed>> = None;
+    // Whether the copy stopped at a piece at or past the end, and at one
+    // starting there, before which what is owed is as copying it would
+    // put it.
+    let mut stopped = false;
+    let mut exact = false;
+    let mut put = |copier: &mut Copier,
+                   text: &str,
+                   s: Place,
+                   e: Place,
+                   (ended, tail): (&mut Ended, &mut Option<Option<Owed>>),
+                   floats: &mut Floats,
+                   cell: Option<usize>| {
+        if s >= end {
+            stopped = true;
+            if s == end {
+                exact = true;
+                floats.put(copier, cell);
+            }
+            return ControlFlow::Break(());
+        }
+        if s >= start && e <= end {
+            *ended = None;
+            *tail = None;
+            floats.put(copier, cell);
+            copier.put(text)?;
+        }
+        ControlFlow::Continue(())
+    };
+    let flow = walk(laid, None, from, |event| match event {
         Event::Begin(at) => {
-            ended = None;
+            begun = at;
+            if at < until {
+                tail = None;
+            }
             let Some(line) = lines.get(at) else {
                 return ControlFlow::Continue(());
             };
@@ -867,12 +1511,15 @@ pub fn copy(
                     // An empty item after this line's start waits for
                     // the line after it.
                     None if first.is_none_or(|s| laid.tree().rank(m.item) > s.rank) => break,
+                    // A marker is put as text is, after what is owed.
                     Some(l) if l as usize == at && held && !hidden(laid, m.style) => {
+                        floats.put(&mut copier, cell.map(|c| c.0));
                         // Its text ends in its own space.
                         copier.put(m.text().as_str())?;
                     }
                     // An empty item's, before this line, is a paragraph
-                    // of its own when the selection spans its item.
+                    // of its own when the selection spans its item, after
+                    // a newline, which no float's edge or end outweighs.
                     None if empty_held(laid, m.item, top, bottom) && !hidden(laid, m.style) => {
                         if copier.started {
                             copier.owe(Owed::Newline);
@@ -886,43 +1533,106 @@ pub fn copy(
             }
             ControlFlow::Continue(())
         }
-        Event::Scalar(c, s, e, _) => {
-            if s >= start && e <= end {
-                copier.put(c.encode_utf8(&mut buffer))?;
-            }
-            ControlFlow::Continue(())
-        }
-        Event::Alt(text, s, e) => {
-            if s >= start && e <= end {
-                copier.put(text)?;
-            }
-            ControlFlow::Continue(())
-        }
+        Event::Scalar(c, s, e, _) => put(
+            &mut copier,
+            c.encode_utf8(&mut buffer),
+            s,
+            e,
+            (&mut ended, &mut tail),
+            &mut floats,
+            cell.map(|c| c.0),
+        ),
+        Event::Alt(text, s, e) => put(
+            &mut copier,
+            text,
+            s,
+            e,
+            (&mut ended, &mut tail),
+            &mut floats,
+            cell.map(|c| c.0),
+        ),
         Event::Gap(text, s, e) => {
-            if s >= start && e <= end && copier.started {
-                copier.put(text)?;
+            if copier.started {
+                put(
+                    &mut copier,
+                    text,
+                    s,
+                    e,
+                    (&mut ended, &mut tail),
+                    &mut floats,
+                    cell.map(|c| c.0),
+                )
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+        // A float's text, block-level, is its own paragraphs, set off
+        // from the text around it where it has any; an inline-block's
+        // lies in its line.
+        Event::Enter(Nested::Float) => {
+            floats.depth += 1;
+            ControlFlow::Continue(())
+        }
+        // It is a piece of its line, as a picture is, empty or not.
+        Event::Enter(Nested::Inline) => {
+            depth += 1;
+            ended = None;
+            floats.put(&mut copier, cell.map(|c| c.0));
+            ControlFlow::Continue(())
+        }
+        Event::Leave(kind, holder) => {
+            // Back in the line holding it, in that line's cell.
+            if let (true, Some(line)) = (tables, holder.and_then(|at| lines.get(at))) {
+                cell = cell_of(laid, line);
+            }
+            match kind {
+                Nested::Inline => {
+                    if let Some((_, owed)) = ended.filter(|&(at, _)| at >= depth) {
+                        copier.owed = owed;
+                        floats.end = None;
+                        ended = None;
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                // Its text ends at an edge, owed before the next piece,
+                // in an inline-block as well, whose leaving cancels only
+                // its own paragraphs' ends after it.
+                Nested::Float => floats.leave(),
             }
             ControlFlow::Continue(())
         }
-        Event::Break => ControlFlow::Continue(()),
         Event::End => {
-            ended = Some(copier.owed);
+            if begun < until {
+                tail = Some(copier.owed);
+            }
             if copier.started {
-                copier.owe(if cell.is_some() {
+                if depth > 0 && ended.is_none() {
+                    ended = Some((depth, copier.owed));
+                }
+                let owed = if cell.is_some() {
                     Owed::Space
                 } else {
                     Owed::Newline
-                });
+                };
+                floats.end(&mut copier, owed);
             }
             ControlFlow::Continue(())
         }
     });
-    flow?;
-    // Ended before the page's end; at a line's start, with the newline
-    // before it.
-    if until < lines.len() || at_start {
-        if let (true, Some(owed)) = (at_start, ended) {
-            copier.owed = owed;
+    // The consumer broke.
+    if flow.is_break() && !stopped {
+        return ControlFlow::Break(());
+    }
+    // Ended before the page's end; where a line starts, with the newline
+    // before it, but for its own paragraph's end.
+    if stopped || until < lines.len() || at_start {
+        if !exact {
+            if let Some((end, _)) = floats.end.take() {
+                copier.owe(end);
+            }
+            if let (true, Some(owed)) = (at_start, tail) {
+                copier.owed = owed;
+            }
         }
         return copier.close(at_start);
     }
@@ -1299,6 +2009,39 @@ mod tests {
     use crate::pipeline::tests::measure;
     use crate::pipeline::text_page;
     use crate::tree::Source;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Lines a walk looked at to find where nested lines lie.
+        static VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn visit() {
+        VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+
+    thread_local! {
+        /// Pieces a walk gave events for.
+        static PIECES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn piece() {
+        PIECES.with(|pieces| pieces.set(pieces.get() + 1));
+    }
+
+    /// The pieces `run` gives events for.
+    fn pieces(run: impl FnOnce()) -> usize {
+        PIECES.with(|pieces| pieces.set(0));
+        run();
+        PIECES.with(Cell::get)
+    }
+
+    /// The lines `run` looks at to find where nested lines lie.
+    fn visits(run: impl FnOnce()) -> usize {
+        VISITS.with(|visits| visits.set(0));
+        run();
+        VISITS.with(Cell::get)
+    }
 
     fn all(laid: &Laid) -> String {
         let (start, end) = page_bounds(laid);
@@ -1413,9 +2156,10 @@ mod tests {
     }
 
     /// A line with no item among a float's or an inline-block's lines lies
-    /// within the line its next line does; those ending the page in none.
+    /// within the line holding its box, as its box's other lines do; one
+    /// of a box no line holds, as those ending the page, in none.
     #[test]
-    fn item_less_lines_lie_where_the_next_line_does() {
+    fn item_less_lines_lie_where_their_box_does() {
         for markup in [
             "<body style=margin:0><p style=margin:0>foo<span style=float:left><br>QQ</span>bar",
             "<body style=margin:0><p style=margin:0>foo\
@@ -1442,7 +2186,7 @@ mod tests {
     /// Around floats met within lines, among them two in one line and
     /// one in a paragraph's second line: every laid piece is found on its
     /// line, and a copy takes the scalars painted selected, those starting
-    /// from the start to before the end, in line order.
+    /// from the start to before the end, in tree order.
     #[test]
     fn copies_around_floats_take_what_is_selected() {
         for markup in [
@@ -1493,9 +2237,9 @@ mod tests {
 
     /// Around inline-blocks, one ending the page's last line and one in
     /// another: every laid piece is found on its line, a copy takes the
-    /// scalars painted selected in line order, an inline-block's text
-    /// after its line's, the page's end is past its text, and its
-    /// placeholder gives no `alt`.
+    /// scalars painted selected in tree order, an inline-block's text in
+    /// its line, the page's end is past its text, and its placeholder
+    /// gives no `alt`.
     #[test]
     fn places_and_copies_around_inline_blocks() {
         let ib = "style=display:inline-block";
@@ -1563,7 +2307,582 @@ mod tests {
             "<body style=margin:0><p style=margin:0>one <span {ib}>aa bb<br>cc</span> two"
         ));
         let (first, last) = page_bounds(&laid);
-        assert_eq!(copy_of(&laid, first, last), "one  two\naa bb\ncc");
+        assert_eq!(copy_of(&laid, first, last), "one aa bb\ncc two");
+    }
+
+    /// The places of the first `word` laid.
+    fn word_at(laid: &Laid, word: &str) -> (Place, Place) {
+        laid.lines()
+            .iter()
+            .flat_map(|line| line.fragments.iter())
+            .find_map(|f| {
+                let at = f.range.start + fragment_text(laid, f).find(word)?;
+                Some((
+                    Place::new(laid, f.node, at),
+                    Place::new(laid, f.node, at + word.len()),
+                ))
+            })
+            .unwrap()
+    }
+
+    /// A paragraph wrapped around a float's or an inline-block's lines,
+    /// laid after its first line, goes on past them: its lines are one
+    /// paragraph, copied whole, the box's text where it lies (a float's
+    /// as paragraphs of their own, an inline-block's in the line), and
+    /// the keys step into the box and out in tree order.
+    #[test]
+    fn a_paragraph_goes_on_across_a_float_s_or_an_inline_block_s_lines() {
+        let p = "<body style=margin:0><p style=margin:0;width:120px>one two ";
+        for (markup, all_text, part, inside) in [
+            (
+                format!("{p}<span style=float:left>FL</span>three four five six seven"),
+                "one two \nFL\nthree four five six seven",
+                "two \nFL\nthree four",
+                "FL",
+            ),
+            (
+                format!(
+                    "{p}<span style=display:inline-block>IB<br>x</span> three four five six seven"
+                ),
+                "one two IB\nx three four five six seven",
+                "two IB\nx three four",
+                "IB",
+            ),
+            (
+                format!("{p}<span style=display:inline-block>QQ</span>three four five six seven"),
+                "one two QQthree four five six seven",
+                "two QQthree four",
+                "QQ",
+            ),
+            // A float met past a line's last piece lies before its next.
+            (
+                format!("{p}three<span style=float:left>FL</span> four five six seven"),
+                "one two three\nFL\nfour five six seven",
+                "two three\nFL\nfour",
+                "FL",
+            ),
+        ] {
+            let laid = laid(&markup);
+            let lines = laid.lines();
+            let last = lines.len() - 1;
+            let holder = lines[0].block();
+            assert!(lines.iter().any(|line| line.block() != holder), "{markup}");
+            for (at, line) in lines.iter().enumerate() {
+                let para = paragraph(&laid, at);
+                if line.block() == holder {
+                    assert_eq!(para, (0, last), "{markup}: line {at}");
+                } else {
+                    assert!(para.0 > 0 && para.1 < last, "{markup}: line {at}");
+                }
+            }
+            assert_eq!(all(&laid), all_text, "{markup}");
+            let (one, _) = word_at(&laid, "one");
+            let (_, seven) = word_at(&laid, "seven");
+            assert_eq!(paragraph_places(&laid, one), Some((one, seven)), "{markup}");
+            assert_eq!(mv(&laid, one, Move::Down), seven, "{markup}");
+            assert_eq!(mv(&laid, seven, Move::Up), one, "{markup}");
+            let (two, _) = word_at(&laid, "two");
+            let (_, four) = word_at(&laid, "four");
+            assert_eq!(copy_of(&laid, two, four), part, "{markup}");
+            let mut m = measure(WANT);
+            let (three, three_end) = word_at(&laid, "three");
+            assert_eq!(
+                word(&laid, &mut m, three),
+                Some((three, three_end)),
+                "{markup}"
+            );
+            let (four_start, _) = word_at(&laid, "four");
+            assert_eq!(
+                word(&laid, &mut m, four_start),
+                Some((four_start, four)),
+                "{markup}"
+            );
+            // Into the box and out, a step each.
+            let (box_start, box_end) = word_at(&laid, inside);
+            let mut before = one;
+            for _ in 0..64 {
+                let right = mv(&laid, before, Move::Right);
+                if right == box_start {
+                    break;
+                }
+                before = right;
+            }
+            assert_eq!(mv(&laid, before, Move::Right), box_start, "{markup}");
+            assert_eq!(mv(&laid, box_start, Move::Left), before, "{markup}");
+            let after = mv(&laid, box_end, Move::Right);
+            assert!(after > box_end, "{markup}");
+            assert_eq!(mv(&laid, after, Move::Left), box_end, "{markup}");
+        }
+    }
+
+    /// The separators of a copy: its text without spaces and the marks a
+    /// picture with no `alt` stands for, a float's marks newlines, each
+    /// run of newlines one, none at either end.
+    fn separators(text: &str) -> String {
+        let mut out = String::new();
+        let marks = |c| if c == '\u{2}' { '\n' } else { c };
+        for c in text
+            .chars()
+            .filter(|&c| c != ' ' && c != '\u{1}')
+            .map(marks)
+        {
+            if c != '\n' || !out.is_empty() && !out.ends_with('\n') {
+                out.push(c);
+            }
+        }
+        out.trim_end_matches('\n').to_string()
+    }
+
+    /// Generated wrapped paragraphs holding floats and inline-blocks, some
+    /// nested, some empty and some holding a `<br>`, mid-paragraph after
+    /// another paragraph: a walk is in tree order, every piece starting
+    /// where the one before it ends or after; a copy between any two
+    /// places takes exactly the scalars painted selected; the page's copy
+    /// has the separators the markup gives, a float's text between
+    /// newlines and an inline-block's in its line with a newline only
+    /// before its own later paragraphs; the holder's lines are one
+    /// paragraph and a walk begins each paragraph once; and each move
+    /// from a place goes the way it moves or stays only where nothing
+    /// lies that way.
+    #[test]
+    fn generated_paragraphs_go_on_across_nested_boxes() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) % n
+        };
+        let words = ["ab", "cde", "fghij", "k", "lmno"];
+        let boxes = [
+            ("<span style=float:left;width:40px>", "</span>", true),
+            ("<span style=float:right>", "</span>", true),
+            ("<span style=display:inline-block>", "</span>", false),
+            ("<a href=/l style=display:inline-block>", "</a>", false),
+        ];
+        let mut m = measure(WANT);
+        let mut pairs = 0usize;
+        for page in 0..120 {
+            let width = 60 + next(140);
+            let mut markup = format!(
+                "<body style=margin:0><p style=margin:0>lead<p style=margin:0;width:{width}px>"
+            );
+            // The open boxes, each with its close, whether it floats and
+            // the text a copy of it gives.
+            let mut open: Vec<(&str, bool, String)> = vec![("", false, String::new())];
+            for _ in 0..16 + next(24) {
+                let depth = open.len() - 1;
+                match next(10) {
+                    0 | 1 if depth < 3 => {
+                        // No link in a link, which the parser would part.
+                        let (start, close, floats) = boxes[next(4) as usize];
+                        if close == "</a>" && open.iter().any(|o| o.0 == "</a>") {
+                            continue;
+                        }
+                        markup.push_str(start);
+                        open.push((close, floats, String::new()));
+                    }
+                    2 if depth > 0 => {
+                        let (close, floats, text) = open.pop().unwrap();
+                        markup.push_str(close);
+                        // An inline-block is a piece, its last paragraph's
+                        // end owing nothing; a float's text lies between
+                        // newlines, marked apart from its paragraphs' ends,
+                        // as an inline-block holding it does not cancel
+                        // them.
+                        let copied = if !floats {
+                            format!("\u{1}{}", text.trim_end_matches('\n'))
+                        } else if text.chars().all(|c| c == '\n') {
+                            // Nothing shown, no edge.
+                            String::new()
+                        } else {
+                            format!("\u{2}{text}\u{2}")
+                        };
+                        open.last_mut().unwrap().2.push_str(&copied);
+                    }
+                    3 if depth > 0 => {
+                        markup.push_str("<br>");
+                        open.last_mut().unwrap().2.push('\n');
+                    }
+                    4 => {
+                        markup.push_str("<img width=12 height=8>");
+                        open.last_mut().unwrap().2.push('\u{1}');
+                    }
+                    _ => {
+                        let word = words[next(5) as usize];
+                        markup.push_str(word);
+                        markup.push(' ');
+                        open.last_mut().unwrap().2.push_str(word);
+                    }
+                }
+            }
+            while open.len() > 1 {
+                let (close, floats, text) = open.pop().unwrap();
+                markup.push_str(close);
+                let copied = if !floats {
+                    format!("\u{1}{}", text.trim_end_matches('\n'))
+                } else if text.chars().all(|c| c == '\n') {
+                    String::new()
+                } else {
+                    format!("\u{2}{text}\u{2}")
+                };
+                open.last_mut().unwrap().2.push_str(&copied);
+            }
+            markup.push_str("tail words end");
+            let expected = separators(&format!("lead\n{}tailwordsend", open[0].2));
+            let laid = laid(&markup);
+            let lines = laid.lines();
+            let mut scalars = Vec::new();
+            let mut spans: Vec<(Place, Place)> = Vec::new();
+            let mut begun = 0usize;
+            let _ = walk(&laid, None, 0, |event| {
+                match event {
+                    Event::Scalar(c, s, e, _) => {
+                        scalars.push((c, s));
+                        spans.push((s, e));
+                    }
+                    Event::Alt(_, s, e) | Event::Gap(_, s, e) => spans.push((s, e)),
+                    Event::Begin(_) => begun += 1,
+                    _ => {}
+                }
+                ControlFlow::Continue(())
+            });
+            assert!(
+                spans
+                    .windows(2)
+                    .all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].0),
+                "{page}: {markup}: not in tree order"
+            );
+            let (first, last) = page_bounds(&laid);
+            assert_eq!(
+                separators(&copy_of(&laid, first, last)),
+                expected,
+                "{page}: {markup}"
+            );
+            // The text after the boxes is the holder's: a float first in it
+            // lays its lines before its first, a box last its own after.
+            let tail = line_of(&laid, word_at(&laid, "tail").0);
+            let holder = lines[tail].block();
+            let whole = paragraph(&laid, tail);
+            let mut firsts: Vec<usize> = Vec::new();
+            for (at, line) in lines.iter().enumerate() {
+                let para = paragraph(&laid, at);
+                if line.block() == holder {
+                    assert_eq!(para, whole, "{page}: {markup}: line {at}");
+                }
+                if !firsts.contains(&para.0) {
+                    firsts.push(para.0);
+                }
+            }
+            assert_eq!(begun, firsts.len(), "{page}: {markup}");
+            let mut places = Vec::new();
+            for line in lines {
+                for item in items(&laid, line) {
+                    places.push(item.start);
+                    places.push(item.end);
+                }
+            }
+            places.sort();
+            places.dedup();
+            for _ in 0..60 {
+                let a = places[next(places.len() as u64) as usize];
+                let b = places[next(places.len() as u64) as usize];
+                let (from, to) = (a.min(b), a.max(b));
+                let shown: String = scalars
+                    .iter()
+                    .filter(|(c, s)| *s >= from && *s < to && !c.is_whitespace())
+                    .map(|(c, _)| *c)
+                    .collect();
+                let mut out = copy_of(&laid, from, to);
+                out.retain(|c| !c.is_whitespace());
+                assert_eq!(out, shown, "{page}: {markup} {from:?} {to:?}");
+                pairs += 1;
+            }
+            for _ in 0..12 {
+                let at = places[next(places.len() as u64) as usize];
+                let ahead = spans.iter().any(|&(_, e)| e > at);
+                let behind = spans.iter().any(|&(s, _)| s < at);
+                for motion in [Move::Right, Move::WordRight, Move::Down] {
+                    let to = moved(&laid, &mut m, at, motion);
+                    assert!(
+                        to > at || to == at && (motion != Move::Right || !ahead),
+                        "{page}: {markup}: {motion:?} from {at:?} to {to:?}"
+                    );
+                }
+                for motion in [Move::Left, Move::WordLeft, Move::Up] {
+                    let to = moved(&laid, &mut m, at, motion);
+                    assert!(
+                        to < at || to == at && (motion != Move::Left || !behind),
+                        "{page}: {markup}: {motion:?} from {at:?} to {to:?}"
+                    );
+                }
+            }
+        }
+        assert!(pairs > 5_000);
+    }
+
+    /// The text a page's matches of `query` copy.
+    fn found_in(laid: &Laid, query: &str) -> Vec<String> {
+        let page = td_alloc::Budget::new(64 << 20).unwrap();
+        let hits = crate::search::find(laid, query, &page).unwrap();
+        hits.iter()
+            .map(|hit| copy_of(laid, hit.start, hit.end))
+            .collect()
+    }
+
+    /// An inline-block's leaving cancels only the newlines its own
+    /// paragraphs' ends owe after its start: the separator before it is
+    /// kept, empty or nested as it may be, as is a `<br>`'s before an
+    /// empty one and a float's newline after its text.
+    #[test]
+    fn an_inline_block_keeps_the_separators_around_it() {
+        let ib = "<span style=display:inline-block;width:16px;height:16px></span>";
+        for (markup, text) in [
+            (format!("<p>prev</p><p>{ib}two</p>"), "prev\ntwo"),
+            (
+                format!(
+                    "<table><tr><td>a</td><td>{ib}b</td></tr><tr><td>\
+                     <span style=display:inline-block;width:8px;height:8px></span>c</td></tr></table>"
+                ),
+                "a\tb\nc",
+            ),
+            (
+                "<p>prev</p><p><span style=display:inline-block>\
+                 <span style=display:inline-block></span></span>two</p>"
+                    .to_string(),
+                "prev\ntwo",
+            ),
+            (
+                "<p>one <span style=display:inline-block>aa<br>bb</span> two".to_string(),
+                "one aa\nbb two",
+            ),
+            (
+                format!("<p>one <span style=display:inline-block>aa<br>{ib}</span>bb"),
+                "one aa\nbb",
+            ),
+            (
+                "<p>one <span style=display:inline-block>aa \
+                 <span style=float:right>fl</span></span>tail"
+                    .to_string(),
+                "one aa\nfl\ntail",
+            ),
+            (
+                "<p>one <span style=display:inline-block><span style=float:right>fl</span>\
+                 aa</span> tail"
+                    .to_string(),
+                "one \nfl\naa tail",
+            ),
+            (
+                "<p style=margin:0;width:196px>k <span style=float:right>fg \
+                 <a href=/l style=display:inline-block><span style=float:right>fghij lmno \
+                 lmno lmno ab cde k cde ab fghij fghij k ab </span>hi \
+                 <span style=display:inline-block>cde </span></a></span>tail"
+                    .to_string(),
+                "k \nfg \nfghij lmno lmno lmno ab cde k cde ab fghij fghij k ab\nhi cde\ntail",
+            ),
+        ] {
+            assert_eq!(all(&laid(&markup)), text, "{markup}");
+        }
+    }
+
+    /// A walk, a copy, a find and each move look at each line a bounded
+    /// number of times, however many item-less lines a box holds.
+    #[test]
+    fn nested_lines_are_looked_at_a_bounded_number_of_times() {
+        let brs = "<br>".repeat(20_000);
+        for markup in [
+            format!("<p>a <span style=display:inline-block>{brs}x</span> b</p>"),
+            format!("<p>a <span style=float:left>{brs}x</span> b</p>"),
+        ] {
+            let laid = laid(&markup);
+            let n = laid.lines().len();
+            assert!(n > 20_000, "{n}");
+            let walked = visits(|| {
+                let _ = walk(&laid, None, 0, |_| ControlFlow::Continue(()));
+            });
+            assert!(walked <= 4 * n + 64, "walk: {walked} for {n} lines");
+            let (first, last) = page_bounds(&laid);
+            let copied = visits(|| {
+                assert!(copy_of(&laid, first, last).contains("\nx"));
+            });
+            assert!(copied <= 4 * n + 64, "copy: {copied} for {n} lines");
+            let finding = visits(|| assert_eq!(found_in(&laid, "x"), ["x"]));
+            assert!(finding <= 4 * n + 64, "find: {finding} for {n} lines");
+            let x = word_at(&laid, "x").0;
+            for motion in [
+                Move::Right,
+                Move::Left,
+                Move::WordRight,
+                Move::WordLeft,
+                Move::Down,
+                Move::Up,
+            ] {
+                let moving = visits(|| {
+                    mv(&laid, x, motion);
+                });
+                assert!(moving <= 8 * n + 64, "{motion:?}: {moving} for {n} lines");
+            }
+        }
+    }
+
+    /// The white space after a wrap goes before the line's first piece
+    /// shown, not before nested lines met ahead of it: places run on.
+    #[test]
+    fn no_gap_goes_before_nested_lines_first_on_a_line() {
+        let markup = "<p style=margin:0;width:120px>one two three \
+             <span style=visibility:hidden>hidden </span>\
+             <span style=float:left>FL</span>five six seven";
+        let laid = laid(markup);
+        let mut spans = Vec::new();
+        let _ = walk(&laid, None, 0, |event| {
+            if let Event::Scalar(_, s, e, _) | Event::Alt(_, s, e) | Event::Gap(_, s, e) = event {
+                spans.push((s, e));
+            }
+            ControlFlow::Continue(())
+        });
+        assert!(spans.windows(2).all(|w| w[0].1 <= w[1].0), "{spans:?}");
+        assert_eq!(all(&laid), "one two three\nFL\nfive six seven");
+        assert_eq!(found_in(&laid, "five six"), ["five six"]);
+    }
+
+    /// A hidden inline-block is walked as one, its lines in its line.
+    #[test]
+    fn a_hidden_inline_block_is_walked_as_one() {
+        let laid =
+            laid("<p>ab <span style=display:inline-block;visibility:hidden>hid</span> cd</p>");
+        let mut entered = Vec::new();
+        let _ = walk(&laid, None, 0, |event| {
+            if let Event::Enter(kind) = event {
+                entered.push(kind);
+            }
+            ControlFlow::Continue(())
+        });
+        assert_eq!(entered, [Nested::Inline]);
+        assert_eq!(all(&laid), "ab  cd");
+    }
+
+    /// A box's last line with no item (a `<br>` last in it) lies within
+    /// the line holding the box, walked with the box's lines.
+    #[test]
+    fn a_box_s_last_line_with_no_item_is_walked_within_it() {
+        let p = "<p style=margin:0;width:120px>one ";
+        for (markup, text) in [
+            (
+                format!("{p}<span style=float:left>FL<br></span>two three four five six seven"),
+                "one \nFL\ntwo three four five six seven",
+            ),
+            (
+                format!("{p}two <span style=display:inline-block>IB<br></span> three four five six seven"),
+                "one two IB three four five six seven",
+            ),
+        ] {
+            let laid = laid(&markup);
+            assert_eq!(all(&laid), text, "{markup}");
+            assert_eq!(found_in(&laid, "three four"), ["three four"], "{markup}");
+            let lines = laid.lines();
+            let empty = lines
+                .iter()
+                .position(|line| items(&laid, line).next().is_none())
+                .unwrap();
+            assert_eq!(laid.outer(empty), Some(0), "{markup}");
+        }
+    }
+
+    /// Each move, chained from every place, goes one way until it stays:
+    /// out of and back past nested boxes, in tree order.
+    #[test]
+    fn moves_chained_from_every_place_are_monotonic() {
+        let ib = "<span style=display:inline-block>IB</span>";
+        let pages = [
+            format!("<p>one {ib} two</p><p>next</p>"),
+            "<p>c <span style=float:left>pq </span>lmno".to_string(),
+            format!("<p>one</p><p>{ib} two</p>"),
+            "<p style=margin:0;width:120px>one two three <span style=visibility:hidden>hidden \
+             </span><span style=float:left>FL</span>five six seven"
+                .to_string(),
+            "<p style=margin:0;width:120px>one <span style=float:left>FL<br></span>two three \
+             four five six seven"
+                .to_string(),
+            "<p>lead<p style=margin:0;width:197px><span style=float:left;width:40px><br>lmno ab \
+             <br>k <a href=/l style=display:inline-block></a>ab <img width=12 height=8>k \
+             <span style=display:inline-block></span></span>tail words end"
+                .to_string(),
+            "<p>lead<p style=margin:0;width:103px>k <img width=12 height=8>lmno ab \
+             <span style=float:left;width:40px><br>k <br><img width=12 height=8>\
+             <img width=12 height=8><a href=/l style=display:inline-block>lmno k fghij k \
+             <img width=12 height=8><br>ab <br>cde fghij </a><img width=12 height=8>ab ab ab \
+             fghij ab <span style=float:left;width:40px>k fghij <img width=12 height=8>k \
+             </span></span>tail words end"
+                .to_string(),
+            "<p style=margin:0;width:120px>one <span style=display:inline-block>aa<br>bb</span> \
+             two three four five six<p>next"
+                .to_string(),
+            "<p>lead<p style=margin:0;width:91px><span style=float:left;width:40px>k \
+             <span style=float:right><span style=display:inline-block></span></span></span>\
+             tail words end"
+                .to_string(),
+        ];
+        for markup in &pages {
+            let laid = laid(markup);
+            let (first, last) = page_bounds(&laid);
+            let mut places = vec![first, last];
+            for line in laid.lines() {
+                for item in items(&laid, line) {
+                    places.push(item.start);
+                    places.push(item.end);
+                }
+            }
+            places.sort();
+            places.dedup();
+            for &from in &places {
+                for (motion, ahead) in [
+                    (Move::Right, true),
+                    (Move::WordRight, true),
+                    (Move::Down, true),
+                    (Move::Left, false),
+                    (Move::WordLeft, false),
+                    (Move::Up, false),
+                ] {
+                    let mut at = from;
+                    let mut steps = 0;
+                    loop {
+                        let to = mv(&laid, at, motion);
+                        if to == at {
+                            break;
+                        }
+                        assert_eq!(to > at, ahead, "{markup}: {motion:?} {at:?} to {to:?}");
+                        at = to;
+                        steps += 1;
+                        assert!(steps <= 2 * places.len() + 64, "{markup}: {motion:?}");
+                    }
+                    let edge = if ahead { last } else { first };
+                    if matches!(motion, Move::Right | Move::Left) {
+                        assert_eq!(at, edge, "{markup}: {motion:?} from {from:?}");
+                    }
+                }
+            }
+        }
+        let down = laid(&pages[0]);
+        let two = word_at(&down, "two").1;
+        assert_eq!(mv(&down, two, Move::Down), word_at(&down, "next").1);
+        let left = laid(&pages[2]);
+        let (_, one) = word_at(&left, "one");
+        let box_start = items(&left, &left.lines()[1]).next().unwrap().start;
+        assert_eq!(mv(&left, box_start, Move::Left), one);
+        // Up from a paragraph's start: the latest paragraph start before
+        // it, an inline-block's laid among its holder's lines.
+        let up = laid(&pages[7]);
+        let next = word_at(&up, "next").0;
+        assert_eq!(mv(&up, next, Move::Up), word_at(&up, "bb").0);
+    }
+
+    /// A copy ending at a line's start, its first piece hidden or not,
+    /// ends in the newline before it; one ending past it, not.
+    #[test]
+    fn a_copy_ending_at_a_line_s_start_ends_in_its_newline() {
+        let laid = laid("<p>aaa</p><p><span style=visibility:hidden>hid </span>bbb</p>");
+        let (first, _) = page_bounds(&laid);
+        let start = items(&laid, &laid.lines()[1]).next().unwrap().start;
+        assert_eq!(copy_of(&laid, first, start), "aaa\n");
+        assert_eq!(copy_of(&laid, first, word_at(&laid, "bbb").0), "aaa");
     }
 
     /// An inline-block last in another, or in a float, followed at once
@@ -2079,5 +3398,567 @@ mod tests {
             }
             y += 3.25;
         }
+    }
+
+    /// A float's edges set it off from the text around it, never a cell's
+    /// tabs: a float holding a table keeps its rows' cells a tab apart and
+    /// their paragraphs a space apart, and a float in a cell is set off
+    /// from the next cell by tabs.
+    #[test]
+    fn a_float_s_edges_keep_a_row_s_cells_a_tab_apart() {
+        for (markup, text) in [
+            (
+                "<div style=float:left;width:300px><table><tr><td>a</td><td>b</td></tr>\
+                 <tr><td>c</td><td>d</td></tr></table></div><p>after</p>",
+                "a\tb\nc\td\nafter",
+            ),
+            (
+                "<div style=float:left;width:300px><table><tr><td>a<br>x</td><td>b</td></tr>\
+                 </table></div>",
+                "a x\tb",
+            ),
+            (
+                "<div style=float:left><table><tr><td>a</td><td></td><td>b</td></tr></table></div>",
+                "a\t\tb",
+            ),
+            (
+                "<table><tr><td><div style=float:left>a</div></td><td>b</td></tr></table>",
+                "a\tb",
+            ),
+            (
+                "<table><td>pq </td><td><span style=float:left><br></span>ab </td></table>",
+                "pq\tab",
+            ),
+            (
+                "<div style=display:inline-block><div style=float:left><table><tr><td>a</td>\
+                 <td>b</td></tr></table></div></div>",
+                "a\tb",
+            ),
+            (
+                "<table><tr><td>x <span style=float:left>fl</span> y</td><td>z</td></tr></table>",
+                "x fl y\tz",
+            ),
+            // Back from an inline-block's table, in the cell holding it.
+            (
+                "<table><tr><td>s0 <span style=display:inline-block><table><tr><td>x</td></tr>\
+                 </table></span></td><td>z</td></tr></table>",
+                "s0 \nx\tz",
+            ),
+        ] {
+            assert_eq!(all(&laid(markup)), text, "{markup}");
+        }
+        // A float's run of paragraphs, its table's cells, is entered once.
+        let laid = laid(
+            "<div style=float:left;width:300px><table><tr><td>a</td><td>b</td></tr>\
+             <tr><td>c</td><td>d</td></tr></table></div><p>after</p>",
+        );
+        let mut entered = 0;
+        let _ = walk(&laid, None, 0, |event| {
+            if let Event::Enter(Nested::Float) = event {
+                entered += 1;
+            }
+            ControlFlow::Continue(())
+        });
+        assert_eq!(entered, 1);
+    }
+
+    /// The white space of a wrap before a float's lines goes where it
+    /// lies, before them, so a float with nothing shown leaves it be; one
+    /// with text puts its newline in its place.
+    #[test]
+    fn a_wrap_s_white_space_goes_before_a_float_s_lines() {
+        for width in [40, 88] {
+            let p = format!("<p style=margin:0;width:{width}px>aaa bbb ccc ");
+            let markup = format!("{p}<span style=float:left><br></span>ddd eee");
+            assert_eq!(all(&laid(&markup)), "aaa bbb ccc ddd eee", "{markup}");
+            let markup = format!("{p}<span style=float:left>fl</span>ddd eee");
+            assert_eq!(all(&laid(&markup)), "aaa bbb ccc\nfl\nddd eee", "{markup}");
+        }
+        for hidden in [
+            "three <span style=visibility:hidden>hidden </span>",
+            "three<span style=visibility:hidden> hidden</span> ",
+        ] {
+            let markup = format!(
+                "<p style=margin:0;width:120px>one two {hidden}<span style=float:left><br></span>\
+                 five six seven"
+            );
+            assert_eq!(
+                all(&laid(&markup)),
+                "one two three five six seven",
+                "{markup}"
+            );
+        }
+        let markup = "<div style=width:177px><table><tr><td></td><td>s26 lmno <table><tr><td>s27 \
+             fghij fghij cde  e27</td></tr></table>cde lmno <div style=float:left;width:60px>\
+             <br><br></div> e26</td><td>s28 lmno cde fghij  e28</td></tr></table>";
+        assert_eq!(
+            all(&laid(markup)),
+            "s26 lmno\ns27 fghij fghij cde e27\ncde lmno e26\ts28 lmno cde fghij e28"
+        );
+    }
+
+    /// A move back walks from near the place: its own paragraph, or the
+    /// one before it, not the whole of the paragraph holding it.
+    #[test]
+    fn a_move_back_walks_from_near_the_place() {
+        let markup = format!(
+            "<p>{}",
+            "<span style=display:inline-block>w</span> ".repeat(2_000)
+        );
+        let laid = laid(&markup);
+        let mut last = None;
+        for line in laid.lines() {
+            for item in items(&laid, line) {
+                if matches!(item.piece, Piece::Text(_)) {
+                    last = Some(item.start);
+                }
+            }
+        }
+        let at = last.unwrap();
+        for motion in [Move::Left, Move::WordLeft, Move::Up] {
+            let walked = pieces(|| {
+                assert!(mv(&laid, at, motion) < at);
+            });
+            assert!(walked <= 16, "{motion:?}: {walked} pieces");
+        }
+    }
+
+    /// A float with nothing shown parts nothing, and one with nothing
+    /// shown in another keeps no paragraph end of that one from its next.
+    #[test]
+    fn a_float_with_nothing_shown_parts_nothing() {
+        for (markup, text) in [
+            (
+                "<p>ab<span style=float:left;visibility:hidden>zz</span>cd",
+                "abcd",
+            ),
+            ("<p>x <span style=float:left><br></span> y", "x y"),
+            (
+                "<p>q <span style=float:left>a <span style=float:left;visibility:hidden>h\
+                 </span></span>b",
+                "q \na\nb",
+            ),
+            (
+                "<p>q <span style=float:left>cde<br><span style=float:right><br></span>k</span>b",
+                "q \ncde\nk\nb",
+            ),
+            (
+                "<p>q <span style=float:left>a <span style=float:left>x</span>y</span>b",
+                "q \na \nx\ny\nb",
+            ),
+            // An empty inline-block is a piece, as a picture is.
+            (
+                "<p>x <span style=float:left><span style=display:inline-block></span></span>y",
+                "x \ny",
+            ),
+        ] {
+            assert_eq!(all(&laid(markup)), text, "{markup}");
+        }
+    }
+
+    /// The line a place lies in looks past a run of lines with no item
+    /// once, however many floats' lines it climbs out of.
+    #[test]
+    fn a_place_s_line_looks_past_item_less_lines_once() {
+        let markup = format!(
+            "<p>a {}{}<span style=white-space:pre>{}</span>c",
+            "<span style=float:left>f ".repeat(40),
+            "</span>g ".repeat(40),
+            "\n".repeat(5_000)
+        );
+        let laid = laid(&markup);
+        let lines = laid.lines().len();
+        assert!(lines > 5_000);
+        let mut worst = 0;
+        for line in laid.lines() {
+            for item in items(&laid, line) {
+                for place in [item.start, item.end] {
+                    worst = worst.max(visits(|| {
+                        line_of(&laid, place);
+                    }));
+                }
+            }
+        }
+        assert!(worst <= lines, "{worst} visits for {lines} lines");
+    }
+
+    /// A paragraph's run of floats' lines is entered once, its block's
+    /// float or inline-block found climbing to an ancestor once climbed,
+    /// for blocks sharing a parent and for each in a box of its own.
+    #[test]
+    fn sibling_paragraphs_find_their_float_once() {
+        for paragraph in ["<p>x</p>", "<div><p>x</p></div>"] {
+            let markup = format!(
+                "{}{}<p><span style=float:left>f</span>y</p>{}",
+                "<div>".repeat(60),
+                paragraph.repeat(2_000),
+                "</div>".repeat(60)
+            );
+            let laid = laid(&markup);
+            let lines = laid.lines().len();
+            let walked = visits(|| {
+                let _ = walk(&laid, None, 0, |_| ControlFlow::Continue(()));
+            });
+            assert!(
+                walked <= 4 * lines,
+                "{paragraph}: {walked} visits for {lines} lines"
+            );
+        }
+    }
+
+    /// A list marker is put as text is: after the edge or the paragraph's
+    /// end a float owes before it, and right before its item's text.
+    #[test]
+    fn a_marker_follows_what_a_float_owes_before_it() {
+        for (markup, text) in [
+            (
+                "<div style=float:left;width:100px>FL</div><ul><li>one</li><li>two</li></ul>",
+                "FL\n• one\n• two",
+            ),
+            (
+                "<p style=margin:0>intro</p><div style=float:right;width:150px><ul><li>one</li>\
+                 <li>two</li></ul></div><p style=margin:0>after</p>",
+                "intro\n• one\n• two\nafter",
+            ),
+            (
+                "<ul><li><span style=float:left>FL</span>one</li><li>two</li></ul>",
+                "FL\n• one\n• two",
+            ),
+            (
+                "<ul><li>one <span style=float:right>FL</span></li><li>two</li></ul>",
+                "• one\nFL\n• two",
+            ),
+            (
+                "<span style=float:left>FL</span><ol><li>one</li><li>two</li></ol>",
+                "FL\n1. one\n2. two",
+            ),
+            (
+                "<div style=float:left;width:100px><ul><li>a</li><li>b</li></ul></div>\
+                 <ul><li>one</li></ul>",
+                "• a\n• b\n• one",
+            ),
+        ] {
+            assert_eq!(all(&laid(markup)), text, "{markup}");
+        }
+    }
+
+    /// A copy ending where a line starts ends in a newline exactly when
+    /// one scalar more would go on after one: after a float's text, but
+    /// not mid-paragraph past an inline-block or an edge owed before it.
+    #[test]
+    fn a_copy_ending_at_a_line_s_start_holds_the_newline_it_would_put() {
+        for (markup, from, to, text) in [
+            ("<span style=float:left>k </span>pq", "k", "pq", "k\n"),
+            (
+                "<div style=float:left;width:100px>FL</div><p style=margin:0>after</p>",
+                "FL",
+                "after",
+                "FL\n",
+            ),
+            (
+                "<p style=margin:0;width:120px>one <span style=float:left>FL</span>two three \
+                 four five six",
+                "one",
+                "FL",
+                "one \n",
+            ),
+            (
+                "<p style=margin:0;width:120px>one <span style=display:inline-block>IB<br>\
+                 </span> two three four five six",
+                "one",
+                "three",
+                "one IB two ",
+            ),
+        ] {
+            let laid = laid(markup);
+            let (start, end) = (word_at(&laid, from).0, word_at(&laid, to).0);
+            assert_eq!(copy_of(&laid, start, end), text, "{markup}");
+        }
+        // Ending at a wrapped line led by hidden text, where no scalar
+        // shown starts it, owes no paragraph's end nor an earlier edge.
+        let hidden = "<span style=visibility:hidden>";
+        for (markup, word, text) in [
+            (
+                "<body style=margin:0;width:173px><img width=12 height=8 alt=IMG>\
+                 <span style=float:right><span style=display:inline-block></span></span>\
+                 k fghij fghij lmno ab"
+                    .to_string(),
+                "ab",
+                "IMG\nk fghij fghij lmno ",
+            ),
+            (
+                format!(
+                    "<body style=margin:0;width:173px><img width=12 height=8 alt=IMG>\
+                     <span style=float:right><span style=display:inline-block></span></span>\
+                     k fghij fghij lmno {hidden}ab</span> cd"
+                ),
+                "ab",
+                "IMG\nk fghij fghij lmno",
+            ),
+            (
+                format!(
+                    "<p style=margin:0;width:120px>one <span style=display:inline-block>IB<br>\
+                     </span> two {hidden}three four</span> five six"
+                ),
+                "three",
+                "one IB two",
+            ),
+        ] {
+            let laid = laid(&markup);
+            let at = word_at(&laid, word).0;
+            assert!(
+                laid.lines()
+                    .iter()
+                    .any(|line| bounds(&laid, line).map(|b| b.0) == Some(at)),
+                "{markup}"
+            );
+            assert_eq!(copy_of(&laid, page_bounds(&laid).0, at), text, "{markup}");
+        }
+    }
+
+    /// A copy ending at the start of a wrapped line of hidden text, with
+    /// nothing shown after it in its paragraph, holds no newline: a line
+    /// starting at the end owes nothing for its own paragraph's end.
+    #[test]
+    fn a_copy_ending_at_a_hidden_line_s_start_owes_its_paragraph_nothing() {
+        let laid = laid(
+            "<p style=margin:0;width:96px>cde fgh <span style=visibility:hidden>hid den </span>\
+             </p><p style=margin:0>lm</p>",
+        );
+        let den = word_at(&laid, "den").0;
+        assert_eq!(line_of(&laid, den), 1, "den starts the second line");
+        assert_eq!(copy_of(&laid, word_at(&laid, "cde").0, den), "cde fgh ");
+    }
+
+    /// A copy whose consumer breaks is handed nothing more, not even the
+    /// newline a copy ending where a line starts would close with.
+    #[test]
+    fn a_copy_stops_where_its_consumer_breaks() {
+        let laid = laid("<p>a <span style=display:inline-block>b<br><br></span>c<p>d");
+        let (first, _) = page_bounds(&laid);
+        let d = word_at(&laid, "d").0;
+        assert_eq!(copy_of(&laid, first, d), "a bc\n");
+        let mut handed = Vec::new();
+        let flow = copy(&laid, first, d, &mut |text| {
+            handed.push(text.to_string());
+            if text == "c" {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        assert!(flow.is_break());
+        assert_eq!(handed.last().map(String::as_str), Some("c"));
+    }
+
+    /// Content for `generated_tables_keep_their_cells_apart`: words,
+    /// breaks, pictures, floats, inline-blocks and tables, nested up to
+    /// three deep; each table's rows, by their table (where it starts in
+    /// the markup) and their cells' ids, go to `rows`.
+    #[allow(clippy::type_complexity)]
+    fn table_content(
+        next: &mut dyn FnMut(u64) -> u64,
+        depth: usize,
+        markup: &mut String,
+        rows: &mut Vec<(usize, Vec<Option<usize>>)>,
+        ids: &mut usize,
+    ) {
+        const WORDS: &[&str] = &["ab", "cde", "fghij", "k", "lmno"];
+        for _ in 0..2 + next(6) {
+            match next(12) {
+                0 if depth < 3 => {
+                    markup.push_str(
+                        [
+                            "<div style=float:left;width:60px>",
+                            "<div style=float:right>",
+                        ][next(2) as usize],
+                    );
+                    table_content(next, depth + 1, markup, rows, ids);
+                    markup.push_str("</div>");
+                }
+                1 if depth < 3 => {
+                    markup.push_str("<div style=display:inline-block>");
+                    table_content(next, depth + 1, markup, rows, ids);
+                    markup.push_str("</div>");
+                }
+                2 | 3 if depth < 3 => {
+                    let table = markup.len();
+                    markup.push_str("<table>");
+                    for _ in 0..1 + next(2) {
+                        markup.push_str("<tr>");
+                        let mut row = Vec::new();
+                        for _ in 0..1 + next(3) {
+                            if next(5) == 0 {
+                                markup.push_str("<td></td>");
+                                row.push(None);
+                                continue;
+                            }
+                            let id = *ids;
+                            *ids += 1;
+                            markup.push_str(&format!("<td>s{id} "));
+                            table_content(next, depth + 1, markup, rows, ids);
+                            markup.push_str(&format!(" e{id}</td>"));
+                            row.push(Some(id));
+                        }
+                        markup.push_str("</tr>");
+                        rows.push((table, row));
+                    }
+                    markup.push_str("</table>");
+                }
+                4 => markup.push_str("<br>"),
+                5 => markup.push_str("<img width=12 height=8>"),
+                _ => {
+                    markup.push_str(WORDS[next(5) as usize]);
+                    markup.push(' ');
+                }
+            }
+        }
+    }
+
+    /// Whether `text` holds `needle` as whole tokens: no letter or digit
+    /// either side.
+    fn holds_token(text: &str, needle: &str) -> bool {
+        text.match_indices(needle).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + needle.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+    }
+
+    /// Generated tables in floats and inline-blocks, and floats,
+    /// inline-blocks and tables in their cells, among wrapped text: two
+    /// cells of one row copy a tab apart, one more for each empty cell
+    /// between, with no newline, and a row's last cell and the next row's
+    /// first a newline apart, whatever lies in them; a walk is in tree
+    /// order; a copy between any two places takes the scalars painted
+    /// selected; and each move goes its way.
+    #[test]
+    fn generated_tables_keep_their_cells_apart() {
+        let mut seed = 0x5851_f42d_4c95_7f2du64;
+        let mut next = move |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) % n
+        };
+        let mut m = measure(WANT);
+        let mut checked = 0usize;
+        for page in 0..120 {
+            let width = 120 + next(240);
+            let mut markup = format!("<body style=margin:0><div style=width:{width}px>lead ");
+            let mut rows = Vec::new();
+            let mut ids = 0;
+            while ids == 0 {
+                table_content(&mut next, 0, &mut markup, &mut rows, &mut ids);
+            }
+            markup.push_str("tail</div>");
+            let laid = laid(&markup);
+            let (first, last) = page_bounds(&laid);
+            let copied = copy_of(&laid, first, last);
+            for (_, row) in &rows {
+                let mut cells = row
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(at, id)| Some((at, (*id)?)));
+                let Some(mut before) = cells.next() else {
+                    continue;
+                };
+                for after in cells {
+                    let tabs = "\t".repeat(after.0 - before.0);
+                    let needle = format!("e{}{tabs}s{}", before.1, after.1);
+                    assert!(
+                        holds_token(&copied, &needle),
+                        "{page}: {markup}: {needle:?} in {copied:?}"
+                    );
+                    checked += 1;
+                    before = after;
+                }
+            }
+            // A table's rows, after any of a nested table's pushed between.
+            for (at, (table, row)) in rows.iter().enumerate() {
+                let Some(a) = row.iter().rev().find_map(|id| *id) else {
+                    continue;
+                };
+                let Some((_, below)) = rows.iter().skip(at + 1).find(|(t, _)| t == table) else {
+                    continue;
+                };
+                if let Some(b) = below.iter().find_map(|id| *id) {
+                    let needle = format!("e{a}\ns{b}");
+                    assert!(
+                        holds_token(&copied, &needle),
+                        "{page}: {markup}: {needle:?} in {copied:?}"
+                    );
+                    checked += 1;
+                }
+            }
+            let mut scalars = Vec::new();
+            let mut spans: Vec<(Place, Place)> = Vec::new();
+            let _ = walk(&laid, None, 0, |event| {
+                match event {
+                    Event::Scalar(c, s, e, _) => {
+                        scalars.push((c, s));
+                        spans.push((s, e));
+                    }
+                    Event::Alt(_, s, e) | Event::Gap(_, s, e) => spans.push((s, e)),
+                    _ => {}
+                }
+                ControlFlow::Continue(())
+            });
+            assert!(
+                spans
+                    .windows(2)
+                    .all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].0),
+                "{page}: {markup}: not in tree order"
+            );
+            let mut places = vec![first, last];
+            for line in laid.lines() {
+                for item in items(&laid, line) {
+                    places.push(item.start);
+                    places.push(item.end);
+                }
+            }
+            places.sort();
+            places.dedup();
+            for _ in 0..40 {
+                let a = places[next(places.len() as u64) as usize];
+                let b = places[next(places.len() as u64) as usize];
+                let (from, to) = (a.min(b), a.max(b));
+                let shown: String = scalars
+                    .iter()
+                    .filter(|(c, s)| *s >= from && *s < to && !c.is_whitespace())
+                    .map(|(c, _)| *c)
+                    .collect();
+                let mut out = copy_of(&laid, from, to);
+                out.retain(|c| !c.is_whitespace());
+                assert_eq!(out, shown, "{page}: {markup} {from:?} {to:?}");
+            }
+            for _ in 0..12 {
+                let at = places[next(places.len() as u64) as usize];
+                let ahead = spans.iter().any(|&(_, e)| e > at);
+                let behind = spans.iter().any(|&(s, _)| s < at);
+                for motion in [Move::Right, Move::WordRight, Move::Down] {
+                    let to = moved(&laid, &mut m, at, motion);
+                    assert!(
+                        to > at || to == at && (motion != Move::Right || !ahead),
+                        "{page}: {markup}: {motion:?} from {at:?} to {to:?}"
+                    );
+                }
+                for motion in [Move::Left, Move::WordLeft, Move::Up] {
+                    let to = moved(&laid, &mut m, at, motion);
+                    assert!(
+                        to < at || to == at && (motion != Move::Left || !behind),
+                        "{page}: {markup}: {motion:?} from {at:?} to {to:?}"
+                    );
+                }
+                // Left goes to the unit before: its start, or its end
+                // where a paragraph or a box starts between.
+                if let Some(&(s, e)) = spans.iter().rev().find(|&&(s, _)| s < at) {
+                    let to = moved(&laid, &mut m, at, Move::Left);
+                    assert!(
+                        to == s || to == e,
+                        "{page}: {markup}: Left from {at:?} to {to:?}"
+                    );
+                }
+            }
+        }
+        assert!(checked > 200, "{checked}");
     }
 }

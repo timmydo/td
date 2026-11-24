@@ -1713,25 +1713,31 @@ even where it is the last node of an enclosing inline-block or float,
 starts on its own line. A place's line
 is the last starting at or before it, or, past the last of a float's
 lines, the line they lie in: td-page keeps each line's enclosing line
-(`Laid::outer`, for a page with floats or inline-blocks one pass over
-the lines' places as a layout is taken, four bytes a line), and a
-fragment
-target is the least place at or after its element among the lines from
-its own until one starts past it. A **paragraph**, the unit find
-matches within and `Shift+Up` and `Shift+Down` move by, is a run of
-consecutive lines one block container lays: text either side of a
-child block is two paragraphs, a preserved newline or a `<br>` ends
-one, and a float's or an inline-block's lines between two of a
-paragraph's lines end it there, the rest another paragraph; so an
-inline-block's text is a paragraph of its own, apart from the text
-around it, where a browser's is one, a limit a later increment lifts.
-Find walks the lines in their order and sorts its matches into tree
-order. A selection
-copies what is painted selected, the scalars starting from its start
-to before its end, in line order: from the outermost line its start's
-lies in to the last line starting at or before its end, so around a
-float met within a line, or an inline-block in it, that line's
-selected text comes before the float's or the inline-block's. The
+and its paragraph's lines before and after it (`Laid::outer`,
+`Laid::joins`, for a page with floats or inline-blocks one pass over
+the lines' places as a layout is taken, twelve bytes a line); a line
+laying nothing (a `<br>`'s) lies where its box starts, so one last in
+a float or an inline-block is within the line holding it, as the
+box's other lines are. A fragment target is the least place at or after its element among the
+lines from the outermost one its place's line lies in until one
+starts past it, so an empty target between two floats or
+inline-blocks of a line is the line's next piece. A **paragraph**, the
+unit find matches within and `Shift+Up` and `Shift+Down` move by, is a
+run of one block container's lines: text either side of a child block
+is two paragraphs and a preserved newline or a `<br>` ends one, but
+the lines of a float or an inline-block, laid after the line it is met
+in and before the paragraph's next, do not, so a paragraph goes on
+past them, and their own text is paragraphs of their own. The text is
+walked in tree order: a paragraph's lines in turn, and a float's or an
+inline-block's lines where it lies among the pieces of its line, or,
+for a float met past its line's last piece, before the paragraph's
+next line, then the rest of the paragraph; a float met before its
+line's first piece, or past its paragraph's last line's last piece,
+lays its lines before or after them, paragraphs of their own that are
+the float's text still. Find, copying and §8's keys
+take that order. A selection copies what is painted selected, the
+scalars starting from its start to before its end, from the outermost
+line its start's lies in until a piece starts at or past its end. The
 page's end is the latest along its last line's enclosing lines; and
 `Tab` from the screen scans the links, whose first lines are not in
 tree order past a float's or an inline-block's: a link laid as an
@@ -1753,7 +1759,9 @@ an inline-block's lines lie, whose text is searched as its own
 paragraph (above, "Places"): text either side of one is apart, as are
 a float's text and its line's, so matches stay disjoint in tree order
 (but where two pictures' `alt` texts stand together, whose matches may
-overlap).
+overlap). Past a float or an inline-block the paragraph goes on, so a
+match runs across the wrap of a line whose float's or inline-block's
+lines lie between it and the next, as across any wrap.
 It ignores case, each character looked at once (Knuth, Morris and
 Pratt), so a search costs the text searched whatever the query, and
 each line enclosed by others is looked at once more for each, to find
@@ -1785,7 +1793,13 @@ it acts on them; left of
 a line is its start and right of it its end, above the page the first
 line's start and below it the last's end.
 §8's keys move by scalars, words and paragraphs taken in tree order
-across fragments; a double click selects a word and a triple click a
+across fragments, a step into a float's or an inline-block's text and
+out of it one of its own, as between paragraphs: each key goes one way
+in tree order from any place, until the page's edge, and `Shift+Up` and
+`Shift+Down` past their paragraph's start or end go to the latest
+paragraph start before the place or the first paragraph end after it,
+a float's or an inline-block's among them; a double click
+selects a word, which ends at such an edge, and a triple click a
 paragraph. A scalar laid with no advance, a combining mark, is never
 parted from the scalar before it: no place falls between them, a point
 past the base's middle falls after its marks, the keys step over the
@@ -1795,27 +1809,46 @@ it, and a copy leaves it out. A line laying nothing (a text page's last
 newline, a paragraph's last `<br>`) holds no place: a place at the end
 of the line before it is on that line.
 
-**Copying** takes the text between the two places in tree order (in
-line order around a float's or an inline-block's lines, above,
-"Places": an inline-block's text after its line's, as a paragraph of
-its own, and its placeholder no text) as it is shown:
-fragments' painted text, neither `visibility: hidden` text nor a
-hidden item's marker; after a `Wrap` end the white
+**Copying** takes the text between the two places in tree order, a
+float's and an inline-block's where they lie (above, "Places"), as it
+is shown, browsers' order: a float's paragraphs, block-level, set off
+from the text around it by a newline at its edges where it shows any
+text and by nothing where it shows none, within the cell it lies in by
+a space, as that cell's paragraphs are, none after text ending in one,
+and never in place of a row's
+tabs, its own paragraphs and cells parted as anywhere; an
+inline-block's text in its line, a newline only between its own
+paragraphs, its placeholder
+no text but a piece, which keeps the separator owed before it:
+fragments' painted text, neither `visibility: hidden` text
+nor a hidden item's marker; after a `Wrap` end the white
 space laid between its line and the next line with a fragment, read
 from the source between them, or across two text nodes from the
-first's tail when that is white space, else from the next's head, as
+first's tail when that is white space, else from the next's head, and
+beside a replaced piece (an image, an inline-block) from the text
+node on its other side, as
 laid: one space where spaces collapse, the preserved run in pre-wrap,
 none at an edge, and past a cut only what td-layout dropped as space,
 never the tree's bytes between, which can hold hidden text or runs
-that collapse. A line of spaces alone has no fragment and no place, so
-that gap is copied once, however many `Wrap` ends lie in it. After a
-`Split` nothing is copied; after each paragraph one newline, whether a
-newline, a `<br>` or its block ended it; and for a replaced element its
-`alt` text when the selection holds it whole; at
+that collapse; it goes before the next line's first piece shown, or,
+where a float's lines lie ahead of that piece, before or after them as
+its places lie, none where they lie among them. A line of spaces
+alone has no fragment and no
+place, so that gap is copied once, however many `Wrap` ends lie in
+it. After a `Split` nothing is copied; after each paragraph one
+newline, whether a newline, a `<br>` or its block ended it; a copy
+ending where a line starts with text or a picture ends in that newline
+exactly when the next scalar would be copied after one, so not
+mid-paragraph at a wrap (where the line starts with an inline-block,
+it may not yet: §11); and
+for a
+replaced element its `alt` text when the selection holds it whole; at
 most `MAX_COPY`, measured before it is gathered. A list item's
 marker, td-layout's `MarkerFragment` (generated text naming its item and
 no byte, td-layout/DESIGN.md §5, "List markers"), is copied as its
-`text()` shows it at the start of the paragraph its line begins, when
+`text()` shows it at the start of the paragraph its line begins, as
+that paragraph's text is, after the newline a float's edge or
+paragraph owes before it, when
 the selection holds that start, an outer item's before an inner one's
 where they share a line; one whose item laid no line, an empty item, is
 copied as a paragraph of its own, its trailing space dropped, when the
@@ -2506,7 +2539,10 @@ order; each is its own design amendment when it starts:
   collections), colour emoji and variable fonts, each waiting for
   td-ui's reader to take that form (`td-ui/src/sfnt.rs`).
 - **Layout beyond normal flow**, as td-layout gains it: inline-block's
-  `vertical-align` and paragraphs across it, inline tables, then
+  `vertical-align`, find across an inline-block's edge (a browser's
+  text runs on into it), a copy ending where a line starts with an
+  inline-block taking the newline its first text would, inline
+  tables, then
   flexbox and grid; pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.

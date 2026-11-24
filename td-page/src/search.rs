@@ -4,7 +4,7 @@
 //! in its place and a wrap's white space put back as a copy puts it,
 //! hidden text left out, searched ignoring case with each character
 //! looked at once (Knuth, Morris and Pratt), never past a paragraph nor
-//! across a nested box (`text::Event::Break`), at most `MAX_HITS`
+//! across a nested box (`text::Event::Enter`), at most `MAX_HITS`
 //! matches, all in a scratch budget of the page's.
 
 use std::ops::ControlFlow;
@@ -38,8 +38,8 @@ fn fold(c: char) -> char {
     }
 }
 
-/// The matches of `query` in `laid`, in tree order (a float's lines,
-/// searched where they lie, sorted into it); none for an empty query. A
+/// The matches of `query` in `laid`, in tree order, as the walk meets
+/// them (a float's text where it lies); none for an empty query. A
 /// refusal of the scratch budget leaves nothing behind.
 pub fn find(laid: &Laid, query: &str, page: &Budget) -> Result<BudgetVec<Hit>, BudgetError> {
     let memory = page.child(SEARCH_BYTES.saturating_add(Budget::metadata_bytes()))?;
@@ -118,7 +118,7 @@ pub fn find(laid: &Laid, query: &str, page: &Budget) -> Result<BudgetVec<Hit>, B
         }
         Event::Begin(_) => ControlFlow::Continue(()),
         // No match spans a nested box.
-        Event::Break => step(None, Place::END, Place::END),
+        Event::Enter(_) | Event::Leave(..) => step(None, Place::END, Place::END),
         Event::End => step(None, Place::END, Place::END),
     });
     match failed {
@@ -164,9 +164,9 @@ mod tests {
         assert!(hits.windows(2).all(|w| w[0].end <= w[1].start), "{hits:?}");
     }
 
-    /// Matches in an inline-block are found after those of the line
-    /// holding it, and sorted into tree order; its text is a paragraph of
-    /// its own, so no match spans its edge.
+    /// Matches in an inline-block are found where it lies in the line
+    /// holding it, in tree order; its text is a paragraph of its own, so
+    /// no match spans its edge.
     #[test]
     fn matches_in_an_inline_block_are_in_tree_order() {
         let markup = "<p>ab cd <span style=display:inline-block>ab ef</span> ab gh";
@@ -177,6 +177,34 @@ mod tests {
         assert!(hits.windows(2).all(|w| w[0].end <= w[1].start), "{hits:?}");
         assert!(found(markup, "cd ab").is_empty());
         assert_eq!(found(markup, "ab ef"), ["ab ef"]);
+    }
+
+    /// A paragraph goes on past a float's or an inline-block's lines laid
+    /// after its line: a match runs across that line's wrap as across any
+    /// other, but none across the box, which is a paragraph of its own;
+    /// a float met past a line's last piece lies between it and the next.
+    #[test]
+    fn a_match_goes_on_across_a_wrap_after_nested_lines() {
+        let p = "<body style=margin:0><p style=margin:0;width:120px>one two ";
+        for markup in [
+            format!("{p}<span style=float:left>FL</span>three four five six seven"),
+            format!("{p}<span style=display:inline-block>QQ</span>three four five six seven"),
+        ] {
+            let laid = laid(&markup);
+            assert!(laid.lines().len() > 3, "{markup}");
+            assert_eq!(found(&markup, "three four"), ["three four"], "{markup}");
+            assert_eq!(found(&markup, "six seven"), ["six seven"], "{markup}");
+            assert!(found(&markup, "two three").is_empty(), "{markup}");
+            assert!(found(&markup, "two qq").is_empty(), "{markup}");
+            assert!(found(&markup, "qqthree").is_empty(), "{markup}");
+            assert!(found(&markup, "flthree").is_empty(), "{markup}");
+            let page = Budget::new(64 << 20).unwrap();
+            let hits = find(&laid, "e", &page).unwrap();
+            assert!(hits.windows(2).all(|w| w[0].end <= w[1].start), "{hits:?}");
+        }
+        let markup = format!("{p}three<span style=float:left>FL</span> four five six seven");
+        assert!(found(&markup, "three four").is_empty());
+        assert_eq!(found(&markup, "four five"), ["four five"]);
     }
 
     /// No match spans an inline-block, its placeholder, or the place a
