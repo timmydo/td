@@ -615,20 +615,6 @@ fn services(p: &Setup<'_>, postgres: &Path) -> Result<()> {
     Ok(())
 }
 
-const REPLICA_GRANTS: &str = r"\connect td_mta
-BEGIN;
-SET ROLE td_mta_owner;
-GRANT INSERT,UPDATE,DELETE ON td_mta.replica_progress,td_mta.replica_pending,
- td_mta.replica_mailbox_receipts,td_mta.replica_email_receipts,
- td_mta.replica_blob_identities TO td_mta_runtime;
-GRANT USAGE ON SCHEMA td_mta TO td_mta_reader;
-GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO td_mta_reader;
-GRANT UPDATE(singleton) ON td_mta.config_selection TO td_mta_reader;
-GRANT UPDATE(id) ON td_mta.accounts TO td_mta_reader;
-GRANT INSERT ON td_mta.leases TO td_mta_reader;
-GRANT INSERT,UPDATE,DELETE ON td_mta.application_logs,td_mta.application_log_state TO td_mta_reader;
-COMMIT;
-";
 fn source_args(p: &Setup<'_>, replica: &Replica) -> Result<Vec<String>> {
     let mut args = vec![
         "--source-origin".into(),
@@ -1129,10 +1115,24 @@ GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
 GRANT INSERT, DELETE ON td_mta.leases TO td_mta_runtime;
 COMMIT;
 "#;
-    p.sql("runtime-grants", grants)?;
     if s.replica.is_some() {
-        p.sql("replica-grants", REPLICA_GRANTS)?;
+        // The same command repairs an installed replica's grants.
+        let publisher = p.path("runtime-connection");
+        let reader = p.path("reader-connection");
+        p.owner(
+            "replica-grants",
+            &[
+                "replica-grants",
+                "--epoch",
+                &epoch,
+                "--publisher-connection-file",
+                text(&publisher)?,
+                "--reader-connection-file",
+                text(&reader)?,
+            ],
+        )?;
     } else {
+        p.sql("runtime-grants", grants)?;
         p.mta(
             "runtime-check",
             &[

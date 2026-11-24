@@ -31,7 +31,7 @@ impl Input {
     pub(super) fn schema() -> Self {
         Self {
             // Two bounded ACL inventories plus migration and ledger replies.
-            frames: 10240,
+            frames: super::SCHEMA_FRAMES,
             ..Self::new()
         }
     }

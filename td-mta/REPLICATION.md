@@ -664,6 +664,9 @@ ends the command, and no copy or post-publication error is replayed. The
 bounded command has no background loop, automatic
 history reset or binding replacement; supervised copying is described below. The runtime login must have the restricted
 replica grants; the ordinary primary login remains ineligible. The fresh local installer provisions separate publisher and reader roles.
+`postgres replica-grants` sets both roles' grants from the qualifier's
+table matrix and qualifies each login
+([REPLICA-OPERATIONS.md](REPLICA-OPERATIONS.md#replica-grants)).
 
 `postgres replica-progress --connection-file PATH --epoch HEX --account ID`
 uses the owner connection to report a historical snapshot of stored copy work.

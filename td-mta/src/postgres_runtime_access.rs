@@ -115,6 +115,28 @@ pub fn primary_grants() -> impl Iterator<Item = (&'static str, &'static str)> {
     })
 }
 
+/// What a replica's shared logins hold: the publisher (`reader` false)
+/// writes replica progress and mail, the reader reads, with the few writes
+/// serving needs. Exactly what `qualify_replica` and
+/// `qualify_replica_reader` accept, table by table.
+pub fn replica_grants(reader: bool) -> impl Iterator<Item = (&'static str, &'static str)> {
+    TABLES.iter().map(move |(table, access)| {
+        let privileges = match (access, reader) {
+            (Access::Read, _) | (Access::Replica, true) => "SELECT",
+            (Access::Replica | Access::Mail, false) => "SELECT, INSERT, UPDATE, DELETE",
+            (Access::Lease, false) => "SELECT, INSERT, DELETE",
+            (Access::Lease, true) => "SELECT, INSERT",
+            (Access::Selection, _) => "SELECT, UPDATE (singleton)",
+            (Access::Mail, true) => match *table {
+                "accounts" => "SELECT, UPDATE (id)",
+                "application_log_state" | "application_logs" => "SELECT, INSERT, UPDATE, DELETE",
+                _ => "SELECT",
+            },
+        };
+        (*table, privileges)
+    })
+}
+
 const PRIVILEGES: &str = "SELECT c.relname::text,
     c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity
         AND NOT c.relforcerowsecurity,
@@ -275,32 +297,97 @@ fn qualify_shared(client: &Client, authority: Authority) -> Result<(), Error> {
             .map(|(_, access)| access)
             .ok_or(Error::Privileges)?;
         let value = |index| row.try_get::<_, bool>(index).map_err(|_| Error::Database);
-        if !value(1)? || !value(2)? || value(5)? {
-            return Err(Error::Privileges);
-        }
-        let allowed = match access {
-            Access::Read => !value(4)?,
-            Access::Replica => {
-                if authority == Authority::Publisher {
-                    value(3)?
-                } else {
-                    !value(4)?
-                }
-            }
-            // Writers reclaim expired upload leases; none may extend one.
-            Access::Lease if authority == Authority::Reader => value(7)?,
-            Access::Lease => value(9)?,
-            Access::Selection => value(6)?,
-            Access::Mail if authority == Authority::Reader => match name {
-                "accounts" => value(8)?,
-                "application_log_state" | "application_logs" => value(3)?,
-                _ => !value(4)?,
-            },
-            Access::Mail => value(3)?,
-        };
-        if !allowed {
+        if !allowed(authority, *access, name, value)? {
             return Err(Error::Privileges);
         }
     }
     Ok(())
+}
+
+/// Whether one table's `PRIVILEGES` row, read column by column through
+/// `value`, is what `authority` may hold.
+fn allowed(
+    authority: Authority,
+    access: Access,
+    name: &str,
+    value: impl Fn(usize) -> Result<bool, Error>,
+) -> Result<bool, Error> {
+    if !value(1)? || !value(2)? || value(5)? {
+        return Ok(false);
+    }
+    Ok(match access {
+        Access::Read => !value(4)?,
+        Access::Replica => {
+            if authority == Authority::Publisher {
+                value(3)?
+            } else {
+                !value(4)?
+            }
+        }
+        // Writers reclaim expired upload leases; none may extend one.
+        Access::Lease if authority == Authority::Reader => value(7)?,
+        Access::Lease => value(9)?,
+        Access::Selection => value(6)?,
+        Access::Mail if authority == Authority::Reader => match name {
+            "accounts" => value(8)?,
+            "application_log_state" | "application_logs" => value(3)?,
+            _ => !value(4)?,
+        },
+        Access::Mail => value(3)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `PRIVILEGES` columns of `name` for a login holding exactly
+    /// `grants` there, as PostgreSQL computes them.
+    fn columns(name: &str, grants: &str) -> [bool; 10] {
+        let held: Vec<&str> = grants.split(", ").collect();
+        let has = |p: &str| held.contains(&p);
+        let column = held.iter().find_map(|p| p.strip_prefix("UPDATE ("));
+        let (insert, update, delete) = (has("INSERT"), has("UPDATE"), has("DELETE"));
+        let any_update = update || column.is_some();
+        let only = |c: &str| {
+            column.and_then(|c| c.strip_suffix(')')) == Some(c) && !update && !insert && !delete
+        };
+        [
+            true,
+            true,
+            has("SELECT"),
+            insert && update && delete,
+            insert || any_update || delete,
+            false,
+            name == "config_selection" && only("singleton"),
+            insert && !any_update && !delete,
+            name == "accounts" && only("id"),
+            insert && delete && !any_update,
+        ]
+    }
+
+    fn qualifies(authority: Authority, reader: bool) -> bool {
+        replica_grants(reader).all(|(name, grants)| {
+            let row = columns(name, grants);
+            TABLES
+                .iter()
+                .find(|(table, _)| *table == name)
+                .is_some_and(|(_, access)| {
+                    let value = |i| row.get(i).copied().ok_or(Error::Database);
+                    allowed(authority, *access, name, value) == Ok(true)
+                })
+        })
+    }
+
+    #[test]
+    fn replica_grants_are_what_each_replica_login_qualifies_with() {
+        assert_eq!(replica_grants(false).count(), TABLES.len());
+        assert!(qualifies(Authority::Publisher, false));
+        assert!(qualifies(Authority::Reader, true));
+        // Each holds what the other may not.
+        assert!(!qualifies(Authority::Reader, false));
+        assert!(!qualifies(Authority::Publisher, true));
+        // A serving primary's grants leave replica progress read-only.
+        assert!(primary_grants().ne(replica_grants(false)));
+    }
 }

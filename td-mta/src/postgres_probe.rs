@@ -51,6 +51,8 @@ const QUERY: &str = "SELECT pg_catalog.current_setting('server_version_num'), \
     pg_catalog.current_setting('transaction_read_only'), \
     pg_catalog.current_setting('fsync'), pg_catalog.current_setting('full_page_writes')";
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(10);
+/// The backend messages a schema client admits, per operation and in all.
+pub(crate) const SCHEMA_FRAMES: usize = 10240;
 pub(crate) const MAX_BODY_DURATION: Duration = Duration::from_secs(30);
 
 /// The longest deadline one owner Email import of `length` body bytes admits:

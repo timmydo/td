@@ -128,9 +128,44 @@ pub(super) fn exercise(origin: &str, source_ca: &[u8], password: &[u8], binding:
         before
     );
     assert!(invoke("replica-copy", &owner, &remote, 1).contains("publication-failed"));
+    // The publisher's grants are a primary runtime's, and the reader holds
+    // something no reader may: replica-grants replaces both and qualifies
+    // each over its own login.
     create_runtime_login(&fixture);
     grant_runtime_mail(&fixture);
-    sql(&fixture,"GRANT INSERT,UPDATE,DELETE ON td_mta.replica_progress,td_mta.replica_pending,td_mta.replica_mailbox_receipts,td_mta.replica_email_receipts,td_mta.replica_blob_identities TO mail_runtime");
+    sql(&fixture, "CREATE ROLE mail_reader LOGIN PASSWORD 'disposable-postgres-fixture-password'; GRANT USAGE ON SCHEMA td_mta TO mail_reader; GRANT SELECT, TRUNCATE ON ALL TABLES IN SCHEMA td_mta TO mail_reader");
+    let reader = connection("mail_reader");
+    let grants = |publisher: &std::path::Path, status| {
+        command_output_with_timeout(
+            &[
+                "postgres",
+                "replica-grants",
+                "--connection-file",
+                owner.to_str().unwrap(),
+                "--epoch",
+                &epoch.to_string(),
+                "--publisher-connection-file",
+                publisher.to_str().unwrap(),
+                "--reader-connection-file",
+                reader.to_str().unwrap(),
+            ],
+            fixture.root.path(),
+            status,
+            Duration::from_secs(75),
+        )
+    };
+    assert!(grants(&reader, 1).contains("invalid-replica-logins"));
+    for _ in 0..2 {
+        let granted = grants(&runtime, 0);
+        assert!(granted.contains("\"publisher_qualified\":true,\"reader_qualified\":true"));
+    }
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT has_table_privilege('mail_reader','td_mta.emails','TRUNCATE')::text || has_table_privilege('mail_runtime','td_mta.replica_progress','UPDATE')::text"
+        ),
+        "falsetrue"
+    );
     // Fill a socket-backed stdout before starting the copy, so its first
     // report blocks independently of host speed or pipe capacity.
     let (mut output, _consumer) = std::os::unix::net::UnixStream::pair().unwrap();

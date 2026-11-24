@@ -29,6 +29,15 @@ pub enum Error {
     Integrity,
     Database,
     Indeterminate,
+    /// The database is not bound to a replica source.
+    Unbound,
+    /// The publisher and reader logins are not two distinct plain names
+    /// other than the owner's.
+    Logins,
+    /// After its grants were replaced, a login still refuses to qualify,
+    /// and why.
+    Publisher(crate::postgres_runtime_access::Error),
+    Reader(crate::postgres_runtime_access::Error),
 }
 
 /// Passive validated source identity, never a device or publication credential.
@@ -173,10 +182,130 @@ pub fn initialize(
     }
 }
 
+/// A plain lowercase login name, which `grant` quotes into its statements.
+fn login(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_lowercase() || *b == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// The statements that leave `publisher` and `reader` exactly their
+/// replica access to the mail schema, whatever they held before.
+fn grant_sql(publisher: &str, reader: &str) -> Result<String, Error> {
+    let mut sql = td_alloc::format(format_args!(
+        "REVOKE ALL ON ALL TABLES IN SCHEMA td_mta FROM \"{publisher}\", \"{reader}\";\n\
+         REVOKE ALL ON SCHEMA td_mta FROM \"{publisher}\", \"{reader}\";\n\
+         GRANT USAGE ON SCHEMA td_mta TO \"{publisher}\", \"{reader}\";\n"
+    ))
+    .map_err(|_| Error::Capacity)?;
+    for (role, reading) in [(publisher, false), (reader, true)] {
+        for (table, privileges) in crate::postgres_runtime_access::replica_grants(reading) {
+            let line = td_alloc::format(format_args!(
+                "GRANT {privileges} ON td_mta.{table} TO \"{role}\";\n"
+            ))
+            .map_err(|_| Error::Capacity)?;
+            td_alloc::push_str(&mut sql, &line).map_err(|_| Error::Capacity)?;
+        }
+    }
+    Ok(sql)
+}
+
+/// Give a bound replica's publisher and reader logins exactly the access
+/// their qualifiers require, in one owner transaction, then qualify each
+/// over its own login as the copier and the reader will. The grants are
+/// replaced, not added to, so a rerun converges on the same set. Every
+/// connection is a schema client: the batch is a statement per table and
+/// login, and each qualification reads every table's privileges.
+pub fn grant(
+    owner: &Request<'_>,
+    publisher: &Request<'_>,
+    reader: &Request<'_>,
+    deadline: Instant,
+    epoch: StoreEpoch,
+) -> Result<(), Error> {
+    if !login(publisher.user)
+        || !login(reader.user)
+        || publisher.user == reader.user
+        || owner.user == publisher.user
+        || owner.user == reader.user
+    {
+        return Err(Error::Logins);
+    }
+    let sql = grant_sql(publisher.user, reader.user)?;
+    let source = postgres_probe::with_schema_client(owner, deadline, |client| {
+        client.batch("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").map_err(|_| Error::Database)?;
+        let receipt =
+            postgres_schema::lock_transaction_and_inspect(client).map_err(Error::Schema)?;
+        if receipt.store_epoch != epoch {
+            return Err(Error::Epoch);
+        }
+        postgres_maintenance::owner(client).map_err(|_| Error::Owner)?;
+        let source = read(client)?.ok_or(Error::Unbound)?;
+        client.batch(&sql).map_err(|_| Error::Database)?;
+        // Replacing grants twice leaves them as once: a rerun settles it.
+        client.commit().map_err(|_| Error::Indeterminate)?;
+        Ok(source)
+    })
+    .map_err(Error::Connection)??;
+    postgres_probe::with_schema_client(publisher, deadline, |client| {
+        let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
+        if receipt.store_epoch != epoch {
+            return Err(Error::Epoch);
+        }
+        crate::postgres_runtime_access::qualify_replica(client, &source).map_err(Error::Publisher)
+    })
+    .map_err(Error::Connection)??;
+    postgres_probe::with_schema_client(reader, deadline, |client| {
+        let receipt = postgres_schema::lock_and_inspect(client).map_err(Error::Schema)?;
+        if receipt.store_epoch != epoch {
+            return Err(Error::Epoch);
+        }
+        crate::postgres_runtime_access::qualify_replica_reader(client, epoch).map_err(Error::Reader)
+    })
+    .map_err(Error::Connection)??;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grants_replace_each_login_and_quote_only_plain_names() {
+        for name in ["td_mta_runtime", "_r", "mail_reader2"] {
+            assert!(login(name));
+        }
+        for name in ["", "Td", "1r", "a-b", "a\"b", "a b", &"a".repeat(64)] {
+            assert!(!login(name));
+        }
+        let sql = grant_sql("td_mta_runtime", "td_mta_reader").unwrap();
+        assert!(sql.starts_with(
+            "REVOKE ALL ON ALL TABLES IN SCHEMA td_mta FROM \"td_mta_runtime\", \"td_mta_reader\";\n"
+        ));
+        assert!(sql.contains(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON td_mta.replica_progress TO \"td_mta_runtime\";\n"
+        ));
+        assert!(sql.contains("GRANT SELECT ON td_mta.replica_progress TO \"td_mta_reader\";\n"));
+        assert!(
+            sql.contains("GRANT SELECT, UPDATE (id) ON td_mta.accounts TO \"td_mta_reader\";\n")
+        );
+        assert_eq!(
+            sql.lines()
+                .filter(|l| l.starts_with("GRANT ") && l.contains(" ON td_mta."))
+                .count(),
+            2 * crate::postgres_runtime_access::replica_grants(true).count()
+        );
+        // One reply per statement, beside a few hundred for the handshake,
+        // ledger, lock and owner reads: a schema client admits them all as
+        // tables are added, where an ordinary client's 128 did not.
+        assert!(sql.lines().count() * 4 < postgres_probe::SCHEMA_FRAMES);
+    }
     #[test]
     fn source_identity_is_canonical_and_contains_no_credentials_or_path() {
         let epoch = StoreEpoch::from_bytes([7; 16]);

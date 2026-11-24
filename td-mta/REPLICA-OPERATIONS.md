@@ -242,16 +242,63 @@ search job before switching binaries. Restart their schedules after verifying
 the reader and copier. On systemd this means stopping the timers and their
 services; on Shepherd stop the two timed services. Preserve search progress.
 
-Schema changes need an explicit compatible upgrade procedure, run in a
-fenced maintenance window, and a retained cold backup of the stopped
-root on a different volume. Stop all users of the database, including
-search preparation and other maintenance jobs, before upgrading; binary
-rollback alone does not undo a schema upgrade. A migration that adds
-tables also needs the replica's publisher (`td_mta_runtime`) and reader
-(`td_mta_reader`) grants extended to them; until then the copier and
-reader refuse to qualify. PostgreSQL package updates are a separate
-operation. Public-server deployment and ACME renewal are independent of
-local replica updates.
+Schema changes run in a fenced maintenance window with a retained cold
+backup of the stopped root on a different volume. Stop all users of the
+database, including search preparation and other maintenance jobs,
+before upgrading; binary rollback alone does not undo a schema upgrade.
+With only the replica's PostgreSQL running, the installed candidate
+plans and applies the migrations with the owner connection file, and
+`replica-grants` below then restores both logins:
+
+```sh
+"$replica_bin" postgres schema-plan --connection-file "$replica_root/owner-connection"
+"$replica_bin" postgres schema-upgrade --connection-file "$replica_root/owner-connection" --timeout-seconds 900
+```
+
+PostgreSQL package updates are a separate operation. Public-server
+deployment and ACME renewal are independent of local replica updates.
+
+## Replica grants
+
+The copier's login (`td_mta_runtime`) and the reader's (`td_mta_reader`)
+qualify only with exactly their replica access to every table, so a
+migration that adds a table leaves both refusing to qualify, and the
+replica serving nothing, until they hold it. One command, with
+PostgreSQL running, sets both:
+
+```sh
+"$replica_bin" postgres replica-grants \
+  --connection-file "$replica_root/owner-connection" --epoch "$replica_epoch" \
+  --publisher-connection-file "$replica_root/runtime-connection" \
+  --reader-connection-file "$replica_root/reader-connection"
+```
+
+In one owner transaction on the current schema of that epoch, bound to
+a replica source, it replaces each login's privileges on the mail
+schema with the set td-mta's qualifier accepts for it, table by table.
+It then connects as each login and runs the qualification the copier
+(against the bound source) and the reader run at start.
+`"publisher_qualified":true,"reader_qualified":true` in its JSON line
+means both pass it. A rerun changes nothing, so every failure, an
+unknown commit outcome included, is answered by running it again once
+its cause is fixed. Before any grant it refuses another epoch
+(`epoch-mismatch`), a login that does not own the schema
+(`owner-required`), a database not bound to a replica
+(`replica-unbound`), and publisher and reader files that do not name
+two distinct lowercase logins (letters, digits and `_`) other than the
+owner (`invalid-replica-logins`); a file that does not load names its
+login's stage (`owner-bootstrap`, `publisher-bootstrap`,
+`reader-bootstrap`). A failure in the `qualification` stage comes after
+the grants were replaced and names the login and why it still refuses
+(`publisher-` or `reader-` and `runtime-owner-or-privileged-role`,
+`runtime-data-privileges`, `maintenance-barrier`, `replica-binding` or
+`query-failed`). Publisher and reader files given the other way round
+refuse with `runtime-data-privileges`, which the right ones fix; the
+same code also names a privilege this command does not revoke (one
+granted to PUBLIC or by another grantor, row-level security, an extra
+relation in the schema), which needs the owner's attention. `--setup-replica`
+grants through the same command. Run it after every schema upgrade,
+then start the reader and the copier.
 
 ## Integrity and recovery evidence
 
