@@ -1170,6 +1170,45 @@ pub(crate) mod tests {
         assert!(page.fits().next().is_none());
     }
 
+    /// An inline table is laid as an inline-block: its cells' lines lie
+    /// within the line holding it, and it and its cells paint after the
+    /// in-flow boxes around it.
+    #[test]
+    fn inline_tables_nest_their_lines_and_paint_after_the_blocks_around_them() {
+        let page = laid(
+            "<body style=margin:0><div id=a style=background:blue>one \
+             <table id=t style=display:inline-table;background:red><tr>\
+             <td id=d style=background:white>in it<td>two</table> after</div>\
+             <div id=c style=background:green>next</div>",
+        );
+        assert!(page.styled().styled().has_inline_blocks());
+        let texts: Vec<String> = page
+            .lines()
+            .iter()
+            .map(|line| {
+                line.fragments
+                    .iter()
+                    .map(|f| crate::text::fragment_text(&page, f))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(texts, ["one  after", "in it", "two", "next"]);
+        let outer: Vec<_> = (0..4).map(|line| page.outer(line)).collect();
+        assert_eq!(outer, [None, Some(0), Some(0), None]);
+        let at = |id: &str| {
+            let node = page.tree().target(id).unwrap();
+            let geometry = page
+                .layout
+                .boxes
+                .iter()
+                .position(|g| g.node == node)
+                .unwrap() as u32;
+            page.painted().iter().position(|&p| p == geometry).unwrap()
+        };
+        assert!(at("a") < at("c") && at("c") < at("t") && at("t") < at("d"));
+        assert!(page.fits().next().is_none());
+    }
+
     #[test]
     fn boxes_are_painted_in_tree_order_and_clip_their_descendants() {
         let laid = laid(

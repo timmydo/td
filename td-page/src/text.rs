@@ -276,8 +276,9 @@ fn box_start(laid: &Laid, line: &Line) -> Option<Place> {
     Some(Place::new(laid, node, 0))
 }
 
-/// The float or inline-block box `index` is, if any, and whether it
-/// floats; with it, its parent's index.
+/// The float or inline-block (an inline table included) box `index` is,
+/// if any, and whether it floats, as layout floats it (a table never
+/// does); with it, its parent's index.
 fn own_box(laid: &Laid, index: usize) -> (Option<(usize, bool)>, Option<usize>) {
     let styled = laid.styled();
     let Some(node) = styled.node_of(index) else {
@@ -287,13 +288,9 @@ fn own_box(laid: &Laid, index: usize) -> (Option<(usize, bool)>, Option<usize>) 
     if node.kind != BoxKind::Block {
         return (None, parent);
     }
-    let keyword = |property| match styled.style(node.style).and_then(|s| s.get(property)) {
-        Some(ComputedValue::Keyword(word)) => word,
-        _ => "",
-    };
-    if matches!(keyword(Property::Float), "left" | "right") {
+    if styled.styled().box_floats(index) {
         (Some((index, true)), parent)
-    } else if keyword(Property::Display) == "inline-block" {
+    } else if styled.styled().box_is_inline_block(index) {
         (Some((index, false)), parent)
     } else {
         (None, parent)
@@ -2680,6 +2677,143 @@ mod tests {
             ),
         ] {
             assert_eq!(all(&laid(&markup)), text, "{markup}");
+        }
+    }
+
+    /// An inline table's cells copy as a table's in an inline-block do:
+    /// tabs between a row's cells, newlines between its rows, its text
+    /// its own paragraphs within the line holding it; every piece starts
+    /// on its own line, and a copy between any two places holds what is
+    /// shown between them.
+    #[test]
+    fn an_inline_table_copies_as_its_cells() {
+        let it = "style=display:inline-table";
+        let ib = "style=display:inline-block";
+        for (table, text) in [
+            (
+                "<table {}><tr><td>a<td>b<tr><td>c<td>d</table>",
+                "one \na\tb\nc\td two",
+            ),
+            (
+                "<table {}><caption>cap</caption><tr><td>a bb<br>cc<td>d</table>",
+                "one cap\na bb cc\td two",
+            ),
+            ("<table {}><tr><td>a<td><td>b</table>", "one \na\t\tb two"),
+            (
+                "<table {}><tr><td>a <span style=display:inline-block>bb</span> c\
+                 <td>d</table>",
+                "one \na bb c\td two",
+            ),
+            ("<table {}></table>", "one  two"),
+            // A caption alone, its text the paragraph's.
+            ("<table {}><caption>cde</caption></table>", "one cde two"),
+            (
+                "<table {}><caption style=caption-side:bottom>cde</caption></table>",
+                "one cde two",
+            ),
+        ] {
+            let inline = format!("<p>one {} two", table.replace("{}", it));
+            let boxed = format!("<p>one <span {ib}>{}</span> two", table.replace("{}", ""));
+            let laid = laid(&inline);
+            assert_eq!(all(&laid), text, "{inline}");
+            assert_eq!(all(&crate::page::tests::laid(&boxed)), text, "{boxed}");
+            let mut places = Vec::new();
+            for (at, line) in laid.lines().iter().enumerate() {
+                for item in items(&laid, line) {
+                    assert_eq!(line_of(&laid, item.start), at, "{inline} {item:?}");
+                    places.push(item.start);
+                    places.push(item.end);
+                }
+            }
+            places.sort();
+            places.dedup();
+            let mut scalars = Vec::new();
+            let _ = walk(&laid, None, 0, |event| {
+                if let Event::Scalar(c, s, _, _) = event {
+                    scalars.push((c, s));
+                }
+                ControlFlow::Continue(())
+            });
+            for (i, &from) in places.iter().enumerate() {
+                for &to in places.iter().skip(i + 1) {
+                    let shown: String = scalars
+                        .iter()
+                        .filter(|(c, s)| *s >= from && *s < to && !c.is_whitespace())
+                        .map(|(c, _)| *c)
+                        .collect();
+                    let mut out = copy_of(&laid, from, to);
+                    out.retain(|c| !c.is_whitespace());
+                    assert_eq!(out, shown, "{inline} {from:?} {to:?}");
+                }
+            }
+        }
+        // In a cell, beside the cell's own text and another cell.
+        let laid = laid(&format!(
+            "<table><tr><td>x <table {it}><tr><td>a<td>b</table> y<td>z</table>"
+        ));
+        assert_eq!(all(&laid), "x \na\tb y\tz");
+        for (at, line) in laid.lines().iter().enumerate() {
+            for item in items(&laid, line) {
+                assert_eq!(line_of(&laid, item.start), at, "{item:?}");
+            }
+        }
+        // In a float, its caption's text its line's: a copy from the
+        // float's word into it parts them with the space laid, no newline.
+        let laid = crate::page::tests::laid(&format!(
+            "<div style=float:left>fghij <table {it}>\
+             <caption style=caption-side:bottom>cde</caption></table></div>"
+        ));
+        let (j, _) = word_at(&laid, "j");
+        let (_, c) = word_at(&laid, "c");
+        assert_eq!(copy_of(&laid, j, c), "j c");
+    }
+
+    /// A table whose `float` is left keeps its place in flow, as layout
+    /// lays it (td-layout/DESIGN.md §5, "Floats"): its caption's lines are
+    /// not a float's, so a copy across them owes no float's newline: every
+    /// copy is the table's without its `float`.
+    #[test]
+    fn a_floated_table_is_walked_in_flow() {
+        for (markup, text) in [
+            // In an inline-block, its caption the line's paragraph.
+            (
+                "<div style=float:left></div><span style=display:inline-block>\
+                 <table{}><caption style=caption-side:bottom>cde </caption></table></span>k",
+                "cdek",
+            ),
+            (
+                "<p>one <span style=display:inline-block><table{}><caption>cap tion\
+                 </caption><tr><td>a<td>b</table></span> two",
+                "one cap tion\na\tb two",
+            ),
+            // At the top level, its caption and rows between paragraphs.
+            (
+                "<p>one</p><table{}><caption>cap tion</caption><tr><td>a<td>b</table><p>two",
+                "one\ncap tion\na\tb\ntwo",
+            ),
+        ] {
+            let floated = laid(&markup.replace("{}", " style=float:left"));
+            let flow = crate::page::tests::laid(&markup.replace("{}", ""));
+            assert_eq!(all(&floated), text, "{markup}");
+            assert_eq!(all(&flow), text, "{markup}");
+            let mut places = Vec::new();
+            for line in floated.lines() {
+                for item in items(&floated, line) {
+                    places.push(item.start);
+                    places.push(item.end);
+                }
+            }
+            places.sort();
+            places.dedup();
+            for (i, &from) in places.iter().enumerate() {
+                for &to in places.iter().skip(i + 1) {
+                    assert_eq!(
+                        copy_of(&floated, from, to),
+                        copy_of(&flow, from, to),
+                        "{markup} {from:?} {to:?}"
+                    );
+                }
+            }
         }
     }
 

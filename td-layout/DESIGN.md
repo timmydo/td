@@ -887,9 +887,13 @@ context, as CSS does (td-web/DESIGN.md §10, "Painting").
 ### Inline-blocks
 
 A box is an **inline-block** when it is a block, not the root, whose
-computed display is `inline-block`. td-css blockifies a floated one, and
-the root, so none floats; an image whose display is `inline-block` is
-an inline image, as before. `StyledDocument::has_inline_blocks` says
+computed display is `inline-block`, or an **inline table** when it is
+`inline-table`; what follows says inline-block of both but where it
+names the inline table. td-css blockifies a floated one, and the root
+(an inline table into a block-level table, which keeps its place in
+flow, above, "Floats"), so none floats; an image whose display is
+`inline-block` is an inline image, as before.
+`StyledDocument::has_inline_blocks` says
 whether any box is one, set while boxes are generated, so a page
 without one takes none of what follows: its geometry, lines and work
 are those of a layout without inline-blocks, and its charges too,
@@ -897,7 +901,7 @@ but for its floats' items, smaller than they were (below, "Bounds").
 `has_nested_lines` says whether floats or inline-blocks may put lines
 within another line. The references are CSS 2.2 §9.2.2's atomic
 inline-level boxes, §10.3.9's width, §10.6.6's height and §10.8.1's
-baseline.
+baseline, and §17.4's inline table.
 
 **Model.** An inline-block is an atomic inline: its content is laid as
 a block formatting context of its own, which holds its floats as a
@@ -909,8 +913,12 @@ first, at the sequence's start and its container's left edge, at its
 set width or shrink-to-fit (§10.3.9 sizes it as §10.3.5 does a float,
 measured as a cell's content is), its auto margins 0, its height its
 content's or its set one within its min and max heights, reaching its
-floats' bottoms (§10.6.6 takes §10.6.7's). The sequence queues it as an
-item of its margin box's width, and as the line holding it is laid,
+floats' bottoms (§10.6.6 takes §10.6.7's). An inline table is laid
+there by its table, as a block-level one is (below, "Tables"), at its
+set width or its columns' within the room its margins leave, which is
+shrink-to-fit, but its auto margins 0, not centring it; its margin
+box, its captions' included, is its table's. The sequence queues it as
+an item of its margin box's width, and as the line holding it is laid,
 retained or not, records where that line puts its margin box's top
 left, after text-align and beside any float shortening the line; its
 boxes, lines, markers and own overflow are then moved there, as a
@@ -945,7 +953,16 @@ initial value; no other value is read. Its baseline is that of its
 last line box in flow at any depth, a nested block's included, else,
 where it lays none or its `overflow` is neither `visible` nor `clip`
 (which, like `visible`, makes no scroll container), its bottom margin
-edge (§10.8.1). A line's height takes its margin box above and below
+edge (§10.8.1). An inline table's is its first row's (§17.4), as
+§17.5.3 defines a row's: where any cell starting and ending in it is
+baseline-aligned, the baseline those cells were aligned to (below,
+"Tables", "Rows and cells"), else the bottom content edge of its lowest
+such cell, the row's bottom less that cell's bottom padding and border;
+where it has no row, or its first row no such cell, its bottom margin
+edge. A cell spanning rows is left out, where §17.5.3 lets a
+baseline-aligned one set its first row's baseline, as td-layout lays
+such a cell at its top (below). Its captions are not its rows, and its `overflow` is not read. A
+line's height takes its margin box above and below
 that baseline, either part negative where its margins make it so,
 which grows no line, as it takes an image's margin box above its
 baseline. Lines of floats, of an inline-block nested in it and of a
@@ -957,15 +974,16 @@ an inline-block, not the inline-block's own.
 **Measured widths.** In an inline sequence measured for a table cell,
 a float's or an inline-block's width, an inline-block contributes its
 own min- and max-content widths with its margins, borders and padding,
-as a float does; where its parent wraps, with a wrap opportunity each
+as a float does, an inline table its table's (below, "Tables",
+"Widths"); where its parent wraps, with a wrap opportunity each
 side, its min-content width a piece of its own and its max-content
 width added to its line's with any space before it; where its parent
 does not wrap, its min-content width is added to the piece around it
 that nothing breaks and its max-content width to the line.
 
 **Departures and later increments.** `vertical-align` other than
-`baseline` is not read. `inline-table` is laid as a block-level table
-where its box is (below, "Tables"). A table never gives the baseline.
+`baseline` is not read. A table never gives an inline-block's
+baseline, but an inline table gives its own.
 Its lines are their own block's paragraphs, between two places of the
 line holding it: td-web reads its text where it lies in that line and
 the line's paragraph as going on past it, but finds nothing across it
@@ -984,7 +1002,9 @@ visits its lines, boxes, markers and fragments once. Its shrink-to-fit
 width measures its content, so inline-blocks of auto width nested d
 deep measure the innermost d times, as nested floats and tables do:
 charged, and refused by name past `MAX_LAYOUT_WORK`. Its layout is no
-deeper than its box's, which `MAX_DEPTH` refuses first.
+deeper than its box's, which `MAX_DEPTH` refuses first. An inline
+table is measured and laid, and bounded, as a block-level one is
+(below, "Tables", "Bounds").
 
 **Measured.** Release, the host of §6, §6's deterministic metrics, at
 1280 px, under a load average of 3 to 5 (2026-11-24), interleaved with
@@ -1018,9 +1038,21 @@ inline-block: 29,537 units of three nested three deep,
 of 50 nested 50 deep are refused `Limit("MAX_LAYOUT_WORK")` in 849 ms,
 as floats nested so are in 836 ms.
 
+Inline tables, measured the same way against the build before them
+(2026-11-24, a load average of 5): 2 MiB shapes without one (prose, one
+word, blocks, a table of two-cell rows, tables nested in cells,
+inline-blocks, inline-blocks holding tables, floats and floated tables)
+lay the same output, work and charges, whole and windowed at 5,000 to
+6,000 px, in the same time within noise (prose 56.0 and 53.5 ms, the
+table 105.0 and 106.3). One 2 MiB paragraph of 26,886 two-cell inline
+tables between words lays 61,454 lines in 97 ms, about 6.32M work,
+charging 140.5 MiB (80,658 lines, 107 ms, 142.4 MiB laid as block-level
+tables before).
+
 **Painting.** `StyledDocument::is_inline_block` says whether a box's
-geometry was laid for an inline-block, so a painter can paint it after
-the in-flow boxes around it, as CSS 2.2 appendix E paints an
+geometry was laid for an inline-block, an inline table's included, so
+a painter can paint it after the in-flow boxes around it, as CSS 2.2
+appendix E paints an
 inline-block with the inline content after the blocks' backgrounds
 (td-web/DESIGN.md §10, "Painting").
 
@@ -1033,8 +1065,8 @@ A box whose computed display is a table display is laid by CSS 2.2
 `table-column-group`, `table-column`, the three row groups, `table-row`
 and `table-cell`; `StyledDocument::table_role` reports a box's and
 `has_tables` whether any box has one, so a page without one never looks.
-`inline-table` is laid as a block-level table where its box is, not
-yet as an inline-block (above, "Inline-blocks").
+An `inline-table` is laid whole in its line, as an inline-block is
+(above, "Inline-blocks").
 
 [tables]: https://www.w3.org/TR/CSS22/tables.html
 [html-tables]: https://html.spec.whatwg.org/multipage/tables.html#table-processing-model
@@ -1129,7 +1161,10 @@ top, middle and bottom, and baseline, where every single-row baseline cell's
 first line's baseline meets the row's lowest such, and any other value
 is baseline; such a cell makes its row the taller of its set height and
 its content moved to the baseline. A spanning baseline cell is laid at
-the top. HTML's sheet
+the top. A cell's baseline is its first line's as laid, else the bottom
+of its content, so a relative offset on a block in it moves it, and its
+row's and an inline table's baseline with it, a departure: CSS applies
+the offset after alignment. HTML's sheet
 gives cells `vertical-align: middle` through their row group. A cell's
 box keeps the row's top and full height; its lines, replaced boxes,
 markers and descendants' geometry move by the alignment offset, rounded
@@ -1992,9 +2027,9 @@ needing a layout and no cascade, are §5's "Intrinsic sizes". Floats,
 placed in their block formatting contexts, the lines beside them
 shortened, `clear`, contexts' roots holding their floats and moving
 beside others, and a float laid first and moved where its line places
-it, are §5's "Floats". Inline-blocks, laid apart as floats are and
-placed whole in their lines at their baselines, are §5's
-"Inline-blocks". The input
+it, are §5's "Floats". Inline-blocks and inline tables, laid apart as
+floats are and placed whole in their lines at their baselines, are
+§5's "Inline-blocks". The input
 limit a caller sets, the
 cascade without style attributes and the byte limit per layout request
 are §6's "Caller-set limits"; each line's block and end (`Line::block`,

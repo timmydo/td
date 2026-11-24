@@ -23,6 +23,8 @@ pub(crate) mod float;
 mod float_tests;
 #[cfg(test)]
 mod inline_block_tests;
+#[cfg(test)]
+mod inline_table_tests;
 mod intrinsic;
 mod table;
 
@@ -970,11 +972,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let side = float_side(style, b.kind).ok_or(Error::Invalid)?;
         let clear = Clear::of(keyword(style, Property::Clear));
         let dims = self.shrink_dimensions(id, &b, place, depth)?;
-        self.lay_item(id, dims, Kind::Float { side, clear }, place, y, depth)
+        let kind = Kind::Float { side, clear };
+        self.lay_item(id, dims, (kind, false), place, y, depth)
     }
     /// Lays the inline-block `id` met in an inline sequence starting at
     /// `y` as a float is laid, CSS 2.2 §10.3.9 sizing it as §10.3.5 does a
-    /// float; `lay_item` finds its baseline (§10.8.1).
+    /// float, or an inline table as its table sizes itself; `lay_item`
+    /// finds its baseline (§10.8.1).
     #[cold]
     #[inline(never)]
     fn lay_inline_block(
@@ -985,25 +989,32 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         depth: usize,
     ) -> Result<(), Error> {
         let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
-        let dims = self.shrink_dimensions(id, &b, place, depth)?;
-        self.lay_item(id, dims, Kind::Inline { baseline: 0.0 }, place, y, depth)
+        let table = self.role(&b)? == Some(TableRole::Table);
+        let dims = if table {
+            self.block_dimensions(&b, place.container.width, place.definite)?
+        } else {
+            self.shrink_dimensions(id, &b, place, depth)?
+        };
+        let kind = Kind::Inline { baseline: 0.0 };
+        self.lay_item(id, dims, (kind, table), place, y, depth)
     }
     /// Lays the box `id`, `dims` in its container, apart where an inline
     /// sequence starting at `y` starts: its margin box's top left at the
     /// container's left edge and `y`, no outside marker waiting for its
     /// lines and none of them its container's first nor its last in flow,
     /// its output and its own overflow kept as an item of `kind` to be
-    /// moved where the sequence places it. An inline-block's kind takes
-    /// its baseline: its last line's in flow, else, or where its overflow
-    /// is neither visible nor clip, its bottom margin edge (CSS 2.2
-    /// §10.8.1).
+    /// moved where the sequence places it; an inline table, `table`, laid
+    /// by its table. An inline-block's kind takes its baseline: its last
+    /// line's in flow, else, or where its overflow is neither visible nor
+    /// clip, its bottom margin edge; an inline table's its first row's,
+    /// else its bottom margin edge (CSS 2.2 §10.8.1, §17.4).
     #[cold]
     #[inline(never)]
     fn lay_item(
         &mut self,
         id: BoxId,
         dims: Dimensions,
-        kind: Kind,
+        (kind, table): (Kind, bool),
         place: &Place,
         y: f64,
         depth: usize,
@@ -1022,21 +1033,37 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             f64::NEG_INFINITY,
             f64::NEG_INFINITY,
         );
-        let laid = self.block(
-            id,
-            b,
-            dims,
-            (x, y + dims.margin.top),
-            place.offset,
-            depth + 1,
-        );
+        let laid = if table {
+            self.inline_table(id, dims, place, y + dims.margin.top, depth + 1)
+        } else {
+            self.block(
+                id,
+                b,
+                dims,
+                (x, y + dims.margin.top),
+                place.offset,
+                depth + 1,
+            )
+            .map(|height| (height, None))
+        };
         let own = (self.left, self.top, self.right, self.bottom);
         (self.left, self.top, self.right, self.bottom) = outer;
         self.waiting = waiting;
         self.first_line = first_line;
         let last = std::mem::replace(&mut self.last_baseline, last_baseline);
-        let height = laid? + dims.margin.vertical();
-        let width = dims.width + decor.horizontal() + dims.margin.horizontal();
+        let (laid, first_row) = laid?;
+        let height = laid + dims.margin.vertical();
+        let width = if table {
+            // A table sizes itself: its margin box is that of its box, the
+            // last it laid.
+            self.boxes
+                .last()
+                .filter(|g| g.node == b.node)
+                .map(|g| g.border.width + g.margin.left + g.margin.right)
+                .ok_or(Error::Invalid)?
+        } else {
+            dims.width + decor.horizontal() + dims.margin.horizontal()
+        };
         if !coordinate(width) || !coordinate(height) {
             return Err(Error::Limit("MAX_COORDINATE"));
         }
@@ -1049,9 +1076,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
             // Clip, like visible, keeps its lines' baseline.
             let shown = |p| matches!(keyword(style, p), "visible" | "clip");
-            *baseline = match last {
-                Some(last) if shown(Property::OverflowX) && shown(Property::OverflowY) => last - y,
-                _ => height,
+            // An inline table's is its first row's; laying a table keeps
+            // `last_baseline`, so it has no `last`.
+            *baseline = match (first_row, last) {
+                (Some(row), _) => row - y,
+                (None, Some(last)) if shown(Property::OverflowX) && shown(Property::OverflowY) => {
+                    last - y
+                }
+                (None, _) => height,
             };
             if !coordinate(*baseline) {
                 return Err(Error::Limit("MAX_COORDINATE"));

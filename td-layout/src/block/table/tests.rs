@@ -153,20 +153,17 @@ mod cases {
         let plain = td_html::document::parse("<p>no table").unwrap();
         assert!(!styled_plain(&plain).has_tables());
     }
+    /// Laid whole in its line (DESIGN.md §5, "Inline-blocks").
     #[test]
-    fn an_inline_table_is_laid_as_a_block_table() {
+    fn an_inline_table_is_laid_in_its_line() {
         let html = "<p>before <span id=t style=display:inline-table>\
                     <span style=display:table-cell id=c>x</span></span> after";
         let (doc, out) = lay(html, "p{margin:0}", 400.0);
-        assert_eq!(border(&doc, &out, "t"), (0.0, 20.0, 8.0, 20.0));
-        assert_eq!(border(&doc, &out, "c"), (0.0, 20.0, 8.0, 20.0));
+        assert_eq!(border(&doc, &out, "t"), (56.0, 0.0, 8.0, 20.0));
+        assert_eq!(border(&doc, &out, "c"), (56.0, 0.0, 8.0, 20.0));
         assert_eq!(
             texts(&doc, &out),
-            [
-                ("before".into(), 0.0, 0.0),
-                ("x".into(), 0.0, 20.0),
-                ("after".into(), 0.0, 40.0)
-            ]
+            [("before  after".into(), 0.0, 0.0), ("x".into(), 56.0, 0.0)]
         );
     }
     #[test]

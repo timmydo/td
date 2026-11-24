@@ -1700,7 +1700,9 @@ after a replaced element. Places are ordered by the tree-order table,
 four bytes a node (1 MiB at td-html's `MAX_NODES`). td-layout lays
 normal flow and tables in tree order, puts a float's lines after
 the line it was met in (td-layout/DESIGN.md §5, "Floats") and an
-inline-block's after the line holding it ("Inline-blocks"), so its
+inline-block's after the line holding it ("Inline-blocks"; an inline
+table is an inline-block here and below, its cells' lines its own), so
+its
 lines are in the tree order of their starts and the fragments in each
 in tree order, a float's or an inline-block's lines starting and ending
 between two places of the line holding it: relative offsets move what
@@ -1818,7 +1820,11 @@ a space, as that cell's paragraphs are, none after text ending in one,
 and never in place of a row's
 tabs, its own paragraphs and cells parted as anywhere; an
 inline-block's text in its line, a newline only between its own
-paragraphs, its placeholder
+paragraphs (an inline table's rows and caption are such paragraphs,
+its cells parted by tabs: `one <table style=display:inline-table>`
+with rows `a`, `b` and `c`, `d` before ` two` copies as
+`one \na\tb\nc\td two`, a newline before its first row and none
+after its last), its placeholder
 no text but a piece, which keeps the separator owed before it:
 fragments' painted text, neither `visibility: hidden` text
 nor a hidden item's marker; after a `Wrap` end the white
@@ -2211,12 +2217,13 @@ their elements lay out (a `button`'s or `textarea`'s text shows, an
 static and relative (td-css computes no other, so `absolute`, `fixed`
 and `sticky` stay in flow); flex and grid until
 td-layout has them, laid in normal flow as td-layout specifies, nothing
-hidden by it; floats and inline-blocks are td-layout's
+hidden by it; floats and inline-blocks, inline tables among them, are
+td-layout's
 (td-layout/DESIGN.md §5, "Floats", "Inline-blocks"), their boxes
 painted after the in-flow boxes around them ("Painting") but their
 lines with the page's, not each painted whole as CSS 2.2 appendix E
-does; an inline-block's `vertical-align` other than `baseline` and an
-`inline-table` laid inline are td-layout's later increments; table layout beyond
+does; an inline-block's `vertical-align` other than `baseline` is
+td-layout's later increment; table layout beyond
 td-layout's automatic one (increment 6); pseudo-elements and generated
 content, list markers aside; presentational attributes; web fonts
 (`@font-face` is skipped); background images, border radii, shadows,
@@ -2541,8 +2548,7 @@ order; each is its own design amendment when it starts:
 - **Layout beyond normal flow**, as td-layout gains it: inline-block's
   `vertical-align`, find across an inline-block's edge (a browser's
   text runs on into it), a copy ending where a line starts with an
-  inline-block taking the newline its first text would, inline
-  tables, then
+  inline-block taking the newline its first text would, then
   flexbox and grid; pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.

@@ -6,10 +6,12 @@
 use super::*;
 use crate::{MAX_COLSPAN, MAX_COORDINATE, MAX_ROWSPAN, MAX_TABLE_COLUMNS};
 
-/// What a table is laid from: a table box, or a run of table boxes with
-/// no table in a block's events, which an anonymous table wraps.
+/// What a table is laid from: a table box, an inline table's, or a run of
+/// table boxes with no table in a block's events, which an anonymous
+/// table wraps.
 pub(super) enum Source<'e> {
     Root(BoxId, Dimensions),
+    Inline(BoxId, Dimensions),
     Anonymous(&'e Events, Range<usize>),
 }
 /// A table measured for its intrinsic widths: a table box, or a run of
@@ -438,6 +440,30 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         y: f64,
         depth: usize,
     ) -> Result<f64, Error> {
+        self.laid_table(source, place, y, depth)
+            .map(|(height, _)| height)
+    }
+    /// Lays the inline table `id`, `dims` in its container, at `y`, as
+    /// `table` lays a table but for its auto margins, which are 0 (CSS 2.2
+    /// §10.3.9), returning its height and its first row's baseline in
+    /// flow (§17.4, §17.5.3), if it has one.
+    pub(super) fn inline_table(
+        &mut self,
+        id: BoxId,
+        dims: Dimensions,
+        place: &Place,
+        y: f64,
+        depth: usize,
+    ) -> Result<(f64, Option<f64>), Error> {
+        self.laid_table(Source::Inline(id, dims), place, y, depth)
+    }
+    fn laid_table(
+        &mut self,
+        source: Source<'_>,
+        place: &Place,
+        y: f64,
+        depth: usize,
+    ) -> Result<(f64, Option<f64>), Error> {
         if depth > self.counters.limits.depth {
             return Err(Error::Limit("MAX_DEPTH"));
         }
@@ -452,11 +478,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         self.last_baseline = last_baseline;
         self.tables.truncate(base);
         self.retain -= 1;
-        let height = laid?;
+        let laid = laid?;
         if outermost {
             self.keep_window()?;
         }
-        Ok(height)
+        Ok(laid)
     }
     /// The intrinsic widths of a table's border box, in 1/64 px.
     pub(super) fn table_intrinsic(
@@ -1339,10 +1365,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         place: &Place,
         y: f64,
         depth: usize,
-    ) -> Result<f64, Error> {
+    ) -> Result<(f64, Option<f64>), Error> {
         let container = place.container;
+        let inline = matches!(source, Source::Inline(..));
         let (frame, walk, margin, relative) = match source {
-            Source::Root(id, dims) => {
+            Source::Root(id, dims) | Source::Inline(id, dims) => {
                 let b = self.styled.box_node(id).ok_or(Error::Invalid)?;
                 let frame = self.frame(
                     Some((id, &dims)),
@@ -1381,7 +1408,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             }
             None => (Some(0.0), Some(0.0)),
         };
-        let (left_auto, right_auto) = (left.is_none(), right.is_none());
+        // An inline table's auto margins are 0 (CSS 2.2 §10.3.9).
+        let (left_auto, right_auto) = (left.is_none() && !inline, right.is_none() && !inline);
         let fixed_margins = left.unwrap_or(0.0) + right.unwrap_or(0.0);
         let room = (container.width - fixed_margins - decoration.horizontal()).max(0.0);
         let bound = |w: f64| w.min(frame.max_width).max(frame.min_width);
@@ -1457,6 +1485,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let mut row_y = content_top + if rows > 0 { frame.down } else { 0.0 };
         let rows_top = row_y;
         let mut below = false;
+        // An inline table's first row gives its baseline.
+        let (mut first_row, mut row_baseline) = (inline, None);
         while item < items {
             match self
                 .tables
@@ -1465,7 +1495,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 .copied()
                 .ok_or(Error::Invalid)?
             {
-                Item::Row(row) => row_y = self.lay_row(&ctx, row, row_y, depth)?,
+                Item::Row(row) if first_row => {
+                    first_row = false;
+                    row_y = self.lay_row(&ctx, row, row_y, depth, Some(&mut row_baseline))?;
+                }
+                Item::Row(row) => row_y = self.lay_row(&ctx, row, row_y, depth, None)?,
                 Item::Group { node, first, end } => {
                     self.group_box(&ctx, node, first, end, row_y)?
                 }
@@ -1553,7 +1587,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         if !coordinate(height) {
             return Err(Error::Limit("MAX_COORDINATE"));
         }
-        Ok(height)
+        Ok((height, row_baseline))
     }
     /// Distributes the content width, less spacing, over the columns:
     /// each starts at its maximum, or its share of the table for a
@@ -1743,8 +1777,16 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         Ok(taken.max(0.0))
     }
     /// Lays a row's cells at `y`, sets its height from them and finishes
-    /// the cells that end in it, returning the next row's y.
-    fn lay_row(&mut self, ctx: &Context, row: u32, y: f64, depth: usize) -> Result<f64, Error> {
+    /// the cells that end in it, returning the next row's y; given
+    /// `watch`, its baseline there too (`row_baseline`).
+    fn lay_row(
+        &mut self,
+        ctx: &Context,
+        row: u32,
+        y: f64,
+        depth: usize,
+        watch: Option<&mut Option<f64>>,
+    ) -> Result<f64, Error> {
         let at = ctx.grid.rows + row as usize;
         let record = *self.tables.rows.get(at).ok_or(Error::Invalid)?;
         if let Some(r) = self.tables.rows.get_mut(at) {
@@ -1808,6 +1850,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         if let Some(r) = self.tables.rows.get_mut(at) {
             r.height = height;
         }
+        if let Some(out) = watch {
+            *out = self.row_baseline(ctx, row, y, height, baseline)?;
+        }
         let mut keep = ctx.grid.laid;
         let count = self.tables.laid.len();
         for read in ctx.grid.laid..count {
@@ -1847,6 +1892,46 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             return Err(Error::Limit("MAX_COORDINATE"));
         }
         Ok(next)
+    }
+    /// The baseline of the row `row` laid at `y`, `height` tall, in flow,
+    /// before its cells end (CSS 2.2 §17.5.3): its baseline cells', at
+    /// `baseline` from its top as they were aligned, else the bottom
+    /// content edge of its lowest cell; None where no cell starts and ends
+    /// in it.
+    #[cold]
+    #[inline(never)]
+    fn row_baseline(
+        &mut self,
+        ctx: &Context,
+        row: u32,
+        y: f64,
+        height: f64,
+        baseline: f64,
+    ) -> Result<Option<f64>, Error> {
+        let open = self
+            .tables
+            .laid
+            .get(ctx.grid.laid..)
+            .ok_or(Error::Invalid)?;
+        self.counters.step(open.len())?;
+        let own = |l: &&Laid| l.top == row && l.last == row;
+        if open.iter().filter(own).any(|l| l.align == Align::Baseline) {
+            return Ok(Some(y + baseline));
+        }
+        let mut lowest: Option<f64> = None;
+        for laid in open.iter().filter(own) {
+            // Its box is the row's height; its content edge within it.
+            let below = match laid.geometry {
+                Some(at) => {
+                    let g = self.boxes.get(at).ok_or(Error::Invalid)?;
+                    g.padding.bottom + g.border_widths.bottom
+                }
+                None => 0.0,
+            };
+            let bottom = y + height - below;
+            lowest = Some(lowest.map_or(bottom, |l: f64| l.max(bottom)));
+        }
+        Ok(lowest)
     }
     /// Lays a cell's content at the top of its row, keeping what it laid
     /// to be moved once its rows are done.

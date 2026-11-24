@@ -235,7 +235,8 @@ pub enum BoxKind {
 /// A box's part in CSS 2.2's table model (§17.2), by its display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableRole {
-    /// `table` or `inline-table`, laid as a block-level table.
+    /// `table`, laid as a block-level table, or `inline-table`, laid
+    /// whole in its line (DESIGN.md §5, "Inline-blocks").
     Table,
     Caption,
     ColumnGroup,
@@ -328,8 +329,8 @@ pub struct StyledDocument<'d> {
     /// Whether any box floats (`float_side`); layout looks for floats
     /// and formatting contexts only then.
     floats: bool,
-    /// Whether any box is an inline-block (`inline_block`); layout lays
-    /// boxes apart in a line only then.
+    /// Whether any box is an inline-block or an inline table
+    /// (`inline_block`); layout lays boxes apart in a line only then.
     inline_blocks: bool,
 }
 enum DocumentOwner<'d> {
@@ -659,6 +660,32 @@ impl<'d> StyledDocument<'d> {
     pub fn first_box(&self) -> Option<BoxId> {
         self.first
     }
+    /// Whether box `index` of `boxes` is laid as a float (DESIGN.md §5,
+    /// "Floats"), by the rule layout floats it by: never the root, nor a
+    /// table, which keeps its place in flow whatever its `float`.
+    pub fn box_floats(&self, index: usize) -> bool {
+        let Some(b) = self.boxes.get(index) else {
+            return false;
+        };
+        self.floats
+            && b.parent.is_some()
+            && self
+                .style(b.style)
+                .is_some_and(|style| float_side(style, b.kind).is_some())
+    }
+    /// Whether box `index` of `boxes` is laid whole in its line as an
+    /// inline-block or an inline table (DESIGN.md §5, "Inline-blocks"):
+    /// never the root.
+    pub fn box_is_inline_block(&self, index: usize) -> bool {
+        let Some(b) = self.boxes.get(index) else {
+            return false;
+        };
+        self.inline_blocks
+            && b.parent.is_some()
+            && self
+                .style(b.style)
+                .is_some_and(|style| inline_block(style, b.kind))
+    }
     /// Whether `geometry` was laid for a float (DESIGN.md §5, "Floats"):
     /// never the root's, nor any on a page without floats.
     pub fn is_float(&self, geometry: &crate::block::BoxGeometry) -> bool {
@@ -676,8 +703,9 @@ impl<'d> StyledDocument<'d> {
                 .style(geometry.style)
                 .is_some_and(|style| float_side(style, kind).is_some())
     }
-    /// Whether `geometry` was laid for an inline-block (DESIGN.md §5,
-    /// "Inline-blocks"): never the root's, nor any on a page without them.
+    /// Whether `geometry` was laid for an inline-block or an inline table
+    /// (DESIGN.md §5, "Inline-blocks"): never the root's, nor any on a
+    /// page without them.
     pub fn is_inline_block(&self, geometry: &crate::block::BoxGeometry) -> bool {
         if !self.inline_blocks || geometry.replaced {
             return false;
@@ -751,7 +779,8 @@ impl<'d> StyledDocument<'d> {
     pub fn has_floats(&self) -> bool {
         self.floats
     }
-    /// Whether any box is an inline-block (DESIGN.md §5, "Inline-blocks").
+    /// Whether any box is an inline-block or an inline table (DESIGN.md
+    /// §5, "Inline-blocks").
     pub fn has_inline_blocks(&self) -> bool {
         self.inline_blocks
     }
@@ -825,11 +854,15 @@ pub(crate) fn float_side(style: &ComputedStyle, kind: BoxKind) -> Option<Side> {
     }
 }
 /// Whether a box of `kind` is an inline-block: a block whose display is
-/// `inline-block`, laid whole in a line (DESIGN.md §5, "Inline-blocks").
-/// td-css blockifies a floated one, so none floats; the root never is
-/// one, which its caller sees to.
+/// `inline-block` or `inline-table`, laid whole in a line (DESIGN.md §5,
+/// "Inline-blocks"). td-css blockifies a floated one, so none floats; the
+/// root never is one, which its caller sees to.
 pub(crate) fn inline_block(style: &ComputedStyle, kind: BoxKind) -> bool {
-    kind == BoxKind::Block && keyword(style, Property::Display) == "inline-block"
+    kind == BoxKind::Block
+        && matches!(
+            keyword(style, Property::Display),
+            "inline-block" | "inline-table"
+        )
 }
 /// The side a float is on, or a clear applies to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

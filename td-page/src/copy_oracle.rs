@@ -1,10 +1,10 @@
 //! A generated oracle for copying (td-web/DESIGN.md §10, "Copying"):
-//! seeded pages of floats, inline-blocks, tables and lists, and what a
-//! copy of them holds, worked from the lines and the boxes they lie in
-//! rather than from what `copy` keeps as it walks; the marker checks
-//! alone read the walk, for the order lines begin in. A failing check
-//! names the generator, the page's seed and the selection, with the page
-//! reduced to the tags that still fail it.
+//! seeded pages of floats, inline-blocks, tables, inline tables and
+//! lists, and what a copy of them holds, worked from the lines and the
+//! boxes they lie in rather than from what `copy` keeps as it walks; the
+//! marker checks alone read the walk, for the order lines begin in. A
+//! failing check names the generator, the page's seed and the selection,
+//! with the page reduced to the tags that still fail it.
 //!
 //! The checks, each over every page of each generator:
 //! - a copy holds the letters painted selected (`Highlight`);
@@ -389,6 +389,81 @@ mod cases {
         out
     }
 
+    // Inline-table pages: inline tables in paragraphs, cells, floats and
+    // inline-blocks, captions above and below their rows, and in their
+    // cells what table pages' cells hold and inline tables again.
+
+    fn inline_table(r: &mut Rng, depth: usize, out: &mut String) {
+        let open = match r.below(8) {
+            // Floated: a block-level table, as td-css blockifies it.
+            0 => "<table style=display:inline-table;float:left>",
+            1 => "<table style=display:inline-table;width:120px>",
+            2 => "<table style=display:inline-table;visibility:hidden>",
+            _ => "<table style=display:inline-table>",
+        };
+        wrapped(out, open, "</table>", |out| {
+            let caption = r.below(4);
+            if caption == 0 {
+                wrapped(out, "<caption>", "</caption>", |out| words(r, out));
+            }
+            for _ in 0..r.below(3) {
+                wrapped(out, "<tr>", "</tr>", |out| {
+                    for _ in 0..1 + r.below(3) {
+                        wrapped(out, "<td>", "</td>", |out| {
+                            if depth < 2 && r.below(4) == 0 {
+                                words(r, out);
+                                inline_table(r, depth + 1, out);
+                                words(r, out);
+                            } else {
+                                cell(r, depth, out);
+                            }
+                        });
+                    }
+                });
+            }
+            if caption == 1 {
+                wrapped(
+                    out,
+                    "<caption style=caption-side:bottom>",
+                    "</caption>",
+                    |out| words(r, out),
+                );
+            }
+        });
+    }
+
+    fn inline_table_page(seed: u64) -> String {
+        let mut r = Rng::new(seed, 0x1_7ab1e);
+        let mut out = body(&mut r, 60, 400);
+        for _ in 0..1 + r.below(3) {
+            match r.below(6) {
+                0..=2 => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                    words(&mut r, out);
+                    inline_table(&mut r, 0, out);
+                    words(&mut r, out);
+                    if r.below(2) == 0 {
+                        inline_table(&mut r, 0, out);
+                        words(&mut r, out);
+                    }
+                }),
+                3 => wrapped(&mut out, "<div style=float:left>", "</div>", |out| {
+                    words(&mut r, out);
+                    inline_table(&mut r, 0, out);
+                }),
+                4 => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                    words(&mut r, out);
+                    wrapped(out, "<span style=display:inline-block>", "</span>", |out| {
+                        words(&mut r, out);
+                        inline_table(&mut r, 0, out);
+                    });
+                    words(&mut r, out);
+                }),
+                _ => table(&mut r, 0, &mut out),
+            }
+        }
+        out
+    }
+
     // List pages: lists in floats, floats before and after lists, floats
     // first, among and last in an item, and lists within those.
 
@@ -696,7 +771,7 @@ mod cases {
             Some(true)
         } else if matches!(
             style.get(Property::Display),
-            Some(ComputedValue::Keyword("inline-block"))
+            Some(ComputedValue::Keyword("inline-block" | "inline-table"))
         ) {
             Some(false)
         } else {
@@ -1408,5 +1483,10 @@ mod cases {
     #[test]
     fn list_pages_copy_as_they_are_painted() {
         run("list", 2_000_000, list_page);
+    }
+
+    #[test]
+    fn inline_table_pages_copy_as_they_are_painted() {
+        run("inline-table", 3_000_000, inline_table_page);
     }
 }
