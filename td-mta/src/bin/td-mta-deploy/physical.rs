@@ -157,17 +157,26 @@ fn read_manifest(path: &Path, source: &str, timeline: u32) -> R<(Json, u64)> {
     Ok((range, start))
 }
 
+/// The recovery volume is a private root directory on another device
+/// than the live cluster's.
+pub(super) fn recovery_volume() -> R<()> {
+    let meta = match fs::symlink_metadata(VOLUME) {
+        Ok(meta) => meta,
+        Err(e) => return Err(fmt(format_args!("private recovery mount {VOLUME}: {e}"))?.into()),
+    };
+    require(
+        meta.is_dir()
+            && meta.uid() == 0
+            && meta.dev() != fs::metadata(PGDATA)?.dev()
+            && meta.mode() & 0o777 == 0o700,
+        "private recovery mount",
+    )
+}
+
 impl Recovery {
     pub(super) fn new(h: &Deployment) -> R<Self> {
         let volume = Path::new(VOLUME);
-        let meta = fs::symlink_metadata(volume)?;
-        require(
-            meta.is_dir()
-                && meta.uid() == 0
-                && meta.dev() != fs::metadata(PGDATA)?.dev()
-                && meta.mode() & 0o777 == 0o700,
-            "private recovery mount",
-        )?;
+        recovery_volume()?;
         let point = fmt(format_args!("td_cut_{}", random_hex(16)?))?;
         let mut receipt = Json::Obj(Vec::new());
         set(&mut receipt, "point", Json::Str(owned(&point)?))?;

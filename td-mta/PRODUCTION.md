@@ -745,7 +745,8 @@ development checkout:
    stepping stone. A plain `./td-mta/deploy` refuses and names this
    command, with STONE filled in, as `approve`. Its outcome names step 2.
 2. `./td-mta/deploy --postgres-socket`: the fenced transport cutover,
-   under the stepping stone.
+   under the stepping stone. Run it first with `--plan` to check it
+   without changing anything (below).
 3. `./td-mta/deploy`: the newest verified main, as for any update. With
    no passing verdict after 290c6de7d here it stays in the stepping-stone
    range and says so; wait for the runner's verdict on a newer head, or
@@ -884,6 +885,27 @@ stay in the job directory for the rollback window. The receipt's
 `socket_retired_checks` names the checks. `install-td-mta
 --operations-services` refuses a `--tls-certificate` that names no
 file, so generating from the old options brings none of them back.
+
+`./td-mta/deploy --postgres-socket --plan` runs the cutover's checks
+up to its rehearsal and stops before it changes anything: the
+preflight, with the readiness settings and the socket group read as
+they are (a check refuses while a readiness setting is missing, since
+the cutover installs those before it stages); staging, with every
+guard above; and what the cutover requires before its fence, read only:
+the fence and socket directories, if present, the recovery volume and
+its room for the rehearsal's base backup, the backup and health
+timers, and the public probes. It does not rehearse, since the
+rehearsal's base backup and trial server are neither cheap nor apart
+from the live host, and like the cutover it stops at the first refusal.
+It writes its job directory (the receipt and the staged files), the
+controller under `/opt/td-mta/lib/td-mta/deploy` as every job does, and
+the activation lock; its health preflight starts the status and health
+oneshots, as every job's does. It reads systemd's loaded units, so run
+`systemctl daemon-reload` after clearing a refusal by hand. On the
+socket it runs that run's checks and names the check units a
+`--postgres-socket` there would retire. Its outcome is
+`socket-cutover-checked`, whose `next` is the cutover; a refusal is
+`failed`, naming what to clear.
 
 Each refusal names the unit or file. To clear one, make it the form
 above or remove it by hand: disable and unlink a check that is not the
@@ -1191,6 +1213,11 @@ configuration"; every other mode holds the following:
     is `--postgres-socket`. A stepping-stone job that ends unseen or
     leaves its fence is `unknown` or `failed` with `next` null, since
     `--recover` does not model the loopback-TLS controller's jobs;
+  - `socket-cutover-checked`: `--postgres-socket --plan` ran its checks
+    and changed nothing; `next` is `--postgres-socket`, with this run's
+    `--window-seconds`. A check job that exits without saying so in its
+    receipt is `unknown` with `next` null; one that did not report is
+    `unknown` with `next` the check again, since it takes no fence;
   - `refused-irreversible`: the deployment would migrate the database
     and was not given `--irreversible --schema-target N --revision HEX`
     for that migration. `next` is null; `approve` is the command that
@@ -1207,7 +1234,8 @@ configuration"; every other mode holds the following:
   instead. A job that leaves the deployment fence held, or whose outcome
   is unknown, is followed by `--recover` (except the stepping stone's,
   and a socket cutover that left its fence, which `--recover` does not
-  model: their `next` is null), which waits for no running
+  model: their `next` is null; and a check, which takes no fence and is
+  followed by itself), which waits for no running
   job: it refuses while one holds the activation lock. A recovery that
   leaves the fence is followed by itself too, unless it refused the
   fence's kind, which no rerun changes.

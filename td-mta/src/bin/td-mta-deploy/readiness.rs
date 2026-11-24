@@ -206,6 +206,26 @@ pub(crate) fn tls_only_lines() -> impl Iterator<Item = &'static str> {
         .filter(|line| !HEALTH_CHECKS.lines().any(|kept| kept == *line))
 }
 
+/// What `prepare` requires, changing nothing: true when every setting is
+/// in place and the aggregate qualifies, false when `prepare` would
+/// install the missing ones over the commands it replaces.
+pub(crate) fn check(host: &Host, tls: bool) -> R<bool> {
+    let mut complete = true;
+    for file in settings(Path::new(UNIT_DIR), tls)? {
+        complete &= files::present(&file)?;
+    }
+    if complete {
+        qualify(host, tls)?;
+    } else {
+        check_commands(
+            &command_property(host, HEALTH, BUS_PATH)?,
+            true,
+            checks(tls),
+        )?;
+    }
+    Ok(complete)
+}
+
 pub(crate) fn prepare(host: &Host, tls: bool) -> R<()> {
     let mut missing = Vec::new();
     for file in settings(Path::new(UNIT_DIR), tls)? {

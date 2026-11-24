@@ -850,3 +850,162 @@ fn installer_numbers_name_at_most_thirty_two_checks() {
         assert_eq!(tls_checks(&show, &dirs).unwrap().len() == 1, found, "{n}");
     }
 }
+
+struct Recorded(Vec<&'static str>, Option<&'static str>);
+
+impl Recorded {
+    fn step(&mut self, step: &'static str) -> R<()> {
+        self.0.push(step);
+        match self.1 {
+            Some(failing) if failing == step => Err("refused".into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl CutoverSteps for Recorded {
+    fn prepare(&mut self) -> R<()> {
+        self.step("prepare")
+    }
+    fn inspect(&mut self) -> R<()> {
+        self.step("inspect")
+    }
+    fn preflight(&mut self) -> R<()> {
+        self.step("preflight")
+    }
+    fn stage(&mut self) -> R<()> {
+        self.step("stage")
+    }
+    fn checked(&mut self) -> R<()> {
+        self.step("checked")
+    }
+    fn cut_over(&mut self) -> R<()> {
+        self.step("cut-over")
+    }
+}
+
+impl SocketSteps for Recorded {
+    fn transport(&mut self) -> R<()> {
+        self.step("transport")
+    }
+    fn prepare(&mut self) -> R<()> {
+        self.step("prepare")
+    }
+    fn inspect(&mut self) -> R<()> {
+        self.step("inspect")
+    }
+    fn preflight(&mut self) -> R<()> {
+        self.step("preflight")
+    }
+    fn retire(&mut self) -> R<()> {
+        self.step("retire")
+    }
+    fn pending(&mut self) -> R<()> {
+        self.step("pending")
+    }
+    fn verify(&mut self) -> R<()> {
+        self.step("verify")
+    }
+    fn checked(&mut self) -> R<()> {
+        self.step("checked")
+    }
+    fn finished(&mut self) -> R<()> {
+        self.step("finished")
+    }
+}
+
+#[test]
+fn a_check_only_cutover_reads_stages_and_checks_and_never_changes_the_host() {
+    let run = |plan: bool, failing: Option<&'static str>| {
+        let mut steps = Recorded(Vec::new(), failing);
+        let ok = cutover(&mut steps, plan).is_ok();
+        (steps.0, ok)
+    };
+    assert_eq!(
+        run(true, None),
+        (vec!["inspect", "preflight", "stage", "checked"], true)
+    );
+    assert_eq!(
+        run(false, None),
+        (vec!["prepare", "preflight", "cut-over"], true)
+    );
+    // A refusal ends a check there.
+    assert_eq!(run(true, Some("inspect")), (vec!["inspect"], false));
+    assert_eq!(
+        run(true, Some("stage")),
+        (vec!["inspect", "preflight", "stage"], false)
+    );
+    // On the socket, a check reads and records; a run installs and retires.
+    let on = |plan: bool| {
+        let mut steps = Recorded(Vec::new(), None);
+        on_socket(&mut steps, plan).unwrap();
+        steps.0
+    };
+    assert_eq!(
+        on(true),
+        [
+            "transport",
+            "inspect",
+            "preflight",
+            "pending",
+            "verify",
+            "checked"
+        ]
+    );
+    assert_eq!(
+        on(false),
+        [
+            "transport",
+            "prepare",
+            "preflight",
+            "retire",
+            "verify",
+            "finished"
+        ]
+    );
+    // Only a job that asks is a check.
+    for (job, plan) in [
+        (r#"{"mode":"postgres-socket"}"#, Some(false)),
+        (r#"{"plan_only":false}"#, Some(false)),
+        (r#"{"plan_only":true}"#, Some(true)),
+        (r#"{"plan_only":"true"}"#, None),
+        (r#"{"plan_only":null}"#, None),
+    ] {
+        assert_eq!(plan_only(&td_json::parse(job).unwrap()).ok(), plan, "{job}");
+    }
+}
+
+#[test]
+fn a_socket_directory_is_checked_only_when_it_exists() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let scratch = td_fs::TempDir::new("mta-socket-directory").unwrap();
+    let path = scratch.path().join("socket");
+    let (uid, gid) = {
+        let meta = fs::metadata(scratch.path()).unwrap();
+        (meta.uid(), meta.gid())
+    };
+    assert!(!socket_directory_owned(&path, uid, None).unwrap());
+    assert!(!socket_directory_owned(&path, uid, Some(gid)).unwrap());
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(socket_directory_owned(&path, uid, Some(gid)).unwrap());
+    // A group still to be created owns nothing yet.
+    assert!(socket_directory_owned(&path, uid, None).is_err());
+    assert!(socket_directory_owned(&path, uid.wrapping_add(1), Some(gid)).is_err());
+    assert!(socket_directory_owned(&path, uid, Some(gid.wrapping_add(1))).is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(socket_directory_owned(&path, uid, Some(gid)).is_err());
+}
+
+#[test]
+fn the_fence_needs_the_backup_and_health_timers() {
+    let timers = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    fence::required_timers(&timers(&[
+        "td-mta-health.timer",
+        "td-mta-maint-backup.timer",
+        "td-mta-maint-tls-0.timer",
+    ]))
+    .unwrap();
+    assert!(fence::required_timers(&timers(&["td-mta-health.timer"])).is_err());
+    assert!(fence::required_timers(&[]).is_err());
+}

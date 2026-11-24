@@ -1447,3 +1447,115 @@ fn a_refusal_before_the_job_carries_its_next_command() {
     let refusal = refusal.downcast::<Refusal>().unwrap();
     assert_eq!(refusal.next.unwrap(), ["td-mta/deploy", "--irreversible"]);
 }
+
+#[test]
+fn a_check_only_socket_cutover_names_the_cutover_once_it_changed_nothing() {
+    let (args, opts) = run_of(&["--postgres-socket", "--plan", "--config", "/t.json"]);
+    let opts = opts.unwrap();
+    assert!(opts.socket && opts.plan);
+    let digest = "c".repeat(64);
+    for refused in [
+        &["--postgres-socket", "--expect-digest", digest.as_str()][..],
+        &["--postgres-binaries", "--plan"][..],
+        &["--retire-rollback", "--irreversible", "--plan"][..],
+        &["--plan"][..],
+    ] {
+        assert!(options(refused).is_err(), "{refused:?}");
+    }
+    let job = |exit: Option<i32>, record: &str, post: Option<bool>| Job {
+        receipt: "/var/lib/td-mta-operator/deploy-abcdefgh/receipt.json".to_string(),
+        record: td_json::parse(record).ok(),
+        exit,
+        fence: Some(false),
+        post,
+        stepping: false,
+    };
+    let checked = r#"{"status":"socket cutover checked: nothing changed","socket_checked":true}"#;
+    let end = ended(&opts, args, &job(Some(0), checked, Some(true))).unwrap();
+    assert_eq!(end.result, "socket-cutover-checked");
+    assert!(end.error.is_none() && end.approve.is_none());
+    assert_eq!(
+        end.next.unwrap().join(" "),
+        "td-mta/deploy --postgres-socket --config /t.json"
+    );
+    // The window the check was given goes to the cutover it names.
+    let (window_args, window) = run_of(&["--postgres-socket", "--plan", "--window-seconds", "600"]);
+    let end = ended(
+        &window.unwrap(),
+        window_args,
+        &job(Some(0), checked, Some(true)),
+    )
+    .unwrap();
+    assert_eq!(
+        end.next.unwrap().join(" "),
+        "td-mta/deploy --postgres-socket --window-seconds 600"
+    );
+    // A job that does not say it changed nothing is not taken as a check.
+    let silent = ended(
+        &opts,
+        args,
+        &job(Some(0), r#"{"status":"verified"}"#, Some(true)),
+    )
+    .unwrap();
+    assert_eq!(silent.result, "unknown");
+    assert!(silent.next.is_none());
+    // A refused check ends as any failed job, naming no cutover.
+    let refused = ended(
+        &opts,
+        args,
+        &job(
+            Some(1),
+            r#"{"status":"deployment failed","error":"td-mta-maint-tls-7.service names loopback TLS material or an unconverted connection file"}"#,
+            None,
+        ),
+    )
+    .unwrap();
+    assert_eq!(refused.result, "failed");
+    assert!(refused.next.is_none());
+    let unchecked = ended(&opts, args, &job(Some(0), checked, Some(false))).unwrap();
+    assert_eq!(unchecked.result, "check-failed");
+    // A check that did not report is run again, never recovered.
+    for (exit, fence) in [(None, None), (Some(255), Some(false)), (Some(1), None)] {
+        let lost = Job {
+            fence,
+            ..job(
+                exit,
+                r#"{"status":"staging private socket transport"}"#,
+                None,
+            )
+        };
+        let end = ended(&opts, args, &lost).unwrap();
+        assert_eq!(end.result, "unknown", "{exit:?}");
+        assert!(!end.error.as_deref().unwrap().contains("--recover"));
+        assert_eq!(
+            end.next.unwrap().join(" "),
+            "td-mta/deploy --postgres-socket --plan --config /t.json"
+        );
+    }
+    // A refusal is reported whatever the fence's state.
+    let refused = Job {
+        fence: None,
+        ..job(
+            Some(1),
+            r#"{"status":"deployment failed","error":"timer preflight"}"#,
+            None,
+        )
+    };
+    let end = ended(&opts, args, &refused).unwrap();
+    assert_eq!(end.result, "failed");
+    assert_eq!(end.error.as_deref(), Some("timer preflight"));
+    assert!(end.next.is_none());
+    // A fence another job holds is not the check's to recover.
+    let fenced = Job {
+        fence: Some(true),
+        ..job(
+            Some(1),
+            r#"{"status":"deployment failed","error":"probe failed"}"#,
+            None,
+        )
+    };
+    let end = ended(&opts, args, &fenced).unwrap();
+    assert_eq!(end.result, "failed");
+    assert!(end.next.is_none() && end.approve.is_none());
+    assert!(end.error.unwrap().contains("never takes"));
+}

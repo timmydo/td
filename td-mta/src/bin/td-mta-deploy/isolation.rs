@@ -354,6 +354,21 @@ pub(crate) fn db_group(host: &Host, create: bool) -> R<u32> {
     Ok(gid)
 }
 
+/// The socket group's id, or None while it does not exist, which
+/// `db_group(host, true)` would create.
+pub(crate) fn db_group_present(host: &Host) -> R<Option<u32>> {
+    let found = host.exec(
+        host.cmd("getent").args(["group", DB_GROUP]),
+        &[],
+        Duration::from_secs(10),
+        false,
+    )?;
+    if found.status.code() == Some(2) {
+        return Ok(None);
+    }
+    db_group(host, false).map(Some)
+}
+
 fn make_directory(path: &Path, mode: u32) -> R<()> {
     DirBuilder::new().mode(mode).create(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;

@@ -41,8 +41,10 @@ const STEPPING_LEFT: &str = "the stepping-stone job ended unseen or left the dep
 const UNNAMED: &str = "an irreversible deployment names its migration: pass --irreversible --schema-target N --revision HEX together";
 /// The refusal when main no longer selects an authorised revision.
 const MOVED: &str = "main no longer selects the revision --revision authorised: its migration needs its own decision";
+const CHECK_LOST: &str = "the check-only job did not report or its fence could not be read; it takes no fence and changes nothing, so run it again once its unit has stopped";
+const CHECK_FENCED: &str = "a deployment fence is held, which a check-only job never takes: /var/lib/td-mta-operator/deployment-fence names the job that holds it";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
-       td-mta/deploy --postgres-socket [OPTIONS]
+       td-mta/deploy --postgres-socket [--plan] [OPTIONS]
        td-mta/deploy --postgres-binaries [--to-debian] [OPTIONS]
        td-mta/deploy --retire-rollback --irreversible [OPTIONS]
        td-mta/deploy --recover [OPTIONS]
@@ -65,6 +67,8 @@ move the live release's database from loopback TLS to its private socket, or
 switch it from the Debian PostgreSQL or another td closure to td's
 source-built one, applying what the reviewed minor-release table says each
 release in between needs; --to-debian returns it to the retained Debian one.
+--postgres-socket --plan stages and checks the socket cutover in its job
+directory and stops before it changes anything.
 --retire-rollback deletes rollback material older than seven days: earlier
 job directories, physical recovery copies, and the Debian PostgreSQL tree
 once a verified switch left it. --recover finishes or rolls back a job
@@ -275,8 +279,12 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         "configuration convergence keeps the live release, is its own job and has no writer window",
     )?;
     require(
-        out.converge || !(out.plan || out.expect.is_some()),
-        "--plan and --expect-digest apply to --converge-config",
+        out.converge || out.expect.is_none(),
+        "--expect-digest applies to --converge-config",
+    )?;
+    require(
+        out.converge || out.socket || !out.plan,
+        "--plan applies to --converge-config and --postgres-socket",
     )?;
     require(
         !(out.plan && out.expect.is_some()),
@@ -1171,6 +1179,7 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
     set(&mut spec, "skip_tests", Json::Bool(opts.skip))?;
     if opts.socket {
         set(&mut spec, "mode", Json::Str(owned("postgres-socket")?))?;
+        set(&mut spec, "plan_only", Json::Bool(opts.plan))?;
     }
     if opts.retire {
         set(&mut spec, "mode", Json::Str(owned("retire-rollback")?))?;
@@ -1725,6 +1734,15 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             approve: None,
             not_before: None,
         },
+        // A check takes no fence and changes nothing: one that did not
+        // report is run again, never recovered.
+        (None | Some(255), _) if opts.socket && opts.plan => Ended {
+            result: "unknown",
+            error: Some(owned(CHECK_LOST)?),
+            next: Some(again(args, &[])?),
+            approve: None,
+            not_before: None,
+        },
         (None | Some(255), _) => unknown(
             "the SSH connection ended before the job reported: --recover finishes it once it stops",
         )?,
@@ -1747,6 +1765,38 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             approve: None,
             not_before,
         },
+        // A check-only run says it stopped before any change.
+        (Some(0), _) if opts.socket && opts.plan => {
+            let checked = job
+                .record
+                .as_ref()
+                .and_then(|r| r.get("socket_checked"))
+                .and_then(Json::as_bool)
+                == Some(true);
+            if checked {
+                Ended {
+                    result: "socket-cutover-checked",
+                    error: None,
+                    next: Some(transport::named_command(
+                        &["--postgres-socket"],
+                        None,
+                        opts,
+                    )?),
+                    approve: None,
+                    not_before: None,
+                }
+            } else {
+                Ended {
+                    result: "unknown",
+                    error: Some(owned(
+                        "the check-only job finished without saying it changed nothing: read its receipt",
+                    )?),
+                    next: None,
+                    approve: None,
+                    not_before: None,
+                }
+            }
+        }
         (Some(0), _) => Ended {
             result: "succeeded",
             error: None,
@@ -1759,6 +1809,17 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             result: "busy",
             error,
             next: Some(again(args, &[])?),
+            approve: None,
+            not_before: None,
+        },
+        // A check takes no fence: one held is another job's.
+        (Some(_), Some(true)) if opts.socket && opts.plan && !names_recover => Ended {
+            result: "failed",
+            error: Some(fmt(format_args!(
+                "{}; {CHECK_FENCED}",
+                error.as_deref().unwrap_or("the job failed")
+            ))?),
+            next: None,
             approve: None,
             not_before: None,
         },
@@ -1782,6 +1843,21 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             } else {
                 Some(recover()?)
             },
+            approve: None,
+            not_before: None,
+        },
+        // A refused check's fence does not bear on its result.
+        (Some(_), None) if opts.socket && opts.plan && error.is_some() => Ended {
+            result: "failed",
+            error,
+            next: None,
+            approve: None,
+            not_before: None,
+        },
+        (Some(_), None) if opts.socket && opts.plan => Ended {
+            result: "unknown",
+            error: Some(owned(CHECK_LOST)?),
+            next: Some(again(args, &[])?),
             approve: None,
             not_before: None,
         },

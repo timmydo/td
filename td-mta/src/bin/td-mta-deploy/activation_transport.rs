@@ -620,12 +620,282 @@ fn socket_directory(uid: u32, gid: u32) -> R<bool> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
         Err(e) => return Err(e.into()),
     };
-    let meta = fs::symlink_metadata(path)?;
     require(
-        meta.is_dir() && meta.uid() == uid && meta.gid() == gid && meta.mode() & 0o7777 == 0o750,
-        "PostgreSQL socket directory ownership or mode",
+        socket_directory_owned(path, uid, Some(gid))?,
+        "missing PostgreSQL socket directory",
     )?;
     Ok(created)
+}
+
+/// Whether the socket directory `path` exists, refusing one that is not
+/// `uid`'s and the socket group `gid`'s (None: a group still to be
+/// created), mode 0750.
+fn socket_directory_owned(path: &Path, uid: u32, gid: Option<u32>) -> R<bool> {
+    let meta = match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+        Ok(meta) => meta,
+    };
+    require(
+        meta.is_dir()
+            && meta.uid() == uid
+            && Some(meta.gid()) == gid
+            && meta.mode() & 0o7777 == 0o750,
+        "PostgreSQL socket directory ownership or mode",
+    )?;
+    Ok(true)
+}
+
+/// Whether the job asks only for a check (`plan_only`, absent in a job
+/// from a launcher that has no such run).
+pub(super) fn plan_only(job: &Json) -> R<bool> {
+    match job.get("plan_only") {
+        None => Ok(false),
+        Some(flag) => flag.as_bool().ok_or_else(|| "invalid plan flag".into()),
+    }
+}
+
+/// The steps of a socket cutover from loopback TLS. A check-only run
+/// (`--postgres-socket --plan`) reads what `prepare` would install,
+/// stages in its own job directory, and checks what the cutover requires
+/// before its fence, stopping before its rehearsal, its fence or any live
+/// change. Only `cutover` chooses between the two.
+pub(super) trait CutoverSteps {
+    /// Install the readiness settings and create the socket group.
+    fn prepare(&mut self) -> R<()>;
+    /// Read the readiness settings and socket group as they are.
+    fn inspect(&mut self) -> R<()>;
+    /// The live release's identity, configuration and health.
+    fn preflight(&mut self) -> R<()>;
+    /// Stage every file the cutover would change, and run its guards.
+    fn stage(&mut self) -> R<()>;
+    /// What the cutover requires before its fence, changing nothing.
+    fn checked(&mut self) -> R<()>;
+    /// The cutover itself, which stages under its own rollback.
+    fn cut_over(&mut self) -> R<()>;
+}
+
+pub(super) fn cutover(steps: &mut impl CutoverSteps, plan: bool) -> R<()> {
+    if plan {
+        steps.inspect()?;
+        steps.preflight()?;
+        steps.stage()?;
+        return steps.checked();
+    }
+    steps.prepare()?;
+    steps.preflight()?;
+    steps.cut_over()
+}
+
+/// The steps of `--postgres-socket` on a host already on the socket,
+/// which finishes retiring what a cutover left; a check reports it.
+pub(super) trait SocketSteps {
+    /// The private socket state every activation expects.
+    fn transport(&mut self) -> R<()>;
+    /// Install the socket layout's readiness settings.
+    fn prepare(&mut self) -> R<()>;
+    /// Read the readiness settings as they are.
+    fn inspect(&mut self) -> R<()>;
+    /// The live release's identity and configuration, and the retired
+    /// material's check units.
+    fn preflight(&mut self) -> R<()>;
+    /// Retire what is left of the loopback transport.
+    fn retire(&mut self) -> R<()>;
+    /// Record what `retire` would retire.
+    fn pending(&mut self) -> R<()>;
+    /// The live release's health and public listeners.
+    fn verify(&mut self) -> R<()>;
+    fn checked(&mut self) -> R<()>;
+    fn finished(&mut self) -> R<()>;
+}
+
+pub(super) fn on_socket(steps: &mut impl SocketSteps, plan: bool) -> R<()> {
+    steps.transport()?;
+    if plan {
+        steps.inspect()?;
+    } else {
+        steps.prepare()?;
+    }
+    steps.preflight()?;
+    if plan {
+        steps.pending()?;
+    } else {
+        steps.retire()?;
+    }
+    steps.verify()?;
+    if plan {
+        steps.checked()
+    } else {
+        steps.finished()
+    }
+}
+
+/// The receipt event that ends a check-only run.
+const SOCKET_CHECKED: &str = "socket cutover checked: nothing changed";
+const ON_SOCKET: &str = "already on the private socket";
+
+/// The host side of `CutoverSteps`.
+struct LiveCutover<'a> {
+    deployment: &'a mut Deployment,
+    cut: Cutover,
+    /// The socket group; None while a check finds it absent.
+    gid: Option<u32>,
+}
+
+impl LiveCutover<'_> {
+    fn group(&mut self, gid: Option<u32>) -> R<()> {
+        self.gid = gid;
+        set(
+            &mut self.deployment.record,
+            "socket_group",
+            gid.map_or(Json::Null, Json::from),
+        )
+    }
+}
+
+impl CutoverSteps for LiveCutover<'_> {
+    fn prepare(&mut self) -> R<()> {
+        let d = &mut *self.deployment;
+        require(
+            !Path::new(PG_FENCE).try_exists()?,
+            "stale PostgreSQL socket fence: inspect the previous receipt",
+        )?;
+        crate::readiness::prepare(&d.host, true)?;
+        let gid = isolation::db_group(&d.host, true)?;
+        self.group(Some(gid))
+    }
+
+    fn inspect(&mut self) -> R<()> {
+        let d = &mut *self.deployment;
+        require(
+            !Path::new(PG_FENCE).try_exists()?,
+            "stale PostgreSQL socket fence: inspect the previous receipt",
+        )?;
+        // Staging reads the settings `prepare` installs first.
+        require(
+            crate::readiness::check(&d.host, true)?,
+            "the readiness settings are not all installed: the cutover installs them before it stages, so a check cannot stage",
+        )?;
+        let gid = isolation::db_group_present(&d.host)?;
+        self.group(gid)
+    }
+
+    fn preflight(&mut self) -> R<()> {
+        let d = &mut *self.deployment;
+        d.journal_identity()?;
+        d.config(&d.previous, &[], d.isolated)?;
+        d.healthy(&d.previous)
+    }
+
+    fn stage(&mut self) -> R<()> {
+        self.deployment.stage_cutover(&mut self.cut)
+    }
+
+    fn checked(&mut self) -> R<()> {
+        let d = &mut *self.deployment;
+        // The cutover creates the fence directory if it is absent.
+        match fs::symlink_metadata(parent(Path::new(PG_FENCE))?) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            _ => {
+                fence::fence_directory(false)?;
+            }
+        }
+        let path = Path::new(SOCKET_DIR);
+        files::safe_parents(path)?;
+        socket_directory_owned(path, fs::metadata(PGDATA)?.uid(), self.gid)?;
+        // The rehearsal's volume and room, and the fence's timers.
+        crate::physical::recovery_volume()?;
+        d.rehearsal_capacity(Path::new(crate::physical::VOLUME))?;
+        fence::required_timers(&d.active_timers()?)?;
+        d.probes.probe("smtp")?;
+        d.probes.probe("jmap")?;
+        set(&mut d.record, "socket_checked", true.into())?;
+        d.event(SOCKET_CHECKED)?;
+        Ok(())
+    }
+
+    fn cut_over(&mut self) -> R<()> {
+        let gid = self.gid.ok_or("missing PostgreSQL socket group")?;
+        self.deployment.guarded(
+            &mut self.cut,
+            |d, cut| d.socket_cutover(cut, gid),
+            Deployment::restore_transport,
+        )
+    }
+}
+
+/// The host side of `SocketSteps`.
+struct LiveSocketHost<'a> {
+    deployment: &'a mut Deployment,
+    checks: Vec<TlsCheck>,
+}
+
+impl SocketSteps for LiveSocketHost<'_> {
+    fn transport(&mut self) -> R<()> {
+        self.deployment.socket_preflight()
+    }
+
+    fn prepare(&mut self) -> R<()> {
+        crate::readiness::prepare(&self.deployment.host, false)
+    }
+
+    fn inspect(&mut self) -> R<()> {
+        let complete = crate::readiness::check(&self.deployment.host, false)?;
+        set(
+            &mut self.deployment.record,
+            "socket_readiness_complete",
+            complete.into(),
+        )
+    }
+
+    fn preflight(&mut self) -> R<()> {
+        let d = &mut *self.deployment;
+        d.journal_identity()?;
+        d.config(&d.previous, &[], d.isolated)?;
+        // A cutover that failed after admission may have left the retired
+        // transport's units or material; finish retiring them.
+        self.checks = d.check_units()?;
+        Ok(())
+    }
+
+    fn retire(&mut self) -> R<()> {
+        let d = &mut *self.deployment;
+        let root = child(&d.work, "postgres-socket")?;
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        d.retire_tls(&root, &self.checks)
+    }
+
+    fn pending(&mut self) -> R<()> {
+        let mut names = Vec::new();
+        for check in &self.checks {
+            td_alloc::push(&mut names, Json::Str(owned(&check.name)?))?;
+        }
+        set(
+            &mut self.deployment.record,
+            "socket_retired_checks",
+            Json::Arr(names),
+        )
+    }
+
+    fn verify(&mut self) -> R<()> {
+        let d = &mut *self.deployment;
+        d.healthy(&d.previous)?;
+        d.probes.probe("smtp")?;
+        d.probes.probe("jmap")?;
+        d.event(ON_SOCKET)?;
+        Ok(())
+    }
+
+    fn checked(&mut self) -> R<()> {
+        let d = &mut *self.deployment;
+        set(&mut d.record, "socket_checked", true.into())?;
+        d.event(SOCKET_CHECKED)?;
+        Ok(())
+    }
+
+    fn finished(&mut self) -> R<()> {
+        Ok(())
+    }
 }
 
 impl Deployment {
@@ -679,35 +949,18 @@ impl Deployment {
             self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous,
             "the socket cutover keeps the live release",
         )?;
+        let plan = plan_only(&self.record)?;
         self.check_source()?;
         if !self.tls {
-            self.socket_preflight()?;
-            crate::readiness::prepare(&self.host, false)?;
-            self.journal_identity()?;
-            self.config(&self.previous, &[], self.isolated)?;
-            // A cutover that failed after admission may have left the retired
-            // transport's units or material; finish retiring them.
-            let checks = self.check_units()?;
-            let root = child(&self.work, "postgres-socket")?;
-            fs::DirBuilder::new().mode(0o700).create(&root)?;
-            self.retire_tls(&root, &checks)?;
-            self.healthy(&self.previous)?;
-            self.probes.probe("smtp")?;
-            self.probes.probe("jmap")?;
-            self.event("already on the private socket")?;
-            return Ok(());
+            return on_socket(
+                &mut LiveSocketHost {
+                    deployment: self,
+                    checks: Vec::new(),
+                },
+                plan,
+            );
         }
-        require(
-            !Path::new(PG_FENCE).try_exists()?,
-            "stale PostgreSQL socket fence: inspect the previous receipt",
-        )?;
-        crate::readiness::prepare(&self.host, true)?;
-        let gid = isolation::db_group(&self.host, true)?;
-        set(&mut self.record, "socket_group", gid.into())?;
-        self.journal_identity()?;
-        self.config(&self.previous, &[], self.isolated)?;
-        self.healthy(&self.previous)?;
-        let mut cut = Cutover {
+        let cut = Cutover {
             root: child(&self.work, "postgres-socket")?,
             files: Vec::new(),
             created_dir: false,
@@ -716,19 +969,26 @@ impl Deployment {
             excluded: Vec::new(),
             checks: Vec::new(),
         };
-        self.guarded(
-            &mut cut,
-            |d, cut| d.socket_cutover(cut, gid),
-            Self::restore_transport,
+        cutover(
+            &mut LiveCutover {
+                deployment: self,
+                cut,
+                gid: None,
+            },
+            plan,
         )
+    }
+
+    fn stage_cutover(&mut self, cut: &mut Cutover) -> R<()> {
+        self.event("staging private socket transport")?;
+        fs::DirBuilder::new().mode(0o700).create(&cut.root)?;
+        let staging = self.stage(cut)?;
+        self.record_staging(cut, &staging)
     }
 
     fn socket_cutover(&mut self, cut: &mut Cutover, gid: u32) -> R<()> {
         let uid = fs::metadata(PGDATA)?.uid();
-        self.event("staging private socket transport")?;
-        fs::DirBuilder::new().mode(0o700).create(&cut.root)?;
-        let staging = self.stage(cut)?;
-        self.record_staging(cut, &staging)?;
+        self.stage_cutover(cut)?;
         // Checked before any fence: the server's include must reach the file.
         fence::fence_directory(true)?;
         cut.created_dir = socket_directory(uid, gid)?;
@@ -832,8 +1092,13 @@ impl Deployment {
 
     fn record_staging(&mut self, cut: &Cutover, staging: &Staging) -> R<()> {
         let mut rules = Vec::new();
+        let verb = if plan_only(&self.record)? {
+            "would drop"
+        } else {
+            "dropped"
+        };
         for rule in &staging.dropped {
-            self.event(&fmt(format_args!("dropped inert local HBA rule: {rule}"))?)?;
+            self.event(&fmt(format_args!("{verb} inert local HBA rule: {rule}"))?)?;
             td_alloc::push(&mut rules, Json::Str(owned(rule)?))?;
         }
         set(&mut self.record, "socket_hba_dropped", Json::Arr(rules))?;

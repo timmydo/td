@@ -502,6 +502,27 @@ impl Deployment {
         result.and(logs).and(cleanup)
     }
 
+    /// Room at `path` for a rehearsal's base backup and trial of the live
+    /// databases.
+    pub(super) fn rehearsal_capacity(&self, path: &Path) -> R<()> {
+        let size = self
+            .sql(
+                "owner",
+                "SELECT sum(pg_database_size(oid)) FROM pg_database",
+                &[],
+                false,
+            )?
+            .parse::<u64>()?;
+        require(
+            free_bytes(path)?
+                > size
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(4 * GIB))
+                    .ok_or("rehearsal size overflow")?,
+            "rehearsal capacity",
+        )
+    }
+
     /// A fresh verified base backup on the recovery volume for `trial`,
     /// removed afterwards whatever happens.
     fn rehearsal(&mut self, trial: impl FnOnce(&mut Self, &mut Recovery) -> R<()>) -> R<()> {
@@ -512,22 +533,7 @@ impl Deployment {
             Json::Str(owned(copy.work.to_str().ok_or("recovery path")?)?),
         )?;
         let result = (|| -> R<()> {
-            let size = self
-                .sql(
-                    "owner",
-                    "SELECT sum(pg_database_size(oid)) FROM pg_database",
-                    &[],
-                    false,
-                )?
-                .parse::<u64>()?;
-            require(
-                free_bytes(&copy.work)?
-                    > size
-                        .checked_mul(2)
-                        .and_then(|n| n.checked_add(4 * GIB))
-                        .ok_or("rehearsal size overflow")?,
-                "rehearsal capacity",
-            )?;
+            self.rehearsal_capacity(&copy.work)?;
             copy.base_backup(self)?;
             trial(self, &mut copy)
         })();

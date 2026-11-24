@@ -68,6 +68,16 @@ pub(super) fn fence_condition() -> R<String> {
     fmt(format_args!("[Unit]\nConditionPathExists=!{FENCE}\n"))
 }
 
+/// The active `timers` include those the fence's health depends on.
+pub(super) fn required_timers(timers: &[String]) -> R<()> {
+    require(
+        ["td-mta-maint-backup.timer", "td-mta-health.timer"]
+            .iter()
+            .all(|required| timers.iter().any(|u| u == required)),
+        "timer preflight",
+    )
+}
+
 pub(super) const PG_FENCE: &str = "/etc/td-mta/postgres-fence.conf";
 pub(super) const FENCE_SETTING: &str = "unix_socket_permissions = 0\n";
 pub(super) const SOCKET: &str = "/var/lib/td-mta-postgres/.s.PGSQL.35432";
@@ -258,12 +268,7 @@ impl Deployment {
             self.socket_preflight()?;
         }
         self.timers = self.active_timers()?;
-        require(
-            ["td-mta-maint-backup.timer", "td-mta-health.timer"]
-                .iter()
-                .all(|required| self.timers.iter().any(|u| u == required)),
-            "timer preflight",
-        )?;
+        required_timers(&self.timers)?;
         let mut recorded = Vec::new();
         for timer in &self.timers {
             td_alloc::push(&mut recorded, Json::Str(owned(timer)?))?;
