@@ -298,7 +298,7 @@ pub struct Laid {
     /// Spans of the lines' ink, `CHUNK` lines each.
     line_spans: BudgetVec<Span>,
     /// Geometry in tree order, a parent before its children, with floats
-    /// after the boxes of their context (`floats_last`).
+    /// and inline-blocks after the boxes around them (`floats_last`).
     painted: BudgetVec<u32>,
     box_spans: BudgetVec<Span>,
     marker_spans: BudgetVec<Span>,
@@ -312,7 +312,8 @@ pub struct Laid {
     /// with the line its first lies on.
     links: BudgetVec<(NodeId, u32)>,
     /// Each line's index among the lines, or `NONE`, of the line it lies
-    /// within: a float's lines lie within the line it was met in.
+    /// within: a float's lines lie within the line it was met in, an
+    /// inline-block's within the line holding it.
     outer: BudgetVec<u32>,
     /// Each inline picture laid, fitted to its box, by node index.
     fits: BudgetVec<Fit>,
@@ -322,10 +323,12 @@ pub struct Laid {
 }
 
 /// `painted`, in tree order with `parents` worked out over it, ordered
-/// by how many floats each box lies in, the box's own counted, then by
-/// tree order: floats after the in-flow boxes of their context, and a
-/// float within a float after its float's (CSS 2.2 appendix E). A parent
-/// stays before its children, as it lies in no more floats than they.
+/// by how many floats and inline-blocks each box lies in, the box's own
+/// counted, then by tree order: floats and inline-blocks after the
+/// in-flow boxes around them, and one within another after it (CSS 2.2
+/// appendix E paints an inline-block as an inline, after the blocks'
+/// backgrounds). A parent stays before its children, as it lies in no
+/// more of them than they.
 fn floats_last(
     layout: &Layout,
     styled: &StyledDocument<'static>,
@@ -345,7 +348,8 @@ fn floats_last(
             .copied()
             .unwrap_or(0);
         if let Some(slot) = depth.get_mut(at as usize) {
-            *slot = parent.saturating_add(u32::from(styled.is_float(geometry)));
+            let apart = styled.is_float(geometry) || styled.is_inline_block(geometry);
+            *slot = parent.saturating_add(u32::from(apart));
         }
     }
     painted.sort_unstable_by_key(|&at| {
@@ -407,10 +411,12 @@ fn fit(
     let mut fits = BudgetVec::new(memory)?;
     let mut short = BudgetVec::new(memory)?;
     let mut work = pictures.work();
+    // An inline-block's placeholder is no picture.
     let inline = layout
         .lines
         .iter()
         .flat_map(|line| line.replaced.iter())
+        .filter(|r| !r.atomic)
         .map(|r| (r.node, r.x, r.y, r.width, r.height));
     let blocks = layout.boxes.iter().filter(|g| g.replaced).map(|g| {
         (
@@ -719,7 +725,7 @@ impl Laid {
             || cancel.load(Ordering::SeqCst),
             memory,
         )?;
-        if styled.styled().has_floats() {
+        if styled.styled().has_nested_lines() {
             floats_last(
                 &layout,
                 styled.styled(),
@@ -783,14 +789,15 @@ impl Laid {
             fits,
             short,
         };
-        if laid.styled.styled().has_floats() {
+        if laid.styled.styled().has_nested_lines() {
             laid.outer = crate::text::nesting(&laid, memory)?;
         }
         Ok(laid)
     }
 
     /// The line `line` lies within, if any: the one a float whose line
-    /// it is was met in.
+    /// it is was met in, or the one holding an inline-block whose line it
+    /// is.
     pub fn outer(&self, line: usize) -> Option<usize> {
         self.outer
             .get(line)
@@ -1107,6 +1114,46 @@ pub(crate) mod tests {
             .filter(|&n| n == node("a") || n == node("b"))
             .collect();
         assert_eq!(order, [node("a"), node("b")]);
+    }
+
+    /// An inline-block's lines lie within the line holding it, one in it
+    /// within its; its box paints after the in-flow boxes around it,
+    /// whose backgrounds would otherwise cover it, and one in it after it.
+    #[test]
+    fn inline_blocks_nest_their_lines_and_paint_after_the_blocks_around_them() {
+        let page = laid(
+            "<body style=margin:0><div id=a style=background:blue>one \
+             <span id=b style=display:inline-block;background:red>in it<br>\
+             two <span id=i style=display:inline-block>three</span></span> after</div>\
+             <div id=c style=background:green>next</div>",
+        );
+        assert!(page.styled().styled().has_inline_blocks());
+        let texts: Vec<String> = page
+            .lines()
+            .iter()
+            .map(|line| {
+                line.fragments
+                    .iter()
+                    .map(|f| crate::text::fragment_text(&page, f))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(texts, ["one  after", "in it", "two ", "three", "next"]);
+        let outer: Vec<_> = (0..5).map(|line| page.outer(line)).collect();
+        assert_eq!(outer, [None, Some(0), Some(0), Some(2), None]);
+        let at = |id: &str| {
+            let node = page.tree().target(id).unwrap();
+            let geometry = page
+                .layout
+                .boxes
+                .iter()
+                .position(|g| g.node == node)
+                .unwrap() as u32;
+            page.painted().iter().position(|&p| p == geometry).unwrap()
+        };
+        assert!(at("a") < at("c") && at("c") < at("b") && at("b") < at("i"));
+        // Its placeholder is no picture to fit.
+        assert!(page.fits().next().is_none());
     }
 
     #[test]

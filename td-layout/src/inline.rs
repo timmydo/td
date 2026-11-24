@@ -1,5 +1,6 @@
 //! Scalar wrapping with DOM-byte provenance. No retained glyph array.
 use crate::block::float::{units, Floats, Item, Kind, View};
+use crate::block::BoxGeometry;
 use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
     cancelled, keyword, BoxId, Error, Limits, StyleId, StyledDocument, CANCEL_INTERVAL,
@@ -48,6 +49,9 @@ pub struct TextFragment {
     pub x: f64,
     pub width: f64,
 }
+/// A replaced element's box in its line, or, `atomic`, an inline-block's
+/// border box: a placeholder holding its place, which draws nothing, its
+/// box and lines laid apart (DESIGN.md §5, "Inline-blocks").
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplacedFragment {
     pub node: NodeId,
@@ -56,6 +60,7 @@ pub struct ReplacedFragment {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    pub atomic: bool,
 }
 /// A single fragment lives in its line; longer runs own budgeted storage.
 /// `M` rides in the storage's own tag word (a line's `LineTag`), so it
@@ -277,11 +282,14 @@ pub(crate) struct Pending {
     tab: bool,
     atomic: Option<Atomic>,
 }
-/// An item laid whole: an image, or an inside list marker.
+/// An item laid whole: an image, an inside list marker, or an
+/// inline-block, its index among the items and its border box from its
+/// margin box's top left.
 #[derive(Clone, Copy)]
 enum Atomic {
     Image(f64, f64, [f64; 4]),
     Marker(MarkerKind, i32),
+    Apart(u32, [f64; 4]),
 }
 /// A list item's marker, measured: its item, style, text and line metrics,
 /// all in 1/64 CSS px.
@@ -444,9 +452,10 @@ pub(crate) struct LineBounds {
     pub band: Option<(f64, f64)>,
 }
 pub(crate) trait LineSink {
-    /// Every line, retained or not.
-    fn measure(&mut self, _bounds: LineBounds, _counters: &mut Counters) -> Result<(), Error> {
-        Ok(())
+    /// Every line, retained or not: where it starts, in flow, before any
+    /// relative offset, as items laid apart are placed.
+    fn measure(&mut self, _bounds: LineBounds, _counters: &mut Counters) -> Result<f64, Error> {
+        Ok(0.0)
     }
     fn wants(&self, y: f64, height: f64) -> bool;
     /// A retained line, with the inside marker it starts with, if any,
@@ -544,12 +553,20 @@ pub(crate) struct Flow<'s, 'd, 'm, M> {
     above: i64,
     below: i64,
     pub y: f64,
+    /// Its last line's baseline, in flow.
+    pub baseline: Option<f64>,
+    /// An inline-block was met: lines emitted place those they hold.
+    apart: bool,
     /// The floats of its formatting context and its block's content edges,
     /// where any may float beside its lines (DESIGN.md §5, "Floats").
     area: Option<Area<'m>>,
     /// The items laid apart that it places, where it holds any: indices
     /// met in it are into these.
     items: Option<&'m mut BudgetVec<Item>>,
+    /// The boxes laid so far, an inline-block's last its own, and its
+    /// block's relative offset, which they were laid with.
+    laid: &'m [BoxGeometry],
+    offset: (f64, f64),
     /// The line's inset and room among those floats, and the nearest bottom
     /// of those beside it.
     inset: f64,
@@ -604,8 +621,12 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             above,
             below,
             y,
+            baseline: None,
+            apart: false,
             area: None,
             items: None,
+            laid: &[],
+            offset: (0.0, 0.0),
             inset: 0.0,
             room: f64::from(width),
             beside: None,
@@ -619,11 +640,19 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         self.block = block;
         self
     }
-    /// The items laid apart for it, which those met in it index.
+    /// The items laid apart for it, which those met in it index, and the
+    /// boxes laid, with its block's relative `offset`.
     #[cold]
     #[inline(never)]
-    pub fn nesting(&mut self, items: &'m mut BudgetVec<Item>) {
+    pub fn nesting(
+        &mut self,
+        items: &'m mut BudgetVec<Item>,
+        laid: &'m [BoxGeometry],
+        offset: (f64, f64),
+    ) {
         self.items = Some(items);
+        self.laid = laid;
+        self.offset = offset;
     }
     /// Its lines take the room `floats` leave between the block's content
     /// edges, `edges`, and it places the floats met in it among the items
@@ -691,7 +720,9 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         let item = items.get_mut(index).ok_or(Error::Invalid)?;
         item.anchor = self.emitted;
         let item = *item;
-        let Kind::Float { side, clear } = item.kind;
+        let Kind::Float { side, clear } = item.kind else {
+            return Err(Error::Invalid);
+        };
         let area = self.area.as_mut().ok_or(Error::Invalid)?;
         let (x, top, room) = area.floats.place(
             (item.width, item.height),
@@ -717,9 +748,11 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
     fn put(&mut self, index: usize, at: (f64, f64), counters: &mut Counters) -> Result<(), Error> {
         let items = self.items.as_mut().ok_or(Error::Invalid)?;
         let item = items.get_mut(index).ok_or(Error::Invalid)?;
-        item.placed = Some(at);
+        item.place(at);
         let size = (item.width, item.height);
-        let Kind::Float { side, .. } = item.kind;
+        let Kind::Float { side, .. } = item.kind else {
+            return Err(Error::Invalid);
+        };
         let area = self.area.as_mut().ok_or(Error::Invalid)?;
         area.floats.add(at, size, side, counters)?;
         self.reband(counters)
@@ -741,7 +774,9 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 counters.step(1)?;
                 let items = self.items.as_ref().ok_or(Error::Invalid)?;
                 let item = *items.get(index).ok_or(Error::Invalid)?;
-                let Kind::Float { side, clear } = item.kind;
+                let Kind::Float { side, clear } = item.kind else {
+                    return Err(Error::Invalid);
+                };
                 let area = self.area.as_mut().ok_or(Error::Invalid)?;
                 let (x, top, _) = area.floats.place(
                     (item.width, item.height),
@@ -888,6 +923,83 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             },
             // Its soft break was taken above; with the pending line
             // emptied or within the width, queue breaks no further.
+            soft,
+            counters,
+            sink,
+        )?;
+        if soft {
+            self.after_space = Some(self.pending.len());
+        }
+        self.last_space = false;
+        self.previous_cr = false;
+        Ok(())
+    }
+    /// An inline-block (`node`, `style`), laid apart as `items[index]`: an
+    /// item its margin box wide that nothing breaks, its baseline on the
+    /// line's, with a wrap opportunity each side where its parent wraps,
+    /// `soft`, as an image has. A line cut, or holding `line_scalars`
+    /// items, ends before it, since its box and lines were laid and must
+    /// be placed (DESIGN.md §5, "Inline-blocks").
+    #[cold]
+    #[inline(never)]
+    pub fn inline_block(
+        &mut self,
+        index: usize,
+        (node, style): (NodeId, StyleId),
+        soft: bool,
+        counters: &mut Counters,
+        sink: &mut impl LineSink,
+    ) -> Result<(), Error> {
+        counters.step(1)?;
+        let items = self.items.as_ref().ok_or(Error::Invalid)?;
+        let item = *items.get(index).ok_or(Error::Invalid)?;
+        let Kind::Inline { baseline } = item.kind else {
+            return Err(Error::Invalid);
+        };
+        // Its border box as drawn, its own relative offset with it, from
+        // its margin box's top left: its box is the last it laid.
+        let own = item
+            .boxes()
+            .1
+            .checked_sub(1)
+            .and_then(|at| self.laid.get(at))
+            .filter(|g| g.node == node)
+            .ok_or(Error::Invalid)?
+            .border;
+        let border = [
+            own.x - item.laid.0 - self.offset.0,
+            own.y - item.laid.1 - self.offset.1,
+            own.width,
+            own.height,
+        ];
+        let slot = u32::try_from(index).map_err(|_| Error::Invalid)?;
+        self.apart = true;
+        let advance = (item.width * 64.0).round() as i64;
+        // Neither cut nor full once restarted, `queue` lays it.
+        let full = self.cut.is_some() || self.pending.len() >= counters.limits.line_scalars;
+        if full || (soft && !self.pending.is_empty() && self.over(self.pen, advance)) {
+            if self.pending.iter().any(|p| !p.space) {
+                self.emit(counters, sink, None, LineEnd::Wrap)?;
+            }
+            self.restart();
+        }
+        let above = (baseline * 64.0).round() as i64;
+        let below = ((item.height - baseline) * 64.0).round() as i64;
+        self.queue(
+            Pending {
+                node,
+                range: 0..0,
+                style,
+                display: DisplayText::Source,
+                pen: 0,
+                advance,
+                above,
+                below,
+                space: false,
+                tab: false,
+                atomic: Some(Atomic::Apart(slot, border)),
+            },
+            // As an image's: its soft break was taken above.
             soft,
             counters,
             sink,
@@ -1272,6 +1384,14 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 bounds.top = bounds.top.min(image_y);
                 bounds.bottom = bounds.bottom.max(image_y + height);
             }
+            if let Some(Atomic::Apart(_, [left, top, width, height])) = p.atomic {
+                let box_x = x + left;
+                let box_y = self.y + (above - p.above) as f64 / 64.0 + top;
+                bounds.left = bounds.left.min(box_x);
+                bounds.right = bounds.right.max(box_x + width);
+                bounds.top = bounds.top.min(box_y);
+                bounds.bottom = bounds.bottom.max(box_y + height);
+            }
         }
         for value in [
             bounds.left,
@@ -1285,7 +1405,12 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 return Err(Error::Limit("MAX_COORDINATE"));
             }
         }
-        sink.measure(bounds, counters)?;
+        let origin = sink.measure(bounds, counters)?;
+        self.baseline = Some(self.y + above as f64 / 64.0);
+        if self.apart {
+            self.place_boxes(origin, end, above, counters)?;
+        }
+        let pending = self.pending.get(..end).ok_or(Error::Invalid)?;
         if sink.wants(self.y, height) {
             let mut fragments: Fragments<TextFragment> = Fragments::with(());
             let mut replaced = Fragments::with(LineTag::new(self.block, line_end)?);
@@ -1326,6 +1451,27 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                             y: above as f64 / 64.0 - height - bottom,
                             width,
                             height,
+                            atomic: false,
+                        },
+                        self.memory,
+                        counters,
+                    )?;
+                    continue;
+                }
+                if let Some(Atomic::Apart(_, [left, top, width, height])) = p.atomic {
+                    if counters.fragments >= counters.limits.fragments {
+                        return Err(Error::Limit("MAX_FRAGMENTS"));
+                    }
+                    counters.fragments += 1;
+                    replaced.add(
+                        ReplacedFragment {
+                            node: p.node,
+                            style: p.style,
+                            x: p.pen as f64 / 64.0 + left,
+                            y: (above - p.above) as f64 / 64.0 + top,
+                            width,
+                            height,
+                            atomic: true,
                         },
                         self.memory,
                         counters,
@@ -1379,6 +1525,37 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         }
         self.y = next_y;
         self.next_line(counters)
+    }
+    /// The inline-blocks among the first `end` pending items, on the line
+    /// being emitted at `self.y` whose ascent is `above` and which starts
+    /// at `origin` in flow: each placed there, its margin box's top left,
+    /// and its lines to follow this line.
+    #[cold]
+    #[inline(never)]
+    fn place_boxes(
+        &mut self,
+        origin: f64,
+        end: usize,
+        above: i64,
+        counters: &mut Counters,
+    ) -> Result<(), Error> {
+        let pending = self.pending.get(..end).ok_or(Error::Invalid)?;
+        for p in pending {
+            let Some(Atomic::Apart(index, _)) = p.atomic else {
+                continue;
+            };
+            counters.step(1)?;
+            let items = self.items.as_mut().ok_or(Error::Invalid)?;
+            let item = items.get_mut(index as usize).ok_or(Error::Invalid)?;
+            let x = origin + p.pen as f64 / 64.0;
+            let y = self.y + (above - p.above) as f64 / 64.0;
+            if !coordinate(x) || !coordinate(y) {
+                return Err(Error::Limit("MAX_COORDINATE"));
+            }
+            item.place((x, y));
+            item.anchor = self.emitted;
+        }
+        Ok(())
     }
 }
 pub(crate) fn coordinate(n: f64) -> bool {

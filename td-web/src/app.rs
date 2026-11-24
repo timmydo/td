@@ -331,18 +331,20 @@ fn measure_of<'m>(
     Some((laid, measure))
 }
 
-/// The image `item` is, when it is in no link: one a click opens.
+/// The image `item` is, when it is in no link: one a click opens. An
+/// inline-block's placeholder is none.
 fn unlinked_image(laid: &Laid, item: Option<text::Item>) -> Option<NodeId> {
     let item = item?;
     let text::Piece::Replaced(i) = item.piece else {
         return None;
     };
-    let node = laid
+    let replaced = laid
         .lines()
         .get(text::line_of(laid, item.start))?
         .replaced
-        .get(i)?
-        .node;
+        .get(i)
+        .filter(|r| !r.atomic)?;
+    let node = replaced.node;
     laid.tree().link(node).is_none().then_some(node)
 }
 
@@ -4237,6 +4239,19 @@ mod tests {
         typed(&mut app, "example.org/i");
         app.motion(Some(point(&app, 0, 1)));
         assert_eq!(app.status_text(), "https://example.org/pic");
+    }
+
+    /// An inline-block's placeholder is no image a click opens.
+    #[test]
+    fn an_inline_blocks_placeholder_is_no_image() {
+        let page = "<p>ab <span style='display:inline-block;padding:8px'>cd</span>";
+        let mut app = app(site().page("https://example.org/i", "text/html", page));
+        typed(&mut app, "example.org/i");
+        let laid = laid(&app);
+        let line = &laid.lines()[0];
+        let item = text::items(laid, line).find(|i| matches!(i.piece, text::Piece::Replaced(_)));
+        assert!(item.is_some());
+        assert_eq!(unlinked_image(laid, item), None);
     }
 
     /// The page let go at a navigation is dropped on the render thread,

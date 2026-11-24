@@ -94,7 +94,7 @@ pub fn fit(
 /// The text node's run and the block it is laid in, if the document is a
 /// text page.
 fn page_text(styled: &StyledDocument<'_>) -> Result<Option<(TextRun, BoxId)>, Error> {
-    if styled.has_tables() || styled.has_floats() || styled.marker_count() != 0 {
+    if styled.has_tables() || styled.has_nested_lines() || styled.marker_count() != 0 {
         return Err(Error::Invalid);
     }
     let mut found = None;
@@ -150,7 +150,7 @@ struct Count {
     passed: Option<Passed>,
 }
 impl LineSink for Count {
-    fn measure(&mut self, bounds: LineBounds, counters: &mut Counters) -> Result<(), Error> {
+    fn measure(&mut self, bounds: LineBounds, counters: &mut Counters) -> Result<f64, Error> {
         if self.passed.is_none() && counters.lines.saturating_add(counters.indents) > self.cap {
             self.passed = Some(Passed {
                 start: bounds.start,
@@ -158,7 +158,7 @@ impl LineSink for Count {
                 indents: counters.indents,
             });
         }
-        Ok(())
+        Ok(0.0)
     }
     fn wants(&self, _: f64, _: f64) -> bool {
         false

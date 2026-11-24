@@ -108,26 +108,78 @@ impl Band {
 pub(crate) enum Kind {
     /// A float: the side it goes to and the floats it clears.
     Float { side: Side, clear: Clear },
+    /// An inline-block (DESIGN.md §5, "Inline-blocks"): its baseline from
+    /// its margin box's top. Its border box is its last box's.
+    Inline { baseline: f64 },
 }
 
-/// A box laid apart where its inline sequence starts (a float, of its
-/// `kind`): its margin box `width` (negative where its margins are) by
-/// `height` with its top left at `laid`, to be placed and its output,
-/// the ranges here, moved there, its lines after the `anchor`th line of
-/// its sequence.
+/// A box laid apart where its inline sequence starts (a float or an
+/// inline-block, of its `kind`): its margin box `width` (negative where
+/// its margins are) by `height` (a float's no less than 0) with its top
+/// left at `laid`, to be placed and its output, the ranges here, moved
+/// there, its lines after the `anchor`th line of its sequence. Kept
+/// small, as a sequence may hold an item a box (DESIGN.md §5,
+/// "Inline-blocks", "Bounds").
 #[derive(Clone, Copy)]
 pub(crate) struct Item {
     pub width: f64,
     pub height: f64,
     pub kind: Kind,
     pub laid: (f64, f64),
-    pub placed: Option<(f64, f64)>,
+    /// Where it was placed, NaN until it is (`placed`).
+    at: (f64, f64),
     pub anchor: usize,
-    pub lines: (usize, usize),
-    pub boxes: (usize, usize),
-    pub markers: (usize, usize),
+    lines: (u32, u32),
+    boxes: (u32, u32),
+    markers: (u32, u32),
     /// Its own overflow where it was laid.
     pub bounds: Option<super::Rect>,
+}
+
+/// An index range as two u32s.
+fn span((start, end): (usize, usize)) -> Result<(u32, u32), Error> {
+    let index = |n: usize| u32::try_from(n).map_err(|_| Error::Invalid);
+    Ok((index(start)?, index(end)?))
+}
+
+impl Item {
+    /// An item of `kind` laid at `laid`, its output the ranges given.
+    pub fn new(
+        (width, height): (f64, f64),
+        kind: Kind,
+        laid: (f64, f64),
+        (lines, boxes, markers): ((usize, usize), (usize, usize), (usize, usize)),
+        bounds: Option<super::Rect>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            width,
+            height,
+            kind,
+            laid,
+            at: (f64::NAN, f64::NAN),
+            anchor: 0,
+            lines: span(lines)?,
+            boxes: span(boxes)?,
+            markers: span(markers)?,
+            bounds,
+        })
+    }
+    /// Its margin box's top left where its sequence placed it, if it has.
+    pub fn placed(&self) -> Option<(f64, f64)> {
+        (!self.at.0.is_nan() && !self.at.1.is_nan()).then_some(self.at)
+    }
+    pub fn place(&mut self, at: (f64, f64)) {
+        self.at = at;
+    }
+    pub fn lines(&self) -> (usize, usize) {
+        (self.lines.0 as usize, self.lines.1 as usize)
+    }
+    pub fn boxes(&self) -> (usize, usize) {
+        (self.boxes.0 as usize, self.boxes.1 as usize)
+    }
+    pub fn markers(&self) -> (usize, usize) {
+        (self.markers.0 as usize, self.markers.1 as usize)
+    }
 }
 
 /// A context's floats are placed in order of their tops, none higher than

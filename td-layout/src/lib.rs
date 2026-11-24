@@ -328,6 +328,9 @@ pub struct StyledDocument<'d> {
     /// Whether any box floats (`float_side`); layout looks for floats
     /// and formatting contexts only then.
     floats: bool,
+    /// Whether any box is an inline-block (`inline_block`); layout lays
+    /// boxes apart in a line only then.
+    inline_blocks: bool,
 }
 enum DocumentOwner<'d> {
     Borrowed(&'d Document),
@@ -491,6 +494,7 @@ impl<'d> StyledDocument<'d> {
             marker_count: 0,
             tables: false,
             floats: false,
+            inline_blocks: false,
         };
         let mut numbering = list::Numbering::new(memory)?;
         // List items are admitted while the index and scratch live.
@@ -564,6 +568,7 @@ impl<'d> StyledDocument<'d> {
                     out.tables |= TableRole::of(keyword(computed, Property::Display)).is_some();
                 }
                 out.floats |= parent.is_some() && float_side(computed, kind).is_some();
+                out.inline_blocks |= parent.is_some() && inline_block(computed, kind);
                 if let Some(element) = node.element() {
                     if kind == BoxKind::Block && keyword(computed, Property::Display) == "list-item"
                     {
@@ -671,6 +676,18 @@ impl<'d> StyledDocument<'d> {
                 .style(geometry.style)
                 .is_some_and(|style| float_side(style, kind).is_some())
     }
+    /// Whether `geometry` was laid for an inline-block (DESIGN.md §5,
+    /// "Inline-blocks"): never the root's, nor any on a page without them.
+    pub fn is_inline_block(&self, geometry: &crate::block::BoxGeometry) -> bool {
+        if !self.inline_blocks || geometry.replaced {
+            return false;
+        }
+        let root = self.first.and_then(|id| self.box_node(id)).map(|b| b.node);
+        root != Some(geometry.node)
+            && self
+                .style(geometry.style)
+                .is_some_and(|style| inline_block(style, BoxKind::Block))
+    }
     pub fn style(&self, id: StyleId) -> Option<&ComputedStyle> {
         self.styles.get(id)
     }
@@ -734,6 +751,15 @@ impl<'d> StyledDocument<'d> {
     pub fn has_floats(&self) -> bool {
         self.floats
     }
+    /// Whether any box is an inline-block (DESIGN.md §5, "Inline-blocks").
+    pub fn has_inline_blocks(&self) -> bool {
+        self.inline_blocks
+    }
+    /// Whether any line may lie within another: a float's or an
+    /// inline-block's lines lie within the line holding it.
+    pub fn has_nested_lines(&self) -> bool {
+        self.floats || self.inline_blocks
+    }
 }
 impl StyledDocument<'static> {
     /// Own the immutable document without a self-referential borrow.
@@ -759,6 +785,7 @@ impl StyledDocument<'static> {
             marker_count,
             tables,
             floats,
+            inline_blocks,
             ..
         } = built;
         Ok(Self {
@@ -776,6 +803,7 @@ impl StyledDocument<'static> {
             marker_count,
             tables,
             floats,
+            inline_blocks,
         })
     }
 }
@@ -795,6 +823,13 @@ pub(crate) fn float_side(style: &ComputedStyle, kind: BoxKind) -> Option<Side> {
         "right" => Some(Side::Right),
         _ => None,
     }
+}
+/// Whether a box of `kind` is an inline-block: a block whose display is
+/// `inline-block`, laid whole in a line (DESIGN.md §5, "Inline-blocks").
+/// td-css blockifies a floated one, so none floats; the root never is
+/// one, which its caller sees to.
+pub(crate) fn inline_block(style: &ComputedStyle, kind: BoxKind) -> bool {
+    kind == BoxKind::Block && keyword(style, Property::Display) == "inline-block"
 }
 /// The side a float is on, or a clear applies to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

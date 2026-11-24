@@ -1,12 +1,12 @@
 //! Normal-flow geometry and windowed line retention.
 use crate::inline::{
-    coordinate, Counters, Cuts, Flow, FontMetrics, ImageRun, Line, LineBounds, LineEnd, LineSink,
-    Marker, Pending, TextRun,
+    coordinate, white_space, Counters, Cuts, Flow, FontMetrics, ImageRun, Line, LineBounds,
+    LineEnd, LineSink, Marker, Pending, TextRun,
 };
 use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
-    float_side, keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, TableRole,
-    MAX_PAGE_BYTES,
+    float_side, inline_block, keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument,
+    TableRole, MAX_PAGE_BYTES,
 };
 use float::{units, Clear, Floats, Item, Kind, View};
 use std::ops::Range;
@@ -21,6 +21,8 @@ mod ends;
 pub(crate) mod float;
 #[cfg(test)]
 mod float_tests;
+#[cfg(test)]
+mod inline_block_tests;
 mod intrinsic;
 mod table;
 
@@ -253,6 +255,7 @@ pub fn layout_with_budget(
         tables: table::Scratch::new(memory)?,
         floats: Floats::new(memory)?,
         nested: BudgetVec::new(memory)?,
+        last_baseline: None,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -338,6 +341,10 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// The boxes inline sequences laid apart and have not yet placed, a
     /// stack: a nested sequence's after its ancestors' (§5, "Floats").
     nested: BudgetVec<Item>,
+    /// The baseline of the last line laid in flow, on a page with
+    /// inline-blocks: an inline-block's own is its last line's (§5,
+    /// "Inline-blocks"). Nested items and tables keep it as they found it.
+    last_baseline: Option<f64>,
     left: f64,
     top: f64,
     right: f64,
@@ -356,11 +363,15 @@ enum Event {
     /// A float, met within an inline sequence or between blocks, which
     /// it does not divide (DESIGN.md §5, "Floats").
     Float(BoxId),
+    /// An inline-block, laid whole in its line (DESIGN.md §5,
+    /// "Inline-blocks").
+    Atomic(BoxId),
 }
 impl Event {
-    /// Inline content, or a float, which an inline sequence holds.
+    /// Inline content, a float or an inline-block, which an inline
+    /// sequence holds.
     fn flows(self) -> bool {
-        matches!(self, Self::Inline(_) | Self::Float(_))
+        matches!(self, Self::Inline(_) | Self::Float(_) | Self::Atomic(_))
     }
 }
 struct Events {
@@ -500,9 +511,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 let floats = self.styled.has_floats()
                     && b.parent.is_some()
                     && float_side(style, b.kind).is_some();
+                let atomic = self.styled.has_inline_blocks()
+                    && b.parent.is_some()
+                    && inline_block(style, b.kind);
                 events.add(
                     if floats {
                         Event::Float(id)
+                    } else if atomic {
+                        Event::Atomic(id)
                     } else if block {
                         Event::Block(id)
                     } else {
@@ -584,7 +600,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     run.previous_margin = Some(dims.margin.bottom);
                     at += 1;
                 }
-                Event::Inline(_) | Event::Float(_) => {
+                Event::Inline(_) | Event::Float(_) | Event::Atomic(_) => {
                     let start = at;
                     while events.get(at).is_some_and(|e| e.flows()) {
                         at += 1;
@@ -608,9 +624,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         Ok(height)
     }
     /// One inline sequence, the `range` of `events`, led by an inside
-    /// marker when it is its list item's first. Its floats are laid first,
-    /// where it starts, then placed as its lines meet them and moved there,
-    /// their lines kept whatever the window until then (§5, "Floats").
+    /// marker when it is its list item's first. Its floats and
+    /// inline-blocks are laid first, where it starts, then placed as its
+    /// lines meet them and moved there, their lines kept whatever the
+    /// window until then (§5, "Floats", "Inline-blocks").
     fn inline_run(
         &mut self,
         events: &Events,
@@ -630,9 +647,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let run_y = run.y + run.previous_margin.unwrap_or(0.0);
         let floating = self.styled.has_floats()
             && (range.start..range.end).any(|at| matches!(events.get(at), Some(Event::Float(_))));
-        let outermost = floating && self.retain == 0;
+        let nesting = floating
+            || (self.styled.has_inline_blocks()
+                && (range.start..range.end)
+                    .any(|at| matches!(events.get(at), Some(Event::Atomic(_)))));
+        let outermost = nesting && self.retain == 0;
         let base = self.nested.len();
-        if floating {
+        if nesting {
             self.lay_nested(events, &range, place, run_y, outermost, depth)?;
         }
         let sequence = self.lines.len();
@@ -648,6 +669,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             first: &mut self.first_line,
             first_index: &mut self.first_index,
             x: container.x + offset.0,
+            origin: container.x,
             dy: offset.1,
             width: container.width,
             align,
@@ -666,10 +688,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             &mut self.pending,
         )?
         .naming(block);
+        if nesting {
+            flow.nesting(&mut self.nested, &self.boxes, offset);
+        }
         if floating || (self.styled.has_floats() && self.floats.any()) {
-            if floating {
-                flow.nesting(&mut self.nested);
-            }
             flow.beside(
                 &mut self.floats,
                 (container.x, container.x + container.width),
@@ -679,14 +701,31 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         if let Some(marker) = marker {
             flow.marker(&marker, &mut self.counters, &mut sink)?;
         }
-        let mut next_float = base;
+        let mut next_item = base;
         for index in range {
             let event = events.get(index).ok_or(Error::Invalid)?;
             let id = match event {
                 Event::Inline(id) => id,
                 Event::Float(_) => {
-                    flow.float(next_float, &mut self.counters)?;
-                    next_float += 1;
+                    flow.float(next_item, &mut self.counters)?;
+                    next_item += 1;
+                    continue;
+                }
+                Event::Atomic(id) => {
+                    let b = self.styled.box_node(*id).ok_or(Error::Invalid)?;
+                    // The breaks around it are its parent's.
+                    let parent = b.parent.and_then(|p| self.styled.box_node(p));
+                    let style = parent
+                        .and_then(|p| self.styled.style(p.style))
+                        .ok_or(Error::Invalid)?;
+                    flow.inline_block(
+                        next_item,
+                        (b.node, b.style),
+                        white_space(style).2,
+                        &mut self.counters,
+                        &mut sink,
+                    )?;
+                    next_item += 1;
                     continue;
                 }
                 Event::Block(_) => return Err(Error::Invalid),
@@ -746,7 +785,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         flow.finish(&mut self.counters, &mut sink)?;
         let end_y = flow.y;
-        if floating {
+        if self.styled.has_inline_blocks() && flow.baseline.is_some() {
+            self.last_baseline = flow.baseline;
+        }
+        if nesting {
             self.place_nested(base, sequence, outermost)?;
         }
         if self.counters.lines != before {
@@ -757,14 +799,18 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     }
     /// Whether `b` roots a block formatting context of its own, whose
     /// floats its lines alone see and its auto height holds: the root, a
-    /// float, a caption, or a block whose overflow is neither visible nor
-    /// clip (a table cell is one too, which its table opens).
+    /// float, an inline-block, a caption, or a block whose overflow is
+    /// neither visible nor clip (a table cell is one too, which its table
+    /// opens).
     fn opens_context(&self, b: &BoxNode) -> Result<bool, Error> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         Ok(b.kind == BoxKind::Block
             && (b.parent.is_none()
                 || float_side(style, b.kind).is_some()
-                || keyword(style, Property::Display) == "table-caption"
+                || matches!(
+                    keyword(style, Property::Display),
+                    "table-caption" | "inline-block"
+                )
                 || !matches!(keyword(style, Property::OverflowX), "visible" | "clip")
                 || !matches!(keyword(style, Property::OverflowY), "visible" | "clip")))
     }
@@ -870,8 +916,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             }
         }
     }
-    /// An inline sequence's floats laid first, its lines and theirs kept
-    /// whatever the window until it ends.
+    /// An inline sequence's floats and inline-blocks laid first, its
+    /// lines and theirs kept whatever the window until it ends.
     #[cold]
     #[inline(never)]
     fn lay_nested(
@@ -888,15 +934,17 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         self.retain = self.retain.checked_add(1).ok_or(Error::Invalid)?;
         for at in range.start..range.end {
-            if let Some(Event::Float(id)) = events.get(at).copied() {
-                self.lay_float(id, place, y, depth)?;
+            match events.get(at).copied() {
+                Some(Event::Float(id)) => self.lay_float(id, place, y, depth)?,
+                Some(Event::Atomic(id)) => self.lay_inline_block(id, place, y, depth)?,
+                _ => {}
             }
         }
         Ok(())
     }
-    /// The sequence ended: its floats moved where it placed them, their
-    /// lines put after those they were met in, and, outermost, the window
-    /// kept.
+    /// The sequence ended: its floats and inline-blocks moved where it
+    /// placed them, their lines put after those they were met in, and,
+    /// outermost, the window kept.
     #[cold]
     #[inline(never)]
     fn place_nested(&mut self, base: usize, sequence: usize, outermost: bool) -> Result<(), Error> {
@@ -921,15 +969,34 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         let side = float_side(style, b.kind).ok_or(Error::Invalid)?;
         let clear = Clear::of(keyword(style, Property::Clear));
-        let dims = self.float_dimensions(id, &b, place, depth)?;
+        let dims = self.shrink_dimensions(id, &b, place, depth)?;
         self.lay_item(id, dims, Kind::Float { side, clear }, place, y, depth)
+    }
+    /// Lays the inline-block `id` met in an inline sequence starting at
+    /// `y` as a float is laid, CSS 2.2 §10.3.9 sizing it as §10.3.5 does a
+    /// float; `lay_item` finds its baseline (§10.8.1).
+    #[cold]
+    #[inline(never)]
+    fn lay_inline_block(
+        &mut self,
+        id: BoxId,
+        place: &Place,
+        y: f64,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
+        let dims = self.shrink_dimensions(id, &b, place, depth)?;
+        self.lay_item(id, dims, Kind::Inline { baseline: 0.0 }, place, y, depth)
     }
     /// Lays the box `id`, `dims` in its container, apart where an inline
     /// sequence starting at `y` starts: its margin box's top left at the
     /// container's left edge and `y`, no outside marker waiting for its
-    /// lines and none of them its container's first, its output and its
-    /// own overflow kept as an item of `kind` to be moved where the
-    /// sequence places it.
+    /// lines and none of them its container's first nor its last in flow,
+    /// its output and its own overflow kept as an item of `kind` to be
+    /// moved where the sequence places it. An inline-block's kind takes
+    /// its baseline: its last line's in flow, else, or where its overflow
+    /// is neither visible nor clip, its bottom margin edge (CSS 2.2
+    /// §10.8.1).
     #[cold]
     #[inline(never)]
     fn lay_item(
@@ -947,6 +1014,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let (lines, markers, boxes) = (self.lines.len(), self.markers.len(), self.boxes.len());
         let first_line = std::mem::replace(&mut self.first_line, false);
         let waiting = std::mem::replace(&mut self.waiting, BudgetVec::new(self.memory)?);
+        let last_baseline = self.last_baseline.take();
         let outer = (self.left, self.top, self.right, self.bottom);
         (self.left, self.top, self.right, self.bottom) = (
             f64::INFINITY,
@@ -966,10 +1034,29 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         (self.left, self.top, self.right, self.bottom) = outer;
         self.waiting = waiting;
         self.first_line = first_line;
+        let last = std::mem::replace(&mut self.last_baseline, last_baseline);
         let height = laid? + dims.margin.vertical();
         let width = dims.width + decor.horizontal() + dims.margin.horizontal();
         if !coordinate(width) || !coordinate(height) {
             return Err(Error::Limit("MAX_COORDINATE"));
+        }
+        let mut kind = kind;
+        // A float's height is no less than 0; an inline-block's keeps its
+        // sign, its line taking its margin box above and below its
+        // baseline.
+        let mut kept = height.max(0.0);
+        if let Kind::Inline { baseline } = &mut kind {
+            let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+            // Clip, like visible, keeps its lines' baseline.
+            let shown = |p| matches!(keyword(style, p), "visible" | "clip");
+            *baseline = match last {
+                Some(last) if shown(Property::OverflowX) && shown(Property::OverflowY) => last - y,
+                _ => height,
+            };
+            if !coordinate(*baseline) {
+                return Err(Error::Limit("MAX_COORDINATE"));
+            }
+            kept = height;
         }
         let bounds = (own.0 <= own.2).then_some(Rect {
             x: own.0,
@@ -977,28 +1064,29 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             width: own.2 - own.0,
             height: own.3 - own.1,
         });
-        self.counters.admit_growth(&mut self.nested)?;
-        self.nested.try_push(Item {
-            width,
-            height: height.max(0.0),
+        let item = Item::new(
+            (width, kept),
             kind,
-            laid: (x, y),
-            placed: None,
-            anchor: 0,
-            lines: (lines, self.lines.len()),
-            boxes: (boxes, self.boxes.len()),
-            markers: (markers, self.markers.len()),
+            (x, y),
+            (
+                (lines, self.lines.len()),
+                (boxes, self.boxes.len()),
+                (markers, self.markers.len()),
+            ),
             bounds,
-        })?;
+        )?;
+        self.counters.admit_growth(&mut self.nested)?;
+        self.nested.try_push(item)?;
         Ok(())
     }
-    /// A float's dimensions in its container: as a block's, or an image's,
-    /// but with its margins as computed, auto ones 0, and an auto width
-    /// shrink-to-fit, min(max(min-content, the room), max-content) within
-    /// its min and max widths.
+    /// A float's or an inline-block's dimensions in its container: as a
+    /// block's, or an image's, but with its margins as computed, auto ones
+    /// 0, and an auto width shrink-to-fit, min(max(min-content, the room),
+    /// max-content) within its min and max widths (CSS 2.2 §10.3.5,
+    /// §10.3.9).
     #[cold]
     #[inline(never)]
-    fn float_dimensions(
+    fn shrink_dimensions(
         &mut self,
         id: BoxId,
         b: &BoxNode,
@@ -1050,7 +1138,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         Ok(dims)
     }
-    /// Moves each float laid since `base` from where it was laid to where
+    /// Moves each item laid since `base` from where it was laid to where
     /// it was placed, its boxes, lines and markers with it, and counts its
     /// own overflow there.
     #[cold]
@@ -1058,9 +1146,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     fn move_nested(&mut self, base: usize) -> Result<(), Error> {
         for at in base..self.nested.len() {
             let item = *self.nested.get(at).ok_or(Error::Invalid)?;
-            let (x, y) = item.placed.ok_or(Error::Invalid)?;
+            let (x, y) = item.placed().ok_or(Error::Invalid)?;
             let (dx, dy) = (x - item.laid.0, y - item.laid.1);
-            let (lines, boxes, markers) = (item.lines, item.boxes, item.markers);
+            let (lines, boxes, markers) = (item.lines(), item.boxes(), item.markers());
             self.counters
                 .step(1 + (lines.1 - lines.0) + (boxes.1 - boxes.0) + (markers.1 - markers.0))?;
             if dx != 0.0 {
@@ -1110,12 +1198,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         Ok(())
     }
-    /// Puts each float laid since `base` (whose lines lie before the
+    /// Puts each item laid since `base` (whose lines lie before the
     /// sequence's, from `sequence`) after the line of the sequence holding
-    /// what came before it, its markers with its lines, so that lines lie
-    /// in the tree order of their starts, a float's within the line it was
-    /// met in (DESIGN.md §5, "Floats", "Placement"). A float met
-    /// before any of its sequence moves nothing.
+    /// what came before it, an inline-block's after the line holding it,
+    /// its markers with its lines, so that lines lie in the tree order of
+    /// their starts, an item's within the line it was met in (DESIGN.md
+    /// §5, "Floats", "Placement"). A float met before any of its sequence
+    /// moves nothing.
     #[cold]
     #[inline(never)]
     fn order_nested(&mut self, base: usize, sequence: usize) -> Result<(), Error> {
@@ -1136,11 +1225,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         if floor == 0 {
             return Ok(());
         }
-        let (start, markers) = (first.lines.0, first.markers.0);
+        let (start, markers) = (first.lines().0, first.markers().0);
         let floated = items
             .iter()
-            .fold(0usize, |n, item| n + (item.lines.1 - item.lines.0));
-        if last.lines.1 != sequence || sequence - start != floated {
+            .fold(0usize, |n, item| n + (item.lines().1 - item.lines().0));
+        if last.lines().1 != sequence || sequence - start != floated {
             return Err(Error::Invalid);
         }
         let marked = self
@@ -1155,7 +1244,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         // The markers in their new order: each float's after the
         // sequence's on the lines before it, as their lines will be.
         let mut order: BudgetVec<u32> = BudgetVec::new(self.memory)?;
-        let mut cut = last.markers.1;
+        let mut cut = last.markers().1;
         for item in items {
             let ahead = sequence + item.anchor;
             while let Some(marker) = self.markers.get(cut) {
@@ -1166,7 +1255,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 order.try_push(index(cut - markers)?)?;
                 cut += 1;
             }
-            for at in item.markers.0..item.markers.1 {
+            for at in item.markers().0..item.markers().1 {
                 self.counters.admit_growth(&mut order)?;
                 order.try_push(index(at - markers)?)?;
             }
@@ -1180,16 +1269,16 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let mut to: BudgetVec<u32> = BudgetVec::new(self.memory)?;
         let mut before = 0;
         for item in items {
-            for at in 0..item.lines.1 - item.lines.0 {
+            for at in 0..item.lines().1 - item.lines().0 {
                 self.counters.admit_growth(&mut to)?;
                 to.try_push(index(item.anchor + before + at)?)?;
             }
-            before += item.lines.1 - item.lines.0;
+            before += item.lines().1 - item.lines().0;
         }
         let (mut next, mut before) = (0, 0);
         for at in 0..count {
             while let Some(item) = items.get(next).filter(|item| item.anchor <= at) {
-                before += item.lines.1 - item.lines.0;
+                before += item.lines().1 - item.lines().0;
                 next += 1;
             }
             self.counters.admit_growth(&mut to)?;
@@ -1436,7 +1525,10 @@ struct Positioned<'a> {
     window: Keep<'a>,
     first: &'a mut bool,
     first_index: &'a mut Option<usize>,
+    /// Where its lines start, with the relative offset, and without it,
+    /// in flow, where items laid apart are placed.
     x: f64,
+    origin: f64,
     dy: f64,
     width: f64,
     align: &'a str,
@@ -1446,12 +1538,13 @@ struct Positioned<'a> {
     bottom: &'a mut f64,
 }
 impl LineSink for Positioned<'_> {
-    fn measure(&mut self, bounds: LineBounds, counters: &mut Counters) -> Result<(), Error> {
+    fn measure(&mut self, bounds: LineBounds, counters: &mut Counters) -> Result<f64, Error> {
         if !self.waiting.is_empty() {
             self.hang(&bounds, counters)?;
         }
         let (inset, room) = bounds.band.unwrap_or((0.0, self.width));
-        let shift = self.x + inset + alignment(self.align, room - bounds.advance);
+        let aligned = alignment(self.align, room - bounds.advance);
+        let shift = self.x + inset + aligned;
         include_bounds(
             self.left,
             self.top,
@@ -1463,7 +1556,9 @@ impl LineSink for Positioned<'_> {
                 width: bounds.right - bounds.left,
                 height: bounds.bottom - bounds.top,
             },
-        )
+        )?;
+        // In flow: an item laid apart was laid with the offset already.
+        Ok(self.origin + inset + aligned)
     }
     fn wants(&self, y: f64, height: f64) -> bool {
         *self.first || self.window.meets(y + self.dy, height)

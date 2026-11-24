@@ -143,7 +143,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         self.block_intrinsic(id, b, role, depth + 1)?
                     }
                 }
-                Event::Inline(_) | Event::Float(_) => {
+                Event::Inline(_) | Event::Float(_) | Event::Atomic(_) => {
                     let start = at;
                     while events.get(at).is_some_and(|e| e.flows()) {
                         at += 1;
@@ -301,6 +301,32 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     m.min = m.min.max(whole(least));
                     m.line = m.line.saturating_add(m.pending).saturating_add(most);
                     m.pending = 0;
+                    continue;
+                }
+                // An inline-block: whole, its own widths with its edges,
+                // a wrap opportunity each side where its parent wraps
+                // (DESIGN.md §5, "Inline-blocks").
+                Some(Event::Atomic(id)) => {
+                    let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
+                    let parent = b.parent.and_then(|p| self.styled.box_node(p));
+                    let soft = parent
+                        .and_then(|p| self.styled.style(p.style))
+                        .map(|style| white_space(style).2)
+                        .ok_or(Error::Invalid)?;
+                    let (least, most) = self.block_intrinsic(id, b, None, depth + 1)?;
+                    if soft {
+                        m.opportunity();
+                        m.min = m.min.max(whole(least));
+                        m.line = m.line.saturating_add(m.pending).saturating_add(most);
+                        m.pending = 0;
+                    } else {
+                        m.word = m.word.saturating_add(m.word_pending).saturating_add(least);
+                        m.word_pending = 0;
+                        m.line = m.line.saturating_add(m.pending).saturating_add(most);
+                        m.pending = 0;
+                    }
+                    m.last_space = false;
+                    m.previous_cr = false;
                     continue;
                 }
                 _ => return Err(Error::Invalid),

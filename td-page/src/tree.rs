@@ -271,6 +271,16 @@ impl Tree {
         self.rank.get(id.index()).copied().unwrap_or(NONE)
     }
 
+    /// The last node of `id`'s subtree in tree order, `id` itself for a
+    /// leaf: an inline-block's places end past its places (text.rs).
+    pub fn last_within(&self, id: NodeId) -> NodeId {
+        let mut last = id;
+        while let Some(child) = self.document.node(last).and_then(|n| n.last_child()) {
+            last = child;
+        }
+        last
+    }
+
     /// The link `id` lies in, itself included.
     pub fn link(&self, id: NodeId) -> Option<NodeId> {
         self.link.get(id.index()).copied().flatten()

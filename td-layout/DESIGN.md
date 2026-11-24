@@ -12,7 +12,8 @@ independent of it and byte-identical.
 The first formatting model is horizontal, left-to-right normal flow. Its
 references are CSS 2.2 [box generation and normal flow][flow], [used sizes
 and line height][sizes], and [CSS Text 3][text], with CSS 2.2's tables
-(§5, "Tables") and floats (§5, "Floats"). This is an explicitly
+(§5, "Tables"), floats (§5, "Floats") and inline-blocks (§5,
+"Inline-blocks"). This is an explicitly
 bounded subset, not a claim to implement browser layout generally.
 
 [flow]: https://www.w3.org/TR/CSS22/visuren.html
@@ -446,9 +447,10 @@ and their margins add. Block relative offsets move visual geometry, not the spac
 in flow. Overflow is reported geometrically; clipping,
 scroll containers and stacking contexts are consumer/future work.
 
-Tables are laid as grids (below, "Tables"). Flex and inline-block
-formatting are not implemented: those containers use ordinary block flow
-and their descendants remain visible. List items use block flow, with
+Tables are laid as grids (below, "Tables"). Inline-blocks are laid
+whole in their lines (below, "Inline-blocks"). Flex formatting is not
+implemented: a flex container uses ordinary block flow and its
+descendants remain visible. List items use block flow, with
 the markers below. visibility:hidden
 retains geometry and style so the eventual painter can suppress it.
 Floats are placed beside the lines they shorten, and `clear` moves a
@@ -880,6 +882,146 @@ says whether a box's geometry was laid for a float, by the rule above,
 so a painter can paint floats after the in-flow blocks of their
 context, as CSS does (td-web/DESIGN.md §10, "Painting").
 
+### Inline-blocks
+
+A box is an **inline-block** when it is a block, not the root, whose
+computed display is `inline-block`. td-css blockifies a floated one, and
+the root, so none floats; an image whose display is `inline-block` is
+an inline image, as before. `StyledDocument::has_inline_blocks` says
+whether any box is one, set while boxes are generated, so a page
+without one takes none of what follows: its geometry, lines and work
+are those of a layout without inline-blocks, and its charges too,
+but for its floats' items, smaller than they were (below, "Bounds").
+`has_nested_lines` says whether floats or inline-blocks may put lines
+within another line. The references are CSS 2.2 §9.2.2's atomic
+inline-level boxes, §10.3.9's width, §10.6.6's height and §10.8.1's
+baseline.
+
+**Model.** An inline-block is an atomic inline: its content is laid as
+a block formatting context of its own, which holds its floats as a
+float's does (above, "Floats", "Formatting contexts"), and its margin
+box is one piece of its line that nothing breaks. Its layout does not
+depend on where its line puts it, so it is laid as a float is (above,
+"Placement"): each inline-block an inline sequence holds is laid
+first, at the sequence's start and its container's left edge, at its
+set width or shrink-to-fit (§10.3.9 sizes it as §10.3.5 does a float,
+measured as a cell's content is), its auto margins 0, its height its
+content's or its set one within its min and max heights, reaching its
+floats' bottoms (§10.6.6 takes §10.6.7's). The sequence queues it as an
+item of its margin box's width, and as the line holding it is laid,
+retained or not, records where that line puts its margin box's top
+left, after text-align and beside any float shortening the line; its
+boxes, lines, markers and own overflow are then moved there, as a
+float's are. Its lines, and the markers on them, follow the line
+holding it, as a float's follow the line it was met in, so lines lie
+in the tree order of their starts, an inline-block's starting and
+ending within the line holding it, and one nested in it within its
+holder's. That line keeps a placeholder, a `ReplacedFragment` of its
+border box as drawn, its own relative offset with it, with `atomic`
+set (the flag fits the fragment's padding: it
+stays 48 bytes), which counts toward `MAX_FRAGMENTS`, has no picture
+and draws nothing: a consumer draws the inline-block's box and its
+lines. Its geometry follows its content's in postorder, before the
+sequence's lines, as a float's.
+
+**In its line.** It has a wrap opportunity on each side where its
+parent's white space wraps, as an inline image has its own: it moves
+whole to the next line where it does not fit the room left, and
+stands alone on a line it is wider than; where its parent does not
+wrap it stays on its line whatever its width. Collapsible spaces
+around it collapse to one on each side, laid, as around an image, and
+inside it at its edges as at a block's. A line cut at
+`Limits::line_scalars`, or holding that many items, ends before it,
+with a `Wrap` end, rather than dropping it, since its box and lines
+were laid and must be placed: what follows it on a cut line is laid
+from it on. Its line's start is reported in flow (`LineSink::measure`),
+before any relative offset, since its boxes were laid with the offset:
+an offset on its container moves it once.
+
+**Baseline.** Its line aligns it at its baseline, the `vertical-align`
+initial value; no other value is read. Its baseline is that of its
+last line box in flow at any depth, a nested block's included, else,
+where it lays none or its `overflow` is neither `visible` nor `clip`
+(which, like `visible`, makes no scroll container), its bottom margin
+edge (§10.8.1). A line's height takes its margin box above and below
+that baseline, either part negative where its margins make it so,
+which grows no line, as it takes an image's margin box above its
+baseline. Lines of floats, of an inline-block nested in it and of a
+table in it are not its lines: tables keep the last baseline as they
+found it, a departure, as browsers take a table's last row's. A table
+cell's baseline is that of its first line in flow, the line holding
+an inline-block, not the inline-block's own.
+
+**Measured widths.** In an inline sequence measured for a table cell,
+a float's or an inline-block's width, an inline-block contributes its
+own min- and max-content widths with its margins, borders and padding,
+as a float does; where its parent wraps, with a wrap opportunity each
+side, its min-content width a piece of its own and its max-content
+width added to its line's with any space before it; where its parent
+does not wrap, its min-content width is added to the piece around it
+that nothing breaks and its max-content width to the line.
+
+**Departures and later increments.** `vertical-align` other than
+`baseline` is not read. `inline-table` is laid as a block-level table
+where its box is (below, "Tables"). A table never gives the baseline.
+A consumer sees an inline-block's lines as their own block's
+paragraphs, between two places of the line holding it, so its text is
+a paragraph apart from the text around it, not one with it, and find
+matches nothing across it (td-web/DESIGN.md §10, "Places", "Find").
+
+**Bounds.** It takes the floats' paths: an item laid apart is 136
+bytes (160 before inline-blocks, a float's too: an inline-block's
+border box is read from its last box, its output's ranges are u32
+pairs and where it was placed is NaN until it is) in a budgeted stack
+charged with the layout's output as it grows (each sequence's dropped
+when it is placed, its charge kept); a line emitted in a
+sequence holding an inline-block visits its items once more to place
+them, a unit each; placing the items' lines after the line holding
+them visits each of the sequence's lines and markers twice; moving one
+visits its lines, boxes, markers and fragments once. Its shrink-to-fit
+width measures its content, so inline-blocks of auto width nested d
+deep measure the innermost d times, as nested floats and tables do:
+charged, and refused by name past `MAX_LAYOUT_WORK`. Its layout is no
+deeper than its box's, which `MAX_DEPTH` refuses first.
+
+**Measured.** Release, the host of §6, §6's deterministic metrics, at
+1280 px, under a load average of 3 to 5 (2026-11-24), interleaved with
+the build before inline-blocks, pinned to one CPU. The 2 MiB prose,
+word and blocks shapes do the same work and charge the same as before,
+to the unit and the byte, and take the same time within run-to-run
+noise (medians of twelve rounds of nine layouts, before and after, in
+three interleaved passes: prose 54.5 and 55.7 ms, 54.8 and 54.1, 55.5
+and 56.1; one word 54.1 and 54.6, 52.4 and 53.3, 54.6 and 54.1; blocks
+78.3 and 79.2, 79.7 and 80.2, 85.8 and 85.1); 2 MiB of paragraphs
+each holding a float lay the same lines and work, charging 48 bytes
+less. With inline-blocks, laid before as blocks splitting their lines
+(medians of five rounds of five, two passes), charged with the tree
+and styled document against the 224 MiB `MAX_PAGE_BYTES`, the item
+stack and the lines holding inline-blocks the largest new terms: one
+2 MiB paragraph of 69,904 `aa <span>bb cc</span> ` lays 73,899 lines
+in 78 ms (69 before, 139,809 lines), 3,287,581 work, charging 192.0
+MiB (167.4 before); 87,376 `<b>x</b> ` in one paragraph, 79 ms (47),
+189.9 MiB (129.5); 65,532 of the first unit, 88 ms (41), 163.8 MiB
+(123.7); 123,361 empty ones of 4 px between words, as many as
+td-html's `MAX_NODES` admits beside a text each, 80 ms (88), 174.2
+MiB (143.8); 36,157 paragraphs each holding one, 91 ms (72), 115.3
+MiB (107.6). The densest, 131,064 `<b>x</b>` in one paragraph, as
+many as `MAX_NODES` admits, laid before as blocks in 140.5 MiB, is
+refused `Limit("MAX_PAGE_BYTES")`: the lines holding them take the
+line array past 2^17 lines, whose growth is charged at twice its
+capacity (130,000 lay 130,823 lines, charging 193.2 MiB). Measured
+with the 200-byte item and before placing charged a unit for each
+inline-block: 29,537 units of three nested three deep,
+149.5 ms (68.7), 8,792,252 work, the nested measures; and 2,327 units
+of 50 nested 50 deep are refused `Limit("MAX_LAYOUT_WORK")` in 849 ms,
+as floats nested so are in 836 ms.
+
+**Painting.** `StyledDocument::is_inline_block` says whether a box's
+geometry was laid for an inline-block, so a painter can paint it after
+the in-flow boxes around it, as CSS 2.2 appendix E paints an
+inline-block with the inline content after the blocks' backgrounds
+(td-web/DESIGN.md §10, "Painting").
+
 ### Tables
 
 A box whose computed display is a table display is laid by CSS 2.2
@@ -889,8 +1031,8 @@ A box whose computed display is a table display is laid by CSS 2.2
 `table-column-group`, `table-column`, the three row groups, `table-row`
 and `table-cell`; `StyledDocument::table_role` reports a box's and
 `has_tables` whether any box has one, so a page without one never looks.
-`inline-table` is laid as a block-level table where its box is: td-layout
-has no inline-block formatting (above).
+`inline-table` is laid as a block-level table where its box is, not
+yet as an inline-block (above, "Inline-blocks").
 
 [tables]: https://www.w3.org/TR/CSS22/tables.html
 [html-tables]: https://html.spec.whatwg.org/multipage/tables.html#table-processing-model
@@ -1481,7 +1623,8 @@ Lines past `Limits::lines` refuse `MAX_LINES` as layout's do, so a cap
 within that of them can be refused rather than cut. A text page here
 is one text node laid `pre-wrap` or `break-spaces` in an ordinary
 block, every other box an ordinary block (no inline box, image, `<br>`,
-table, float or list marker, which would put items or lines in the flow
+table, float, inline-block or list marker, which would put items or
+lines in the flow
 the count does not see), and its text holds no control scalar but tab,
 newline and carriage return: any other shows as U+FFFD, a fragment of
 its own (§3), so a line of them would hold several. `fit` refuses
@@ -1847,7 +1990,9 @@ needing a layout and no cascade, are §5's "Intrinsic sizes". Floats,
 placed in their block formatting contexts, the lines beside them
 shortened, `clear`, contexts' roots holding their floats and moving
 beside others, and a float laid first and moved where its line places
-it, are §5's "Floats". The input
+it, are §5's "Floats". Inline-blocks, laid apart as floats are and
+placed whole in their lines at their baselines, are §5's
+"Inline-blocks". The input
 limit a caller sets, the
 cascade without style attributes and the byte limit per layout request
 are §6's "Caller-set limits"; each line's block and end (`Line::block`,

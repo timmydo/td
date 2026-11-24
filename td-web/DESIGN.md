@@ -1698,31 +1698,46 @@ CSS background images and SVG are not fetched.
 byte offset in its decoded text on a scalar boundary, or before or
 after a replaced element. Places are ordered by the tree-order table,
 four bytes a node (1 MiB at td-html's `MAX_NODES`). td-layout lays
-normal flow and tables in tree order, and puts a float's lines after
-the line it was met in (td-layout/DESIGN.md §5, "Floats"), so its lines
-are in the tree order of their starts and the fragments in each in tree
-order, a float's lines starting and ending between two places of the
-line it was met in: relative offsets move what is drawn, not the
-order. A place's line is the last starting at or before it, or, past
-the last of a float's lines, the line they lie in: td-page keeps each
-line's enclosing line (`Laid::outer`, for a page with floats one pass
-over the lines' places as a layout is taken, four bytes a line), and a
+normal flow and tables in tree order, puts a float's lines after
+the line it was met in (td-layout/DESIGN.md §5, "Floats") and an
+inline-block's after the line holding it ("Inline-blocks"), so its
+lines are in the tree order of their starts and the fragments in each
+in tree order, a float's or an inline-block's lines starting and ending
+between two places of the line holding it: relative offsets move what
+is drawn, not the order. An inline-block's placeholder in that line
+(a `ReplacedFragment` with `atomic` set) has the place before it as its
+start and, as its end, its subtree's last node at an offset no piece
+reaches: past every place in its subtree, so the line holds its lines'
+places, and before any place after it, so a piece that follows it,
+even where it is the last node of an enclosing inline-block or float,
+starts on its own line. A place's line
+is the last starting at or before it, or, past the last of a float's
+lines, the line they lie in: td-page keeps each line's enclosing line
+(`Laid::outer`, for a page with floats or inline-blocks one pass over
+the lines' places as a layout is taken, four bytes a line), and a
 fragment
 target is the least place at or after its element among the lines from
 its own until one starts past it. A **paragraph**, the unit find
 matches within and `Shift+Up` and `Shift+Down` move by, is a run of
 consecutive lines one block container lays: text either side of a
 child block is two paragraphs, a preserved newline or a `<br>` ends
-one, and a float's lines between two of a paragraph's lines end it
-there, the rest another paragraph. Find walks the lines in their
-order and sorts its matches into tree order. A selection copies what is
-painted selected, the scalars starting from its start to before its end,
-in line order: from the outermost line its start's lies in to the last
-line starting at or before its end, so around a float met within a line
-that line's selected text comes before the float's. The page's end is
-the latest along its last line's enclosing lines; and `Tab` from the
-screen scans the links, whose first lines are not in
-tree order past a float's. td-web
+one, and a float's or an inline-block's lines between two of a
+paragraph's lines end it there, the rest another paragraph; so an
+inline-block's text is a paragraph of its own, apart from the text
+around it, where a browser's is one, a limit a later increment lifts.
+Find walks the lines in their order and sorts its matches into tree
+order. A selection
+copies what is painted selected, the scalars starting from its start
+to before its end, in line order: from the outermost line its start's
+lies in to the last line starting at or before its end, so around a
+float met within a line, or an inline-block in it, that line's
+selected text comes before the float's or the inline-block's. The
+page's end is the latest along its last line's enclosing lines; and
+`Tab` from the screen scans the links, whose first lines are not in
+tree order past a float's or an inline-block's: a link laid as an
+inline-block is first on the line holding it, by its placeholder. A
+point on a line and on an inline-block's line within it, as one inside
+the inline-block is, falls on the inner one. td-web
 reads both from td-layout, each line naming the block that laid it
 and how it ended (`Line::block`, `Line::end`, td-layout/DESIGN.md §4,
 "Line ends"), not from gaps between lines.
@@ -1732,10 +1747,18 @@ spaces collapsed, a tab taken as a space, as in the query, and a
 replaced scalar as U+FFFD, with the white
 space a `Wrap` end leaves between lines put back as Copying puts it
 (none at an edge, nor across a `Split`) and an image's `alt` text in
-its place, in tree order and
-not past a paragraph, ignoring case, each character looked at once
-(Knuth, Morris and Pratt), so a search costs the text searched whatever
-the query, at most `MAX_HITS` matches, which do not overlap. Text with
+its place, in tree order and not past a paragraph, nor across an
+inline-block's placeholder or the place in a line where a float's or
+an inline-block's lines lie, whose text is searched as its own
+paragraph (above, "Places"): text either side of one is apart, as are
+a float's text and its line's, so matches stay disjoint in tree order
+(but where two pictures' `alt` texts stand together, whose matches may
+overlap).
+It ignores case, each character looked at once (Knuth, Morris and
+Pratt), so a search costs the text searched whatever the query, and
+each line enclosed by others is looked at once more for each, to find
+where its lines lie; at most `MAX_HITS` matches, which do not overlap.
+Text with
 no fragment (`display: none`) or not painted (`visibility: hidden`) is
 not found, nor is a list marker, which is no fragment's text. Matches
 are places, so they outlive a relayout; showing one
@@ -1773,7 +1796,9 @@ newline, a paragraph's last `<br>`) holds no place: a place at the end
 of the line before it is on that line.
 
 **Copying** takes the text between the two places in tree order (in
-line order around a float's lines, above, "Places") as it is shown:
+line order around a float's or an inline-block's lines, above,
+"Places": an inline-block's text after its line's, as a paragraph of
+its own, and its placeholder no text) as it is shown:
 fragments' painted text, neither `visibility: hidden` text nor a
 hidden item's marker; after a `Wrap` end the white
 space laid between its line and the next line with a fragment, read
@@ -1974,15 +1999,18 @@ order, then every glyph.
    2.2 §14.2), else `PAPER`, over the whole pane.
 2. Each box in tree order: its background colour over its border box,
    then each border side as a fill of its width, every style but `none`
-   and `hidden` drawn solid. On a page with floats, boxes are ordered
-   by how many floats (`StyledDocument::is_float`) each lies in, its
+   and `hidden` drawn solid. On a page with floats or inline-blocks,
+   boxes are ordered by how many floats and inline-blocks
+   (`StyledDocument::is_float`, `is_inline_block`) each lies in, its
    own counted, then in tree order, so an in-flow block's background
-   after a float does not cover it, nor a float's in-flow block a float
-   within it (CSS 2.2 appendix E, floats after in-flow blocks'
-   backgrounds); the count is worked out once down the tree order,
-   from each box's nearest ancestor with geometry. Two floats that
-   overlap each other paint by depth then tree order, not each whole
-   in turn.
+   after a float or an inline-block does not cover it, nor a float's
+   in-flow block a float within it (CSS 2.2 appendix E, floats after
+   in-flow blocks' backgrounds, and inline-blocks with the inline
+   content after them); the count is worked out once down the tree
+   order, from each box's nearest ancestor with geometry. Two floats
+   that overlap each other paint by depth then tree order, not each
+   whole in turn. An inline-block's box paints here, and its lines in
+   step 3 with the page's.
 3. Each line's content: the backgrounds of a fragment's inline
    ancestors behind its extent, as one fill, since all lie over that
    extent: the innermost opaque one with the translucent ones inside it
@@ -1992,7 +2020,8 @@ order, then every glyph.
    `SELECTED`; the underlines, overlines and line-throughs it takes
    from itself and its ancestors, as CSS propagates them, as fills
    across the fragment, a pixel thick at scale one; and a replaced
-   element's picture once its layout has fitted it, an `Image` held
+   element's picture (an inline-block's placeholder, which is none,
+   drawing nothing) once its layout has fitted it, an `Image` held
    back in the fills' order and charged its pixels as a fill is (it is
    not opaque, so it covers no fill, and a later fill covering it
    leaves it undrawn), framed in `SELECTED` when its link is marked;
@@ -2147,12 +2176,14 @@ Not shown, each a later amendment: script (§1); forms beyond what
 their elements lay out (a `button`'s or `textarea`'s text shows, an
 `input` nothing, and nothing is submitted); positioning other than
 static and relative (td-css computes no other, so `absolute`, `fixed`
-and `sticky` stay in flow); flex, grid and inline-block until
+and `sticky` stay in flow); flex and grid until
 td-layout has them, laid in normal flow as td-layout specifies, nothing
-hidden by it; floats are td-layout's (td-layout/DESIGN.md §5,
-"Floats"), their boxes painted after the in-flow boxes of their
-context ("Painting") but their lines with the page's, not each float
-painted whole as CSS 2.2 appendix E does; table layout beyond
+hidden by it; floats and inline-blocks are td-layout's
+(td-layout/DESIGN.md §5, "Floats", "Inline-blocks"), their boxes
+painted after the in-flow boxes around them ("Painting") but their
+lines with the page's, not each painted whole as CSS 2.2 appendix E
+does; an inline-block's `vertical-align` other than `baseline` and an
+`inline-table` laid inline are td-layout's later increments; table layout beyond
 td-layout's automatic one (increment 6); pseudo-elements and generated
 content, list markers aside; presentational attributes; web fonts
 (`@font-face` is skipped); background images, border radii, shadows,
@@ -2474,8 +2505,9 @@ order; each is its own design amendment when it starts:
 - **More faces.** Kerning from `GPOS`, then Noto's CJK (CFF
   collections), colour emoji and variable fonts, each waiting for
   td-ui's reader to take that form (`td-ui/src/sfnt.rs`).
-- **Layout beyond normal flow**, as td-layout gains it: inline-block,
-  then flexbox and grid; pseudo-elements and
+- **Layout beyond normal flow**, as td-layout gains it: inline-block's
+  `vertical-align` and paragraphs across it, inline tables, then
+  flexbox and grid; pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.
 - **Pictures.** `srcset` and `<picture>`; an SVG subset.

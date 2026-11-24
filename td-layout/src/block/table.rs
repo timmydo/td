@@ -236,7 +236,10 @@ impl<'e> Walk<'e> {
                         let event = events.get(*at).ok_or(Error::Invalid)?;
                         *at += 1;
                         Some(match event {
-                            Event::Inline(id) | Event::Block(id) | Event::Float(id) => *id,
+                            Event::Inline(id)
+                            | Event::Block(id)
+                            | Event::Float(id)
+                            | Event::Atomic(id) => *id,
                         })
                     } else {
                         None
@@ -407,7 +410,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let mut next = end;
         while let Some(event) = events.get(next).copied() {
             let b = match event {
-                Event::Block(id) | Event::Inline(id) | Event::Float(id) => {
+                Event::Block(id) | Event::Inline(id) | Event::Float(id) | Event::Atomic(id) => {
                     *self.styled.box_node(id).ok_or(Error::Invalid)?
                 }
             };
@@ -426,7 +429,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// Lays a table and its captions at `y`, returning their height. While
     /// any table is laid every line the window may yet meet is kept; the
     /// outermost keeps only the window's as its rows end and once it is
-    /// done.
+    /// done. No line of it is an inline-block's last (DESIGN.md §5,
+    /// "Inline-blocks").
     pub(super) fn table(
         &mut self,
         source: Source<'_>,
@@ -443,7 +447,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         self.retain = self.retain.checked_add(1).ok_or(Error::Invalid)?;
         let base = self.tables.base();
+        let last_baseline = self.last_baseline;
         let laid = self.lay_table(source, place, y, depth);
+        self.last_baseline = last_baseline;
         self.tables.truncate(base);
         self.retain -= 1;
         let height = laid?;

@@ -1151,7 +1151,8 @@ fn paint_run(
     }
 }
 
-/// A line's replaced boxes, each as `paint_picture` draws it.
+/// A line's replaced boxes, each as `paint_picture` draws it; an
+/// inline-block's placeholder draws nothing, its box and lines drawing it.
 #[allow(clippy::too_many_arguments)]
 fn paint_replaced(
     p: &mut Painter,
@@ -1166,6 +1167,9 @@ fn paint_replaced(
     for r in line.replaced.iter() {
         if !p.work(1) {
             return;
+        }
+        if r.atomic {
+            continue;
         }
         let place = Placed {
             node: r.node,
@@ -1750,6 +1754,36 @@ mod tests {
         assert_eq!(p.worked, 20);
         p.finish();
         assert_eq!(glyphs(&out), "a".repeat(MAX_STACKED));
+    }
+
+    /// An inline-block's placeholder draws no frame: its box draws its
+    /// background and its lines its text, after the line holding it.
+    #[test]
+    fn an_inline_block_draws_its_box_and_lines_not_a_placeholder() {
+        let framed = |out: &[Draw]| fills(out).iter().filter(|(_, c)| *c == BORDER).count();
+        let (picture, _) = draws(
+            "<body style=margin:0><p style=margin:0>ab <img width=10 height=10> ef",
+            Marks::default(),
+        );
+        assert_eq!(framed(&picture), 4);
+        let (out, _) = draws(
+            "<body style=margin:0><p style=margin:0>ab <span \
+             style='display:inline-block;background:#102030;border:2px solid #405060'>cd</span> ef",
+            Marks::default(),
+        );
+        assert_eq!(framed(&out), 0);
+        let colours: Vec<u32> = fills(&out).iter().map(|(_, c)| *c).collect();
+        assert!(colours.contains(&0x102030), "{colours:x?}");
+        assert!(colours.contains(&0x405060), "{colours:x?}");
+        assert_eq!(glyphs(&out).replace(' ', ""), "abefcd");
+        // Hidden, it draws nothing, its geometry kept.
+        let (hidden, _) = draws(
+            "<body style=margin:0><p style=margin:0>ab <span \
+             style='display:inline-block;background:#102030;visibility:hidden'>cd</span> ef",
+            Marks::default(),
+        );
+        assert!(!fills(&hidden).iter().any(|(_, c)| *c == 0x102030));
+        assert_eq!(glyphs(&hidden).replace(' ', ""), "abef");
     }
 
     /// A fragment and a replaced box looked at are work, though wholly

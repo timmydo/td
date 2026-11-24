@@ -636,6 +636,65 @@ mod tests {
         );
     }
 
+    /// A link laid as an inline-block: a point on its text or its padding
+    /// is on it, `Tab` reaches it in tree order, from the line holding it,
+    /// and shows its place there.
+    #[test]
+    fn a_link_laid_as_an_inline_block() {
+        let laid = laid(
+            "<body style=margin:0><p style=margin:0>see <a href=/x \
+             style=display:inline-block;padding:4px>the link</a> then <a href=/y>other</a>",
+        );
+        let lines = laid.lines();
+        assert_eq!(laid.links().len(), 2);
+        assert_eq!(laid.links()[0].1, 0);
+        let pane = pane();
+        let mut m = measure(WANT);
+        let view = View::default();
+        let window = |x: f64, y: f64| (pane.rect.x + pane.inset + x as i64, pane.rect.y + y as i64);
+        let text = &lines[1];
+        let (x, y) = window(text.fragments[0].x + 2.0, text.y + text.height / 2.0);
+        assert_eq!(view.link_at(&laid, &mut m, &pane, x, y), Some(0));
+        let r = &lines[0].replaced[0];
+        let (x, y) = window(r.x + 1.0, r.y + 1.0);
+        assert_eq!(view.link_at(&laid, &mut m, &pane, x, y), Some(0));
+        let other = lines[0].fragments.last().unwrap();
+        let (x, y) = window(other.x + other.width - 2.0, lines[0].y + 2.0);
+        assert_eq!(view.link_at(&laid, &mut m, &pane, x, y), Some(1));
+        let mut view = View::default();
+        view.step_link(&laid, &mut m, &pane, true);
+        assert_eq!(view.focus, Some(0));
+        let (link, line) = laid.links()[0];
+        let place = first_place(&laid, link, line as usize).unwrap();
+        assert_eq!(place.node, Some(link));
+        assert_eq!(text::line_of(&laid, place), 0);
+        view.step_link(&laid, &mut m, &pane, true);
+        assert_eq!(view.focus, Some(1));
+    }
+
+    /// An inline-block link after one whose last node is an inline-block:
+    /// its padding is on it and its first place on the line holding it.
+    #[test]
+    fn a_link_after_a_nested_last_inline_block() {
+        let laid = laid(
+            "<body style=margin:0><div><a href=/a style=display:inline-block;padding:6px>\
+             <span style=display:inline-block>icon</span></a><a href=/b \
+             style=display:inline-block;padding:6px>Next</a></div>",
+        );
+        let lines = laid.lines();
+        assert_eq!(laid.links().len(), 2);
+        let pane = pane();
+        let mut m = measure(WANT);
+        let view = View::default();
+        let window = |x: f64, y: f64| (pane.rect.x + pane.inset + x as i64, pane.rect.y + y as i64);
+        let r = &lines[0].replaced[1];
+        let (x, y) = window(r.x + 1.0, r.y + 1.0);
+        assert_eq!(view.link_at(&laid, &mut m, &pane, x, y), Some(1));
+        let (link, line) = laid.links()[1];
+        let place = first_place(&laid, link, line as usize).unwrap();
+        assert_eq!(text::line_of(&laid, place), 0);
+    }
+
     #[test]
     fn a_fragment_target_is_its_first_place_or_the_next() {
         let laid = laid("<p>a<p id=t>b<p id=e><p>c");

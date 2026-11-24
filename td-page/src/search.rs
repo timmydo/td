@@ -3,8 +3,9 @@
 //! taken as a space, a replaced scalar as U+FFFD, an image's `alt` text
 //! in its place and a wrap's white space put back as a copy puts it,
 //! hidden text left out, searched ignoring case with each character
-//! looked at once (Knuth, Morris and Pratt), never past a paragraph, at
-//! most `MAX_HITS` matches, all in a scratch budget of the page's.
+//! looked at once (Knuth, Morris and Pratt), never past a paragraph nor
+//! across a nested box (`text::Event::Break`), at most `MAX_HITS`
+//! matches, all in a scratch budget of the page's.
 
 use std::ops::ControlFlow;
 
@@ -116,6 +117,8 @@ pub fn find(laid: &Laid, query: &str, page: &Budget) -> Result<BudgetVec<Hit>, B
             ControlFlow::Continue(())
         }
         Event::Begin(_) => ControlFlow::Continue(()),
+        // No match spans a nested box.
+        Event::Break => step(None, Place::END, Place::END),
         Event::End => step(None, Place::END, Place::END),
     });
     match failed {
@@ -159,6 +162,76 @@ mod tests {
         let page = Budget::new(64 << 20).unwrap();
         let hits = find(&laid, "ab", &page).unwrap();
         assert!(hits.windows(2).all(|w| w[0].end <= w[1].start), "{hits:?}");
+    }
+
+    /// Matches in an inline-block are found after those of the line
+    /// holding it, and sorted into tree order; its text is a paragraph of
+    /// its own, so no match spans its edge.
+    #[test]
+    fn matches_in_an_inline_block_are_in_tree_order() {
+        let markup = "<p>ab cd <span style=display:inline-block>ab ef</span> ab gh";
+        assert_eq!(found(markup, "ab"), ["ab", "ab", "ab"]);
+        let laid = laid(markup);
+        let page = Budget::new(64 << 20).unwrap();
+        let hits = find(&laid, "ab", &page).unwrap();
+        assert!(hits.windows(2).all(|w| w[0].end <= w[1].start), "{hits:?}");
+        assert!(found(markup, "cd ab").is_empty());
+        assert_eq!(found(markup, "ab ef"), ["ab ef"]);
+    }
+
+    /// No match spans an inline-block, its placeholder, or the place a
+    /// float's lines were met: the text either side is apart.
+    #[test]
+    fn no_match_spans_a_nested_box() {
+        // A float or inline-block whose lines hold one with no item.
+        for (markup, needle) in [
+            ("<p>foo<span style=float:left><br>QQ</span>bar", "oob"),
+            (
+                "<p>foo<span style=float:left>a<br><br>b</span>mid\
+                 <span style=float:left>QQ</span>bar",
+                "midbar",
+            ),
+            (
+                "<p>foo<span style=\"display:inline-block;visibility:hidden\"><br>\
+                 <span style=visibility:visible>QQ</span></span>bar",
+                "oob",
+            ),
+        ] {
+            assert!(found(markup, needle).is_empty(), "{markup}");
+        }
+        assert_eq!(
+            found("<p>xa<span style=float:left><br>aa</span>ax", "aa"),
+            ["aa"]
+        );
+        for markup in [
+            "<p>foo<span style=display:inline-block>QQ</span>bar",
+            "<p>foo<span style=float:left>QQ</span>bar",
+        ] {
+            assert!(found(markup, "oob").is_empty(), "{markup}");
+            assert!(found(markup, "ooqqb").is_empty(), "{markup}");
+            assert_eq!(found(markup, "qq"), ["QQ"], "{markup}");
+            assert_eq!(found(markup, "foo"), ["foo"], "{markup}");
+        }
+        for markup in [
+            "<p>foo <span style=display:inline-block>QQ</span> bar",
+            "<p>foo <span style=float:left>QQ</span> bar",
+        ] {
+            assert!(found(markup, "foo bar").is_empty(), "{markup}");
+            assert!(found(markup, "o  b").is_empty(), "{markup}");
+            assert_eq!(found(markup, "bar"), ["bar"], "{markup}");
+            let laid = laid(markup);
+            let page = Budget::new(64 << 20).unwrap();
+            let hits = find(&laid, "o", &page).unwrap();
+            assert!(hits.windows(2).all(|w| w[0].end <= w[1].start), "{hits:?}");
+        }
+        // An empty inline-block, with no lines, is its placeholder.
+        let markup = "<p>foo<span style=display:inline-block;width:9px></span>bar";
+        assert!(found(markup, "oob").is_empty());
+        assert_eq!(found(markup, "bar"), ["bar"]);
+        // A float met mid-word on a wrapped line still breaks it there.
+        let markup = "<p style=width:60px>aaaa bbbb cc<span style=float:right>Z</span>dd";
+        assert!(found(markup, "ccdd").is_empty());
+        assert_eq!(found(markup, "dd"), ["dd"]);
     }
 
     #[test]
