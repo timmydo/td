@@ -10475,6 +10475,7 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
+                "td-mixer",
                 "td-mta",
                 "td-news",
                 "td-open",
@@ -10522,8 +10523,9 @@ mod tests {
         // reader graph includes its test and Clippy legs.
         // The format check rides with the workspace.
         // td-sh exercises its job control through the toolkit PTY in its tests.
-        // td-picture reads td-ui for its pictures: its test and Clippy legs.
-        assert_eq!(comp.len(), 93, "{comp:?}");
+        // td-picture reads td-ui for its pictures: its test and Clippy legs,
+        // as does td-mixer for its panel.
+        assert_eq!(comp.len(), 95, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -10545,6 +10547,7 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
+                "td-mixer",
                 "td-mta",
                 "td-news",
                 "td-open",
@@ -10593,6 +10596,7 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
+                "td-mixer",
                 "td-mta",
                 "td-news",
                 "td-open",

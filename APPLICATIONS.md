@@ -8960,6 +8960,40 @@ its answer, and any entry that breaks its schema. After any failure but
 a refusal the connection is broken, since its framing or tags are no
 longer known.
 
+The sound panel, `td-mixer`, is one more controller over td-pulse, with
+no rights the CLI lacks: a td-ui window listing the playing output's
+level first, then every output, the playing one marked, then each
+application's level, named and grouped by `apps` as the CLI lists them.
+It is keyboard first: Up/Down or Tab move, Left/Right step the focused
+level on the 5% grid the volume keys use, setting the level and then
+unmuting it as they do, `m` mutes it, Return makes an output the one
+that plays; a held key repeats only a step. A press focuses a row or
+chooses an output, and on the slider drags the level of the row it began
+on, the drag ending if that row goes. The window never waits on the
+daemon. A control thread applies the panel's actions in order over one
+kept connection, a batch and the read after it under one two-second
+deadline, and once on a fresh connection when a kept one a restarted
+daemon broke fails; each refused action is said by name. A watch thread
+subscribes, lifting the deadline only once the daemon has answered, asks
+for a read on subscribing and on each event, and reconnects with the
+compositor's one-to-thirty-second backoff; while the daemon was last
+unavailable, the control thread also reads again every two seconds
+unasked, and a refused read, an account that is no controller, is said
+as the reason. An action shows at once; each snapshot, which carries
+changes made elsewhere too, replaces what the panel shows, with the
+actions it has not yet answered shown over it, so an older answer never
+undoes a newer action. Of the actions waiting, a newer level, mute or
+choice of output replaces the older one for the same thing in its place,
+so a drag or a held key sends where it ended and a level stays before
+the unmute that follows it. While a choice of output is unanswered, the
+playing output's level and mute do not move: the level shown is still
+the output's being left. Its scripted tests pin the reads and their
+bounds, the order of a batch, every refusal said with the read after it,
+the one reconnect, the retry while unavailable, and a level changed
+elsewhere reaching the panel; its headless render tests pin the rows,
+the keys, the pointer, the focus and scroll across snapshots, and the
+actions in flight.
+
 **It runs as a dedicated `audio` uid, not as uid 1000 — CONFIRMED by the
 maintainer**, which §O listed as the one privilege question the two
 design passes disagreed on. This is the one place the maintainer's "if it
