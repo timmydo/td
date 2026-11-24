@@ -108,19 +108,24 @@ impl Deployment {
         )
     }
 
-    /// The production HBA file, as the selected server reads the
-    /// production configuration.
-    pub(super) fn hba_file(&self) -> R<PathBuf> {
-        let hba = self.host.out(
+    /// `setting` as the selected server reads the production
+    /// configuration, postgresql.auto.conf included.
+    pub(super) fn production_setting(&self, setting: &str) -> R<String> {
+        self.host.out(
             self.host
                 .cmd("runuser")
                 .args(["-u", "td-mta", "--"])
                 .arg(self.host.tool("postgres")?)
                 .args(["-D", PGDATA, "-c"])
                 .arg(fmt(format_args!("config_file={MAIL}/postgresql.conf"))?)
-                .args(["-C", "hba_file"]),
-        )?;
-        let hba = PathBuf::from(hba);
+                .args(["-C", setting]),
+        )
+    }
+
+    /// The production HBA file, as the selected server reads the
+    /// production configuration.
+    pub(super) fn hba_file(&self) -> R<PathBuf> {
+        let hba = PathBuf::from(self.production_setting("hba_file")?);
         require(
             hba == child(Path::new(PGDATA), "pg_hba.conf")?,
             "unexpected production HBA path",

@@ -827,8 +827,19 @@ the mail accepted since.
 
 `--postgres-socket` then rehearses the cutover with the live release on
 a fresh copy before it changes production, and refuses there too if
-that release cannot reach the group-shared socket. Its job directory
-under `/var/lib/td-mta-operator` keeps the replaced settings
+that release cannot reach the group-shared socket. It moves each
+loopback SCRAM rule in `pg_hba.conf` to the socket and carries no
+`local` rule but SCRAM or reject; production's `local all setup_admin
+trust` would admit every account in the socket group. Such a rule
+refuses the cutover unless `postgresql.conf`, the server's reading of it
+with `postgresql.auto.conf` and the running postmaster all have no Unix
+socket: it then admits no one, and the cutover drops it and names it in
+its receipt (events and `socket_hba_dropped`). That rule was an older
+install's superuser entry for a start under `bootstrap.conf`, which the
+cutover leaves naming retired TLS material, so afterwards no
+configuration admits a superuser to the live cluster: start a private
+copy with its own `hba_file` and a peer rule, as the rehearsals do. Its
+job directory under `/var/lib/td-mta-operator` keeps the replaced settings
 (`postgres-socket/original/`) and the retired TLS material, CA key
 included (`postgres-socket/retired/`), for the rollback window
 ([Retiring rollback material](#retiring-rollback-material)).

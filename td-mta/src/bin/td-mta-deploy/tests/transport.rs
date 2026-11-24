@@ -52,8 +52,10 @@ fn loopback_scram_rules_move_to_the_socket_in_place() {
                     local td_mta td_mta_frontend scram-sha-256\n\
                     host all all 127.0.0.1/32 reject\n\
                     host all all ::1 ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff reject\n";
+    let converted = pg_hba(original, false).unwrap();
+    assert!(converted.dropped.is_empty());
     assert_eq!(
-        pg_hba(original).unwrap(),
+        converted.text,
         "# TYPE DATABASE USER ADDRESS METHOD\n\
          local td_mta td_mta_owner scram-sha-256\n\
          \n\
@@ -80,7 +82,126 @@ fn loopback_scram_rules_move_to_the_socket_in_place() {
         "include other_hba.conf\n",
         "include_dir hba.d\n",
     ] {
-        assert!(pg_hba(refused).is_err(), "{refused}");
+        assert!(pg_hba(refused, false).is_err(), "{refused}");
+        // Without a socket only the inert local rules are dropped instead.
+        let local = refused.starts_with("local ");
+        assert_eq!(pg_hba(refused, true).is_err(), !local, "{refused}");
+    }
+}
+
+/// Production's file: a trust rule left from before the socket existed.
+const PRODUCTION_HBA: &str = "\
+hostssl td_mta td_mta_frontend 127.0.0.1/32 scram-sha-256
+hostssl td_mta td_mta_receive 127.0.0.1/32 scram-sha-256
+hostssl td_mta td_mta_relay 127.0.0.1/32 scram-sha-256
+hostssl td_mta td_mta_migadu 127.0.0.1/32 scram-sha-256
+hostssl td_mta td_mta_acme 127.0.0.1/32 scram-sha-256
+local all setup_admin trust
+hostssl all td_mta_owner 127.0.0.1/32 scram-sha-256
+hostssl all td_mta_runtime 127.0.0.1/32 scram-sha-256
+hostssl replication td_mta_cutover_backup 127.0.0.1/32 scram-sha-256
+hostssl postgres td_mta_cutover_marker 127.0.0.1/32 scram-sha-256
+host all all 0.0.0.0/0 reject
+";
+
+#[test]
+fn an_inert_local_rule_is_dropped_only_without_a_unix_socket() {
+    let conf = "listen_addresses = '127.0.0.1'\nssl = on\nunix_socket_directories = ''\n";
+    assert!(no_unix_socket(conf));
+    let converted = pg_hba(PRODUCTION_HBA, no_unix_socket(conf)).unwrap();
+    assert_eq!(converted.dropped, ["local all setup_admin trust"]);
+    assert_eq!(
+        converted.text,
+        "local td_mta td_mta_frontend scram-sha-256\n\
+         local td_mta td_mta_receive scram-sha-256\n\
+         local td_mta td_mta_relay scram-sha-256\n\
+         local td_mta td_mta_migadu scram-sha-256\n\
+         local td_mta td_mta_acme scram-sha-256\n\
+         local all td_mta_owner scram-sha-256\n\
+         local all td_mta_runtime scram-sha-256\n\
+         local replication td_mta_cutover_backup scram-sha-256\n\
+         local postgres td_mta_cutover_marker scram-sha-256\n\
+         host all all 0.0.0.0/0 reject\n"
+    );
+    // Every loopback SCRAM rule has its socket rule, and nothing else admits.
+    let mut moved = 0;
+    for line in PRODUCTION_HBA.lines() {
+        let words: Vec<&str> = line.split_ascii_whitespace().collect();
+        if let ["hostssl", database, user, "127.0.0.1/32", "scram-sha-256"] = words[..] {
+            let local = format!("local {database} {user} scram-sha-256");
+            assert!(converted.text.lines().any(|l| l == local), "{local}");
+            moved += 1;
+        }
+    }
+    assert_eq!(moved, 9);
+    assert!(converted
+        .text
+        .lines()
+        .any(|l| l == "host all all 0.0.0.0/0 reject"));
+    assert!(!converted.text.contains("trust"));
+    assert!(!converted.text.contains("setup_admin"));
+
+    // With a socket the rule admits someone today: refused, not dropped.
+    let refusal = "local HBA rule without SCRAM while PostgreSQL has a Unix socket";
+    for socket in [
+        "listen_addresses = '127.0.0.1'\n",
+        "unix_socket_directories = '/run/postgresql'\n",
+        "unix_socket_directories = ''\nunix_socket_directories = '/tmp'\n",
+        "unix_socket_directories = '''/tmp'\n",
+        "unix_socket_directories = ''\ninclude_if_exists = 'other.conf'\n",
+    ] {
+        assert!(!no_unix_socket(socket), "{socket}");
+        let error = pg_hba(PRODUCTION_HBA, no_unix_socket(socket))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), refusal, "{socket}");
+    }
+
+    // The file, the server's reading of it with postgresql.auto.conf, and
+    // the running postmaster must all say there is no socket.
+    let postmaster = "4242\n/var/lib/td-mta/mail/postgres\n1700000000\n35432\n\n\
+                      127.0.0.1\n  1234 5678\nready   \n";
+    assert!(no_socket_today(conf, "", postmaster));
+    let socket_pid = postmaster.replace("35432\n\n", "35432\n/run/postgresql\n");
+    for (file, setting, pid) in [
+        ("unix_socket_directories = '/tmp'\n", "", postmaster),
+        (conf, "/tmp", postmaster),
+        (conf, "", socket_pid.as_str()),
+        (
+            conf,
+            "",
+            "4242\n/var/lib/td-mta/mail/postgres\n1700000000\n35432\n",
+        ),
+    ] {
+        assert!(
+            !no_socket_today(file, setting, pid),
+            "{file} {setting} {pid}"
+        );
+    }
+    for none in [
+        "unix_socket_directories=''",
+        "  UNIX_SOCKET_DIRECTORIES ''  # none\r\n",
+        "unix_socket_directories = '/tmp'\nunix_socket_directories = ''\n",
+        "unix_socket_directories = ''\n# unix_socket_directories = '/tmp'\n",
+    ] {
+        assert!(no_unix_socket(none), "{none}");
+    }
+
+    // A dropped rule goes with its options and comment; other shapes refuse.
+    let peer = pg_hba("local all setup_admin peer map=trial # trial\n", true).unwrap();
+    assert_eq!(peer.dropped, ["local all setup_admin peer map=trial"]);
+    assert_eq!(peer.text, "");
+    for refused in [
+        "local all setup_admin custom\n",
+        "local all setup_admin peer trial\n",
+        "local all +admins trust\n",
+        "local all setup_admin,other trust\n",
+        "local td_mta td_mta_owner scram-sha-256 clientcert=verify-full\n",
+        "local all setup_admin\n",
+        "local all setup_admin peer map=\u{1b}[2J\n",
+        "# continued \\\nlocal all setup_admin trust\n",
+    ] {
+        assert!(pg_hba(refused, true).is_err(), "{refused}");
     }
 }
 

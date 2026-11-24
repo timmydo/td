@@ -117,11 +117,37 @@ fn real_postgres_fence_file_and_live_mode_close_new_connections() -> R<()> {
         Ok((meta.mode() & 0o7777, meta.gid()))
     };
 
+    // What the cutover reads to call a local rule inert: `postgres -C`
+    // prints no socket directory as nothing, and postgresql.auto.conf
+    // overrides the file.
+    let bare = root.join("bare.conf");
+    fs::write(&bare, "port = 35432\nunix_socket_directories = ''\n")?;
+    let directories = || {
+        checked(
+            tools
+                .cmd("postgres")
+                .arg("-D")
+                .arg(&data)
+                .arg("-c")
+                .arg(format!("config_file={}", bare.display()))
+                .args(["-C", "unix_socket_directories"]),
+        )
+    };
+    assert_eq!(directories()?, "");
+    let auto = data.join("postgresql.auto.conf");
+    let generated = fs::read(&auto)?;
+    fs::write(&auto, "unix_socket_directories = '/tmp'\n")?;
+    assert_eq!(directories()?, "/tmp");
+    fs::write(&auto, generated)?;
+
     // A start while the file exists creates the socket closed.
     close_socket(&mut fixture)?;
     {
         let _server = start("fenced.log")?;
         assert_eq!(socket(&fixture)?, (0, group));
+        // The fifth line names the running postmaster's first socket.
+        let pid = fs::read_to_string(data.join("postmaster.pid"))?;
+        assert_eq!(pid.lines().nth(4), sockets.to_str());
         refused(connect()?);
     }
     // With the file removed first, the next start opens it.

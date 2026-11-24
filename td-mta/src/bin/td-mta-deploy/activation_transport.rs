@@ -36,6 +36,12 @@ const DROPPED: &[&str] = &[
 ];
 const INCLUDES: &[&str] = &["include", "include_dir", "include_if_exists"];
 const HBA_DATABASES: &[&str] = &["td_mta", "replication", "postgres", "all"];
+// `local` methods the cutover does not carry to the group-shared socket:
+// trust and peer would admit every account in its group, and the rest
+// are not the SCRAM every login there uses.
+const LOCAL_UNCARRIED: &[&str] = &[
+    "trust", "peer", "ident", "md5", "password", "pam", "ldap", "radius", "gss", "bsd",
+];
 const SERVICE_KEYS: &[&str] = &[
     "host",
     "hostaddr",
@@ -181,14 +187,65 @@ pub(super) fn role_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// Whether `text`, the whole server configuration, leaves the server
+/// without a Unix socket: its last `unix_socket_directories` is `''`.
+/// Absent, the compiled-in directory applies; any other value, or an
+/// include that could set it, counts as a socket.
+pub(super) fn no_unix_socket(text: &str) -> bool {
+    let mut none = false;
+    for line in text.lines() {
+        let Some(key) = setting_key(line) else {
+            continue;
+        };
+        if INCLUDES.iter().any(|k| key.eq_ignore_ascii_case(k)) {
+            return false;
+        }
+        if !key.eq_ignore_ascii_case("unix_socket_directories") {
+            continue;
+        }
+        let rest = line
+            .trim_start()
+            .get(key.len()..)
+            .unwrap_or_default()
+            .trim_start();
+        let value = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+        none = value.strip_prefix("''").is_some_and(|tail| {
+            let tail = tail.trim();
+            tail.is_empty() || tail.starts_with('#')
+        });
+    }
+    none
+}
+
+/// Whether the server has no Unix socket today, as three readings agree:
+/// the configuration file `conf`, `postgres -C unix_socket_directories`
+/// over it and postgresql.auto.conf (`setting`), and the running
+/// postmaster's `postmaster.pid`, whose fifth line is its first socket
+/// directory, empty when it has none.
+pub(super) fn no_socket_today(conf: &str, setting: &str, postmaster: &str) -> bool {
+    no_unix_socket(conf) && setting.is_empty() && postmaster.lines().nth(4) == Some("")
+}
+
+/// What the cutover makes of the production HBA file.
+pub(super) struct Hba {
+    pub(super) text: String,
+    /// Each inert `local` rule dropped, its words single-spaced.
+    pub(super) dropped: Vec<String>,
+}
+
 /// Each loopback SCRAM rule becomes the same rule on the socket, in place.
 /// Socket rules must already use SCRAM or reject: the group-shared socket
 /// would otherwise expose a peer or trust rule to every service account.
-/// TCP rejections stay; any other rule is refused.
-pub(super) fn pg_hba(text: &str) -> R<String> {
+/// Such a rule is dropped instead when `no_socket` says the server has no
+/// Unix socket today, so that it admits no one now; with a socket it is
+/// refused. TCP rejections stay; any other rule is refused.
+pub(super) fn pg_hba(text: &str, no_socket: bool) -> R<Hba> {
     require(text.len() as u64 <= CONF_LIMIT, "oversized HBA file")?;
+    // A continuation would join what follows a dropped line to another.
+    require(!text.contains('\\'), "unexpected HBA line continuation")?;
     let mut out = String::new();
     td_alloc::reserve_string(&mut out, text.len())?;
+    let mut dropped = Vec::new();
     for line in text.split_inclusive('\n') {
         let (body, newline) = split_newline(line);
         let (rule, comment) = match body.split_once('#') {
@@ -214,6 +271,29 @@ pub(super) fn pg_hba(text: &str) -> R<String> {
             ["local", _, _, method] if matches!(*method, "scram-sha-256" | "reject") => {
                 td_alloc::push_str(&mut out, line)?;
             }
+            ["local", _, _, method, options @ ..]
+                if LOCAL_UNCARRIED.contains(method) && options.iter().all(|o| o.contains('=')) =>
+            {
+                require(
+                    no_socket,
+                    "local HBA rule without SCRAM while PostgreSQL has a Unix socket",
+                )?;
+                // The rule reaches the receipt and the operator's terminal.
+                require(
+                    fields
+                        .iter()
+                        .all(|w| w.bytes().all(|b| b.is_ascii_graphic())),
+                    "unexpected HBA rule",
+                )?;
+                let mut rule = String::new();
+                for word in fields {
+                    if !rule.is_empty() {
+                        td_alloc::push_str(&mut rule, " ")?;
+                    }
+                    td_alloc::push_str(&mut rule, word)?;
+                }
+                td_alloc::push(&mut dropped, rule)?;
+            }
             ["host" | "hostssl", _, _, _, "reject"]
             | ["host" | "hostssl", _, _, _, _, "reject"] => {
                 td_alloc::push_str(&mut out, line)?;
@@ -232,7 +312,7 @@ pub(super) fn pg_hba(text: &str) -> R<String> {
             _ => return Err("unexpected HBA rule".into()),
         }
     }
-    Ok(out)
+    Ok(Hba { text: out, dropped })
 }
 
 /// Point each libpq service at the socket directory, dropping TLS settings,
@@ -627,7 +707,13 @@ impl Deployment {
         let uid = fs::metadata(PGDATA)?.uid();
         self.event("staging private socket transport")?;
         fs::DirBuilder::new().mode(0o700).create(&cut.root)?;
-        self.stage(cut)?;
+        let dropped = self.stage(cut)?;
+        let mut rules = Vec::new();
+        for rule in &dropped {
+            self.event(&fmt(format_args!("dropped inert local HBA rule: {rule}"))?)?;
+            td_alloc::push(&mut rules, Json::Str(owned(rule)?))?;
+        }
+        set(&mut self.record, "socket_hba_dropped", Json::Arr(rules))?;
         let mut staged = Vec::new();
         for file in &cut.files {
             td_alloc::push(
@@ -726,15 +812,27 @@ impl Deployment {
         Ok(())
     }
 
-    fn stage(&self, cut: &mut Cutover) -> R<()> {
+    /// Stage every converted file; returns the inert HBA rules dropped.
+    fn stage(&self, cut: &mut Cutover) -> R<Vec<String>> {
         let conf = child(Path::new(MAIL), "postgresql.conf")?;
         let (old, meta) = read_file(&conf, CONF_LIMIT)?;
         let settings = socket_settings(SOCKET_DIR, isolation::DB_GROUP, PG_FENCE)?;
-        let new = postgresql_conf(std::str::from_utf8(&old)?, &settings)?;
+        let text = std::str::from_utf8(&old)?;
+        let new = postgresql_conf(text, &settings)?;
+        let postmaster = td_fs::read_bounded_real_file(
+            &child(Path::new(PGDATA), "postmaster.pid")?,
+            "postmaster.pid",
+            FILE_LIMIT,
+        )?;
+        let no_socket = no_socket_today(
+            text,
+            &self.production_setting("unix_socket_directories")?,
+            std::str::from_utf8(&postmaster)?,
+        );
         cut.add(&conf, Some((old, meta)), new, true)?;
         let hba = self.hba_file()?;
         let (old, meta) = read_file(&hba, CONF_LIMIT)?;
-        let new = pg_hba(std::str::from_utf8(&old)?)?;
+        let Hba { text: new, dropped } = pg_hba(std::str::from_utf8(&old)?, no_socket)?;
         cut.add(&hba, Some((old, meta)), new, false)?;
 
         let mut logins = Vec::new();
@@ -842,7 +940,7 @@ impl Deployment {
                 "notification configuration names an unconverted connection file",
             )?;
         }
-        Ok(())
+        Ok(dropped)
     }
 
     fn rehearse(&mut self, cut: &Cutover, uid: u32, gid: u32) -> R<()> {
