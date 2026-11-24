@@ -1545,6 +1545,38 @@ fn a_check_only_socket_cutover_names_the_cutover_once_it_changed_nothing() {
     assert_eq!(end.result, "failed");
     assert_eq!(end.error.as_deref(), Some("timer preflight"));
     assert!(end.next.is_none());
+    // A check reports every refusal it found, the first as its error.
+    let several = job(
+        Some(1),
+        r#"{"status":"deployment failed","error":"first refusal","socket_refusals":["first refusal","second refusal"]}"#,
+        Some(true),
+    );
+    let end = ended(&opts, args, &several).unwrap();
+    assert_eq!(end.result, "failed");
+    assert_eq!(end.error.as_deref(), Some("first refusal"));
+    let mut written = Vec::new();
+    write_job_outcome(&mut written, &end, &several).unwrap();
+    let line = td_json::parse(
+        String::from_utf8(written)
+            .unwrap()
+            .trim()
+            .strip_prefix("td-mta-deploy-outcome ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(line.get("result").and_then(Json::as_str), Some("failed"));
+    assert_eq!(
+        line.get("error").and_then(Json::as_str),
+        Some("first refusal")
+    );
+    let refusals: Vec<&str> = line
+        .get("refusals")
+        .and_then(Json::as_arr)
+        .unwrap()
+        .iter()
+        .filter_map(Json::as_str)
+        .collect();
+    assert_eq!(refusals, ["first refusal", "second refusal"]);
     // A fence another job holds is not the check's to recover.
     let fenced = Job {
         fence: Some(true),

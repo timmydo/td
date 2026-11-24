@@ -7,8 +7,8 @@ use crate::{
     physical::{PG_DROPIN, SOCKET_DIR},
 };
 use checks::{
-    check_unit_state, generated_check, health_unit, notification_config, schedule_check,
-    service_text, timer_text, tls_checks, tls_word, TlsCheck,
+    check_unit_state, copied_unit, generated_check, hardened_service_text, health_unit,
+    notification_config, schedule_check, service_text, timer_text, tls_checks, tls_word, TlsCheck,
 };
 use database::{CONTROL_SERVICE, OWNER_SERVICE};
 use fence::{fence_condition, open_socket, LiveSocket, SocketFence, FENCE_DROPIN, PG_FENCE};
@@ -539,6 +539,55 @@ pub(super) struct Cutover {
     checks: Vec<TlsCheck>,
 }
 
+/// The refusals of a check-only run, collected so that one run reports
+/// every blocker it reaches; a cutover stops at the first.
+pub(super) struct Refusals {
+    collect: bool,
+    found: Vec<String>,
+}
+
+impl Refusals {
+    pub(super) fn new(collect: bool) -> Self {
+        Self {
+            collect,
+            found: Vec::new(),
+        }
+    }
+
+    /// `result`'s value; a refusal is the cutover's error, or a check's to
+    /// report later, giving None.
+    pub(super) fn take<T>(&mut self, result: R<T>) -> R<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if self.collect => {
+                td_alloc::push(&mut self.found, fmt(format_args!("{error}"))?)?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `take`, a check's refusal naming `subject`, the file it concerns.
+    pub(super) fn take_for<T>(&mut self, subject: &Path, result: R<T>) -> R<Option<T>> {
+        match result {
+            Err(error) if self.collect => {
+                let refusal = fmt(format_args!("{}: {error}", subject.display()))?;
+                td_alloc::push(&mut self.found, refusal)?;
+                Ok(None)
+            }
+            result => self.take(result),
+        }
+    }
+
+    pub(super) fn found(&self) -> &[String] {
+        &self.found
+    }
+}
+
+/// A notification configuration to rewrite: its bytes as read, its new
+/// text, and the names of the checks it drops.
+type Rewrite = (Vec<u8>, String, Vec<String>);
+
 /// What staging found beside the files it converts.
 struct Staging {
     /// Each inert `local` HBA rule dropped.
@@ -669,17 +718,27 @@ pub(super) trait CutoverSteps {
     fn preflight(&mut self) -> R<()>;
     /// Stage every file the cutover would change, and run its guards.
     fn stage(&mut self) -> R<()>;
-    /// What the cutover requires before its fence, changing nothing.
+    /// Keep a check's refusal with those it collected.
+    fn refused(&mut self, error: Failure) -> R<()>;
+    /// What the cutover requires before its fence, changing nothing, and
+    /// a check's end.
     fn checked(&mut self) -> R<()>;
     /// The cutover itself, which stages under its own rollback.
     fn cut_over(&mut self) -> R<()>;
 }
 
+pub(super) type Failure = Box<dyn std::error::Error + Send + Sync>;
+
+/// A cutover stops at its first refusal; a check stops only where nothing
+/// after it can be judged (its preflight), and otherwise reports at its
+/// end everything it refused.
 pub(super) fn cutover(steps: &mut impl CutoverSteps, plan: bool) -> R<()> {
     if plan {
         steps.inspect()?;
         steps.preflight()?;
-        steps.stage()?;
+        if let Err(error) = steps.stage() {
+            steps.refused(error)?;
+        }
         return steps.checked();
     }
     steps.prepare()?;
@@ -696,38 +755,42 @@ pub(super) trait SocketSteps {
     fn prepare(&mut self) -> R<()>;
     /// Read the readiness settings as they are.
     fn inspect(&mut self) -> R<()>;
-    /// The live release's identity and configuration, and the retired
-    /// material's check units.
+    /// The live release's identity and configuration.
     fn preflight(&mut self) -> R<()>;
+    /// The retired material's check units, as the cutover would find them.
+    fn units(&mut self) -> R<()>;
     /// Retire what is left of the loopback transport.
     fn retire(&mut self) -> R<()>;
     /// Record what `retire` would retire.
     fn pending(&mut self) -> R<()>;
     /// The live release's health and public listeners.
     fn verify(&mut self) -> R<()>;
+    /// Keep a check's refusal with those it collected.
+    fn refused(&mut self, error: Failure) -> R<()>;
     fn checked(&mut self) -> R<()>;
     fn finished(&mut self) -> R<()>;
 }
 
 pub(super) fn on_socket(steps: &mut impl SocketSteps, plan: bool) -> R<()> {
     steps.transport()?;
-    if plan {
-        steps.inspect()?;
-    } else {
+    if !plan {
         steps.prepare()?;
-    }
-    steps.preflight()?;
-    if plan {
-        steps.pending()?;
-    } else {
+        steps.preflight()?;
+        steps.units()?;
         steps.retire()?;
+        steps.verify()?;
+        return steps.finished();
     }
-    steps.verify()?;
-    if plan {
-        steps.checked()
-    } else {
-        steps.finished()
+    steps.inspect()?;
+    steps.preflight()?;
+    if let Err(error) = steps.units() {
+        steps.refused(error)?;
     }
+    steps.pending()?;
+    if let Err(error) = steps.verify() {
+        steps.refused(error)?;
+    }
+    steps.checked()
 }
 
 /// The receipt event that ends a check-only run.
@@ -740,6 +803,7 @@ struct LiveCutover<'a> {
     cut: Cutover,
     /// The socket group; None while a check finds it absent.
     gid: Option<u32>,
+    refusals: Refusals,
 }
 
 impl LiveCutover<'_> {
@@ -788,30 +852,39 @@ impl CutoverSteps for LiveCutover<'_> {
     }
 
     fn stage(&mut self) -> R<()> {
-        self.deployment.stage_cutover(&mut self.cut)
+        self.deployment
+            .stage_cutover(&mut self.cut, &mut self.refusals)
+    }
+
+    fn refused(&mut self, error: Failure) -> R<()> {
+        self.refusals.take::<()>(Err(error)).map(|_| ())
     }
 
     fn checked(&mut self) -> R<()> {
         let d = &mut *self.deployment;
+        let r = &mut self.refusals;
         // The cutover creates the fence directory if it is absent.
-        match fs::symlink_metadata(parent(Path::new(PG_FENCE))?) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            _ => {
-                fence::fence_directory(false)?;
-            }
-        }
+        r.take(match fs::symlink_metadata(parent(Path::new(PG_FENCE))?) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            _ => fence::fence_directory(false).map(|_| ()),
+        })?;
         let path = Path::new(SOCKET_DIR);
-        files::safe_parents(path)?;
-        socket_directory_owned(path, fs::metadata(PGDATA)?.uid(), self.gid)?;
+        r.take(
+            files::safe_parents(path)
+                .and_then(|()| fs::metadata(PGDATA).map_err(Into::into))
+                .and_then(|pgdata| socket_directory_owned(path, pgdata.uid(), self.gid)),
+        )?;
         // The rehearsal's volume and room, and the fence's timers.
-        crate::physical::recovery_volume()?;
-        d.rehearsal_capacity(Path::new(crate::physical::VOLUME))?;
-        fence::required_timers(&d.active_timers()?)?;
-        d.probes.probe("smtp")?;
-        d.probes.probe("jmap")?;
-        set(&mut d.record, "socket_checked", true.into())?;
-        d.event(SOCKET_CHECKED)?;
-        Ok(())
+        if r.take(crate::physical::recovery_volume())?.is_some() {
+            r.take(d.rehearsal_capacity(Path::new(crate::physical::VOLUME)))?;
+        }
+        r.take(
+            d.active_timers()
+                .and_then(|timers| fence::required_timers(&timers)),
+        )?;
+        r.take(d.probes.probe("smtp"))?;
+        r.take(d.probes.probe("jmap"))?;
+        d.concluded(r)
     }
 
     fn cut_over(&mut self) -> R<()> {
@@ -828,6 +901,7 @@ impl CutoverSteps for LiveCutover<'_> {
 struct LiveSocketHost<'a> {
     deployment: &'a mut Deployment,
     checks: Vec<TlsCheck>,
+    refusals: Refusals,
 }
 
 impl SocketSteps for LiveSocketHost<'_> {
@@ -851,10 +925,13 @@ impl SocketSteps for LiveSocketHost<'_> {
     fn preflight(&mut self) -> R<()> {
         let d = &mut *self.deployment;
         d.journal_identity()?;
-        d.config(&d.previous, &[], d.isolated)?;
+        d.config(&d.previous, &[], d.isolated)
+    }
+
+    fn units(&mut self) -> R<()> {
         // A cutover that failed after admission may have left the retired
         // transport's units or material; finish retiring them.
-        self.checks = d.check_units()?;
+        self.checks = self.deployment.check_units(&mut self.refusals)?;
         Ok(())
     }
 
@@ -879,18 +956,22 @@ impl SocketSteps for LiveSocketHost<'_> {
 
     fn verify(&mut self) -> R<()> {
         let d = &mut *self.deployment;
-        d.healthy(&d.previous)?;
-        d.probes.probe("smtp")?;
-        d.probes.probe("jmap")?;
-        d.event(ON_SOCKET)?;
+        let r = &mut self.refusals;
+        let healthy = r.take(d.healthy(&d.previous))?.is_some();
+        let smtp = r.take(d.probes.probe("smtp"))?.is_some();
+        let jmap = r.take(d.probes.probe("jmap"))?.is_some();
+        if healthy && smtp && jmap {
+            d.event(ON_SOCKET)?;
+        }
         Ok(())
     }
 
+    fn refused(&mut self, error: Failure) -> R<()> {
+        self.refusals.take::<()>(Err(error)).map(|_| ())
+    }
+
     fn checked(&mut self) -> R<()> {
-        let d = &mut *self.deployment;
-        set(&mut d.record, "socket_checked", true.into())?;
-        d.event(SOCKET_CHECKED)?;
-        Ok(())
+        self.deployment.concluded(&self.refusals)
     }
 
     fn finished(&mut self) -> R<()> {
@@ -956,6 +1037,7 @@ impl Deployment {
                 &mut LiveSocketHost {
                     deployment: self,
                     checks: Vec::new(),
+                    refusals: Refusals::new(plan),
                 },
                 plan,
             );
@@ -974,21 +1056,38 @@ impl Deployment {
                 deployment: self,
                 cut,
                 gid: None,
+                refusals: Refusals::new(plan),
             },
             plan,
         )
     }
 
-    fn stage_cutover(&mut self, cut: &mut Cutover) -> R<()> {
+    fn stage_cutover(&mut self, cut: &mut Cutover, refusals: &mut Refusals) -> R<()> {
         self.event("staging private socket transport")?;
         fs::DirBuilder::new().mode(0o700).create(&cut.root)?;
-        let staging = self.stage(cut)?;
+        let staging = self.stage(cut, refusals)?;
         self.record_staging(cut, &staging)
+    }
+
+    /// The end of a check: every refusal it collected, the first as its
+    /// error, or that it found none and changed nothing.
+    fn concluded(&mut self, refusals: &Refusals) -> R<()> {
+        if let Some(first) = refusals.found().first() {
+            let mut all = Vec::new();
+            for refusal in refusals.found() {
+                td_alloc::push(&mut all, Json::Str(owned(refusal)?))?;
+            }
+            set(&mut self.record, "socket_refusals", Json::Arr(all))?;
+            return Err(owned(first)?.into());
+        }
+        set(&mut self.record, "socket_checked", true.into())?;
+        self.event(SOCKET_CHECKED)?;
+        Ok(())
     }
 
     fn socket_cutover(&mut self, cut: &mut Cutover, gid: u32) -> R<()> {
         let uid = fs::metadata(PGDATA)?.uid();
-        self.stage_cutover(cut)?;
+        self.stage_cutover(cut, &mut Refusals::new(false))?;
         // Checked before any fence: the server's include must reach the file.
         fence::fence_directory(true)?;
         cut.created_dir = socket_directory(uid, gid)?;
@@ -1138,58 +1237,84 @@ impl Deployment {
     }
 
     /// The installer's expiry checks of the retired material, each still
-    /// exactly as it generated it.
-    fn check_units(&self) -> R<Vec<TlsCheck>> {
+    /// in a form it generated.
+    fn check_units(&self, refusals: &mut Refusals) -> R<Vec<TlsCheck>> {
         let found = tls_checks(
             &self.unit_commands()?,
             &checks::material_dirs(self.isolated)?,
         )?;
         for check in &found {
-            self.verify_check(check)?;
+            self.verify_check(check, refusals)?;
         }
         Ok(found)
     }
 
     /// `check`'s service and timer are the files the operations installer
-    /// generated, with no drop-in but a fence's own condition; the Shepherd
-    /// definition beside them, if any, registers and runs the same check.
-    fn verify_check(&self, check: &TlsCheck) -> R<()> {
+    /// generated, or production's copies of them (`generated_check`), with
+    /// no drop-in but a fence's own condition; the Shepherd definition
+    /// beside generated ones, if any, registers and runs the same check.
+    fn verify_check(&self, check: &TlsCheck, refusals: &mut Refusals) -> R<()> {
         let condition = fence_condition()?;
-        for (suffix, text) in [
-            ("service", service_text(check)?),
-            ("timer", timer_text(check)?),
-        ] {
-            let unit = check.unit(suffix)?;
-            let props = self.host.out(self.host.cmd("systemctl").args([
-                "show",
-                &unit,
-                "-p",
-                "LoadState",
-                "-p",
-                "FragmentPath",
-                "-p",
-                "DropInPaths",
-            ]))?;
-            let directory = child(Path::new(UNIT_DIR), &fmt(format_args!("{unit}.d"))?)?;
-            let fence = child(&directory, FENCE_DROPIN)?;
-            let clean = fence_only(&directory, &condition)?;
-            let Some(fragment) = check_unit_state(&unit, suffix == "timer", &props, &fence, clean)?
-            else {
-                continue;
-            };
-            let real = fs::canonicalize(fragment)?;
-            let (bytes, _) = read_file(&real, FILE_LIMIT)?;
-            generated_check(&unit, &real, &bytes, &text)?;
-            if suffix != "service" {
-                continue;
+        let mut service = Vec::new();
+        td_alloc::push(&mut service, service_text(check)?)?;
+        td_alloc::push(&mut service, hardened_service_text(check)?)?;
+        let mut timer = Vec::new();
+        td_alloc::push(&mut timer, timer_text(check)?)?;
+        let mut kinds = Vec::new();
+        for (suffix, forms) in [("service", service), ("timer", timer)] {
+            if let Some(Some(kind)) =
+                refusals.take(self.verify_check_unit(check, suffix, &forms, &condition))?
+            {
+                td_alloc::push(&mut kinds, kind)?;
             }
-            let scm = child(parent(&real)?, &check.unit("scm")?)?;
+        }
+        refusals.take(same_kind(&check.name, &kinds))?;
+        Ok(())
+    }
+
+    /// One of `check`'s units: where its file is (None for a copy, else
+    /// the directory it is linked from), None when it is a timer systemd
+    /// does not find.
+    fn verify_check_unit(
+        &self,
+        check: &TlsCheck,
+        suffix: &str,
+        forms: &[String],
+        condition: &str,
+    ) -> R<Option<Option<PathBuf>>> {
+        let unit = check.unit(suffix)?;
+        let props = self.host.out(self.host.cmd("systemctl").args([
+            "show",
+            &unit,
+            "-p",
+            "LoadState",
+            "-p",
+            "FragmentPath",
+            "-p",
+            "DropInPaths",
+        ]))?;
+        let directory = child(Path::new(UNIT_DIR), &fmt(format_args!("{unit}.d"))?)?;
+        let fence = child(&directory, FENCE_DROPIN)?;
+        let clean = fence_only(&directory, condition)?;
+        let Some(fragment) = check_unit_state(&unit, suffix == "timer", &props, &fence, clean)?
+        else {
+            return Ok(None);
+        };
+        let (real, copied) = copy_of(&unit, Path::new(fragment))?;
+        let (bytes, _) = read_file(&real, FILE_LIMIT)?;
+        generated_check(&unit, &real, copied, &bytes, forms)?;
+        if copied {
+            return Ok(Some(None));
+        }
+        let directory = PathBuf::from(parent(&real)?);
+        if suffix == "service" {
+            let scm = child(&directory, &check.unit("scm")?)?;
             if scm.try_exists()? {
                 let (bytes, _) = read_file(&scm, FILE_LIMIT)?;
                 schedule_check(check, &bytes)?;
             }
         }
-        Ok(())
+        Ok(Some(Some(directory)))
     }
 
     /// The aggregate health unit's own file may still list the checks of
@@ -1208,11 +1333,8 @@ impl Deployment {
             "td-mta-health.service has no unit file",
         )?;
         let text = td_fs::read_bounded(Path::new(&fragment), FILE_LIMIT)?;
-        let mut lines = Vec::new();
-        for line in crate::readiness::tls_only_lines() {
-            td_alloc::push(&mut lines, line)?;
-        }
-        let Some(new) = health_unit(std::str::from_utf8(&text)?, &lines)? else {
+        let dirs = checks::material_dirs(self.isolated)?;
+        let Some(new) = health_unit(std::str::from_utf8(&text)?, &dirs)? else {
             return Ok(());
         };
         let path = child(Path::new(UNIT_DIR), HEALTH)?;
@@ -1227,27 +1349,34 @@ impl Deployment {
 
     /// Stage every converted file and find the jobs retired with the
     /// material; refuses anything else that still needs the old transport.
-    fn stage(&self, cut: &mut Cutover) -> R<Staging> {
-        let conf = child(Path::new(MAIL), "postgresql.conf")?;
-        let (old, meta) = read_file(&conf, CONF_LIMIT)?;
-        let settings = socket_settings(SOCKET_DIR, isolation::DB_GROUP, PG_FENCE)?;
-        let text = std::str::from_utf8(&old)?;
-        let new = postgresql_conf(text, &settings)?;
-        let postmaster = td_fs::read_bounded_real_file(
-            &child(Path::new(PGDATA), "postmaster.pid")?,
-            "postmaster.pid",
-            FILE_LIMIT,
-        )?;
-        let no_socket = no_socket_today(
-            text,
-            &self.production_setting("unix_socket_directories")?,
-            std::str::from_utf8(&postmaster)?,
-        );
-        cut.add(&conf, Some((old, meta)), new, true)?;
-        let hba = self.hba_file()?;
-        let (old, meta) = read_file(&hba, CONF_LIMIT)?;
-        let Hba { text: new, dropped } = pg_hba(std::str::from_utf8(&old)?, no_socket)?;
-        cut.add(&hba, Some((old, meta)), new, false)?;
+    /// Each independent part's refusal goes to `refusals`.
+    fn stage(&self, cut: &mut Cutover, refusals: &mut Refusals) -> R<Staging> {
+        // pg_hba.conf's inert rules depend on postgresql.conf's reading.
+        let dropped = refusals
+            .take((|| -> R<Vec<String>> {
+                let conf = child(Path::new(MAIL), "postgresql.conf")?;
+                let (old, meta) = read_file(&conf, CONF_LIMIT)?;
+                let settings = socket_settings(SOCKET_DIR, isolation::DB_GROUP, PG_FENCE)?;
+                let text = std::str::from_utf8(&old)?;
+                let new = postgresql_conf(text, &settings)?;
+                let postmaster = td_fs::read_bounded_real_file(
+                    &child(Path::new(PGDATA), "postmaster.pid")?,
+                    "postmaster.pid",
+                    FILE_LIMIT,
+                )?;
+                let no_socket = no_socket_today(
+                    text,
+                    &self.production_setting("unix_socket_directories")?,
+                    std::str::from_utf8(&postmaster)?,
+                );
+                cut.add(&conf, Some((old, meta)), new, true)?;
+                let hba = self.hba_file()?;
+                let (old, meta) = read_file(&hba, CONF_LIMIT)?;
+                let Hba { text: new, dropped } = pg_hba(std::str::from_utf8(&old)?, no_socket)?;
+                cut.add(&hba, Some((old, meta)), new, false)?;
+                Ok(dropped)
+            })())?
+            .unwrap_or_default();
 
         let mut logins = Vec::new();
         for (path, user) in [
@@ -1273,23 +1402,38 @@ impl Deployment {
                 )?;
             }
         }
-        for (path, user, ca) in logins {
-            let (old, meta) = read_file(&path, FILE_LIMIT)?;
-            let new = connection(std::str::from_utf8(&old)?, &user, &ca)?;
-            cut.add(&path, Some((old, meta)), new, true)?;
+        for (path, user, ca) in &logins {
+            refusals.take_for(
+                path,
+                (|| -> R<()> {
+                    let (old, meta) = read_file(path, FILE_LIMIT)?;
+                    let new = connection(std::str::from_utf8(&old)?, user, ca)?;
+                    cut.add(path, Some((old, meta)), new, true)
+                })(),
+            )?;
         }
 
         let mut passfiles = Vec::new();
         for path in [OWNER_SERVICE, CONTROL_SERVICE] {
             let path = Path::new(path);
-            let (old, meta) = read_file(path, FILE_LIMIT)?;
-            let new = service_file(std::str::from_utf8(&old)?, &mut passfiles)?;
-            cut.add(path, Some((old, meta)), new, true)?;
+            refusals.take_for(
+                path,
+                (|| -> R<()> {
+                    let (old, meta) = read_file(path, FILE_LIMIT)?;
+                    let new = service_file(std::str::from_utf8(&old)?, &mut passfiles)?;
+                    cut.add(path, Some((old, meta)), new, true)
+                })(),
+            )?;
         }
         for path in passfiles {
-            let (old, meta) = read_file(&path, FILE_LIMIT)?;
-            let new = passfile(std::str::from_utf8(&old)?)?;
-            cut.add(&path, Some((old, meta)), new, true)?;
+            refusals.take_for(
+                &path,
+                (|| -> R<()> {
+                    let (old, meta) = read_file(&path, FILE_LIMIT)?;
+                    let new = passfile(std::str::from_utf8(&old)?)?;
+                    cut.add(&path, Some((old, meta)), new, true)
+                })(),
+            )?;
         }
 
         let dropin = Setting {
@@ -1297,7 +1441,7 @@ impl Deployment {
             text: owned(PG_DROPIN_TEXT)?,
             mode: 0o644,
         };
-        cut.setting(None, &dropin)?;
+        refusals.take_for(&dropin.path, cut.setting(None, &dropin))?;
         if self.isolated {
             for (old, new) in files::production_tls()?
                 .iter()
@@ -1305,91 +1449,111 @@ impl Deployment {
             {
                 require(old.path == new.path, "identity setting order")?;
                 if old.text != new.text {
-                    cut.setting(Some(old), new)?;
+                    refusals.take_for(&new.path, cut.setting(Some(old), new))?;
                 }
             }
         }
-        cut.setting(
-            Some(&crate::readiness::aggregate(true)?),
-            &crate::readiness::aggregate(false)?,
+        let aggregate = crate::readiness::aggregate(false)?;
+        refusals.take_for(
+            &aggregate.path,
+            cut.setting(Some(&crate::readiness::aggregate(true)?), &aggregate),
         )?;
-        self.stage_health(cut)?;
+        refusals.take(self.stage_health(cut))?;
         // Every other td-mta job must already be independent of the retired
         // transport; the cutover would otherwise leave it failing. The
         // installer's expiry checks of the material retire with it.
         let dirs = checks::material_dirs(self.isolated)?;
-        let show = self.unit_commands()?;
-        cut.checks = tls_checks(&show, &dirs)?;
-        let mut retiring = Vec::new();
-        for check in &cut.checks {
-            self.verify_check(check)?;
-            td_alloc::push(&mut retiring, check.unit("service")?)?;
-        }
-        let mut notifications = Vec::new();
-        let mut rewritten = Vec::new();
-        {
-            let mut converted = Vec::new();
-            for file in &cut.files {
-                td_alloc::push(&mut converted, file.target.as_path())?;
+        if let Some(show) = refusals.take(self.unit_commands())? {
+            cut.checks = tls_checks(&show, &dirs)?;
+            let mut retiring = Vec::new();
+            for check in &cut.checks {
+                self.verify_check(check, refusals)?;
+                td_alloc::push(&mut retiring, check.unit("service")?)?;
             }
-            if let Some(unit) = retired_reference(&show, &converted, &retiring)? {
-                return Err(fmt(format_args!(
+            // Judged against the files the cutover converts, so a refused
+            // conversion is reported once, not again for each job using it.
+            let mut paths = Vec::new();
+            for (path, _, _) in &logins {
+                td_alloc::push(&mut paths, path.as_path())?;
+            }
+            for unit in retired_references(&show, &paths, &retiring)? {
+                refusals.take::<()>(Err(fmt(format_args!(
                     "{unit} names loopback TLS material or an unconverted connection file"
                 ))?
-                .into());
-            }
-            // The notification jobs name theirs inside their configuration,
-            // and run the installer's checks of the material from it too.
-            for (name, canonical) in [("config.json", true), ("isolated.json", false)] {
-                let path = child(Path::new(isolation::NOTIFY), name)?;
-                if !path.try_exists()? {
-                    continue;
-                }
-                let bytes = td_fs::read_bounded_real_file(
-                    &path,
-                    "notification configuration",
-                    isolation::NOTIFICATION_LIMIT as u64,
-                )?;
-                let text = std::str::from_utf8(&bytes)?;
-                let config =
-                    td_json::parse(text).map_err(|_| "invalid notification configuration")?;
-                let connection = config
-                    .get("connection")
-                    .and_then(Json::as_str)
-                    .ok_or("notification configuration without a connection")?;
-                require(
-                    converted.iter().any(|p| p.as_os_str() == connection),
-                    "notification configuration names an unconverted connection file",
-                )?;
-                // The installer writes config.json canonical, and the
-                // operator may have edited it since (its `alerts`); the
-                // isolation helper always derives isolated.json as td-json
-                // prints it.
-                let encode = |json: &Json| -> R<String> {
-                    if canonical {
-                        Ok(json.to_canonical())
-                    } else {
-                        fmt(format_args!("{json}\n"))
-                    }
-                };
-                if let Some((new, names)) = notification_config(text, &dirs, !canonical, encode)? {
-                    // isolated.json derives from config.json: one name each.
-                    for name in names {
-                        if !notifications.contains(&name) {
-                            td_alloc::push(&mut notifications, name)?;
-                        }
-                    }
-                    td_alloc::push(&mut rewritten, (path, bytes, new))?;
-                }
+                .into()))?;
             }
         }
-        for (path, bytes, new) in rewritten {
-            let (old, meta) = read_file(&path, isolation::NOTIFICATION_LIMIT as u64)?;
-            require(
-                old == bytes,
-                "notification configuration changed while staging",
+        // The notification jobs name theirs inside their configuration,
+        // and run the installer's checks of the material from it too.
+        let mut notifications = Vec::new();
+        let mut rewritten = Vec::new();
+        for (name, canonical) in [("config.json", true), ("isolated.json", false)] {
+            let path = child(Path::new(isolation::NOTIFY), name)?;
+            let staged = refusals.take_for(
+                &path,
+                (|| -> R<Option<Rewrite>> {
+                    if !path.try_exists()? {
+                        return Ok(None);
+                    }
+                    let bytes = td_fs::read_bounded_real_file(
+                        &path,
+                        "notification configuration",
+                        isolation::NOTIFICATION_LIMIT as u64,
+                    )?;
+                    let text = std::str::from_utf8(&bytes)?;
+                    let config =
+                        td_json::parse(text).map_err(|_| "invalid notification configuration")?;
+                    let connection = config
+                        .get("connection")
+                        .and_then(Json::as_str)
+                        .ok_or("notification configuration without a connection")?;
+                    require(
+                        logins
+                            .iter()
+                            .any(|(path, _, _)| path.as_os_str() == connection),
+                        "notification configuration names an unconverted connection file",
+                    )?;
+                    // The installer writes config.json canonical, and the
+                    // operator may have edited it since (its `alerts`); the
+                    // isolation helper always derives isolated.json as td-json
+                    // prints it.
+                    let encode = |json: &Json| -> R<String> {
+                        if canonical {
+                            Ok(json.to_canonical())
+                        } else {
+                            fmt(format_args!("{json}\n"))
+                        }
+                    };
+                    let Some((new, names)) = notification_config(text, &dirs, !canonical, encode)?
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(Some((bytes, new, names)))
+                })(),
             )?;
-            cut.add(&path, Some((old, meta)), new, false)?;
+            let Some(Some((bytes, new, names))) = staged else {
+                continue;
+            };
+            // isolated.json derives from config.json: one name each.
+            for name in names {
+                if !notifications.contains(&name) {
+                    td_alloc::push(&mut notifications, name)?;
+                }
+            }
+            td_alloc::push(&mut rewritten, (path, bytes, new))?;
+        }
+        for (path, bytes, new) in rewritten {
+            refusals.take_for(
+                &path,
+                (|| -> R<()> {
+                    let (old, meta) = read_file(&path, isolation::NOTIFICATION_LIMIT as u64)?;
+                    require(
+                        old == bytes,
+                        "notification configuration changed while staging",
+                    )?;
+                    cut.add(&path, Some((old, meta)), new, false)
+                })(),
+            )?;
         }
         Ok(Staging {
             dropped,
@@ -1509,9 +1673,11 @@ impl Deployment {
 
     // td-mta's operations installer generated the renewal units and the
     // expiry checks in its prefix's `share/td-mta/services`, where the
-    // operator linked them; once disabled, those files move into the job
-    // directory. A unit file found anywhere else was never td-mta's and
-    // stays, recorded for the operator. The certificate material is moved,
+    // operator linked them; production copied the checks into
+    // /etc/systemd/system instead, as staging verified. Once disabled,
+    // those files move into the job directory, owner and mode kept. A unit
+    // file found anywhere else was never td-mta's and stays, recorded for
+    // the operator. The certificate material is moved,
     // never deleted, for rollback. Each step acts only on what is still
     // present, so a later run on the socket finishes what an interrupted one
     // left.
@@ -1553,7 +1719,12 @@ impl Deployment {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
-            if generated_unit(&real, unit) {
+            let check = checks.iter().any(|c| {
+                c.unit("service").is_ok_and(|u| &u == unit)
+                    || c.unit("timer").is_ok_and(|u| &u == unit)
+            });
+            let copied = check && copy_of(unit, Path::new(&fragment))?.1;
+            if generated_unit(&real, unit) || copied {
                 td_alloc::push(&mut generated, real)?;
             } else {
                 td_alloc::push(&mut left, Json::Str(owned(&fragment)?))?;
@@ -1592,9 +1763,13 @@ impl Deployment {
         }
         // The Shepherd definition generated beside each goes too, and so
         // does a sibling unit file systemd no longer loads, such as a timer
-        // disabled by hand.
+        // disabled by hand; only in the installer's directory, since a copy
+        // in /etc/systemd/system goes alone, as verified.
         let mut siblings = Vec::new();
         for path in &generated {
+            if parent(path)? == Path::new(UNIT_DIR) {
+                continue;
+            }
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1616,13 +1791,7 @@ impl Deployment {
         fs::DirBuilder::new().mode(0o700).create(&kept)?;
         let mut moved = Vec::new();
         for path in &generated {
-            let (bytes, _) = read_file(path, FILE_LIMIT)?;
-            let mut copy = create_file(&child(&kept, name(path)?)?, 0o600)?;
-            copy.write_all(&bytes)?;
-            copy.sync_all()?;
-            sync_dir(&kept)?;
-            remove_file(path)?;
-            sync_dir(parent(path)?)?;
+            retire_file(path, &kept)?;
             td_alloc::push(
                 &mut moved,
                 Json::Str(owned(path.to_str().ok_or("unit path")?)?),
@@ -1702,6 +1871,50 @@ impl Deployment {
     }
 }
 
+/// `fragment`, a unit file as systemd names it, resolved, and whether it is
+/// a copy in /etc/systemd/system (`copied_unit`).
+fn copy_of(unit: &str, fragment: &Path) -> R<(PathBuf, bool)> {
+    let meta = fs::symlink_metadata(fragment)?;
+    let real = fs::canonicalize(fragment)?;
+    let copied = copied_unit(
+        unit,
+        fragment,
+        &real,
+        meta.is_file(),
+        meta.uid(),
+        meta.mode(),
+    );
+    Ok((real, copied))
+}
+
+/// Retirement moves a check's service and timer into one directory by
+/// name: `kinds`, each found unit's (None for a copy, else the directory
+/// it is linked from), must agree.
+pub(super) fn same_kind(name: &str, kinds: &[Option<PathBuf>]) -> R<()> {
+    match kinds {
+        [service, timer] if service != timer => checks::refuse(
+            name,
+            "has a service and a timer that are not both copies or both linked from one directory",
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Moves the file `path` into the directory `kept`, keeping its bytes,
+/// owner and mode, so that copying it back restores it.
+fn retire_file(path: &Path, kept: &Path) -> R<()> {
+    let (bytes, meta) = read_file(path, FILE_LIMIT)?;
+    let mut copy = create_file(&child(kept, name(path)?)?, 0o600)?;
+    copy.write_all(&bytes)?;
+    std::os::unix::fs::fchown(&copy, Some(meta.uid()), Some(meta.gid()))?;
+    copy.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    copy.sync_all()?;
+    sync_dir(kept)?;
+    remove_file(path)?;
+    sync_dir(parent(path)?)?;
+    Ok(())
+}
+
 /// Whether `path` is the fence's drop-in holding exactly `condition`, which
 /// a job that ended before its cleanup leaves beside each scheduled service.
 fn fence_dropin(path: &Path, condition: &str) -> R<bool> {
@@ -1754,16 +1967,17 @@ fn retire_dropins(directory: &Path, condition: &str) -> R<Option<bool>> {
 // Units the cutover itself replaces or retires.
 const RETIRED_UNITS: &[&str] = &[RENEW, RENEW_SERVICE, HEALTH];
 
-/// The first unit in `systemctl show` output, other than those `retiring`
+/// Each unit in `systemctl show` output, other than those `retiring`
 /// names, whose commands name a PostgreSQL TLS directory, or a connection
 /// file the cutover does not convert. Units are blank-line separated;
 /// `Id=` may follow the commands.
-pub(super) fn retired_reference<'a>(
+pub(super) fn retired_references<'a>(
     show: &'a str,
     converted: &[&Path],
     retiring: &[String],
-) -> R<Option<&'a str>> {
-    for block in show.split("\n\n").filter(|b| !b.trim().is_empty()) {
+) -> R<Vec<&'a str>> {
+    let mut found = Vec::new();
+    'units: for block in show.split("\n\n").filter(|b| !b.trim().is_empty()) {
         let unit = block
             .lines()
             .find_map(|line| line.strip_prefix("Id="))
@@ -1777,11 +1991,12 @@ pub(super) fn retired_reference<'a>(
             };
             let argv = rest.split(" ;").next().unwrap_or(rest);
             if names_retired(argv, converted)? {
-                return Ok(Some(unit));
+                td_alloc::push(&mut found, unit)?;
+                continue 'units;
             }
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 fn names_retired(argv: &str, converted: &[&Path]) -> R<bool> {

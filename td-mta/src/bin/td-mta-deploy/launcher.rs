@@ -949,6 +949,16 @@ fn write_job_outcome(out: &mut impl std::io::Write, end: &Ended, job: &Job) -> R
     if let Some(time) = end.not_before {
         set(&mut details, "not_before", Json::from(time))?;
     }
+    // A check-only socket cutover's every refusal, the first its error.
+    if let Some(refusals @ Json::Arr(_)) =
+        job.record.as_ref().and_then(|r| r.get("socket_refusals"))
+    {
+        set(
+            &mut details,
+            "refusals",
+            crate::common::copy_json(refusals)?,
+        )?;
+    }
     write_ended(out, end, details)
 }
 

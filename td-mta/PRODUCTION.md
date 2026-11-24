@@ -855,23 +855,35 @@ job that names an unconverted connection file:
 
 - The operations installer's expiry checks `td-mta-maint-tls-N`: a
   service running exactly `OPENSSL x509 -in FILE -noout -checkend
-  2592000` on a file directly in one of those directories, whose service
-  and timer files are byte for byte the installer's, in its prefix's
-  `share/td-mta/services`, with no drop-in but a fence's own condition,
-  and whose Shepherd definition beside them, if any, registers that
-  service and runs that command. Their timers stay stopped from the
-  fence on (`retired_timers_excluded`). After verification the job
-  disables them, moves their files, their Shepherd definitions and any
-  other generated unit file of the same name beside them (such as a
-  timer disabled by hand) into `retired/units` beside the renewal
-  job's (`retired_units`), and
-  removes the drop-in directory left beside each once it holds nothing
-  but the fence's condition (`retired_unit_dropins`; one holding
-  anything else stays, in `retired_unit_dropins_left`).
+  2592000` on a file directly in one of those directories, with no
+  drop-in but a fence's own condition (an empty drop-in directory is
+  none), whose service and timer files are either the installer's own,
+  linked from its prefix's `share/td-mta/services`, byte for byte, with
+  the Shepherd definition beside them, if any, registering that service
+  and running that command; or root's regular-file copies in
+  `/etc/systemd/system`, as production has them: the timer byte for
+  byte, the service byte for byte or with exactly the six lines from
+  `User=td-mta` to `TasksMax=32` that production's hand-installed
+  maintenance services carry after `[Service]` (the readiness jobs'
+  template took them from there). A check's service and timer are both
+  copies or both linked from one directory. Their timers stay stopped
+  from the fence on (`retired_timers_excluded`). After verification the
+  job disables them, moves their files into `retired/units` beside the
+  renewal job's (`retired_units`), with, for linked files, the Shepherd
+  definition and any other unit file of the same name beside them in
+  the installer's directory (such as a timer disabled by hand), keeping
+  each file's owner and mode so that copying it back with `cp -p`
+  restores it, and removes the drop-in directory left beside
+  each once it holds nothing but the fence's condition
+  (`retired_unit_dropins`; one holding anything else stays, in
+  `retired_unit_dropins_left`). The installer's own files in `share`
+  that production copied stay where they are, linked by nothing.
 - `td-mta-health.service`: its readiness drop-in becomes the socket
-  layout's, and the unit file itself loses exactly the two `openssl`
-  lines of the TLS aggregate (which the drop-in's `ExecStart=` already
-  overrode), every other line byte for byte.
+  layout's, and the unit file itself loses each `ExecStart=` expiry
+  check of a file in those directories (`OPENSSL x509 -in FILE`, then
+  `-noout -checkend 2592000` or `-checkend 2592000 -noout`, plain or
+  each word in double quotes; the drop-in's `ExecStart=` already
+  overrode them), every other line byte for byte.
 - The notification monitor's `tls-N` status checks of the same files:
   `config.json` and `isolated.json` lose them
   (`socket_notification_checks_dropped`). `isolated.json` must be as
@@ -896,7 +908,20 @@ the fence and socket directories, if present, the recovery volume and
 its room for the rehearsal's base backup, the backup and health
 timers, and the public probes. It does not rehearse, since the
 rehearsal's base backup and trial server are neither cheap nor apart
-from the live host, and like the cutover it stops at the first refusal.
+from the live host. Unlike the cutover, it does not stop at a refusal
+where the steps after it do not depend on it: each converted file, each
+setting, the health unit, each check unit, each job naming the old
+transport, each notification configuration and each requirement before
+the fence is checked on its own, and the outcome lists every refusal
+(`refusals`, the first also as `error`; the receipt's
+`socket_refusals`), a refusal of a converted file or setting prefixed
+with its path. The
+preflight before staging still stops it; a step whose input a refused
+step would have produced (`pg_hba.conf` after `postgresql.conf`, a
+passfile after its service file, the rehearsal's room after its volume)
+is skipped. A job naming a connection file whose conversion is refused
+is not reported again. The receipt's `socket_retired_checks` then names
+the check units found, verified or not.
 It writes its job directory (the receipt and the staged files), the
 controller under `/opt/td-mta/lib/td-mta/deploy` as every job does, and
 the activation lock; its health preflight starts the status and health
@@ -906,6 +931,12 @@ socket it runs that run's checks and names the check units a
 `--postgres-socket` there would retire. Its outcome is
 `socket-cutover-checked`, whose `next` is the cutover; a refusal is
 `failed`, naming what to clear.
+
+The renewal units `td-mta-maint-postgres-tls-renew.{service,timer}`
+are not checked: the cutover leaves their timer out of admission, and
+disables and stops them after verification. Only the installer's linked
+files move; a copy in `/etc/systemd/system` stays where it is, disabled,
+and is named in `retired_units_left`.
 
 Each refusal names the unit or file. To clear one, make it the form
 above or remove it by hand: disable and unlink a check that is not the
@@ -1225,7 +1256,9 @@ configuration"; every other mode holds the following:
   - `deferred`: `--retire-rollback` found all its material inside the
     window; `approve` repeats it, not before `not_before`.
 - `error`: on a refusal or failure, the message, which the command also
-  prints on standard error before exiting nonzero. A job refused before
+  prints on standard error before exiting nonzero. A refused
+  `--postgres-socket --plan` check that got past its preflight also
+  has `refusals`, every refusal it found, the first being `error`. A job refused before
   it reserved its receipt records why in `refusal.json` in its job
   directory, which the launcher reads in its place;
 - `next`: the command that follows, as `{"argv": [...], "needs":

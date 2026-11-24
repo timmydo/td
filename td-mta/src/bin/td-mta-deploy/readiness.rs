@@ -198,14 +198,6 @@ pub(crate) fn aggregate(tls: bool) -> R<Setting> {
         .ok_or_else(|| "missing aggregate health setting".into())
 }
 
-/// The aggregate's lines that check the loopback TLS material: those of the
-/// TLS layout's drop-in the socket layout's lacks.
-pub(crate) fn tls_only_lines() -> impl Iterator<Item = &'static str> {
-    HEALTH_CHECKS_TLS
-        .lines()
-        .filter(|line| !HEALTH_CHECKS.lines().any(|kept| kept == *line))
-}
-
 /// What `prepare` requires, changing nothing: true when every setting is
 /// in place and the aggregate qualifies, false when `prepare` would
 /// install the missing ones over the commands it replaces.

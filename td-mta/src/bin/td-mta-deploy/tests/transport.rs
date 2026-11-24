@@ -1,6 +1,17 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 use super::*;
 
+/// The first unit `retired_references` finds.
+fn retired_reference<'a>(
+    show: &'a str,
+    converted: &[&Path],
+    retiring: &[String],
+) -> R<Option<&'a str>> {
+    Ok(retired_references(show, converted, retiring)?
+        .first()
+        .copied())
+}
+
 const PASS: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn socket_block() -> String {
@@ -484,10 +495,14 @@ fn openssl_check(file: &str) -> Vec<String> {
 fn production_units_pass_the_guard_once_their_tls_checks_retire() {
     let paths = connections();
     let converted: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-    // What refused the cutover on production.
+    // What refused the cutover on production, and all that would.
     assert_eq!(
         retired_reference(PRODUCTION_SHOW, &converted, &[]).unwrap(),
         Some("td-mta-maint-tls-1.service")
+    );
+    assert_eq!(
+        retired_references(PRODUCTION_SHOW, &converted, &[]).unwrap(),
+        ["td-mta-maint-tls-1.service", "td-mta-maint-tls-0.service"]
     );
     for isolated in [true, false] {
         let found = tls_checks(PRODUCTION_SHOW, &checks::material_dirs(isolated).unwrap()).unwrap();
@@ -628,7 +643,14 @@ fn retired_checks_match_the_files_the_operations_installer_wrote() {
 
 #[test]
 fn the_health_rewrite_keeps_every_other_line_exactly() {
-    let lines: Vec<&str> = crate::readiness::tls_only_lines().collect();
+    let dirs = checks::material_dirs(false).unwrap();
+    // The TLS layout's readiness drop-in lists them as the health unit did;
+    // the installer orders the options the other way and quotes each word.
+    let tls_dropin = include_str!("../units/zz-readiness-jobs.tls.conf");
+    let lines: Vec<&str> = tls_dropin
+        .lines()
+        .filter(|l| checks::expiry_line(l, &dirs).unwrap())
+        .collect();
     assert_eq!(
         lines,
         [
@@ -636,30 +658,60 @@ fn the_health_rewrite_keeps_every_other_line_exactly() {
             "ExecStart=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -checkend 2592000 -noout",
         ]
     );
-    let head = "[Unit]\r\nDescription=td-mta aggregate health\n\n[Service]\nType=oneshot\n\
-        ExecStart=/usr/bin/systemctl --quiet is-active td-mta-postgres.service\n";
+    let socket_dropin = include_str!("../units/zz-readiness-jobs.conf");
+    assert!(!socket_dropin
+        .lines()
+        .any(|l| checks::expiry_line(l, &dirs).unwrap()));
+    let installer = "ExecStart=:\"/usr/bin/openssl\" \"x509\" \"-in\" \"/var/lib/td-mta/mail/tls/ca.pem\" \"-noout\" \"-checkend\" \"2592000\"";
+    // Production's maintenance services carry the hardening block.
+    let head = format!(
+        "[Unit]\r\nDescription=td-mta aggregate health\n\n[Service]\n{}Type=oneshot\n\
+        ExecStart=/usr/bin/systemctl --quiet is-active td-mta-postgres.service\n",
+        checks::HARDENING
+    );
     let middle = "# keep  this   comment\n";
     let tail = "ExecStart=/opt/td-mta/bin/td-mta acme-status --connection-file /var/lib/td-mta/mail/runtime-connection  \n\
         ExecStart=/usr/bin/systemctl --quiet is-active td-mta-migadu.service";
-    let unit = format!("{head}{}\n{middle}{}\n{tail}", lines[0], lines[1]);
+    let unit = format!(
+        "{head}{}\n{middle}{}\n{installer}\n{tail}",
+        lines[0], lines[1]
+    );
     let kept = format!("{head}{middle}{tail}");
-    assert_eq!(health_unit(&unit, &lines).unwrap(), Some(kept.clone()));
-    assert_eq!(health_unit(&kept, &lines).unwrap(), None);
+    assert_eq!(health_unit(&unit, &dirs).unwrap(), Some(kept.clone()));
+    assert_eq!(health_unit(&kept, &dirs).unwrap(), None);
     // The last line, without its newline, goes as well.
     let last = format!("{kept}\n{}", lines[1]);
     assert_eq!(
-        health_unit(&last, &lines).unwrap(),
+        health_unit(&last, &dirs).unwrap(),
         Some(format!("{kept}\n"))
     );
+    // A check continuing the line before it, or continued, is no check.
+    for continued in [
+        format!("Environment=A=b \\\n{}", lines[0]),
+        format!("Environment=A=b \\\r\n{}", lines[0]),
+        format!("Environment=A=b \\\n# note\n{}", lines[0]),
+        format!("{} \\\n -x", lines[0]),
+    ] {
+        assert!(
+            health_unit(&format!("{kept}\n{continued}\n"), &dirs).is_err(),
+            "{continued}"
+        );
+    }
     for other in [
         "ExecStart=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/server.pem -checkend 2592000 -noout ",
+        "ExecStart=/usr/bin/openssl  x509 -in /var/lib/td-mta/mail/tls/server.pem -checkend 2592000 -noout",
         "ExecStart=-/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -checkend 2592000 -noout",
+        "ExecStart=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -checkend 86400 -noout",
+        "ExecStart=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -noout",
+        "ExecStart=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/sub/ca.pem -checkend 2592000 -noout",
+        "ExecStart=/usr/bin/openssl x509 -in \"/var/lib/td-mta/mail/tls/ca.pem -checkend 2592000 -noout",
+        "ExecStart=/usr/bin/openssl x509 -in '/var/lib/td-mta/mail/tls/ca.pem' -checkend 2592000 -noout",
         "ExecStartPre=/usr/bin/test -e \"/var/lib/td-mta/mail/tls/ca.pem\"",
         "Environment=CA=/var/lib/td-mta/mail/tls/ca.pem",
         "# /var/lib/td-mta/mail/tls",
     ] {
         assert!(
-            health_unit(&format!("{unit}\n{other}\n"), &lines).is_err(),
+            health_unit(&format!("{unit}\n{other}\n"), &dirs).is_err(),
             "{other}"
         );
     }
@@ -744,8 +796,14 @@ fn a_retired_checks_drop_in_directory_goes_once_only_the_fence_is_in_it() {
     let directory = scratch.path().join("td-mta-maint-tls-0.service.d");
     assert_eq!(retire_dropins(&directory, &condition).unwrap(), None);
     assert!(fence_only(&directory, &condition).unwrap());
+    // An empty directory, as production's fence left beside its checks,
+    // is clean and goes.
     fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(fence_only(&directory, &condition).unwrap());
+    assert_eq!(retire_dropins(&directory, &condition).unwrap(), Some(true));
+    assert!(!directory.exists());
+    fs::create_dir(&directory).unwrap();
     fs::write(directory.join(FENCE_DROPIN), &condition).unwrap();
     assert!(fence_only(&directory, &condition).unwrap());
     assert_eq!(retire_dropins(&directory, &condition).unwrap(), Some(true));
@@ -816,14 +874,19 @@ fn a_check_unit_is_judged_by_what_systemd_says_of_it_and_its_file() {
         argv: openssl_check("/var/lib/td-mta/mail/tls/server.pem"),
     };
     let text = service_text(&check).unwrap();
+    let forms = [text.clone(), hardened_service_text(&check).unwrap()];
     let generated = Path::new("/opt/td-mta/share/td-mta/services/td-mta-maint-tls-0.service");
-    generated_check(unit, generated, text.as_bytes(), &text).unwrap();
-    assert!(generated_check(unit, generated, b"[Unit]\n", &text).is_err());
+    generated_check(unit, generated, false, text.as_bytes(), &forms).unwrap();
+    assert!(generated_check(unit, generated, false, b"[Unit]\n", &forms).is_err());
+    // The hardened form is only production's copy, never a generated file.
+    assert!(generated_check(unit, generated, false, forms[1].as_bytes(), &forms).is_err());
     for elsewhere in [
         "/etc/systemd/system/td-mta-maint-tls-0.service",
         "/opt/td-mta/share/td-mta/services/td-mta-maint-tls-1.service",
     ] {
-        assert!(generated_check(unit, Path::new(elsewhere), text.as_bytes(), &text).is_err());
+        assert!(
+            generated_check(unit, Path::new(elsewhere), false, text.as_bytes(), &forms).is_err()
+        );
     }
     let scm = "(use-modules (shepherd service))\n(register-services\n (service '(td-mta-maint-tls-0)\n  #:start (make-timer-constructor\n    (command '(\"/usr/bin/openssl\" \"x509\" \"-in\" \"/var/lib/td-mta/mail/tls/server.pem\" \"-noout\" \"-checkend\" \"2592000\")\n      #:directory \"/state\"))))\n";
     schedule_check(&check, scm.as_bytes()).unwrap();
@@ -876,6 +939,9 @@ impl CutoverSteps for Recorded {
     fn stage(&mut self) -> R<()> {
         self.step("stage")
     }
+    fn refused(&mut self, _: Failure) -> R<()> {
+        self.step("refused")
+    }
     fn checked(&mut self) -> R<()> {
         self.step("checked")
     }
@@ -897,6 +963,9 @@ impl SocketSteps for Recorded {
     fn preflight(&mut self) -> R<()> {
         self.step("preflight")
     }
+    fn units(&mut self) -> R<()> {
+        self.step("units")
+    }
     fn retire(&mut self) -> R<()> {
         self.step("retire")
     }
@@ -905,6 +974,9 @@ impl SocketSteps for Recorded {
     }
     fn verify(&mut self) -> R<()> {
         self.step("verify")
+    }
+    fn refused(&mut self, _: Failure) -> R<()> {
+        self.step("refused")
     }
     fn checked(&mut self) -> R<()> {
         self.step("checked")
@@ -929,39 +1001,93 @@ fn a_check_only_cutover_reads_stages_and_checks_and_never_changes_the_host() {
         run(false, None),
         (vec!["prepare", "preflight", "cut-over"], true)
     );
-    // A refusal ends a check there.
+    // A check stops where nothing after can be judged; a refusal in
+    // staging is kept, and the checks before the fence still run and end
+    // it. A cutover stops at any refusal.
     assert_eq!(run(true, Some("inspect")), (vec!["inspect"], false));
     assert_eq!(
-        run(true, Some("stage")),
-        (vec!["inspect", "preflight", "stage"], false)
+        run(true, Some("preflight")),
+        (vec!["inspect", "preflight"], false)
     );
+    assert_eq!(
+        run(true, Some("stage")),
+        (
+            vec!["inspect", "preflight", "stage", "refused", "checked"],
+            true
+        )
+    );
+    assert_eq!(run(false, Some("prepare")), (vec!["prepare"], false));
     // On the socket, a check reads and records; a run installs and retires.
-    let on = |plan: bool| {
-        let mut steps = Recorded(Vec::new(), None);
-        on_socket(&mut steps, plan).unwrap();
-        steps.0
+    let on = |plan: bool, failing: Option<&'static str>| {
+        let mut steps = Recorded(Vec::new(), failing);
+        let ok = on_socket(&mut steps, plan).is_ok();
+        (steps.0, ok)
     };
     assert_eq!(
-        on(true),
-        [
-            "transport",
-            "inspect",
-            "preflight",
-            "pending",
-            "verify",
-            "checked"
-        ]
+        on(true, None),
+        (
+            vec![
+                "transport",
+                "inspect",
+                "preflight",
+                "units",
+                "pending",
+                "verify",
+                "checked"
+            ],
+            true
+        )
     );
     assert_eq!(
-        on(false),
-        [
-            "transport",
-            "prepare",
-            "preflight",
-            "retire",
-            "verify",
-            "finished"
-        ]
+        on(true, Some("units")),
+        (
+            vec![
+                "transport",
+                "inspect",
+                "preflight",
+                "units",
+                "refused",
+                "pending",
+                "verify",
+                "checked"
+            ],
+            true
+        )
+    );
+    assert_eq!(
+        on(true, Some("verify")),
+        (
+            vec![
+                "transport",
+                "inspect",
+                "preflight",
+                "units",
+                "pending",
+                "verify",
+                "refused",
+                "checked"
+            ],
+            true
+        )
+    );
+    assert_eq!(
+        on(false, None),
+        (
+            vec![
+                "transport",
+                "prepare",
+                "preflight",
+                "units",
+                "retire",
+                "verify",
+                "finished"
+            ],
+            true
+        )
+    );
+    assert_eq!(
+        on(false, Some("units")),
+        (vec!["transport", "prepare", "preflight", "units"], false)
     );
     // Only a job that asks is a check.
     for (job, plan) in [
@@ -1008,4 +1134,195 @@ fn the_fence_needs_the_backup_and_health_timers() {
     .unwrap();
     assert!(fence::required_timers(&timers(&["td-mta-health.timer"])).is_err());
     assert!(fence::required_timers(&[]).is_err());
+}
+
+#[test]
+fn production_copies_of_the_checks_are_recognised_and_nothing_else() {
+    let units = [
+        (
+            "td-mta-maint-tls-0",
+            "/var/lib/td-mta/mail/tls/server.pem",
+            include_str!("production-units/td-mta-maint-tls-0.service"),
+            include_str!("production-units/td-mta-maint-tls-0.timer"),
+        ),
+        (
+            "td-mta-maint-tls-1",
+            "/var/lib/td-mta/mail/tls/ca.pem",
+            include_str!("production-units/td-mta-maint-tls-1.service"),
+            include_str!("production-units/td-mta-maint-tls-1.timer"),
+        ),
+    ];
+    // The readiness jobs' template carries the same block.
+    let readiness = include_str!("../units/readiness.service.in");
+    assert!(readiness.contains(&format!("[Service]\n{}Type=oneshot\n", checks::HARDENING)));
+    for (name, file, service, timer) in units {
+        let check = TlsCheck {
+            name: name.into(),
+            argv: openssl_check(file),
+        };
+        assert_eq!(hardened_service_text(&check).unwrap(), service);
+        assert_eq!(timer_text(&check).unwrap(), timer);
+        let forms = [
+            service_text(&check).unwrap(),
+            hardened_service_text(&check).unwrap(),
+        ];
+        let service_unit = check.unit("service").unwrap();
+        let timer_unit = check.unit("timer").unwrap();
+        let etc = |unit: &str| PathBuf::from(format!("/etc/systemd/system/{unit}"));
+        let copy = etc(&service_unit);
+        assert!(copied_unit(&service_unit, &copy, &copy, true, 0, 0o100644));
+        generated_check(&service_unit, &copy, true, service.as_bytes(), &forms).unwrap();
+        generated_check(&service_unit, &copy, true, forms[0].as_bytes(), &forms).unwrap();
+        let timer_copy = etc(&timer_unit);
+        assert!(copied_unit(
+            &timer_unit,
+            &timer_copy,
+            &timer_copy,
+            true,
+            0,
+            0o644
+        ));
+        generated_check(
+            &timer_unit,
+            &timer_copy,
+            true,
+            timer.as_bytes(),
+            &[timer.to_string()],
+        )
+        .unwrap();
+        // Not root's regular file, a link elsewhere, another name or
+        // directory: not a copy.
+        let share = PathBuf::from(format!("/opt/td-mta/share/td-mta/services/{service_unit}"));
+        // Not a regular file, not root's, writable by others:
+        assert!(!copied_unit(&service_unit, &copy, &copy, false, 0, 0o644));
+        assert!(!copied_unit(&service_unit, &copy, &copy, true, 1000, 0o644));
+        assert!(!copied_unit(&service_unit, &copy, &copy, true, 0, 0o664));
+        assert!(!copied_unit(&service_unit, &copy, &copy, true, 0, 0o646));
+        assert!(copied_unit(&service_unit, &copy, &copy, true, 0, 0o600));
+        assert!(!copied_unit(&service_unit, &copy, &share, true, 0, 0o644));
+        assert!(!copied_unit(
+            &service_unit,
+            &etc("other.service"),
+            &etc("other.service"),
+            true,
+            0,
+            0o644
+        ));
+        let nested = PathBuf::from(format!("/etc/systemd/system/x/{service_unit}"));
+        assert!(!copied_unit(
+            &service_unit,
+            &nested,
+            &nested,
+            true,
+            0,
+            0o644
+        ));
+        assert!(generated_check(&service_unit, &copy, false, service.as_bytes(), &forms).is_err());
+        // Any other change to the copy still refuses.
+        for changed in [
+            service.replace("MemoryMax=512M", "MemoryMax=1G"),
+            service.replace("User=td-mta\n", ""),
+            service.replace(
+                "PrivateTmp=yes\n",
+                "PrivateTmp=yes\nExecStartPost=/bin/true\n",
+            ),
+            service.replace("2592000", "86400"),
+            format!("{service}\n"),
+        ] {
+            assert!(
+                generated_check(&service_unit, &copy, true, changed.as_bytes(), &forms).is_err(),
+                "{changed}"
+            );
+        }
+        assert!(generated_check(
+            &timer_unit,
+            &timer_copy,
+            true,
+            timer.replace("15min", "1min").as_bytes(),
+            &[timer.to_string()],
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn a_retired_unit_file_keeps_its_bytes_owner_and_mode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let scratch = td_fs::TempDir::new("mta-retired-unit").unwrap();
+    let kept = scratch.path().join("units");
+    fs::create_dir(&kept).unwrap();
+    let path = scratch.path().join("td-mta-maint-tls-1.service");
+    let text = include_str!("production-units/td-mta-maint-tls-1.service");
+    fs::write(&path, text).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let before = fs::metadata(&path).unwrap();
+    retire_file(&path, &kept).unwrap();
+    assert!(!path.exists());
+    let moved = kept.join("td-mta-maint-tls-1.service");
+    assert_eq!(fs::read_to_string(&moved).unwrap(), text);
+    let after = fs::metadata(&moved).unwrap();
+    assert_eq!(after.mode() & 0o7777, 0o644);
+    assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+    // Copying it back restores the file as it was.
+    fs::copy(&moved, &path).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o644);
+}
+
+#[test]
+fn a_check_collects_every_refusal_and_a_cutover_stops_at_the_first() {
+    let refuse = |why: &'static str| -> R<u8> { Err(why.into()) };
+    let mut check = Refusals::new(true);
+    assert_eq!(check.take(R::<u8>::Ok(1)).unwrap(), Some(1));
+    assert_eq!(check.take(refuse("first")).unwrap(), None);
+    assert_eq!(check.take(refuse("second")).unwrap(), None);
+    assert_eq!(check.found(), ["first", "second"]);
+    let mut cutover = Refusals::new(false);
+    assert_eq!(cutover.take(R::<u8>::Ok(1)).unwrap(), Some(1));
+    assert_eq!(
+        cutover.take(refuse("first")).unwrap_err().to_string(),
+        "first"
+    );
+    assert!(cutover.found().is_empty());
+    // A check names the file a refusal concerns; a cutover's message is
+    // its own.
+    let path = Path::new("/var/lib/td-mta/mail/owner-connection");
+    assert_eq!(check.take_for(path, refuse("third")).unwrap(), None);
+    assert_eq!(
+        check.found().last().map(String::as_str),
+        Some("/var/lib/td-mta/mail/owner-connection: third")
+    );
+    assert_eq!(check.take_for(path, R::<u8>::Ok(2)).unwrap(), Some(2));
+    assert_eq!(
+        cutover
+            .take_for(path, refuse("third"))
+            .unwrap_err()
+            .to_string(),
+        "third"
+    );
+}
+
+#[test]
+fn a_checks_service_and_timer_are_of_one_kind() {
+    let share = || Some(PathBuf::from("/opt/td-mta/share/td-mta/services"));
+    let other = Some(PathBuf::from("/opt/other/share/td-mta/services"));
+    for kinds in [
+        vec![None, None],
+        vec![share(), share()],
+        vec![None],
+        vec![share()],
+        vec![],
+    ] {
+        same_kind("td-mta-maint-tls-0", &kinds).unwrap();
+    }
+    for kinds in [
+        vec![None, share()],
+        vec![share(), None],
+        vec![share(), other],
+    ] {
+        assert!(
+            same_kind("td-mta-maint-tls-0", &kinds).is_err(),
+            "{kinds:?}"
+        );
+    }
 }

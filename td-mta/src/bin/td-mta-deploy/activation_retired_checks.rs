@@ -1,8 +1,9 @@
 //! The loopback TLS material the socket cutover moves aside, and the jobs
 //! that check it: the operations installer's `td-mta-maint-tls-N` expiry
 //! checks, the aggregate health unit's lines and the notification checks.
-//! Each is recognised only in the exact form its generator wrote; anything
-//! else naming the material refuses the cutover before it fences.
+//! Each is recognised only in the exact form its generator wrote, or the
+//! one historical copy production made of it; anything else naming the
+//! material refuses the cutover before it fences.
 use super::*;
 
 /// One `td-mta-maint-tls-N` check of a file of retired material.
@@ -176,6 +177,21 @@ pub(super) fn service_text(check: &TlsCheck) -> R<String> {
     ))
 }
 
+/// The lines production's hand-installed maintenance services carry after
+/// `[Service]` (the readiness jobs' template took them from there). Its
+/// expiry checks are copies of the installer's services in
+/// /etc/systemd/system with exactly these lines added.
+pub(super) const HARDENING: &str = "User=td-mta\nGroup=td-mta\nProtectSystem=strict\nProtectHome=yes\nMemoryMax=512M\nTasksMax=32\n";
+
+/// `service_text` as production copied it, with `HARDENING`.
+pub(super) fn hardened_service_text(check: &TlsCheck) -> R<String> {
+    let text = service_text(check)?;
+    let (head, tail) = text
+        .split_once("[Service]\n")
+        .ok_or("generated check without a service section")?;
+    fmt(format_args!("{head}[Service]\n{HARDENING}{tail}"))
+}
+
 /// The timer file the installer generated for `check`.
 pub(super) fn timer_text(check: &TlsCheck) -> R<String> {
     fmt(format_args!(
@@ -193,7 +209,7 @@ pub(super) fn schedule_parts(check: &TlsCheck) -> R<(String, String)> {
     ))
 }
 
-fn refuse<T>(subject: &str, why: &str) -> R<T> {
+pub(super) fn refuse<T>(subject: &str, why: &str) -> R<T> {
     Err(fmt(format_args!("{subject} {why}"))?.into())
 }
 
@@ -234,13 +250,46 @@ pub(super) fn check_unit_state<'a>(
     }
 }
 
-/// `bytes`, the canonical file `real` of `unit`, is the installer's `text`
-/// in its prefix's `share/td-mta/services`.
-pub(super) fn generated_check(unit: &str, real: &Path, bytes: &[u8], text: &str) -> R<()> {
-    if !generated_unit(real, unit) {
-        return refuse(unit, "is not the operations installer's generated file");
-    }
-    if bytes != text.as_bytes() {
+/// Whether `unit`'s file is a copy in /etc/systemd/system: `fragment`, as
+/// systemd names it, is that file itself (`real`, resolved), a `regular`
+/// file owned by root (`uid`) that only root may write (`mode`).
+pub(super) fn copied_unit(
+    unit: &str,
+    fragment: &Path,
+    real: &Path,
+    regular: bool,
+    uid: u32,
+    mode: u32,
+) -> bool {
+    regular
+        && uid == 0
+        && mode & 0o022 == 0
+        && fragment == real
+        && real.parent() == Some(Path::new(UNIT_DIR))
+        && real.file_name() == Some(std::ffi::OsStr::new(unit))
+}
+
+/// `bytes`, the file `real` of `unit`, is the installer's: in its prefix's
+/// `share/td-mta/services` (reached through a link) exactly `forms[0]`, the
+/// generated text, or, a `copied` file, any of `forms`.
+pub(super) fn generated_check(
+    unit: &str,
+    real: &Path,
+    copied: bool,
+    bytes: &[u8],
+    forms: &[String],
+) -> R<()> {
+    let allowed = if generated_unit(real, unit) {
+        forms.get(..1).unwrap_or_default()
+    } else if copied {
+        forms
+    } else {
+        return refuse(
+            unit,
+            "is neither the operations installer's generated file nor a copy of it in /etc/systemd/system",
+        );
+    };
+    if !allowed.iter().any(|form| form.as_bytes() == bytes) {
         return refuse(
             unit,
             "differs from the check the operations installer generates",
@@ -263,16 +312,65 @@ pub(super) fn schedule_check(check: &TlsCheck, bytes: &[u8]) -> R<()> {
     Ok(())
 }
 
-/// The aggregate health unit `text` without the `lines` that check the
-/// retired material, every other line byte for byte; None when it holds
+/// The words of a unit file's `ExecStart=` line that systemd runs as they
+/// are: plain words or words in double quotes, nothing to expand or
+/// escape, and no prefix but `:`; None for any other line.
+fn exec_words(line: &str) -> R<Option<Vec<&str>>> {
+    let Some(command) = line.strip_prefix("ExecStart=") else {
+        return Ok(None);
+    };
+    let command = command.strip_prefix(':').unwrap_or(command);
+    let mut words = Vec::new();
+    for word in command.split(' ') {
+        let word = match word.strip_prefix('"') {
+            Some(rest) => match rest.strip_suffix('"') {
+                Some(inner) => inner,
+                None => return Ok(None),
+            },
+            None => word,
+        };
+        if word.is_empty() || word.contains(['"', '\'', '\\', '$', '%', ';']) {
+            return Ok(None);
+        }
+        td_alloc::push(&mut words, word)?;
+    }
+    Ok(Some(words))
+}
+
+/// Whether `line` is an `ExecStart=` expiry check of a file in `dirs`, its
+/// two trailing options in either order (the health unit lists them
+/// `-checkend 2592000 -noout`, the installer the other way round).
+pub(super) fn expiry_line(line: &str, dirs: &[PathBuf]) -> R<bool> {
+    let Some(words) = exec_words(line)? else {
+        return Ok(false);
+    };
+    Ok(match words.as_slice() {
+        [openssl, "x509", "-in", path, "-noout", "-checkend", "2592000"]
+        | [openssl, "x509", "-in", path, "-checkend", "2592000", "-noout"] => {
+            program(openssl) && retired_file(path, dirs)
+        }
+        _ => false,
+    })
+}
+
+/// The aggregate health unit `text` without its `ExecStart=` expiry checks
+/// of files in `dirs`, every other line byte for byte; None when it holds
 /// none. Any other line naming the material refuses.
-pub(super) fn health_unit(text: &str, lines: &[&str]) -> R<Option<String>> {
+pub(super) fn health_unit(text: &str, dirs: &[PathBuf]) -> R<Option<String>> {
     let mut out = String::new();
     td_alloc::reserve_string(&mut out, text.len())?;
     let mut removed = false;
+    // A line continuing the one before is part of it, never a check.
+    // systemd also reads `\` before a CR as one, and a comment inside a
+    // continued directive neither ends nor continues it.
+    let mut continued = false;
     for line in text.split_inclusive('\n') {
         let body = line.strip_suffix('\n').unwrap_or(line);
-        if lines.contains(&body) {
+        let continuation = continued;
+        if !body.trim_start().starts_with(['#', ';']) {
+            continued = body.trim_end_matches('\r').ends_with('\\');
+        }
+        if !continuation && !continued && expiry_line(body, dirs)? {
             removed = true;
             continue;
         }
