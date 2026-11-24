@@ -144,7 +144,18 @@ emulation too, because td-jail-test runs that probe there (DEVELOPMENT.md,
 The new evaluator warms declared fixed-output inputs for `system-x86-64`,
 then invokes `build-run` through the existing sandbox and recipe
 graph. It receives the exact builder just compiled through
-`TD_BUILDER_SELF`. No host cache is imported, no application payload becomes
+`TD_BUILDER_SELF`. `build-run` alone runs under that builder's
+`build-with-budget` wrapper (DEVELOPMENT.md, "Image build parallelism"),
+which takes a memory grant from the account's check host and sizes the
+kernel's `make -j` and recipe Cargo jobs from it at two GiB a job, up to
+the CPUs. Warming holds no grant. The wrapper says when it starts waiting
+and what it was granted: admission can wait behind the account's other
+hosted checks or memory pressure. The host cancels the build when memory
+falls below its emergency reserve, or when the terminal reads none of its
+output for five minutes. `td-builder stop` in the checkout stops it. On a
+machine too small for the host's three 1 GiB tokens the build runs
+unhosted with one compiler job, as it did before it held a grant.
+No host cache is imported, no application payload becomes
 a compilation input, and the logical target prefix remains `/td/store`.
 The first build therefore needs the graph's local build space and source
 downloads, each from td's source mirror where it holds the pin's bytes and
@@ -198,7 +209,8 @@ Pure tests cover absent source, preservation of existing and symlinked
 destinations, malformed metadata, unsafe state and retained lock descriptors.
 Host preflights additionally exercise real Git with SHA-1 and SHA-256 bundles,
 interrupted staging, private edits, and corrupt or mismatched exports. The
-host process fixture verifies helper argv, fresh builder identity and failure
+host process fixture verifies helper argv, fresh builder identity, that
+only the build runs under the compiler-grant wrapper, and failure
 propagation through compilation, fetch-tool dependencies, warm and build.
 The compiler-only gate runs the binary's pure tests without host Git or
 rustc. The target recipe checks its realized static executable, debug

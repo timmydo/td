@@ -416,13 +416,35 @@ pub fn inherited_build_grant(args: &[String]) -> bool {
 }
 
 pub fn should_forward(args: &[String]) -> bool {
-    if inherited_build_grant(args) {
+    if inherited_build_grant(args) || unhosted_build(args).is_some() {
         return false;
     }
     should_forward_with_host_state(
         args,
         std::env::var_os(check_memory::HOST_CHILD_ENV).is_some(),
     )
+}
+
+/// Why a `build-with-budget` outside the host runs unhosted: on a machine
+/// too small for the host's token pool it builds with one compiler job, as a
+/// build without a grant always has, rather than failing.
+fn unhosted_build(args: &[String]) -> Option<String> {
+    unhosted_build_reason(
+        args,
+        std::env::var_os(check_memory::HOST_CHILD_ENV).is_some(),
+        check_memory::HostBudget::discover,
+    )
+}
+
+fn unhosted_build_reason(
+    args: &[String],
+    already_hosted: bool,
+    discover: impl FnOnce() -> Result<check_memory::HostBudget, String>,
+) -> Option<String> {
+    if already_hosted || args.first().map(String::as_str) != Some("build-with-budget") {
+        return None;
+    }
+    discover().err()
 }
 
 // `pub(crate)` because `run_record::long_run_verb` DERIVES from this: what a
@@ -465,6 +487,8 @@ pub fn forward(args: &[String]) -> ExitCode {
     let mut request = args.to_vec();
     if let Some(verb) = request.first_mut() {
         if verb == "build-with-budget" {
+            // Admission can wait on the base grant as well as the build's.
+            eprintln!("td-builder: build-with-budget: waiting for a memory grant");
             *verb = "build-with-budget-hosted".into();
         }
     }
@@ -490,22 +514,21 @@ pub fn build_with_budget(args: &[String], acquire: bool) -> ExitCode {
         let permit = acquire
             .then(|| check_memory::plan_permit(&|| false))
             .transpose()?;
-        let bytes = permit
+        let grant = permit
             .as_ref()
             .map(check_memory::MemoryPermit::bytes)
-            .or_else(check_memory::request_job_budget)
-            .ok_or("missing inherited compiler memory grant")?;
-        let jobs = check_memory::jobs_for_budget(bytes, check_memory::nproc());
-        eprintln!(
-            "td-builder: build-with-budget: {jobs} compiler job(s), {} MiB memory grant",
-            bytes / (1024 * 1024)
-        );
-        let status = Command::new(program)
-            .args(args.get(1..).ok_or("missing build arguments")?)
-            .env(check_memory::JOB_BUDGET_ENV, bytes.to_string())
-            .env("CARGO_BUILD_JOBS", jobs.to_string())
-            .status()
-            .map_err(|e| format!("run admitted build: {e}"))?;
+            .or_else(check_memory::request_job_budget);
+        if grant.is_none() && (acquire || std::env::var_os(check_memory::HOST_CHILD_ENV).is_some())
+        {
+            return Err("missing inherited compiler memory grant".into());
+        }
+        let status = budgeted_command(
+            program,
+            args.get(1..).ok_or("missing build arguments")?,
+            grant,
+        )
+        .and_then(|mut command| command.status())
+        .map_err(|e| format!("run admitted build: {e}"))?;
         Ok(ExitCode::from(
             status
                 .code()
@@ -520,6 +543,39 @@ pub fn build_with_budget(args: &[String], acquire: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The admitted build: sized by its grant, or, unhosted with none, at one
+/// compiler job.
+fn budgeted_command(program: &str, args: &[String], grant: Option<u64>) -> io::Result<Command> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(bytes) = grant {
+        let jobs = check_memory::jobs_for_budget(bytes, check_memory::nproc());
+        eprintln!(
+            "td-builder: build-with-budget: {jobs} compiler job(s), {} MiB memory grant",
+            bytes / (1024 * 1024)
+        );
+        command
+            .env(check_memory::JOB_BUDGET_ENV, bytes.to_string())
+            .env("CARGO_BUILD_JOBS", jobs.to_string());
+        return Ok(command);
+    }
+    // `should_forward` declined: report its reason, best-effort.
+    let why = check_memory::HostBudget::discover()
+        .err()
+        .unwrap_or_else(|| "no check host".into());
+    eprintln!("td-builder: build-with-budget: unhosted ({why}); building with one compiler job");
+    command
+        .env_remove(check_memory::JOB_BUDGET_ENV)
+        .env_remove("CARGO_BUILD_JOBS")
+        // A feed daemon started in the namespace would die with it.
+        .env(FEED_NO_DAEMON_ENV, "1");
+    // `stop` signals this recorded wrapper: its PID namespace, armed to die
+    // with it, takes the whole build down.
+    crate::sandbox::die_with_parent(&mut command);
+    crate::sandbox::contain_pid_namespace(&mut command)?;
+    Ok(command)
 }
 
 fn forward_inner(args: &[String]) -> Result<u8, String> {
@@ -4015,6 +4071,51 @@ mod tests {
             &words(&["check", "check-engine"]),
             true
         ));
+    }
+
+    #[test]
+    fn a_host_too_small_to_start_leaves_budgeted_builds_unhosted() {
+        let build = vec!["build-with-budget".to_string(), "/bin/program".to_string()];
+        let small = || check_memory::HostBudget::from_observed(4 * check_memory::GIB, &[]);
+        let large = || check_memory::HostBudget::from_observed(32 * check_memory::GIB, &[]);
+        assert!(small().is_err());
+        let why = unhosted_build_reason(&build, false, small).unwrap();
+        assert!(why.contains("three 1 GiB memory tokens"), "{why}");
+        assert_eq!(unhosted_build_reason(&build, false, large), None);
+        assert_eq!(unhosted_build_reason(&build, true, small), None);
+        assert_eq!(
+            unhosted_build_reason(&["check".to_string()], false, small),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unhosted_budgeted_build_runs_contained_with_one_job() {
+        let script = [
+            "-c".to_string(),
+            "echo jobs=${CARGO_BUILD_JOBS-none} budget=${TD_CHECK_JOB_BUDGET_BYTES-none} pid=$$ feed=${TD_FEED_NO_DAEMON-none}; exit 3"
+                .to_string(),
+        ];
+        let output = budgeted_command("/bin/sh", &script, None)
+            .unwrap()
+            .output()
+            .unwrap();
+        // The program is PID 2 behind the namespace's init.
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "jobs=none budget=none pid=2 feed=1\n"
+        );
+        let output = budgeted_command("/bin/sh", &script, Some(4 * check_memory::GIB))
+            .unwrap()
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(text.starts_with("jobs="), "{text}");
+        assert!(
+            text.contains(&format!("budget={}", 4 * check_memory::GIB)),
+            "{text}"
+        );
     }
 
     #[test]

@@ -836,15 +836,21 @@ it from `git log`; an untracked plan file cannot be the handoff.
 Never use `git stash` in this repository. `refs/stash` is repository-global,
 not worktree-local.
 
-# Publisher build parallelism
+# Image build parallelism
 
-`./publish` runs its image-build child through `td-builder
+`./publish` runs its image-build child, and `./update build` its
+`build-run` (td-update/DESIGN.md), through `td-builder
 build-with-budget ABSOLUTE-PROGRAM [ARGUMENT...]`. The wrapper joins the
 per-user check host and claims available memory tokens before starting
 the child, hence before the evaluator takes its build-cache lock. It
 requests up to two GiB per available CPU, bounded by the pool's capacity
 after its base grant, and accepts a smaller grant when peers hold tokens,
-with two GiB as the minimum. It prints the compiler job count and grant.
+with two GiB as the minimum. It says when it starts waiting, and prints the
+compiler job count and grant. Where the client cannot size a host (fewer
+than three tokens, or unreadable memory figures), the wrapper runs its
+child unhosted with no grant, one compiler job, in a PID namespace that
+dies with the wrapper, and says why. An idle host lingers fifteen minutes
+and serves the account's later requests.
 The grant is held until the child exits; client loss cancels the hosted
 process tree. Waiting requests share the existing admission and
 memory-pressure checks. The wrapper is recorded for `td-builder stop` in
@@ -865,10 +871,11 @@ To abandon a long check run, ask for it:
 td-builder stop
 ```
 
-It stops the `ready`, `check`, `affected-checks --run` or `gate-run` that THIS
-worktree started, and no other: the run writes a record inside the worktree,
-so a `stop` cannot name a run whose record it cannot see. It signals through
-the audited path, so the kill audit says who asked and why.
+It stops the `ready`, `check`, `affected-checks --run`, `gate-run` or
+`build-with-budget` that THIS worktree started, and no other: the run writes
+a record inside the worktree, so a `stop` cannot name a run whose record it
+cannot see. It signals through the audited path, so the kill audit says who
+asked and why.
 
 Do not reach for `pkill -f`. Every worktree invokes the same binary path and a
 command line carries no cwd, so no pattern distinguishes your run from a
@@ -886,7 +893,9 @@ over a client that is still running; nothing to stop is success on its own.
 What it confirms is that the recorded process has ended. A recorded run is one
 the check host took, so that process owns no build tree of its own; the hosted
 tree is the host's, and comes down on the host's client-went-away cancellation
-shortly after. `stop` does not wait for that.
+shortly after. `stop` does not wait for that. The exception is a
+`build-with-budget` run unhosted ("Image build parallelism"), whose tree is
+a PID namespace that dies with it.
 
 `ready` records its run when it hands selected checks to the shared host.
 Its initial local selection and record scan, including an empty-selection

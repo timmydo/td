@@ -546,10 +546,12 @@ fn confirm_all(mut pending: Vec<(PathBuf, Record)>, deadline: Instant, tally: &m
 /// Stop every run recorded in `root`, and keep going past the ones that fail.
 ///
 /// SIGTERM to the recorded pid, and nothing else needs killing: a recorded run
-/// is by construction one the check host would take (`long_run_verb` derives
-/// from `should_forward`), so the client owns no build tree of its own. The
-/// hosted tree is the host's, armed to die with the HOST rather than with this
-/// client, and it comes down on the host's own client-went-away cancellation
+/// is one the check host would take (`long_run_verb` derives from
+/// `should_forward`), so the client owns no build tree of its own; a
+/// `build-with-budget` run unhosted on a machine too small for the host owns
+/// one, in a PID namespace armed to die with it. The hosted tree is the
+/// host's, armed to die with the HOST rather than with this client, and it
+/// comes down on the host's own client-went-away cancellation
 /// once this process is gone. That teardown is asynchronous and this command
 /// does not wait for it: what `stop` confirms is that the process it was able
 /// to name has ended.
@@ -640,14 +642,17 @@ const HELP: &str = "\
 usage: td-builder stop
 
 Stop the long check run this worktree started — `ready`,
-`check`, `affected-checks --run`, or `gate-run`. Reads the run
-records under .td-build-cache/runs/ and SIGTERMs each live one.
+`check`, `affected-checks --run`, `gate-run`, or
+`build-with-budget`. Reads the run records under
+.td-build-cache/runs/ and SIGTERMs each live one.
 
 A recorded run is one the shared check host took, so the process
 signalled here owns no build tree of its own: the hosted tree is
 the host's, and it comes down on the host's own client-went-away
 cancellation once this process is gone. That teardown is
-asynchronous and `stop` does not wait for it.
+asynchronous and `stop` does not wait for it. A build-with-budget
+run unhosted for want of memory keeps its tree in a PID namespace
+that dies with it.
 
 Only this worktree's runs: the records live in it, so another
 worktree's build cannot be named from here. This is the reason

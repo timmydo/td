@@ -428,10 +428,14 @@ fn build_with_tools(
         "warm system",
     )?;
     eprintln!("td-update: building the system image");
+    // Without a check-host memory grant every compiler step runs one job.
+    let builder = bin.join("td-builder");
     let mut child = io(
-        command(&bin.join("td-recipe-eval"), root, home)
+        command(&builder, root, home)
+            .arg("build-with-budget")
+            .arg(bin.join("td-recipe-eval"))
             .args(["build-run", "system-x86-64"])
-            .env("TD_BUILDER_SELF", bin.join("td-builder"))
+            .env("TD_BUILDER_SELF", &builder)
             .stdout(Stdio::piped())
             .spawn(),
         "build system",
@@ -723,9 +727,17 @@ fn main() {
         assert_eq!(PathBuf::from(env::var_os("TD_BUILDER_SELF").unwrap()), bin.join("td-builder"));
         "vendor"
     } else {
+        let wrapped = env::current_exe().unwrap().file_name().unwrap() == "td-builder";
+        let args = if wrapped {
+            assert_eq!(&args[..2], ["build-with-budget", bin.join("td-recipe-eval").to_str().unwrap()]);
+            &args[2..]
+        } else {
+            &args[..]
+        };
         assert_eq!(args.len(), 2);
         assert_eq!(args[1], "system-x86-64");
         assert!(matches!(args[0].as_str(), "warm" | "build-run"), "unknown evaluator verb");
+        assert_eq!(args[0] == "build-run", wrapped, "only the image build holds a compiler grant");
         assert_eq!(PathBuf::from(env::var_os("TD_BUILDER_SELF").unwrap()), bin.join("td-builder"));
         assert!(bin.join("td-builder").is_file());
         args[0].as_str()

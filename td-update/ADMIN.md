@@ -303,6 +303,14 @@ td-update's normal source build and deployment assembly. No source code is
 executed as root; source-built control-plane programs remain host control
 plane under TRUST.md's build model.
 
+That build takes its compiler grant from a check host of the
+`td-admin-build` account (td-update/DESIGN.md, "Build command"), up to two
+GiB per CPU and uncoordinated with the human's own checks. The host runs
+inside the build group and is drained with it after every job. Its runtime
+directory is `/run/user/985/td-builder` where that exists and otherwise
+`td-builder-985` under `/dev/shm` or `/tmp`. A directory of that name that
+another account owns fails the build closed rather than sharing it.
+
 Every helper waits on a pipe start gate. The parent places its PID in the
 owned subgroup before releasing the gate; EOF refuses execution, and the
 helper verifies its membership. The builder uses

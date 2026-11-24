@@ -9046,10 +9046,11 @@ fn main() -> ExitCode {
     // from outside and is the same for every worktree's run. It sits above the
     // branch so the binding lives to the end of `main` and the record is taken
     // away by whichever arm below returns, not because a run might go
-    // unforwarded: a recorded run is by construction one the host takes, since
-    // `long_run_verb` derives from `should_forward`. `stop` depends on that —
-    // it signals one pid and no tree, because there is no local tree to
-    // orphan. See builder/src/run_record.rs.
+    // unforwarded: a recorded run is one the host takes, since `long_run_verb`
+    // derives from `should_forward`, except a `build-with-budget` the client
+    // cannot size a host for, whose local tree is a PID namespace armed to
+    // die with it. `stop` depends on that — it signals one pid and no tree,
+    // because no local tree outlives it. See builder/src/run_record.rs.
     let _run = run_record::record_if_long_run(args.get(1..).unwrap_or(&[]));
     if check_host::should_forward(args.get(1..).unwrap_or(&[])) {
         return check_host::forward(args.get(1..).unwrap_or(&[]));
