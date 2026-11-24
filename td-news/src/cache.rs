@@ -100,12 +100,14 @@ impl Cache {
         Article::from_json(&td_json::parse_slice(value).ok()?)
     }
 
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
     pub fn put_articles(&self, articles: &[Article]) {
         let mut txn = self.store.write();
         for article in articles {
             insert_json(&mut txn, ARTICLES, &article.hash, &article.to_json());
         }
-        commit(txn, "put_articles");
+        txn.commit().expect("seed cache");
     }
 
     pub fn get_feed_meta(&self, url: &str) -> Option<FeedMeta> {
@@ -116,10 +118,11 @@ impl Cache {
     }
 
     #[cfg(test)]
+    #[allow(clippy::expect_used)]
     pub fn put_feed_meta(&self, meta: &FeedMeta) {
         let mut txn = self.store.write();
         insert_json(&mut txn, FEEDS, &meta.url, &meta.to_json());
-        commit(txn, "put_feed_meta");
+        txn.commit().expect("seed cache");
     }
 
     pub fn get_feed_index(&self, feed_url: &str) -> Option<Vec<String>> {
@@ -130,17 +133,21 @@ impl Cache {
     }
 
     #[cfg(test)]
+    #[allow(clippy::expect_used)]
     pub fn put_feed_index(&self, feed_url: &str, hashes: &[String]) {
         let mut txn = self.store.write();
         insert_json(&mut txn, FEED_INDEX, feed_url, &hashes_to_json(hashes));
-        commit(txn, "put_feed_index");
+        txn.commit().expect("seed cache");
     }
 
     /// Every feed's new articles, metadata and index, in one transaction:
     /// the three tables move together or not at all.
-    pub fn apply_refresh_batch(&self, refreshes: &[FeedRefresh]) -> Vec<FeedRefreshSummary> {
+    pub fn apply_refresh_batch(
+        &self,
+        refreshes: &[FeedRefresh],
+    ) -> Result<Vec<FeedRefreshSummary>, td_kv::Error> {
         if refreshes.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut txn = self.store.write();
@@ -218,19 +225,33 @@ impl Cache {
             });
         }
 
-        // Nothing was stored if the commit did not take, so nothing is
-        // reported as stored either.
-        if !commit(txn, "apply_refresh_batch") {
-            return Vec::new();
-        }
-        summaries
+        txn.commit()?;
+        Ok(summaries)
     }
 
-    pub fn mark_read(&self, hash: &str, read: bool) {
-        if let Some(mut article) = self.get_article(hash) {
-            article.read = read;
-            self.put_articles(&[article]);
+    /// Apply the whole selection to the current versions in one transaction.
+    pub fn mark_read(
+        &self,
+        hashes: impl IntoIterator<Item = impl AsRef<str>>,
+        read: bool,
+    ) -> Result<usize, String> {
+        let mut txn = self.store.write();
+        let mut changed = 0;
+        for hash in hashes {
+            let hash = hash.as_ref();
+            let mut article = txn
+                .get(ARTICLES, &Key::from_str(hash))
+                .and_then(|bytes| td_json::parse_slice(bytes).ok())
+                .and_then(|json| Article::from_json(&json))
+                .ok_or_else(|| format!("article not found: {hash}"))?;
+            if article.read != read {
+                changed += 1;
+                article.read = read;
+                insert_json(&mut txn, ARTICLES, hash, &article.to_json());
+            }
         }
+        txn.commit().map_err(|error| format!("{error}"))?;
+        Ok(changed)
     }
 
     pub fn list_feed_urls(&self) -> Vec<String> {
@@ -311,20 +332,6 @@ fn insert_json(txn: &mut WriteTxn<'_>, table: &str, key: &str, value: &Json) {
     txn.insert(table, &Key::from_str(key), &value.to_vec());
 }
 
-/// Commit, and say whether it took. A cache write has no one to report to
-/// — the caller is a background refresh or a keystroke — so a failure is
-/// logged rather than raised, and never panics the thread that made it.
-fn commit(txn: WriteTxn<'_>, what: &str) -> bool {
-    match txn.commit() {
-        Ok(()) => true,
-        Err(e) => {
-            crate::log::error(format!("cache write failed ({}): {}", what, e));
-            crate::log::news(format!("cache write failed ({}): {}", what, e));
-            false
-        }
-    }
-}
-
 impl Clone for Cache {
     fn clone(&self) -> Self {
         Cache {
@@ -345,13 +352,15 @@ mod tests {
     fn refresh_batch_inserts_articles_and_summarizes_feed() {
         let dir = tempdir().expect("tempdir");
         let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
-        let summaries = cache.apply_refresh_batch(&[FeedRefresh {
-            url: FEED_URL.to_string(),
-            name: FEED_NAME.to_string(),
-            title: FEED_NAME.to_string(),
-            fetched_at: "2026-04-30 10:00:00".to_string(),
-            articles: vec![article("a1", false)],
-        }]);
+        let summaries = cache
+            .apply_refresh_batch(&[FeedRefresh {
+                url: FEED_URL.to_string(),
+                name: FEED_NAME.to_string(),
+                title: FEED_NAME.to_string(),
+                fetched_at: "2026-04-30 10:00:00".to_string(),
+                articles: vec![article("a1", false)],
+            }])
+            .expect("refresh");
 
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].new_articles, 1);
@@ -368,13 +377,15 @@ mod tests {
         cache.put_articles(&[article("a1", true)]);
         cache.put_feed_index(FEED_URL, &["a1".to_string()]);
 
-        let summaries = cache.apply_refresh_batch(&[FeedRefresh {
-            url: FEED_URL.to_string(),
-            name: FEED_NAME.to_string(),
-            title: FEED_NAME.to_string(),
-            fetched_at: "2026-04-30 10:00:00".to_string(),
-            articles: vec![article("a1", false)],
-        }]);
+        let summaries = cache
+            .apply_refresh_batch(&[FeedRefresh {
+                url: FEED_URL.to_string(),
+                name: FEED_NAME.to_string(),
+                title: FEED_NAME.to_string(),
+                fetched_at: "2026-04-30 10:00:00".to_string(),
+                articles: vec![article("a1", false)],
+            }])
+            .expect("refresh");
 
         assert_eq!(summaries[0].new_articles, 0);
         assert_eq!(summaries[0].unread, 0);
@@ -389,13 +400,15 @@ mod tests {
         let path = dir.path().join("test.tdkv");
         {
             let cache = Cache::open_at(path.clone()).expect("cache");
-            cache.apply_refresh_batch(&[FeedRefresh {
-                url: FEED_URL.to_string(),
-                name: FEED_NAME.to_string(),
-                title: FEED_NAME.to_string(),
-                fetched_at: "2026-04-30 10:00:00".to_string(),
-                articles: vec![article("a1", false), article("a2", true)],
-            }]);
+            cache
+                .apply_refresh_batch(&[FeedRefresh {
+                    url: FEED_URL.to_string(),
+                    name: FEED_NAME.to_string(),
+                    title: FEED_NAME.to_string(),
+                    fetched_at: "2026-04-30 10:00:00".to_string(),
+                    articles: vec![article("a1", false), article("a2", true)],
+                }])
+                .expect("refresh");
         }
         let cache = Cache::open_at(path).expect("reopen");
         assert_eq!(cache.list_feed_urls(), vec![FEED_URL.to_string()]);
@@ -434,6 +447,22 @@ mod tests {
         drop(cache);
         let (_, replaced) = open_store(&path).expect("reopen");
         assert!(replaced.is_none());
+    }
+
+    #[test]
+    fn a_failed_folder_mark_preserves_every_article_and_can_be_retried() {
+        let dir = tempdir().unwrap();
+        let path = dir.join("cache.tdkv");
+        let cache = Cache::open_at(path.clone()).unwrap();
+        cache.put_articles(&[article("a", false), article("b", false)]);
+        assert!(cache.mark_read(["a", "absent"], true).is_err());
+        drop(cache);
+        let cache = Cache::open_at(path.clone()).unwrap();
+        assert!(!cache.get_article("a").unwrap().read);
+        cache.mark_read(["a", "b"], true).unwrap();
+        drop(cache);
+        let cache = Cache::open_at(path).unwrap();
+        assert!(cache.get_article("a").unwrap().read && cache.get_article("b").unwrap().read);
     }
 
     fn article(hash: &str, read: bool) -> Article {

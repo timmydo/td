@@ -14,6 +14,7 @@ pub fn recipe() -> Recipe {
         .local_source_trees(&[
             "td-civil",
             "td-fetch-client",
+            "td-fs",
             "td-html",
             "td-json",
             "td-kv",
@@ -45,6 +46,7 @@ mod tests {
             Some(vec![
                 "td-civil".into(),
                 "td-fetch-client".into(),
+                "td-fs".into(),
                 "td-html".into(),
                 "td-json".into(),
                 "td-kv".into(),
@@ -80,6 +82,7 @@ mod tests {
                 "td-alloc",
                 "td-civil",
                 "td-fetch-client",
+                "td-fs",
                 "td-html",
                 "td-json",
                 "td-kv",
@@ -93,6 +96,7 @@ mod tests {
         for sibling in [
             "td-civil",
             "td-fetch-client",
+            "td-fs",
             "td-html",
             "td-json",
             "td-kv",

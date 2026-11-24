@@ -42,6 +42,7 @@ indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 # toolkit, through which alone the window, the lists and the read-only
 # editor pane an article is read in reach this crate.
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-civil = { path = "../td-civil" }
 td-fetch-client = { path = "../td-fetch-client" }
 td-html = { path = "../td-html" }
@@ -49,3 +50,6 @@ td-json = { path = "../td-json" }
 td-kv = { path = "../td-kv" }
 td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }
+
+[dev-dependencies]
+td-fs = { path = "../td-fs" }

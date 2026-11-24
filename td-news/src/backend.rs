@@ -10,15 +10,24 @@ use crate::log;
 pub enum BackendCommand {
     FetchAllFeeds,
     FetchFeed { url: String },
-    MarkRead { hash: String, read: bool },
-    MarkFeedRead { feed_url: String },
+    MarkRead { hash: String, read: bool, id: u64 },
+    MarkFeedRead { hashes: Vec<String> },
     Shutdown,
 }
 
 pub enum BackendResponse {
-    RefreshCompleted { reports: Vec<FeedRefreshReport> },
-    ArticleMutation { hash: String, read: bool },
-    FeedMarkedRead { feed_url: String },
+    RefreshCompleted {
+        manual: bool,
+        reports: Result<Vec<FeedRefreshReport>, td_kv::Error>,
+    },
+    ArticleMutation {
+        hash: String,
+        id: u64,
+        result: Result<(), String>,
+    },
+    FeedMarkedRead {
+        result: Result<(), String>,
+    },
 }
 
 pub struct FeedRefreshReport {
@@ -76,7 +85,10 @@ fn backend_loop(
                     log::info("backend command: FetchAllFeeds");
                     log::news("manual refresh: all feeds");
                     let reports = refresh_feeds(feeds.iter(), cache, &mut attempts);
-                    let _ = resp_tx.send(BackendResponse::RefreshCompleted { reports });
+                    let _ = resp_tx.send(BackendResponse::RefreshCompleted {
+                        manual: true,
+                        reports,
+                    });
                 }
                 BackendCommand::FetchFeed { url } => {
                     log::info(format!("backend command: FetchFeed {}", url));
@@ -85,21 +97,18 @@ fn backend_loop(
                         cache,
                         &mut attempts,
                     );
-                    let _ = resp_tx.send(BackendResponse::RefreshCompleted { reports });
+                    let _ = resp_tx.send(BackendResponse::RefreshCompleted {
+                        manual: true,
+                        reports,
+                    });
                 }
-                BackendCommand::MarkRead { hash, read } => {
-                    log::info(format!("backend command: MarkRead {} => {}", hash, read));
-                    cache.mark_read(&hash, read);
-                    let _ = resp_tx.send(BackendResponse::ArticleMutation { hash, read });
+                BackendCommand::MarkRead { hash, read, id } => {
+                    let result = cache.mark_read([hash.as_str()], read).map(|_| ());
+                    let _ = resp_tx.send(BackendResponse::ArticleMutation { hash, id, result });
                 }
-                BackendCommand::MarkFeedRead { feed_url } => {
-                    log::info(format!("backend command: MarkFeedRead {}", feed_url));
-                    if let Some(hashes) = cache.get_feed_index(&feed_url) {
-                        for h in &hashes {
-                            cache.mark_read(h, true);
-                        }
-                    }
-                    let _ = resp_tx.send(BackendResponse::FeedMarkedRead { feed_url });
+                BackendCommand::MarkFeedRead { hashes } => {
+                    let result = cache.mark_read(hashes, true).map(|_| ());
+                    let _ = resp_tx.send(BackendResponse::FeedMarkedRead { result });
                 }
                 BackendCommand::Shutdown => break,
             },
@@ -121,7 +130,10 @@ fn backend_loop(
                     cache,
                     &mut attempts,
                 );
-                let _ = resp_tx.send(BackendResponse::RefreshCompleted { reports });
+                let _ = resp_tx.send(BackendResponse::RefreshCompleted {
+                    manual: false,
+                    reports,
+                });
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 log::warn("backend command channel disconnected");
@@ -235,7 +247,7 @@ fn refresh_feeds<'a, I>(
     feeds: I,
     cache: &Cache,
     attempts: &mut HashMap<String, Instant>,
-) -> Vec<FeedRefreshReport>
+) -> Result<Vec<FeedRefreshReport>, td_kv::Error>
 where
     I: IntoIterator<Item = &'a crate::config::FeedConfig>,
 {
@@ -266,18 +278,18 @@ where
     }
 
     let mut summaries_by_url = cache
-        .apply_refresh_batch(&refreshes)
+        .apply_refresh_batch(&refreshes)?
         .into_iter()
         .map(|summary| (summary.feed_url.clone(), summary))
         .collect::<std::collections::HashMap<_, _>>();
 
-    report_order
+    Ok(report_order
         .into_iter()
         .filter_map(|item| match item {
             Ok(url) => summaries_by_url.remove(&url).map(report_from_summary),
             Err(report) => Some(report),
         })
-        .collect()
+        .collect())
 }
 
 fn report_from_summary(summary: FeedRefreshSummary) -> FeedRefreshReport {
@@ -422,7 +434,7 @@ mod tests {
             name: "refused".to_string(),
             url: "http://127.0.0.1:1/feed".to_string(),
         };
-        let reports = refresh_feeds([&refused], &cache, &mut attempts);
+        let reports = refresh_feeds([&refused], &cache, &mut attempts).unwrap();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].error.is_some());
         assert!(attempts.contains_key(&refused.url));

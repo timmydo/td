@@ -20,11 +20,7 @@ mod config;
 mod feed;
 mod keybindings;
 mod log;
-/// `tempfile`'s replacement, test-only and shared with the integration
-/// tests through a `#[path]` include. It is the same text as td-mail's,
-/// whose tests also take `env_lock`; td-news's no longer do.
 #[cfg(test)]
-#[allow(dead_code)]
 mod testing;
 mod ui;
 #[allow(dead_code)]
@@ -164,7 +160,11 @@ fn run() -> io::Result<()> {
         let mut had_errors = false;
         loop {
             match resp_rx.recv() {
-                Ok(backend::BackendResponse::RefreshCompleted { reports }) => {
+                Ok(backend::BackendResponse::RefreshCompleted {
+                    manual: true,
+                    reports,
+                }) => {
+                    let reports = reports.map_err(io::Error::other)?;
                     for report in reports {
                         if let Some(error) = report.error {
                             had_errors = true;

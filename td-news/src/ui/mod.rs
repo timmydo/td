@@ -53,7 +53,7 @@ const HTML_LIMITS: td_html::Limits = td_html::Limits {
 struct FeedRow {
     name: String,
     url: String,
-    total: usize,
+    hashes: Vec<String>,
     unread: usize,
     last_updated: Option<String>,
     last_error: Option<String>,
@@ -246,8 +246,8 @@ struct App {
     url_picking: bool,
     url_cursor: usize,
     url_first: usize,
-    pending_user_fetches: usize,
-    pending_read_mutations: HashMap<String, bool>,
+    next_mutation: u64,
+    pending_read_mutations: HashMap<String, (u64, bool)>,
     /// The document pane, read-only: an article or a log window.
     pane: Controller,
     pane_tab: Option<TabId>,
@@ -288,7 +288,7 @@ impl App {
             feeds.push(FeedRow {
                 name: feed.name.clone(),
                 url: feed.url.clone(),
-                total: hashes.len(),
+                hashes,
                 unread,
                 last_updated: cache
                     .get_feed_meta(&feed.url)
@@ -333,7 +333,7 @@ impl App {
             url_picking: false,
             url_cursor: 0,
             url_first: 0,
-            pending_user_fetches: 0,
+            next_mutation: 0,
             pending_read_mutations: HashMap::new(),
             pane,
             pane_tab: None,
@@ -347,11 +347,16 @@ impl App {
 
     fn handle_backend(&mut self, msg: BackendResponse, cache: &Cache) {
         match msg {
-            BackendResponse::RefreshCompleted { reports } => {
-                let user_refresh = self.pending_user_fetches > 0;
-                if user_refresh {
-                    self.pending_user_fetches -= 1;
-                } else {
+            BackendResponse::RefreshCompleted { manual, reports } => {
+                let reports = match reports {
+                    Ok(reports) => reports,
+                    Err(error) => {
+                        self.status = format!("Refresh could not be saved: {error}");
+                        self.pending_redraw = true;
+                        return;
+                    }
+                };
+                if !manual {
                     let mut errors = 0usize;
                     for report in &reports {
                         if let Some(error) = report.error.as_ref() {
@@ -398,11 +403,13 @@ impl App {
 
                     successes += 1;
                     new_total += report.new_articles;
-                    let effective_unread =
-                        self.feed_unread_count_from_cache(cache, &report.feed_url);
                     if let Some(row) = self.feeds.iter_mut().find(|f| f.url == report.feed_url) {
-                        row.total = report.total;
-                        row.unread = effective_unread;
+                        let mut hashes = cache.get_feed_index(&row.url).unwrap_or_default();
+                        // A newer refresh may already have prepended articles.
+                        hashes.drain(..hashes.len().saturating_sub(report.total));
+                        row.hashes = hashes;
+                        row.unread =
+                            Self::unread_count(cache, &row.hashes, &self.pending_read_mutations);
                         row.last_updated = report
                             .fetched_at
                             .as_deref()
@@ -432,35 +439,30 @@ impl App {
                 self.status = refresh_status(&reports, successes, errors, new_total);
                 self.pending_redraw = true;
             }
-            BackendResponse::ArticleMutation { hash, read } => {
-                let effective_read = match self.pending_read_mutations.get(&hash).copied() {
-                    Some(pending_read) if pending_read == read => {
-                        self.pending_read_mutations.remove(&hash);
-                        read
+            BackendResponse::ArticleMutation { hash, id, result } => {
+                if self
+                    .pending_read_mutations
+                    .get(&hash)
+                    .is_some_and(|(pending, _)| *pending == id)
+                {
+                    self.pending_read_mutations.remove(&hash);
+                    if result.is_err() {
+                        self.recount_displayed_unread(cache);
+                        self.reload_articles(cache);
                     }
-                    Some(pending_read) => pending_read,
-                    None => read,
-                };
-                self.apply_article_read(&hash, effective_read);
-                self.recount_current_feed_unread();
+                }
+                if let Err(error) = result {
+                    self.status = error;
+                }
                 self.pending_redraw = true;
             }
-            BackendResponse::FeedMarkedRead { feed_url } => {
-                if let Some(row) = self.feeds.iter_mut().find(|f| f.url == feed_url) {
-                    row.unread = 0;
-                }
-                if let Some(scope) = self.selected_feed_scope.as_ref() {
-                    match scope {
-                        FeedScope::Feed(url) if url == &feed_url => {
-                            for article in &mut self.articles {
-                                article.read = true;
-                            }
-                        }
-                        FeedScope::All | FeedScope::Unread => self.reload_articles(cache),
-                        _ => {}
-                    }
-                }
-                self.status = "Marked feed as read".to_string();
+            BackendResponse::FeedMarkedRead { result } => {
+                self.recount_displayed_unread(cache);
+                self.reload_articles(cache);
+                self.status = match result {
+                    Ok(()) => "Marked feed as read".to_string(),
+                    Err(error) => error,
+                };
                 self.pending_redraw = true;
             }
         }
@@ -690,12 +692,11 @@ impl App {
                             .find(|f| f.url == url)
                             .map(|f| f.name.as_str())
                             .unwrap_or("feed");
-                        self.pending_user_fetches += 1;
+
                         let _ = cmd_tx.send(BackendCommand::FetchFeed { url });
                         self.status = format!("Refreshing {}...", feed_name);
                     }
                     FeedScope::All | FeedScope::Unread => {
-                        self.pending_user_fetches += 1;
                         let _ = cmd_tx.send(BackendCommand::FetchAllFeeds);
                         self.status = "Refreshing feeds...".to_string();
                     }
@@ -704,32 +705,35 @@ impl App {
             }
             Key::Char('G') => {
                 self.reload_feeds_from_cache(cache);
-                self.pending_user_fetches += 1;
+
                 let _ = cmd_tx.send(BackendCommand::FetchAllFeeds);
                 self.status = "Refreshing feeds...".to_string();
                 self.pending_redraw = true;
             }
             Key::Char('u') if self.selected_feed != self.log_row_index() => {
-                match self.scope_for_selected_feed() {
-                    FeedScope::Feed(url) => {
-                        if let Some(feed) = self.feeds.iter().find(|f| f.url == url) {
-                            let _ = cmd_tx.send(BackendCommand::MarkFeedRead {
-                                feed_url: feed.url.clone(),
-                            });
-                            self.status = format!("Marking {} read...", feed.name);
-                            self.pending_redraw = true;
-                        }
+                let scope = self.scope_for_selected_feed();
+                let mut hashes = Vec::new();
+                for feed in &self.feeds {
+                    if matches!(&scope, FeedScope::Feed(url) if url != &feed.url) {
+                        continue;
                     }
-                    FeedScope::All | FeedScope::Unread => {
-                        for feed in &self.feeds {
-                            let _ = cmd_tx.send(BackendCommand::MarkFeedRead {
-                                feed_url: feed.url.clone(),
-                            });
+                    for hash in &feed.hashes {
+                        if td_alloc::string(hash)
+                            .and_then(|hash| td_alloc::push(&mut hashes, hash))
+                            .is_err()
+                        {
+                            self.status = "Selection too large".into();
+                            self.pending_redraw = true;
+                            return;
                         }
-                        self.status = "Marking all feeds read...".to_string();
-                        self.pending_redraw = true;
                     }
                 }
+                self.status = if cmd_tx.send(BackendCommand::MarkFeedRead { hashes }).is_ok() {
+                    "Marking read...".into()
+                } else {
+                    "News worker disconnected".into()
+                };
+                self.pending_redraw = true;
             }
             _ => {}
         }
@@ -796,12 +800,10 @@ impl App {
                 if let Some(scope) = self.selected_feed_scope.as_ref() {
                     match scope {
                         FeedScope::Feed(url) => {
-                            self.pending_user_fetches += 1;
                             let _ = cmd_tx.send(BackendCommand::FetchFeed { url: url.clone() });
                             self.status = "Refreshing feed...".to_string();
                         }
                         FeedScope::All | FeedScope::Unread => {
-                            self.pending_user_fetches += 1;
                             let _ = cmd_tx.send(BackendCommand::FetchAllFeeds);
                             self.status = "Refreshing feeds...".to_string();
                         }
@@ -812,7 +814,7 @@ impl App {
             Key::Char('G') => {
                 self.reload_feeds_from_cache(cache);
                 self.reload_articles(cache);
-                self.pending_user_fetches += 1;
+
                 let _ = cmd_tx.send(BackendCommand::FetchAllFeeds);
                 self.status = "Refreshing feeds...".to_string();
                 self.pending_redraw = true;
@@ -1659,7 +1661,7 @@ impl App {
                     format!(
                         "{} unread of {} · {}{}",
                         feed.unread,
-                        feed.total,
+                        feed.hashes.len(),
                         updated(feed.last_updated.as_ref()),
                         if feed.last_error.is_some() { " !" } else { "" }
                     ),
@@ -1717,18 +1719,37 @@ impl App {
     }
 
     fn toggle_current_read(&mut self, _cache: &Cache, cmd_tx: &mpsc::Sender<BackendCommand>) {
-        if let Some(article) = self.current_article().cloned() {
-            let read = !article.read;
-            let _ = cmd_tx.send(BackendCommand::MarkRead {
-                hash: article.hash.clone(),
-                read,
-            });
-            self.pending_read_mutations
-                .insert(article.hash.clone(), read);
-            self.apply_article_read(&article.hash, read);
-            self.recount_current_feed_unread();
-            self.pending_redraw = true;
+        if let Some(article) = self.current_article() {
+            self.queue_read(article.hash.clone(), !article.read, cmd_tx);
         }
+    }
+
+    fn queue_read(&mut self, hash: String, read: bool, commands: &mpsc::Sender<BackendCommand>) {
+        self.next_mutation = self.next_mutation.wrapping_add(1);
+        let id = self.next_mutation;
+        if commands
+            .send(BackendCommand::MarkRead {
+                hash: hash.clone(),
+                read,
+                id,
+            })
+            .is_ok()
+        {
+            self.apply_article_read(&hash, read);
+            for row in &mut self.feeds {
+                if row.hashes.contains(&hash) {
+                    row.unread = if read {
+                        row.unread.saturating_sub(1)
+                    } else {
+                        row.unread.saturating_add(1).min(row.hashes.len())
+                    };
+                }
+            }
+            self.pending_read_mutations.insert(hash, (id, read));
+        } else {
+            self.status = "News worker disconnected".into();
+        }
+        self.pending_redraw = true;
     }
 
     fn open_current_article(&mut self) {
@@ -1849,18 +1870,8 @@ impl App {
     }
 
     fn mark_current_article_read(&mut self, cmd_tx: &mpsc::Sender<BackendCommand>) {
-        if let Some(article) = self.current_article().cloned() {
-            if article.read {
-                return;
-            }
-            let _ = cmd_tx.send(BackendCommand::MarkRead {
-                hash: article.hash.clone(),
-                read: true,
-            });
-            self.pending_read_mutations
-                .insert(article.hash.clone(), true);
-            self.apply_article_read(&article.hash, true);
-            self.recount_current_feed_unread();
+        if let Some(article) = self.current_article().filter(|article| !article.read) {
+            self.queue_read(article.hash.clone(), true, cmd_tx);
         }
     }
 
@@ -1883,17 +1894,8 @@ impl App {
         let mut latest_str = None;
         let pending_read_mutations = &self.pending_read_mutations;
         for row in &mut self.feeds {
-            let hashes = cache.get_feed_index(&row.url).unwrap_or_default();
-            row.total = hashes.len();
-            row.unread = hashes
-                .iter()
-                .filter(|hash| {
-                    cache
-                        .get_article(hash)
-                        .map(|a| Self::is_unread_with_pending(&a, pending_read_mutations))
-                        .unwrap_or(false)
-                })
-                .count();
+            row.hashes = cache.get_feed_index(&row.url).unwrap_or_default();
+            row.unread = Self::unread_count(cache, &row.hashes, pending_read_mutations);
             if let Some(meta) = cache.get_feed_meta(&row.url) {
                 row.last_updated = normalize_datetime_to_local(&meta.last_fetched);
                 row.last_error = None;
@@ -1916,9 +1918,12 @@ impl App {
         if let Some(scope) = self.selected_feed_scope.as_ref() {
             match scope {
                 FeedScope::Feed(url) => {
-                    let hashes = cache.get_feed_index(url).unwrap_or_default();
-                    self.articles = hashes
+                    self.articles = self
+                        .feeds
                         .iter()
+                        .find(|row| &row.url == url)
+                        .into_iter()
+                        .flat_map(|row| &row.hashes)
                         .filter_map(|hash| cache.get_article(hash))
                         .collect();
                 }
@@ -1929,9 +1934,7 @@ impl App {
                         .feeds
                         .iter()
                         .map(|feed| {
-                            cache
-                                .get_feed_index(&feed.url)
-                                .unwrap_or_default()
+                            feed.hashes
                                 .iter()
                                 .filter_map(|hash| cache.get_article(hash))
                                 .filter(|a| {
@@ -1980,36 +1983,40 @@ impl App {
         }
     }
 
-    fn feed_unread_count_from_cache(&self, cache: &Cache, feed_url: &str) -> usize {
-        cache
-            .get_feed_index(feed_url)
-            .unwrap_or_default()
+    fn unread_count(
+        cache: &Cache,
+        hashes: &[String],
+        pending: &HashMap<String, (u64, bool)>,
+    ) -> usize {
+        hashes
             .iter()
-            .filter(|hash| {
-                cache
-                    .get_article(hash)
-                    .map(|a| Self::is_unread_with_pending(&a, &self.pending_read_mutations))
-                    .unwrap_or(false)
-            })
+            .filter_map(|hash| cache.get_article(hash))
+            .filter(|article| Self::is_unread_with_pending(article, pending))
             .count()
+    }
+
+    fn recount_displayed_unread(&mut self, cache: &Cache) {
+        for row in &mut self.feeds {
+            row.unread = Self::unread_count(cache, &row.hashes, &self.pending_read_mutations);
+        }
     }
 
     fn is_unread_with_pending(
         article: &Article,
-        pending_read_mutations: &HashMap<String, bool>,
+        pending_read_mutations: &HashMap<String, (u64, bool)>,
     ) -> bool {
         !pending_read_mutations
             .get(&article.hash)
-            .copied()
+            .map(|&(_, read)| read)
             .unwrap_or(article.read)
     }
 
     fn apply_pending_read_mutations(
         articles: &mut [Article],
-        pending_read_mutations: &HashMap<String, bool>,
+        pending_read_mutations: &HashMap<String, (u64, bool)>,
     ) {
         for article in articles {
-            if let Some(read) = pending_read_mutations.get(&article.hash).copied() {
+            if let Some((_, read)) = pending_read_mutations.get(&article.hash).copied() {
                 article.read = read;
             }
         }
@@ -2030,7 +2037,7 @@ impl App {
             .cloned()
             .or_else(|| cache.get_article(&hash));
         if let Some(article) = article.as_mut() {
-            if let Some(read) = self.pending_read_mutations.get(&hash).copied() {
+            if let Some((_, read)) = self.pending_read_mutations.get(&hash).copied() {
                 article.read = read;
             }
         }
@@ -2049,37 +2056,6 @@ impl App {
             true
         } else {
             false
-        }
-    }
-
-    fn recount_current_feed_unread(&mut self) {
-        let Some(scope) = self.selected_feed_scope.as_ref() else {
-            return;
-        };
-        match scope {
-            FeedScope::Feed(url) => {
-                let unread = self.articles.iter().filter(|a| !a.read).count();
-                if let Some(row) = self.feeds.iter_mut().find(|f| &f.url == url) {
-                    row.unread = unread;
-                    row.total = self.articles.len();
-                }
-            }
-            FeedScope::All | FeedScope::Unread => {
-                let mut unread_by_feed_name: HashMap<&str, usize> = HashMap::new();
-                for article in &self.articles {
-                    if !article.read {
-                        *unread_by_feed_name
-                            .entry(article.feed_name.as_str())
-                            .or_insert(0) += 1;
-                    }
-                }
-                for row in &mut self.feeds {
-                    row.unread = unread_by_feed_name
-                        .get(row.name.as_str())
-                        .copied()
-                        .unwrap_or(0);
-                }
-            }
         }
     }
 
@@ -2132,7 +2108,7 @@ impl App {
     }
 
     fn apply_article_read(&mut self, hash: &str, read: bool) {
-        if let Some(article) = self.articles.iter_mut().find(|a| a.hash == hash) {
+        for article in self.articles.iter_mut().filter(|a| a.hash == hash) {
             article.read = read;
         }
         if let Some(article) = self
@@ -2169,7 +2145,7 @@ impl App {
     }
 
     fn total_articles(&self) -> usize {
-        self.feeds.iter().map(|f| f.total).sum()
+        self.feeds.iter().map(|f| f.hashes.len()).sum()
     }
 
     fn total_unread(&self) -> usize {
@@ -2962,10 +2938,10 @@ pub(super) mod tests {
         app.toggle_current_read(&cache, &cmd_tx);
         assert!(app.articles[0].read);
 
-        app.pending_user_fetches = 1;
         app.handle_backend(
             BackendResponse::RefreshCompleted {
-                reports: vec![FeedRefreshReport {
+                manual: true,
+                reports: Ok(vec![FeedRefreshReport {
                     feed_url: FEED_URL.to_string(),
                     feed_name: FEED_NAME.to_string(),
                     fetched_at: Some("2026-04-29 12:00:00".to_string()),
@@ -2973,7 +2949,7 @@ pub(super) mod tests {
                     total: 1,
                     unread: 1,
                     error: None,
-                }],
+                }]),
             },
             &cache,
         );
@@ -2981,9 +2957,131 @@ pub(super) mod tests {
         assert!(app.articles[0].read);
         assert_eq!(app.feeds[0].unread, 0);
         assert_eq!(
-            app.pending_read_mutations.get(ARTICLE_HASH).copied(),
+            app.pending_read_mutations
+                .get(ARTICLE_HASH)
+                .map(|&(_, read)| read),
             Some(true)
         );
+    }
+
+    #[test]
+    fn a_delayed_manual_report_displays_only_its_own_articles() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::open_at(dir.join("cache")).unwrap();
+        seed_cache(&cache, false);
+        let mut app = App::new(&test_config(), &cache, false).unwrap();
+        app.selected_feed_scope = Some(FeedScope::Feed(FEED_URL.into()));
+        let mut newer = cache.get_article(ARTICLE_HASH).unwrap();
+        newer.hash = "later".into();
+        cache.put_articles(&[newer]);
+        cache.put_feed_index(FEED_URL, &["later".into(), ARTICLE_HASH.into()]);
+        app.handle_backend(
+            BackendResponse::RefreshCompleted {
+                manual: true,
+                reports: Ok(vec![FeedRefreshReport {
+                    feed_url: FEED_URL.into(),
+                    feed_name: FEED_NAME.into(),
+                    fetched_at: None,
+                    new_articles: 0,
+                    total: 1,
+                    unread: 1,
+                    error: None,
+                }]),
+            },
+            &cache,
+        );
+        assert_eq!(app.feeds[0].hashes, [ARTICLE_HASH]);
+        assert_eq!(app.feeds[0].unread, 1);
+        assert_eq!(app.articles.len(), 1);
+        assert_eq!(app.articles[0].hash, ARTICLE_HASH);
+    }
+
+    /// Hold an automatic fetch, queue a manual fetch and a feed mark, then
+    /// release the two network replies one at a time. The child owns the
+    /// fetch socket and XDG environment for this test alone.
+    #[test]
+    fn marking_during_a_fetch_leaves_new_arrivals_unread() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+
+        if std::env::var_os("TD_NEWS_FETCH_RACE_CHILD").is_none() {
+            let dir = tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::tests::marking_during_a_fetch_leaves_new_arrivals_unread",
+                ])
+                .current_dir(dir.path())
+                .env("XDG_RUNTIME_DIR", ".")
+                .env("XDG_CACHE_HOME", dir.path())
+                .env("TD_NEWS_FETCH_RACE_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let reopened = Cache::open_at(dir.join("news.tdkv")).unwrap();
+            assert!(reopened.get_article(ARTICLE_HASH).unwrap().read);
+            assert_eq!(reopened.list_unread_articles().len(), 2);
+            return;
+        }
+
+        std::fs::create_dir("td-fetch").unwrap();
+        let listener = UnixListener::bind("td-fetch/socket").unwrap();
+        let (requests, accepted) = mpsc::channel();
+        std::thread::spawn(move || {
+            for peer in listener.incoming().take(2) {
+                let mut reader = BufReader::new(peer.unwrap());
+                reader
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\n" {
+                        break;
+                    }
+                }
+                requests.send(reader.into_inner()).unwrap();
+            }
+        });
+        let cache = Cache::open_at(PathBuf::from("./news.tdkv")).unwrap();
+        seed_cache(&cache, false);
+        let config = test_config();
+        let mut app = App::new(&config, &cache, false).unwrap();
+        app.selected_feed = 2;
+        let (tx, rx) = crate::backend::spawn(&config, cache.clone());
+        let wait = Duration::from_secs(5);
+        let mut automatic = accepted.recv_timeout(wait).unwrap();
+        app.handle_feed_keys(Key::Char('g'), &cache, &tx);
+        app.handle_feed_keys(Key::Char('u'), &cache, &tx);
+        let reply = |peer: &mut std::os::unix::net::UnixStream, title: &str| {
+            let xml = format!("<rss><channel><title>Feed</title><item><title>{title}</title><link>https://example.com/{title}</link></item></channel></rss>");
+            write!(peer, "td-fetch 1\nstatus 200\nbody {}\n\n{xml}", xml.len()).unwrap();
+        };
+        reply(&mut automatic, "automatic");
+        drop(automatic);
+        let mut manual = accepted.recv_timeout(wait).unwrap();
+        app.handle_backend(rx.recv_timeout(wait).unwrap(), &cache);
+        assert_eq!(
+            app.feeds[0].hashes.len(),
+            1,
+            "automatic reply consumed the manual request"
+        );
+        reply(&mut manual, "manual");
+        drop(manual);
+        app.handle_backend(rx.recv_timeout(wait).unwrap(), &cache);
+        app.handle_backend(rx.recv_timeout(wait).unwrap(), &cache);
+        assert_eq!((app.feeds[0].hashes.len(), app.feeds[0].unread), (3, 2));
+        assert!(cache.get_article(ARTICLE_HASH).unwrap().read);
+        assert_eq!(cache.list_unread_articles().len(), 2);
+        tx.send(BackendCommand::Shutdown).unwrap();
+        drop(tx);
+        assert!(matches!(
+            rx.recv_timeout(wait),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 
     /// A press on a list row selects it, the action bar's labels stand
@@ -3609,25 +3707,70 @@ pub(super) mod tests {
         app.handle_backend(
             BackendResponse::ArticleMutation {
                 hash: ARTICLE_HASH.to_string(),
-                read: true,
+                id: 1,
+                result: Ok(()),
             },
             &cache,
         );
         assert!(!app.articles[0].read);
         assert_eq!(
-            app.pending_read_mutations.get(ARTICLE_HASH).copied(),
+            app.pending_read_mutations
+                .get(ARTICLE_HASH)
+                .map(|&(_, read)| read),
             Some(false)
         );
 
         app.handle_backend(
             BackendResponse::ArticleMutation {
                 hash: ARTICLE_HASH.to_string(),
-                read: false,
+                id: 2,
+                result: Ok(()),
             },
             &cache,
         );
         assert!(!app.articles[0].read);
         assert!(!app.pending_read_mutations.contains_key(ARTICLE_HASH));
+    }
+
+    #[test]
+    fn an_old_matching_reply_cannot_clear_a_newer_toggle_and_a_failure_restores_the_cache() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::open_at(dir.join("news.tdkv")).unwrap();
+        seed_cache(&cache, false);
+        let mut app = App::new(&test_config(), &cache, true).unwrap();
+        app.selected_feed_scope = Some(FeedScope::Feed(FEED_URL.into()));
+        app.reload_articles(&cache);
+        app.sync_open_article_to_selection();
+        let (tx, _rx) = mpsc::channel();
+        for _ in 0..3 {
+            app.toggle_current_read(&cache, &tx);
+        }
+        for (id, read) in [(1, true), (2, false)] {
+            cache.mark_read([ARTICLE_HASH], read).unwrap();
+            app.handle_backend(
+                BackendResponse::ArticleMutation {
+                    hash: ARTICLE_HASH.into(),
+                    id,
+                    result: Ok(()),
+                },
+                &cache,
+            );
+            app.reload_articles(&cache);
+            assert!(app.articles[0].read && app.open_article.as_ref().unwrap().read);
+            assert_eq!(app.feeds[0].unread, 0);
+        }
+        app.handle_backend(
+            BackendResponse::ArticleMutation {
+                hash: ARTICLE_HASH.into(),
+                id: 3,
+                result: Err("No space left on device".into()),
+            },
+            &cache,
+        );
+        assert!(!app.articles[0].read && !app.open_article.as_ref().unwrap().read);
+        assert_eq!(app.feeds[0].unread, 1);
+        assert!(app.pending_read_mutations.is_empty());
+        assert!(app.status.contains("No space"));
     }
 
     #[test]

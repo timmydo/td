@@ -114,6 +114,12 @@ shows and draw in the toolkit's palette.
 - A `C-click` on a link in the article opens it in the browser;
   holding Control over one underlines it
 
+Marking a feed read covers the articles counted in its row when you press
+the key. Articles arriving during a refresh stay unread. Individual toggles
+appear immediately. If the cache write fails, the reader shows the error and
+restores the saved state. The CLI acknowledges a mark after its transaction
+commits, including a whole folder marked in one operation.
+
 ## Memory
 
 td's jail lets td-news grow to 128 MiB before it throttles it

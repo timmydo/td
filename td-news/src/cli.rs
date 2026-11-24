@@ -334,38 +334,31 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
                 "error": format!("article not found: {}", hash),
             }),
         },
-        Command::MarkRead { hash, read } => {
-            if cache.get_article(&hash).is_none() {
-                td_json::json!({
-                    "ok": false,
-                    "error": format!("article not found: {}", hash),
-                })
-            } else {
-                cache.mark_read(&hash, read);
-                td_json::json!({
-                    "ok": true,
-                    "hash": hash,
-                    "read": read,
-                })
-            }
-        }
+        Command::MarkRead { hash, read } => match cache.mark_read([hash.as_str()], read) {
+            Ok(_) => td_json::json!({"ok": true, "hash": hash, "read": read}),
+            Err(error) => td_json::json!({"ok": false, "error": error}),
+        },
         Command::MarkFolderRead { folder } => {
-            let hashes = match folder_articles(cache, &folder) {
-                Ok(articles) => articles.into_iter().map(|a| a.hash).collect::<Vec<_>>(),
-                Err(error) => {
-                    return td_json::json!({
-                        "ok": false,
-                        "error": error,
-                    })
-                }
-            };
-            for hash in &hashes {
-                cache.mark_read(hash, true);
+            let urls = cache.list_feed_urls();
+            let combined = matches!(folder.as_str(), "all" | "unread");
+            if !combined && !urls.contains(&folder) {
+                return td_json::json!({"ok": false, "error": format!("unknown folder: {folder}")});
             }
+            let mut total = 0;
+            let hashes = urls
+                .iter()
+                .filter(|url| combined || **url == folder)
+                .flat_map(|url| cache.get_feed_index(url).unwrap_or_default())
+                .inspect(|_| total += 1);
+            let updated = match cache.mark_read(hashes, true) {
+                Ok(changed) if folder == "unread" => changed,
+                Ok(_) => total,
+                Err(error) => return td_json::json!({"ok": false, "error": error}),
+            };
             td_json::json!({
                 "ok": true,
                 "folder": folder,
-                "updated": hashes.len(),
+                "updated": updated,
             })
         }
         Command::SearchArticles {
