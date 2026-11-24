@@ -12,7 +12,7 @@ independent of it and byte-identical.
 The first formatting model is horizontal, left-to-right normal flow. Its
 references are CSS 2.2 [box generation and normal flow][flow], [used sizes
 and line height][sizes], and [CSS Text 3][text], with CSS 2.2's tables
-(§5, "Tables"). This is an explicitly
+(§5, "Tables") and floats (§5, "Floats"). This is an explicitly
 bounded subset, not a claim to implement browser layout generally.
 
 [flow]: https://www.w3.org/TR/CSS22/visuren.html
@@ -291,8 +291,8 @@ prose-compatible break test; output positions retain subpixel precision.
 
 **Tab stops.** Where white space is preserved, a tab advances to the
 next multiple of the tab interval measured from its line's start pen,
-the block container's starting content edge, before text-align shifts
-the line. The interval is `TAB_SPACES` (8, CSS tab-size's initial
+the block container's starting content edge (beside a left float, the
+float's edge, §5, "Floats"), before text-align shifts the line. The interval is `TAB_SPACES` (8, CSS tab-size's initial
 value) times the advance of a space in the block container's style,
 its letter-spacing included, in 1/64 px (CSS Text 3 §4.2): the strut
 style an inline sequence is laid with, looked up once a sequence, so a
@@ -451,9 +451,8 @@ formatting are not implemented: those containers use ordinary block flow
 and their descendants remain visible. List items use block flow, with
 the markers below. visibility:hidden
 retains geometry and style so the eventual painter can suppress it.
-Floats use their computed blockified display in ordinary flow with **no
-exclusion region**; clear has no effect. Float placement is a later
-increment, not silently approximated by text wrapping around placeholders.
+Floats are placed beside the lines they shorten, and `clear` moves a
+block below them (below, "Floats").
 
 HTML img is a replaced element even when no image bytes are available.
 Its content size comes from its CSS width and height, then its width
@@ -715,6 +714,167 @@ markers), 3% of
 lines' 68 MiB step refuses the layout `Limit("MAX_PAGE_BYTES")`; 131,000
 items of one letter, which lay a line each anyway, charge 162.6 MiB
 with markers either way and 144.6 without (charges after §2's split).
+
+### Floats
+
+A box **floats** when its computed `float` is left or right and it is a
+block, which td-css's blockification makes a floated inline, or an
+image laid as a block, and its display is not a table's: a floated
+table keeps its place in flow, as before. The root never floats.
+`StyledDocument::has_floats` says whether any box floats, set while
+boxes are generated, so a page without one takes none of what follows:
+its geometry, lines, work and charges are those of a layout without
+floats. The references are CSS 2.2 [§9.5][floats], §9.4.1's block
+formatting contexts and §10.3.5's shrink-to-fit width.
+
+[floats]: https://www.w3.org/TR/CSS22/visuren.html#floats
+
+**Formatting contexts.** Floats belong to the block formatting context
+their box is in, and a context's floats shorten only the lines of
+blocks in it, not those in a context nested in it. Contexts are rooted
+by the root, each float, each table cell and caption, and each block
+whose `overflow-x` or `overflow-y` is neither `visible` nor `clip`;
+td-css has no `flow-root`. A root's auto height reaches its floats' bottom margin
+edges (§10.6.7); an ordinary block's does not, and its floats hang out
+of it, shortening lines after it.
+
+**Placement.** A float is laid as a context's root at its used width:
+its set width, or, auto, min(max(min-content, room), max-content)
+within its min and max widths, where room is its containing block's
+width less its margins, borders and padding, and min- and max-content
+are measured as a table cell's (§5, "Tables"); an image floats at its
+replaced size. Its margins are as computed, auto ones 0, and never
+collapse. Its margin box is then placed (§9.5.1): no higher than the
+top of the line it is met in (between blocks, the flow's y past the
+margin pending), than an earlier float's top in its context, or, with
+`clear`, than the floats it clears; and from there at the first y
+where its width fits between its containing block's content edges less
+the margin boxes of its context's floats overlapping its height, left
+floats' right edges and right floats' left edges, at that room's left
+edge, or right; where no float overlaps it is placed at the edge,
+overflowing if it is wider. Since every earlier float's top is no
+lower than that start, the room is narrowest at its top. Widths are
+compared with rooms in whole 1/64 px, as a table's cells are (below,
+"Tables"), so floats whose percentages sum to their container's width
+fit beside each other at any fractional x. A margin box narrower than
+nothing (negative margins) excludes nothing, and a right float's right
+margin edge still meets the room's. A float met within a line goes on
+that line where it fits beside what the line holds so far, which then
+starts past it or ends before it, and no float met earlier in the line
+waits; one that goes lower anyway, past other floats, is placed there
+at once, unless one met earlier waits; any other waits for the next
+line's top, after those before it.
+
+A float's height is known only once it is laid, and its layout does
+not depend on where it goes, so each float an inline sequence holds is
+laid first, at the sequence's start and its container's left edge, and
+moved, its boxes, lines, markers and own overflow, to where the
+sequence places it, as a table cell's content is moved by its
+alignment. Its boxes therefore come before the sequence's lines, in
+postorder as ever. Its lines, and the markers on them, are then moved
+to follow the line of the sequence on which what came before it was
+laid (wherever that went: a word the float was met in that wraps takes
+it to the next line), or to precede the next line where nothing did or
+what did was dropped (spaces at a wrap), in one pass that moves each
+line and marker once. So lines lie in the tree order of their
+starts, a float's lines starting and ending between two places of the
+line it was met in and following that line, markers stay in line
+order, and lines are not in y order around a float, as around a table
+(§5, "Tables", "Output and lines"). A table cell's baseline, and the
+first line it keeps whatever the window, is that of its first line in
+flow, not of a float laid before it. While a sequence with floats
+is laid, its lines and its floats' are kept whatever the window, as a
+table's are (a float only moves down from where it was laid, so a line
+starting below the window stays dropped), and the outermost such
+sequence, or table, keeps only the window's once they are moved. A
+windowed layout equals the filtered whole one.
+
+**Lines beside floats.** A line takes the room its context's floats
+leave between its block's content edges over its top and the block's
+own line height (its strut), so a line taller than the strut, with a
+large image or font, may overlap a float below that. It starts at the
+room's left edge and text-align moves it within the room; tab stops
+are measured from that start, not from the block's edge, where a left
+float shortens the line. A line whose first unbreakable piece (a word,
+an image, or a run that does not wrap) does not fit moves down to the
+nearest bottom of the floats beside it, until it fits or none shortens
+it (§9.5), rather than splitting there; a word wider than the whole
+line is then split as before.
+
+**Clear.** A block's `clear` puts its border box's top no higher than
+the bottom margin edge of each earlier float on those sides in its
+context. Clearance does not change how its margins collapse with those
+above: its top is the larger of where they put it and the floats'
+bottom. Only a block's `clear` is read: a `<br>`'s is not, and with no
+generated content `::after { clear: both }` clears nothing, so a block
+holding only floats has no height from them unless it roots a context.
+
+**Roots beside floats.** A context's root in flow, a block with
+`overflow` neither `visible` nor `clip`, does not overlap the floats beside its
+top: it is sized in the room they leave there, its auto width that
+room's and its percentages resolved against it, where its margin box
+fits, else it moves down to the nearest float bottom until it fits or
+none is beside it. Its height is unknown when it is placed, so a float
+lower than its top that started beside its lower part (one that went
+down to fit) may overlap it. A table beside floats is laid where it is,
+overlapping them.
+
+**Measured widths.** In an inline sequence measured for a table cell
+or a float's width, a float is no wrap opportunity, as it is none when
+laid: its own min-content width is a piece of its own, and its
+max-content width is added to its line's with any space before it,
+which the line's pen holds when the float is placed.
+
+**Bounds.** Each open context's placed floats are a budgeted list,
+charged with the layout's output as it grows, as are the floats laid
+and not yet placed and the contexts open. A context places its floats
+in the order of their tops, none higher than an earlier one's, and
+queues them so, each with the lowest bottom of those queued up to it.
+Its lines (with a root in flow, laid where its lines are) and its float
+placements are two views asking for room, each mostly at a y no higher
+than the last: each takes a float from the queue when it asks at or
+past its top, and lets it go when it asks below its bottom, so a query
+visits, a unit of work each, the floats it has reached and not passed,
+not every float below it however far the other has gone. A view asking
+above where it last asked (past a negative margin, or after a block
+whose set height is less than its lines') takes back, by one binary
+search of those lowest bottoms, the floats from the first reaching
+below it, visiting them again; placements never rise. A clear reads
+the lowest bottom on each side, which the context keeps. Placing a
+sequence's floats' lines after the lines they were met in visits each
+of the sequence's lines and markers twice, a unit each, its scratch
+of four bytes each charged while held and given back; a float met
+before any of its sequence moves nothing. Three shapes cost more than linear, each charged and so
+refused by name past MAX_LAYOUT_WORK: floats side by side, each placed
+past all those before it; many tall floats overlapping, each line
+beside them visiting them all; and auto-width floats nested d deep,
+each measuring its content, d measures of the innermost, as nested
+tables do (§5, "Tables", "Bounds").
+
+**Measured.** Release, the host of §6, §6's deterministic metrics, at
+1280 px, under a load average of 6 to 11 (2026-11-23), interleaved
+with the build before floats. The 2 MiB prose, word and blocks shapes
+do the same work and charge the same as before, to the unit and the
+byte. Prose and one word take the same time or up to 3% more
+(medians of fifteen and twenty-five rounds of nine layouts, before and
+after: prose 55.2 and 55.1 ms, then 52.9 and 54.5; one word 53.4 and
+53.2); blocks, a run of inline content each, is 3 to 6% slower
+(forty-one rounds: medians 79.4 and 82.0 ms, fastest 65.4 and 68.8;
+twenty-five: 74.8 and 79.0), about 40 ns a block, which the float
+paths, out of line, leave in the branches that skip them and a larger
+line flow. 2 MiB of paragraphs each led by
+a 40 px image floated left and three lines' words lays 14,170 lines
+beside them in 48 ms (3,347,477 work, 73.2 MiB charged), where in flow
+they took 28,339 lines; 2 MiB of 40 px floats each clearing the last,
+a one-line paragraph after each, so the floats pile up below the
+lines, in 37 ms (786,454 work, 108.5 MiB); 2 MiB of zero-width floats
+side by side, some 44,000, is refused `Limit("MAX_LAYOUT_WORK")` in
+109 ms.
+
+**Painting.** Geometry stays in postorder. A painter in tree order
+paints a float's box before the in-flow blocks after it, whose
+backgrounds then cover it; CSS paints floats above the in-flow blocks
+of their context (td-web's painter, td-web/DESIGN.md §10, "Painting").
 
 ### Tables
 
@@ -1316,8 +1476,8 @@ Lines past `Limits::lines` refuse `MAX_LINES` as layout's do, so a cap
 within that of them can be refused rather than cut. A text page here
 is one text node laid `pre-wrap` or `break-spaces` in an ordinary
 block, every other box an ordinary block (no inline box, image, `<br>`,
-table or list marker, which would put items or lines in the flow the
-count does not see), and its text holds no control scalar but tab,
+table, float or list marker, which would put items or lines in the flow
+the count does not see), and its text holds no control scalar but tab,
 newline and carriage return: any other shows as U+FFFD, a fragment of
 its own (§3), so a line of them would hold several. `fit` refuses
 anything else (`Invalid`); td-web's text, its controls but the tab
@@ -1658,7 +1818,7 @@ distinct maps.
 5. Real-page and 2 MiB cost validation, synthetic regressions and measured
    memory/latency table. Reconcile the 132 MiB baseline after interning.
 
-Flexbox, float exclusion and advanced text need subsequent designs;
+Flexbox and advanced text need subsequent designs;
 painting and td-web's integration are td-web/DESIGN.md §10's. Open for
 tables: a windowed layout
 holds the lines above its window in the row being laid and in rows a
@@ -1678,7 +1838,11 @@ separated borders with collapse approximated, vertical alignment and
 captions, is §5's "Tables". List markers as a fragment kind of their own, outside and
 inside, numbered as HTML numbers list items, are §5's "List markers".
 Intrinsic sizes for replaced elements supplied by the caller, a change
-needing a layout and no cascade, are §5's "Intrinsic sizes". The input
+needing a layout and no cascade, are §5's "Intrinsic sizes". Floats,
+placed in their block formatting contexts, the lines beside them
+shortened, `clear`, contexts' roots holding their floats and moving
+beside others, and a float laid first and moved where its line places
+it, are §5's "Floats". The input
 limit a caller sets, the
 cascade without style attributes and the byte limit per layout request
 are §6's "Caller-set limits"; each line's block and end (`Line::block`,

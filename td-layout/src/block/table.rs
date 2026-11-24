@@ -236,7 +236,7 @@ impl<'e> Walk<'e> {
                         let event = events.get(*at).ok_or(Error::Invalid)?;
                         *at += 1;
                         Some(match event {
-                            Event::Inline(id) | Event::Block(id) => *id,
+                            Event::Inline(id) | Event::Block(id) | Event::Float(id) => *id,
                         })
                     } else {
                         None
@@ -407,7 +407,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let mut next = end;
         while let Some(event) = events.get(next).copied() {
             let b = match event {
-                Event::Block(id) | Event::Inline(id) => {
+                Event::Block(id) | Event::Inline(id) | Event::Float(id) => {
                     *self.styled.box_node(id).ok_or(Error::Invalid)?
                 }
             };
@@ -1886,6 +1886,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         };
         let (lines, markers, boxes) = (self.lines.len(), self.markers.len(), self.boxes.len());
         let first_line = std::mem::replace(&mut self.first_line, true);
+        let first_index = self.first_index.take();
         // The cell's own overflow, moved with it.
         let outer = (self.left, self.top, self.right, self.bottom);
         (self.left, self.top, self.right, self.bottom) = (
@@ -1894,6 +1895,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             f64::NEG_INFINITY,
             f64::NEG_INFINITY,
         );
+        // A cell roots a formatting context, which holds its floats.
+        let context = self.styled.has_floats();
+        if context {
+            self.floats.open(&mut self.counters)?;
+        }
         let laid = self.children(
             first,
             until,
@@ -1912,10 +1918,21 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             depth + 3,
             None,
         );
+        let laid = match (laid, context) {
+            (Ok(laid), true) => match self.floats.close()? {
+                Some(bottom) => Ok(laid.max(bottom - content.y)),
+                None => Ok(laid),
+            },
+            (laid, _) => laid,
+        };
         let own = (self.left, self.top, self.right, self.bottom);
         (self.left, self.top, self.right, self.bottom) = outer;
         // An enclosing cell whose first line this was has it.
-        self.first_line = first_line && self.lines.len() == lines;
+        let taken = std::mem::replace(&mut self.first_index, first_index);
+        if first_line && taken.is_some() {
+            self.first_index = taken;
+        }
+        self.first_line = first_line && taken.is_none();
         let laid = laid?;
         let bounds = (own.0 <= own.2).then_some(Rect {
             x: own.0,
@@ -1926,7 +1943,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let inner = laid.max(set.unwrap_or(0.0));
         let height = inner + decoration.vertical();
         let baseline = decoration.top
-            + match self.lines.get(lines..).and_then(|l| l.first()) {
+            + match taken.and_then(|at| self.lines.get(at)) {
                 Some(line) => line.y + line.baseline - (content.y + ctx.offset.1),
                 None => laid,
             };
@@ -2025,7 +2042,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// Keeps, of what the outermost table laid since it last filtered, the
     /// lines and markers the window meets, as a layout that never held
     /// them would.
-    fn keep_window(&mut self) -> Result<(), Error> {
+    pub(super) fn keep_window(&mut self) -> Result<(), Error> {
         let (lines, markers) = self.filtered;
         let Some(window) = self.request.window.as_ref() else {
             return Ok(());

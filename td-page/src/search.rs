@@ -37,8 +37,9 @@ fn fold(c: char) -> char {
     }
 }
 
-/// The matches of `query` in `laid`, in tree order; none for an empty
-/// query. A refusal of the scratch budget leaves nothing behind.
+/// The matches of `query` in `laid`, in tree order (a float's lines,
+/// searched where they lie, sorted into it); none for an empty query. A
+/// refusal of the scratch budget leaves nothing behind.
 pub fn find(laid: &Laid, query: &str, page: &Budget) -> Result<BudgetVec<Hit>, BudgetError> {
     let memory = page.child(SEARCH_BYTES.saturating_add(Budget::metadata_bytes()))?;
     let mut hits = BudgetVec::new(&memory)?;
@@ -119,7 +120,10 @@ pub fn find(laid: &Laid, query: &str, page: &Budget) -> Result<BudgetVec<Hit>, B
     });
     match failed {
         Some(error) => Err(error),
-        None => Ok(hits),
+        None => {
+            hits.sort_unstable_by_key(|hit| hit.start);
+            Ok(hits)
+        }
     }
 }
 
@@ -143,6 +147,18 @@ mod tests {
                 out
             })
             .collect()
+    }
+
+    /// Matches in a float met within a line come between those before
+    /// and after it on that line.
+    #[test]
+    fn matches_around_a_float_are_in_tree_order() {
+        let markup = "<p>ab cd <span style=float:right;width:60px>ab ef</span> ab gh";
+        assert_eq!(found(markup, "ab"), ["ab", "ab", "ab"]);
+        let laid = laid(markup);
+        let page = Budget::new(64 << 20).unwrap();
+        let hits = find(&laid, "ab", &page).unwrap();
+        assert!(hits.windows(2).all(|w| w[0].end <= w[1].start), "{hits:?}");
     }
 
     #[test]

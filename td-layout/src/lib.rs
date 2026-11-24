@@ -325,6 +325,9 @@ pub struct StyledDocument<'d> {
     /// Whether any block box has a table display; layout looks for tables
     /// only then.
     tables: bool,
+    /// Whether any box floats (`float_side`); layout looks for floats
+    /// and formatting contexts only then.
+    floats: bool,
 }
 enum DocumentOwner<'d> {
     Borrowed(&'d Document),
@@ -487,6 +490,7 @@ impl<'d> StyledDocument<'d> {
             list_items: BudgetVec::new(memory)?,
             marker_count: 0,
             tables: false,
+            floats: false,
         };
         let mut numbering = list::Numbering::new(memory)?;
         // List items are admitted while the index and scratch live.
@@ -559,6 +563,7 @@ impl<'d> StyledDocument<'d> {
                 if kind == BoxKind::Block {
                     out.tables |= TableRole::of(keyword(computed, Property::Display)).is_some();
                 }
+                out.floats |= parent.is_some() && float_side(computed, kind).is_some();
                 if let Some(element) = node.element() {
                     if kind == BoxKind::Block && keyword(computed, Property::Display) == "list-item"
                     {
@@ -708,6 +713,10 @@ impl<'d> StyledDocument<'d> {
     pub fn has_tables(&self) -> bool {
         self.tables
     }
+    /// Whether any box floats (DESIGN.md §5, "Floats").
+    pub fn has_floats(&self) -> bool {
+        self.floats
+    }
 }
 impl StyledDocument<'static> {
     /// Own the immutable document without a self-referential borrow.
@@ -732,6 +741,7 @@ impl StyledDocument<'static> {
             list_items,
             marker_count,
             tables,
+            floats,
             ..
         } = built;
         Ok(Self {
@@ -748,8 +758,32 @@ impl StyledDocument<'static> {
             list_items,
             marker_count,
             tables,
+            floats,
         })
     }
+}
+/// The side a box of `kind` floats to: a block, or an image laid as a
+/// block, whose `float` is left or right and whose display is not a
+/// table's, which keeps its place in flow (DESIGN.md §5, "Floats"). The
+/// root never floats; its caller sees to that.
+pub(crate) fn float_side(style: &ComputedStyle, kind: BoxKind) -> Option<Side> {
+    let display = keyword(style, Property::Display);
+    let block = kind == BoxKind::Block
+        || (kind == BoxKind::Image && !matches!(display, "inline" | "inline-block"));
+    if !block || TableRole::of(display).is_some() {
+        return None;
+    }
+    match keyword(style, Property::Float) {
+        "left" => Some(Side::Left),
+        "right" => Some(Side::Right),
+        _ => None,
+    }
+}
+/// The side a float is on, or a clear applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Side {
+    Left,
+    Right,
 }
 fn default_budget(limits: Limits<'_>) -> Result<Budget, Error> {
     Ok(Budget::new(

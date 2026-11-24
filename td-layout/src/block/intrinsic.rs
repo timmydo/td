@@ -88,7 +88,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// a line may wrap after it. The events' storage is charged while it is
     /// held and given back after, so that measuring the same content for
     /// each table around it charges its peak, not a multiple.
-    fn content_with(
+    pub(super) fn content_with(
         &mut self,
         first: Option<BoxId>,
         until: Option<BoxId>,
@@ -143,12 +143,12 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         self.block_intrinsic(id, b, role, depth + 1)?
                     }
                 }
-                Event::Inline(_) => {
+                Event::Inline(_) | Event::Float(_) => {
                     let start = at;
-                    while matches!(events.get(at), Some(Event::Inline(_))) {
+                    while events.get(at).is_some_and(|e| e.flows()) {
                         at += 1;
                     }
-                    self.inline_intrinsic(events, start..at, strut, lead.take())?
+                    self.inline_intrinsic(events, start..at, strut, lead.take(), depth)?
                 }
             };
             min = min.max(least);
@@ -158,7 +158,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     }
     /// A list item's inside marker, measured as layout lays it: its
     /// advance, and whether its item's lines wrap after it.
-    fn inside_marker(&mut self, id: BoxId, b: &BoxNode) -> Result<Option<(i64, bool)>, Error> {
+    pub(super) fn inside_marker(
+        &mut self,
+        id: BoxId,
+        b: &BoxNode,
+    ) -> Result<Option<(i64, bool)>, Error> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         if b.kind != BoxKind::Block
             || keyword(style, Property::Display) != "list-item"
@@ -271,6 +275,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         range: Range<usize>,
         strut: StyleId,
         lead: Option<(i64, bool)>,
+        depth: usize,
     ) -> Result<(i64, i64), Error> {
         let mut m = Measure::new();
         let mut stops: Option<i64> = None;
@@ -284,8 +289,21 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             }
         }
         for index in range {
-            let Some(Event::Inline(id)) = events.get(index).copied() else {
-                return Err(Error::Invalid);
+            let id = match events.get(index).copied() {
+                Some(Event::Inline(id)) => id,
+                // A float: no wrap opportunity, as laid; its own least a
+                // piece of its own, and its widest beside its line's
+                // and the space before it, which the line's pen holds
+                // when it is placed (DESIGN.md §5, "Floats").
+                Some(Event::Float(id)) => {
+                    let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
+                    let (least, most) = self.block_intrinsic(id, b, None, depth + 1)?;
+                    m.min = m.min.max(whole(least));
+                    m.line = m.line.saturating_add(m.pending).saturating_add(most);
+                    m.pending = 0;
+                    continue;
+                }
+                _ => return Err(Error::Invalid),
             };
             let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
             let style = self.styled.style(b.style).ok_or(Error::Invalid)?;

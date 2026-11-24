@@ -268,6 +268,8 @@ impl View {
     /// Steps the focused link forward or back in tree order, showing it;
     /// with none focused, from the screen: the first link on a line
     /// shown or after, or the last on a line shown or before, else round.
+    /// A link's first line is not in tree order past a float's lines, so
+    /// the links are scanned.
     pub fn step_link(&mut self, laid: &Laid, measure: &mut Measure, pane: &Pane, forward: bool) {
         let links = laid.links();
         let count = links.len();
@@ -278,14 +280,12 @@ impl View {
             (None, true) => self
                 .lines_shown(laid, pane)
                 .min()
-                .map(|top| links.partition_point(|&(_, line)| (line as usize) < top))
-                .filter(|&at| at < count)
+                .and_then(|top| links.iter().position(|&(_, line)| line as usize >= top))
                 .unwrap_or(0),
             (None, false) => self
                 .lines_shown(laid, pane)
                 .max()
-                .map(|bottom| links.partition_point(|&(_, line)| line as usize <= bottom))
-                .and_then(|after| after.checked_sub(1))
+                .and_then(|bottom| links.iter().rposition(|&(_, line)| line as usize <= bottom))
                 .unwrap_or(count - 1),
             (Some(at), true) => (at + 1) % count,
             (Some(at), false) => (at + count - 1) % count,
@@ -372,12 +372,24 @@ pub fn target_place(laid: &Laid, target: NodeId) -> Option<Place> {
             node: Some(target),
         },
     );
-    let lines = laid.lines();
-    lines.get(at..)?.iter().find_map(|line| {
-        text::items(laid, line)
+    // Lines are in the order of their starts, but a float's lie within
+    // the line it was met in, after it: the least start at or after the
+    // target, among the lines until one starts past the best.
+    let mut best: Option<Place> = None;
+    for line in laid.lines().get(at..)? {
+        let start = text::bounds(laid, line).map(|(start, _)| start);
+        if best.is_some_and(|best| start.is_some_and(|start| start > best)) {
+            break;
+        }
+        let here = text::items(laid, line)
             .find(|item| item.start.rank >= rank)
-            .map(|item| item.start)
-    })
+            .map(|item| item.start);
+        best = match (best, here) {
+            (Some(best), Some(here)) => Some(best.min(here)),
+            (best, here) => best.or(here),
+        };
+    }
+    best
 }
 
 #[cfg(test)]
@@ -542,6 +554,86 @@ mod tests {
         };
         view.restore(&laid, &tall, anchor);
         assert_eq!(view.y, 19);
+    }
+
+    /// A float met within a line: its lines follow that line, every
+    /// place laid is found on the line that lays it, past the float's
+    /// lines too, and the float is a fragment's target.
+    #[test]
+    fn places_in_and_around_a_float_met_within_a_line() {
+        let laid = laid(
+            "<body style=margin:0><p style=margin:0>one two \
+             <span id=f style=float:right;width:60px>in the float</span> three four\
+             <p style=margin:0>next",
+        );
+        let lines = laid.lines();
+        let float = lines
+            .iter()
+            .position(|line| line.block() != lines[0].block())
+            .unwrap();
+        assert!(float > 0, "the float's lines follow the line it was met in");
+        assert!(laid.outer(float).is_some());
+        for (at, line) in lines.iter().enumerate() {
+            for item in text::items(&laid, line) {
+                assert_eq!(text::line_of(&laid, item.start), at, "{item:?}");
+                assert_eq!(text::line_of(&laid, item.end), at, "{item:?}");
+            }
+        }
+        let f = laid.tree().target("f").unwrap();
+        let place = target_place(&laid, f).unwrap();
+        assert_eq!(text::line_of(&laid, place), float);
+        // Past the last piece of the line the float was met in: that line.
+        let (_, end) = text::bounds(&laid, &lines[0]).unwrap();
+        let past = Place {
+            offset: end.offset + 1,
+            ..end
+        };
+        assert_eq!(text::line_of(&laid, past), 0);
+        // In white space a wrap dropped between two of a float's lines:
+        // the first of them.
+        let laid = crate::page::tests::laid(
+            "<body style=margin:0><p style=margin:0>one two \
+             <span style=float:right;width:40px>in    the float</span> three",
+        );
+        let lines = laid.lines();
+        let float = lines
+            .iter()
+            .position(|line| line.block() != lines[0].block())
+            .unwrap();
+        let node = lines[float].fragments.first().unwrap().node;
+        assert_eq!(text::line_of(&laid, Place::new(&laid, node, 4)), float);
+        // A copy from inside the float to the end holds the tail of the
+        // line it was met in; the whole page's end is that tail's.
+        let copied = |from: Place, to: Place| {
+            let mut out = String::new();
+            let _ = text::copy(&laid, from, to, &mut |t| {
+                out.push_str(t);
+                std::ops::ControlFlow::Continue(())
+            });
+            out
+        };
+        let (first, last) = text::page_bounds(&laid);
+        let (in_float, _) = text::bounds(&laid, &lines[float]).unwrap();
+        let (_, float_end) = text::bounds(&laid, &lines[float + 2]).unwrap();
+        // A selection ending in the float copies the float's text up to
+        // its end.
+        let to_float = copied(first, float_end);
+        assert!(
+            to_float.contains("in") && to_float.contains("float"),
+            "{to_float}"
+        );
+        assert!(
+            copied(in_float, last).contains("three"),
+            "{}",
+            copied(in_float, last)
+        );
+        let all = copied(first, last);
+        assert!(
+            ["one two", "in", "the", "float", "three"]
+                .iter()
+                .all(|w| all.contains(w)),
+            "{all}"
+        );
     }
 
     #[test]

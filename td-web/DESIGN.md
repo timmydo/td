@@ -1698,12 +1698,31 @@ CSS background images and SVG are not fetched.
 byte offset in its decoded text on a scalar boundary, or before or
 after a replaced element. Places are ordered by the tree-order table,
 four bytes a node (1 MiB at td-html's `MAX_NODES`). td-layout lays
-normal flow and tables, in tree order, so its lines and the fragments
-in each are in tree order: relative offsets move what is drawn, not the
-order. A **paragraph**, the unit find matches within and `Shift+Up` and
-`Shift+Down` move by, is a run of consecutive
-lines one block container lays: text either side of a child block is
-two paragraphs, and a preserved newline or a `<br>` ends one. td-web
+normal flow and tables in tree order, and puts a float's lines after
+the line it was met in (td-layout/DESIGN.md §5, "Floats"), so its lines
+are in the tree order of their starts and the fragments in each in tree
+order, a float's lines starting and ending between two places of the
+line it was met in: relative offsets move what is drawn, not the
+order. A place's line is the last starting at or before it, or, past
+the last of a float's lines, the line they lie in: td-page keeps each
+line's enclosing line (`Laid::outer`, for a page with floats one pass
+over the lines' places as a layout is taken, four bytes a line), and a
+fragment
+target is the least place at or after its element among the lines from
+its own until one starts past it. A **paragraph**, the unit find
+matches within and `Shift+Up` and `Shift+Down` move by, is a run of
+consecutive lines one block container lays: text either side of a
+child block is two paragraphs, a preserved newline or a `<br>` ends
+one, and a float's lines between two of a paragraph's lines end it
+there, the rest another paragraph. Find walks the lines in their
+order and sorts its matches into tree order. A selection copies what is
+painted selected, the scalars starting from its start to before its end,
+in line order: from the outermost line its start's lies in to the last
+line starting at or before its end, so around a float met within a line
+that line's selected text comes before the float's. The page's end is
+the latest along its last line's enclosing lines; and `Tab` from the
+screen scans the links, whose first lines are not in
+tree order past a float's. td-web
 reads both from td-layout, each line naming the block that laid it
 and how it ended (`Line::block`, `Line::end`, td-layout/DESIGN.md §4,
 "Line ends"), not from gaps between lines.
@@ -1753,9 +1772,10 @@ it, and a copy leaves it out. A line laying nothing (a text page's last
 newline, a paragraph's last `<br>`) holds no place: a place at the end
 of the line before it is on that line.
 
-**Copying** takes the text between the two places in tree order as it
-is shown: fragments' painted text, neither `visibility: hidden` text
-nor a hidden item's marker; after a `Wrap` end the white
+**Copying** takes the text between the two places in tree order (in
+line order around a float's lines, above, "Places") as it is shown:
+fragments' painted text, neither `visibility: hidden` text nor a
+hidden item's marker; after a `Wrap` end the white
 space laid between its line and the next line with a fragment, read
 from the source between them, or across two text nodes from the
 first's tail when that is white space, else from the next's head, as
@@ -2116,9 +2136,11 @@ Not shown, each a later amendment: script (§1); forms beyond what
 their elements lay out (a `button`'s or `textarea`'s text shows, an
 `input` nothing, and nothing is submitted); positioning other than
 static and relative (td-css computes no other, so `absolute`, `fixed`
-and `sticky` stay in flow); floats, flex, grid and inline-block until
-td-layout has them, laid in normal flow as td-layout specifies, a float
-taking no exclusion, nothing hidden by it; table layout beyond
+and `sticky` stay in flow); flex, grid and inline-block until
+td-layout has them, laid in normal flow as td-layout specifies, nothing
+hidden by it; floats are td-layout's (td-layout/DESIGN.md §5,
+"Floats"), their boxes painted in tree order, so an in-flow block's
+background after a float covers the float's; table layout beyond
 td-layout's automatic one (increment 6); pseudo-elements and generated
 content, list markers aside; presentational attributes; web fonts
 (`@font-face` is skipped); background images, border radii, shadows,
@@ -2440,8 +2462,8 @@ order; each is its own design amendment when it starts:
 - **More faces.** Kerning from `GPOS`, then Noto's CJK (CFF
   collections), colour emoji and variable fonts, each waiting for
   td-ui's reader to take that form (`td-ui/src/sfnt.rs`).
-- **Layout beyond normal flow**, as td-layout gains it: float
-  exclusion, inline-block, then flexbox and grid; pseudo-elements and
+- **Layout beyond normal flow**, as td-layout gains it: inline-block,
+  then flexbox and grid; pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.
 - **Pictures.** `srcset` and `<picture>`; an SVG subset.

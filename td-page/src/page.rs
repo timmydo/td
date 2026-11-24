@@ -310,6 +310,9 @@ pub struct Laid {
     /// Links that laid a fragment or replaced box, in tree order, each
     /// with the line its first lies on.
     links: BudgetVec<(NodeId, u32)>,
+    /// Each line's index among the lines, or `NONE`, of the line it lies
+    /// within: a float's lines lie within the line it was met in.
+    outer: BudgetVec<u32>,
     /// Each inline picture laid, fitted to its box, by node index.
     fits: BudgetVec<Fit>,
     /// The node indices of pictures whose copy was refused, for room or
@@ -715,7 +718,7 @@ impl Laid {
             kept += 1;
         }
         links.truncate(kept);
-        Ok(Self {
+        let mut laid = Self {
             styled,
             layout,
             want,
@@ -727,9 +730,23 @@ impl Laid {
             parents,
             node_geometry,
             links,
+            outer: BudgetVec::new(memory)?,
             fits,
             short,
-        })
+        };
+        if laid.styled.styled().has_floats() {
+            laid.outer = crate::text::nesting(&laid, memory)?;
+        }
+        Ok(laid)
+    }
+
+    /// The line `line` lies within, if any: the one a float whose line
+    /// it is was met in.
+    pub fn outer(&self, line: usize) -> Option<usize> {
+        self.outer
+            .get(line)
+            .filter(|&&at| at != NONE)
+            .map(|&at| at as usize)
     }
 
     /// The fitted copy of `node`'s picture, if it was laid with one.
@@ -895,6 +912,7 @@ impl Laid {
                     * 4
                     + self.clips.capacity() * std::mem::size_of::<Clip>()
                     + self.links.capacity() * std::mem::size_of::<(NodeId, u32)>()
+                    + self.outer.capacity() * 4
                     + self.fits.capacity() * std::mem::size_of::<Fit>()
                     + self.short.capacity() * std::mem::size_of::<usize>(),
             )

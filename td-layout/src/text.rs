@@ -94,7 +94,7 @@ pub fn fit(
 /// The text node's run and the block it is laid in, if the document is a
 /// text page.
 fn page_text(styled: &StyledDocument<'_>) -> Result<Option<(TextRun, BoxId)>, Error> {
-    if styled.has_tables() || styled.marker_count() != 0 {
+    if styled.has_tables() || styled.has_floats() || styled.marker_count() != 0 {
         return Err(Error::Invalid);
     }
     let mut found = None;
@@ -163,7 +163,13 @@ impl LineSink for Count {
     fn wants(&self, _: f64, _: f64) -> bool {
         false
     }
-    fn line(&mut self, _: Line, _: Option<MarkerFragment>, _: &mut Counters) -> Result<(), Error> {
+    fn line(
+        &mut self,
+        _: Line,
+        _: Option<MarkerFragment>,
+        _: Option<(f64, f64)>,
+        _: &mut Counters,
+    ) -> Result<(), Error> {
         Ok(())
     }
 }

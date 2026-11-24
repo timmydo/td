@@ -5,8 +5,10 @@ use crate::inline::{
 };
 use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
-    keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, TableRole, MAX_PAGE_BYTES,
+    float_side, keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, TableRole,
+    MAX_PAGE_BYTES,
 };
+use float::{units, Clear, Floats, Item, View};
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use td_alloc::{Budget, BudgetVec};
@@ -16,6 +18,9 @@ use td_html::document::NodeId;
 
 #[cfg(test)]
 mod ends;
+pub(crate) mod float;
+#[cfg(test)]
+mod float_tests;
 mod intrinsic;
 mod table;
 
@@ -243,8 +248,10 @@ pub fn layout_with_budget(
         list_cursor: 0,
         retain: 0,
         first_line: false,
+        first_index: None,
         filtered: (0, 0),
         tables: table::Scratch::new(memory)?,
+        floats: Floats::new(memory)?,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -318,10 +325,16 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// Keep the next line whatever the window: a cell's first, whose
     /// baseline its row is aligned by.
     first_line: bool,
+    /// The line that took `first_line`, which a float's lines laid before
+    /// it may precede.
+    first_index: Option<usize>,
     /// The lines and markers before these the outermost table has filtered.
     filtered: (usize, usize),
     /// Tables' grids, a stack: a nested table's after its ancestors'.
     tables: table::Scratch,
+    /// The open formatting contexts' floats, and those laid and not yet
+    /// placed (DESIGN.md §5, "Floats").
+    floats: Floats,
     left: f64,
     top: f64,
     right: f64,
@@ -337,6 +350,15 @@ struct Waiting {
 enum Event {
     Inline(BoxId),
     Block(BoxId),
+    /// A float, met within an inline sequence or between blocks, which
+    /// it does not divide (DESIGN.md §5, "Floats").
+    Float(BoxId),
+}
+impl Event {
+    /// Inline content, or a float, which an inline sequence holds.
+    fn flows(self) -> bool {
+        matches!(self, Self::Inline(_) | Self::Float(_))
+    }
 }
 struct Events {
     inline: [Option<Event>; 4],
@@ -472,8 +494,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 let block = b.kind == BoxKind::Block
                     || (b.kind == BoxKind::Image
                         && !matches!(keyword(style, Property::Display), "inline" | "inline-block"));
+                let floats = self.styled.has_floats()
+                    && b.parent.is_some()
+                    && float_side(style, b.kind).is_some();
                 events.add(
-                    if block {
+                    if floats {
+                        Event::Float(id)
+                    } else if block {
                         Event::Block(id)
                     } else {
                         Event::Inline(id)
@@ -516,7 +543,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 Event::Block(id) => {
                     // An inside marker before a block is a line of its own.
                     if let Some(marker) = inside.take() {
-                        self.inline_run(&events, at..at, &place, &mut run, Some(marker))?;
+                        self.inline_run(&events, at..at, &place, &mut run, Some(marker), depth)?;
                     }
                     let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
                     let role = self.role(&b)?;
@@ -537,25 +564,29 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         }
                         continue;
                     }
-                    let dims = self.block_dimensions(&b, container.width, definite)?;
+                    let mut dims = self.block_dimensions(&b, container.width, definite)?;
                     let gap = run.previous_margin.map_or(dims.margin.top, |previous| {
                         collapse(previous, dims.margin.top)
                     });
                     run.y += gap;
+                    let mut x = container.x;
+                    if self.styled.has_floats() {
+                        (x, dims) = self.among_floats(&b, role, dims, &place, &mut run.y)?;
+                    }
                     run.y += if role == Some(TableRole::Table) {
                         self.table(table::Source::Root(id, dims), &place, run.y, depth + 1)?
                     } else {
-                        self.block(id, b, dims, (container.x, run.y), offset, depth + 1)?
+                        self.block(id, b, dims, (x, run.y), offset, depth + 1)?
                     };
                     run.previous_margin = Some(dims.margin.bottom);
                     at += 1;
                 }
-                Event::Inline(_) => {
+                Event::Inline(_) | Event::Float(_) => {
                     let start = at;
-                    while matches!(events.get(at), Some(Event::Inline(_))) {
+                    while events.get(at).is_some_and(|e| e.flows()) {
                         at += 1;
                     }
-                    self.inline_run(&events, start..at, &place, &mut run, inside.take())?;
+                    self.inline_run(&events, start..at, &place, &mut run, inside.take(), depth)?;
                 }
             }
             if !coordinate(run.y) {
@@ -564,7 +595,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         // An item with nothing inline still lays its inside marker.
         if let Some(marker) = inside.take() {
-            self.inline_run(&events, at..at, &place, &mut run, Some(marker))?;
+            self.inline_run(&events, at..at, &place, &mut run, Some(marker), depth)?;
         }
         let end = run.y + run.previous_margin.unwrap_or(0.0);
         let height = (end - container.y).max(0.0);
@@ -574,7 +605,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         Ok(height)
     }
     /// One inline sequence, the `range` of `events`, led by an inside
-    /// marker when it is its list item's first.
+    /// marker when it is its list item's first. Its floats are laid first,
+    /// where it starts, then placed as its lines meet them and moved there,
+    /// their lines kept whatever the window until then (§5, "Floats").
     fn inline_run(
         &mut self,
         events: &Events,
@@ -582,6 +615,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         place: &Place,
         run: &mut Run,
         marker: Option<Marker>,
+        depth: usize,
     ) -> Result<(), Error> {
         let Place {
             container,
@@ -591,6 +625,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             block,
         } = *place;
         let run_y = run.y + run.previous_margin.unwrap_or(0.0);
+        let floating = self.styled.has_floats()
+            && (range.start..range.end).any(|at| matches!(events.get(at), Some(Event::Float(_))));
+        let outermost = floating && self.retain == 0;
+        let base = self.floats.items.len();
+        if floating {
+            self.lay_floats(events, &range, place, run_y, outermost, depth)?;
+        }
+        let sequence = self.lines.len();
         let before = self.counters.lines;
         let style = self.styled.style(strut).ok_or(Error::Invalid)?;
         let align = keyword(style, Property::TextAlign);
@@ -601,6 +643,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             waiting: &mut self.waiting,
             window,
             first: &mut self.first_line,
+            first_index: &mut self.first_index,
             x: container.x + offset.0,
             dy: offset.1,
             width: container.width,
@@ -620,13 +663,27 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             &mut self.pending,
         )?
         .naming(block);
+        if floating || (self.styled.has_floats() && self.floats.any()) {
+            flow.beside(
+                &mut self.floats,
+                (container.x, container.x + container.width),
+                &mut self.counters,
+            )?;
+        }
         if let Some(marker) = marker {
             flow.marker(&marker, &mut self.counters, &mut sink)?;
         }
+        let mut next_float = base;
         for index in range {
             let event = events.get(index).ok_or(Error::Invalid)?;
-            let Event::Inline(id) = event else {
-                return Err(Error::Invalid);
+            let id = match event {
+                Event::Inline(id) => id,
+                Event::Float(_) => {
+                    flow.float(next_float, &mut self.counters)?;
+                    next_float += 1;
+                    continue;
+                }
+                Event::Block(_) => return Err(Error::Invalid),
             };
             let b = self.styled.box_node(*id).ok_or(Error::Invalid)?;
             match b.kind {
@@ -683,11 +740,432 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         flow.finish(&mut self.counters, &mut sink)?;
         let end_y = flow.y;
+        if floating {
+            self.place_floats(base, sequence, outermost)?;
+        }
         if self.counters.lines != before {
             run.y = end_y;
             run.previous_margin = None;
         }
         Ok(())
+    }
+    /// Whether `b` roots a block formatting context of its own, whose
+    /// floats its lines alone see and its auto height holds: the root, a
+    /// float, a caption, or a block whose overflow is neither visible nor
+    /// clip (a table cell is one too, which its table opens).
+    fn opens_context(&self, b: &BoxNode) -> Result<bool, Error> {
+        let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+        Ok(b.kind == BoxKind::Block
+            && (b.parent.is_none()
+                || float_side(style, b.kind).is_some()
+                || keyword(style, Property::Display) == "table-caption"
+                || !matches!(keyword(style, Property::OverflowX), "visible" | "clip")
+                || !matches!(keyword(style, Property::OverflowY), "visible" | "clip")))
+    }
+    /// A block met in a context with floats: below those it clears, and
+    /// a context's root (not a table) beside those at its top; its x and
+    /// dimensions.
+    #[cold]
+    #[inline(never)]
+    fn among_floats(
+        &mut self,
+        b: &BoxNode,
+        role: Option<TableRole>,
+        dims: Dimensions,
+        place: &Place,
+        y: &mut f64,
+    ) -> Result<(f64, Dimensions), Error> {
+        let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+        let clear = Clear::of(keyword(style, Property::Clear));
+        if let Some(below) = self.floats.clearance(clear) {
+            *y = y.max(below);
+        }
+        if role != Some(TableRole::Table) && self.floats.any() && self.opens_context(b)? {
+            return self.beside_floats(b, place, y);
+        }
+        Ok((place.container.x, dims))
+    }
+    /// A formatting context's root in flow beside floats: its x and
+    /// dimensions in the room they leave at its top, its auto width that
+    /// room's, where it fits; else `y` moves down past the nearest float
+    /// until it does or none is beside it.
+    #[cold]
+    #[inline(never)]
+    fn beside_floats(
+        &mut self,
+        b: &BoxNode,
+        place: &Place,
+        y: &mut f64,
+    ) -> Result<(f64, Dimensions), Error> {
+        let sides = (place.container.x, place.container.x + place.container.width);
+        loop {
+            let band = self
+                .floats
+                .band(sides, *y, 0.0, View::Lines, &mut self.counters)?;
+            let room = band.room();
+            let dims = self.block_dimensions(b, room, place.definite)?;
+            // Its margins as computed: sizing gives an over-constrained
+            // box's excess to its right margin.
+            let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+            let margin = edges(
+                style,
+                [
+                    Property::MarginTop,
+                    Property::MarginRight,
+                    Property::MarginBottom,
+                    Property::MarginLeft,
+                ],
+                room,
+                false,
+            );
+            let outer = dims.width + dims.decoration().horizontal() + margin.horizontal();
+            let fits = units(outer) <= units(room);
+            match band.below {
+                Some(below) if !fits => *y = below,
+                Some(_) => return Ok((band.left, dims)),
+                None => {
+                    let dims = self.block_dimensions(b, place.container.width, place.definite)?;
+                    return Ok((place.container.x, dims));
+                }
+            }
+        }
+    }
+    /// An inline sequence's floats laid first, its lines and theirs kept
+    /// whatever the window until it ends.
+    #[cold]
+    #[inline(never)]
+    fn lay_floats(
+        &mut self,
+        events: &Events,
+        range: &Range<usize>,
+        place: &Place,
+        y: f64,
+        outermost: bool,
+        depth: usize,
+    ) -> Result<(), Error> {
+        if outermost {
+            self.filtered = (self.lines.len(), self.markers.len());
+        }
+        self.retain = self.retain.checked_add(1).ok_or(Error::Invalid)?;
+        for at in range.start..range.end {
+            if let Some(Event::Float(id)) = events.get(at).copied() {
+                self.lay_float(id, place, y, depth)?;
+            }
+        }
+        Ok(())
+    }
+    /// The sequence ended: its floats moved where it placed them, their
+    /// lines put after those they were met in, and, outermost, the window
+    /// kept.
+    #[cold]
+    #[inline(never)]
+    fn place_floats(&mut self, base: usize, sequence: usize, outermost: bool) -> Result<(), Error> {
+        self.move_floats(base)?;
+        self.order_floats(base, sequence)?;
+        self.floats.items.truncate(base);
+        self.retain -= 1;
+        if outermost {
+            self.keep_window()?;
+        }
+        Ok(())
+    }
+    /// Lays the float `id` met in an inline sequence starting at `y`: its
+    /// margin box's top left at the container's left edge and `y`, its
+    /// width its set one or shrink-to-fit (CSS 2.2 §10.3.5), its auto
+    /// margins 0, its output and its own overflow kept as an item to be
+    /// moved where the sequence places it.
+    #[cold]
+    #[inline(never)]
+    fn lay_float(&mut self, id: BoxId, place: &Place, y: f64, depth: usize) -> Result<(), Error> {
+        let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
+        let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+        let side = float_side(style, b.kind).ok_or(Error::Invalid)?;
+        let clear = Clear::of(keyword(style, Property::Clear));
+        let dims = self.float_dimensions(id, &b, place, depth)?;
+        let decor = dims.decoration();
+        let x = place.container.x;
+        let (lines, markers, boxes) = (self.lines.len(), self.markers.len(), self.boxes.len());
+        let first_line = std::mem::replace(&mut self.first_line, false);
+        let waiting = std::mem::replace(&mut self.waiting, BudgetVec::new(self.memory)?);
+        let outer = (self.left, self.top, self.right, self.bottom);
+        (self.left, self.top, self.right, self.bottom) = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        let laid = self.block(
+            id,
+            b,
+            dims,
+            (x, y + dims.margin.top),
+            place.offset,
+            depth + 1,
+        );
+        let own = (self.left, self.top, self.right, self.bottom);
+        (self.left, self.top, self.right, self.bottom) = outer;
+        self.waiting = waiting;
+        self.first_line = first_line;
+        let height = laid? + dims.margin.vertical();
+        let width = dims.width + decor.horizontal() + dims.margin.horizontal();
+        if !coordinate(width) || !coordinate(height) {
+            return Err(Error::Limit("MAX_COORDINATE"));
+        }
+        let bounds = (own.0 <= own.2).then_some(Rect {
+            x: own.0,
+            y: own.1,
+            width: own.2 - own.0,
+            height: own.3 - own.1,
+        });
+        self.counters.admit_growth(&mut self.floats.items)?;
+        self.floats.items.try_push(Item {
+            width,
+            height: height.max(0.0),
+            side,
+            clear,
+            laid: (x, y),
+            placed: None,
+            anchor: 0,
+            lines: (lines, self.lines.len()),
+            boxes: (boxes, self.boxes.len()),
+            markers: (markers, self.markers.len()),
+            bounds,
+        })?;
+        Ok(())
+    }
+    /// A float's dimensions in its container: as a block's, or an image's,
+    /// but with its margins as computed, auto ones 0, and an auto width
+    /// shrink-to-fit, min(max(min-content, the room), max-content) within
+    /// its min and max widths.
+    #[cold]
+    #[inline(never)]
+    fn float_dimensions(
+        &mut self,
+        id: BoxId,
+        b: &BoxNode,
+        place: &Place,
+        depth: usize,
+    ) -> Result<Dimensions, Error> {
+        let width = place.container.width;
+        let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+        let mut dims = dimensions(
+            self.styled,
+            b,
+            style,
+            width,
+            place.definite,
+            lookup(self.request, b),
+        )?;
+        dims.margin = edges(
+            style,
+            [
+                Property::MarginTop,
+                Property::MarginRight,
+                Property::MarginBottom,
+                Property::MarginLeft,
+            ],
+            width,
+            false,
+        );
+        if b.kind != BoxKind::Block || length(style, Property::Width, Some(width)).is_some() {
+            return Ok(dims);
+        }
+        let decoration = dims.decoration().horizontal();
+        let border_box = keyword(style, Property::BoxSizing) == "border-box";
+        let content = |v: f64| {
+            if border_box {
+                (v - decoration).max(0.0)
+            } else {
+                v.max(0.0)
+            }
+        };
+        let low = length(style, Property::MinWidth, Some(width)).map_or(0.0, content);
+        let high = length(style, Property::MaxWidth, Some(width)).map_or(f64::INFINITY, content);
+        let lead = self.inside_marker(id, b)?;
+        let (least, most) = self.content_with(b.first_child, None, b.style, lead, depth + 1)?;
+        let room = (width - decoration - dims.margin.horizontal()).max(0.0);
+        let fit = (most as f64 / 64.0).min((least as f64 / 64.0).max(room));
+        dims.width = fit.min(high).max(low);
+        if !coordinate(dims.width) {
+            return Err(Error::Limit("MAX_COORDINATE"));
+        }
+        Ok(dims)
+    }
+    /// Moves each float laid since `base` from where it was laid to where
+    /// it was placed, its boxes, lines and markers with it, and counts its
+    /// own overflow there.
+    #[cold]
+    #[inline(never)]
+    fn move_floats(&mut self, base: usize) -> Result<(), Error> {
+        for at in base..self.floats.items.len() {
+            let item = *self.floats.items.get(at).ok_or(Error::Invalid)?;
+            let (x, y) = item.placed.ok_or(Error::Invalid)?;
+            let (dx, dy) = (x - item.laid.0, y - item.laid.1);
+            let (lines, boxes, markers) = (item.lines, item.boxes, item.markers);
+            self.counters
+                .step(1 + (lines.1 - lines.0) + (boxes.1 - boxes.0) + (markers.1 - markers.0))?;
+            if dx != 0.0 {
+                let laid = self.lines.get(lines.0..lines.1).ok_or(Error::Invalid)?;
+                let pieces = laid
+                    .iter()
+                    .fold(0usize, |n, l| n + l.fragments.len() + l.replaced.len());
+                self.counters.step(pieces)?;
+            }
+            if dx != 0.0 || dy != 0.0 {
+                for line in self.lines.get_mut(lines.0..lines.1).ok_or(Error::Invalid)? {
+                    line.y += dy;
+                    for f in &mut line.fragments {
+                        f.x += dx;
+                    }
+                    for image in &mut line.replaced {
+                        image.x += dx;
+                        image.y += dy;
+                    }
+                    if !coordinate(line.y + line.height) {
+                        return Err(Error::Limit("MAX_COORDINATE"));
+                    }
+                }
+                for geometry in self.boxes.get_mut(boxes.0..boxes.1).ok_or(Error::Invalid)? {
+                    geometry.content.x += dx;
+                    geometry.content.y += dy;
+                    geometry.border.x += dx;
+                    geometry.border.y += dy;
+                }
+                for marker in self
+                    .markers
+                    .get_mut(markers.0..markers.1)
+                    .ok_or(Error::Invalid)?
+                {
+                    marker.x += dx;
+                    marker.y += dy;
+                    marker.baseline += dy;
+                }
+            }
+            if let Some(rect) = item.bounds {
+                self.bounds(Rect {
+                    x: rect.x + dx,
+                    y: rect.y + dy,
+                    ..rect
+                })?;
+            }
+        }
+        Ok(())
+    }
+    /// Puts each float laid since `base` (whose lines lie before the
+    /// sequence's, from `sequence`) after the line of the sequence holding
+    /// what came before it, its markers with its lines, so that lines lie
+    /// in the tree order of their starts, a float's within the line it was
+    /// met in (DESIGN.md §5, "Floats", "Placement"). A float met
+    /// before any of its sequence moves nothing.
+    #[cold]
+    #[inline(never)]
+    fn order_floats(&mut self, base: usize, sequence: usize) -> Result<(), Error> {
+        let count = self
+            .lines
+            .len()
+            .checked_sub(sequence)
+            .ok_or(Error::Invalid)?;
+        let mut floor = 0;
+        for item in self.floats.items.get_mut(base..).ok_or(Error::Invalid)? {
+            item.anchor = item.anchor.max(floor).min(count);
+            floor = item.anchor;
+        }
+        let items = self.floats.items.get(base..).ok_or(Error::Invalid)?;
+        let (Some(first), Some(last)) = (items.first(), items.last()) else {
+            return Ok(());
+        };
+        if floor == 0 {
+            return Ok(());
+        }
+        let (start, markers) = (first.lines.0, first.markers.0);
+        let floated = items
+            .iter()
+            .fold(0usize, |n, item| n + (item.lines.1 - item.lines.0));
+        if last.lines.1 != sequence || sequence - start != floated {
+            return Err(Error::Invalid);
+        }
+        let marked = self
+            .markers
+            .len()
+            .checked_sub(markers)
+            .ok_or(Error::Invalid)?;
+        self.counters.step(2 * (floated + count + marked))?;
+        // The scratch below is charged while held and given back after.
+        let charged = self.counters.bytes;
+        let index = |n: usize| u32::try_from(n).map_err(|_| Error::Invalid);
+        // The markers in their new order: each float's after the
+        // sequence's on the lines before it, as their lines will be.
+        let mut order: BudgetVec<u32> = BudgetVec::new(self.memory)?;
+        let mut cut = last.markers.1;
+        for item in items {
+            let ahead = sequence + item.anchor;
+            while let Some(marker) = self.markers.get(cut) {
+                if !marker.line.is_some_and(|line| (line as usize) < ahead) {
+                    break;
+                }
+                self.counters.admit_growth(&mut order)?;
+                order.try_push(index(cut - markers)?)?;
+                cut += 1;
+            }
+            for at in item.markers.0..item.markers.1 {
+                self.counters.admit_growth(&mut order)?;
+                order.try_push(index(at - markers)?)?;
+            }
+        }
+        for at in cut..self.markers.len() {
+            self.counters.admit_growth(&mut order)?;
+            order.try_push(index(at - markers)?)?;
+        }
+        // Where each line goes, in its order now: the floats', then the
+        // sequence's.
+        let mut to: BudgetVec<u32> = BudgetVec::new(self.memory)?;
+        let mut before = 0;
+        for item in items {
+            for at in 0..item.lines.1 - item.lines.0 {
+                self.counters.admit_growth(&mut to)?;
+                to.try_push(index(item.anchor + before + at)?)?;
+            }
+            before += item.lines.1 - item.lines.0;
+        }
+        let (mut next, mut before) = (0, 0);
+        for at in 0..count {
+            while let Some(item) = items.get(next).filter(|item| item.anchor <= at) {
+                before += item.lines.1 - item.lines.0;
+                next += 1;
+            }
+            self.counters.admit_growth(&mut to)?;
+            to.try_push(index(at + before)?)?;
+        }
+        let moved = |line: usize| -> Result<usize, Error> {
+            match line.checked_sub(start) {
+                Some(at) => Ok(start + *to.get(at).ok_or(Error::Invalid)? as usize),
+                None => Ok(line),
+            }
+        };
+        if let Some(line) = self.first_index {
+            self.first_index = Some(moved(line)?);
+        }
+        for marker in self.markers.get_mut(markers..).ok_or(Error::Invalid)? {
+            if let Some(line) = marker.line {
+                marker.line = Some(index(moved(line as usize)?)?);
+            }
+        }
+        permute(self.lines.get_mut(start..).ok_or(Error::Invalid)?, &mut to)?;
+        // `order` inverted: where each marker goes.
+        to.clear();
+        for _ in 0..order.len() {
+            self.counters.admit_growth(&mut to)?;
+            to.try_push(0)?;
+        }
+        for (new, &old) in order.iter().enumerate() {
+            *to.get_mut(old as usize).ok_or(Error::Invalid)? = index(new)?;
+        }
+        let permuted = permute(
+            self.markers.get_mut(markers..).ok_or(Error::Invalid)?,
+            &mut to,
+        );
+        self.counters.bytes = charged;
+        permuted
     }
     /// A list item's marker, measured, and whether it is inside; None for
     /// any other box and for `list-style-type: none`.
@@ -772,6 +1250,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 })?;
             }
         }
+        let root = self.styled.has_floats() && self.opens_context(&b)?;
+        if root {
+            self.floats.open(&mut self.counters)?;
+        }
         let mut natural = if b.kind == BoxKind::Image {
             dims.height.unwrap_or(0.0)
         } else {
@@ -794,6 +1276,12 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 inside,
             )?
         };
+        if root {
+            // A context's root holds its floats (CSS 2.2 §10.6.7).
+            if let Some(bottom) = self.floats.close()? {
+                natural = natural.max(bottom - content_y);
+            }
+        }
         if self.waiting.last().is_some_and(|w| w.marker.item == b.node) {
             // The item laid no line: its marker stands at its content top,
             // which it holds open.
@@ -888,6 +1376,7 @@ struct Positioned<'a> {
     waiting: &'a mut BudgetVec<Waiting>,
     window: Keep<'a>,
     first: &'a mut bool,
+    first_index: &'a mut Option<usize>,
     x: f64,
     dy: f64,
     width: f64,
@@ -902,7 +1391,8 @@ impl LineSink for Positioned<'_> {
         if !self.waiting.is_empty() {
             self.hang(&bounds, counters)?;
         }
-        let shift = self.x + alignment(self.align, self.width - bounds.advance);
+        let (inset, room) = bounds.band.unwrap_or((0.0, self.width));
+        let shift = self.x + inset + alignment(self.align, room - bounds.advance);
         include_bounds(
             self.left,
             self.top,
@@ -923,9 +1413,11 @@ impl LineSink for Positioned<'_> {
         &mut self,
         mut line: Line,
         marker: Option<MarkerFragment>,
+        band: Option<(f64, f64)>,
         counters: &mut Counters,
     ) -> Result<(), Error> {
-        let shift = self.x + alignment(self.align, self.width - line.width);
+        let (inset, room) = band.unwrap_or((0.0, self.width));
+        let shift = self.x + inset + alignment(self.align, room - line.width);
         if let Some(mut marker) = marker {
             marker.x += shift;
             marker.y += self.dy;
@@ -936,6 +1428,9 @@ impl LineSink for Positioned<'_> {
             }
             counters.admit_growth(self.markers)?;
             self.markers.try_push(marker)?;
+        }
+        if *self.first {
+            *self.first_index = Some(self.lines.len());
         }
         *self.first = false;
         let local_y = line.y;
@@ -992,6 +1487,31 @@ impl Positioned<'_> {
         self.waiting.clear();
         Ok(())
     }
+}
+/// Moves each of `items` to `to[its index]`, a permutation, following its
+/// cycles: each item moves once, and `to` is spent.
+fn permute<T>(items: &mut [T], to: &mut [u32]) -> Result<(), Error> {
+    const DONE: u32 = u32::MAX;
+    if items.len() != to.len() {
+        return Err(Error::Invalid);
+    }
+    for start in 0..items.len() {
+        let mut at = start;
+        loop {
+            let slot = to.get_mut(at).ok_or(Error::Invalid)?;
+            let next = std::mem::replace(slot, DONE);
+            if next == DONE || next as usize == start {
+                break;
+            }
+            let next = next as usize;
+            if next >= items.len() {
+                return Err(Error::Invalid);
+            }
+            items.swap(start, next);
+            at = next;
+        }
+    }
+    Ok(())
 }
 fn length(style: &ComputedStyle, p: Property, basis: Option<f64>) -> Option<f64> {
     match style.get(p) {
@@ -2119,7 +2639,7 @@ mod tests {
         assert_eq!(block(&relaid), (120.0, 15.0));
     }
     #[test]
-    fn float_fallback_inline_block_splits_and_alignment() {
+    fn floats_shorten_lines_and_inline_block_splits_keep_alignment() {
         let html = "<div id=float></div><span>before<div id=block>x</div>after</span>";
         let doc = td_html::document::parse(html).unwrap();
         let css = sheets(
@@ -2128,10 +2648,18 @@ mod tests {
         let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
         let out = layout(&styled, &mut Metrics, &Request::new(100.0, 200.0)).unwrap();
         assert_eq!(out.lines.len(), 3);
-        assert_eq!(out.lines[0].y, 20.0);
-        assert_eq!(out.lines[0].fragments[0].x, 26.0);
-        assert_eq!(find(&doc, &out, "block").border.y, 40.0);
-        assert_eq!(out.lines[2].y, 50.0);
+        let float = find(&doc, &out, "float").border;
+        assert_eq!(
+            (float.x, float.y, float.width, float.height),
+            (0.0, 0.0, 30.0, 20.0)
+        );
+        // Beside the float, centred in the 70 px it leaves.
+        assert_eq!(out.lines[0].y, 0.0);
+        assert_eq!(out.lines[0].fragments[0].x, 41.0);
+        assert_eq!(find(&doc, &out, "block").border.y, 20.0);
+        // Below it, centred in the whole width.
+        assert_eq!(out.lines[2].y, 30.0);
+        assert_eq!(out.lines[2].fragments[0].x, 30.0);
     }
     #[test]
     fn windowed_output_equals_filtering_full_and_resize_charges_overlap() {

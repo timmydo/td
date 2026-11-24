@@ -1,4 +1,5 @@
 //! Scalar wrapping with DOM-byte provenance. No retained glyph array.
+use crate::block::float::{units, Floats, View};
 use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
     cancelled, keyword, BoxId, Error, Limits, StyleId, StyledDocument, CANCEL_INTERVAL,
@@ -438,6 +439,9 @@ pub(crate) struct LineBounds {
     pub baseline: f64,
     /// The byte its first item starts at, if it has one.
     pub start: Option<usize>,
+    /// Its inset from its block's content edge and its room, where floats
+    /// may shorten it (DESIGN.md §5, "Floats"); None where none can.
+    pub band: Option<(f64, f64)>,
 }
 pub(crate) trait LineSink {
     /// Every line, retained or not.
@@ -445,11 +449,13 @@ pub(crate) trait LineSink {
         Ok(())
     }
     fn wants(&self, y: f64, height: f64) -> bool;
-    /// A retained line, with the inside marker it starts with, if any.
+    /// A retained line, with the inside marker it starts with, if any,
+    /// and its band, as `LineBounds::band`.
     fn line(
         &mut self,
         line: Line,
         marker: Option<MarkerFragment>,
+        band: Option<(f64, f64)>,
         counters: &mut Counters,
     ) -> Result<(), Error>;
 }
@@ -462,6 +468,7 @@ impl LineSink for AllLines {
         &mut self,
         line: Line,
         _: Option<MarkerFragment>,
+        _: Option<(f64, f64)>,
         counters: &mut Counters,
     ) -> Result<(), Error> {
         counters.admit_growth(&mut self.0)?;
@@ -537,6 +544,25 @@ pub(crate) struct Flow<'s, 'd, 'm, M> {
     above: i64,
     below: i64,
     pub y: f64,
+    /// The floats of its formatting context and its block's content edges,
+    /// where any may float beside its lines (DESIGN.md §5, "Floats").
+    area: Option<Area<'m>>,
+    /// The line's inset and room among those floats, and the nearest bottom
+    /// of those beside it.
+    inset: f64,
+    room: f64,
+    beside: Option<f64>,
+    /// Floats met that wait for the next line's top: their items.
+    waiting: Option<BudgetVec<usize>>,
+    /// Lines emitted, and the floats met after pending items, with how
+    /// many came before them: each goes after the line those items are
+    /// laid on, or before the next where they are dropped.
+    emitted: usize,
+    unsettled: Option<BudgetVec<(usize, usize)>>,
+}
+struct Area<'m> {
+    floats: &'m mut Floats,
+    edges: (f64, f64),
 }
 impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
     pub fn new(
@@ -575,12 +601,165 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             above,
             below,
             y,
+            area: None,
+            inset: 0.0,
+            room: f64::from(width),
+            beside: None,
+            waiting: None,
+            emitted: 0,
+            unsettled: None,
         })
     }
     /// Its lines name `block`; without, none.
     pub fn naming(mut self, block: Option<BoxId>) -> Self {
         self.block = block;
         self
+    }
+    /// Its lines take the room `floats` leave between the block's content
+    /// edges, `edges`, and it places the floats met in it.
+    #[cold]
+    #[inline(never)]
+    pub fn beside(
+        &mut self,
+        floats: &'m mut Floats,
+        edges: (f64, f64),
+        counters: &mut Counters,
+    ) -> Result<(), Error> {
+        self.area = Some(Area { floats, edges });
+        self.reband(counters)
+    }
+    /// The line at `y` takes the room the floats beside its block's line
+    /// height leave: a taller line may overlap one below that.
+    #[cold]
+    #[inline(never)]
+    fn reband(&mut self, counters: &mut Counters) -> Result<(), Error> {
+        let strut = (self.above + self.below).max(0) as f64 / 64.0;
+        let Some(area) = self.area.as_mut() else {
+            return Ok(());
+        };
+        let band = area
+            .floats
+            .band(area.edges, self.y, strut, View::Lines, counters)?;
+        self.inset = band.left - area.edges.0;
+        self.room = band.room();
+        self.beside = band.below;
+        let width = (units(self.room) / 64.0).floor();
+        if !(0.0..=MAX_COORDINATE).contains(&width) || !coordinate(self.inset) {
+            return Err(Error::Limit("MAX_COORDINATE"));
+        }
+        self.width = width as u32;
+        Ok(())
+    }
+    /// A float met in the sequence after its `emitted` lines, laid as
+    /// `items[index]`: placed on this line where it fits beside what the
+    /// line holds and no earlier float waits, else at the next line's top
+    /// (CSS 2.2 §9.5.1). Its lines go after the line holding what came
+    /// before it.
+    #[cold]
+    #[inline(never)]
+    pub fn float(&mut self, index: usize, counters: &mut Counters) -> Result<(), Error> {
+        counters.step(1)?;
+        let pen = self.pen as f64;
+        let y = self.y;
+        let empty = self.pending.is_empty();
+        let queued = self.waiting.as_ref().is_some_and(|w| !w.is_empty());
+        // An inside marker alone holds no place: the float comes first.
+        let content = match self.pending.first() {
+            Some(p) if matches!(p.atomic, Some(Atomic::Marker(..))) => self.pending.len() > 1,
+            first => first.is_some(),
+        };
+        if content {
+            if self.unsettled.is_none() {
+                self.unsettled = Some(BudgetVec::new(self.memory)?);
+            }
+            let unsettled = self.unsettled.as_mut().ok_or(Error::Invalid)?;
+            counters.admit_growth(unsettled)?;
+            unsettled.try_push((index, self.pending.len()))?;
+        }
+        let emitted = self.emitted;
+        let area = self.area.as_mut().ok_or(Error::Invalid)?;
+        let item = area.floats.items.get_mut(index).ok_or(Error::Invalid)?;
+        item.anchor = emitted;
+        let item = *item;
+        let (x, top, room) = area.floats.place(
+            (item.width, item.height),
+            item.side,
+            item.clear,
+            area.edges,
+            y,
+            counters,
+        )?;
+        let fits = units(item.width.max(0.0)) + pen <= units(room);
+        if !queued && (top > y || empty || fits) {
+            return self.put(index, (x, top), counters);
+        }
+        if self.waiting.is_none() {
+            self.waiting = Some(BudgetVec::new(self.memory)?);
+        }
+        let waiting = self.waiting.as_mut().ok_or(Error::Invalid)?;
+        counters.admit_growth(waiting)?;
+        waiting.try_push(index)?;
+        Ok(())
+    }
+    /// `items[index]` placed at `at`, and the line's room again.
+    fn put(&mut self, index: usize, at: (f64, f64), counters: &mut Counters) -> Result<(), Error> {
+        let area = self.area.as_mut().ok_or(Error::Invalid)?;
+        let item = area.floats.items.get_mut(index).ok_or(Error::Invalid)?;
+        item.placed = Some(at);
+        let (size, side) = ((item.width, item.height), item.side);
+        area.floats.add(at, size, side, counters)?;
+        self.reband(counters)
+    }
+    /// A line begins: the floats waiting for it placed from its top, and
+    /// its room found.
+    #[inline]
+    fn next_line(&mut self, counters: &mut Counters) -> Result<(), Error> {
+        if self.area.is_none() {
+            return Ok(());
+        }
+        self.next_line_beside(counters)
+    }
+    #[cold]
+    #[inline(never)]
+    fn next_line_beside(&mut self, counters: &mut Counters) -> Result<(), Error> {
+        if let Some(mut waiting) = self.waiting.take() {
+            for &index in waiting.iter() {
+                counters.step(1)?;
+                let area = self.area.as_mut().ok_or(Error::Invalid)?;
+                let item = *area.floats.items.get(index).ok_or(Error::Invalid)?;
+                let (x, top, _) = area.floats.place(
+                    (item.width, item.height),
+                    item.side,
+                    item.clear,
+                    area.edges,
+                    self.y,
+                    counters,
+                )?;
+                self.put(index, (x, top), counters)?;
+            }
+            waiting.clear();
+            self.waiting = Some(waiting);
+        }
+        self.reband(counters)
+    }
+    /// A line whose content so far, with an item `advance` wide, has no
+    /// break and does not fit beside floats moves down past the nearest,
+    /// until it fits or none shortens it (CSS 2.2 §9.5).
+    #[cold]
+    #[inline(never)]
+    fn descend(&mut self, advance: i64, counters: &mut Counters) -> Result<(), Error> {
+        while let Some(below) = self.beside {
+            if !self.over(self.pen, advance) {
+                break;
+            }
+            counters.step(1)?;
+            self.y = below;
+            self.reband(counters)?;
+        }
+        Ok(())
+    }
+    fn over(&self, pen: i64, advance: i64) -> bool {
+        (pen + advance + 32).div_euclid(64) > i64::from(self.width)
     }
     pub fn text(
         &mut self,
@@ -670,10 +849,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             ),
             "pre" | "nowrap"
         );
-        if soft
-            && (self.pen + advance + 32).div_euclid(64) > i64::from(self.width)
-            && !self.pending.is_empty()
-        {
+        if soft && self.over(self.pen, advance) && !self.pending.is_empty() {
             if self.pending.iter().any(|p| !p.space) {
                 self.emit(counters, sink, None, LineEnd::Wrap)?;
             }
@@ -770,10 +946,11 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         counters: &mut Counters,
         sink: &mut impl LineSink,
     ) -> Result<(), Error> {
-        let width = self.width;
-        let over = |pen: i64| (pen + item.advance + 32).div_euclid(64) > i64::from(width);
+        if !item.space && self.after_space.is_none() && self.beside.is_some() {
+            self.descend(item.advance, counters)?;
+        }
         if !item.space
-            && over(self.pen)
+            && self.over(self.pen, item.advance)
             && !self.pending.is_empty()
             && (soft || self.after_space.is_some())
         {
@@ -783,7 +960,10 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 None => (self.pending.len(), self.soft_end(&item)),
             };
             self.break_at(keep, end, counters, sink)?;
-            if soft && over(self.pen) && !self.pending.is_empty() {
+            if self.beside.is_some() {
+                self.descend(item.advance, counters)?;
+            }
+            if soft && self.over(self.pen, item.advance) && !self.pending.is_empty() {
                 let end = self.soft_end(&item);
                 self.emit(counters, sink, None, end)?;
                 self.restart();
@@ -820,6 +1000,10 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         }
         self.restart();
         self.after_newline = false;
+        // Floats still waiting go below the last line.
+        if self.waiting.as_ref().is_some_and(|w| !w.is_empty()) {
+            self.next_line(counters)?;
+        }
         Ok(())
     }
     /// At Limits::line_scalars, or past a cut: whether to lay `item`.
@@ -932,6 +1116,9 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             self.pending.swap(at, keep + at);
         }
         self.pending.truncate(remaining);
+        if self.unsettled.as_ref().is_some_and(|u| !u.is_empty()) {
+            self.settle(keep);
+        }
         counters.step(self.pending.len())?;
         // From the new line's start: a tab the tail holds (one laid where
         // its run does not wrap) meets its stop again.
@@ -956,8 +1143,36 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         self.stops = Some(stops);
         Ok(stops)
     }
+    /// The first `count` pending items leave, laid on the lines emitted
+    /// or dropped: a float met after them goes after those lines, before
+    /// the next; one met later counts what remains.
+    #[cold]
+    #[inline(never)]
+    fn settle(&mut self, count: usize) {
+        let (Some(unsettled), Some(area)) = (self.unsettled.as_mut(), self.area.as_mut()) else {
+            return;
+        };
+        let mut at = 0;
+        while let Some(entry) = unsettled.get_mut(at) {
+            let (index, before) = *entry;
+            if before > count {
+                entry.1 = before - count;
+                at += 1;
+                continue;
+            }
+            if let Some(item) = area.floats.items.get_mut(index) {
+                item.anchor = self.emitted;
+            }
+            let last = unsettled.len() - 1;
+            unsettled.swap(at, last);
+            unsettled.pop();
+        }
+    }
     /// A new line: nothing pending, no break opportunity, no cut.
     fn restart(&mut self) {
+        if self.unsettled.as_ref().is_some_and(|u| !u.is_empty()) {
+            self.settle(usize::MAX);
+        }
         self.pending.clear();
         self.pen = 0;
         self.after_space = None;
@@ -990,6 +1205,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         }
         counters.lines += 1;
         let end = prefix.iter().rposition(|p| !p.space).map_or(0, |i| i + 1);
+        self.emitted += 1;
         let pending = self.pending.get(..end).ok_or(Error::Invalid)?;
         // A space trimmed, or an atomic's edge, is no split word.
         let line_end = if line_end == LineEnd::Split
@@ -1022,7 +1238,9 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             height,
             baseline: above as f64 / 64.0,
             start: prefix.first().map(|p| p.range.start),
+            band: self.area.as_ref().map(|_| (self.inset, self.room)),
         };
+        let band = bounds.band;
         counters.step(pending.len())?;
         for p in pending {
             let x = p.pen as f64 / 64.0;
@@ -1139,11 +1357,12 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                     replaced,
                 },
                 marker,
+                band,
                 counters,
             )?;
         }
         self.y = next_y;
-        Ok(())
+        self.next_line(counters)
     }
 }
 pub(crate) fn coordinate(n: f64) -> bool {
