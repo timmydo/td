@@ -60,6 +60,14 @@ fn install_condition(directory: &Path, filename: &str, content: &str) -> R<PathB
     Ok(path)
 }
 
+/// The drop-in a fence gives each writer and scheduled service.
+pub(super) const FENCE_DROPIN: &str = "98-td-mta-deploy-fence.conf";
+
+/// What `FENCE_DROPIN` holds.
+pub(super) fn fence_condition() -> R<String> {
+    fmt(format_args!("[Unit]\nConditionPathExists=!{FENCE}\n"))
+}
+
 pub(super) const PG_FENCE: &str = "/etc/td-mta/postgres-fence.conf";
 pub(super) const FENCE_SETTING: &str = "unix_socket_permissions = 0\n";
 pub(super) const SOCKET: &str = "/var/lib/td-mta-postgres/.s.PGSQL.35432";
@@ -278,10 +286,9 @@ impl Deployment {
         writers.dedup();
         for unit in writers {
             let dir = child(Path::new(UNIT_DIR), &fmt(format_args!("{unit}.d"))?)?;
-            let content = fmt(format_args!("[Unit]\nConditionPathExists=!{FENCE}\n"))?;
             td_alloc::push(
                 &mut self.drops,
-                install_condition(&dir, "98-td-mta-deploy-fence.conf", &content)?,
+                install_condition(&dir, FENCE_DROPIN, &fence_condition()?)?,
             )?;
         }
         if recovery {

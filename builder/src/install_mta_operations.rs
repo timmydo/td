@@ -882,6 +882,12 @@ fn notification_config(opts: &Options, jobs: &[Job]) -> Result<Option<Json>> {
 }
 
 fn install(opts: &Options) -> Result<()> {
+    // A check of a file that is not there fails at every run. The socket
+    // cutover moves PostgreSQL's loopback TLS files aside and retires their
+    // checks; generation from the old options must not bring them back.
+    if opts.tls.iter().any(|path| !path.is_file()) {
+        return Err("each --tls-certificate must name an existing certificate file this account can reach: a check of a missing one fails at every run".into());
+    }
     if let Some(drill) = &opts.drill {
         super::restore_layout::qualify(
             &drill.tools.bin,
@@ -1421,6 +1427,57 @@ mod tests {
             .contains("unsupported PostgreSQL restore package"));
         assert!(!prefix.exists());
         assert!(!state.exists());
+    }
+
+    #[test]
+    fn certificate_checks_need_their_files_and_keep_their_generated_text() {
+        let tmp = crate::test_temp::TempDir::new("mail-certificate-checks").unwrap();
+        let prefix = tmp.path().join("prefix");
+        let state = tmp.path().join("state");
+        let certificate = tmp.path().join("server.pem");
+        let generate = |certificate: &Path| {
+            options(
+                &args(&[
+                    "--prefix",
+                    prefix.to_str().unwrap(),
+                    "--state-dir",
+                    state.to_str().unwrap(),
+                    "--tls-certificate",
+                    certificate.to_str().unwrap(),
+                    "--openssl-bin",
+                    "/usr/bin/openssl",
+                ]),
+                "/home/a",
+            )
+            .unwrap()
+        };
+        // The socket cutover moved the file aside: its check is not generated.
+        assert!(install(&generate(&certificate))
+            .unwrap_err()
+            .contains("existing certificate file"));
+        assert!(!prefix.exists());
+        assert!(!state.exists());
+        fs::write(&certificate, "").unwrap();
+        install(&generate(&certificate)).unwrap();
+        assert!(prefix
+            .join("share/td-mta/services/td-mta-maint-tls-0.timer")
+            .is_file());
+        // td-mta-deploy recognises the checks it retires by exactly this
+        // text (activation_retired_checks.rs): a change here is one there.
+        let opts = generate(Path::new("/var/lib/td-mta/mail/tls/server.pem"));
+        let jobs = jobs(&opts).unwrap();
+        let generated = files(&jobs[0], &opts.state).unwrap();
+        assert_eq!(generated[0].0, "td-mta-maint-tls-0.service");
+        assert_eq!(
+            generated[0].1,
+            "[Unit]\nDescription=td-mta-maint-tls-0\n\n[Service]\nType=oneshot\nExecStart=:\"/usr/bin/openssl\" \"x509\" \"-in\" \"/var/lib/td-mta/mail/tls/server.pem\" \"-noout\" \"-checkend\" \"2592000\"\nUMask=0077\nTimeoutStartSec=120\nNoNewPrivileges=yes\nPrivateTmp=yes\n"
+        );
+        assert_eq!(
+            generated[1].1,
+            "[Unit]\nDescription=Schedule td-mta-maint-tls-0\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=15min\nUnit=td-mta-maint-tls-0.service\n\n[Install]\nWantedBy=timers.target\n"
+        );
+        assert!(generated[2].1.contains("(service '(td-mta-maint-tls-0)\n"));
+        assert!(generated[2].1.contains("(command '(\"/usr/bin/openssl\" \"x509\" \"-in\" \"/var/lib/td-mta/mail/tls/server.pem\" \"-noout\" \"-checkend\" \"2592000\")\n"));
     }
 
     #[test]

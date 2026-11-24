@@ -6,9 +6,16 @@ use crate::{
     isolation::files::{self, Setting},
     physical::{PG_DROPIN, SOCKET_DIR},
 };
+use checks::{
+    check_unit_state, generated_check, health_unit, notification_config, schedule_check,
+    service_text, timer_text, tls_checks, tls_word, TlsCheck,
+};
 use database::{CONTROL_SERVICE, OWNER_SERVICE};
-use fence::{open_socket, LiveSocket, SocketFence, PG_FENCE};
+use fence::{fence_condition, open_socket, LiveSocket, SocketFence, FENCE_DROPIN, PG_FENCE};
 use std::{io::Read, os::unix::fs::FileTypeExt};
+
+#[path = "activation_retired_checks.rs"]
+mod checks;
 
 pub(crate) const RUNTIME_CONNECTION: &str = "/var/lib/td-mta/mail/runtime-connection";
 /// `sed -n` program printing the runtime connection URI after its
@@ -21,7 +28,7 @@ const MAIL_CA: &str = "/var/lib/td-mta/mail/tls/ca.pem";
 const PG_DROPIN_TEXT: &str = "[Service]\nSupplementaryGroups=td-mta-db\n";
 const RENEW: &str = "td-mta-maint-postgres-tls-renew.timer";
 const RENEW_SERVICE: &str = "td-mta-maint-postgres-tls-renew.service";
-const RENEW_SCHEDULE: &str = "td-mta-maint-postgres-tls-renew.scm";
+const HEALTH: &str = "td-mta-health.service";
 pub(super) const CONF_LIMIT: u64 = 64 * 1024;
 pub(super) const FILE_LIMIT: u64 = 16 * 1024;
 const DROPPED: &[&str] = &[
@@ -526,7 +533,18 @@ pub(super) struct Cutover {
     // Drop-in directories the install created, removed again on restore.
     created: Vec<PathBuf>,
     touched: bool,
-    renew_excluded: bool,
+    // The timers of retired jobs this job left out of writer admission.
+    excluded: Vec<String>,
+    // The generated expiry checks of the retired material, retired with it.
+    checks: Vec<TlsCheck>,
+}
+
+/// What staging found beside the files it converts.
+struct Staging {
+    /// Each inert `local` HBA rule dropped.
+    dropped: Vec<String>,
+    /// Each notification check of the retired material dropped.
+    notification: Vec<String>,
 }
 
 impl Cutover {
@@ -669,9 +687,10 @@ impl Deployment {
             self.config(&self.previous, &[], self.isolated)?;
             // A cutover that failed after admission may have left the retired
             // transport's units or material; finish retiring them.
+            let checks = self.check_units()?;
             let root = child(&self.work, "postgres-socket")?;
             fs::DirBuilder::new().mode(0o700).create(&root)?;
-            self.retire_tls(&root)?;
+            self.retire_tls(&root, &checks)?;
             self.healthy(&self.previous)?;
             self.probes.probe("smtp")?;
             self.probes.probe("jmap")?;
@@ -694,7 +713,8 @@ impl Deployment {
             created_dir: false,
             created: Vec::new(),
             touched: false,
-            renew_excluded: false,
+            excluded: Vec::new(),
+            checks: Vec::new(),
         };
         self.guarded(
             &mut cut,
@@ -707,21 +727,8 @@ impl Deployment {
         let uid = fs::metadata(PGDATA)?.uid();
         self.event("staging private socket transport")?;
         fs::DirBuilder::new().mode(0o700).create(&cut.root)?;
-        let dropped = self.stage(cut)?;
-        let mut rules = Vec::new();
-        for rule in &dropped {
-            self.event(&fmt(format_args!("dropped inert local HBA rule: {rule}"))?)?;
-            td_alloc::push(&mut rules, Json::Str(owned(rule)?))?;
-        }
-        set(&mut self.record, "socket_hba_dropped", Json::Arr(rules))?;
-        let mut staged = Vec::new();
-        for file in &cut.files {
-            td_alloc::push(
-                &mut staged,
-                Json::Str(owned(file.target.to_str().ok_or("staged path")?)?),
-            )?;
-        }
-        set(&mut self.record, "socket_files", Json::Arr(staged))?;
+        let staging = self.stage(cut)?;
+        self.record_staging(cut, &staging)?;
         // Checked before any fence: the server's include must reach the file.
         fence::fence_directory(true)?;
         cut.created_dir = socket_directory(uid, gid)?;
@@ -793,13 +800,24 @@ impl Deployment {
         )?;
         self.event("private socket installed")?;
 
-        // The retired certificate's renewal never runs again.
-        cut.renew_excluded = self.timers.iter().any(|t| t == RENEW);
-        self.timers.retain(|t| t != RENEW);
+        // The retired material's renewal and expiry checks never run again.
+        let mut retiring = Vec::new();
+        td_alloc::push(&mut retiring, owned(RENEW)?)?;
+        for check in &cut.checks {
+            td_alloc::push(&mut retiring, check.unit("timer")?)?;
+        }
+        let mut excluded = Vec::new();
+        for timer in retiring {
+            if self.timers.contains(&timer) {
+                td_alloc::push(&mut excluded, Json::Str(owned(&timer)?))?;
+                td_alloc::push(&mut cut.excluded, timer)?;
+            }
+        }
+        self.timers.retain(|t| !cut.excluded.contains(t));
         set(
             &mut self.record,
-            "renewal_timer_was_active",
-            cut.renew_excluded.into(),
+            "retired_timers_excluded",
+            Json::Arr(excluded),
         )?;
         self.admit()?;
         self.wait(240, "ACME lease recovery", || self.acme_online())?;
@@ -807,13 +825,144 @@ impl Deployment {
         self.healthy(&self.previous)?;
         require(self.active_timers()? == self.timers, "timer set changed")?;
         self.event("verified private socket transport")?;
-        self.retire_tls(&cut.root)?;
+        self.retire_tls(&cut.root, &cut.checks)?;
         self.event("retired loopback TLS")?;
         Ok(())
     }
 
-    /// Stage every converted file; returns the inert HBA rules dropped.
-    fn stage(&self, cut: &mut Cutover) -> R<Vec<String>> {
+    fn record_staging(&mut self, cut: &Cutover, staging: &Staging) -> R<()> {
+        let mut rules = Vec::new();
+        for rule in &staging.dropped {
+            self.event(&fmt(format_args!("dropped inert local HBA rule: {rule}"))?)?;
+            td_alloc::push(&mut rules, Json::Str(owned(rule)?))?;
+        }
+        set(&mut self.record, "socket_hba_dropped", Json::Arr(rules))?;
+        let mut staged = Vec::new();
+        for file in &cut.files {
+            td_alloc::push(
+                &mut staged,
+                Json::Str(owned(file.target.to_str().ok_or("staged path")?)?),
+            )?;
+        }
+        set(&mut self.record, "socket_files", Json::Arr(staged))?;
+        let mut units = Vec::new();
+        for check in &cut.checks {
+            td_alloc::push(&mut units, Json::Str(owned(&check.name)?))?;
+        }
+        set(&mut self.record, "socket_retired_checks", Json::Arr(units))?;
+        let mut checks = Vec::new();
+        for name in &staging.notification {
+            td_alloc::push(&mut checks, Json::Str(owned(name)?))?;
+        }
+        set(
+            &mut self.record,
+            "socket_notification_checks_dropped",
+            Json::Arr(checks),
+        )
+    }
+
+    /// `systemctl show` of every td-mta unit's commands.
+    fn unit_commands(&self) -> R<String> {
+        self.host.out(self.host.cmd("systemctl").args([
+            "show",
+            "--all",
+            "-p",
+            "Id,ExecStartPre,ExecStart,ExecStartPost",
+            "td-mta-*",
+        ]))
+    }
+
+    /// The installer's expiry checks of the retired material, each still
+    /// exactly as it generated it.
+    fn check_units(&self) -> R<Vec<TlsCheck>> {
+        let found = tls_checks(
+            &self.unit_commands()?,
+            &checks::material_dirs(self.isolated)?,
+        )?;
+        for check in &found {
+            self.verify_check(check)?;
+        }
+        Ok(found)
+    }
+
+    /// `check`'s service and timer are the files the operations installer
+    /// generated, with no drop-in but a fence's own condition; the Shepherd
+    /// definition beside them, if any, registers and runs the same check.
+    fn verify_check(&self, check: &TlsCheck) -> R<()> {
+        let condition = fence_condition()?;
+        for (suffix, text) in [
+            ("service", service_text(check)?),
+            ("timer", timer_text(check)?),
+        ] {
+            let unit = check.unit(suffix)?;
+            let props = self.host.out(self.host.cmd("systemctl").args([
+                "show",
+                &unit,
+                "-p",
+                "LoadState",
+                "-p",
+                "FragmentPath",
+                "-p",
+                "DropInPaths",
+            ]))?;
+            let directory = child(Path::new(UNIT_DIR), &fmt(format_args!("{unit}.d"))?)?;
+            let fence = child(&directory, FENCE_DROPIN)?;
+            let clean = fence_only(&directory, &condition)?;
+            let Some(fragment) = check_unit_state(&unit, suffix == "timer", &props, &fence, clean)?
+            else {
+                continue;
+            };
+            let real = fs::canonicalize(fragment)?;
+            let (bytes, _) = read_file(&real, FILE_LIMIT)?;
+            generated_check(&unit, &real, &bytes, &text)?;
+            if suffix != "service" {
+                continue;
+            }
+            let scm = child(parent(&real)?, &check.unit("scm")?)?;
+            if scm.try_exists()? {
+                let (bytes, _) = read_file(&scm, FILE_LIMIT)?;
+                schedule_check(check, &bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The aggregate health unit's own file may still list the checks of
+    /// the retired material that its readiness drop-in replaces
+    /// (`ExecStart=` resets them); the cutover drops those lines too.
+    fn stage_health(&self, cut: &mut Cutover) -> R<()> {
+        let fragment = self.host.out(self.host.cmd("systemctl").args([
+            "show",
+            HEALTH,
+            "-p",
+            "FragmentPath",
+            "--value",
+        ]))?;
+        require(
+            fragment.starts_with('/'),
+            "td-mta-health.service has no unit file",
+        )?;
+        let text = td_fs::read_bounded(Path::new(&fragment), FILE_LIMIT)?;
+        let mut lines = Vec::new();
+        for line in crate::readiness::tls_only_lines() {
+            td_alloc::push(&mut lines, line)?;
+        }
+        let Some(new) = health_unit(std::str::from_utf8(&text)?, &lines)? else {
+            return Ok(());
+        };
+        let path = child(Path::new(UNIT_DIR), HEALTH)?;
+        require(
+            Path::new(&fragment) == path,
+            "td-mta-health.service names loopback TLS material outside /etc/systemd/system",
+        )?;
+        let (old, meta) = read_file(&path, FILE_LIMIT)?;
+        require(old == text, "td-mta-health.service changed while staging")?;
+        cut.add(&path, Some((old, meta)), new, false)
+    }
+
+    /// Stage every converted file and find the jobs retired with the
+    /// material; refuses anything else that still needs the old transport.
+    fn stage(&self, cut: &mut Cutover) -> R<Staging> {
         let conf = child(Path::new(MAIL), "postgresql.conf")?;
         let (old, meta) = read_file(&conf, CONF_LIMIT)?;
         let settings = socket_settings(SOCKET_DIR, isolation::DB_GROUP, PG_FENCE)?;
@@ -899,48 +1048,88 @@ impl Deployment {
             Some(&crate::readiness::aggregate(true)?),
             &crate::readiness::aggregate(false)?,
         )?;
+        self.stage_health(cut)?;
         // Every other td-mta job must already be independent of the retired
-        // transport; the cutover would otherwise leave it failing.
-        let show = self.host.out(self.host.cmd("systemctl").args([
-            "show",
-            "--all",
-            "-p",
-            "Id,ExecStartPre,ExecStart,ExecStartPost",
-            "td-mta-*",
-        ]))?;
-        let mut converted = Vec::new();
-        for file in &cut.files {
-            td_alloc::push(&mut converted, file.target.as_path())?;
+        // transport; the cutover would otherwise leave it failing. The
+        // installer's expiry checks of the material retire with it.
+        let dirs = checks::material_dirs(self.isolated)?;
+        let show = self.unit_commands()?;
+        cut.checks = tls_checks(&show, &dirs)?;
+        let mut retiring = Vec::new();
+        for check in &cut.checks {
+            self.verify_check(check)?;
+            td_alloc::push(&mut retiring, check.unit("service")?)?;
         }
-        if let Some(unit) = retired_reference(&show, &converted)? {
-            return Err(fmt(format_args!(
-                "{unit} names loopback TLS material or an unconverted connection file"
-            ))?
-            .into());
-        }
-        // The notification jobs name theirs inside their configuration.
-        for name in ["config.json", "isolated.json"] {
-            let path = child(Path::new(isolation::NOTIFY), name)?;
-            if !path.try_exists()? {
-                continue;
+        let mut notifications = Vec::new();
+        let mut rewritten = Vec::new();
+        {
+            let mut converted = Vec::new();
+            for file in &cut.files {
+                td_alloc::push(&mut converted, file.target.as_path())?;
             }
-            let bytes = td_fs::read_bounded_real_file(
-                &path,
-                "notification configuration",
-                isolation::NOTIFICATION_LIMIT as u64,
-            )?;
-            let config = td_json::parse(std::str::from_utf8(&bytes)?)
-                .map_err(|_| "invalid notification configuration")?;
-            let connection = config
-                .get("connection")
-                .and_then(Json::as_str)
-                .ok_or("notification configuration without a connection")?;
-            require(
-                converted.iter().any(|p| p.as_os_str() == connection),
-                "notification configuration names an unconverted connection file",
-            )?;
+            if let Some(unit) = retired_reference(&show, &converted, &retiring)? {
+                return Err(fmt(format_args!(
+                    "{unit} names loopback TLS material or an unconverted connection file"
+                ))?
+                .into());
+            }
+            // The notification jobs name theirs inside their configuration,
+            // and run the installer's checks of the material from it too.
+            for (name, canonical) in [("config.json", true), ("isolated.json", false)] {
+                let path = child(Path::new(isolation::NOTIFY), name)?;
+                if !path.try_exists()? {
+                    continue;
+                }
+                let bytes = td_fs::read_bounded_real_file(
+                    &path,
+                    "notification configuration",
+                    isolation::NOTIFICATION_LIMIT as u64,
+                )?;
+                let text = std::str::from_utf8(&bytes)?;
+                let config =
+                    td_json::parse(text).map_err(|_| "invalid notification configuration")?;
+                let connection = config
+                    .get("connection")
+                    .and_then(Json::as_str)
+                    .ok_or("notification configuration without a connection")?;
+                require(
+                    converted.iter().any(|p| p.as_os_str() == connection),
+                    "notification configuration names an unconverted connection file",
+                )?;
+                // The installer writes config.json canonical, and the
+                // operator may have edited it since (its `alerts`); the
+                // isolation helper always derives isolated.json as td-json
+                // prints it.
+                let encode = |json: &Json| -> R<String> {
+                    if canonical {
+                        Ok(json.to_canonical())
+                    } else {
+                        fmt(format_args!("{json}\n"))
+                    }
+                };
+                if let Some((new, names)) = notification_config(text, &dirs, !canonical, encode)? {
+                    // isolated.json derives from config.json: one name each.
+                    for name in names {
+                        if !notifications.contains(&name) {
+                            td_alloc::push(&mut notifications, name)?;
+                        }
+                    }
+                    td_alloc::push(&mut rewritten, (path, bytes, new))?;
+                }
+            }
         }
-        Ok(dropped)
+        for (path, bytes, new) in rewritten {
+            let (old, meta) = read_file(&path, isolation::NOTIFICATION_LIMIT as u64)?;
+            require(
+                old == bytes,
+                "notification configuration changed while staging",
+            )?;
+            cut.add(&path, Some((old, meta)), new, false)?;
+        }
+        Ok(Staging {
+            dropped,
+            notification: notifications,
+        })
     }
 
     fn rehearse(&mut self, cut: &Cutover, uid: u32, gid: u32) -> R<()> {
@@ -973,7 +1162,7 @@ impl Deployment {
         for file in &cut.files {
             match &file.old {
                 Some(old) => {
-                    let (bytes, meta) = read_file(&file.target, CONF_LIMIT)?;
+                    let (bytes, meta) = read_file(&file.target, u64::try_from(old.len())?)?;
                     require(
                         bytes == *old
                             && meta.uid() == file.uid
@@ -1038,10 +1227,12 @@ impl Deployment {
             open_socket(&mut LiveSocket(&self.host))?;
             self.socket_fence = false;
         }
-        if cut.renew_excluded {
-            td_alloc::push(&mut self.timers, owned(RENEW)?)?;
+        if !cut.excluded.is_empty() {
+            td_alloc::reserve(&mut self.timers, cut.excluded.len())?;
+            for timer in cut.excluded.drain(..) {
+                td_alloc::push(&mut self.timers, timer)?;
+            }
             self.timers.sort_unstable();
-            cut.renew_excluded = false;
         }
         self.config(&self.previous, &[], self.isolated)?;
         self.admit()?;
@@ -1051,26 +1242,42 @@ impl Deployment {
         remove_socket_directory(cut)
     }
 
-    // td-mta's operations installer generated the renewal units in its
-    // prefix's `share/td-mta/services`, where the operator linked them; once
-    // disabled, those files move into the job directory. A unit file found
-    // anywhere else was never td-mta's and stays, recorded for the operator.
-    // The certificate material is moved, never deleted, for rollback.
-    // Each step acts only on what is still present, so a later run on the
-    // socket finishes what an interrupted one left.
-    fn retire_tls(&mut self, root: &Path) -> R<()> {
+    // td-mta's operations installer generated the renewal units and the
+    // expiry checks in its prefix's `share/td-mta/services`, where the
+    // operator linked them; once disabled, those files move into the job
+    // directory. A unit file found anywhere else was never td-mta's and
+    // stays, recorded for the operator. The certificate material is moved,
+    // never deleted, for rollback. Each step acts only on what is still
+    // present, so a later run on the socket finishes what an interrupted one
+    // left.
+    fn retire_tls(&mut self, root: &Path, checks: &[TlsCheck]) -> R<()> {
         let retired = child(root, "retired")?;
         fs::DirBuilder::new().mode(0o700).create(&retired)?;
+        let mut units = Vec::new();
+        let mut services = Vec::new();
+        td_alloc::push(&mut units, owned(RENEW)?)?;
+        td_alloc::push(&mut units, owned(RENEW_SERVICE)?)?;
+        td_alloc::push(&mut services, owned(RENEW_SERVICE)?)?;
+        for check in checks {
+            td_alloc::push(&mut units, check.unit("timer")?)?;
+            td_alloc::push(&mut units, check.unit("service")?)?;
+            td_alloc::push(&mut services, check.unit("service")?)?;
+        }
+        let show = |unit: &str, property: &str| {
+            self.host.out(
+                self.host
+                    .cmd("systemctl")
+                    .args(["show", unit, "-p", property, "--value"]),
+            )
+        };
         let mut generated = Vec::new();
         let mut left = Vec::new();
-        for unit in [RENEW, RENEW_SERVICE] {
-            let fragment = self.host.out(self.host.cmd("systemctl").args([
-                "show",
-                unit,
-                "-p",
-                "FragmentPath",
-                "--value",
-            ]))?;
+        let mut loaded = Vec::new();
+        for unit in &units {
+            if show(unit, "LoadState")? != "not-found" {
+                td_alloc::push(&mut loaded, unit.as_str())?;
+            }
+            let fragment = show(unit, "FragmentPath")?;
             // A masked unit cannot run and has no file of its own.
             if fragment.is_empty() || fragment == "/dev/null" {
                 continue;
@@ -1087,60 +1294,68 @@ impl Deployment {
                 td_alloc::push(&mut left, Json::Str(owned(&fragment)?))?;
             }
         }
-        let mut loaded = false;
-        for unit in [RENEW, RENEW_SERVICE] {
-            loaded |= self.host.out(self.host.cmd("systemctl").args([
-                "show",
-                unit,
-                "-p",
-                "LoadState",
-                "--value",
-            ]))? != "not-found";
-        }
-        // A run that failed against the closed TCP port would otherwise keep
-        // failing the health check, even once its files are gone.
-        self.host.exec(
-            self.host
-                .cmd("systemctl")
-                .args(["reset-failed", RENEW_SERVICE]),
-            &[],
-            Duration::from_secs(30),
-            false,
-        )?;
-        if loaded {
-            self.host.run(self.host.cmd("systemctl").args([
-                "disable",
-                "--now",
-                RENEW,
-                RENEW_SERVICE,
-            ]))?;
-            for unit in [RENEW, RENEW_SERVICE] {
-                let state = self.host.out(self.host.cmd("systemctl").args([
-                    "show",
-                    unit,
-                    "-p",
-                    "ActiveState",
-                    "--value",
-                ]))?;
-                require(state == "inactive", "PostgreSQL TLS renewal still active")?;
+        // A run that failed against the closed TCP port or the moved
+        // material would otherwise keep failing the health check, even once
+        // its files are gone: reset before stopping, which leaves a failed
+        // unit failed, and again after, for a run that failed meanwhile.
+        let reset = |services: &[String]| -> R<()> {
+            for service in services {
+                self.host.exec(
+                    self.host.cmd("systemctl").args(["reset-failed", service]),
+                    &[],
+                    Duration::from_secs(30),
+                    false,
+                )?;
+            }
+            Ok(())
+        };
+        reset(&services)?;
+        if !loaded.is_empty() {
+            self.host.run(
+                self.host
+                    .cmd("systemctl")
+                    .args(["disable", "--now"])
+                    .args(&loaded),
+            )?;
+            reset(&services)?;
+            for unit in &loaded {
+                require(
+                    show(unit, "ActiveState")? == "inactive",
+                    "a retired loopback TLS unit is still active",
+                )?;
             }
         }
-        // The Shepherd definition generated beside them goes too.
-        if let Some(directory) = generated.first().and_then(|p| p.parent()) {
-            let scm = child(directory, RENEW_SCHEDULE)?;
-            if scm.try_exists()? {
-                td_alloc::push(&mut generated, scm)?;
+        // The Shepherd definition generated beside each goes too, and so
+        // does a sibling unit file systemd no longer loads, such as a timer
+        // disabled by hand.
+        let mut siblings = Vec::new();
+        for path in &generated {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or("unit path")?;
+            for suffix in ["service", "timer", "scm"] {
+                let sibling = child(parent(path)?, &fmt(format_args!("{stem}.{suffix}"))?)?;
+                if !generated.contains(&sibling)
+                    && !siblings.contains(&sibling)
+                    && sibling.try_exists()?
+                {
+                    td_alloc::push(&mut siblings, sibling)?;
+                }
             }
         }
-        let units = child(&retired, "units")?;
-        fs::DirBuilder::new().mode(0o700).create(&units)?;
+        for sibling in siblings {
+            td_alloc::push(&mut generated, sibling)?;
+        }
+        let kept = child(&retired, "units")?;
+        fs::DirBuilder::new().mode(0o700).create(&kept)?;
         let mut moved = Vec::new();
         for path in &generated {
             let (bytes, _) = read_file(path, FILE_LIMIT)?;
-            let mut copy = create_file(&child(&units, name(path)?)?, 0o600)?;
+            let mut copy = create_file(&child(&kept, name(path)?)?, 0o600)?;
             copy.write_all(&bytes)?;
             copy.sync_all()?;
-            sync_dir(&units)?;
+            sync_dir(&kept)?;
             remove_file(path)?;
             sync_dir(parent(path)?)?;
             td_alloc::push(
@@ -1150,7 +1365,7 @@ impl Deployment {
         }
         // `disable` undoes `link`; a link left to a moved or generated file
         // goes as well, including one an earlier run left dangling.
-        for unit in [RENEW, RENEW_SERVICE] {
+        for unit in &units {
             let link = child(Path::new(UNIT_DIR), unit)?;
             if let Ok(target) = fs::read_link(&link) {
                 if generated.contains(&target) || generated_unit(&target, unit) {
@@ -1159,44 +1374,48 @@ impl Deployment {
                 }
             }
         }
+        // A fence leaves its condition, or an empty directory, beside each
+        // check; anything else there stays, recorded for the operator.
+        let condition = fence_condition()?;
+        let mut dropins = Vec::new();
+        let mut dropins_left = Vec::new();
+        let mut kept_dropins = Vec::new();
+        for check in checks {
+            for suffix in ["service", "timer"] {
+                let unit = check.unit(suffix)?;
+                let directory = child(Path::new(UNIT_DIR), &fmt(format_args!("{unit}.d"))?)?;
+                let path = Json::Str(owned(directory.to_str().ok_or("drop-in path")?)?);
+                match retire_dropins(&directory, &condition)? {
+                    Some(true) => td_alloc::push(&mut dropins, path)?,
+                    Some(false) => {
+                        td_alloc::push(&mut dropins_left, path)?;
+                        td_alloc::push(&mut kept_dropins, unit)?;
+                    }
+                    None => (),
+                }
+            }
+        }
         self.host
             .run(self.host.cmd("systemctl").arg("daemon-reload"))?;
+        // A unit file left in place keeps its unit; so may drop-ins left.
         if left.is_empty() {
-            for unit in [RENEW, RENEW_SERVICE] {
-                let state = self.host.out(self.host.cmd("systemctl").args([
-                    "show",
-                    unit,
-                    "-p",
-                    "LoadState",
-                    "--value",
-                ]))?;
+            for unit in units.iter().filter(|u| !kept_dropins.contains(u)) {
                 require(
-                    matches!(state.as_str(), "not-found" | "masked"),
-                    "PostgreSQL TLS renewal unit still loaded",
+                    matches!(show(unit, "LoadState")?.as_str(), "not-found" | "masked"),
+                    "a retired loopback TLS unit is still loaded",
                 )?;
             }
         }
-        set(&mut self.record, "renewal_units_retired", Json::Arr(moved))?;
-        set(&mut self.record, "renewal_units_left", Json::Arr(left))?;
-        let mut moves = Vec::new();
-        td_alloc::push(
-            &mut moves,
-            (child(Path::new(MAIL), "tls")?, child(&retired, "mail-tls")?),
+        set(&mut self.record, "retired_units", Json::Arr(moved))?;
+        set(&mut self.record, "retired_units_left", Json::Arr(left))?;
+        set(&mut self.record, "retired_unit_dropins", Json::Arr(dropins))?;
+        set(
+            &mut self.record,
+            "retired_unit_dropins_left",
+            Json::Arr(dropins_left),
         )?;
-        if self.isolated {
-            for &role in ROLES {
-                let home = PathBuf::from(parent(Path::new(isolation::connection(role)?))?);
-                td_alloc::push(
-                    &mut moves,
-                    (
-                        child(&home, "tls")?,
-                        child(&retired, &fmt(format_args!("{role}-tls"))?)?,
-                    ),
-                )?;
-            }
-        }
         let mut record = Vec::new();
-        for (from, to) in moves {
+        for (from, to) in checks::material(self.isolated)? {
             match fs::symlink_metadata(&from) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
@@ -1206,7 +1425,7 @@ impl Deployment {
                 fs::metadata(parent(&from)?)?.dev() == fs::metadata(&retired)?.dev(),
                 "retired TLS material is on another filesystem",
             )?;
-            fs::rename(&from, &to)?;
+            fs::rename(&from, child(&retired, &to)?)?;
             sync_dir(parent(&from)?)?;
             sync_dir(&retired)?;
             td_alloc::push(
@@ -1218,19 +1437,73 @@ impl Deployment {
     }
 }
 
-// Units the cutover itself replaces or retires.
-const RETIRED_UNITS: &[&str] = &[RENEW, RENEW_SERVICE, "td-mta-health.service"];
+/// Whether `path` is the fence's drop-in holding exactly `condition`, which
+/// a job that ended before its cleanup leaves beside each scheduled service.
+fn fence_dropin(path: &Path, condition: &str) -> R<bool> {
+    Ok(path.file_name() == Some(std::ffi::OsStr::new(FENCE_DROPIN))
+        && td_fs::read_bounded(path, 4096)? == condition.as_bytes())
+}
 
-/// The first unit in `systemctl show` output whose commands name a
-/// PostgreSQL TLS directory, or a connection file the cutover does not
-/// convert. Units are blank-line separated; `Id=` may follow the commands.
-pub(super) fn retired_reference<'a>(show: &'a str, converted: &[&Path]) -> R<Option<&'a str>> {
+/// Whether the drop-in `directory` is absent or holds nothing but the
+/// fence's `condition`.
+fn fence_only(directory: &Path, condition: &str) -> R<bool> {
+    let entries = match fs::read_dir(directory) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e.into()),
+        Ok(entries) => entries,
+    };
+    for entry in entries {
+        if !fence_dropin(&entry?.path(), condition)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Clears a retired check's drop-in `directory` of the fence's `condition`
+/// and removes it: Some(true) once it is gone, Some(false) when it holds
+/// anything else, None when there is none.
+fn retire_dropins(directory: &Path, condition: &str) -> R<Option<bool>> {
+    let entries = match fs::read_dir(directory) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(entries) => entries,
+    };
+    let mut other = false;
+    for entry in entries {
+        let path = entry?.path();
+        if fence_dropin(&path, condition)? {
+            remove_file(&path)?;
+        } else {
+            other = true;
+        }
+    }
+    if other {
+        return Ok(Some(false));
+    }
+    fs::remove_dir(directory)?;
+    sync_dir(parent(directory)?)?;
+    Ok(Some(true))
+}
+
+// Units the cutover itself replaces or retires.
+const RETIRED_UNITS: &[&str] = &[RENEW, RENEW_SERVICE, HEALTH];
+
+/// The first unit in `systemctl show` output, other than those `retiring`
+/// names, whose commands name a PostgreSQL TLS directory, or a connection
+/// file the cutover does not convert. Units are blank-line separated;
+/// `Id=` may follow the commands.
+pub(super) fn retired_reference<'a>(
+    show: &'a str,
+    converted: &[&Path],
+    retiring: &[String],
+) -> R<Option<&'a str>> {
     for block in show.split("\n\n").filter(|b| !b.trim().is_empty()) {
         let unit = block
             .lines()
             .find_map(|line| line.strip_prefix("Id="))
             .ok_or("unit without an Id")?;
-        if RETIRED_UNITS.contains(&unit) {
+        if RETIRED_UNITS.contains(&unit) || retiring.iter().any(|r| r == unit) {
             continue;
         }
         for line in block.lines() {
@@ -1258,8 +1531,7 @@ fn names_retired(argv: &str, converted: &[&Path]) -> R<bool> {
                 .map(|(_, value)| value)
         };
         connection = option(word);
-        if word.starts_with("/var/lib/td-mta") && (word.contains("/tls/") || word.ends_with("/tls"))
-        {
+        if tls_word(word) {
             return Ok(true);
         }
         if path.is_some_and(|path| !converted.iter().any(|p| p.as_os_str() == path)) {

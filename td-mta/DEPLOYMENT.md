@@ -160,8 +160,10 @@ independent scheduled operations with the same installer:
 
 Select any complete group independently: mail profiles, managed certificate
 profiles with their connection file, private certificate files with an explicit
-OpenSSL executable (such as the local setup's listener leaf and CA), or the
-four backup arguments. Recovery hosts can independently select the
+OpenSSL executable (such as the local setup's listener leaf and CA; each
+must exist, reachable by the generating account, when the schedules are
+generated, and checks are numbered by their position among these
+flags), or the four backup arguments. Recovery hosts can independently select the
 [weekly restore drill and daily backup pull](#pull-backups-to-a-recovery-host).
 Repeat profiles/certificate
 files up to 32 per kind. All paths are absolute. On a mail host, use the state directory

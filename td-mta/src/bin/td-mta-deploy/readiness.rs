@@ -198,6 +198,14 @@ pub(crate) fn aggregate(tls: bool) -> R<Setting> {
         .ok_or_else(|| "missing aggregate health setting".into())
 }
 
+/// The aggregate's lines that check the loopback TLS material: those of the
+/// TLS layout's drop-in the socket layout's lacks.
+pub(crate) fn tls_only_lines() -> impl Iterator<Item = &'static str> {
+    HEALTH_CHECKS_TLS
+        .lines()
+        .filter(|line| !HEALTH_CHECKS.lines().any(|kept| kept == *line))
+}
+
 pub(crate) fn prepare(host: &Host, tls: bool) -> R<()> {
     let mut missing = Vec::new();
     for file in settings(Path::new(UNIT_DIR), tls)? {

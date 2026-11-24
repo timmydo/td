@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 use super::*;
 
 const PASS: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -407,8 +407,8 @@ fn units_naming_the_retired_transport_are_found_before_the_cutover() {
         "Id=td-mta-maint-backup.timer".to_string(),
     ]
     .join("\n\n");
-    assert_eq!(retired_reference(&clean, &converted).unwrap(), None);
-    assert_eq!(retired_reference("", &converted).unwrap(), None);
+    assert_eq!(retired_reference(&clean, &converted, &[]).unwrap(), None);
+    assert_eq!(retired_reference("", &converted, &[]).unwrap(), None);
     for (argv, why) in [
         (
             "/opt/td-mta/bin/td-mta-operator x --tls-certificate /var/lib/td-mta/mail/tls/ca.pem",
@@ -429,12 +429,424 @@ fn units_naming_the_retired_transport_are_found_before_the_cutover() {
     ] {
         let show = format!("{clean}\n\n{}", unit("td-mta-maint-x.service", argv));
         assert_eq!(
-            retired_reference(&show, &converted).unwrap(),
+            retired_reference(&show, &converted, &[]).unwrap(),
             Some("td-mta-maint-x.service"),
             "{why}"
         );
     }
     let dangling = unit("td-mta-maint-x.service", "/bin/td-mta x --connection-file");
-    assert!(retired_reference(&dangling, &converted).is_err());
-    assert!(retired_reference("ExecStart=x", &converted).is_err());
+    assert!(retired_reference(&dangling, &converted, &[]).is_err());
+    assert!(retired_reference("ExecStart=x", &converted, &[]).is_err());
+}
+
+// `systemctl show --all -p Id,ExecStartPre,ExecStart,ExecStartPost
+// 'td-mta-*'` as production printed it on the cutover's second refusal,
+// with the ACME contact and names replaced.
+const PRODUCTION_SHOW: &str = include_str!("production-systemctl-show.txt");
+
+fn connections() -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from(OWNER_CONNECTION),
+        PathBuf::from(RUNTIME_CONNECTION),
+    ];
+    for &role in ROLES {
+        paths.push(PathBuf::from(isolation::connection(role).unwrap()));
+    }
+    paths
+}
+
+fn check_unit(id: &str, lines: &[String]) -> String {
+    let mut block = lines.join("\n");
+    block.push_str(&format!("\nId={id}"));
+    block
+}
+
+fn exec(argv: &str) -> String {
+    let path = argv.split(' ').next().unwrap();
+    format!("ExecStart={{ path={path} ; argv[]={argv} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}")
+}
+
+fn openssl_check(file: &str) -> Vec<String> {
+    [
+        "/usr/bin/openssl",
+        "x509",
+        "-in",
+        file,
+        "-noout",
+        "-checkend",
+        "2592000",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+#[test]
+fn production_units_pass_the_guard_once_their_tls_checks_retire() {
+    let paths = connections();
+    let converted: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    // What refused the cutover on production.
+    assert_eq!(
+        retired_reference(PRODUCTION_SHOW, &converted, &[]).unwrap(),
+        Some("td-mta-maint-tls-1.service")
+    );
+    for isolated in [true, false] {
+        let found = tls_checks(PRODUCTION_SHOW, &checks::material_dirs(isolated).unwrap()).unwrap();
+        assert_eq!(
+            found,
+            [
+                TlsCheck {
+                    name: "td-mta-maint-tls-1".into(),
+                    argv: openssl_check("/var/lib/td-mta/mail/tls/ca.pem"),
+                },
+                TlsCheck {
+                    name: "td-mta-maint-tls-0".into(),
+                    argv: openssl_check("/var/lib/td-mta/mail/tls/server.pem"),
+                },
+            ]
+        );
+        let retiring: Vec<String> = found.iter().map(|c| c.unit("service").unwrap()).collect();
+        assert_eq!(
+            retired_reference(PRODUCTION_SHOW, &converted, &retiring).unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn a_tls_naming_unit_in_any_other_form_still_refuses() {
+    let paths = connections();
+    let converted: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    let dirs = checks::material_dirs(true).unwrap();
+    let check =
+        "/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -noout -checkend 2592000";
+    let pre = String::from("ExecStartPre={ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }");
+    let ignored = exec(check).replace("ignore_errors=no", "ignore_errors=yes");
+    for (id, lines, why) in [
+        (
+            "td-mta-maint-tls-5.service",
+            vec![pre, exec(check)],
+            "a command before it",
+        ),
+        (
+            "td-mta-maint-tls-5.service",
+            vec![exec(check), exec(check)],
+            "a second command",
+        ),
+        (
+            "td-mta-maint-tls-5.service",
+            vec![ignored],
+            "its failure ignored",
+        ),
+        (
+            "td-mta-maint-tls-00.service",
+            vec![exec(check)],
+            "an unnumbered name",
+        ),
+        (
+            "td-mta-maint-tls-x.service",
+            vec![exec(check)],
+            "an unnumbered name",
+        ),
+        (
+            "td-mta-maint-cert.service",
+            vec![exec(check)],
+            "another job's name",
+        ),
+        (
+            "td-mta-maint-tls-5.service",
+            vec![exec(&check.replace("2592000", "86400"))],
+            "another threshold",
+        ),
+        (
+            "td-mta-maint-tls-5.service",
+            vec![exec(&check.replace("tls/ca.pem", "tls/old/ca.pem"))],
+            "a file below the material",
+        ),
+        (
+            "td-mta-maint-tls-5.service",
+            vec![exec(
+                &check.replace("/usr/bin/openssl", "/usr/bin/open%ssl"),
+            )],
+            "a program the installer would quote",
+        ),
+        (
+            "td-mta-maint-tls-5.service",
+            vec![exec(
+                "/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls -noout -checkend 2592000",
+            )],
+            "the directory itself",
+        ),
+    ] {
+        let show = format!("{PRODUCTION_SHOW}\n{}", check_unit(id, &lines));
+        let found = tls_checks(&show, &dirs).unwrap();
+        assert_eq!(found.len(), 2, "{why}");
+        let retiring: Vec<String> = found.iter().map(|c| c.unit("service").unwrap()).collect();
+        assert_eq!(
+            retired_reference(&show, &converted, &retiring).unwrap(),
+            Some(id),
+            "{why}"
+        );
+    }
+    // A shared layout has no service TLS directories to retire.
+    let relay = "/usr/bin/openssl x509 -in /var/lib/td-mta-services/relay/tls/ca.pem -noout -checkend 2592000";
+    let show = check_unit("td-mta-maint-tls-2.service", &[exec(relay)]);
+    assert_eq!(tls_checks(&show, &dirs).unwrap().len(), 1);
+    assert!(tls_checks(&show, &checks::material_dirs(false).unwrap())
+        .unwrap()
+        .is_empty());
+    // A check of a certificate the cutover leaves is no check it retires,
+    // and the guard leaves it too.
+    let kept = "/usr/bin/openssl x509 -in /etc/ssl/td-mta/listener.pem -noout -checkend 2592000";
+    let show = check_unit("td-mta-maint-tls-3.service", &[exec(kept)]);
+    assert!(tls_checks(&show, &dirs).unwrap().is_empty());
+    assert_eq!(retired_reference(&show, &converted, &[]).unwrap(), None);
+    assert!(tls_checks("ExecStart=x", &dirs).is_err());
+}
+
+#[test]
+fn retired_checks_match_the_files_the_operations_installer_wrote() {
+    let check = TlsCheck {
+        name: "td-mta-maint-tls-0".into(),
+        argv: openssl_check("/var/lib/td-mta/mail/tls/server.pem"),
+    };
+    // builder/src/install_mta_operations.rs pins the same text.
+    assert_eq!(
+        service_text(&check).unwrap(),
+        "[Unit]\nDescription=td-mta-maint-tls-0\n\n[Service]\nType=oneshot\nExecStart=:\"/usr/bin/openssl\" \"x509\" \"-in\" \"/var/lib/td-mta/mail/tls/server.pem\" \"-noout\" \"-checkend\" \"2592000\"\nUMask=0077\nTimeoutStartSec=120\nNoNewPrivileges=yes\nPrivateTmp=yes\n"
+    );
+    assert_eq!(
+        timer_text(&check).unwrap(),
+        "[Unit]\nDescription=Schedule td-mta-maint-tls-0\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=15min\nUnit=td-mta-maint-tls-0.service\n\n[Install]\nWantedBy=timers.target\n"
+    );
+    let (service, command) = checks::schedule_parts(&check).unwrap();
+    assert_eq!(service, "(service '(td-mta-maint-tls-0)\n");
+    assert_eq!(
+        command,
+        "(command '(\"/usr/bin/openssl\" \"x509\" \"-in\" \"/var/lib/td-mta/mail/tls/server.pem\" \"-noout\" \"-checkend\" \"2592000\")\n"
+    );
+}
+
+#[test]
+fn the_health_rewrite_keeps_every_other_line_exactly() {
+    let lines: Vec<&str> = crate::readiness::tls_only_lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "ExecStart=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/server.pem -checkend 2592000 -noout",
+            "ExecStart=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -checkend 2592000 -noout",
+        ]
+    );
+    let head = "[Unit]\r\nDescription=td-mta aggregate health\n\n[Service]\nType=oneshot\n\
+        ExecStart=/usr/bin/systemctl --quiet is-active td-mta-postgres.service\n";
+    let middle = "# keep  this   comment\n";
+    let tail = "ExecStart=/opt/td-mta/bin/td-mta acme-status --connection-file /var/lib/td-mta/mail/runtime-connection  \n\
+        ExecStart=/usr/bin/systemctl --quiet is-active td-mta-migadu.service";
+    let unit = format!("{head}{}\n{middle}{}\n{tail}", lines[0], lines[1]);
+    let kept = format!("{head}{middle}{tail}");
+    assert_eq!(health_unit(&unit, &lines).unwrap(), Some(kept.clone()));
+    assert_eq!(health_unit(&kept, &lines).unwrap(), None);
+    // The last line, without its newline, goes as well.
+    let last = format!("{kept}\n{}", lines[1]);
+    assert_eq!(
+        health_unit(&last, &lines).unwrap(),
+        Some(format!("{kept}\n"))
+    );
+    for other in [
+        "ExecStart=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/server.pem -checkend 2592000 -noout ",
+        "ExecStart=-/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -checkend 2592000 -noout",
+        "ExecStartPre=/usr/bin/test -e \"/var/lib/td-mta/mail/tls/ca.pem\"",
+        "Environment=CA=/var/lib/td-mta/mail/tls/ca.pem",
+        "# /var/lib/td-mta/mail/tls",
+    ] {
+        assert!(
+            health_unit(&format!("{unit}\n{other}\n"), &lines).is_err(),
+            "{other}"
+        );
+    }
+}
+
+fn notification(checks: &[&str]) -> Json {
+    td_json::parse(&format!(
+        r#"{{"checks":[{}],"connection":"/var/lib/td-mta/mail/owner-connection","epoch":"0123456789abcdef0123456789abcdef","mta":"/opt/td-mta/bin/td-mta","recipient":"ops@example.org","smtp":"127.0.0.1:25","state":"/var/lib/td-mta/mail/.operations/notifications"}}"#,
+        checks.join(",")
+    ))
+    .unwrap()
+}
+
+#[test]
+fn notification_checks_of_the_material_go_and_the_rest_stay_as_written() {
+    let mail = r#"{"argv":["/opt/td-mta/bin/td-mta","status","--json","--require-ready","--runtime","/var/lib/td-mta/mail/frontend/runtime"],"kind":"status","name":"mail-frontend"}"#;
+    let tls = |n: u8, file: &str| {
+        format!(
+            r#"{{"argv":["/usr/bin/openssl","x509","-in","/var/lib/td-mta/mail/tls/{file}","-noout","-checkend","2592000"],"kind":"status","name":"tls-{n}"}}"#
+        )
+    };
+    let (zero, one) = (tls(0, "server.pem"), tls(1, "ca.pem"));
+    let dirs = checks::material_dirs(true).unwrap();
+    let canonical = |json: &Json| -> R<String> { Ok(json.to_canonical()) };
+    let printed = |json: &Json| -> R<String> { Ok(format!("{json}\n")) };
+    let before = notification(&[mail, &zero, &one]);
+    let after = notification(&[mail]);
+    let text = before.to_canonical();
+    let (new, removed) = notification_config(&text, &dirs, true, canonical)
+        .unwrap()
+        .unwrap();
+    assert_eq!(new, after.to_canonical());
+    assert_eq!(removed, ["tls-0", "tls-1"]);
+    let text = format!("{before}\n");
+    let (new, _) = notification_config(&text, &dirs, true, printed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(new, format!("{after}\n"));
+    // Nothing to drop leaves the file alone, whatever its form.
+    let plain = after.to_string_pretty();
+    for exact in [true, false] {
+        assert_eq!(
+            notification_config(&plain, &dirs, exact, canonical).unwrap(),
+            None
+        );
+    }
+    // A derived file in a form its writer would not leave is not rewritten;
+    // the operator's file, which may have been edited, takes the canonical
+    // form with its content.
+    let pretty = before.to_string_pretty();
+    assert!(notification_config(&pretty, &dirs, true, canonical).is_err());
+    let (new, _) = notification_config(&pretty, &dirs, false, canonical)
+        .unwrap()
+        .unwrap();
+    assert_eq!(new, after.to_canonical());
+    // A check naming the material in any other form refuses.
+    for other in [
+        zero.replace(r#""kind":"status""#, r#""kind":"performance""#),
+        zero.replace(r#""name":"tls-0""#, r#""name":"tls-x""#),
+        zero.replace(r#""name":"tls-0""#, r#""name":"cert-0""#),
+        zero.replace("2592000", "86400"),
+        zero.replace(r#""kind":"status""#, r#""kind":"status","retain":1"#),
+        mail.replace(
+            "/var/lib/td-mta/mail/frontend/runtime",
+            "/var/lib/td-mta/mail/tls",
+        ),
+    ] {
+        let text = notification(&[mail, &other]).to_canonical();
+        for exact in [true, false] {
+            assert!(
+                notification_config(&text, &dirs, exact, canonical).is_err(),
+                "{other}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_retired_checks_drop_in_directory_goes_once_only_the_fence_is_in_it() {
+    let scratch = td_fs::TempDir::new("mta-retired-dropins").unwrap();
+    let condition = fence_condition().unwrap();
+    let directory = scratch.path().join("td-mta-maint-tls-0.service.d");
+    assert_eq!(retire_dropins(&directory, &condition).unwrap(), None);
+    assert!(fence_only(&directory, &condition).unwrap());
+    fs::create_dir(&directory).unwrap();
+    assert!(fence_only(&directory, &condition).unwrap());
+    fs::write(directory.join(FENCE_DROPIN), &condition).unwrap();
+    assert!(fence_only(&directory, &condition).unwrap());
+    assert_eq!(retire_dropins(&directory, &condition).unwrap(), Some(true));
+    assert!(!directory.exists());
+    // Anything else stays, and so does its directory.
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join(FENCE_DROPIN), &condition).unwrap();
+    fs::write(directory.join("10-local.conf"), "[Service]\n").unwrap();
+    assert!(!fence_only(&directory, &condition).unwrap());
+    assert_eq!(retire_dropins(&directory, &condition).unwrap(), Some(false));
+    assert!(!directory.join(FENCE_DROPIN).exists());
+    assert!(directory.join("10-local.conf").exists());
+    fs::remove_file(directory.join("10-local.conf")).unwrap();
+    fs::write(directory.join(FENCE_DROPIN), "[Unit]\n").unwrap();
+    assert!(!fence_only(&directory, &condition).unwrap());
+    assert_eq!(retire_dropins(&directory, &condition).unwrap(), Some(false));
+    assert!(directory.join(FENCE_DROPIN).exists());
+}
+
+#[test]
+fn a_check_unit_is_judged_by_what_systemd_says_of_it_and_its_file() {
+    let unit = "td-mta-maint-tls-0.service";
+    let fence =
+        Path::new("/etc/systemd/system/td-mta-maint-tls-0.service.d/98-td-mta-deploy-fence.conf");
+    let link = "/etc/systemd/system/td-mta-maint-tls-0.service";
+    let props = |load: &str, fragment: &str, dropins: &str| {
+        format!("LoadState={load}\nFragmentPath={fragment}\nDropInPaths={dropins}\n")
+    };
+    let state = |props: &str, timer: bool, clean: bool| {
+        check_unit_state(unit, timer, props, fence, clean).map(|f| f.map(String::from))
+    };
+    assert_eq!(
+        state(&props("loaded", link, ""), false, true).unwrap(),
+        Some(link.to_string())
+    );
+    // The fence's own condition, left by a job that ended before its
+    // cleanup, is the one drop-in a check may have.
+    let fenced = props("loaded", link, fence.to_str().unwrap());
+    assert!(state(&fenced, false, true).unwrap().is_some());
+    assert!(state(&fenced, false, false).is_err());
+    assert!(state(&props("loaded", link, ""), false, false).is_err());
+    let other = format!(
+        "{} /etc/systemd/system/td-mta-maint-.service.d/10-x.conf",
+        fence.display()
+    );
+    assert!(state(&props("loaded", link, &other), false, true).is_err());
+    // A timer systemd does not find leaves the service to retire alone.
+    assert_eq!(
+        state(&props("not-found", "", ""), true, true).unwrap(),
+        None
+    );
+    for (load, fragment, timer) in [
+        ("not-found", "", false),
+        ("masked", "/dev/null", false),
+        ("masked", "/dev/null", true),
+        ("loaded", "", false),
+        ("error", link, true),
+    ] {
+        assert!(
+            state(&props(load, fragment, ""), timer, true).is_err(),
+            "{load} {timer}"
+        );
+    }
+    assert!(state("LoadState=loaded\nFragmentPath=/x\n", false, true).is_err());
+
+    let check = TlsCheck {
+        name: "td-mta-maint-tls-0".into(),
+        argv: openssl_check("/var/lib/td-mta/mail/tls/server.pem"),
+    };
+    let text = service_text(&check).unwrap();
+    let generated = Path::new("/opt/td-mta/share/td-mta/services/td-mta-maint-tls-0.service");
+    generated_check(unit, generated, text.as_bytes(), &text).unwrap();
+    assert!(generated_check(unit, generated, b"[Unit]\n", &text).is_err());
+    for elsewhere in [
+        "/etc/systemd/system/td-mta-maint-tls-0.service",
+        "/opt/td-mta/share/td-mta/services/td-mta-maint-tls-1.service",
+    ] {
+        assert!(generated_check(unit, Path::new(elsewhere), text.as_bytes(), &text).is_err());
+    }
+    let scm = "(use-modules (shepherd service))\n(register-services\n (service '(td-mta-maint-tls-0)\n  #:start (make-timer-constructor\n    (command '(\"/usr/bin/openssl\" \"x509\" \"-in\" \"/var/lib/td-mta/mail/tls/server.pem\" \"-noout\" \"-checkend\" \"2592000\")\n      #:directory \"/state\"))))\n";
+    schedule_check(&check, scm.as_bytes()).unwrap();
+    assert!(schedule_check(&check, scm.replace("2592000", "1").as_bytes()).is_err());
+    assert!(schedule_check(&check, scm.replace("tls-0)", "tls-1)").as_bytes()).is_err());
+}
+
+#[test]
+fn installer_numbers_name_at_most_thirty_two_checks() {
+    let dirs = checks::material_dirs(false).unwrap();
+    let check =
+        "/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -noout -checkend 2592000";
+    for (n, found) in [
+        ("0", true),
+        ("9", true),
+        ("31", true),
+        ("32", false),
+        ("99", false),
+        ("01", false),
+        ("", false),
+        ("+1", false),
+    ] {
+        let show = check_unit(&format!("td-mta-maint-tls-{n}.service"), &[exec(check)]);
+        assert_eq!(tls_checks(&show, &dirs).unwrap().len() == 1, found, "{n}");
+    }
 }

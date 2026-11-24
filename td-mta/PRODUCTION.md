@@ -670,7 +670,8 @@ records one.
 Rollback material stays for seven days after its last write: each
 earlier job directory under `/var/lib/td-mta-operator` (its receipt, the
 original data directory a migration left, uploaded closures, and the
-loopback TLS material and CA key the socket cutover moved there), and
+loopback TLS material, CA key and retired check units the socket
+cutover moved there), and
 each physical recovery copy under `/data/td-mta-physical-recovery` (base
 backup, WAL and `bootstrap.tar`; copies taken before the socket cutover
 hold the old TLS directory and its CA key). While td's server is
@@ -843,6 +844,54 @@ job directory under `/var/lib/td-mta-operator` keeps the replaced settings
 (`postgres-socket/original/`) and the retired TLS material, CA key
 included (`postgres-socket/retired/`), for the rollback window
 ([Retiring rollback material](#retiring-rollback-material)).
+
+The material it retires is `/var/lib/td-mta/mail/tls` and, with isolated
+services, each `/var/lib/td-mta-services/ROLE/tls`; the cutover retires
+the jobs that check it with it. Staging recognises each only in the form
+its generator wrote, and refuses before any fence on any other unit,
+health line or notification check that names the material, as on a
+job that names an unconverted connection file:
+
+- The operations installer's expiry checks `td-mta-maint-tls-N`: a
+  service running exactly `OPENSSL x509 -in FILE -noout -checkend
+  2592000` on a file directly in one of those directories, whose service
+  and timer files are byte for byte the installer's, in its prefix's
+  `share/td-mta/services`, with no drop-in but a fence's own condition,
+  and whose Shepherd definition beside them, if any, registers that
+  service and runs that command. Their timers stay stopped from the
+  fence on (`retired_timers_excluded`). After verification the job
+  disables them, moves their files, their Shepherd definitions and any
+  other generated unit file of the same name beside them (such as a
+  timer disabled by hand) into `retired/units` beside the renewal
+  job's (`retired_units`), and
+  removes the drop-in directory left beside each once it holds nothing
+  but the fence's condition (`retired_unit_dropins`; one holding
+  anything else stays, in `retired_unit_dropins_left`).
+- `td-mta-health.service`: its readiness drop-in becomes the socket
+  layout's, and the unit file itself loses exactly the two `openssl`
+  lines of the TLS aggregate (which the drop-in's `ExecStart=` already
+  overrode), every other line byte for byte.
+- The notification monitor's `tls-N` status checks of the same files:
+  `config.json` and `isolated.json` lose them
+  (`socket_notification_checks_dropped`). `isolated.json` must be as
+  the isolation helper writes it; `config.json`, which may carry the
+  operator's `alerts`, is written back in the installer's canonical
+  form, its other content unchanged.
+
+The unit file and the notification configurations are staged files, so
+the rollback before writer admission restores them; the retired units
+stay in the job directory for the rollback window. The receipt's
+`socket_retired_checks` names the checks. `install-td-mta
+--operations-services` refuses a `--tls-certificate` that names no
+file, so generating from the old options brings none of them back.
+
+Each refusal names the unit or file. To clear one, make it the form
+above or remove it by hand: disable and unlink a check that is not the
+installer's, drop a drop-in a check unit should not have, take a line
+naming the material out of the health unit, or remove the check from
+`config.json` and `isolated.json` (which stays the one compact line the
+isolation helper writes: `--refresh-notifications`, which derives it,
+refuses until the host is on the socket).
 
 ### Converge the configuration
 

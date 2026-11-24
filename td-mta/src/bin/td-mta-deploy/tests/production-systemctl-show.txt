@@ -1,0 +1,110 @@
+ExecStart={ path=/opt/td-mta/postgresql/usr/lib/postgresql/17/bin/postgres ; argv[]=/opt/td-mta/postgresql/usr/lib/postgresql/17/bin/postgres -D /var/lib/td-mta/mail/postgres -c config_file=/var/lib/td-mta/mail/postgresql.conf ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-postgres.service
+
+Id=td-mta-maint-notifications-digest.timer
+
+Id=td-mta-maint-notifications-monitor.timer
+
+Id=td-mta-maint-mail-relay.timer
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta status --json --require-ready --runtime /var/lib/td-mta/mail/receive/runtime ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642094 ; code=exited ; status=0 }
+Id=td-mta-maint-mail-receive.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta acme-status --connection-file /var/lib/td-mta/mail/runtime-connection --certificate-profile production --require-ready --minimum-validity-seconds 2592000 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-maint-acme-production.service
+
+Id=td-mta-maint-acme-production.timer
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta serve --connection-file /var/lib/td-mta/mail/runtime-connection --profile receive --runtime /var/lib/td-mta/mail/receive/runtime --scratch /var/lib/td-mta/mail/receive/scratch ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-receive.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta postgres blob-scrub-status --state-dir /var/lib/td-mta/integrity --epoch 0123456789abcdef0123456789abcdef ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-maint-scrub-status.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta postgres search-prepare-status --state-dir /var/lib/td-mta/search-index --epoch 0123456789abcdef0123456789abcdef ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-maint-search-status.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta-operator ; argv[]=/opt/td-mta/bin/td-mta-operator install-td-mta --backup --service-file /var/lib/td-mta/backup-control/service.conf --service td-mta-backup --destination /var/lib/td-mta/backups/scheduled --max-archive-bytes 1073741824 --max-total-bytes 4294967296 --retain 7 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-maint-backup.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta status --json --require-ready --runtime /var/lib/td-mta/mail/migadu/runtime ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642093 ; code=exited ; status=0 }
+Id=td-mta-maint-mail-migadu.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta postgres search-prepare --state-dir /var/lib/td-mta/search-index --epoch 0123456789abcdef0123456789abcdef --connection-file /var/lib/td-mta/mail/owner-connection ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:41 UTC] ; stop_time=[Tue 2026-11-24 17:05:41 UTC] ; pid=642372 ; code=exited ; status=0 }
+Id=td-mta-maint-search.service
+
+ExecStart={ path=/usr/bin/openssl ; argv[]=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -noout -checkend 2592000 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-maint-tls-1.service
+
+Id=td-mta-maint-backup.timer
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta serve --connection-file /var/lib/td-mta/mail/runtime-connection --profile relay --runtime /var/lib/td-mta/mail/relay/runtime --scratch /var/lib/td-mta/mail/relay/scratch ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-relay.service
+
+Id=td-mta-maint-postgres-tls-renew.timer
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta postgres blob-scrub --state-dir /var/lib/td-mta/integrity --epoch 0123456789abcdef0123456789abcdef --connection-file /var/lib/td-mta/mail/owner-connection ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:41 UTC] ; stop_time=[Tue 2026-11-24 17:05:41 UTC] ; pid=642371 ; code=exited ; status=0 }
+Id=td-mta-maint-scrub.service
+
+Id=td-mta-maint-tls-0.timer
+
+Id=td-mta-maint-backup-status.timer
+
+Id=td-mta-maint-scrub-status.timer
+
+Id=td-mta-maint-scrub.timer
+
+ExecStart={ path=/opt/td-mta/bin/td-mta-operator ; argv[]=/opt/td-mta/bin/td-mta-operator install-td-mta --postgres-tls-renew --tls-dir /var/lib/td-mta/mail/tls --data-dir /var/lib/td-mta/mail/postgres --postgres-bin /opt/td-mta/postgresql/usr/lib/postgresql/17/bin --openssl-bin /usr/bin/openssl --port 35432 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-maint-postgres-tls-renew.service
+
+Id=td-mta-maint-mail-frontend.timer
+
+ExecStart={ path=/usr/bin/systemctl ; argv[]=/usr/bin/systemctl --quiet is-active td-mta-postgres.service ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642115 ; code=exited ; status=0 }
+ExecStart={ path=/usr/bin/systemctl ; argv[]=/usr/bin/systemctl --quiet is-active td-mta-frontend.service ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642117 ; code=exited ; status=0 }
+ExecStart={ path=/usr/bin/systemctl ; argv[]=/usr/bin/systemctl --quiet is-active td-mta-receive.service ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642118 ; code=exited ; status=0 }
+ExecStart={ path=/usr/bin/systemctl ; argv[]=/usr/bin/systemctl --quiet is-active td-mta-relay.service ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642121 ; code=exited ; status=0 }
+ExecStart={ path=/usr/bin/systemctl ; argv[]=/usr/bin/systemctl --quiet is-active td-mta-acme-production.service ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642123 ; code=exited ; status=0 }
+ExecStart={ path=/usr/bin/openssl ; argv[]=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/server.pem -checkend 2592000 -noout ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642125 ; code=exited ; status=0 }
+ExecStart={ path=/usr/bin/openssl ; argv[]=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/ca.pem -checkend 2592000 -noout ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642126 ; code=exited ; status=0 }
+ExecStart={ path=/usr/bin/systemctl ; argv[]=/usr/bin/systemctl --quiet is-active td-mta-maint-backup.timer ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642128 ; code=exited ; status=0 }
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta acme-status --connection-file /var/lib/td-mta/mail/runtime-connection --certificate-profile production --require-ready --minimum-validity-seconds 2592000 ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642130 ; code=exited ; status=0 }
+ExecStart={ path=/opt/td-mta/bin/td-mta-backup-host ; argv[]=/opt/td-mta/bin/td-mta-backup-host install-td-mta --backup-status --destination /var/lib/td-mta/backups/scheduled --maximum-age-seconds 172800 ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642136 ; code=exited ; status=0 }
+ExecStart={ path=/usr/bin/systemctl ; argv[]=/usr/bin/systemctl --quiet is-active td-mta-migadu.service ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642139 ; code=exited ; status=0 }
+Id=td-mta-health.service
+
+Id=td-mta-maint-search-status.timer
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta serve --connection-file /var/lib/td-mta/mail/runtime-connection --profile migadu --runtime /var/lib/td-mta/mail/migadu/runtime --scratch /var/lib/td-mta/mail/migadu/scratch ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-migadu.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta-operator ; argv[]=/opt/td-mta/bin/td-mta-operator install-td-mta --backup-status --destination /var/lib/td-mta/backups/scheduled --maximum-age-seconds 172800 ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642091 ; code=exited ; status=0 }
+Id=td-mta-maint-backup-status.service
+
+Id=td-mta-maint-mail-receive.timer
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta status --json --require-ready --runtime /var/lib/td-mta/mail/relay/runtime ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642095 ; code=exited ; status=0 }
+Id=td-mta-maint-mail-relay.service
+
+Id=td-mta-health.timer
+
+ExecStart={ path=/usr/bin/openssl ; argv[]=/usr/bin/openssl x509 -in /var/lib/td-mta/mail/tls/server.pem -noout -checkend 2592000 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-maint-tls-0.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta-operator ; argv[]=/opt/td-mta/bin/td-mta-operator install-td-mta --notifications-digest --config-file /var/lib/td-mta/mail/.operations/notifications/isolated.json ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-maint-notifications-digest.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta status --json --require-ready --runtime /var/lib/td-mta/mail/frontend/runtime ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:38 UTC] ; stop_time=[Tue 2026-11-24 17:05:38 UTC] ; pid=642092 ; code=exited ; status=0 }
+Id=td-mta-maint-mail-frontend.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta-operator ; argv[]=/opt/td-mta/bin/td-mta-operator install-td-mta --notifications-monitor --config-file /var/lib/td-mta/mail/.operations/notifications/isolated.json ; ignore_errors=no ; start_time=[Tue 2026-11-24 17:05:41 UTC] ; stop_time=[Tue 2026-11-24 17:05:42 UTC] ; pid=642370 ; code=exited ; status=0 }
+Id=td-mta-maint-notifications-monitor.service
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta acme --connection-file /var/lib/td-mta/mail/runtime-connection --certificate-profile production --directory https://acme-v02.api.letsencrypt.org/directory --contact postmaster@example.org --bind 0.0.0.0:80 --accept-terms --name mx.example.org --name mx.example.net --name mx.example.com ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-acme-production.service
+
+Id=td-mta-maint-search.timer
+
+ExecStart={ path=/opt/td-mta/bin/td-mta ; argv[]=/opt/td-mta/bin/td-mta serve --connection-file /var/lib/td-mta/mail/runtime-connection --profile frontend --runtime /var/lib/td-mta/mail/frontend/runtime --scratch /var/lib/td-mta/mail/frontend/scratch ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Id=td-mta-frontend.service
+
+Id=td-mta-maint-tls-1.timer
