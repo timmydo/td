@@ -1,5 +1,5 @@
 //! Scalar wrapping with DOM-byte provenance. No retained glyph array.
-use crate::block::float::{units, Floats, View};
+use crate::block::float::{units, Floats, Item, Kind, View};
 use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
     cancelled, keyword, BoxId, Error, Limits, StyleId, StyledDocument, CANCEL_INTERVAL,
@@ -547,6 +547,9 @@ pub(crate) struct Flow<'s, 'd, 'm, M> {
     /// The floats of its formatting context and its block's content edges,
     /// where any may float beside its lines (DESIGN.md §5, "Floats").
     area: Option<Area<'m>>,
+    /// The items laid apart that it places, where it holds any: indices
+    /// met in it are into these.
+    items: Option<&'m mut BudgetVec<Item>>,
     /// The line's inset and room among those floats, and the nearest bottom
     /// of those beside it.
     inset: f64,
@@ -602,6 +605,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             below,
             y,
             area: None,
+            items: None,
             inset: 0.0,
             room: f64::from(width),
             beside: None,
@@ -615,8 +619,15 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         self.block = block;
         self
     }
+    /// The items laid apart for it, which those met in it index.
+    #[cold]
+    #[inline(never)]
+    pub fn nesting(&mut self, items: &'m mut BudgetVec<Item>) {
+        self.items = Some(items);
+    }
     /// Its lines take the room `floats` leave between the block's content
-    /// edges, `edges`, and it places the floats met in it.
+    /// edges, `edges`, and it places the floats met in it among the items
+    /// `nesting` gives it.
     #[cold]
     #[inline(never)]
     pub fn beside(
@@ -676,15 +687,16 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
             counters.admit_growth(unsettled)?;
             unsettled.try_push((index, self.pending.len()))?;
         }
-        let emitted = self.emitted;
-        let area = self.area.as_mut().ok_or(Error::Invalid)?;
-        let item = area.floats.items.get_mut(index).ok_or(Error::Invalid)?;
-        item.anchor = emitted;
+        let items = self.items.as_mut().ok_or(Error::Invalid)?;
+        let item = items.get_mut(index).ok_or(Error::Invalid)?;
+        item.anchor = self.emitted;
         let item = *item;
+        let Kind::Float { side, clear } = item.kind;
+        let area = self.area.as_mut().ok_or(Error::Invalid)?;
         let (x, top, room) = area.floats.place(
             (item.width, item.height),
-            item.side,
-            item.clear,
+            side,
+            clear,
             area.edges,
             y,
             counters,
@@ -703,10 +715,12 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
     }
     /// `items[index]` placed at `at`, and the line's room again.
     fn put(&mut self, index: usize, at: (f64, f64), counters: &mut Counters) -> Result<(), Error> {
-        let area = self.area.as_mut().ok_or(Error::Invalid)?;
-        let item = area.floats.items.get_mut(index).ok_or(Error::Invalid)?;
+        let items = self.items.as_mut().ok_or(Error::Invalid)?;
+        let item = items.get_mut(index).ok_or(Error::Invalid)?;
         item.placed = Some(at);
-        let (size, side) = ((item.width, item.height), item.side);
+        let size = (item.width, item.height);
+        let Kind::Float { side, .. } = item.kind;
+        let area = self.area.as_mut().ok_or(Error::Invalid)?;
         area.floats.add(at, size, side, counters)?;
         self.reband(counters)
     }
@@ -725,12 +739,14 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
         if let Some(mut waiting) = self.waiting.take() {
             for &index in waiting.iter() {
                 counters.step(1)?;
+                let items = self.items.as_ref().ok_or(Error::Invalid)?;
+                let item = *items.get(index).ok_or(Error::Invalid)?;
+                let Kind::Float { side, clear } = item.kind;
                 let area = self.area.as_mut().ok_or(Error::Invalid)?;
-                let item = *area.floats.items.get(index).ok_or(Error::Invalid)?;
                 let (x, top, _) = area.floats.place(
                     (item.width, item.height),
-                    item.side,
-                    item.clear,
+                    side,
+                    clear,
                     area.edges,
                     self.y,
                     counters,
@@ -1149,7 +1165,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
     #[cold]
     #[inline(never)]
     fn settle(&mut self, count: usize) {
-        let (Some(unsettled), Some(area)) = (self.unsettled.as_mut(), self.area.as_mut()) else {
+        let (Some(unsettled), Some(items)) = (self.unsettled.as_mut(), self.items.as_mut()) else {
             return;
         };
         let mut at = 0;
@@ -1160,7 +1176,7 @@ impl<'s, 'd, 'm, M: FontMetrics> Flow<'s, 'd, 'm, M> {
                 at += 1;
                 continue;
             }
-            if let Some(item) = area.floats.items.get_mut(index) {
+            if let Some(item) = items.get_mut(index) {
                 item.anchor = self.emitted;
             }
             let last = unsettled.len() - 1;

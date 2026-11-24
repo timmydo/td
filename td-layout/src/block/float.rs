@@ -1,7 +1,8 @@
 //! Floats (DESIGN.md §5, "Floats"): each open block formatting
 //! context's placed floats, the room they leave a line or a box at a y,
-//! and where a float of a size goes. Coordinates are flow coordinates,
-//! before relative offsets, as a block's container is.
+//! and where a float of a size goes; and the items an inline sequence
+//! lays apart to place. Coordinates are flow coordinates, before relative
+//! offsets, as a block's container is.
 use crate::inline::Counters;
 use crate::{Error, Side};
 use td_alloc::{Budget, BudgetVec};
@@ -102,16 +103,23 @@ impl Band {
     }
 }
 
-/// A float laid where its inline sequence starts, its margin box `width`
-/// (negative where its margins are) by `height` with its top left at
-/// `laid`, to be placed and its output, the ranges here, moved there,
-/// its lines after the `anchor`th line of its sequence.
+/// What a nested item is, and what placing it reads.
+#[derive(Clone, Copy)]
+pub(crate) enum Kind {
+    /// A float: the side it goes to and the floats it clears.
+    Float { side: Side, clear: Clear },
+}
+
+/// A box laid apart where its inline sequence starts (a float, of its
+/// `kind`): its margin box `width` (negative where its margins are) by
+/// `height` with its top left at `laid`, to be placed and its output,
+/// the ranges here, moved there, its lines after the `anchor`th line of
+/// its sequence.
 #[derive(Clone, Copy)]
 pub(crate) struct Item {
     pub width: f64,
     pub height: f64,
-    pub side: Side,
-    pub clear: Clear,
+    pub kind: Kind,
     pub laid: (f64, f64),
     pub placed: Option<(f64, f64)>,
     pub anchor: usize,
@@ -131,7 +139,6 @@ pub(crate) struct Floats {
     queued: BudgetVec<Placed>,
     started: [BudgetVec<Placed>; 2],
     contexts: BudgetVec<Context>,
-    pub items: BudgetVec<Item>,
 }
 
 impl Floats {
@@ -140,7 +147,6 @@ impl Floats {
             queued: BudgetVec::new(memory)?,
             started: [BudgetVec::new(memory)?, BudgetVec::new(memory)?],
             contexts: BudgetVec::new(memory)?,
-            items: BudgetVec::new(memory)?,
         })
     }
     /// A formatting context opens: its floats, until it closes, are the

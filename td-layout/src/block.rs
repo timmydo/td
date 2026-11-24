@@ -8,7 +8,7 @@ use crate::{
     float_side, keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument, TableRole,
     MAX_PAGE_BYTES,
 };
-use float::{units, Clear, Floats, Item, View};
+use float::{units, Clear, Floats, Item, Kind, View};
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use td_alloc::{Budget, BudgetVec};
@@ -252,6 +252,7 @@ pub fn layout_with_budget(
         filtered: (0, 0),
         tables: table::Scratch::new(memory)?,
         floats: Floats::new(memory)?,
+        nested: BudgetVec::new(memory)?,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -332,9 +333,11 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     filtered: (usize, usize),
     /// Tables' grids, a stack: a nested table's after its ancestors'.
     tables: table::Scratch,
-    /// The open formatting contexts' floats, and those laid and not yet
-    /// placed (DESIGN.md §5, "Floats").
+    /// The open formatting contexts' floats (DESIGN.md §5, "Floats").
     floats: Floats,
+    /// The boxes inline sequences laid apart and have not yet placed, a
+    /// stack: a nested sequence's after its ancestors' (§5, "Floats").
+    nested: BudgetVec<Item>,
     left: f64,
     top: f64,
     right: f64,
@@ -628,9 +631,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let floating = self.styled.has_floats()
             && (range.start..range.end).any(|at| matches!(events.get(at), Some(Event::Float(_))));
         let outermost = floating && self.retain == 0;
-        let base = self.floats.items.len();
+        let base = self.nested.len();
         if floating {
-            self.lay_floats(events, &range, place, run_y, outermost, depth)?;
+            self.lay_nested(events, &range, place, run_y, outermost, depth)?;
         }
         let sequence = self.lines.len();
         let before = self.counters.lines;
@@ -664,6 +667,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         )?
         .naming(block);
         if floating || (self.styled.has_floats() && self.floats.any()) {
+            if floating {
+                flow.nesting(&mut self.nested);
+            }
             flow.beside(
                 &mut self.floats,
                 (container.x, container.x + container.width),
@@ -741,7 +747,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         flow.finish(&mut self.counters, &mut sink)?;
         let end_y = flow.y;
         if floating {
-            self.place_floats(base, sequence, outermost)?;
+            self.place_nested(base, sequence, outermost)?;
         }
         if self.counters.lines != before {
             run.y = end_y;
@@ -868,7 +874,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// whatever the window until it ends.
     #[cold]
     #[inline(never)]
-    fn lay_floats(
+    fn lay_nested(
         &mut self,
         events: &Events,
         range: &Range<usize>,
@@ -893,10 +899,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// kept.
     #[cold]
     #[inline(never)]
-    fn place_floats(&mut self, base: usize, sequence: usize, outermost: bool) -> Result<(), Error> {
-        self.move_floats(base)?;
-        self.order_floats(base, sequence)?;
-        self.floats.items.truncate(base);
+    fn place_nested(&mut self, base: usize, sequence: usize, outermost: bool) -> Result<(), Error> {
+        self.move_nested(base)?;
+        self.order_nested(base, sequence)?;
+        self.nested.truncate(base);
         self.retain -= 1;
         if outermost {
             self.keep_window()?;
@@ -916,6 +922,26 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let side = float_side(style, b.kind).ok_or(Error::Invalid)?;
         let clear = Clear::of(keyword(style, Property::Clear));
         let dims = self.float_dimensions(id, &b, place, depth)?;
+        self.lay_item(id, dims, Kind::Float { side, clear }, place, y, depth)
+    }
+    /// Lays the box `id`, `dims` in its container, apart where an inline
+    /// sequence starting at `y` starts: its margin box's top left at the
+    /// container's left edge and `y`, no outside marker waiting for its
+    /// lines and none of them its container's first, its output and its
+    /// own overflow kept as an item of `kind` to be moved where the
+    /// sequence places it.
+    #[cold]
+    #[inline(never)]
+    fn lay_item(
+        &mut self,
+        id: BoxId,
+        dims: Dimensions,
+        kind: Kind,
+        place: &Place,
+        y: f64,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let b = *self.styled.box_node(id).ok_or(Error::Invalid)?;
         let decor = dims.decoration();
         let x = place.container.x;
         let (lines, markers, boxes) = (self.lines.len(), self.markers.len(), self.boxes.len());
@@ -951,12 +977,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             width: own.2 - own.0,
             height: own.3 - own.1,
         });
-        self.counters.admit_growth(&mut self.floats.items)?;
-        self.floats.items.try_push(Item {
+        self.counters.admit_growth(&mut self.nested)?;
+        self.nested.try_push(Item {
             width,
             height: height.max(0.0),
-            side,
-            clear,
+            kind,
             laid: (x, y),
             placed: None,
             anchor: 0,
@@ -1030,9 +1055,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// own overflow there.
     #[cold]
     #[inline(never)]
-    fn move_floats(&mut self, base: usize) -> Result<(), Error> {
-        for at in base..self.floats.items.len() {
-            let item = *self.floats.items.get(at).ok_or(Error::Invalid)?;
+    fn move_nested(&mut self, base: usize) -> Result<(), Error> {
+        for at in base..self.nested.len() {
+            let item = *self.nested.get(at).ok_or(Error::Invalid)?;
             let (x, y) = item.placed.ok_or(Error::Invalid)?;
             let (dx, dy) = (x - item.laid.0, y - item.laid.1);
             let (lines, boxes, markers) = (item.lines, item.boxes, item.markers);
@@ -1093,18 +1118,18 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// before any of its sequence moves nothing.
     #[cold]
     #[inline(never)]
-    fn order_floats(&mut self, base: usize, sequence: usize) -> Result<(), Error> {
+    fn order_nested(&mut self, base: usize, sequence: usize) -> Result<(), Error> {
         let count = self
             .lines
             .len()
             .checked_sub(sequence)
             .ok_or(Error::Invalid)?;
         let mut floor = 0;
-        for item in self.floats.items.get_mut(base..).ok_or(Error::Invalid)? {
+        for item in self.nested.get_mut(base..).ok_or(Error::Invalid)? {
             item.anchor = item.anchor.max(floor).min(count);
             floor = item.anchor;
         }
-        let items = self.floats.items.get(base..).ok_or(Error::Invalid)?;
+        let items = self.nested.get(base..).ok_or(Error::Invalid)?;
         let (Some(first), Some(last)) = (items.first(), items.last()) else {
             return Ok(());
         };
