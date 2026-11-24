@@ -2483,8 +2483,9 @@ order; each is its own design amendment when it starts:
   fetched from elsewhere, its links opened in the configured browser
   with their real target shown first, or with Shift held in the other
   one, which td's mail package makes td-web through the portal's
-  handler option (§7). To come: remote content only when asked for;
-  and its pages made off the window's thread.
+  handler option (§7), its pages made and its pictures decoded on a
+  thread of td-mail's own. To come: remote content only when asked
+  for.
 - **Primary selection**: the page's selection offered as the primary
   selection, and a middle click pasting it into the address row, once
   td-ui's widget window binds it and delivers the middle button.

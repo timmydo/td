@@ -122,13 +122,14 @@ steps down td-page's ladder: without its styles, then as its text, and
 at the least as td-mail's notice. HTML past the 512 KiB input limit is
 cut at it, as the text rendering cuts it. The status row says which of
 these happened, the limit, and that h shows the text rendering. A page
-is laid out on the window's thread when its message, the body's size or
-its scale changes, and is let go when the message view's body is
-anything else and before any text of a message is rendered: the view's
-own again for h or v, a reply's or forward's quotation, and a reply the
-list was asked for, which opening a message drops; so a page is never
-held beside a rendering. Under a draft composed from scratch, which
-renders nothing, the message view keeps its page. A
+is made on td-mail's page thread, never the window's ("Memory"), when
+its message, the body's size or its scale changes, the window showing
+the status row's `Laying out the HTML` until it comes, and is let go,
+or its making cancelled, when the message view's body is anything else
+and before any text of a message is rendered: the view's own again for
+h or v, a reply's or forward's quotation, and a reply the list was
+asked for, which opening a message drops. Under a draft composed from
+scratch, which renders nothing, the message view keeps its page. A
 page refused outright is said in the status row and not tried again
 until the message, the body or the scale changes. The CLI uses the text
 rendering.
@@ -801,10 +802,10 @@ Use a separate configured account name/cache for a local replica.
 
 ## Memory
 
-td's jail lets td-mail grow to 256 MiB before it throttles it
-(`memory-high`) and to 320 MiB before it ends it
+td's jail lets td-mail grow to 320 MiB before it throttles it
+(`memory-high`) and to 384 MiB before it ends it
 (`recipes/src/recipes/mail.rs`), room for the mailbox and the message
-beside a rendering's or a page's terms.
+beside a rendering's and a page's terms.
 td-mail renders a message's HTML as text, for the message view and for a
 reply's quotation, on the window's thread, one rendering at a time, within
 `compose::HTML_LIMITS`: the first 512 KiB of the HTML, and an 8 MiB
@@ -831,41 +832,55 @@ marks then carrying the target: it peaks 74 MB above the test's 2 MiB
 input. The window's prose faces hold, besides their bytes, an atlas page
 with its keys and shelves for each of three faces at the raster's size
 and td-ui's `prose::ATLAS` for every other size a page draws, 21.5 MB
-at most, so 148 to 193 MB in all, under 256 MiB (268 MB) at either size,
-which leaves 75 to 120 MB for the mailbox and the message itself. A test holds
+at most, so 148 to 193 MB in all, under 320 MiB (335 MB) at either
+size, which leaves the rest, after a page's terms below, for the mailbox
+and the message itself. A test holds
 `HTML_LIMITS` to td-html's rule (100 bytes a byte of input, 1.25 a byte
 of budget) beside the larger baseline, the faces' glyphs and the view's
 kept text; those figures and the jail's are copied by hand, and reviewed
 when `mail.rs` or the limits change.
 
-A message shown as its page keeps the page, its budget at most, beside
-the view's kept text, and never beside a rendering: the view lets the
-page go first. The same test holds the larger of a rendering and the
-budget to the jail. What a page's layout holds beyond its budget,
-td-layout's uncharged working memory, the rule does not model; it has
-the 29 MB by which a rendering's term exceeds the budget, and is held
-by measurement: release build, at 2880x1800 in the prose faces, each
+A message's pages are made, laid out again and its pictures decoded on
+a thread of their own, td-mail's page thread (`ui::worker`), one job at
+a time, so the window goes on painting while they are: the frame that
+asks waits up to 40 ms, so an ordinary message shows at once, and past
+that shows the status row's `Laying out the HTML` until the page comes,
+the poll quickening to 20 ms meanwhile. A job let go first, as before a
+text renders or for another message, gives up its copy of the HTML at
+once, is cancelled between td-page's steps, and its answer is dropped
+there, never shown. The allocator gives that thread an arena
+of its own, which keeps its peak beside the window's: so the same test
+holds a rendering and a page's budget together to the jail, with what a
+page's layout holds beyond its budget, td-layout's uncharged working
+memory, which the rule does not model but holds at 25 MB, within the 29
+MB by which a rendering's term exceeds the budget, and which is held by
+measurement: release build, at 2880x1800 in the prose faces, each
 hostile shape at the input limit and each cut to the most of it whose
 page fits the budget, opened in the view, laid out as its page, then
-quoted for a reply, one shape a process (`ui::page` test
-`measure_pages`). Making a page added at most 19 MB of resident memory
-to the view's, for a fill of pictures' alternative text, and the
-costliest page laid whole came to 32 MB in all. The costliest whole is
-the open paragraphs in quotes above, whose page falls to its text, at
-about 69 MB in all, within the rule's 79.7 MB for the kept text and a
-rendering. A 100 KiB newsletter of nested tables and inline styles uses
-1.5 MiB of the budget and is laid out in 19 ms. The ladder's steps take
+quoted for a reply, one shape a process, the page made on the page
+thread (`ui::page` test `measure_pages`). Making a page added at most
+23 MB of resident memory to the view's, for nested tables, and at most
+17 MB beyond the budget it used, for styled divs whose page steps down
+to its text; the costliest page laid whole came to 36 MB in all. The
+costliest whole is the open paragraphs in quotes above, whose page
+falls to its text, at about 83 MB in all, the reply's rendering no
+longer reusing heap the page let go, within the rule's 138 MB for the
+kept text, a rendering, a page and its layout. A 100 KiB newsletter of
+nested tables and inline styles uses 1.5 MiB of the budget and is laid
+out in 21 ms. The ladder's steps take
 up to 2 s on this host for hostile shapes (a table, empty paragraphs),
-on the window's thread, and the jail's CPU share of half a core may
-double that: a known cost until pages are made off it. A message's
+and the jail's CPU share of half a core may double that, on the page
+thread, the window meanwhile showing the status row's note. A message's
 pictures are held beside its page: 24 MiB for those decoded, each
 decoding's peak charged there before it begins, 16 MiB for the copies
 fitted to their boxes, and one 2 MiB body, the one fetch asked at a
-time, which the same rule counts (`compose` test
-`the_html_limits_fit_the_jail`). They are decoded on the window's
-thread too, and each that comes makes the page again there, its
-markup parsed and laid, then laid with its pictures: a page with
-pictures costs about twice one without, once for each picture.
+time, held twice while the page thread takes a copy to decode, which
+the same rule counts (`compose` test `the_html_limits_fit_the_jail`).
+Each that an `img` of the shown page names lays it out again on the
+page thread, the old layout kept beside the new within the page's
+budget and shown until it comes; refused there, the pages are made
+again whole for it and any after, the old let go first, and put back
+where they were read.
 
 A message is fetched whole, its body values included, to the fetch
 service's 64 MiB ceiling; these limits bound what rendering it costs,

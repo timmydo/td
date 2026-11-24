@@ -4,7 +4,7 @@ use crate::jmap::types::{Email, Mailbox};
 use crate::rules;
 use crate::ui::input::Key;
 use crate::ui::page::{Held, Paged};
-use crate::ui::pictures::{self, Pictures};
+use crate::ui::pictures::{self, Answered, Pictures};
 use crate::ui::views::{
     strip_newlines, text_scroll, wrap_text, Body, Row, Scene, Scroll, View, ViewAction,
 };
@@ -1286,6 +1286,44 @@ impl View for EmailView {
         }
     }
 
+    fn poll_work(&mut self) -> bool {
+        let page = self.page.poll();
+        let decoded = self.pictures.as_mut().and_then(Pictures::poll);
+        if decoded.is_some() {
+            self.ask_next_picture();
+        }
+        // A picture kept lays the shown message out again; one for a
+        // message the view has moved on from waits for it.
+        let shown = self
+            .pictures
+            .as_ref()
+            .is_some_and(|pictures| pictures.of_email(&self.email_id));
+        page || (decoded == Some(true) && shown)
+    }
+
+    fn working(&self) -> bool {
+        self.page.working() || self.pictures.as_ref().is_some_and(Pictures::decoding)
+    }
+
+    #[cfg(test)]
+    fn wait_work(&self) {
+        self.page.wait_ready();
+        if let Some(pictures) = self.pictures.as_ref() {
+            pictures.wait_decoded();
+        }
+    }
+
+    #[cfg(test)]
+    fn settle_work(&mut self) -> bool {
+        let working = self.working();
+        self.page.settle();
+        if let Some(pictures) = self.pictures.as_ref() {
+            pictures.wait_decoded();
+        }
+        self.poll_work();
+        working
+    }
+
     fn lay_out_page(&mut self, rect: Option<Rect>, scale: Scale, faces: Option<&Faces>) {
         let html = if self.page_as_text {
             None
@@ -1354,16 +1392,17 @@ impl View for EmailView {
                 result,
             } => {
                 let body = result.as_ref().ok().map(Vec::as_slice);
-                let Some(kept) = self
+                let answered = self
                     .pictures
                     .as_mut()
                     .filter(|pictures| pictures.of_email(email_id))
-                    .and_then(|pictures| pictures.answered(blob_id, body))
-                else {
-                    return false;
-                };
-                self.ask_next_picture();
-                kept && *email_id == self.email_id
+                    .map(|pictures| pictures.answered(blob_id, body));
+                // A body decodes on the page thread; the next is asked for
+                // once it has (`poll_work`), so one is held at a time.
+                if answered == Some(Answered::Next) {
+                    self.ask_next_picture();
+                }
+                false
             }
             BackendResponse::EmailForReply { id, result } if *id == self.email_id => {
                 let reply_all = self.pending_reply_all.take();
@@ -1679,17 +1718,19 @@ mod tests {
             });
         }
         assert_eq!(asked_pictures(&cmd_rx), asked("blob-2"));
-        let came = |view: &mut EmailView, email: &str, blob: &str, body: &[u8]| {
-            view.on_response(&BackendResponse::PictureFetched {
-                email_id: email.to_string(),
-                blob_id: blob.to_string(),
-                result: Ok(body.to_vec()),
-            })
-        };
+        let came = picture_came;
         let png = crate::ui::pictures::tests::png(4, 4);
         assert!(!came(&mut view, "e2", "blob-2", &png));
         assert!(asked_pictures(&cmd_rx).is_empty());
-        assert!(!came(&mut view, "e1", "blob-2", b"not a picture"));
+        // The next part is asked for only once the body has decoded.
+        assert!(!view.on_response(&BackendResponse::PictureFetched {
+            email_id: "e1".to_string(),
+            blob_id: "blob-2".to_string(),
+            result: Ok(b"not a picture".to_vec()),
+        }));
+        assert!(asked_pictures(&cmd_rx).is_empty());
+        view.wait_work();
+        assert!(!view.poll_work());
         assert_eq!(asked_pictures(&cmd_rx), asked("blob-4"));
         assert!(came(&mut view, "e1", "blob-4", &png));
         assert!(asked_pictures(&cmd_rx).is_empty());
@@ -1719,13 +1760,7 @@ mod tests {
         assert_eq!(asked_pictures(&cmd_rx), asked("blob-2"));
         view.email_id = "e2".to_string();
         let png = crate::ui::pictures::tests::png(4, 4);
-        let came = |view: &mut EmailView, blob: &str| {
-            view.on_response(&BackendResponse::PictureFetched {
-                email_id: "e1".to_string(),
-                blob_id: blob.to_string(),
-                result: Ok(png.clone()),
-            })
-        };
+        let came = |view: &mut EmailView, blob: &str| picture_came(view, "e1", blob, &png);
         assert!(!came(&mut view, "blob-2"));
         assert_eq!(asked_pictures(&cmd_rx), asked("blob-4"));
         view.email_id = "e1".to_string();
@@ -1822,7 +1857,22 @@ mod tests {
     /// The view's pages, laid out for `RECT` as the session lays them.
     fn held(view: &mut EmailView) -> bool {
         view.lay_out_page(Some(RECT), Scale::default(), None);
+        view.settle_work();
         view.page().and_then(Held::get).is_some()
+    }
+
+    /// A part's body come for message `email`, its decoding waited for:
+    /// whether the view redraws.
+    fn picture_came(view: &mut EmailView, email: &str, blob: &str, body: &[u8]) -> bool {
+        let answered = view.on_response(&BackendResponse::PictureFetched {
+            email_id: email.to_string(),
+            blob_id: blob.to_string(),
+            result: Ok(body.to_vec()),
+        });
+        if let Some(pictures) = view.pictures.as_ref() {
+            pictures.wait_decoded();
+        }
+        answered | view.poll_work()
     }
 
     /// The view lets its pages go before it renders a text: a reply's

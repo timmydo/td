@@ -5,31 +5,56 @@
 //! and above it td-mail's own text of the headers and the
 //! attachments, a page of its own the message's styles cannot reach,
 //! under a rule td-mail draws. The two scroll as one document. Both are
-//! made on the window's thread within one budget, laid out again when
-//! the body's size changes, and let go by the view before it renders a
-//! text, so a page is never held beside a rendering.
+//! made on td-mail's page thread (`ui::worker`) within one budget, made
+//! again when the body's size changes, laid out again there for the
+//! pictures that come while shown, and let go, or their making
+//! cancelled, by the view before it renders a text.
 
 use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
-use crate::ui::pictures::{self, Pictures};
+use crate::ui::pictures::{self, Come, Pictures};
+use crate::ui::worker::{self, Job, Pending, Taken};
 use td_alloc::{Budget, BudgetShared, BudgetString, BudgetVec};
 use td_page::fonts::Measure;
 use td_page::inline::Set;
 use td_page::page::{Laid, Want};
 use td_page::paint::{self, Frame, Marks, Scratch};
 use td_page::pipeline::{self, Again, Page, Refusal};
+use td_page::tree::Tree;
 use td_page::view::{Pane, View};
 use td_ui::prose::{Faces, Metrics};
 use td_ui::raster::{Draw, Primitive, Rect, Scale, TextFamily, BORDER, PAPER};
+
+/// The pictures come that `tree`'s `img`s name by their `cid:` URLs, by
+/// node, charged to the page's `budget`, and how many: none when none is
+/// named or td-alloc refuses.
+fn set_of(tree: &Tree, budget: &Budget, pictures: &Come) -> Option<(Set, u32)> {
+    let mut shown = BudgetVec::new(budget).ok()?;
+    for &node in tree.pictures() {
+        let Some(inline) = tree.src(node).and_then(|src| pictures.named(src)) else {
+            continue;
+        };
+        shown
+            .try_push((node.index(), inline.try_clone().ok()?))
+            .ok()?;
+    }
+    let laid = u32::try_from(shown.as_slice().len()).ok()?;
+    (laid > 0).then_some(())?;
+    Some((
+        Set::new(shown, pictures.fitted(), pictures::FIT_WORK).ok()?,
+        laid,
+    ))
+}
 
 /// `page` laid again with the pictures come for its `img`s' `cid:` URLs;
 /// as it was when none is named. Refused with them, it is laid again
 /// without them at its rung; refused so, it steps down td-page's ladder.
 fn with_pictures(
     page: Page,
-    pictures: Option<&Pictures>,
+    pictures: Option<&Come>,
     want: Want,
     measure: &mut Measure,
     cancel: &AtomicBool,
@@ -37,24 +62,7 @@ fn with_pictures(
     let Some(pictures) = pictures.filter(|pictures| pictures.count() > 0) else {
         return Ok(page);
     };
-    let set = (|| {
-        let mut shown = BudgetVec::new(&page.budget).ok()?;
-        for &node in page.tree.pictures() {
-            let Some(inline) = page.tree.src(node).and_then(|src| pictures.named(src)) else {
-                continue;
-            };
-            shown
-                .try_push((node.index(), inline.try_clone().ok()?))
-                .ok()?;
-        }
-        let laid = u32::try_from(shown.as_slice().len()).ok()?;
-        (laid > 0).then_some(())?;
-        Some((
-            Set::new(shown, pictures.fitted(), pictures::FIT_WORK).ok()?,
-            laid,
-        ))
-    })();
-    let Some((set, laid)) = set else {
+    let Some((set, laid)) = set_of(&page.tree, &page.budget, pictures) else {
         return Ok(page);
     };
     let Page {
@@ -93,6 +101,63 @@ fn with_pictures(
         Ok(page) => Ok(page),
         Err(Refusal::Cancelled) => Err(Refusal::Cancelled),
         Err(Refusal::Limit(_)) => pipeline::again(parts(None, want, false)?, measure, cancel),
+    }
+}
+
+/// A message's pages to make on the page thread (`Paged::build`).
+pub struct MakeJob {
+    key: String,
+    head: String,
+    /// The HTML as far as td-mail reads it, and whether it was cut there.
+    markup: String,
+    cut: bool,
+    rect: Rect,
+    scale: Scale,
+    faces: Option<Faces>,
+    limit: usize,
+    pictures: Option<Come>,
+}
+
+impl MakeJob {
+    pub fn run(self, cancel: &AtomicBool) -> Option<Paged> {
+        Paged::build(
+            &self.key,
+            &self.head,
+            &self.markup,
+            self.cut,
+            self.rect,
+            self.scale,
+            self.faces.as_ref(),
+            self.limit,
+            self.pictures.as_ref(),
+            cancel,
+        )
+    }
+}
+
+/// A shown page to lay out again with the pictures come since, on the
+/// page thread, its old layout kept beside the new within the page's
+/// budget while the window paints it; refused so, the refusal.
+pub struct LayJob {
+    again: Again,
+    pictures: Come,
+    faces: Option<Faces>,
+    scale: Scale,
+}
+
+impl LayJob {
+    pub fn run(self, cancel: &AtomicBool) -> Result<Page, Refusal> {
+        let metrics = Metrics::new(self.faces.as_ref(), self.scale);
+        let mut measure = Measure::new(metrics, TextFamily::Sans);
+        let mut again = self.again;
+        let (set, laid) =
+            set_of(&again.tree, &again.budget, &self.pictures).ok_or(Refusal::Limit("memory"))?;
+        again.pictures = Some(set);
+        again.want = Want {
+            pictures: laid,
+            ..again.want
+        };
+        pipeline::again(again, &mut measure, cancel)
     }
 }
 
@@ -219,6 +284,9 @@ pub struct Paged {
     scratch: RefCell<Scratch>,
     /// The pages' budget, their parent: let go after them.
     budget: Budget,
+    /// The thread they were made on.
+    #[cfg(test)]
+    made_on: Option<String>,
 }
 
 fn want(rect: Rect, scale: i64) -> Option<Want> {
@@ -234,10 +302,9 @@ fn want(rect: Rect, scale: i64) -> Option<Want> {
 }
 
 impl Paged {
-    /// The message whose view names it `key`: `head` as td-mail's text,
-    /// `html` as its page, laid out for `rect` at `scale` over `faces`
-    /// within a budget of `limit` bytes, with the `pictures` come. None
-    /// when td-alloc refuses even the head's.
+    /// `build`'s pages for `html`, as far as td-mail reads it, on this
+    /// thread: the tests'.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn make(
         key: &str,
@@ -249,22 +316,55 @@ impl Paged {
         limit: usize,
         pictures: Option<&Pictures>,
     ) -> Option<Self> {
+        let markup = crate::compose::HTML_LIMITS.read(html);
+        let come = pictures.and_then(Pictures::come);
+        let cancel = AtomicBool::new(false);
+        Self::build(
+            key,
+            head,
+            markup,
+            markup.len() < html.len(),
+            rect,
+            scale,
+            faces,
+            limit,
+            come.as_ref(),
+            &cancel,
+        )
+    }
+
+    /// The message whose view names it `key`: `head` as td-mail's text,
+    /// `markup` as its page (`cut` at td-mail's input limit), laid out for
+    /// `rect` at `scale` over `faces` within a budget of `limit` bytes,
+    /// with the `pictures` come. None when td-alloc refuses even the
+    /// head's, or when `cancel` is raised.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        key: &str,
+        head: &str,
+        markup: &str,
+        cut: bool,
+        rect: Rect,
+        scale: Scale,
+        faces: Option<&Faces>,
+        limit: usize,
+        pictures: Option<&Come>,
+        cancel: &AtomicBool,
+    ) -> Option<Self> {
         let s = i64::try_from(scale.value()).ok()?.max(1);
         let want = want(rect, s)?;
         let budget = Budget::new(limit).ok()?;
         let metrics = Metrics::new(faces, scale);
         let line = i64::from(metrics.line().height.max(1));
         let mut measure = Measure::new(metrics, TextFamily::Sans);
-        let cancel = AtomicBool::new(false);
-        let head_page = pipeline::text_page(head, want, &mut measure, &cancel, &budget).ok()?;
+        let head_page = pipeline::text_page(head, want, &mut measure, cancel, &budget).ok()?;
         let head_height = head_page.laid.as_deref().map_or(0, |laid| bottom(laid, s));
-        let markup = crate::compose::HTML_LIMITS.read(html);
         let page = BudgetString::copy(&budget, markup)
             .ok()
             .and_then(|markup| BudgetShared::new(&budget, markup).ok());
         let made = match page {
-            Some(markup) => pipeline::markup_page(markup, want, &mut measure, &cancel, &budget)
-                .and_then(|page| with_pictures(page, pictures, want, &mut measure, &cancel)),
+            Some(markup) => pipeline::markup_page(markup, want, &mut measure, cancel, &budget)
+                .and_then(|page| with_pictures(page, pictures, want, &mut measure, cancel)),
             None => Err(Refusal::Limit("memory")),
         };
         let (page, refused) = match made {
@@ -272,7 +372,7 @@ impl Paged {
             Err(Refusal::Limit(name)) => {
                 let notice = "This message's HTML is past what td-mail lays out; \
                               h shows it as text.";
-                let own = pipeline::own_page(notice, want, &mut measure, &cancel, &budget).ok()?;
+                let own = pipeline::own_page(notice, want, &mut measure, cancel, &budget).ok()?;
                 (own, Some(name))
             }
             Err(Refusal::Cancelled) => return None,
@@ -292,12 +392,14 @@ impl Paged {
             pointer: None,
             stepped: false,
             named: false,
-            cut: markup.len() < html.len(),
-            pictures: pictures.map_or(0, Pictures::count),
+            cut,
+            pictures: pictures.map_or(0, Come::count),
             refused,
             measure: RefCell::new(measure),
             scratch: RefCell::new(Scratch::new_empty()),
             budget,
+            #[cfg(test)]
+            made_on: std::thread::current().name().map(str::to_string),
         })
     }
 
@@ -649,13 +751,76 @@ impl Paged {
     }
 }
 
-/// A view's pages while its body is one, and the frame they were last
-/// refused for, which is not tried again until the key, the body or the
-/// scale changes.
-#[derive(Default)]
+/// A view's pages while its body is one, the pages asked of the page
+/// thread, and the frame they were last refused for, which is not tried
+/// again until the key, the body or the scale changes.
 pub struct Held {
     paged: Option<Paged>,
-    refused: Option<(u64, Rect, usize)>,
+    refused: Option<Tried>,
+    asked: Option<Asked>,
+    /// The frame whose pictures were refused beside its shown layout:
+    /// its pages are made again whole for any more, the old let go first,
+    /// rather than laid again to the same refusal.
+    beside: Option<Tried>,
+    /// How long a frame waits for the pages it asks (`IN_FRAME`).
+    in_frame: Duration,
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Self {
+            paged: None,
+            refused: None,
+            asked: None,
+            beside: None,
+            in_frame: IN_FRAME,
+        }
+    }
+}
+
+/// A key (and for `tried`, the pictures come) hashed, the body and the
+/// scale.
+type Tried = (u64, Rect, usize);
+
+/// How long a frame waits for the pages it asked, so a message laid out
+/// in less is shown in the frame that asked, not after a blank one.
+#[cfg(not(test))]
+const IN_FRAME: Duration = Duration::from_millis(40);
+/// The tests see every answer come after the frame that asked, as a slow
+/// page's does; `pages_come_in_the_frame_that_asked` waits.
+#[cfg(test)]
+const IN_FRAME: Duration = Duration::ZERO;
+
+struct Asked {
+    tried: Tried,
+    /// The frame, its key hashed without the pictures come.
+    frame: Tried,
+    job: Asking,
+}
+
+/// Where the pages made again whole for the same frame were read: scroll,
+/// focused link, whether a key stepped it, and the pointer.
+type Place = (i64, Option<usize>, bool, Option<(i64, i64)>);
+
+enum Asking {
+    /// Pages made whole, the old let go, put back where they were read
+    /// when they are the same frame's.
+    Make(Pending<MakeJob, Option<Paged>>, Option<Place>),
+    /// The shown page laid out again with `come` pictures.
+    Lay(Pending<LayJob, Result<Page, Refusal>>, usize),
+}
+
+fn frame(key: &str, rect: Rect, scale: Scale) -> Tried {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish(), rect, scale.value())
+}
+
+/// Whether an `img` in `tree` names one of the pictures come.
+fn names_any(tree: &Tree, come: &Come) -> bool {
+    tree.pictures()
+        .iter()
+        .any(|&node| tree.src(node).is_some_and(|src| come.named(src).is_some()))
 }
 
 impl Held {
@@ -667,15 +832,25 @@ impl Held {
         self.paged.as_mut()
     }
 
-    /// Let go, before a text is rendered or when the body is no page.
+    /// Let go, before a text is rendered or when the body is no page: a
+    /// job asked is cancelled.
     pub fn clear(&mut self) {
+        self.asked = None;
         self.paged = None;
         self.refused = None;
+        self.beside = None;
     }
 
-    /// `Paged::make`'s pages for `key` at `rect` and `scale`, unless it holds
-    /// them already or they were refused there; the old pages go before
-    /// the new are made.
+    /// Whether pages are asked of the page thread and not yet come.
+    pub fn working(&self) -> bool {
+        self.asked.is_some()
+    }
+
+    /// Asks the page thread for the pages for `key` at `rect` and `scale`,
+    /// unless it holds them, has asked for them, or they were refused
+    /// there. Pages for another frame are made whole, the old let go
+    /// first; for pictures come since, the shown page is laid out again,
+    /// shown meanwhile.
     #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
@@ -703,41 +878,234 @@ impl Held {
         limit: usize,
         pictures: Option<&Pictures>,
     ) {
-        let come = pictures.map_or(0, Pictures::count);
+        let count = pictures.map_or(0, Pictures::count);
         let same = self.get().filter(|paged| paged.is(key, rect, scale));
-        if same.is_some_and(|paged| paged.pictures == come) {
+        if same.is_some_and(|paged| paged.pictures == count) {
             return;
         }
-        // Made again for a picture come, it stays where it was read, its
-        // focused link still focused: the same HTML has the same links.
-        let kept = same.map(|paged| (paged.y, paged.focus, paged.stepped, paged.pointer));
+        let laid = same.is_some();
+        let frame = frame(key, rect, scale);
+        // Where the frame's pages were read: the shown ones', or those a
+        // remake of the same frame still asked carries.
+        let place = same
+            .map(|paged| (paged.y, paged.focus, paged.stepped, paged.pointer))
+            .or_else(|| match self.asked.as_ref() {
+                Some(Asked {
+                    frame: asked,
+                    job: Asking::Make(_, place),
+                    ..
+                }) if *asked == frame => *place,
+                _ => None,
+            });
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        come.hash(&mut hasher);
+        count.hash(&mut hasher);
         let tried = (hasher.finish(), rect, scale.value());
-        if self.refused == Some(tried) {
+        if self.refused == Some(tried) || self.asked.as_ref().is_some_and(|a| a.tried == tried) {
             return;
         }
-        self.paged = None;
-        self.paged = Paged::make(key, head, html, rect, scale, faces, limit, pictures);
-        if let Some((paged, (y, focus, stepped, pointer))) = self.paged.as_mut().zip(kept) {
-            paged.pointer = pointer;
-            paged.y = y.clamp(0, paged.most());
-            let links = paged
-                .page
-                .laid
-                .as_deref()
-                .map_or(0, |laid| laid.links().len());
-            paged.focus = focus.filter(|&at| at < links);
-            paged.stepped = stepped && paged.focus.is_some();
+        self.asked = None;
+        let mut come = pictures.and_then(Pictures::come);
+        if let Some(paged) = self.paged.as_mut().filter(|_| laid) {
+            // Pictures come that no `img` of the shown page names (a
+            // background's, a link's, or the page stepped down to its
+            // text) change nothing it lays.
+            let named = come
+                .as_ref()
+                .is_some_and(|come| names_any(&paged.page.tree, come));
+            if !named {
+                paged.pictures = count;
+                return;
+            }
         }
-        self.refused = self.paged.is_none().then_some(tried);
+        if laid && self.beside != Some(frame) {
+            if let Some(pending) = come.take().and_then(|come| self.lay(come, faces, scale)) {
+                self.asked = Some(Asked {
+                    tried,
+                    frame,
+                    job: Asking::Lay(pending, count),
+                });
+                self.wait_in_frame();
+                // Refused beside within the frame's wait, the pages are
+                // made whole now: no later frame is asked for.
+                if self.asked.is_some() || self.beside != Some(frame) {
+                    return;
+                }
+            }
+        }
+        self.paged = None;
+        let markup = crate::compose::HTML_LIMITS.read(html);
+        let job = (|| {
+            Some(MakeJob {
+                key: td_alloc::string(key).ok()?,
+                head: td_alloc::string(head).ok()?,
+                markup: td_alloc::string(markup).ok()?,
+                cut: markup.len() < html.len(),
+                rect,
+                scale,
+                faces: faces.cloned(),
+                limit,
+                pictures: come.or_else(|| pictures.and_then(Pictures::come)),
+            })
+        })();
+        match job.and_then(|job| worker::ask(job, Job::Make)) {
+            Some(pending) => {
+                self.asked = Some(Asked {
+                    tried,
+                    frame,
+                    job: Asking::Make(pending, place),
+                });
+                self.wait_in_frame();
+            }
+            None => self.refused = Some(tried),
+        }
+    }
+
+    /// Waits `IN_FRAME` at most for the job just asked, and takes its
+    /// answer if it came.
+    fn wait_in_frame(&mut self) {
+        if self.in_frame.is_zero() {
+            return;
+        }
+        match self.asked.as_ref().map(|asked| &asked.job) {
+            Some(Asking::Make(pending, _)) => pending.wait_for(self.in_frame),
+            Some(Asking::Lay(pending, _)) => pending.wait_for(self.in_frame),
+            None => return,
+        }
+        self.poll();
+    }
+
+    /// Asks for the shown page laid out again with the pictures `come`.
+    fn lay(
+        &self,
+        come: Come,
+        faces: Option<&Faces>,
+        scale: Scale,
+    ) -> Option<Pending<LayJob, Result<Page, Refusal>>> {
+        let paged = self.paged.as_ref()?;
+        let page = &paged.page;
+        let old = page.laid.as_ref()?.try_clone().ok()?;
+        let want = old.want;
+        let again = Again {
+            tree: page.tree.try_clone().ok()?,
+            markup: page
+                .markup
+                .as_ref()
+                .map(BudgetShared::try_clone)
+                .transpose()
+                .ok()?,
+            sheets: page
+                .sheets
+                .as_ref()
+                .map(BudgetShared::try_clone)
+                .transpose()
+                .ok()?,
+            rung: page.rung,
+            notes: page.notes,
+            budget: page.budget.try_clone().ok()?,
+            old: Some(old),
+            keep: true,
+            want,
+            pictures: None,
+        };
+        let job = LayJob {
+            again,
+            pictures: come,
+            faces: faces.cloned(),
+            scale,
+        };
+        worker::ask(job, Job::Lay)
+    }
+
+    /// Takes what the page thread has answered: whether the pages shown
+    /// changed, or what the status row says of them.
+    pub fn poll(&mut self) -> bool {
+        let Some(asked) = self.asked.as_ref() else {
+            return false;
+        };
+        let (tried, frame) = (asked.tried, asked.frame);
+        match &asked.job {
+            Asking::Make(pending, place) => {
+                let place = *place;
+                let made = match pending.take() {
+                    Taken::Waiting => return false,
+                    Taken::Done(made) => made,
+                    Taken::Lost => None,
+                };
+                self.asked = None;
+                self.refused = made.is_none().then_some(tried);
+                self.paged = made;
+                // Made again whole for the same frame, the pages are put
+                // back where they were read: the same HTML, the same links.
+                if let Some((paged, (y, focus, stepped, pointer))) = self.paged.as_mut().zip(place)
+                {
+                    paged.y = y.clamp(0, paged.most());
+                    let links = paged
+                        .page
+                        .laid
+                        .as_deref()
+                        .map_or(0, |laid| laid.links().len());
+                    paged.focus = focus.filter(|&at| at < links);
+                    paged.stepped = stepped && paged.focus.is_some();
+                    paged.pointer = pointer;
+                }
+                true
+            }
+            Asking::Lay(pending, come) => {
+                let come = *come;
+                let laid = match pending.take() {
+                    Taken::Waiting => return false,
+                    Taken::Done(laid) => laid,
+                    Taken::Lost => Err(Refusal::Limit("lost")),
+                };
+                self.asked = None;
+                let shown = self.paged.as_mut().filter(|paged| {
+                    laid.as_ref()
+                        .is_ok_and(|page| BudgetShared::ptr_eq(&page.tree, &paged.page.tree))
+                });
+                match (shown, laid) {
+                    (Some(paged), Ok(page)) => {
+                        paged.page = page;
+                        paged.pictures = come;
+                        paged.y = paged.y.clamp(0, paged.most());
+                    }
+                    // Refused beside the shown layout, the pages are made
+                    // again whole at the next frame, and for any picture
+                    // after.
+                    _ => self.beside = Some(frame),
+                }
+                true
+            }
+        }
+    }
+
+    /// Waits until the job asked, if one is, has answered, taking nothing.
+    #[cfg(test)]
+    pub fn wait_ready(&self) {
+        match self.asked.as_ref().map(|asked| &asked.job) {
+            Some(Asking::Make(pending, _)) => pending.wait_ready(),
+            Some(Asking::Lay(pending, _)) => pending.wait_ready(),
+            None => {}
+        }
+    }
+
+    /// `poll`, waited for: the tests'.
+    #[cfg(test)]
+    pub fn settle(&mut self) {
+        while let Some(asked) = self.asked.as_ref() {
+            match &asked.job {
+                Asking::Make(pending, _) => pending.wait_ready(),
+                Asking::Lay(pending, _) => pending.wait_ready(),
+            }
+            self.poll();
+        }
     }
 
     /// What the status row says of the pages.
     pub fn note(&self) -> Option<String> {
         match &self.paged {
             Some(paged) => paged.note(),
+            None if self.asked.is_some() => td_alloc::string("Laying out the HTML").ok(),
             None if self.refused.is_some() => {
                 td_alloc::format(format_args!("HTML could not be laid out; h: text")).ok()
             }
@@ -977,11 +1345,13 @@ mod tests {
 
         let mut held = Held::default();
         held.show("m", "Subject: Hi", &html, BODY, one, None, None);
+        held.settle();
         assert!(held.get_mut().expect("made").step_link(true));
         assert!(held.get_mut().expect("made").scroll_lines(-1));
         let y = held.get().expect("made").y;
         assert!(y > 0);
         held.show("m", "Subject: Hi", &html, BODY, one, None, Some(&tall));
+        held.settle();
         let first: *const Paged = held.get().expect("made again");
         assert_eq!(
             held.get().map(|paged| (paged.y, paged.pictures)),
@@ -989,6 +1359,7 @@ mod tests {
         );
         assert_eq!(held.get().and_then(Paged::shown_link), Some(0));
         held.show("m", "Subject: Hi", &html, BODY, one, None, Some(&tall));
+        held.settle();
         assert_eq!(held.get().map(|p| p as *const Paged), Some(first));
 
         let paged = held.get_mut().expect("made");
@@ -1001,6 +1372,7 @@ mod tests {
         let both =
             crate::ui::pictures::tests::all_come(&[("a@x", &png(40, 3000)), ("b@x", &png(4, 4))]);
         held.show("m", "Subject: Hi", &html, BODY, one, None, Some(&both));
+        held.settle();
         let paged = held.get_mut().expect("made again");
         assert_eq!(paged.pictures, 2);
         paged.hover(Some(at));
@@ -1040,6 +1412,207 @@ mod tests {
         assert!(roomy.most() > least.most());
     }
 
+    /// Pages are made on the page thread: asked, the window holds none
+    /// and says they are being laid out until the answer is taken; let go
+    /// before it comes, as before a text renders, none is shown; and pages
+    /// asked for another message take the place of those asked before.
+    #[test]
+    fn pages_are_made_on_the_page_thread_and_let_go_unseen() {
+        let one = Scale::default();
+        let mut held = Held::default();
+        held.show("m", "Subject: Hi", "<p>a", BODY, one, None, None);
+        assert!(held.get().is_none());
+        assert!(held.working());
+        assert_eq!(held.note().as_deref(), Some("Laying out the HTML"));
+        held.settle();
+        assert!(!held.working());
+        assert!(held.get().is_some_and(|paged| paged.is("m", BODY, one)));
+        assert_eq!(
+            held.get().and_then(|paged| paged.made_on.as_deref()),
+            Some("td-mail page")
+        );
+        assert_eq!(held.note(), None);
+
+        held.clear();
+        held.show("n", "Subject: Hi", "<p>b", BODY, one, None, None);
+        held.clear();
+        assert!(!held.working());
+        assert!(!held.poll());
+        assert!(held.get().is_none());
+
+        held.show("n", "Subject: Hi", "<p>b", BODY, one, None, None);
+        held.show("o", "Subject: Hi", "<p>c", BODY, one, None, None);
+        held.settle();
+        assert!(held.get().is_some_and(|paged| paged.is("o", BODY, one)));
+    }
+
+    /// Pictures come for the shown page lay it out again on the page
+    /// thread while it is shown: the old layout stays until the new comes.
+    /// Refused beside it, the pages are made again whole, the old let go
+    /// first, rather than laid again and again.
+    #[test]
+    fn pictures_come_lay_the_shown_page_again_beside_it() {
+        use crate::ui::pictures::tests::{come, png};
+        let one = Scale::default();
+        let html = format!(
+            "<p><a href='https://e.example/'>top</a>{}<img src='cid:a%40x'>\
+             <img src='cid:b%40x'>",
+            "<div style='color:#123'>a</div>".repeat(400)
+        );
+        let tall = come("a@x", &png(40, 3000));
+        let mut held = Held::default();
+        held.show("m", "Subject: Hi", &html, BODY, one, None, None);
+        held.settle();
+        let bare = held.get().expect("made").most();
+        held.show("m", "Subject: Hi", &html, BODY, one, None, Some(&tall));
+        assert!(held.working());
+        assert_eq!(held.get().map(|paged| paged.pictures), Some(0));
+        held.settle();
+        let laid = held.get().expect("laid again");
+        assert_eq!(laid.pictures, 1);
+        assert!(laid.most() >= bare + 2900);
+
+        // At the least budget the page is made whole in, there is no room
+        // for a second layout beside it.
+        let styled = |limit| {
+            Paged::make("m", "Subject: Hi", &html, BODY, one, None, limit, None)
+                .is_some_and(|paged| paged.note().is_none())
+        };
+        let (mut low, mut high) = (1usize << 16, BUDGET);
+        while high - low > 64 {
+            let mid = low + (high - low) / 2;
+            if styled(mid) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        let show = |held: &mut Held, pictures: Option<&Pictures>| {
+            held.show_within("m", "Subject: Hi", &html, BODY, one, None, high, pictures);
+        };
+        let mut held = Held::default();
+        show(&mut held, None);
+        held.settle();
+        // Read part way down, its link focused.
+        let paged = held.get_mut().expect("made");
+        assert!(paged.step_link(true));
+        assert!(paged.scroll_lines(4));
+        let place = (paged.y, paged.shown_link());
+        assert!(place.0 > 0 && place.1.is_some());
+        show(&mut held, Some(&tall));
+        assert!(held.working());
+        held.settle();
+        assert_eq!(held.get().map(|paged| paged.pictures), Some(0));
+        assert!(held.beside.is_some());
+        show(&mut held, Some(&tall));
+        assert!(held.get().is_none(), "made again whole, the old let go");
+        held.settle();
+        let made = held.get().expect("made again");
+        assert_eq!((made.pictures, made.note()), (1, None));
+        assert_eq!(
+            (made.y, made.shown_link()),
+            place,
+            "put back where it was read"
+        );
+        show(&mut held, Some(&tall));
+        assert!(!held.working());
+        // Another picture: made whole at once, not laid again to the same
+        // refusal.
+        let both = crate::ui::pictures::tests::all_come(&[
+            ("a@x", &png(40, 3000)),
+            ("b@x", &png(40, 3000)),
+        ]);
+        show(&mut held, Some(&both));
+        assert!(held.get().is_none(), "made whole, no lay asked");
+        held.settle();
+        assert_eq!(held.get().map(|paged| paged.pictures), Some(2));
+
+        // A newer picture overtaking a remake still asked keeps the place
+        // it carried.
+        let mut held = Held::default();
+        show(&mut held, None);
+        held.settle();
+        let paged = held.get_mut().expect("made");
+        assert!(paged.step_link(true));
+        assert!(paged.scroll_lines(4));
+        let place = (paged.y, paged.shown_link());
+        show(&mut held, Some(&tall));
+        held.settle();
+        show(&mut held, Some(&tall));
+        assert!(held.get().is_none() && held.working(), "remade whole");
+        show(&mut held, Some(&both));
+        held.settle();
+        let made = held.get().expect("made again");
+        assert_eq!(made.pictures, 2);
+        assert_eq!((made.y, made.shown_link()), place, "the place carried");
+
+        // Refused beside within the frame's wait, the pages are made whole
+        // in the same frame: none later is asked for.
+        let mut held = Held {
+            in_frame: Duration::from_secs(60),
+            ..Held::default()
+        };
+        show(&mut held, None);
+        assert!(held.get_mut().expect("made").scroll_lines(4));
+        let y = held.get().expect("made").y;
+        show(&mut held, Some(&tall));
+        assert!(!held.working());
+        assert!(held.beside.is_some());
+        assert_eq!(
+            held.get().map(|paged| (paged.pictures, paged.y)),
+            Some((1, y))
+        );
+    }
+
+    /// Pictures come that no `img` of the shown page names, as a table's
+    /// background's, ask the page thread for nothing: the page stays as it
+    /// is, where it is read.
+    #[test]
+    fn a_picture_no_img_names_lays_nothing() {
+        use crate::ui::pictures::tests::{come, png};
+        let one = Scale::default();
+        let html = format!(
+            "{}<table background='cid:a%40x'><tr><td>cell</table>",
+            "<p>words</p>".repeat(300)
+        );
+        let mut held = Held::default();
+        held.show("m", "Subject: Hi", &html, BODY, one, None, None);
+        held.settle();
+        assert!(held.get_mut().expect("made").scroll_lines(5));
+        let shown: *const Paged = held.get().expect("made");
+        let y = held.get().expect("made").y;
+        let background = come("a@x", &png(4, 4));
+        held.show(
+            "m",
+            "Subject: Hi",
+            &html,
+            BODY,
+            one,
+            None,
+            Some(&background),
+        );
+        assert!(!held.working());
+        assert_eq!(held.get().map(|paged| paged as *const Paged), Some(shown));
+        assert_eq!(
+            held.get().map(|paged| (paged.y, paged.pictures)),
+            Some((y, 1))
+        );
+    }
+
+    /// A frame waits a little for the pages it asked: a message laid out
+    /// in less is shown in the frame that asked, not after a blank one.
+    #[test]
+    fn pages_come_in_the_frame_that_asked() {
+        let one = Scale::default();
+        let mut held = Held {
+            in_frame: Duration::from_secs(60),
+            ..Held::default()
+        };
+        held.show("m", "Subject: Hi", "<p>a", BODY, one, None, None);
+        assert!(!held.working());
+        assert!(held.get().is_some_and(|paged| paged.is("m", BODY, one)));
+    }
+
     /// A view's pages are kept for the same key, body and scale, made
     /// again for another, and let go; pages refused are said, and not
     /// tried again for the same frame.
@@ -1048,16 +1621,20 @@ mod tests {
         let one = Scale::default();
         let mut held = Held::default();
         held.show("m", "Subject: Hi", "<p>a", BODY, one, None, None);
+        held.settle();
         let first: *const Paged = held.get().expect("made");
         held.show("m", "Subject: Hi", "<p>a", BODY, one, None, None);
+        held.settle();
         assert_eq!(held.get().map(|p| p as *const Paged), Some(first));
         let wider = Rect { width: 600, ..BODY };
         held.show("m", "Subject: Hi", "<p>a", wider, one, None, None);
+        held.settle();
         assert!(held.get().is_some_and(|paged| paged.is("m", wider, one)));
         held.clear();
         assert!(held.get().is_none());
         assert_eq!(held.note(), None);
         held.show_within("m", "Subject: Hi", "<p>a", BODY, one, None, 1024, None);
+        held.settle();
         assert!(held.get().is_none());
         assert_eq!(
             held.note().as_deref(),
@@ -1065,8 +1642,10 @@ mod tests {
         );
         // The same frame is not tried again, even with the room for it.
         held.show("m", "Subject: Hi", "<p>a", BODY, one, None, None);
+        held.settle();
         assert!(held.get().is_none());
         held.show("m", "Subject: Hi", "<p>a", wider, one, None, None);
+        held.settle();
         assert!(held.get().is_some());
         assert_eq!(held.note(), None);
     }
@@ -1582,6 +2161,7 @@ mod tests {
             let viewed = resident();
             let making = std::time::Instant::now();
             view.lay_out_page(Some(body), scale, faces.as_ref());
+            view.settle_work();
             let paged = view.page().and_then(Held::get).expect("pages");
             let (used, note) = (paged.budget.used(), paged.note());
             let made = resident();

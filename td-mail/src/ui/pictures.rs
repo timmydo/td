@@ -8,6 +8,7 @@
 //! leaves its `img` as the page lays one without a picture.
 
 use crate::jmap::types::{BodyPart, Email};
+use crate::ui::worker::{self, Job, Pending, Taken};
 use td_alloc::{Budget, BudgetShared};
 use td_page::inline::Inline;
 
@@ -61,8 +62,63 @@ pub struct Pictures {
     next: usize,
     waiting: Option<usize>,
     shown: Vec<(usize, BudgetShared<Inline>)>,
+    /// The body come for `asked`'s entry, decoding on the page thread.
+    decoding: Option<(usize, Pending<Decode, Option<BudgetShared<Inline>>>)>,
     term: Budget,
     fitted: Budget,
+}
+
+/// What an answer for a part asks of the view.
+#[derive(Debug, PartialEq)]
+pub enum Answered {
+    /// Not the part awaited: nothing.
+    Elsewhere,
+    /// Ask for the next part: this one has no picture.
+    Next,
+    /// Wait: its body decodes on the page thread (`Pictures::poll`).
+    Decoding,
+}
+
+/// A body to decode on the page thread into the message's term.
+pub struct Decode {
+    body: Vec<u8>,
+    content_type: String,
+    term: Budget,
+}
+
+impl Decode {
+    pub fn run(self) -> Option<BudgetShared<Inline>> {
+        let format = td_picture::Format::sniff(&self.body)
+            .or_else(|| td_picture::Format::from_mime(&self.content_type))?;
+        let (picture, natural) =
+            td_picture::decode_inline(format, &self.body, &self.term, LIMITS).ok()?;
+        BudgetShared::new(&self.term, Inline::new(picture, natural, None)).ok()
+    }
+}
+
+/// The pictures come, as a page laid on the page thread names them.
+pub struct Come {
+    named: Vec<(String, BudgetShared<Inline>)>,
+    fitted: Budget,
+}
+
+impl Come {
+    /// How many have come.
+    pub fn count(&self) -> usize {
+        self.named.len()
+    }
+
+    /// The picture an `img`'s `src` names, if it has come.
+    pub fn named(&self, src: &str) -> Option<&BudgetShared<Inline>> {
+        self.named
+            .iter()
+            .find_map(|(cid, inline)| names(src, cid).then_some(inline))
+    }
+
+    /// The term a layout's fitted copies are charged to.
+    pub fn fitted(&self) -> &Budget {
+        &self.fitted
+    }
 }
 
 impl Pictures {
@@ -97,6 +153,7 @@ impl Pictures {
             next: 0,
             waiting: None,
             shown: Vec::new(),
+            decoding: None,
             term: Budget::new(TERM + 4 * Budget::metadata_bytes()).ok()?,
             fitted: Budget::new(FITTED + 4 * Budget::metadata_bytes()).ok()?,
         })
@@ -133,35 +190,76 @@ impl Pictures {
         None
     }
 
-    /// The answer for part `blob_id`, its `body` or none: `None` when it
-    /// is not the one awaited, else whether a picture was kept. Kept, it
-    /// is shown for every Content-ID naming that blob.
-    pub fn answered(&mut self, blob_id: &str, body: Option<&[u8]>) -> Option<bool> {
-        let at = self.waiting.filter(|&at| {
+    /// The answer for part `blob_id`, its `body` or none, when it is the
+    /// one awaited: its body is decoded on the page thread.
+    pub fn answered(&mut self, blob_id: &str, body: Option<&[u8]>) -> Answered {
+        let Some(at) = self.waiting.filter(|&at| {
             self.asked
                 .get(at)
                 .is_some_and(|part| part.blob_id == blob_id)
-        })?;
+        }) else {
+            return Answered::Elsewhere;
+        };
         self.waiting = None;
-        Some(body.is_some_and(|body| self.keep(at, body)))
+        match body.and_then(|body| self.decode(at, body)) {
+            Some(pending) => {
+                self.decoding = Some((at, pending));
+                Answered::Decoding
+            }
+            None => Answered::Next,
+        }
     }
 
-    fn keep(&mut self, at: usize, body: &[u8]) -> bool {
-        let Some(part) = self.asked.get(at) else {
-            return false;
+    fn decode(
+        &self,
+        at: usize,
+        body: &[u8],
+    ) -> Option<Pending<Decode, Option<BudgetShared<Inline>>>> {
+        let part = self.asked.get(at)?;
+        let job = Decode {
+            body: td_alloc::copy(body).ok()?,
+            content_type: td_alloc::string(&part.content_type).ok()?,
+            term: self.term.try_clone().ok()?,
         };
-        let format = td_picture::Format::sniff(body)
-            .or_else(|| td_picture::Format::from_mime(&part.content_type));
-        let Some(format) = format else {
-            return false;
+        worker::ask(job, Job::Decode)
+    }
+
+    /// The picture decoding, once it is done: whether it was kept, shown
+    /// for every Content-ID naming its blob. None while it decodes, or
+    /// when none does.
+    pub fn poll(&mut self) -> Option<bool> {
+        let (at, pending) = self.decoding.as_ref()?;
+        let inline = match pending.take() {
+            Taken::Waiting => return None,
+            Taken::Done(inline) => inline,
+            Taken::Lost => None,
         };
-        let Ok((picture, natural)) = td_picture::decode_inline(format, body, &self.term, LIMITS)
-        else {
-            return false;
-        };
-        let Ok(inline) = BudgetShared::new(&self.term, Inline::new(picture, natural, None)) else {
-            return false;
-        };
+        let at = *at;
+        self.decoding = None;
+        Some(inline.is_some_and(|inline| self.keep(at, inline)))
+    }
+
+    /// Whether a picture is decoding.
+    pub fn decoding(&self) -> bool {
+        self.decoding.is_some()
+    }
+
+    /// `poll`, waited for.
+    #[cfg(test)]
+    pub fn settle(&mut self) -> Option<bool> {
+        self.wait_decoded();
+        self.poll()
+    }
+
+    /// Waits until the picture decoding, if one is, has done.
+    #[cfg(test)]
+    pub fn wait_decoded(&self) {
+        if let Some((_, pending)) = self.decoding.as_ref() {
+            pending.wait_ready();
+        }
+    }
+
+    fn keep(&mut self, at: usize, inline: BudgetShared<Inline>) -> bool {
         let mut kept = false;
         for (index, part) in self.asked.iter().enumerate().skip(at) {
             if part.blob_id != blob_of(&self.asked, at) {
@@ -183,17 +281,18 @@ impl Pictures {
         self.shown.len()
     }
 
-    /// The picture an `img`'s `src` names, if it has come.
-    pub fn named(&self, src: &str) -> Option<&BudgetShared<Inline>> {
-        self.shown.iter().find_map(|(at, inline)| {
-            let part = self.asked.get(*at)?;
-            names(src, &part.cid).then_some(inline)
+    /// The pictures come, for a page laid on the page thread. None when
+    /// td-alloc refuses the copy.
+    pub fn come(&self) -> Option<Come> {
+        let mut named = Vec::new();
+        for (at, inline) in &self.shown {
+            let cid = td_alloc::string(&self.asked.get(*at)?.cid).ok()?;
+            td_alloc::push(&mut named, (cid, inline.try_clone().ok()?)).ok()?;
+        }
+        Some(Come {
+            named,
+            fitted: self.fitted.try_clone().ok()?,
         })
-    }
-
-    /// The term a layout's fitted copies are charged to.
-    pub fn fitted(&self) -> &Budget {
-        &self.fitted
     }
 }
 
@@ -356,6 +455,7 @@ pub(crate) mod tests {
             next: 0,
             waiting: None,
             shown: Vec::new(),
+            decoding: None,
             term: Budget::new(TERM + 4 * Budget::metadata_bytes()).unwrap(),
             fitted: Budget::new(FITTED + 4 * Budget::metadata_bytes()).unwrap(),
         }
@@ -372,16 +472,26 @@ pub(crate) mod tests {
         let mut pictures = asking(&asked);
         for (blob, (_, body)) in blobs.iter().zip(parts) {
             assert_eq!(pictures.next_ask().unwrap().blob_id, *blob);
-            assert_eq!(pictures.answered(blob, Some(body)), Some(true));
+            assert_eq!(answer(&mut pictures, blob, Some(body)), Some(true));
         }
         pictures
+    }
+
+    /// `pictures.answered`, its decoding waited for: None when the part
+    /// was not the one awaited, else whether a picture was kept.
+    pub(crate) fn answer(pictures: &mut Pictures, blob: &str, body: Option<&[u8]>) -> Option<bool> {
+        match pictures.answered(blob, body) {
+            Answered::Elsewhere => None,
+            Answered::Next => Some(false),
+            Answered::Decoding => pictures.settle(),
+        }
     }
 
     /// Message `e1`'s pictures with one come: `cid`'s, `body` decoded.
     pub(crate) fn come(cid: &str, body: &[u8]) -> Pictures {
         let mut pictures = asking(&[("b1", cid)]);
         assert_eq!(pictures.next_ask().unwrap().blob_id, "b1");
-        assert_eq!(pictures.answered("b1", Some(body)), Some(true));
+        assert_eq!(answer(&mut pictures, "b1", Some(body)), Some(true));
         pictures
     }
 
@@ -513,20 +623,24 @@ pub(crate) mod tests {
     #[test]
     fn pictures_are_asked_for_one_at_a_time() {
         let mut pictures = asking(&[("b1", "one"), ("b2", "two"), ("b1", "again")]);
-        assert_eq!(pictures.answered("b1", Some(&png(2, 2))), None);
+        assert_eq!(answer(&mut pictures, "b1", Some(&png(2, 2))), None);
         assert_eq!(pictures.next_ask().unwrap().blob_id, "b1");
-        assert_eq!(pictures.answered("b2", Some(&png(2, 2))), None);
-        assert_eq!(pictures.answered("b1", Some(&png(3, 5))), Some(true));
-        assert_eq!(pictures.answered("b1", Some(&png(3, 5))), None);
+        assert_eq!(answer(&mut pictures, "b2", Some(&png(2, 2))), None);
+        assert_eq!(answer(&mut pictures, "b1", Some(&png(3, 5))), Some(true));
+        assert_eq!(answer(&mut pictures, "b1", Some(&png(3, 5))), None);
         assert_eq!(pictures.count(), 2);
         assert_eq!(
-            pictures.named("cid:again").map(|p| p.natural()),
+            pictures
+                .come()
+                .unwrap()
+                .named("cid:again")
+                .map(|p| p.natural()),
             Some((3, 5))
         );
         assert_eq!(pictures.next_ask().unwrap().blob_id, "b2");
-        assert_eq!(pictures.answered("b2", None), Some(false));
+        assert_eq!(answer(&mut pictures, "b2", None), Some(false));
         assert!(pictures.next_ask().is_none());
-        assert!(pictures.named("cid:two").is_none());
+        assert!(pictures.come().unwrap().named("cid:two").is_none());
     }
 
     /// A picture come decodes and is named by its `cid:` URL; a body not
@@ -537,12 +651,17 @@ pub(crate) mod tests {
     fn a_picture_come_is_kept_within_the_term() {
         let pictures = come("a@x", &png(40, 60));
         assert_eq!(pictures.count(), 1);
-        let inline = pictures.named("cid:a%40x").unwrap();
+        let shown = pictures.come().unwrap();
+        assert_eq!(shown.count(), 1);
+        let inline = shown.named("cid:a%40x").unwrap();
         assert_eq!(inline.natural(), (40, 60));
-        assert!(pictures.named("cid:b@x").is_none());
+        assert!(shown.named("cid:b@x").is_none());
         let mut fresh = asking(&[("b1", "a"), ("b2", "b")]);
         fresh.next_ask();
-        assert_eq!(fresh.answered("b1", Some(b"not a picture")), Some(false));
+        assert_eq!(
+            answer(&mut fresh, "b1", Some(b"not a picture")),
+            Some(false)
+        );
         // A picture whose reckoned peak passes the term is refused before
         // its pixels: 3000 by 3000 is 36 MB of RGBA alone.
         let huge = header_only(3000, 3000);
@@ -551,7 +670,7 @@ pub(crate) mod tests {
             Err(td_picture::Error::Work(..))
         ));
         fresh.next_ask();
-        assert_eq!(fresh.answered("b2", Some(&huge)), Some(false));
+        assert_eq!(answer(&mut fresh, "b2", Some(&huge)), Some(false));
         assert_eq!(fresh.count(), 0);
         let big = png(1600, 1200);
         let blobs: Vec<String> = (0..4).map(|n| format!("b{n}")).collect();
@@ -561,7 +680,7 @@ pub(crate) mod tests {
             .iter()
             .map(|blob| {
                 filling.next_ask();
-                filling.answered(blob, Some(&big)).unwrap()
+                answer(&mut filling, blob, Some(&big)).unwrap()
             })
             .collect();
         assert_eq!(kept.first(), Some(&true));

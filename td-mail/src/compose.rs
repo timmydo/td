@@ -416,8 +416,8 @@ fn html_to_plain(html: &str) -> String {
 
 /// What one rendering of a message's HTML may read and build, here and in
 /// the message view: the view's and a reply's renderings, with the view's
-/// text kept, some 74 MB at their worst, under the 256 MiB jail beside
-/// td-mail's own 52-97 MB and its prose faces' glyphs (README.md,
+/// text kept, some 74 MB at their worst, under the 320 MiB jail beside
+/// td-mail's own 52-97 MB, its prose faces' glyphs and a page (README.md,
 /// "Memory"). A message's page reads the same input.
 pub(crate) const HTML_LIMITS: td_html::Limits = td_html::Limits {
     input: 512 << 10,
@@ -1055,16 +1055,19 @@ mod tests {
     /// 1.25 per byte of output budget (td-html/DESIGN.md, "Resident
     /// rendering cost"), and the view keeps its last rendering's text and
     /// a string per line, at most twice its budget, while a reply renders.
-    /// A message's pages are at most their budget and are never held while
-    /// a rendering runs, the view letting them go first, so the larger of
-    /// the two counts. The window's prose faces hold, beside their bytes,
+    /// A message's pages are made on the page thread (`ui::worker`), whose
+    /// allocator arena keeps its own peak beside the window's: their
+    /// budget and what a layout holds beyond it, uncharged, which the
+    /// rendering's term once covered (`LAYOUT`), count beside a rendering.
+    /// The window's prose faces hold, beside their bytes,
     /// an atlas page with its key map and shelves for each of the three
     /// faces at the raster's size, bounded as td-ui bounds its other
     /// pages, and `prose::ATLAS` for every other size.
     /// A message's pictures (`ui::pictures`) are held beside its page:
     /// their decoded term, which each decoding's peak is charged to
     /// first, the term their fitted copies are charged to, and one body
-    /// fetched at a time.
+    /// fetched at a time, held twice while the page thread takes a copy
+    /// to decode.
     /// `BASELINE` is td-mail's own resident memory at 2880x1800 with
     /// td-ui's three window buffers and the faces' bytes, and
     /// `MEMORY_HIGH` the jail's in recipes/src/recipes/mail.rs, both
@@ -1073,7 +1076,10 @@ mod tests {
     fn the_html_limits_fit_the_jail() {
         use td_ui::atlas::{MAX_KEYS, PAGE_HEIGHT, PAGE_WIDTH};
         const BASELINE: usize = 97_000_000;
-        const MEMORY_HIGH: usize = 256 << 20;
+        const MEMORY_HIGH: usize = 320 << 20;
+        // What a page's layout holds beyond its budget, uncharged: measured
+        // within what a rendering's term exceeds the budget by.
+        const LAYOUT: usize = 25_000_000;
         let rendering = 100 * HTML_LIMITS.input + HTML_LIMITS.output * 5 / 4;
         let kept = 2 * HTML_LIMITS.output;
         let at_size = 3 * (PAGE_WIDTH * PAGE_HEIGHT + (MAX_KEYS / 4 + 2) * 768 + PAGE_HEIGHT * 48);
@@ -1081,12 +1087,14 @@ mod tests {
         let page = crate::ui::page::BUDGET;
         let pictures = crate::ui::pictures::TERM
             + crate::ui::pictures::FITTED
-            + crate::ui::pictures::MAX_BODY as usize;
-        let total = BASELINE + glyphs + kept + rendering.max(page) + pictures;
+            + 2 * crate::ui::pictures::MAX_BODY as usize;
+        let total = BASELINE + glyphs + kept + rendering + page + LAYOUT + pictures;
         assert!(total < MEMORY_HIGH, "{total}");
-        // What a page's layout holds beyond its budget, uncharged, has the
-        // rest of the rendering's term: measured, not modelled.
-        assert!(rendering - page > 25_000_000);
+        // At least 20 MB of room for what the terms leave out.
+        assert!(MEMORY_HIGH - total > 20_000_000, "{total}");
+        // The layout's uncharged hold, measured when pages were made on the
+        // window's thread, has the rest of a rendering's term.
+        assert!(rendering - page > LAYOUT);
     }
 
     /// A sent draft and its sidecar move together into the private `sent`

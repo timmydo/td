@@ -14,6 +14,7 @@ pub mod page;
 pub mod pictures;
 pub mod sidebar;
 pub mod views;
+pub mod worker;
 
 use crate::attach;
 use crate::backend::{
@@ -49,6 +50,11 @@ use views::{Body, Scene, Scroll, Slot, View, ViewAction, ViewStack};
 /// The tenth of a second the terminal's read timed out at, kept as the
 /// longest a turn waits for the backend's answer or the idle-sync clock.
 const POLL_MS: u64 = 100;
+/// The poll while the page thread has work asked of it, or a message's
+/// frame is to be drawn, which may ask it (td-ui sets the wait before it
+/// draws), so a page or a picture it finishes is shown soon after
+/// (`worker`).
+const WORK_POLL_MS: u64 = 20;
 
 /// The most scroll keys one wheel frame becomes, so a fling is bounded.
 const WHEEL_EVENTS: usize = 64;
@@ -2304,10 +2310,20 @@ impl Session {
             .and_then(Held::get)
     }
 
-    /// The frame as text, after `prepare_frame`: what a test reads back.
+    /// `prepare_frame`, then the page thread's work the views asked for
+    /// waited for and taken, until none is left: what a test paints.
+    #[cfg(test)]
+    fn settle_work(&mut self) {
+        self.prepare_frame();
+        while self.stack.settle_work() {
+            self.prepare_frame();
+        }
+    }
+
+    /// The frame as text, settled (`settle_work`): what a test reads back.
     #[cfg(test)]
     fn shown(&mut self) -> String {
-        self.prepare_frame();
+        self.settle_work();
         let slot = self.stack.top().expect("a view");
         let scene = self.scene(slot);
         let frame = Frame {
@@ -2607,6 +2623,9 @@ impl Handler for Session {
                 }
             }
         }
+        if self.stack.poll_work() {
+            self.redraw();
+        }
         for (index, live) in self.live.iter_mut().enumerate() {
             if !live.fetching_mailboxes && self.stack.accepts_folder_refresh(index) {
                 if let Some(kind) = live.pending_refresh.take() {
@@ -2626,7 +2645,15 @@ impl Handler for Session {
     }
 
     fn wait_ms(&self, _now: u64) -> u64 {
-        POLL_MS
+        let message = self
+            .stack
+            .top()
+            .is_some_and(|slot| slot.view.page().is_some());
+        if (self.dirty && message) || self.stack.working() {
+            WORK_POLL_MS
+        } else {
+            POLL_MS
+        }
     }
 
     fn needs_redraw(&self) -> bool {
@@ -4249,8 +4276,21 @@ mod frame_tests {
         for n in 0..200 {
             html.push_str(&format!("<p>line {n}"));
         }
+        // The list's frames ask the page thread nothing.
+        session.dirty = true;
+        assert_eq!(session.wait_ms(0), POLL_MS);
         show_html(&mut session, &resp_tx, &html);
+        // A frame to be drawn may ask the page thread: td-ui sets the
+        // wait before it draws.
+        assert!(session.dirty);
+        assert_eq!(session.wait_ms(0), WORK_POLL_MS);
+        // Asked of the page thread, the window polls sooner until it
+        // answers.
+        session.prepare_frame();
+        session.dirty = false;
+        assert_eq!(session.wait_ms(0), WORK_POLL_MS);
         let shown = session.shown();
+        assert_eq!(session.wait_ms(0), POLL_MS);
         assert!(shown.contains("Subject: Hello"), "{shown}");
         assert!(shown.contains("first words"), "{shown}");
         assert!(!shown.contains("hidden words"), "{shown}");
@@ -4280,6 +4320,21 @@ mod frame_tests {
         assert!(session.shown_page().is_some());
     }
 
+    /// The window's poll takes the pages the page thread made, and redraws.
+    #[test]
+    fn the_poll_takes_the_pages_made_and_redraws() {
+        let (mut session, _cmd_rx, resp_tx) = session(true);
+        show_html(&mut session, &resp_tx, "<p>first words");
+        session.prepare_frame();
+        assert!(session.shown_page().is_none());
+        session.dirty = false;
+        session.stack.wait_work();
+        session.poll(0);
+        assert!(session.dirty);
+        assert!(session.shown_page().is_some());
+        assert!(!session.stack.working());
+    }
+
     /// The pages are made again for a body of another size, and the
     /// status row says, before the view's own words, how a page was not
     /// made whole.
@@ -4290,14 +4345,14 @@ mod frame_tests {
         html.push_str(&"word ".repeat(crate::compose::HTML_LIMITS.input / 5));
         html.push_str("past the limit");
         show_html(&mut session, &resp_tx, &html);
-        session.prepare_frame();
+        session.settle_work();
         let wide = session.shown_page().unwrap().rect();
         assert_eq!(wide.width, 800);
         session.input(
             Input::Resize(Surface::new(400, 600, Default::default()).unwrap()),
             &mut NoClipboard,
         );
-        session.prepare_frame();
+        session.settle_work();
         assert_eq!(session.shown_page().unwrap().rect().width, 400);
         let shown = session.shown();
         let status = shown.lines().last().unwrap_or_default();
@@ -4321,7 +4376,7 @@ mod frame_tests {
             &resp_tx,
             "<p>see <a href='https://e.example/there'>the place</a>",
         );
-        session.prepare_frame();
+        session.settle_work();
         let rect = session.shape().unwrap().layout.page.unwrap();
         // A press on the head opens nothing.
         press(&mut session, rect.x + 2, rect.y + 2);
@@ -4373,7 +4428,7 @@ mod frame_tests {
             &resp_tx,
             "<p>see <a href='https://e.example/there'>the place</a>",
         );
-        session.prepare_frame();
+        session.settle_work();
         let at = page_point(&session, 0).expect("a point over the link");
         // Nothing named, Shift+Return says nothing, as Return does.
         key(&mut session, "S-Return");
@@ -4452,7 +4507,7 @@ mod frame_tests {
             &answers[0],
             "<p>see <a href='https://e.example/there'>the place</a>",
         );
-        session.prepare_frame();
+        session.settle_work();
         session.setup.other_browser = Some("true".to_string());
         key(&mut session, "l");
         key(&mut session, "Tab");
@@ -4495,7 +4550,7 @@ mod frame_tests {
             "<p><a href='https://e.example/first'>first</a>\
              <p><a href='https://e.example/second'>second</a>",
         );
-        session.prepare_frame();
+        session.settle_work();
         let at = page_point(&session, 1).expect("a point over the second link");
         session.motion(Some(at));
         let status = |session: &mut Session| {

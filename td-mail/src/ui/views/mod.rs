@@ -226,6 +226,23 @@ pub trait View {
     /// Handle a response from the backend thread.
     /// Returns true if the view consumed the response and should re-render.
     fn on_response(&mut self, response: &BackendResponse) -> bool;
+    /// Takes what the page thread has answered the view: whether it
+    /// changed what the view shows (`ui::worker`).
+    fn poll_work(&mut self) -> bool {
+        false
+    }
+    /// Whether the view has asked the page thread for work not yet come.
+    fn working(&self) -> bool {
+        false
+    }
+    /// The page thread's work waited for and taken: whether there was any.
+    #[cfg(test)]
+    fn settle_work(&mut self) -> bool {
+        false
+    }
+    /// The page thread's work waited for, nothing taken.
+    #[cfg(test)]
+    fn wait_work(&self) {}
     /// A response from the account at `account`'s backend: a view bound
     /// to one account takes it as its own; one over every account (the
     /// unified inbox) tells the accounts apart.
@@ -324,6 +341,43 @@ impl ViewStack {
             }
         }
         needs_render
+    }
+
+    /// Takes the page thread's answers for every view: whether the top
+    /// one changed.
+    pub fn poll_work(&mut self) -> bool {
+        let top = self.slots.len().saturating_sub(1);
+        let mut changed = false;
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            if slot.view.poll_work() && idx == top {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Every view's page-thread work waited for and taken: whether there
+    /// was any.
+    #[cfg(test)]
+    pub fn settle_work(&mut self) -> bool {
+        let mut any = false;
+        for slot in &mut self.slots {
+            any |= slot.view.settle_work();
+        }
+        any
+    }
+
+    /// Every view's page-thread work waited for, nothing taken.
+    #[cfg(test)]
+    pub fn wait_work(&self) {
+        for slot in &self.slots {
+            slot.view.wait_work();
+        }
+    }
+
+    /// Whether any view awaits the page thread.
+    pub fn working(&self) -> bool {
+        self.slots.iter().any(|slot| slot.view.working())
     }
 
     pub fn apply_account_access(&mut self, access: &[bool]) {
