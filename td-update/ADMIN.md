@@ -373,7 +373,22 @@ account hosts an untrusted loopback repository using a target-built fixture;
 only its ephemeral, separately provisioned admin SSH key grants update
 authority. Expiry, truncated HTTP/resumption, root rotation/rollback refusal and
 failed-boot rollback are required assertions. It also runs the public mode's
-own SSH line once, from the guest's shell. The test provisions policy
+own SSH line once, from the guest's shell. Before that exercise, while
+nothing serves its release, the primary account's own path runs. The
+oracle checks that the status socket and its directory are root:1000 and
+the control socket's directory root:986 mode 0710. As UID 1000,
+`td-admin update --no-reboot` waits on the settings intake. `H` presents
+tag 46 for a signed release that does not restart, and Enter approves
+it. The client reports its job started. `td-admin status` follows that
+job to `failed` without an installation, `td-admin logs` answers,
+`td-admin cancel` is refused at the control socket, which UID 1000
+cannot reach, and the selectors are unchanged. Then the menu's `U`,
+pressed once the menu has been on glass past the settle, shows `UPDATE
+FROM MAIN STARTED`. Its job is later than the approved one and records
+a source phase: queued, `fetching main` or `building`. The fixture's
+admin key cancels it, because the guest's user network may reach
+upstream, and it ends `failed` with the selectors unchanged, online or
+offline. The test provisions policy
 out of band and does not grant an ordinary account a policy-setting command.
 The fixture executable and keys are absent from distribution images.
 

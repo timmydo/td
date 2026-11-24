@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod local;
 pub(crate) mod public;
 
 const PROFILE: &str = "system-x86-64";
@@ -302,6 +303,7 @@ pub(crate) fn run(runner: &crate::check_runner::RecipeCheckRunner) -> Result<()>
     let result = (|| {
         let mut guest = Guest::healthy(&options, 1, deadline, &disk, |_| Ok(()))?;
         guest.command("mkdir -p /var/home/tester/.td-admin-oracle && chmod 700 /var/home/tester/.td-admin-oracle && cp /run/td-volume/td/admin-fixture/client /var/home/tester/.td-admin-oracle/client && chmod 700 /var/home/tester/.td-admin-oracle/client")?;
+        local::run(&mut guest, work)?;
         let lines = guest.command(&format!("{CLIENT} exercise"))?;
         for marker in [
             "TD-ADMIN-EXPIRED-REFUSED",
@@ -351,7 +353,7 @@ pub(crate) fn run(runner: &crate::check_runner::RecipeCheckRunner) -> Result<()>
         })?;
         evidence.finish(true)?;
         guest.stop()?;
-        println!("PASS: qemu-admin-update: guest SSH update, expiry, interrupted HTTP/cache resume, root rotation/rollback refusal, default reboot, health and automatic rollback");
+        println!("PASS: qemu-admin-update: local H approval, status-only primary account and U, guest SSH update, expiry, interrupted HTTP/cache resume, root rotation/rollback refusal, default reboot, health and automatic rollback");
         Ok(())
     })();
     let logs = runner.scratch_dir().join("admin-update");

@@ -543,6 +543,8 @@ recipes/src/bin/td_recipe_eval/checks/qemu_boot/update.rs	allocation-macro	98
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/update.rs	unchecked-growth-or-clone	4
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/update/admin.rs	allocating-conversion	75
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/update/admin.rs	allocation-macro	7
+recipes/src/bin/td_recipe_eval/checks/qemu_boot/update/admin/local.rs	allocating-conversion	1
+recipes/src/bin/td_recipe_eval/checks/qemu_boot/update/admin/local.rs	allocation-macro	23
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/update/admin/public.rs	allocating-conversion	37
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/update/admin/public.rs	allocation-macro	15
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/update/admin/public.rs	unchecked-growth-or-clone	3

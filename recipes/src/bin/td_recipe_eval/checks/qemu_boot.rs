@@ -9734,6 +9734,8 @@ impl Qmp {
                         | "b"
                         | "h"
                         | "q"
+                        // `qemu-admin-update`'s trusted-main update.
+                        | "u"
                         // The compositor's volume key, before Firefox's tone.
                         | "volumedown"
                         // `qemu-deploy-rollback`'s Ctrl+Alt+Delete, the
