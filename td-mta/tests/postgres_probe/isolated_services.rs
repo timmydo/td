@@ -29,17 +29,25 @@ pub(super) fn exercise(
     let https_addr = https.local_addr().unwrap();
     let outbound = TcpListener::bind("127.0.0.1:0").unwrap();
     let dns = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dns_addr = dns.local_addr().unwrap();
+    // Whole quoted assignments: a bare "127.0.0.1:443" also matches the
+    // resolver once a DNS port such as 44312 is in it.
+    let resolver = format!("address = \"{dns_addr}\"");
+    let bind = format!("bind = \"{https_addr}\"");
+    let relay_port = format!("port = {}\n", outbound.local_addr().unwrap().port());
+    let origin = format!("jmap_origin = \"https://localhost:{}\"", https_addr.port());
     let frontend = desktop
-        .replace("127.0.0.1:53", &dns.local_addr().unwrap().to_string())
-        .replace(
-            "port = 465",
-            &format!("port = {}", outbound.local_addr().unwrap().port()),
-        )
-        .replace("127.0.0.1:443", &https_addr.to_string())
-        .replace(
-            "https://localhost",
-            &format!("https://localhost:{}", https_addr.port()),
+        .replace("address = \"127.0.0.1:53\"", &resolver)
+        .replace("port = 465\n", &relay_port)
+        .replace("bind = \"127.0.0.1:443\"", &bind)
+        .replace("jmap_origin = \"https://localhost\"", &origin);
+    for rewritten in [&resolver, &bind, &relay_port, &origin] {
+        assert_eq!(
+            frontend.matches(rewritten.as_str()).count(),
+            1,
+            "{frontend}"
         );
+    }
     let receive = format!("{}[listener \"smtp\"]\nkind = \"direct_smtp\"\nbind = \"{smtp_addr}\"\nserver_name = \"localhost\"\ncertificate = \"public\"\nsession_limit = 2\nper_peer_limit = 2\n", frontend.split_once("[listener").unwrap().0);
     let relay = frontend.split_once("[certificate").unwrap().0;
     let migadu = relay.replace("personal-smarthost", "other-smarthost");
