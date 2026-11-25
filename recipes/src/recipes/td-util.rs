@@ -161,6 +161,17 @@ const CIVIL: &[(&str, &str)] = &[
     ("tzif.rs", include_str!("../../../td-civil/src/tzif.rs")),
 ];
 
+// Cargo exposes these helpers through td-fs. The bootstrap recipe stages
+// the same publication module as its rlib root.
+const FS: &[(&str, &str)] = &[
+    (
+        "publication.rs",
+        include_str!("../../../td-fs/src/publication.rs"),
+    ),
+    ("entry.rs", include_str!("../../../td-fs/src/entry.rs")),
+    ("replace.rs", include_str!("../../../td-fs/src/replace.rs")),
+];
+
 pub fn recipe() -> Recipe {
     build("td-util", "rust-toolchain")
 }
@@ -200,41 +211,58 @@ pub fn build(name: &str, rust: &str) -> Recipe {
             exec: false,
         });
     }
-    for (file, source) in CIVIL {
-        steps.push(Step::WriteFile {
-            path: format!("{{src}}/td-civil/src/{file}"),
-            content: (*source).into(),
-            exec: false,
-        });
+    for (krate, files, name, library, source) in [
+        (
+            "civil",
+            CIVIL,
+            "td_civil",
+            "{src}/libtd_civil.rlib",
+            "{src}/td-civil/src/lib.rs",
+        ),
+        (
+            "fs",
+            FS,
+            "td_fs",
+            "{src}/libtd_fs.rlib",
+            "{src}/td-fs/src/publication.rs",
+        ),
+    ] {
+        for (file, source) in files {
+            steps.push(Step::WriteFile {
+                path: format!("{{src}}/td-{krate}/src/{file}"),
+                content: (*source).into(),
+                exec: false,
+            });
+        }
+        steps.push(
+            target_rustc(
+                "{src}",
+                rustc,
+                &[
+                    "--edition",
+                    "2021",
+                    "--crate-name",
+                    name,
+                    "--crate-type",
+                    "rlib",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-C",
+                    "opt-level=s",
+                    "-C",
+                    "target-feature=+crt-static",
+                    "-C",
+                    "relocation-model=static",
+                    "-C",
+                    "panic=abort",
+                    "-o",
+                    library,
+                    source,
+                ],
+            )
+            .env("SOURCE_DATE_EPOCH", "1"),
+        );
     }
-    steps.push(
-        target_rustc(
-            "{src}",
-            rustc,
-            &[
-                "--edition",
-                "2021",
-                "--crate-name",
-                "td_civil",
-                "--crate-type",
-                "rlib",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-C",
-                "opt-level=s",
-                "-C",
-                "target-feature=+crt-static",
-                "-C",
-                "relocation-model=static",
-                "-C",
-                "panic=abort",
-                "-o",
-                "{src}/libtd_civil.rlib",
-                "{src}/td-civil/src/lib.rs",
-            ],
-        )
-        .env("SOURCE_DATE_EPOCH", "1"),
-    );
     steps.push(
         target_rustc(
             "{src}",
@@ -259,6 +287,8 @@ pub fn build(name: &str, rust: &str) -> Recipe {
                 "{out}/bin/td-util",
                 "--extern",
                 "td_civil={src}/libtd_civil.rlib",
+                "--extern",
+                "td_fs={src}/libtd_fs.rlib",
                 &main_rs,
             ],
         )
@@ -281,13 +311,13 @@ pub fn build(name: &str, rust: &str) -> Recipe {
 
 #[cfg(test)]
 mod tests {
-    use super::{CIVIL, ENGINE, MAIN_RS, MODULES};
+    use super::{CIVIL, ENGINE, FS, MAIN_RS, MODULES};
 
     #[test]
     fn embedded_sources_do_not_contain_recipe_template_tokens() {
         let sources = std::iter::once(("main", MAIN_RS))
             .chain(MODULES.iter().copied())
-            .chain(CIVIL.iter().copied())
+            .chain(CIVIL.iter().chain(FS).copied())
             .chain(ENGINE.iter().map(|(name, _, source)| (*name, *source)));
         const TOKENS: &[&str] = &[
             "{root}",

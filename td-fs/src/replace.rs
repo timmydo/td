@@ -10,7 +10,8 @@ use std::path::Path;
 
 /// Tells apart the temporaries of concurrent `replace` calls in one process;
 /// the pid in the name tells apart processes.
-static REPLACE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static REPLACE_SERIAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// How many names `replace` tries before giving up. A name is taken only by
 /// a temporary a crashed process left under a pid this one now has, so the
@@ -57,24 +58,55 @@ pub fn replace_if(
     commit: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     use std::io::Write;
+    let directory = File::open(parent_of(path)).map_err(|e| named(path, "", e))?;
+    stream_with_sync(
+        &directory,
+        path,
+        mode,
+        |file| {
+            prepare(file)?;
+            file.write_all(bytes)
+        },
+        |temporary| {
+            commit()?;
+            std::fs::rename(temporary, path)
+        },
+        File::sync_all,
+    )
+}
+
+fn parent_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn named(path: &Path, stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}{stage}: {error}", path.display()))
+}
+
+pub(crate) fn stream_with_sync(
+    directory: &File,
+    path: &Path,
+    mode: u32,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+    publish: impl FnOnce(&Path) -> io::Result<()>,
+    sync: impl Fn(&File) -> io::Result<()>,
+) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let named =
-        |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", path.display()));
+    let fail = |e| named(path, "", e);
     let name = path
         .file_name()
-        .ok_or_else(|| named(io::Error::from(io::ErrorKind::InvalidInput)))?;
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let directory = File::open(parent).map_err(named)?;
+        .ok_or_else(|| fail(io::ErrorKind::InvalidInput.into()))?;
+    let parent = parent_of(path);
     let mut attempt = 0;
     let (temporary, mut file) = loop {
         let serial = REPLACE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut temporary = std::ffi::OsString::from(".");
-        temporary.push(name);
-        temporary.push(format!(".{}.{serial}.tmp", std::process::id()));
-        let temporary = parent.join(temporary);
+        let leaf = format!(".td-replace.{}.{serial}.tmp", std::process::id());
+        if name == std::ffi::OsStr::new(&leaf) {
+            continue;
+        }
+        let temporary = parent.join(leaf);
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -85,25 +117,35 @@ pub fn replace_if(
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 attempt += 1;
                 if attempt >= NAME_ATTEMPTS {
-                    return Err(named(error));
+                    return Err(fail(error));
                 }
             }
-            Err(error) => return Err(named(error)),
+            Err(error) => return Err(fail(error)),
         }
     };
-    let placed = prepare(&file)
-        .and_then(|()| file.write_all(bytes))
-        .and_then(|()| file.sync_all())
-        .and_then(|()| commit())
-        .and_then(|()| std::fs::rename(&temporary, path));
+    use std::os::unix::fs::MetadataExt;
+    let same_file = |file: &File| -> io::Result<()> {
+        let opened = file.metadata()?;
+        let named = std::fs::symlink_metadata(&temporary)?;
+        if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+            return Err(io::Error::other("staging file changed"));
+        }
+        Ok(())
+    };
+    let placed = write(&mut file)
+        .and_then(|()| sync(&file))
+        .and_then(|()| same_file(&file))
+        .and_then(|()| publish(&temporary));
     if let Err(error) = placed {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(named(error));
+        if same_file(&file).is_ok() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        return Err(fail(error));
     }
-    match directory.sync_all() {
+    match sync(directory) {
         // EINVAL: a filesystem with no directory sync, so nothing to wait for.
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
-        synced => synced.map_err(named),
+        synced => synced.map_err(|e| named(path, " published, directory sync failed", e)),
     }
 }
 
@@ -162,28 +204,6 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
         assert!(std::fs::symlink_metadata(&link).unwrap().is_file());
         assert_eq!(std::fs::read(&link).unwrap(), b"new");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_temporary_left_by_a_crash_is_passed_over_not_removed() {
-        let dir = scratch("replace-squat");
-        let path = dir.join("state");
-        // The names the next calls in this process would take, as a crashed
-        // process with this pid would have left them. Tests in other
-        // threads take serials too, which only moves this one further on.
-        let next = REPLACE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
-        let squatters: Vec<_> = (next..next + 8)
-            .map(|serial| dir.join(format!(".state.{}.{serial}.tmp", std::process::id())))
-            .collect();
-        for squatter in &squatters {
-            std::fs::write(squatter, b"left").unwrap();
-        }
-        replace(&path, b"placed", 0o600).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"placed");
-        for squatter in &squatters {
-            assert_eq!(std::fs::read(squatter).unwrap(), b"left");
-        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

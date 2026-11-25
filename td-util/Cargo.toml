@@ -17,9 +17,9 @@ path = "src/main.rs"
 # `--test`, so the shipped binary never sees it.
 [dependencies]
 td-civil = { path = "../td-civil" }
+td-fs = { path = "../td-fs" }
 
 [dev-dependencies]
-td-fs = { path = "../td-fs" }
 td-source-scan = { path = "../td-source-scan" }
 
 # The engine root carries no `exclude` list and never needed one: an `exclude`

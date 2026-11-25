@@ -1281,11 +1281,11 @@ out-of-bounds kernel write from code the compiler reads as safe; and
 check that would catch a constructed termios can only fire against a real
 terminal, which the gate has none of.
 
-Every other applet td-util serves is safe `std`: `/proc`, `/sys` and
-`/dev/kmsg` read as ordinary files, and the build-tool applets (`find`, `xargs`,
-`cmp`, `diff`, `od`, `uname`, `gzip`, `tar`, `cpio`, `gen_init_cpio`) walk,
-read, write and spawn through `std::fs` and `std::process`. That is what
-keeps the surface at one syscall.
+The tar publisher reaches two existing td-fs wrappers from §14. It checks
+the previous and staged regular file with the size-only attribute query,
+and publishes a new archive name with descriptor-bound no-replace rename.
+The tar confinement test pins those call sites. The other build-tool
+applets walk, read, write and spawn through safe standard-library APIs.
 
 Six modules are not td-util's own: `main.rs` reaches td-alloc, the
 engine's CRC, SHA-256, tar extractor and tar writer, and td-inflate's
@@ -2780,7 +2780,11 @@ An unsupported query refuses saving, not just replacement. Attributes hidden
 from the calling credentials are not proven absent by Linux's listing API;
 the exact supported-file boundary is recorded in `td-editor/DESIGN.md`.
 
-The editor file adapter and td-ssh-keygen signature publisher call
+The td-util tar writer also queries the opened archive and staged file for
+attributes before replacing a regular archive. It uses the same size-only
+wrapper.
+
+The editor file adapter, td-util tar writer and td-ssh-keygen signature publisher call
 `rename_entry`, borrowing opened source and
 destination directories and two literal Unix basenames. The wrapper rejects empty, dot, dot-dot,
 slash-containing, NUL-containing and over-4096-byte names, owns both C

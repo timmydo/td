@@ -421,3 +421,78 @@ fn refuses_paths_outside_the_directory_and_empty_archives() {
     assert!(!result.status.success(), "{result:?}");
     assert!(String::from_utf8_lossy(&result.stderr).contains("not UTF-8"));
 }
+
+#[test]
+fn a_failed_replacement_preserves_the_archive_and_its_symlink_until_retry() {
+    let d = TempDir::new("tar-replace").unwrap();
+    let old = archive("old-file");
+    fs::write(d.join("backup"), &old).unwrap();
+    fs::set_permissions(d.join("backup"), fs::Permissions::from_mode(0o640)).unwrap();
+    symlink("backup", d.join("link")).unwrap();
+    fs::write(d.join("payload"), vec![42; 128 * 1024]).unwrap();
+    for flag in ["-cf", "-czf"] {
+        let failed = run(&d, &["tar", flag, "link", "payload", "absent"]);
+        assert_eq!(failed.status.code(), Some(2));
+        assert_eq!(fs::read(d.join("link")).unwrap(), old);
+        assert_eq!(fs::read_link(d.join("link")).unwrap(), Path::new("backup"));
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 3);
+    }
+    let retry = run(&d, &["tar", "-cf", "link", "payload"]);
+    assert!(retry.status.success(), "{retry:?}");
+    assert_eq!(
+        members(&fs::read(d.join("backup")).unwrap())[0].0,
+        "payload"
+    );
+    assert_eq!(
+        fs::metadata(d.join("backup")).unwrap().mode() & 0o777,
+        0o640
+    );
+    fs::hard_link(d.join("backup"), d.join("alias")).unwrap();
+    assert_eq!(
+        run(&d, &["tar", "-cf", "link", "payload"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(
+        fs::metadata(d.join("alias")).unwrap().ino(),
+        fs::metadata(d.join("backup")).unwrap().ino()
+    );
+}
+
+#[test]
+fn creates_through_a_dangling_symlink_without_replacing_it() {
+    let d = TempDir::new("tar-dangling").unwrap();
+    symlink("backup", d.join("link")).unwrap();
+    fs::write(d.join("input"), b"input").unwrap();
+    let result = run(&d, &["tar", "-cf", "link", "input"]);
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(fs::read_link(d.join("link")).unwrap(), Path::new("backup"));
+    assert_eq!(members(&fs::read(d.join("backup")).unwrap())[0].0, "input");
+}
+
+#[test]
+fn a_missing_directory_operand_cannot_publish_a_regular_archive() {
+    let d = TempDir::new("tar-directory-operand").unwrap();
+    fs::write(d.join("input"), b"data").unwrap();
+    for n in 1..40 {
+        symlink(format!("link{n}"), d.join(format!("link{}", n - 1))).unwrap();
+    }
+    for arg in ["missing/", "missing/."] {
+        assert_eq!(
+            run(&d, &["tar", "-cf", arg, "input"]).status.code(),
+            Some(2)
+        );
+        symlink(arg, d.join("link")).unwrap();
+        assert_eq!(
+            run(&d, &["tar", "-cf", "link", "input"]).status.code(),
+            Some(2)
+        );
+        fs::remove_file(d.join("link")).unwrap();
+        symlink(arg, d.join("link39")).unwrap();
+        assert_eq!(
+            run(&d, &["tar", "-cf", "link0", "input"]).status.code(),
+            Some(2)
+        );
+        fs::remove_file(d.join("link39")).unwrap();
+        assert!(!d.join("missing").exists());
+    }
+}

@@ -46,8 +46,10 @@ one that cannot be read ends the archive, as does a path past the kernel's limit
 -z builds the archive in memory, refused past what extraction reads: 1 GiB expanded,\n\
 257 MiB compressed.\n\
 \n\
+A named regular archive is staged beside its destination and published whole. Existing\n\
+hard-linked files and files with extended attributes need a new destination name.\n\
 Exit status: 0, done; 1, an archive made whole but with a file that changed while it\n\
-was stored; 2, an error, after which an archive being made is incomplete.\n";
+was stored; 2, an error. A streamed archive may be incomplete.\n";
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -195,34 +197,134 @@ fn create(
     for name in &names {
         through_no_symlink(base, name)?;
     }
-    let (output, archive_meta) = if archive == "-" {
-        let stdout = io::stdout();
-        // Standard output may be a file in the tree, as `tar -cf - . > a.tar` makes it.
-        let meta = stdout
+    let io_error = |e: io::Error| format!("{archive}: {e}");
+    if archive == "-" {
+        let fd = io::stdout()
             .as_fd()
             .try_clone_to_owned()
-            .ok()
-            .and_then(|fd| File::from(fd).metadata().ok());
-        (Box::new(stdout.lock()) as Box<dyn Write>, meta)
-    } else {
-        let file = File::create(archive).map_err(|e| format!("create {archive}: {e}"))?;
-        let meta = file.metadata().ok();
-        (Box::new(file) as Box<dyn Write>, meta)
+            .map_err(io_error)?;
+        return pack_archive(&File::from(fd), None, gzip, base, &names);
+    }
+
+    // Open without truncation: this both checks write access and pins the
+    // previous inode until publication, including through a symlink.
+    let path = Path::new(archive);
+    let old = match File::options().write(true).open(path) {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io_error(e)),
     };
+    let previous = old
+        .as_ref()
+        .map(File::metadata)
+        .transpose()
+        .map_err(io_error)?;
+    if let (Some(file), Some(meta)) = (old.as_ref(), previous.as_ref()) {
+        if !meta.is_file() {
+            return pack_archive(file, None, gzip, base, &names);
+        }
+        if meta.nlink() != 1 || td_fs::has_attributes(file).map_err(io_error)? {
+            return Err(
+                "archive has multiple hard links or extended attributes; use a new filename".into(),
+            );
+        }
+    }
+    let dest = if old.is_some() {
+        std::borrow::Cow::Owned(fs::canonicalize(path).map_err(io_error)?)
+    } else {
+        // Follow a dangling output symlink just as opening it with create
+        // would, then publish exclusively at the missing target.
+        let mut dest: std::borrow::Cow<Path> = std::borrow::Cow::Borrowed(path);
+        for depth in 0..=40 {
+            if matches!(
+                dest.as_os_str()
+                    .as_bytes()
+                    .rsplit(|byte| *byte == b'/')
+                    .next(),
+                Some(b"" | b"." | b"..")
+            ) {
+                return Err("archive path requires a directory".into());
+            }
+            match fs::read_link(&dest) {
+                Ok(_) if depth == 40 => return Err("too many archive symlinks".into()),
+                Ok(target) => dest = std::borrow::Cow::Owned(dest.with_file_name(target)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                Err(e) => return Err(io_error(e)),
+            }
+        }
+        dest
+    };
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let directory = File::open(parent).map_err(io_error)?;
+    let name = dest
+        .file_name()
+        .ok_or_else(|| io_error(io::ErrorKind::InvalidInput.into()))?;
+    let mut status = 0;
+    td_fs::replace_stream(
+        &directory,
+        name,
+        if previous.is_some() { 0o600 } else { 0o666 },
+        |staged| {
+            status = pack_archive(staged, previous.as_ref(), gzip, base, &names)
+                .map_err(io::Error::other)?;
+            if let Some(meta) = &previous {
+                let new = staged.metadata()?;
+                if td_fs::has_attributes(staged)? {
+                    return Err(io::Error::other(
+                        "staged archive inherited extended attributes",
+                    ));
+                }
+                if (new.uid(), new.gid()) != (meta.uid(), meta.gid()) {
+                    std::os::unix::fs::fchown(&*staged, Some(meta.uid()), Some(meta.gid()))?;
+                }
+                use std::os::unix::fs::PermissionsExt;
+                staged.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o777))?;
+            }
+            Ok(())
+        },
+        |temporary, destination| {
+            if let Some(old) = &previous {
+                let now = fs::symlink_metadata(destination)?;
+                if (old.dev(), old.ino(), old.ctime(), old.ctime_nsec())
+                    != (now.dev(), now.ino(), now.ctime(), now.ctime_nsec())
+                {
+                    return Err(io::Error::other("archive changed before replacement"));
+                }
+                fs::rename(temporary, destination)
+            } else {
+                let temp = temporary.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+                td_fs::rename_entry(&directory, temp, &directory, name)
+            }
+        },
+    )
+    .map_err(io_error)?;
+    Ok(status)
+}
+
+fn pack_archive(
+    mut output: &File,
+    previous: Option<&Metadata>,
+    gzip: bool,
+    base: &Path,
+    names: &[Vec<u8>],
+) -> Result<u8, String> {
+    let written = |e: io::Error| format!("write archive: {e}");
+    let meta = output.metadata().map_err(written)?;
     let mut packer = Packer {
-        archive: archive_meta
-            .filter(Metadata::is_file)
-            .map(|meta| (meta.dev(), meta.ino())),
+        archives: [Some(&meta), previous]
+            .map(|meta| meta.filter(|m| m.is_file()).map(|m| (m.dev(), m.ino()))),
         buffer: vec![0; COPY_BUFFER],
         changed: false,
     };
-    let written = |e: io::Error| format!("write {archive}: {e}");
     if gzip {
         let mut tar = Bounded {
             bytes: Vec::new(),
             limit: MAX_GZIP_BYTES,
         };
-        packer.pack(&mut tar, base, &names)?;
+        packer.pack(&mut tar, base, names)?;
         let compressed = crate::deflate::gzip(&tar.bytes, 6);
         drop(tar);
         if compressed.len() as u64 > crate::gzip::MAX_GZIP_INPUT_BYTES {
@@ -231,14 +333,13 @@ fn create(
                 compressed.len()
             ));
         }
-        let mut output = output;
         output
             .write_all(&compressed)
             .and_then(|()| output.flush())
             .map_err(written)?;
     } else {
         let mut output = BufWriter::with_capacity(COPY_BUFFER, output);
-        packer.pack(&mut output, base, &names)?;
+        packer.pack(&mut output, base, names)?;
         output.flush().map_err(written)?;
     }
     Ok(u8::from(packer.changed))
@@ -293,7 +394,7 @@ fn through_no_symlink(base: &Path, name: &[u8]) -> Result<(), String> {
 
 struct Packer {
     /// The archive's own file, if it is one, so it is not stored in itself.
-    archive: Option<(u64, u64)>,
+    archives: [Option<(u64, u64)>; 2],
     buffer: Vec<u8>,
     /// A file changed while it was stored: the archive is whole, its copy not.
     changed: bool,
@@ -330,7 +431,7 @@ impl Packer {
                 fs::symlink_metadata(&path)
             };
             let meta = looked.map_err(|e| format!("{}: {e}", path.display()))?;
-            if self.archive == Some((meta.dev(), meta.ino())) {
+            if self.archives.contains(&Some((meta.dev(), meta.ino()))) {
                 crate::emit_err(&format!(
                     "tar: {}: the archive itself is not stored\n",
                     path.display()

@@ -413,6 +413,30 @@ mod confinement {
         ),
     ];
 
+    #[test]
+    fn only_tar_reaches_the_shared_publication_wrappers() {
+        for (name, source) in sources() {
+            let text = squeeze(&source);
+            if name == "tar.rs" {
+                for call in [
+                    concat!("td_", "fs::has_attributes(file)"),
+                    concat!("td_", "fs::has_attributes(staged)"),
+                    concat!("td_", "fs::rename_entry(&directory,temp,&directory,name)"),
+                ] {
+                    assert_eq!(text.matches(call).count(), 1, "{call}");
+                }
+                assert_eq!(text.matches(concat!("td_", "fs::")).count(), 4);
+            } else {
+                assert!(
+                    !text
+                        .replace(concat!("td_", "fs::TempDir"), "")
+                        .contains(concat!("td_", "fs::")),
+                    "{name}"
+                );
+            }
+        }
+    }
+
     /// The engine files are compiled under this crate's `deny`, so an `allow`
     /// or an `unsafe` token in one would escape the `src/` scans: refuse both.
     #[test]

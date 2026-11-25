@@ -8,9 +8,9 @@ license = "MIT"
 # Own workspace root, so cargo behaves the same from the main checkout as from
 # a worktree nested under it (see the root Cargo.toml). A consumer names this
 # crate as `td-fs = { path = "../td-fs" }`, the one sibling-dependency
-# spelling the lock guard admits (AGENTS.md 'Rust code'); a crate a recipe
-# compiles with a direct rustc includes the one src/ file of the helper it
-# uses by `#[path]` instead. This crate depends on nothing but `std`.
+# spelling the lock guard admits (AGENTS.md 'Rust code'). The td-util recipe
+# links the shared publication module as an rlib. Other direct-rustc
+# consumers can include a single helper by path. This crate depends only on std.
 [workspace]
 
 [package.metadata.td-gate]

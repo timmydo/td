@@ -1869,7 +1869,6 @@ td-fs/src/real_file.rs	allocating-constructor	1
 td-fs/src/real_file.rs	allocation-macro	8
 td-fs/src/replace.rs	allocating-conversion	1
 td-fs/src/replace.rs	allocation-macro	2
-td-fs/src/replace.rs	unchecked-growth-or-clone	2
 td-fs/src/temp_dir.rs	allocating-conversion	3
 td-fs/src/temp_dir.rs	allocation-macro	2
 td-fs/src/temp_dir.rs	unchecked-growth-or-clone	3
@@ -4274,7 +4273,6 @@ td-util/src/sleep.rs	unchecked-growth-or-clone	1
 td-util/src/tar.rs	allocating-constructor	1
 td-util/src/tar.rs	allocating-conversion	16
 td-util/src/tar.rs	allocation-macro	32
-td-util/src/tar.rs	heap-owner	2
 td-util/src/tar.rs	unchecked-growth-or-clone	13
 td-util/src/test.rs	allocating-conversion	2
 td-util/src/test.rs	allocation-macro	7
