@@ -1247,6 +1247,14 @@ const PINS: &[PinDef] = &[
         version: "1.99.1",
     },
     PinDef {
+        key: "rust-rustfmt-dist",
+        aliases: &[],
+        url: "https://static.rust-lang.org/dist/2026-10-15/rustfmt-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "e3b36c4c7ec3486c059d8067ff48787676612007123aad7a4e8ec12c48ee9ba2",
+        file: "rustfmt-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+        version: "1.99.1",
+    },
+    PinDef {
         key: "tzdata-source",
         aliases: &[],
         // Approved IANA data-only input; compile with the existing td glibc zic.
@@ -1517,7 +1525,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        assert_eq!(all().len(), 143);
+        assert_eq!(all().len(), 144);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

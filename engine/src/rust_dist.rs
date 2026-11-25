@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 // --- rust-dist: the upstream Rust release, retargeted onto td's runtime ----------
 //
 // The engine phase runner for buildSystem "rust-dist" (`rust-toolchain`). It unpacks
-// the pinned rustc, rust-std, Cargo and Clippy release components with the engine's
+// the pinned rustc, rust-std, Cargo, Clippy and rustfmt release components with the engine's
 // own archive readers, assembles one toolchain tree, links td's runtime into its lib/
 // (found through the UNCHANGED upstream RUNPATH `$ORIGIN/../lib`), and relinks each
 // shipped executable's interpreter onto td's glibc loader with `crate::elf_edit::set_interp`
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 //
 //   TD_SRC        the rustc component tarball (Class::Source).
 //   TD_INPUT_MAP  name -> /td/store path:
-//                   rust-std-dist, rust-cargo-dist, rust-clippy-dist
+//                   rust-std-dist, rust-cargo-dist, rust-clippy-dist, rust-rustfmt-dist
 //                   glibc-x86-64   staged at GLIBC_X86_64_STAGE (loader + sonames)
 //                   gcc-runtime    lib/libgcc_s.so.1
 //                   zlib-x86-64    lib/libz.so.1
@@ -42,6 +42,8 @@ const RUST_EXECUTABLES: &[&str] = &[
     "bin/cargo",
     "bin/cargo-clippy",
     "bin/clippy-driver",
+    "bin/rustfmt",
+    "bin/cargo-fmt",
     "lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
 ];
 
@@ -80,6 +82,7 @@ pub struct RustDistInputs {
     pub std_src: PathBuf,
     pub cargo_src: PathBuf,
     pub clippy_src: PathBuf,
+    pub rustfmt_src: PathBuf,
     /// glibc-x86-64 (staged): the loader and the sonames linked into lib/.
     pub glibc: PathBuf,
     /// gcc-runtime's `lib/libgcc_s.so.1`.
@@ -121,6 +124,7 @@ fn assemble_rust_tree(inp: &RustDistInputs) -> Result<(), String> {
         (&inp.rustc_src, "rustc"),
         (&inp.cargo_src, "cargo"),
         (&inp.clippy_src, "clippy-preview"),
+        (&inp.rustfmt_src, "rustfmt-preview"),
         (&inp.std_src, "rust-std-x86_64-unknown-linux-gnu"),
     ] {
         merge_component(&component.join(dir), tree, Path::new(""))?;

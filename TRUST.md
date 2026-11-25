@@ -349,7 +349,7 @@ store, and nothing builds into it on the host.
 ## Rust toolchain and dependencies
 
 td uses upstream's prebuilt Rust 1.99.1 for `x86_64-unknown-linux-gnu`: the
-rustc, rust-std, Cargo and Clippy release components, each a source pin with
+rustc, rust-std, Cargo, Clippy and rustfmt release components, each a source pin with
 an upstream URL and its channel-manifest SHA-256. The `rust-toolchain`
 recipe's `rust-dist` transform assembles them, links td glibc,
 gcc-runtime's libgcc_s and td zlib into the tree, and relinks every shipped

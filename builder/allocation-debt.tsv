@@ -411,7 +411,7 @@ net/src/release/tests.rs	unchecked-growth-or-clone	32
 net/src/release/upload.rs	allocating-conversion	11
 net/src/release/upload.rs	allocation-macro	6
 net/src/release/upload.rs	unchecked-growth-or-clone	3
-net/src/rust_toolchain.rs	allocating-conversion	43
+net/src/rust_toolchain.rs	allocating-conversion	39
 net/src/rust_toolchain.rs	allocation-macro	12
 net/src/rust_toolchain.rs	unchecked-growth-or-clone	5
 net/src/s3/inventory.rs	allocating-conversion	2

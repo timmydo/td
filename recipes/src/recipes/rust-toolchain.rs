@@ -1,7 +1,7 @@
 use crate::types::{CheckRunner, Recipe, RecipeCheck};
 
 // rust-toolchain is the recipe build input for Rust 1.99.1 toolchain: upstream's prebuilt
-// x86_64-unknown-linux-gnu rustc, rust-std, Cargo and Clippy release
+// x86_64-unknown-linux-gnu rustc, rust-std, Cargo, Clippy and rustfmt release
 // components, pinned by their channel-manifest SHA-256. It is a declared
 // build-tool trust root (AGENTS.md "Rust toolchain"), not a source build.
 //
@@ -13,14 +13,15 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck};
 // companions: td-profiler reports them as a coverage boundary, and every
 // Rust output's assembly-exception marker names its prebuilt std.
 //
-// Kept: rustc, rustdoc, cargo, cargo-clippy, clippy-driver and rust-lld,
+// Kept: rustc, rustdoc, cargo, cargo-clippy, clippy-driver, rustfmt, cargo-fmt
+// and rust-lld,
 // with `gcc-ld/ld.lld` linked to rust-lld for upstream's default
 // `-fuse-ld=lld`. Dropped: the debugger scripts, the rust-analyzer server,
 // the other linker flavors, wasm-component-ld and rust-objcopy.
 pub fn recipe() -> Recipe {
     Recipe::rust_dist("rust-toolchain", "1.99.1")
         .source_input("rust-rustc-dist")
-        .inputs(&["rust-std-dist", "rust-cargo-dist", "rust-clippy-dist"])
+        .inputs(&["rust-std-dist", "rust-cargo-dist", "rust-clippy-dist", "rust-rustfmt-dist"])
         .native_inputs(&["glibc-x86-64", "gcc-runtime", "zlib-x86-64"])
         .checks(vec![RecipeCheck::new(
             r#"

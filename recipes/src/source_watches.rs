@@ -398,6 +398,13 @@ const WATCHES: &[(&str, Watch)] = &[
         },
     ),
     (
+        "rust-rustfmt-dist",
+        Watch::Index {
+            index: RUST_STABLE,
+            pattern: "rustfmt-{}-x86_64-unknown-linux-gnu.tar.xz",
+        },
+    ),
+    (
         "tzdata-source",
         Watch::Index {
             index: "https://data.iana.org/time-zones/releases/",

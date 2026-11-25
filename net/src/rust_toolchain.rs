@@ -17,12 +17,21 @@ use td_engine::{rust_dist, sha256};
 const CONFIG: &str = "/etc/td-rust.tsv";
 const MAX_CONFIG: u64 = 16 * 1024;
 const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
-const TOOLS: &[&str] = &["rustc", "rustdoc", "cargo", "cargo-clippy", "clippy-driver"];
-const COMPONENTS: &[(&str, &str)] = &[
+const TOOLS: &[&str] = &[
+    "rustc",
+    "rustdoc",
+    "cargo",
+    "cargo-clippy",
+    "clippy-driver",
+    "rustfmt",
+    "cargo-fmt",
+];
+const COMPONENTS: &[(&str, &str); 5] = &[
     ("rustc", "rustc/bin/rustc"),
     ("std", "rust-std-x86_64-unknown-linux-gnu/lib/rustlib"),
     ("cargo", "cargo/bin/cargo"),
     ("clippy", "clippy-preview/bin/clippy-driver"),
+    ("rustfmt", "rustfmt-preview/bin/rustfmt"),
 ];
 const LLD: &str = "lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld";
 
@@ -252,20 +261,23 @@ fn prepare(
                 ));
             }
         }
-        for (name, required) in COMPONENTS {
+        let directories = COMPONENTS.map(|(name, _)| work.join(name));
+        for ((name, required), directory) in COMPONENTS.iter().zip(&directories) {
             rust_dist::unpack_rust_component(
                 &work.join(format!("{name}.tar.xz")),
-                &work.join(name),
+                directory,
                 required,
             )?;
         }
         let output = work.join("toolchain");
         private_dir(&output, uid)?;
+        let [rustc_src, std_src, cargo_src, clippy_src, rustfmt_src] = directories;
         rust_dist::assemble(&rust_dist::RustDistInputs {
-            rustc_src: work.join("rustc"),
-            std_src: work.join("std"),
-            cargo_src: work.join("cargo"),
-            clippy_src: work.join("clippy"),
+            rustc_src,
+            std_src,
+            cargo_src,
+            clippy_src,
+            rustfmt_src,
             glibc: config.glibc.clone(),
             libgcc_s: config.libgcc.clone(),
             libz: config.libz.clone(),
@@ -330,7 +342,7 @@ pub(crate) fn run(args: &[String]) {
             )
         };
         if matches!(tool, "help" | "--help" | "-h") {
-            println!("usage: td-rust fetch|path|rustc|rustdoc|cargo|cargo-clippy|clippy-driver [ARGS...]");
+            println!("usage: td-rust fetch|path|rustc|rustdoc|cargo|cargo-clippy|clippy-driver|rustfmt|cargo-fmt [ARGS...]");
             return Ok(());
         }
         if !is_tool(tool) && !matches!(tool, "fetch" | "path") {
@@ -440,7 +452,14 @@ mod tests {
                 "clippy".to_string(),
                 archive(&[
                     ("r/clippy-preview/bin/cargo-clippy", executable.clone()),
-                    ("r/clippy-preview/bin/clippy-driver", executable),
+                    ("r/clippy-preview/bin/clippy-driver", executable.clone()),
+                ]),
+            ),
+            (
+                "rustfmt".to_string(),
+                archive(&[
+                    ("r/rustfmt-preview/bin/cargo-fmt", executable.clone()),
+                    ("r/rustfmt-preview/bin/rustfmt", executable),
                 ]),
             ),
         ]);
@@ -525,7 +544,7 @@ mod tests {
         });
         let tree = results.0.unwrap();
         assert_eq!(tree, results.1.unwrap());
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), COMPONENTS.len());
         assert_eq!(
             td_engine::elf::read_interp(&tree.join("bin/rustc")).unwrap(),
             Some(format!(

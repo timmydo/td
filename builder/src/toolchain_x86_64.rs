@@ -43,6 +43,11 @@ fn from_drv_env() -> Result<RustDistInputs, String> {
             "td-rust-dist-clippy",
             "clippy-preview/bin/clippy-driver",
         )?,
+        rustfmt_src: unpack(
+            &pick("rust-rustfmt-dist")?,
+            "td-rust-dist-rustfmt",
+            "rustfmt-preview/bin/rustfmt",
+        )?,
         glibc: pick("glibc-x86-64")?.join(GLIBC_X86_64_STAGE),
         libgcc_s: pick("gcc-runtime")?.join("lib/libgcc_s.so.1"),
         libz: pick("zlib-x86-64")?.join("lib/libz.so.1"),

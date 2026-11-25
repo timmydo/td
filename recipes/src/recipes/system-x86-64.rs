@@ -6058,6 +6058,8 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         "cargo",
         "cargo-clippy",
         "clippy-driver",
+        "rustfmt",
+        "cargo-fmt",
     ] {
         steps.push(Step::Symlink {
             target: "{in:td-net}/bin/td-net".into(),
@@ -6076,6 +6078,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         ("std", "rust-std-dist"),
         ("cargo", "rust-cargo-dist"),
         ("clippy", "rust-clippy-dist"),
+        ("rustfmt", "rust-rustfmt-dist"),
     ] {
         let pin =
             crate::source_pins::by_key(key).ok_or_else(|| format!("missing Rust pin {key}"))?;
@@ -11201,6 +11204,8 @@ mod tests {
             ("cargo", "{in:td-net}/bin/td-net"),
             ("cargo-clippy", "{in:td-net}/bin/td-net"),
             ("clippy-driver", "{in:td-net}/bin/td-net"),
+            ("rustfmt", "{in:td-net}/bin/td-net"),
+            ("cargo-fmt", "{in:td-net}/bin/td-net"),
             ("td-link", "{in:td-link-runtime}/bin/td-link"),
             ("cc", "{in:td-link-runtime}/bin/td-link"),
         ] {
@@ -11242,6 +11247,7 @@ mod tests {
             "rust-std-dist",
             "rust-cargo-dist",
             "rust-clippy-dist",
+            "rust-rustfmt-dist",
         ] {
             let pin = crate::source_pins::by_key(key).unwrap();
             assert!(rust_config.contains(&format!("\t{}\t{}\n", pin.url, pin.sha256)));

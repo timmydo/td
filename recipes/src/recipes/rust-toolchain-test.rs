@@ -34,6 +34,8 @@ const RELINKED: &[&str] = &[
     "bin/cargo",
     "bin/cargo-clippy",
     "bin/clippy-driver",
+    "bin/rustfmt",
+    "bin/cargo-fmt",
     "lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
 ];
 
@@ -88,6 +90,10 @@ const CARGO_SMOKE: &str = r#"PATH='{in:rust-toolchain}/bin' RUSTC='{in:rust-tool
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER='{in:td-link}/bin/td-link' \
   '{in:rust-toolchain}/bin/cargo' build --offline \
   --manifest-path '{root}/cargo-smoke/Cargo.toml' --target-dir '{root}/cargo-target'
+PATH='{in:rust-toolchain}/bin' CARGO_HOME='{root}/cargo-home' HOME='{root}/cargo-home' \
+  '{in:rust-toolchain}/bin/cargo' fmt --manifest-path '{root}/cargo-smoke/Cargo.toml'
+'{in:rust-toolchain}/bin/rustfmt' --check '{root}/cargo-smoke/src/main.rs'
+grep -Fx '    println!("43");' '{root}/cargo-smoke/src/main.rs' || fail 'cargo fmt did not format the smoke program'
 td_linked '{root}/cargo-target/debug/td-cargo-smoke'
 test "$('{root}/cargo-target/debug/td-cargo-smoke')" = 43 || fail 'the Cargo smoke program did not print 43'
 "#;

@@ -7505,10 +7505,10 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   refused rather than ignored**.
 
 **On-demand Rust.** The image's `/bin/rustc`, `rustdoc`, `cargo`,
-`cargo-clippy` and `clippy-driver` launch the `td-net rust` applet, also
+`cargo-clippy`, `clippy-driver`, `rustfmt` and `cargo-fmt` launch the `td-net rust` applet, also
 named `/bin/td-rust`. No compiler, LLVM or standard-library archive ships
 in the root image. `/etc/td-rust.tsv` contains the running deployment's
-four upstream component URLs and SHA-256 pins, version and td runtime
+five upstream component URLs and SHA-256 pins, version and td runtime
 paths. These are generated from the recipe pins. The account may prepare
 Rust explicitly with `td-rust fetch`; `td-rust path` also prepares it and
 prints its root. Development workspace jails bind this public configuration
@@ -7519,7 +7519,7 @@ and select that copy through the controller's typed compiler field
 (`td-agent/DESIGN.md` §2). Their HOME stays noexec and their network stays
 isolated; they never mount or hardlink the account cache.
 
-First use downloads all four components with a shared 30-minute deadline
+First use downloads all five components with a shared 30-minute deadline
 and a 512 MiB bound per archive, verifies every checksum before unpacking,
 and uses `engine/src/rust_dist.rs` and `engine/src/elf_edit.rs` to assemble
 and retarget exactly those pinned tools onto td glibc. This is the sole

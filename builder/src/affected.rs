@@ -6689,9 +6689,7 @@ fn rustfmt_roots(
     let report = report.into_inner().unwrap_or_else(PoisonError::into_inner);
     if let Some(e) = report.failed {
         return Err(if e.kind() == std::io::ErrorKind::NotFound {
-            "rustfmt is not on PATH, and the format check needs it (td's own Rust \
-             toolchain does not ship it yet)"
-                .to_string()
+            "the format check requires rustfmt on PATH".to_string()
         } else {
             format!("rustfmt: {e}")
         });

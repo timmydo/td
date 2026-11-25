@@ -20,7 +20,7 @@ will separate a bump's red from one already there.
 | Class | Where it is pinned | How it moves |
 | --- | --- | --- |
 | Source tarballs, data and the pinned Rust crates | `recipes/src/source_pins.rs`, watched from `recipes/src/source_watches.rs` | [Source pins](#source-pins) |
-| The Rust toolchain (rustc, rust-std, Cargo, Clippy) | the four `rust-*-dist` source pins | [Rust toolchain](#rust-toolchain) |
+| The Rust toolchain (rustc, rust-std, Cargo, Clippy, rustfmt) | the five `rust-*-dist` source pins | [Rust toolchain](#rust-toolchain) |
 | fd, ripgrep and uutils' crate closures | `recipes/locks/*/Cargo.lock` | with their crate pin ([Crate pins](#crate-pins)) |
 | The Debian build root: every C build tool, and the glibc and gcc-runtime td imports from it | `recipes/src/debian-root.lock` | [Debian build root](#debian-build-root) |
 | td-net's crates | `net/Cargo.lock` | [Rust dependency closures](#rust-dependency-closures) |
@@ -123,7 +123,7 @@ takes.
 
 # Source pins
 
-One pin, or one tight group (the four Rust components, the Nerd Fonts archive
+One pin, or one tight group (the five Rust components, the Nerd Fonts archive
 and its licences, Noto's eight faces and their licence), per commit.
 
 1. Edit the `PinDef` in `recipes/src/source_pins.rs`: `url`, `file`,
@@ -236,7 +236,7 @@ new release's MSRV against the pinned Rust toolchain.
 A new toolchain can change which syscalls `mail`, `news` and `web` reach: derive
 their lists again (`APPLICATIONS.md`, "Per-application allowlists").
 
-The four `rust-*-dist` pins move together, to one dated directory of
+The five `rust-*-dist` pins move together, to one dated directory of
 `static.rust-lang.org/dist`, with hashes from that date's
 `channel-rust-stable.toml`. `td-rust` downloads the same pinned components,
 so it follows them. The version and the dist date are restated elsewhere:
