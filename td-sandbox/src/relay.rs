@@ -1,5 +1,5 @@
 use crate::wire;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
@@ -341,6 +341,20 @@ fn drain<W>(to: &Output<W>, pumps: Vec<Pump>) -> io::Result<()> {
     Ok(())
 }
 
+fn add_td_term_environment(
+    environment: &mut Vec<(OsString, OsString)>,
+    terminal: bool,
+    term: &OsStr,
+) -> io::Result<()> {
+    if terminal && term == "td-term" {
+        for (key, value) in [("COLORTERM", "truecolor"), ("TERMINFO", "/etc/terminfo")] {
+            let pair = (crate::owned(key)?.into(), crate::owned(value)?.into());
+            td_alloc::push(environment, pair).map_err(crate::refused)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn inside(arguments: Vec<OsString>) -> io::Result<u8> {
     if std::env::current_exe()? != Path::new("/opt/workspace/bin/td-sandbox") {
         return Err(err("internal entry requires the workspace jail"));
@@ -369,6 +383,7 @@ pub fn inside(arguments: Vec<OsString>) -> io::Result<u8> {
     path.push(std::env::var_os("PATH").unwrap_or_default());
     let mut environment: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     environment.retain(|(k, _)| k != "PATH" && k != "TERM");
+    add_td_term_environment(&mut environment, terminal, &term)?;
     environment.extend([("PATH".into(), path), ("TERM".into(), term)]);
     for ca in ["/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"] {
         if Path::new(ca).is_file() {
@@ -536,6 +551,30 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
+
+    #[test]
+    fn td_term_pty_advertises_color_and_its_terminfo_database() {
+        for (pty, term) in [
+            (true, "td-term"),
+            (true, "xterm-256color"),
+            (false, "td-term"),
+            (false, "dumb"),
+        ] {
+            let mut env = Vec::new();
+            add_td_term_environment(&mut env, pty, term.as_ref()).unwrap();
+            if pty && term == "td-term" {
+                assert_eq!(
+                    env,
+                    [
+                        ("COLORTERM".into(), "truecolor".into()),
+                        ("TERMINFO".into(), "/etc/terminfo".into()),
+                    ]
+                );
+            } else {
+                assert!(env.is_empty());
+            }
+        }
+    }
 
     const DRAIN_IDLE: Duration = Duration::from_millis(DRAIN_POLL_MS * DRAIN_IDLE_POLLS);
 

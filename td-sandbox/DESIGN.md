@@ -323,7 +323,11 @@ a deletion's emptying among them. Root refuses a launch of a deleted
 sandbox `deleted`, which td-sandbox tells as such.
 
 The entry opens a fresh PTY in the private devpts via td-ui, then spawns
-the command as a new session leader on its slave. The workspace's generic
+the command as a new session leader on its slave. For a PTY with
+`TERM=td-term`, the relay sets `COLORTERM=truecolor` and
+`TERMINFO=/etc/terminfo` in the child's environment. The workspace already
+exposes td's terminal description there. Other terminal types and pipe
+sessions receive neither hint from the relay. The workspace's generic
 /dev/tty (5,0) refers to that session's terminal, not the host's. PID 1
 and the relay entry have no controlling terminal.
 
