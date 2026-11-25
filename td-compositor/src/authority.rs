@@ -614,8 +614,43 @@ impl InstalledSet {
     }
 }
 
+pub(crate) type SandboxListing = Arc<std::sync::OnceLock<Option<Vec<(u16, String)>>>>;
+
+fn sandbox_offsets(reply: &[u8]) -> Result<Option<&[[u8; 2]]>, String> {
+    if reply == [0xff, 2] {
+        return Ok(None);
+    }
+    let Some(bytes) = reply.strip_prefix(&[0xb1]) else {
+        return Err("invalid sandbox list reply".into());
+    };
+    let (pairs, tail) = bytes.as_chunks::<2>();
+    if !tail.is_empty() || pairs.len() > crate::workload_accounts::WORKLOAD_KIND_ROWS {
+        return Err("invalid sandbox list size".into());
+    }
+    Ok(Some(pairs))
+}
+
+fn sandbox_names(pairs: &[[u8; 2]]) -> Option<Vec<(u16, String)>> {
+    use crate::workload_accounts::{self as accounts, Kind};
+    if pairs.is_empty() {
+        return Some(Vec::new());
+    }
+    let ledger = accounts::load().ok()?;
+    let mut names = crate::allocation::with_capacity(pairs.len()).ok()?;
+    for pair in pairs {
+        let id = u16::from_be_bytes(*pair);
+        let uid = accounts::WORKLOAD_UIDS.start() + u32::from(id);
+        let name = crate::allocation::string(ledger.name(Kind::Sandbox, uid)?).ok()?;
+        crate::allocation::push(&mut names, (id, name)).ok()?;
+    }
+    names.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    names.dedup_by(|a, b| a.0 == b.0);
+    Some(names)
+}
+
 #[derive(Default)]
 struct InstalledShared {
+    sandbox_listing: Option<SandboxListing>,
     /// The launcher table's names, which an answer may name; nothing is
     /// asked before the runtime gives them.
     table: Option<Vec<String>>,
@@ -634,6 +669,37 @@ struct InstalledShared {
 pub(crate) struct Installed(Arc<Mutex<InstalledShared>>);
 
 impl Installed {
+    pub(crate) fn ask_sandboxes(&self, listing: SandboxListing) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sandbox_listing = Some(listing);
+    }
+
+    fn follow_sandboxes(&self, wire: &mut impl Exchange) -> Result<(), String> {
+        let wanted = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sandbox_listing
+            .take();
+        if let Some(listing) = wanted {
+            let reply = wire
+                .exchange(&[0x31])
+                .and_then(|bytes| Ok(sandbox_offsets(&bytes)?.and_then(sandbox_names)));
+            match reply {
+                Ok(names) => {
+                    let _ = listing.set(names);
+                }
+                Err(error) => {
+                    let _ = listing.set(None);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The launcher table's names, and a first ask.
     pub(crate) fn follow_table(&self, names: Vec<String>) {
         let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1467,7 +1533,7 @@ impl Queued {
 #[derive(Clone, Copy)]
 pub(crate) enum Program {
     Home,
-    Sandbox,
+    Sandbox(u16),
     Task,
     TaskManager,
     Editor,
@@ -1628,7 +1694,10 @@ impl Processes {
     ) -> Result<Option<&'static str>, String> {
         let request = match terminal {
             Program::Home => 1,
-            Program::Sandbox => 0x27,
+            Program::Sandbox(id) => {
+                let [hi, lo] = id.to_be_bytes();
+                return self.request(wire, &[0x27, hi, lo]);
+            }
             Program::Task => 4,
             Program::TaskManager => 7,
             Program::Editor => 8,
@@ -1975,6 +2044,7 @@ fn worker(
         hostnames.follow(&mut wire)?;
         application.follow(&mut wire)?;
         installed.follow(&mut wire, Instant::now())?;
+        installed.follow_sandboxes(&mut wire)?;
     }
 }
 
@@ -2548,9 +2618,32 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_listing_reply_is_bounded_and_exact() {
+        assert_eq!(
+            sandbox_offsets(&[0xb1, 0, 42]).unwrap(),
+            Some(&[[0, 42]][..])
+        );
+        assert_eq!(sandbox_offsets(&[0xff, 2]).unwrap(), None);
+        for invalid in [&[0xb1, 1][..], &[0xff, 3], &[0xff, 2, 0], &[]] {
+            assert!(sandbox_offsets(invalid).is_err());
+        }
+        assert!(sandbox_offsets(&vec![
+            0xb1;
+            3 + 2 * crate::workload_accounts::WORKLOAD_KIND_ROWS
+        ])
+        .is_err());
+        let mut processes = Processes::new();
+        let mut wire = wire(vec![handle(1)]);
+        assert_eq!(
+            processes.start(&mut wire, Program::Sandbox(258)).unwrap(),
+            None
+        );
+        assert_eq!(wire.requests, [vec![0x27, 1, 2]]);
+    }
+
+    #[test]
     fn selected_programs_send_only_their_fixed_authority_request() {
         for (terminal, expected) in [
-            (Program::Sandbox, 0x27),
             (Program::TaskManager, 7),
             (Program::Editor, 8),
             (Program::Photo, 9),

@@ -1543,14 +1543,15 @@ TDLA003, because `1c` carries a PIN; `0c` through `0f`, `22` through
 took their names within it. Both peers again ship together, without
 negotiation.
 
-Request `27` is the sandbox terminal: the same unprivileged terminal path
-with the fixed additional arguments `--command /bin/td-sandbox shell default`.
-It carries no operands, path or profile name. td-sandbox asks root's
-workspace intake to start the default sandbox's shell as its account; the
-authority reads none of that sandbox's grants and grants no new privilege.
-The image seeds the sandbox as the primary user before the compositor
-starts (td-sandbox/DESIGN.md).
-The additive request ships with its compositor peer within TDLA003.
+Request `31` lists sandbox profiles through `td-login exec-as HUMAN --
+/bin/td-sandbox launcher-ids`. The helper reads the human's profile records
+and the workload ledger. In at most two seconds it returns up to 1024
+big-endian u16 offsets from the first workload UID. Root replies with
+`b1` and those offsets, or `ff 02` on failure. Request `27` with one
+such offset resolves the sandbox name from the ledger and starts a human
+terminal with the literal arguments `--command /bin/td-sandbox shell NAME`.
+The operand-free form selects `default`. The workspace intake admits the
+selected sandbox and applies its grants at launch.
 
 For terminal requests it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket

@@ -46,6 +46,7 @@ pub enum LaunchRequest {
     UiDemo,
     Terminal,
     Sandbox,
+    SandboxProfile(u16),
     TaskManager,
     Editor,
     Photo,
@@ -69,7 +70,8 @@ impl LaunchRequest {
     /// authority starts as the human: the desktop programs the image ships.
     fn authority_program(self) -> Option<crate::authority::Program> {
         match self {
-            Self::Sandbox => Some(crate::authority::Program::Sandbox),
+            Self::SandboxProfile(id) => Some(crate::authority::Program::Sandbox(id)),
+            Self::Sandbox => None,
             Self::TaskManager => Some(crate::authority::Program::TaskManager),
             Self::Editor => Some(crate::authority::Program::Editor),
             Self::Photo => Some(crate::authority::Program::Photo),
@@ -218,6 +220,7 @@ struct Application {
 /// Install row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Item {
+    Sandbox(usize),
     Fixed(usize),
     Application(usize),
     Install(usize),
@@ -283,6 +286,8 @@ pub struct Launcher {
     matches: Vec<Item>,
     /// The launcher table's applications, by display name.
     applications: Vec<Application>,
+    sandbox_listing: Option<crate::authority::SandboxListing>,
+    listing_seen: bool,
     authority: bool,
 }
 
@@ -414,6 +419,8 @@ impl Launcher {
             query: String::with_capacity(filter::MAX_QUERY_BYTES),
             matches: Vec::new(),
             applications: Vec::new(),
+            sandbox_listing: None,
+            listing_seen: false,
             authority: false,
         };
         launcher.refresh_matches();
@@ -484,10 +491,29 @@ impl Launcher {
         self.applications.get(index).map(|a| a.name.as_str())
     }
 
+    pub(crate) fn sandbox_listing(&self) -> Option<crate::authority::SandboxListing> {
+        self.sandbox_listing.as_ref().map(std::sync::Arc::clone)
+    }
+
+    pub(crate) fn refresh_sandboxes(&mut self) -> bool {
+        if self.visible
+            && !self.listing_seen
+            && self
+                .sandbox_listing
+                .as_ref()
+                .is_some_and(|list| list.get().is_some())
+        {
+            self.refresh_matches();
+            return true;
+        }
+        false
+    }
+
     pub fn apply(&mut self, action: LauncherAction) -> Option<LaunchRequest> {
         match action {
             LauncherAction::Open => {
                 self.visible = true;
+                self.sandbox_listing = None;
                 self.query.clear();
                 self.refresh_matches();
             }
@@ -518,7 +544,14 @@ impl Launcher {
                     .and_then(|item| self.entry(*item))
                     .map(|entry| entry.request);
                 let request = request?;
-                self.visible = false;
+                if request == Some(LaunchRequest::Sandbox) {
+                    self.sandbox_listing = Some(Default::default());
+                    self.listing_seen = false;
+                    self.query.clear();
+                    self.refresh_matches();
+                } else {
+                    self.visible = false;
+                }
                 return request;
             }
             LauncherAction::Insert(character)
@@ -542,6 +575,14 @@ impl Launcher {
 
     fn entry(&self, item: Item) -> Option<Entry<'_>> {
         match item {
+            Item::Sandbox(index) => {
+                let (id, name) = self.sandbox_listing.as_ref()?.get()?.as_ref()?.get(index)?;
+                Some(Entry {
+                    label: name,
+                    search: name,
+                    request: Some(LaunchRequest::SandboxProfile(*id)),
+                })
+            }
             Item::Fixed(index) => fixed_entry(self.authority, index),
             Item::Application(index) => self.applications.get(index).map(|a| Entry {
                 label: &a.label,
@@ -563,6 +604,23 @@ impl Launcher {
     fn refresh_matches(&mut self) {
         self.matches.clear();
         let query = self.query.as_str();
+        if let Some(listing) = &self.sandbox_listing {
+            self.selected = 0;
+            self.scroll = 0;
+            let answer = listing.get();
+            self.listing_seen = answer.is_some();
+            if let Some(Some(names)) = answer {
+                for (index, (_, name)) in names.iter().enumerate() {
+                    if filter::matches(name, query)
+                        && crate::allocation::push(&mut self.matches, Item::Sandbox(index)).is_err()
+                    {
+                        self.matches.clear();
+                        break;
+                    }
+                }
+            }
+            return;
+        }
         for index in 0..fixed_count(self.authority) {
             if fixed_entry(self.authority, index).is_some_and(|e| filter::matches(e.search, query))
             {
@@ -661,7 +719,11 @@ impl Launcher {
             height,
             stride,
             (left.saturating_add(20), top.saturating_add(18)),
-            "TD LAUNCHER",
+            if self.sandbox_listing.is_some() {
+                "SELECT SANDBOX"
+            } else {
+                "TD LAUNCHER"
+            },
             ([0xff, 0xff, 0xff, 0], CARD),
             card,
         );
@@ -694,7 +756,12 @@ impl Launcher {
                 height,
                 stride,
                 (left.saturating_add(24), top.saturating_add(92)),
-                "NO MATCHES",
+                match self.sandbox_listing.as_ref().map(|list| list.get()) {
+                    Some(None) => "LOADING SANDBOXES",
+                    Some(Some(None)) => "SANDBOX LIST UNAVAILABLE",
+                    Some(Some(Some(names))) if names.is_empty() => "NO SANDBOXES",
+                    _ => "NO MATCHES",
+                },
                 ([0xa8, 0xa0, 0xb0, 0], CARD),
                 card,
             );
@@ -898,6 +965,7 @@ pub(crate) fn launch_command(
     ));
     let program = match request {
         LaunchRequest::Sandbox
+        | LaunchRequest::SandboxProfile(_)
         | LaunchRequest::TaskManager
         | LaunchRequest::Editor
         | LaunchRequest::Photo
@@ -1918,7 +1986,7 @@ mod authority_entry_tests {
         use crate::authority::Program;
         matches!(
             (request, request.authority_program()),
-            (LaunchRequest::Sandbox, Some(Program::Sandbox))
+            (LaunchRequest::SandboxProfile(_), Some(Program::Sandbox(_)))
                 | (LaunchRequest::TaskManager, Some(Program::TaskManager))
                 | (LaunchRequest::Editor, Some(Program::Editor))
                 | (LaunchRequest::Photo, Some(Program::Photo))
@@ -1942,7 +2010,6 @@ mod authority_entry_tests {
         launcher.apply(LauncherAction::Open);
         assert_eq!(launcher.matched_labels(), FIXED);
         for (word, label, request) in [
-            ("sandbox", "td-term (sandbox)", LaunchRequest::Sandbox),
             ("process", "TASK MANAGER", LaunchRequest::TaskManager),
             ("editor", "TEXT EDITOR", LaunchRequest::Editor),
             ("picture", "PHOTOS", LaunchRequest::Photo),
@@ -1981,6 +2048,42 @@ mod authority_entry_tests {
         ] {
             assert!(request.authority_program().is_none());
         }
+    }
+
+    #[test]
+    fn sandbox_submenu_filters_and_opens_the_selected_account() {
+        let mut launcher = Launcher::new();
+        launcher.set_authority(true);
+        launcher.apply(LauncherAction::Open);
+        for c in "sandbox".chars() {
+            launcher.apply(LauncherAction::Insert(c));
+        }
+        assert_eq!(
+            launcher.apply(LauncherAction::Choose(0)),
+            Some(LaunchRequest::Sandbox)
+        );
+        assert!(launcher.visible());
+        assert_eq!(launcher.apply(LauncherAction::Activate), None);
+        launcher
+            .sandbox_listing()
+            .unwrap()
+            .set(Some(vec![
+                (3, "default".into()),
+                (41, "web".into()),
+                (42, "work".into()),
+            ]))
+            .unwrap();
+        launcher.apply(LauncherAction::Insert('w'));
+        assert_eq!(launcher.matched_labels(), ["web", "work"]);
+        launcher.apply(LauncherAction::Next);
+        assert!(!launcher.refresh_sandboxes());
+        assert_eq!(
+            launcher.apply(LauncherAction::Activate),
+            Some(LaunchRequest::SandboxProfile(42))
+        );
+        assert!(!launcher.visible());
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(launcher.matched_labels(), FIXED);
     }
 
     /// The card shows at most CARD_ROWS rows, which a full card holds;

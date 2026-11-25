@@ -2298,6 +2298,14 @@ impl Scene {
         self.launcher.apply(action)
     }
 
+    pub(crate) fn sandbox_listing(&self) -> Option<crate::authority::SandboxListing> {
+        self.launcher.sandbox_listing()
+    }
+
+    pub(crate) fn refresh_sandboxes(&mut self) -> bool {
+        self.launcher.refresh_sandboxes()
+    }
+
     pub fn launcher_visible(&self) -> bool {
         self.launcher.visible()
     }

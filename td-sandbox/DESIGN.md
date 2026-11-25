@@ -291,11 +291,12 @@ the grant also needs access to the backing repository at its original
 path. To revoke the share, run `td-sandbox unshare default ~/src/project`
 in the regular terminal. Existing sessions retain their view until exit.
 
-The image compositor offers `td-term (sandbox)`. Its fixed authority request
-starts a human-owned td-term with literal command `/bin/td-sandbox shell
-default`, using the normal terminal readiness and process tracking. The
-terminal remains outside the jail. Each launch opens its own shell and
-PTY in the same sandbox account, with the same home and current grants. The launcher never
+The image compositor's `td-term (sandbox)` opens a searchable submenu.
+It lists readable profile records with a sandbox ledger account, in name
+order. Selecting a name opens a human-owned td-term running
+`/bin/td-sandbox shell NAME`, with normal terminal readiness and process
+tracking. Each launch opens a separate shell and PTY in that account.
+The launcher never
 initializes or rewrites a record. Boot orders the compositor after default
 provisioning but does not require provisioning success, so a damaged record
 cannot prevent the desktop opening. A deleted default is seeded on the next

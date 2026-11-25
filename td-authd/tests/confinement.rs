@@ -423,7 +423,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x2c7e51db738098fa,
+        0x06e8ff0061b8d895,
         "read-only store controller changed"
     );
     let inspection = include_str!("../src/inspection.rs")
@@ -1464,11 +1464,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
     ] {
         assert!(!launch.contains(forbidden), "launch.rs: {forbidden}");
     }
+    assert!(launch.contains("command.args([\n                    \"exec-as\",\n                    &config.user,\n                    \"--\",\n                    \"/bin/td-sandbox\",\n                    \"launcher-ids\","));
+    assert!(launch.contains("Self::Sandbox => crate::workload_accounts::valid_name(name)"));
     assert_eq!(launch.matches("thread::sleep(").count(), 1);
     assert_eq!(launch.matches(".spawn(").count(), 1);
     assert_eq!(launch.matches(".exec()").count(), 2);
     assert_eq!(launch.matches(".process_group(0)").count(), 1);
-    assert_eq!(launch.matches("Command::new(").count(), 7);
+    assert_eq!(launch.matches("Command::new(").count(), 8);
     // The root commands a peer can cause beside the credential helper:
     // its supervisor starting an application's unit or the fixed update
     // unit, and reading an application unit's status line. The name is
@@ -1496,7 +1498,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     ] {
         assert_eq!(launch.matches(bound).count(), 1, "{bound}");
     }
-    assert_eq!(launch.matches("Inspection::printing(").count(), 1);
+    assert_eq!(launch.matches("Inspection::printing(").count(), 2);
     // `0d` starts only the unit a registry name names; the retired update
     // unit, `0e`'s, is named nowhere.
     assert!(launch.contains("let Self::Start(name) = self;\n        name"));
@@ -1510,8 +1512,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         1
     );
     assert_eq!(launch.matches("spawn_with(").count(), 3);
-    // The one peer-named program argument is td-software's selection, a
-    // registry name checked before the command is built.
+    // Named selections are admitted separately for each program.
     assert_eq!(
         launch
             .matches("command.args([\"--select\", name]);")
@@ -1519,15 +1520,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
         1
     );
     assert_eq!(launch.matches("fn valid_selection(").count(), 1);
-    // Root's helper argv carries it only for td-software's own variant.
+    // Root passes the selection through the credential helper as one word.
     assert_eq!(launch.matches("command.arg(name);").count(), 1);
     assert!(launch
-        .contains("if let Launch::SoftwareAt(name) = launch {\n            command.arg(name);"));
+        .contains("if let Launch::SoftwareAt(name) | Launch::SandboxAt(name) = launch {\n            command.arg(name);"));
     assert!(launch.contains("Self::SoftwareAt(_) => Program::Software,"));
     let gate = launch
-        .find(
-            "if select.is_some_and(|name| terminal != Program::Software || !valid_selection(name))",
-        )
+        .find("if select.is_some_and(|name| !terminal.valid_operand(name))")
         .unwrap();
     assert!(gate < launch.find("command.args([\"--select\", name]);").unwrap());
     // A PIN request lives on only in its clearing owner.
@@ -1889,7 +1888,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
 const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
-const LAUNCH_FINGERPRINT: u64 = 0x1c33ce89c12b4fe2;
+const LAUNCH_FINGERPRINT: u64 = 0x4fde98f76ca43535;
 const MAIN_FINGERPRINT: u64 = 0xaca9c2323ccde7ee;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0x715685005ea23b04;

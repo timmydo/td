@@ -5965,11 +5965,12 @@ client through the paired service at UID 993. The direct launcher remains
 available for host development.
 
 The authority card also offers `td-term (sandbox)`, searchable by sandbox,
-private home or terminal. It sends the operand-free request `27` for a fixed
-human terminal running `/bin/td-sandbox shell default`. The same worker,
-readiness probe and bounded process handles track it. No profile policy,
-program path or command arguments come from the compositor. Host direct
-mode does not offer this authority-only entry.
+private home or terminal. Selecting it opens a filterable card of sandbox
+profiles. The authority worker asks `31` for their workload UID offsets and
+resolves their names from the ledger. Choosing a row sends `27` and its
+two-byte big-endian offset. Root starts the human terminal running
+`/bin/td-sandbox shell NAME` through the normal readiness and handle path.
+Direct host mode omits the sandbox card.
 
 Before opening the framebuffer or starting any worker, the client verifies one
 thread, identical service uid/gid columns in 1..=999, and only inherited fd

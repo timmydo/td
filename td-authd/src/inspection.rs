@@ -20,7 +20,7 @@ const LOGIN_RESULT: usize = 36;
 /// How often a synchronous wait looks at the helper again.
 const WAIT_STEP: Duration = Duration::from_millis(2);
 /// One read's buffer: every helper's result bound is below it.
-const READ_SIZE: usize = 512;
+const READ_SIZE: usize = 2 * crate::workload_accounts::WORKLOAD_KIND_ROWS + 1;
 
 /// A helper's output and whether it exited successfully, once its run is
 /// over: `None` while it runs, `Some(None)` when nothing can be read.

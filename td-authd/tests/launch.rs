@@ -1490,6 +1490,22 @@ fn a_start_in_flight_stays_asked_across_a_switch() {
 fn sandbox_request_is_a_fixed_unprivileged_terminal_command() {
     assert_eq!(request(&[0x27]).unwrap(), Request::Start(Program::Sandbox));
     assert!(request(&[0x27, 1]).is_err());
+    assert_eq!(request(&[0x27, 1, 2]).unwrap(), Request::SandboxAt(258));
+    assert_eq!(request(&[0x31]).unwrap(), Request::Sandboxes);
+    let args = [
+        "1000",
+        "0123456789abcdef0123456789abcdef",
+        "7",
+        "sandbox",
+        "dev.tools",
+    ]
+    .map(str::to_owned);
+    let (uid, generation, handle, program, select) = terminal_arguments(&args).unwrap();
+    let named = terminal_command(uid, generation, handle, program, select, || {
+        Ok(primary("renamed"))
+    })
+    .unwrap();
+    assert_eq!(named.get_args().last().unwrap(), "dev.tools");
     assert_eq!(Program::Sandbox.selection(), Some("sandbox"));
     assert_eq!(Program::from_selection("sandbox"), Some(Program::Sandbox));
     let command = terminal_command(
@@ -1517,7 +1533,7 @@ fn sandbox_request_is_a_fixed_unprivileged_terminal_command() {
         ]
     );
     assert!(
-        terminal_command(1000, "g", 1, Program::Sandbox, Some("other"), || Ok(
+        terminal_command(1000, "g", 1, Program::Sandbox, Some("../other"), || Ok(
             primary("renamed")
         ))
         .is_err()

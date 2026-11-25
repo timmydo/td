@@ -331,6 +331,35 @@ fn runtime_catalog(output: &mut impl Write) -> io::Result<()> {
     )
 }
 
+fn launcher_ids(
+    home: &Path,
+    ledger: impl FnOnce() -> Result<workload_accounts::Ledger, String>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let profiles = PathBuf::from(text(format_args!(
+        "{}/.local/share/td-sandbox/.profiles",
+        state::text(home)?
+    ))?);
+    let base = profiles.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    for directory in [base, profiles.as_path()] {
+        match td_fs::check_private_dir(directory) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        }
+    }
+    let ledger = ledger().map_err(io::Error::other)?;
+    for name in state::list(&profiles)? {
+        if let Some(uid) = ledger.uid_of(workload_accounts::Kind::Sandbox, &name) {
+            if state::Profile::read(&profiles, &name).is_ok() {
+                let offset = u16::try_from(uid - workload_accounts::WORKLOAD_UIDS.start())
+                    .map_err(io::Error::other)?;
+                out.write_all(&offset.to_be_bytes())?;
+            }
+        }
+    }
+    out.flush()
+}
+
 fn run() -> io::Result<u8> {
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().is_some_and(|v| v == "--inside") {
@@ -356,6 +385,15 @@ fn run() -> io::Result<u8> {
             ..intake::Root::new()
         };
         init_default(&home, &patient)?;
+        return Ok(0);
+    }
+    if command == "launcher-ids" {
+        end(&mut args)?;
+        launcher_ids(
+            &canonical,
+            workload_accounts::load,
+            &mut io::stdout().lock(),
+        )?;
         return Ok(0);
     }
     let base = state::base(&home)?;
@@ -528,6 +566,28 @@ pub fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn launcher_lists_readable_profiles_in_private_directories() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let home = td_fs::TempDir::new("launcher-profiles")?;
+        let ledger = || {
+            workload_accounts::Ledger::parse(
+                "td-accounts-v1\nsandbox\tdev\t98310\nsandbox\tgone\t98311\n",
+            )
+        };
+        let mut answer = Vec::new();
+        launcher_ids(&home, ledger, &mut answer)?;
+        assert!(answer.is_empty());
+        let base = state::base(&home)?;
+        let profiles = state::profiles(&base)?;
+        drop(state::Profile::create(&profiles, "dev", None, None)?);
+        launcher_ids(&home, ledger, &mut answer)?;
+        assert_eq!(answer, [0, 6]);
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o755))?;
+        assert!(launcher_ids(&home, ledger, &mut Vec::new()).is_err());
+        Ok(())
+    }
 
     #[test]
     fn runtimes_lists_the_compiled_choices_without_an_intake_or_home() -> io::Result<()> {

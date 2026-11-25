@@ -126,7 +126,7 @@ impl Config {
         if let Some(selection) = launch.program().selection() {
             command.arg(selection);
         }
-        if let Launch::SoftwareAt(name) = launch {
+        if let Launch::SoftwareAt(name) | Launch::SandboxAt(name) = launch {
             command.arg(name);
         }
         command.process_group(0);
@@ -286,10 +286,8 @@ fn terminal_command(
     select: Option<&str>,
     account: impl FnOnce() -> std::io::Result<crate::primary_account::PrimaryAccount>,
 ) -> std::io::Result<Command> {
-    if select.is_some_and(|name| terminal != Program::Software || !valid_selection(name)) {
-        return Err(std::io::Error::other(
-            "only td-software opens at an application, named in the registry grammar",
-        ));
+    if select.is_some_and(|name| !terminal.valid_operand(name)) {
+        return Err(std::io::Error::other("invalid program selection"));
     }
     if let Some(program) = terminal.desktop_program() {
         let mut command = Command::new(program);
@@ -326,7 +324,12 @@ fn terminal_command(
     }
     match terminal {
         Program::Sandbox => {
-            command.args(["--command", "/bin/td-sandbox", "shell", "default"]);
+            command.args([
+                "--command",
+                "/bin/td-sandbox",
+                "shell",
+                select.unwrap_or("default"),
+            ]);
         }
         Program::Home | Program::Task => {}
         // Desktop programs returned above; listed so a new kind is a decision.
@@ -417,16 +420,9 @@ fn terminal_arguments(
             Program::from_selection(literal),
             None,
         ),
-        [uid, generation, handle, literal, name]
-            if literal == "software" && valid_selection(name) =>
-        {
-            (
-                uid,
-                generation,
-                handle,
-                Some(Program::Software),
-                Some(name.as_str()),
-            )
+        [uid, generation, handle, literal, name] => {
+            let program = Program::from_selection(literal).filter(|p| p.valid_operand(name));
+            (uid, generation, handle, program, Some(name.as_str()))
         }
         _ => return Err(USAGE.into()),
     };
@@ -538,6 +534,8 @@ enum Request {
     Software(crate::software::Request),
     /// `23`: which of the registry's Flathub declarations are installed.
     Installed,
+    Sandboxes,
+    SandboxAt(u16),
     /// `22` and a name: td-software, opened at that application.
     SoftwareAt(String),
     /// `2c`: a grant request on an application account's directories.
@@ -550,6 +548,7 @@ enum Request {
 #[derive(Debug, PartialEq, Eq)]
 enum Launch {
     Fixed(Program),
+    SandboxAt(String),
     SoftwareAt(String),
 }
 
@@ -558,6 +557,7 @@ impl Launch {
         match self {
             Self::Fixed(program) => *program,
             Self::SoftwareAt(_) => Program::Software,
+            Self::SandboxAt(_) => Program::Sandbox,
         }
     }
 }
@@ -789,6 +789,14 @@ enum Program {
 }
 
 impl Program {
+    fn valid_operand(self, name: &str) -> bool {
+        match self {
+            Self::Software => valid_selection(name),
+            Self::Sandbox => crate::workload_accounts::valid_name(name),
+            _ => false,
+        }
+    }
+
     fn selection(self) -> Option<&'static str> {
         match self {
             Self::Home => None,
@@ -907,6 +915,8 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [1] => Ok(Request::Start(Program::Home)),
         [4] => Ok(Request::Start(Program::Task)),
         [0x27] => Ok(Request::Start(Program::Sandbox)),
+        [0x27, hi, lo] => Ok(Request::SandboxAt(u16::from_be_bytes([*hi, *lo]))),
+        [0x31] => Ok(Request::Sandboxes),
         // 5 started the retired Codex agent and 6 the retired Claude Code;
         // both stay unassigned.
         [7] => Ok(Request::Start(Program::TaskManager)),
@@ -953,6 +963,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
 }
 
 struct Launches {
+    sandbox_reader: Option<Inspection>,
     children: BTreeMap<u64, Child>,
     next: u64,
     generation: String,
@@ -1019,6 +1030,7 @@ impl Launches {
     ) -> Self {
         Self {
             children: BTreeMap::new(),
+            sandbox_reader: None,
             next: 1,
             generation,
             supervised: BTreeMap::new(),
@@ -1043,10 +1055,48 @@ impl Launches {
         // Every launch request and heartbeat reaps a finished status
         // client, so one the peer stopped asking about is not left a
         // zombie, and a finished application request.
+        if self.sandbox_reader.as_mut().is_some_and(Inspection::reaped) {
+            self.sandbox_reader = None;
+        }
         self.unit.advance();
         self.software.advance();
         match request {
             Request::Software(request) => Ok(self.software.answer(config.owner, request)),
+            Request::Sandboxes => {
+                if self.sandbox_reader.is_some() {
+                    return crate::allocation::copy(&[0xff, 2]).map_err(crate::refused);
+                }
+                let mut command = Command::new("/bin/td-login");
+                command.args([
+                    "exec-as",
+                    &config.user,
+                    "--",
+                    "/bin/td-sandbox",
+                    "launcher-ids",
+                ]);
+                let bound = 2 * crate::workload_accounts::WORKLOAD_KIND_ROWS;
+                self.sandbox_reader = Inspection::printing(command, bound, CHECK_TIMEOUT).ok();
+                let bytes = self.sandbox_reader.as_mut().and_then(Inspection::wait);
+                let Some(bytes) = bytes.filter(|bytes| bytes.len() % 2 == 0) else {
+                    return crate::allocation::copy(&[0xff, 2]).map_err(crate::refused);
+                };
+                let mut reply = crate::allocation::copy(&[0xb1]).map_err(crate::refused)?;
+                crate::allocation::extend_from_slice(&mut reply, &bytes).map_err(crate::refused)?;
+                Ok(reply)
+            }
+            Request::SandboxAt(offset) => {
+                use crate::workload_accounts::{self as accounts, Kind};
+                let uid = accounts::WORKLOAD_UIDS.start() + u32::from(offset);
+                let ledger = accounts::load();
+                let Some(name) = ledger
+                    .as_ref()
+                    .ok()
+                    .and_then(|l| l.name(Kind::Sandbox, uid))
+                else {
+                    return crate::allocation::copy(&[0xff, 2]).map_err(crate::refused);
+                };
+                self.start(config, &Launch::SandboxAt(crate::owned(name)?))
+            }
             Request::Installed => Ok(self.software.installed(config.owner)),
             // The writer is waited for here, within its own bound.
             Request::Grants(request) => {
@@ -1362,7 +1412,7 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         &[0x2e, 0, 0],
         &[0x2f, 0],
         &[0x30, 0],
-        &[0x31],
+        &[0x31, 0],
     ] {
         assert!(request(bad).is_err(), "{bad:?}");
     }

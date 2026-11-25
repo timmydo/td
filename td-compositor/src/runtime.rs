@@ -3580,6 +3580,16 @@ impl Runtime {
             }
             return Err(error);
         }
+        if request == Some(LaunchRequest::Sandbox) {
+            if let Some(listing) = self.scene.sandbox_listing() {
+                if let Some((installed, _)) = &self.installed {
+                    installed.ask_sandboxes(listing);
+                } else {
+                    let _ = listing.set(None);
+                }
+            }
+            return Ok(None);
+        }
         Ok(request)
     }
 
@@ -3748,7 +3758,8 @@ impl Runtime {
         let cleared = expired && self.scene.set_notice(None);
         // The sampler's tick is also what moves a pending launch's state
         // and time on, and brings root's installed set to the card.
-        let launch = self.refresh_launch() | self.refresh_installed();
+        let launch =
+            self.refresh_launch() | self.refresh_installed() | self.scene.refresh_sandboxes();
         let previous = self.scene.set_status(status);
         if previous.is_none() && !cleared && !launch {
             return Ok(());
