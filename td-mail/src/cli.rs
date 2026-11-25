@@ -929,6 +929,37 @@ fn triage_from_rules(
     out
 }
 
+/// Senders whose mail the heuristics trash.
+const TRASH_SENDER_DOMAINS: &[&str] = &[
+    "equityexcelloans.com",
+    "megastarfinancial.com",
+    "fastrefinow.com",
+    "homebridgerefi.com",
+    "homefinancerelief.com",
+    "communitymortgagehelp.com",
+    "bridgepointloans.com",
+    "cecilia.in",
+];
+
+/// Transactional and notification senders the heuristics archive.
+const ARCHIVE_SENDER_DOMAINS: &[&str] = &[
+    "delta.com",
+    "alaskaair.com",
+    "americanexpress.com",
+    "chase.com",
+    "bankofamerica.com",
+    "orders.icebreaker.com",
+    "ebay.com",
+    "collinstreet.com",
+    "hyatt.com",
+    "anthropic.com",
+    "accounts.google.com",
+    "ui.com",
+    "github.com",
+    "gitlab@redox-os.org",
+    "comcast.net",
+];
+
 fn triage_from_heuristics(email: &Email) -> (TriageTarget, String, f32) {
     let from = email
         .from
@@ -939,17 +970,7 @@ fn triage_from_heuristics(email: &Email) -> (TriageTarget, String, f32) {
         .to_ascii_lowercase();
     let subject = email.subject.as_deref().unwrap_or("").to_ascii_lowercase();
 
-    let trash_domains = [
-        "equityexcelloans.com",
-        "megastarfinancial.com",
-        "fastrefinow.com",
-        "homebridgerefi.com",
-        "homefinancerelief.com",
-        "communitymortgagehelp.com",
-        "bridgepointloans.com",
-        "cecilia.in",
-    ];
-    if trash_domains.iter().any(|d| from.contains(d)) {
+    if TRASH_SENDER_DOMAINS.iter().any(|d| from.contains(d)) {
         return (
             TriageTarget::Trash,
             "known spam-like sender".to_string(),
@@ -967,24 +988,7 @@ fn triage_from_heuristics(email: &Email) -> (TriageTarget, String, f32) {
         );
     }
 
-    let archive_domains = [
-        "delta.com",
-        "alaskaair.com",
-        "americanexpress.com",
-        "chase.com",
-        "bankofamerica.com",
-        "orders.icebreaker.com",
-        "ebay.com",
-        "collinstreet.com",
-        "hyatt.com",
-        "anthropic.com",
-        "accounts.google.com",
-        "ui.com",
-        "github.com",
-        "gitlab@redox-os.org",
-        "comcast.net",
-    ];
-    if archive_domains.iter().any(|d| from.contains(d)) {
+    if ARCHIVE_SENDER_DOMAINS.iter().any(|d| from.contains(d)) {
         return (
             TriageTarget::Archive,
             "transactional/notification sender".to_string(),
@@ -1942,7 +1946,7 @@ keybindings: Export the window's keybinding dictionary, the rows its key list (F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jmap::types::{BodyPart, BodyValue};
+    use crate::jmap::types::{BodyPart, BodyValue, EmailAddress};
 
     #[test]
     fn response_failure_stops_before_dispatching_the_next_command() -> io::Result<()> {
@@ -2008,5 +2012,54 @@ mod tests {
         let body = cut.get("body").and_then(Value::as_str).unwrap_or_default();
         assert!(body.ends_with(&format!("\n{}\n", td_html::CUT_NOTICE)));
         assert!(!body.contains("beyond"));
+    }
+
+    /// Each listed sender decides the heuristic verdict on its own, under
+    /// a subject no subject rule matches; an unlisted sender keeps it.
+    #[test]
+    fn listed_senders_decide_the_heuristic_triage() {
+        let email = |from: String| Email {
+            id: "e1".to_string(),
+            thread_id: None,
+            from: Some(vec![EmailAddress {
+                name: None,
+                email: Some(from),
+            }]),
+            to: None,
+            cc: None,
+            reply_to: None,
+            subject: Some("hello".to_string()),
+            received_at: None,
+            sent_at: None,
+            preview: None,
+            text_body: None,
+            html_body: None,
+            body_values: HashMap::new(),
+            keywords: HashMap::new(),
+            mailbox_ids: HashMap::new(),
+            message_id: None,
+            references: None,
+            attachments: None,
+            extra: HashMap::new(),
+        };
+        let sender = |entry: &str| {
+            if entry.contains('@') {
+                entry.to_ascii_uppercase()
+            } else {
+                format!("Someone@{}", entry.to_ascii_uppercase())
+            }
+        };
+        for entry in TRASH_SENDER_DOMAINS {
+            let (target, reason, _) = triage_from_heuristics(&email(sender(entry)));
+            assert!(matches!(target, TriageTarget::Trash), "{entry}");
+            assert_eq!(reason, "known spam-like sender", "{entry}");
+        }
+        for entry in ARCHIVE_SENDER_DOMAINS {
+            let (target, reason, _) = triage_from_heuristics(&email(sender(entry)));
+            assert!(matches!(target, TriageTarget::Archive), "{entry}");
+            assert_eq!(reason, "transactional/notification sender", "{entry}");
+        }
+        let (target, _, _) = triage_from_heuristics(&email("someone@example.com".into()));
+        assert!(matches!(target, TriageTarget::Keep));
     }
 }

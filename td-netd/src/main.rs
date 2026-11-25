@@ -1770,7 +1770,7 @@ mod tests {
         pkt.extend_from_slice(&[OPT_MSG_TYPE, 1, DHCP_OFFER]);
         pkt.extend_from_slice(&[OPT_SUBNET, 4, 255, 255, 255, 0]);
         pkt.extend_from_slice(&[OPT_ROUTER, 4, 10, 0, 2, 2]);
-        pkt.extend_from_slice(&[OPT_DNS, 8, 10, 0, 2, 3, 8, 8, 8, 8]);
+        pkt.extend_from_slice(&[OPT_DNS, 8, 10, 0, 2, 3, 192, 0, 2, 53]);
         pkt.extend_from_slice(&[OPT_SERVER_ID, 4, 10, 0, 2, 2]);
         pkt.extend_from_slice(&[OPT_LEASE_TIME, 4, 0, 0, 0x0e, 0x10]);
         pkt.push(OPT_END);
@@ -1781,7 +1781,7 @@ mod tests {
         assert_eq!(lease.yiaddr, [10, 0, 2, 15]);
         assert_eq!(lease.subnet, Some([255, 255, 255, 0]));
         assert_eq!(lease.routers, vec![[10, 0, 2, 2]]);
-        assert_eq!(lease.dns, vec![[10, 0, 2, 3], [8, 8, 8, 8]]);
+        assert_eq!(lease.dns, vec![[10, 0, 2, 3], [192, 0, 2, 53]]);
         assert_eq!(lease.server_id, Some([10, 0, 2, 2]));
         assert_eq!(lease.seconds, Some(3600));
         assert_eq!(lease_duration(&lease), Duration::from_secs(3600));
@@ -1988,9 +1988,9 @@ mod tests {
 
     #[test]
     fn resolv_conf_render_and_read_back() {
-        let body = render_resolv_conf(&[[10, 0, 2, 3], [1, 1, 1, 1]]);
+        let body = render_resolv_conf(&[[10, 0, 2, 3], [192, 0, 2, 53]]);
         assert!(body.contains("nameserver 10.0.2.3\n"));
-        assert!(body.contains("nameserver 1.1.1.1\n"));
+        assert!(body.contains("nameserver 192.0.2.53\n"));
         assert_eq!(first_nameserver(&body), Some([10, 0, 2, 3]));
     }
 
@@ -2013,16 +2013,16 @@ mod tests {
 
     #[test]
     fn first_nameserver_tolerates_comments_and_whitespace() {
-        let body = "# comment\n\n  nameserver   8.8.4.4  \nnameserver 9.9.9.9\n";
-        assert_eq!(first_nameserver(body), Some([8, 8, 4, 4]));
+        let body = "# comment\n\n  nameserver   198.51.100.53  \nnameserver 203.0.113.53\n";
+        assert_eq!(first_nameserver(body), Some([198, 51, 100, 53]));
         assert_eq!(first_nameserver("search example.com\n"), None);
     }
 
     #[test]
     fn ip_list_splits_and_drops_partial() {
         assert_eq!(
-            ip_list(&[10, 0, 2, 2, 8, 8, 8, 8]),
-            vec![[10, 0, 2, 2], [8, 8, 8, 8]]
+            ip_list(&[10, 0, 2, 2, 192, 0, 2, 53]),
+            vec![[10, 0, 2, 2], [192, 0, 2, 53]]
         );
         assert_eq!(ip_list(&[10, 0, 2, 2, 9, 9]), vec![[10, 0, 2, 2]]);
         assert!(ip_list(&[]).is_empty());

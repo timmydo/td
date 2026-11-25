@@ -509,8 +509,8 @@ mod tests {
             "[2001:db8::1]"
         );
         assert_eq!(
-            Url::parse("http://93.184.216.34/").unwrap().text(),
-            "http://93.184.216.34/"
+            Url::parse("http://203.0.113.34/").unwrap().text(),
+            "http://203.0.113.34/"
         );
         // Dot segments go as the service's parser takes them away.
         for (url, text) in [

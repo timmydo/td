@@ -1884,9 +1884,9 @@ secret = \"portal\"
             assert!(account(url).placeholder(), "{url}");
         }
         for url in [
-            "https://api.fastmail.com/.well-known/jmap",
+            "https://jmap.mail.test/.well-known/jmap",
             "https://myexample.com/",
-            "https://example.com.evil.org/",
+            "https://example.com.evil.test/",
             "https://[2001:db8::1]:8443/",
             "",
             "example.com",
@@ -1901,8 +1901,8 @@ secret = \"portal\"
     #[test]
     fn the_setup_form_takes_a_host_or_an_https_discovery_url() {
         assert_eq!(
-            discovery_url(" api.fastmail.com ").unwrap(),
-            "https://api.fastmail.com/.well-known/jmap"
+            discovery_url(" jmap.mail.test ").unwrap(),
+            "https://jmap.mail.test/.well-known/jmap"
         );
         assert_eq!(
             discovery_url("https://mx.td.dev/jmap/session").unwrap(),

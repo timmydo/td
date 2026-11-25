@@ -2839,8 +2839,8 @@ mod tests {
             assert_eq!(refused_address(ip, STRICT), Some(reason), "{address}");
         }
         for address in [
-            "93.184.216.34",
-            "2606:2800:21f:cb07:6820:80da:af6b:8b2c",
+            "203.0.113.34",
+            "2001:db8:21f:cb07:6820:80da:af6b:8b2c",
             "10.0.0.1",
         ] {
             let ip: IpAddr = address.parse().unwrap();
@@ -2861,10 +2861,10 @@ mod tests {
             refusal: Mutex::new(None),
             local: false,
         };
-        let resolved = resolver.resolve_netloc("93.184.216.34:443").unwrap();
+        let resolved = resolver.resolve_netloc("203.0.113.34:443").unwrap();
         assert_eq!(
             resolved,
-            ["93.184.216.34:443".parse::<SocketAddr>().unwrap()]
+            ["203.0.113.34:443".parse::<SocketAddr>().unwrap()]
         );
         assert_eq!(*resolver.refusal.lock().unwrap(), None);
         for (netloc, reason) in [
@@ -2892,7 +2892,7 @@ mod tests {
             refusal: Mutex::new(None),
             local: false,
         };
-        assert!(public.resolve_netloc("93.184.216.34:443").is_ok());
+        assert!(public.resolve_netloc("203.0.113.34:443").is_ok());
         for (netloc, reason) in [
             ("10.0.0.1:80", "10.0.0.1 is private (RFC 1918)"),
             ("192.168.1.1:80", "192.168.1.1 is private (RFC 1918)"),
@@ -3709,7 +3709,7 @@ mod tests {
         // it before anything is resolved.
         let (lines, _) = ask(
             &socket,
-            "method GET\nurl http://0.0.0.1:1\\@93.184.216.34/\n",
+            "method GET\nurl http://0.0.0.1:1\\@203.0.113.34/\n",
             b"",
         );
         assert!(

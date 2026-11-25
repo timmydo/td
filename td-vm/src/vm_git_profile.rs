@@ -634,7 +634,7 @@ pub(crate) mod tests {
     const KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
     fn example() -> String {
-        format!("TDVM-GIT-PROFILE-1\nrepository=/srv/git/td.git\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid=1001\nsocket=/home/test/.td-vm-registrar\nregistrar=/usr/local/libexec/td-vm-registrar\ngit=/bin/git\nhost-key={KEY}\nauthor-name=Timmy Douglas\nauthor-email=mail@timmydouglas.com\n")
+        format!("TDVM-GIT-PROFILE-1\nrepository=/srv/git/td.git\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid=1001\nsocket=/home/test/.td-vm-registrar\nregistrar=/usr/local/libexec/td-vm-registrar\ngit=/bin/git\nhost-key={KEY}\nauthor-name=Example Author\nauthor-email=author@example.com\n")
     }
     #[test]
     fn profile_roundtrip_and_invalid_fields() {
@@ -655,7 +655,7 @@ pub(crate) mod tests {
             format!("{text}port=23\n"),
             format!("{text}private-key=/secret\n"),
             text.trim_end().into(),
-            text.replace("author-name=Timmy Douglas\n", ""),
+            text.replace("author-name=Example Author\n", ""),
         ] {
             assert!(Profile::parse(&bad).is_err(), "{bad}");
         }

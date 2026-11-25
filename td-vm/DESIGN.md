@@ -988,8 +988,8 @@ socket=/home/test/.td-vm-registrar
 registrar=/usr/local/libexec/td-vm-registrar
 git=/absolute/path/to/git
 host-key=ssh-ed25519 BASE64_PUBLIC_HOST_KEY
-author-name=Timmy Douglas
-author-email=mail@timmydouglas.com
+author-name=Example Author
+author-email=author@example.com
 ```
 
 Replace the host-key placeholder with the host's ordinary Ed25519 public

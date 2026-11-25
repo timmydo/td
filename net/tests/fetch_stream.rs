@@ -282,8 +282,8 @@ fn a_streamed_request_is_refused_as_a_counted_one_is() {
         (
             // ureq's parser refuses this authority before anything is
             // resolved; a naive split would read it as a public host.
-            "method GET\nurl http://0.0.0.1:1\\@93.184.216.34/\nstream\n",
-            "error transport: http://0.0.0.1:1\\@93.184.216.34/: http: invalid uri character"
+            "method GET\nurl http://0.0.0.1:1\\@203.0.113.34/\nstream\n",
+            "error transport: http://0.0.0.1:1\\@203.0.113.34/: http: invalid uri character"
                 .to_string(),
         ),
         (

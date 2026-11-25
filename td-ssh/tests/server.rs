@@ -1036,7 +1036,8 @@ fn a_missing_key_file_is_ordinary_and_not_a_strict_modes_refusal() {
     assert!(!log.contains("authorized keys for"), "{log}");
 }
 
-const FORGED: &str = "Accepted publickey for root from 6.6.6.6 port 1 ssh2: ED25519 SHA256:forged";
+const FORGED: &str =
+    "Accepted publickey for root from 203.0.113.66 port 1 ssh2: ED25519 SHA256:forged";
 
 fn forged_line_in(log: &str) -> bool {
     log.lines()

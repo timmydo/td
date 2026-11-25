@@ -163,9 +163,9 @@ mod recipient_diagnostics {
         assert_eq!(retained.recipient(), Some((&address[..96], true)));
         assert_eq!(
             refusal
-                .with_command("RCPT TO:<@old.test:united@timmyd.info>")
+                .with_command("RCPT TO:<@old.test:routed@new.test>")
                 .recipient(),
-            Some(("united@timmyd.info", false))
+            Some(("routed@new.test", false))
         );
         let data = Rejection::from_reply(b"554 5.6.0 Invalid message framing\r\n").unwrap();
         assert_eq!(

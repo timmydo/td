@@ -443,8 +443,8 @@ the physical authorization described below; SSH access to the human account does
 not confer it.
 
 For a direct connection to td-mta, set the account's HTTPS discovery URL and
-username in the app, for example `https://mx.timmydouglas.com/.well-known/jmap`
-and `mail@timmydouglas.com`. Keep portal credentials in the packaged app.
+username in the app, for example `https://mx.example.com/.well-known/jmap`
+and `me@example.com`. Keep portal credentials in the packaged app.
 No local td-mta, PostgreSQL, Unix socket, or replica renewal service is needed.
 After connecting, verify that folders and one message load online. Keep an
 existing local-replica account distinct from a direct-server account on hosts
