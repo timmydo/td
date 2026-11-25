@@ -41,6 +41,7 @@ pub fn outside(
     marker: &File,
     terminal: bool,
     banner: Option<String>,
+    layout_lock: File,
 ) -> io::Result<u8> {
     let mut terminal = if terminal {
         Some(RelayTerminal::enter(File::from(
@@ -115,7 +116,7 @@ pub fn outside(
     let mut pending_output = banner.map(|line| (wire::ERROR, line.into_bytes()));
     let mut outstanding = 0usize;
     let mut exit = None;
-    let mut started = false;
+    let mut startup_lock = Some(layout_lock);
     loop {
         if marker.metadata()?.nlink() == 0 {
             return Ok(143);
@@ -179,7 +180,9 @@ pub fn outside(
             let frame = rx.try_recv();
             // Any frame, the inside's empty first one included, says the
             // command started.
-            started |= matches!(frame, Ok(Ok(_)));
+            if matches!(frame, Ok(Ok(_))) {
+                drop(startup_lock.take());
+            }
             match frame {
                 Ok(Ok((kind @ (wire::OUTPUT | wire::ERROR), bytes))) => {
                     pending_output = Some((kind, bytes))
@@ -187,7 +190,7 @@ pub fn outside(
                 Ok(Ok((wire::EXIT, bytes))) if bytes.len() == 1 => exit = bytes.first().copied(),
                 Ok(Ok(_)) => return Err(err("unexpected jail relay frame")),
                 Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(ended(started));
+                    return Err(ended(startup_lock.is_none()));
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
             }
@@ -427,6 +430,7 @@ pub fn inside(arguments: Vec<OsString>) -> io::Result<u8> {
             )
             .map_err(err)?,
         );
+        output(&output_channel, wire::OUTPUT, &[])?;
         input = Some(Box::new(pty.master().try_clone()?));
         pumps.push(pump(
             pty.master().try_clone()?,
@@ -444,6 +448,7 @@ pub fn inside(arguments: Vec<OsString>) -> io::Result<u8> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         child = Running(command.spawn()?);
+        output(&output_channel, wire::OUTPUT, &[])?;
         input = child
             .0
             .stdin
@@ -462,9 +467,6 @@ pub fn inside(arguments: Vec<OsString>) -> io::Result<u8> {
             Reader::Second,
         ));
     }
-    // An empty first frame: the command runs, so a channel that ends from
-    // here on is a session that ended, not one that never started.
-    output(&output_channel, wire::OUTPUT, &[])?;
     let (tx, rx) = mpsc::sync_channel(128);
     std::thread::spawn(move || {
         let mut input = io::stdin();

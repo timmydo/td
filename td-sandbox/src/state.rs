@@ -29,6 +29,7 @@ pub struct Profile {
     /// The home of the profile this one was imported from, which the
     /// import left as it was.
     pub old_home: Option<PathBuf>,
+    pub personal_home_path: bool,
     _lock: Option<File>,
 }
 
@@ -179,6 +180,7 @@ impl Profile {
             root,
             runtime,
             old_home,
+            personal_home_path: false,
             _lock: None,
         };
         let written = (|| {
@@ -238,17 +240,103 @@ impl Profile {
         };
         let record = td_fs::read_bounded_real_file(&record_path, "sandbox record", 8192)?;
         let record = String::from_utf8(record).map_err(io::Error::other)?;
-        let (runtime, old_home) = parse(&record)?;
+        let (runtime, old_home, personal_home_path) = parse(&record)?;
         Ok(Self {
             root,
             runtime,
             old_home,
+            personal_home_path,
             _lock: lock,
         })
     }
 
     pub fn save(&self) -> io::Result<()> {
         td_fs::replace(&self.root.join("record"), self.render()?.as_bytes(), 0o600)
+    }
+
+    fn layout_file(&self, name: &str) -> io::Result<PathBuf> {
+        Ok(PathBuf::from(crate::text(format_args!(
+            "{}/{name}",
+            text(&self.root)?
+        ))?))
+    }
+
+    fn pending_mount(&self) -> io::Result<Option<String>> {
+        match td_fs::read_bounded_real_file(
+            &self.layout_file("mounts.pending")?,
+            "pending share edit",
+            1024,
+        ) {
+            Ok(bytes) if bytes.is_empty() => Ok(None),
+            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(io::Error::other)?)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn layout(&self) -> io::Result<(File, crate::sandbox_layout::Layout)> {
+        let lock = open_private(&self.layout_file("mounts.lock")?, true)?;
+        lock.lock_shared()?;
+        if let Some(source) = self.pending_mount()? {
+            return Err(crate::failure(format_args!(
+                "interrupted share edit: repeat share or unshare for ~/{source}"
+            )));
+        }
+        Ok((lock, self.read_layout()?))
+    }
+
+    fn read_layout(&self) -> io::Result<crate::sandbox_layout::Layout> {
+        let path = self.layout_file("mounts")?;
+        let mut layout = crate::sandbox_layout::Layout::default();
+        let bytes = match td_fs::read_bounded_real_file(
+            &path,
+            "sandbox mount destinations",
+            crate::sandbox_layout::MAX_BYTES as u64,
+        ) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(layout),
+            other => other?,
+        };
+        let rows = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+        for row in rows.lines() {
+            layout.row(row)?;
+        }
+        Ok(layout)
+    }
+
+    /// Serialize layout edits independently of running sessions. The profile's
+    /// shared lock keeps deletion away until the grant operation returns.
+    pub fn change_mount(
+        &self,
+        source: &str,
+        edit: impl FnOnce(&mut crate::sandbox_layout::Layout) -> io::Result<()>,
+        change: impl FnOnce(bool) -> io::Result<crate::intake::Answer>,
+    ) -> io::Result<()> {
+        let lock = open_private(&self.layout_file("mounts.lock")?, true)?;
+        lock.lock()?;
+        let pending = self.pending_mount()?;
+        if let Some(other) = pending.as_deref().filter(|other| *other != source) {
+            return Err(crate::failure(format_args!(
+                "finish the interrupted share edit for ~/{other} first"
+            )));
+        }
+        let mut layout = self.read_layout()?;
+        let previous = layout.encode("")?;
+        edit(&mut layout)?;
+        let next = layout.encode("")?;
+        let retry = pending.is_some();
+        if !retry && next == previous {
+            return change(false)?.accepted().map(drop);
+        }
+        // A lost reply can mean the authority committed. Keep launches
+        // closed until an edit of this source has a definite result.
+        let marker = self.layout_file("mounts.pending")?;
+        if !retry {
+            td_fs::replace(&marker, source.as_bytes(), 0o600)?;
+        }
+        // Even a writer error can arrive after its table was replaced.
+        change(retry)?.accepted()?;
+        td_fs::replace(&self.layout_file("mounts")?, next.as_bytes(), 0o600)?;
+        td_fs::replace(&marker, b"", 0o600)
     }
 
     pub fn sessions(&self) -> io::Result<crate::sessions::Registry> {
@@ -266,6 +354,9 @@ impl Profile {
             let line = crate::text(format_args!("runtime={runtime}\n"))?;
             td_alloc::push_str(&mut record, &line).map_err(crate::refused)?;
         }
+        if self.personal_home_path {
+            td_alloc::push_str(&mut record, "home=personal-path\n").map_err(crate::refused)?;
+        }
         if let Some(home) = &self.old_home {
             let line = crate::text(format_args!("old-home={}\n", text(home)?))?;
             td_alloc::push_str(&mut record, &line).map_err(crate::refused)?;
@@ -274,8 +365,8 @@ impl Profile {
     }
 }
 
-/// The format line, an optional `runtime`, then an optional `old-home`.
-fn parse(record: &str) -> io::Result<(Option<String>, Option<PathBuf>)> {
+/// Optional runtime, personal home location and imported home follow the format line.
+fn parse(record: &str) -> io::Result<(Option<String>, Option<PathBuf>, bool)> {
     let invalid = || io::Error::other("invalid sandbox record");
     let mut lines = record.lines().peekable();
     if lines.next() != Some(RECORD_FORMAT) {
@@ -290,6 +381,7 @@ fn parse(record: &str) -> io::Result<(Option<String>, Option<PathBuf>)> {
         Some(_) => return Err(invalid()),
         None => None,
     };
+    let personal_home_path = lines.next_if_eq(&"home=personal-path").is_some();
     let old_home = match lines.next().map(|line| line.strip_prefix("old-home=")) {
         Some(Some(path)) if Path::new(path).is_absolute() => Some(PathBuf::from(path)),
         Some(_) => return Err(invalid()),
@@ -298,7 +390,7 @@ fn parse(record: &str) -> io::Result<(Option<String>, Option<PathBuf>)> {
     if lines.next().is_some() {
         return Err(invalid());
     }
-    Ok((runtime, old_home))
+    Ok((runtime, old_home, personal_home_path))
 }
 
 #[cfg(test)]
@@ -343,6 +435,17 @@ mod tests {
             fs::read_to_string(profiles.join("default/record"))?,
             "td-sandbox-profile-v1\nold-home=/h/.local/share/td-sandbox/default/home\n"
         );
+        let mut profile = Profile::open(&profiles, "default", Access::Change)?;
+        assert!(!profile.personal_home_path);
+        profile.personal_home_path = true;
+        profile.save()?;
+        let saved = Profile::read(&profiles, "default")?;
+        assert!(saved.personal_home_path);
+        assert_eq!(saved.old_home, profile.old_home);
+        profile.personal_home_path = false;
+        profile.save()?;
+        assert!(!Profile::read(&profiles, "default")?.personal_home_path);
+        drop(profile);
         assert_eq!(list(&profiles)?, ["default", "tools"]);
         let again = Profile::create(&profiles, "default", None, None).err();
         assert!(again.is_some_and(|e| e.to_string().contains("already exists")));
@@ -350,6 +453,46 @@ mod tests {
         assert_eq!(list(&profiles)?, ["default"]);
         assert!(!exists(&profiles, "tools")?);
         assert!(Profile::read(&profiles, "tools").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mount_edits_keep_uncertain_writer_outcomes_closed_until_retried() -> io::Result<()> {
+        let base = td_fs::TempDir::new("sandbox-mount-layout")?;
+        let profiles = profiles(&base)?;
+        drop(Profile::create(&profiles, "dev", None, None)?);
+        let active = Profile::open(&profiles, "dev", Access::Session)?;
+        let editor = Profile::open(&profiles, "dev", Access::Session)?;
+        use crate::intake::Answer;
+        assert_eq!(active.layout()?.1.mounts().count(), 0);
+        editor.change_mount(
+            "src/td",
+            |m| m.add("src/td", "/work/td"),
+            |_| Ok(Answer::Ok(String::new())),
+        )?;
+        assert_eq!(active.layout()?.1.get("src/td"), Some("/work/td"));
+        let clear = |m: &mut crate::sandbox_layout::Layout| {
+            m.retain(|_| false);
+            Ok(())
+        };
+        assert!(editor
+            .change_mount("src/td", clear, |_| Ok(Answer::Refused(
+                "writer failed".into()
+            )))
+            .is_err());
+        assert!(active.layout().is_err());
+        assert!(editor
+            .change_mount("src/td", clear, |_| Err(io::Error::other("reply lost")))
+            .is_err());
+        assert!(active.layout().is_err());
+        assert!(editor
+            .change_mount("other", clear, |_| Ok(Answer::Ok(String::new())))
+            .is_err());
+        editor.change_mount("src/td", clear, |retry| {
+            assert!(retry);
+            Ok(Answer::Ok(String::new()))
+        })?;
+        assert_eq!(active.layout()?.1.mounts().count(), 0);
         Ok(())
     }
 

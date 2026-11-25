@@ -29,7 +29,7 @@ const SCAN_ENTRIES: usize = 4 * state::MAX_PROFILES;
 const REPORT_BYTES: u64 = 1024 * 1024;
 const REPORT_HEAD: &str = "td-sandbox: what the import of profiles from before sandbox accounts did not carry over, and what changed (td-sandbox/DESIGN.md, \"Import\")\n";
 const REPORT_FULL: &str = "the report is full; later lines were printed only";
-const SHARES_MOVED: &str = "a sandbox now sees its shares at their own paths below your home, not inside its home: the ~/sandbox link the old default's home held is gone";
+const SHARES_MOVED: &str = "shared directories are mounted below the sandbox’s own home and at their original absolute paths";
 
 /// An old profile's policy: its network, its runtime and its shares, each
 /// a canonical absolute path and whether it was writable.

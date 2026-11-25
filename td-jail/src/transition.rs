@@ -1674,6 +1674,14 @@ fn mount_grant(grant: &FilesystemGrant, executable: bool) -> io::Result<()> {
     authority::validate_filesystem_target(&grant.target)?;
     require_filesystem_source_identity(grant)?;
     let target = prepare_filesystem_target(&grant.target, grant.source_kind)?;
+    mount_grant_at(grant, executable, target).map(drop)
+}
+
+fn mount_grant_at(
+    grant: &FilesystemGrant,
+    executable: bool,
+    target: PathBuf,
+) -> io::Result<Stage2Filesystem> {
     mount_bind_kind(
         &grant.source,
         &target,
@@ -1698,15 +1706,13 @@ fn mount_grant(grant: &FilesystemGrant, executable: bool) -> io::Result<()> {
     require_filesystem_source_identity(grant)?;
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
     require_bind_source(&mountinfo, &grant.source, &target)?;
-    require_tree_mount_policy(
-        &mountinfo,
-        &Stage2Filesystem {
-            target,
-            read_only: grant.read_only,
-            source_kind: grant.source_kind,
-        },
-        executable,
-    )
+    let mounted = Stage2Filesystem {
+        target,
+        read_only: grant.read_only,
+        source_kind: grant.source_kind,
+    };
+    require_tree_mount_policy(&mountinfo, &mounted, executable)?;
+    Ok(mounted)
 }
 
 fn require_filesystem_source_identity(grant: &FilesystemGrant) -> io::Result<()> {
@@ -7115,7 +7121,11 @@ fn stage2_workspace_arguments(
             .iter()
             .map(|directory| directory.as_os_str().to_os_string()),
     );
-    stage2.push(OsString::from(STAGE2_HOME_ARG));
+    stage2.push(OsString::from(if plan.sandbox {
+        "--sandbox-home"
+    } else {
+        STAGE2_HOME_ARG
+    }));
     stage2.push(plan.home.target.as_os_str().to_os_string());
     stage2.push(OsString::from(STAGE2_WORKTREES_ARG));
     stage2.push(OsString::from(plan.worktrees.len().to_string()));
@@ -7243,7 +7253,11 @@ where
         }
         path.push(directory);
     }
-    expect(STAGE2_HOME_ARG, args)?;
+    let sandbox_home = match args.next().as_deref().and_then(OsStr::to_str) {
+        Some(STAGE2_HOME_ARG) => false,
+        Some("--sandbox-home") if development && !persistent => true,
+        _ => return Err(usage_error()),
+    };
     let home = tree(args.next())?;
     expect(STAGE2_WORKTREES_ARG, args)?;
     let count = parse_count(args.next(), "worktree count")?;
@@ -7306,7 +7320,11 @@ where
     if count
         .saturating_add(worktrees.len())
         .saturating_add(repositories.len())
-        > workspace::MAX_TREES
+        > if sandbox_home {
+            workspace::MAX_TREES * 2
+        } else {
+            workspace::MAX_TREES
+        }
     {
         return Err(usage_error());
     }
@@ -7346,7 +7364,32 @@ where
         working_directory,
         arguments: authority::collect_arguments(args)?,
     };
-    let trees: Vec<&Path> = plan.trees().collect();
+    if sandbox_home {
+        let name = plan
+            .home
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(usage_error)?;
+        let valid_home = (plan.home.parent() == Some(Path::new("/var/home"))
+            && crate::primary_account::validate_name(name).is_ok())
+            || (name.parse::<u32>().ok().is_some_and(|uid| {
+                crate::workload_accounts::WORKLOAD_UIDS.contains(&uid)
+                    && crate::workload_accounts::Kind::Sandbox.home(uid) == plan.home
+            }));
+        if !valid_home
+            || !plan.worktrees.is_empty()
+            || !plan.repositories.is_empty()
+            || !plan.chain.is_empty()
+            || plan.shared.iter().any(|g| {
+                plan.home.starts_with(&g.target)
+                    || (!g.target.starts_with(&plan.home)
+                        && workspace::require_view_target(&g.target).is_err())
+            })
+        {
+            return Err(usage_error());
+        }
+    }
+    let trees: Vec<&Path> = plan.trees().skip(usize::from(sandbox_home)).collect();
     for (index, tree) in trees.iter().enumerate() {
         if trees
             .iter()
@@ -7481,8 +7524,12 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
     for tree in &plan.worktrees {
         mount_grant(tree, true)?;
     }
-    for grant in &plan.shared {
-        mount_grant(grant, plan.development)?;
+    for (index, grant) in plan.shared.iter().enumerate() {
+        if plan.sandbox && grant.target.starts_with(&plan.home.target) {
+            mount_home_view(&plan.home.target, grant, index)?;
+        } else {
+            mount_grant(grant, plan.development)?;
+        }
     }
     for repository in &plan.repositories {
         mount_grant(repository, false)?;
@@ -7491,6 +7538,67 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         mount_grant(entry, false)?;
     }
     remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+/// Prepare the policy in our private staging tmpfs. A concurrent sandbox can
+/// rename entries in the private home, so no mount or remount follows those
+/// pathnames. Only the final recursive bind uses the pinned destination.
+fn mount_home_view(home: &Path, grant: &FilesystemGrant, index: usize) -> io::Result<()> {
+    let relative = grant.target.strip_prefix(home).map_err(io::Error::other)?;
+    let root = crate::text(format_args!("{NEW_ROOT}{}", home.display()))?;
+    let staging = crate::text(format_args!("{SCRATCH_ROOT}/td-sandbox-grant-{index}"))?;
+    attach_home_view(Path::new(&root), relative, staging, grant)
+}
+
+fn attach_home_view(
+    home: &Path,
+    relative: &Path,
+    staging: String,
+    grant: &FilesystemGrant,
+) -> io::Result<()> {
+    let target = home_mountpoint(home, relative)?;
+    create_dir(&staging, 0o700)?;
+    require_filesystem_source_identity(grant)?;
+    let staged = mount_grant_at(grant, true, PathBuf::from(staging))?;
+    let pinned = crate::text(format_args!("/proc/self/fd/{}", target.as_raw_fd()))?;
+    mount_bind_kind(
+        &staged.target,
+        Path::new(&pinned),
+        FilesystemSourceKind::Directory,
+        "sandbox home grant",
+    )?;
+    let attached = workspace::joined(home, relative.as_os_str())?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    require_bind_source(&mountinfo, &grant.source, &attached)
+}
+
+fn home_mountpoint(home: &Path, relative: &Path) -> io::Result<fs::File> {
+    use crate::workload_accounts::{O_DIRECTORY, O_NOFOLLOW};
+    use std::os::unix::fs::OpenOptionsExt;
+    let open = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+            .open(path)
+    };
+    let mut directory = open(home)?;
+    if relative.as_os_str().is_empty() {
+        return Err(io::Error::other("grant would cover the sandbox home"));
+    }
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::other("invalid grant mountpoint"));
+        };
+        let parent = crate::text(format_args!("/proc/self/fd/{}", directory.as_raw_fd()))?;
+        let child = workspace::joined(Path::new(&parent), name)?;
+        match fs::create_dir(&child) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        directory = open(&child)?;
+    }
+    Ok(directory)
 }
 
 fn bind_workspace_system_tree(name: &str, runtime: bool, native: bool) -> bool {
@@ -8261,6 +8369,9 @@ fn require_workspace_scaffolds(plan: &Stage2Workspace) -> io::Result<()> {
     for tree in plan.trees() {
         let mut parent = PathBuf::from("/");
         for component in tree.components().skip(1) {
+            if parent == plan.home {
+                break;
+            }
             let name = component
                 .as_os_str()
                 .to_str()
@@ -8393,6 +8504,92 @@ mod tests {
     #![allow(clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn nested_home_grant_targets_require_real_directories() -> io::Result<()> {
+        let home = td_fs::TempDir::new("sandbox-home-targets")?;
+        home_mountpoint(&home, Path::new("src/td"))?;
+        home_mountpoint(&home, Path::new("src/td"))?;
+        symlink("src", home.join("link"))?;
+        fs::write(home.join("file"), "")?;
+        for invalid in [
+            "",
+            "../escape",
+            "/tmp",
+            "file",
+            "link/child",
+            "src/../child",
+        ] {
+            assert!(
+                home_mountpoint(&home, Path::new(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(!home.join("src/child").exists());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user and mount namespaces"]
+    fn private_home_with_real_nested_grants() -> io::Result<()> {
+        const DIR: &str = "TD_JAIL_TEST_HOME_GRANT_DIR";
+        let Some(fixture) = std::env::var_os(DIR) else {
+            let fixture = td_fs::TempDir::new("sandbox-nested-grants")?;
+            let result = Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                ])
+                .arg(std::env::current_exe()?)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "transition::tests::private_home_with_real_nested_grants",
+                ])
+                .env(DIR, fixture.as_os_str())
+                .status()?;
+            assert!(result.success());
+            return Ok(());
+        };
+        let fixture = Path::new(&fixture);
+        let private = fixture.join("private");
+        fs::create_dir(&private)?;
+        for (name, read_only) in [("checkout", false), ("reference", true)] {
+            let source = fixture.join(name);
+            fs::create_dir(&source)?;
+            fs::write(source.join("marker"), name)?;
+            let metadata = fs::metadata(&source)?;
+            let grant = FilesystemGrant {
+                source_device: metadata.dev(),
+                source_inode: metadata.ino(),
+                source_kind: FilesystemSourceKind::Directory,
+                source: source.clone(),
+                target: Path::new("/var/home/timmy/src").join(name),
+                read_only,
+            };
+            let relative = Path::new("src").join(name);
+            let staging = fixture.join(format!("staging-{name}"));
+            attach_home_view(
+                &private,
+                &relative,
+                staging.to_str().unwrap().to_owned(),
+                &grant,
+            )?;
+            let inside = private.join(relative);
+            assert_eq!(fs::read_to_string(inside.join("marker"))?, name);
+            let write = fs::write(inside.join("changed"), "new");
+            if read_only {
+                assert_eq!(write.unwrap_err().kind(), io::ErrorKind::ReadOnlyFilesystem);
+            } else {
+                write?;
+                assert_eq!(fs::read_to_string(source.join("changed"))?, "new");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn only_firefox_autotest_automation_gets_system_access() {
@@ -8556,6 +8753,7 @@ mod tests {
             runtime: None,
             native_abi: None,
             intake: false,
+            sandbox: false,
         };
         let identity = Identity {
             uid: 1000,
@@ -8690,6 +8888,26 @@ mod tests {
         let good = "confined ephemeral native --programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
         assert!(parse_stage2_workspace(&mut words(good).into_iter()).is_ok());
 
+        let personal = good
+            .replace("confined", "development")
+            .replace("--home", "--sandbox-home")
+            .replace("/h ", "/var/home/timmy ")
+            .replace("--shared 0", "--shared 1 /var/home/timmy/src/td rw");
+        assert!(parse_stage2_workspace(&mut words(&personal).into_iter()).is_ok());
+        for invalid in [
+            personal.replace("development", "confined"),
+            personal.replace("ephemeral", "persistent"),
+            personal.replace("/var/home/timmy/src/td", "/var/home/timmy"),
+            personal.replace("/var/home/timmy/src/td", "/etc/overlay"),
+            personal.replace("/var/home/timmy", "/var/lib/td/workloads/3"),
+            personal.replace("--sandbox-home", "--home"),
+            personal.replace("--shared 1", "--shared 2 /var/home/timmy/src ro"),
+        ] {
+            assert!(
+                parse_stage2_workspace(&mut words(&invalid).into_iter()).is_err(),
+                "{invalid}"
+            );
+        }
         // The runtime word: one of two, and with a runtime no path
         // directory or alias source in a tree the runtime replaces.
         let tail =

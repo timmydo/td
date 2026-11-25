@@ -1047,6 +1047,9 @@ mod tests {
             assert!(block.contains("web_fetch tool separately uses"), "{block}");
         }
         let sandbox = td_sandbox::client::Sandbox {
+            personal_home_path: false,
+            mount_layout: Default::default(),
+            profiles: Default::default(),
             name: "default".into(),
             runtime: None,
             home: "/var/lib/td/workloads/98304".into(),

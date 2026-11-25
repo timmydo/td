@@ -14,15 +14,17 @@ use std::path::Path;
 use std::time::Duration;
 
 pub use crate::workspace_intake::{lasting, shown, Answer, Intake, DELETED, EXISTS, LOG};
-pub type Root<'a> = crate::workspace_intake::Root<'a, MAX_REQUEST>;
+pub type Root<'a> =
+    crate::workspace_intake::Root<'a, { MAX_REQUEST + crate::sandbox_layout::MAX_BYTES + 16 }>;
 const MAX_REQUEST: usize = 8192;
 #[cfg(test)]
 use crate::workspace_intake::parse;
 
 /// `start NAME RUNTIME TERM`: td's shell on a PTY.
-pub fn start(name: &str, runtime: Option<&str>, term: &str) -> io::Result<String> {
+pub fn start(name: &str, runtime: Option<&str>, term: &str, personal: bool) -> io::Result<String> {
     text(format_args!(
-        "start {name} {} {term}\n",
+        "{} {name} {} {term}\n",
+        if personal { "start-home" } else { "start" },
         runtime.unwrap_or("native")
     ))
 }
@@ -35,9 +37,11 @@ pub fn run(
     terminal: bool,
     term: &str,
     command: &[String],
+    personal: bool,
 ) -> io::Result<String> {
     let mut line = text(format_args!(
-        "run {name} {} {} {term}",
+        "{} {name} {} {} {term}",
+        if personal { "run-home" } else { "run" },
         runtime.unwrap_or("native"),
         if terminal { "pty" } else { "pipes" }
     ))?;
@@ -57,6 +61,14 @@ pub fn run(
         )));
     }
     Ok(line)
+}
+
+pub fn with_layout(line: &str, layout: &crate::sandbox_layout::Layout) -> io::Result<String> {
+    let count = layout.mounts().count();
+    if count == 0 {
+        return owned(line);
+    }
+    text(format_args!("mounts {count}\n{}{line}", layout.encode("")?))
 }
 
 /// `create NAME`, `delete NAME`, `status NAME` or `grants NAME`.
@@ -192,12 +204,12 @@ mod tests {
     #[test]
     fn requests_are_the_lines_the_intake_parses() -> io::Result<()> {
         assert_eq!(
-            start("default", None, "xterm-256color")?,
+            start("default", None, "xterm-256color", false)?,
             "start default native xterm-256color\n"
         );
         assert_eq!(
-            start("tools", Some("freedesktop-sdk-25-08"), "linux")?,
-            "start tools freedesktop-sdk-25-08 linux\n"
+            start("tools", Some("freedesktop-sdk-25-08"), "linux", true)?,
+            "start-home tools freedesktop-sdk-25-08 linux\n"
         );
         assert_eq!(
             run(
@@ -210,7 +222,8 @@ mod tests {
                     "-c".into(),
                     "echo 'a b'\nexit 3".into(),
                     String::new()
-                ]
+                ],
+                false
             )?,
             "run oracle native pipes dumb x2f62696e2f7368 x2d63 x6563686f202761206227\
              0a657869742033 x\n"
@@ -221,11 +234,12 @@ mod tests {
                 Some("freedesktop-sdk-25-08"),
                 true,
                 "xterm",
-                &["ls".into()]
+                &["ls".into()],
+                true
             )?,
-            "run tools freedesktop-sdk-25-08 pty xterm x6c73\n"
+            "run-home tools freedesktop-sdk-25-08 pty xterm x6c73\n"
         );
-        assert!(run("x", None, false, "dumb", &["a".repeat(MAX_REQUEST)]).is_err());
+        assert!(run("x", None, false, "dumb", &["a".repeat(MAX_REQUEST)], false).is_err());
         assert_eq!(simple("create", "default")?, "create default\n");
         assert_eq!(simple("delete", "default")?, "delete default\n");
         assert_eq!(simple("grants", "default")?, "grants default\n");

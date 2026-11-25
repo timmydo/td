@@ -4708,7 +4708,8 @@ restarting the broker. Profiles live on the broker's machine.
 
 Such a template names no repository, shared-folder override or runtime
 override: those conflicting settings refuse Save. Its tools work in the
-sandbox account's existing home and reach its existing grants, including
+sandbox account's existing home at the location selected by its profile,
+and reach its existing grants, including
 tools installed in that home. Top-level agent shares and conversation
 directory grants are not added; `request_directory` directs the human to
 td-sandbox's grant commands. Web fetch retains the template's separate

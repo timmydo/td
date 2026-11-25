@@ -2236,7 +2236,12 @@ remount, and a `/lib64` link to it, through the same `mkdir` and
 and executable, device and inode checked; and the admitted directories
 at their real paths through the same grant bind and hardening loop,
 `noexec` but for worktrees and development's private home and shared trees, which keeps
-a flag the host set on a row. Development may replace the ephemeral scratch
+a flag the host set on a row. A sandbox may mount its private home at
+the human's home path inside the new root. It prepares each nested view
+in the private staging tmpfs, opens or creates real destination directories
+relative to pinned parent descriptors, then recursively binds the hardened
+view onto the pinned final directory and checks the bind source again.
+Development may replace the ephemeral scratch
 mounts with four admitted persistent directory binds at compiled targets
 `/tmp`, `/var/tmp`, `/dev/shm`, `/run`; only `/dev/shm` is noexec. These use
 existing bind operations and identity checks; stage 2 checks mount flags

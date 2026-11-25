@@ -14,6 +14,9 @@ pub struct Sandbox {
     pub name: String,
     pub runtime: Option<String>,
     pub home: PathBuf,
+    pub personal_home_path: bool,
+    pub profiles: PathBuf,
+    pub mount_layout: crate::sandbox_layout::Layout,
     pub host_network: bool,
     pub shares: Vec<(PathBuf, bool)>,
 }
@@ -29,11 +32,21 @@ impl Sandbox {
         let human = std::fs::canonicalize(human)?;
         let profiles = human.join(".local/share/td-sandbox/.profiles");
         let profile = state::Profile::read(&profiles, name)?;
+        let (_guard, layout) = profile.layout()?;
         let grants = intake::Root::new()
             .ask(&intake::simple("grants", name)?)?
             .accepted()
             .and_then(|answer| intake::grants(&answer))?;
-        Self::from_grants(name, profile.runtime, &human, grants)
+
+        Self::from_grants(
+            name,
+            profile.runtime,
+            &human,
+            grants,
+            profile.personal_home_path,
+            profiles,
+            layout,
+        )
     }
 
     fn from_grants(
@@ -41,10 +54,18 @@ impl Sandbox {
         runtime: Option<String>,
         human: &Path,
         grants: intake::Grants,
+        personal_home_path: bool,
+        profiles: PathBuf,
+        mount_layout: crate::sandbox_layout::Layout,
     ) -> io::Result<Self> {
         if !workload_accounts::WORKLOAD_UIDS.contains(&grants.uid) {
             return Err(io::Error::other("sandbox has no workload account"));
         }
+        let home = if personal_home_path {
+            PathBuf::from(owned(state::text(human)?)?)
+        } else {
+            workload_accounts::Kind::Sandbox.home(grants.uid)
+        };
         let mut shares = Vec::new();
         for (path, write) in grants.directories {
             if path.is_empty()
@@ -54,12 +75,16 @@ impl Sandbox {
             {
                 return Err(io::Error::other("sandbox grant is not home-relative"));
             }
-            td_alloc::push(&mut shares, (human.join(path), write)).map_err(refused)?;
+            let (target, original) = mount_layout.targets(&path, &home, human)?;
+            td_alloc::push(&mut shares, (original.unwrap_or(target), write)).map_err(refused)?;
         }
         Ok(Self {
             name: owned(name)?,
             runtime,
-            home: workload_accounts::Kind::Sandbox.home(grants.uid),
+            home,
+            profiles,
+            mount_layout,
+            personal_home_path,
             host_network: grants.host,
             shares,
         })
@@ -73,8 +98,38 @@ impl Sandbox {
         if let Some(runtime) = &self.runtime {
             state::runtime(runtime)?;
         }
-        let line = intake::run(&self.name, self.runtime.as_deref(), false, "dumb", command)?;
-        let channel = intake::Root::new().launch(&line)?;
+        let line = intake::run(
+            &self.name,
+            self.runtime.as_deref(),
+            false,
+            "dumb",
+            command,
+            self.personal_home_path,
+        )?;
+        let profile = state::Profile::open(&self.profiles, &self.name, state::Access::Session)?;
+        let (guard, layout) = profile.layout()?;
+        if profile.personal_home_path != self.personal_home_path
+            || profile.runtime != self.runtime
+            || layout != self.mount_layout
+        {
+            return Err(io::Error::other(
+                "sandbox profile changed; prepare the sandbox again",
+            ));
+        }
+        let mut channel = intake::Root::new().launch(&intake::with_layout(&line, &layout)?)?;
+        channel.set_read_timeout(Some(crate::workspace_intake::LAUNCH_PATIENCE))?;
+        let (kind, payload) = wire::read(&mut channel).map_err(|e| {
+            failure(format_args!(
+                "sandbox relay failed to start: {e}; see {}",
+                intake::LOG
+            ))
+        })?;
+        if kind != wire::OUTPUT || !payload.is_empty() {
+            return Err(io::Error::other("missing sandbox startup frame"));
+        }
+        channel.set_read_timeout(None)?;
+        drop(guard);
+        drop(profile);
         channel.set_write_timeout(Some(Duration::from_millis(250)))?;
         let input = Input(channel.try_clone()?);
         let output = Output {
@@ -263,6 +318,9 @@ mod tests {
             Some("freedesktop-platform-25-08".into()),
             Path::new("/home/person"),
             grants,
+            false,
+            Default::default(),
+            Default::default(),
         )?;
         assert_eq!(sandbox.home, Path::new("/var/lib/td/workloads/98304"));
         assert_eq!(

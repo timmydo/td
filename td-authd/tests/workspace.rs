@@ -82,6 +82,8 @@ fn word(argument: &str) -> String {
 
 fn shell(runtime: Option<&'static str>, term: &str) -> Verb {
     Verb::Launch(Launch {
+        mounts: Default::default(),
+        personal_home_path: false,
         runtime,
         mode: Mode::Pty,
         term: term.into(),
@@ -109,6 +111,18 @@ fn a_request_is_one_exact_bounded_line() {
         encode(&request.name, launch),
         b"start default native xterm-256color\n".to_vec()
     );
+    for line in [
+        "start-home tools native linux\n",
+        "run-home tools native pipes dumb x6c73\n",
+    ] {
+        assert!(matches!(
+            Request::parse(line.as_bytes()).unwrap().verb,
+            Verb::Launch(Launch {
+                personal_home_path: true,
+                ..
+            })
+        ));
+    }
     let runtime = Request::parse(b"start tools freedesktop-sdk-25-08 linux\n").unwrap();
     assert_eq!(runtime.verb, shell(Some("freedesktop-sdk-25-08"), "linux"));
     let Verb::Launch(launch) = &runtime.verb else {
@@ -145,6 +159,8 @@ fn a_request_is_one_exact_bounded_line() {
             kind: Kind::Sandbox,
             name: "oracle".into(),
             verb: Verb::Launch(Launch {
+                mounts: Default::default(),
+                personal_home_path: false,
                 runtime: None,
                 mode: Mode::Pipes,
                 term: "dumb".into(),
@@ -331,6 +347,31 @@ fn the_request_is_read_exactly_within_its_bound_and_deadline() {
     drop(peer);
 }
 
+#[test]
+fn mount_preamble_names_destinations_only_for_sandbox_launches() {
+    let (mut root, mut peer) = UnixStream::pair().unwrap();
+    peer.write_all(b"mounts 2\nsrc/td\t/work/td\nreference\tmy books\nrun tools native pipes dumb x6c73\nPAYLOAD").unwrap();
+    let Verb::Launch(launch) = read_request(&mut root).unwrap().verb else {
+        panic!()
+    };
+    assert_eq!(launch.mounts.get("src/td"), Some("/work/td"));
+    assert_eq!(launch.mounts.get("reference"), Some("my books"));
+    let mut rest = [0; 7];
+    root.read_exact(&mut rest).unwrap();
+    assert_eq!(&rest, b"PAYLOAD");
+    for malformed in [
+        "mounts 1\nsrc\t/etc/config\n",
+        "mounts 2\nsrc\ta\nsrc\tb\n",
+        "mounts 1\nsrc\ta\ndelete tools\n",
+        "mounts 33\n",
+    ] {
+        let (mut stream, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(malformed.as_bytes()).unwrap();
+        drop(peer);
+        assert!(read_request(&mut stream).is_err());
+    }
+}
+
 /// Only the primary human's programs are admitted, by the peer's kernel
 /// credentials: not root, an application's account, a sandbox's own
 /// account, or a peer whose credentials cannot be read.
@@ -387,18 +428,29 @@ fn the_spec_maps_the_network_row_and_names_only_the_account() {
     let entry = Path::new("/td/store/abc-td-sandbox/bin/td-sandbox");
     let home = Kind::Sandbox.home(98304);
     assert_eq!(
-        spec_text(Network::Off, None, entry, &home).unwrap(),
+        spec_text(Network::Off, None, entry, &home, false).unwrap(),
         "format=1\nprofile=development-offline\nentry=/td/store/abc-td-sandbox/bin/td-sandbox\nhome=/var/lib/td/workloads/98304\n"
     );
     assert_eq!(
-        spec_text(Network::Host, Some("freedesktop-platform-25-08"), entry, &home).unwrap(),
+        spec_text(Network::Host, Some("freedesktop-platform-25-08"), entry, &home, false).unwrap(),
         "format=1\nprofile=development\nruntime=freedesktop-platform-25-08\nentry=/td/store/abc-td-sandbox/bin/td-sandbox\nhome=/var/lib/td/workloads/98304\n"
     );
     assert_eq!(
-        spec_text(Network::Off, Some("native-glibc"), entry, &home).unwrap(),
+        spec_text(Network::Off, Some("native-glibc"), entry, &home, false).unwrap(),
         "format=1\nprofile=development-offline\nruntime=native-glibc\nentry=/td/store/abc-td-sandbox/bin/td-sandbox\nhome=/var/lib/td/workloads/98304\n"
     );
-    assert!(spec_text(Network::Off, None, Path::new("/td/a\nwrite=/x"), &home).is_err());
+    assert_eq!(
+        spec_text(Network::Off, None, entry, &home, true).unwrap(),
+        "format=1\nprofile=development-offline\nentry=/td/store/abc-td-sandbox/bin/td-sandbox\nhome=/var/lib/td/workloads/98304\nhome-location=personal\n"
+    );
+    assert!(spec_text(
+        Network::Off,
+        None,
+        Path::new("/td/a\nwrite=/x"),
+        &home,
+        false
+    )
+    .is_err());
     assert_eq!(
         spec_path(98304, 7).unwrap(),
         Path::new("/run/td-authd/workspaces/98304/7")

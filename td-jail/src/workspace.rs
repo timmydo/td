@@ -114,29 +114,7 @@ pub(crate) const SYNTHESIZED_ETC: &[&str] =
     &["group", "hostname", "hosts", "nsswitch.conf", "passwd"];
 /// What no admitted directory may be, contain or lie inside: the jail's
 /// own mount points and the host trees bound for it.
-const RESERVED: &[&str] = &[
-    "/bin",
-    "/boot",
-    "/dev",
-    "/etc",
-    "/gnu",
-    "/lib",
-    "/lib32",
-    "/lib64",
-    "/libx32",
-    "/nix",
-    "/opt",
-    "/proc",
-    "/run",
-    "/sbin",
-    "/sys",
-    "/td",
-    "/tmp",
-    "/usr",
-    "/var/tmp",
-    // td-svc's logs, which the human account's svc-log group may read.
-    "/var/log/svc",
-];
+use crate::sandbox_layout::{Layout, RESERVED};
 const FORMAT_LINE: &str = "format=1";
 const O_NOFOLLOW: i32 = 0o400_000;
 const O_NONBLOCK: i32 = 0o4000;
@@ -242,6 +220,7 @@ pub(crate) struct WorkspacePlan {
     /// Whether the channel is a connection root's intake accepted, a
     /// ledger caller's, rather than its launcher's unnamed socket pair.
     pub(crate) intake: bool,
+    pub(crate) sandbox: bool,
 }
 
 /// Who may launch the kind, which decides whose spec, home and grants an
@@ -479,6 +458,8 @@ struct Spec {
     /// Set only after a ledger caller's root-owned spec has passed
     /// `require_account_spec`; never parsed from a spec line.
     account_private: bool,
+    personal_home_path: bool,
+    mounts: Layout,
     development: bool,
     shared_network: bool,
     runtime: Option<FlathubRuntime>,
@@ -547,6 +528,8 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         "alias",
         "path",
         "home",
+        "home-location",
+        "mount",
         "scratch",
         "worktree",
         "checkout",
@@ -574,6 +557,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             "runtime" => spec.runtime.is_some() || spec.native_glibc,
             "entry" => entry,
             "home" => home.is_some(),
+            "home-location" => spec.personal_home_path,
             _ => false,
         };
         if rank < last || repeated {
@@ -592,6 +576,17 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
                     "workspace spec names {value:?}, which is no declared runtime"
                 ))
             })?);
+            continue;
+        }
+        if key == "home-location" {
+            if value != "personal" {
+                return Err(invalid("invalid sandbox home location"));
+            }
+            spec.personal_home_path = true;
+            continue;
+        }
+        if key == "mount" {
+            spec.mounts.row(value)?;
             continue;
         }
         if key == "alias" {
@@ -724,6 +719,8 @@ where
             Kind::Sandbox | Kind::Application => spec.views = views,
         }
     }
+    let personal_home_path = spec.personal_home_path;
+    let mounts = std::mem::take(&mut spec.mounts);
     let runtime = spec.runtime;
     let native_glibc = spec.native_glibc;
     // A ledger account's home is the spec's, its own; the human's is the
@@ -740,6 +737,14 @@ where
     };
     let arguments = authority::collect_arguments(arguments)?;
     let mut plan = admit(spec, spec_path, uid, gid, &real_home, arguments, RESERVED)?;
+    if caller == Caller::Account(Kind::Sandbox) {
+        let human = crate::primary_account::load()?.persistent_home();
+        if personal_home_path {
+            plan.home.target = PathBuf::from(crate::text(format_args!("{}", human.display()))?);
+        }
+        plan.sandbox = true;
+        plan.shared = sandbox_views(plan.shared, &mounts, &human, &plan.home.target)?;
+    }
     plan.intake = matches!(caller, Caller::Account(_));
     if let Some(runtime) = runtime {
         plan.runtime = Some(spec_runtime(runtime, &td_runtime_source())?);
@@ -749,6 +754,54 @@ where
         require_td_for_runtime(Path::new(authority::CONFIG_PATH))?;
     }
     Ok(plan)
+}
+
+/// Source identity and access come only from the admitted manifest. Apply
+/// layout after admission, then check every destination including old paths.
+fn sandbox_views(
+    views: Vec<FilesystemGrant>,
+    layout: &Layout,
+    human: &Path,
+    home: &Path,
+) -> io::Result<Vec<FilesystemGrant>> {
+    let mut result = Vec::new();
+    for mut view in views {
+        let source = view
+            .target
+            .strip_prefix(human)
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or_else(|| invalid("sandbox view is outside the primary home"))?;
+        let (target, original) = layout.targets(source, home, human)?;
+        if let Some(target) = original {
+            let alias = FilesystemGrant {
+                target,
+                source: PathBuf::from(crate::text(format_args!("{}", view.source.display()))?),
+                ..view
+            };
+            crate::allocation::push(&mut result, alias)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        }
+        view.target = target;
+        crate::allocation::push(&mut result, view)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    }
+    for (index, view) in result.iter().enumerate() {
+        if result
+            .iter()
+            .skip(index + 1)
+            .any(|other| paths_overlap(&view.target, &other.target))
+        {
+            return Err(crate::error(
+                io::ErrorKind::InvalidInput,
+                format_args!(
+                    "sandbox mount destination {} overlaps another mount",
+                    view.target.display()
+                ),
+            ));
+        }
+    }
+    Ok(result)
 }
 
 /// Where a spec's runtime may come from: td, with its product
@@ -861,6 +914,13 @@ fn configuration_installed(config: &Path) -> io::Result<bool> {
 /// by role, each of which must be a view its manifest lists
 /// (`select_views`).
 fn require_account_spec(spec: &Spec, kind: Kind, uid: u32) -> io::Result<()> {
+    if (spec.personal_home_path || spec.mounts.mounts().next().is_some())
+        && (kind != Kind::Sandbox || !spec.development)
+    {
+        return Err(invalid(
+            "the personal home path belongs to sandbox accounts",
+        ));
+    }
     let names_directories = !(spec.worktrees.is_empty()
         && spec.checkouts.is_empty()
         && spec.repositories.is_empty()
@@ -991,6 +1051,11 @@ fn select_views(spec: &mut Spec, mut views: Vec<FilesystemGrant>, human: &Path) 
 /// sandbox's profile, and a sandbox runs as its own account through
 /// root's workspace intake (td-sandbox/DESIGN.md), never as the human.
 fn require_host_spec(spec: &Spec) -> io::Result<()> {
+    if spec.personal_home_path || spec.mounts.mounts().next().is_some() {
+        return Err(invalid(
+            "the personal home path belongs to sandbox accounts",
+        ));
+    }
     if spec.development && !spec.shared_network {
         return Err(invalid(
             "profile=development-offline is a sandbox's, which runs as its own account \
@@ -1094,11 +1159,15 @@ fn read_spec_of(path: &Path, owner: u32, sealed: bool) -> io::Result<String> {
             ));
         }
     }
+    let max_bytes = MAX_SPEC_BYTES
+        + if sealed {
+            crate::sandbox_layout::MAX_BYTES as u64
+        } else {
+            0
+        };
     let mut text = String::new();
-    (&mut file)
-        .take(MAX_SPEC_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_SPEC_BYTES {
+    (&mut file).take(max_bytes + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
         return Err(invalid("workspace spec is too large"));
     }
     Ok(text)
@@ -1400,6 +1469,7 @@ fn admit(
         runtime: None,
         native_abi: None,
         intake: false,
+        sandbox: false,
     })
 }
 
@@ -2245,6 +2315,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sandbox_mounts_preserve_sources_access_and_legacy_paths() -> io::Result<()> {
+        let human = Path::new("/var/home/timmy");
+        let home = Path::new("/var/lib/td/workloads/98304");
+        let view = |name: &str, read_only| FilesystemGrant {
+            source: PathBuf::from("/run/td/views/98304/0"),
+            target: human.join(name),
+            source_kind: FilesystemSourceKind::Directory,
+            source_device: 1,
+            source_inode: 2,
+            read_only,
+        };
+        let mut layout = Layout::default();
+        let old = view("src/td", false);
+        let legacy = sandbox_views(vec![old.clone()], &layout, human, home)?;
+        let [alias, nested]: [_; 2] = legacy.try_into().unwrap();
+        assert_eq!(alias, old);
+        assert_eq!(nested.target, home.join("src/td"));
+        for (dest, expected) in [
+            ("checkout", home.join("checkout")),
+            ("/work/td", "/work/td".into()),
+        ] {
+            let mut mapped = Layout::default();
+            mapped.add("src/td", dest)?;
+            let mapped = sandbox_views(vec![old.clone()], &mapped, human, home)?;
+            let [entry]: [_; 1] = mapped.try_into().unwrap();
+            assert_eq!(entry.target, expected);
+            assert_eq!(entry.source, old.source);
+            assert!(!entry.read_only);
+        }
+        layout.add("docs", "src")?;
+        assert!(sandbox_views(vec![old, view("docs", true)], &layout, human, home).is_err());
+        let unused = sandbox_views(Vec::new(), &layout, human, home)?;
+        assert!(unused.is_empty());
+        Ok(())
+    }
+
     /// Root writes a ledger caller's spec with the account's own home and
     /// no directory to bind: its grants are its manifest's views, bound at
     /// the human's own paths.
@@ -2260,6 +2367,11 @@ mod tests {
         assert!(require_account_spec(&spec(""), Kind::Sandbox, 98304).is_ok());
         assert!(require_account_spec(&spec(""), Kind::Workspace, 98304).is_ok());
         assert!(require_account_spec(&spec(""), Kind::Sandbox, 98305).is_err());
+        let personal = spec("home-location=personal\n");
+        assert!(require_account_spec(&personal, Kind::Sandbox, 98304).is_ok());
+        assert!(require_account_spec(&personal, Kind::Workspace, 98304).is_err());
+        assert!(require_account_spec(&personal, Kind::Application, 98304).is_err());
+        assert!(require_host_spec(&personal).is_err());
         for extra in [
             "worktree=/var/home/alice/src\n",
             "checkout=/var/home/alice/src\n",

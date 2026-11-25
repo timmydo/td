@@ -32,7 +32,7 @@ const MAX_ANSWER: usize = 64 * 1024;
 const MAX_LINE: usize = 256;
 /// How long root may take to answer: a launch prepares the account and
 /// publishes its views; a deletion has the account empty its home.
-const LAUNCH_PATIENCE: Duration = Duration::from_secs(120);
+pub(crate) const LAUNCH_PATIENCE: Duration = Duration::from_secs(120);
 const ANSWER_PATIENCE: Duration = Duration::from_secs(600);
 /// Root's refusals by their words: a creation over a sandbox that holds
 /// files or grants, and a launch or grant change of a deleted one.

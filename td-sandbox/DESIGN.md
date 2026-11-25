@@ -19,7 +19,9 @@ immutable entry; the target recipe stages engine's Flathub declarations
 (`flathub_app.rs`) and the ledger's names (`workload_accounts.rs`) too.
 
 Sandboxes run only on td, where the intake runs: on any other host every
-command but `help`, `runtimes`, `runtime`, `sessions` and `stop`, which need no intake, fails naming the missing intake. `./install-apps` no longer
+public command that needs the intake reports its absence. `help`, `runtimes`,
+`runtime`, `sessions` and `stop` work locally. The `home` command checks the
+current grants when the profile has explicit mount destinations. `./install-apps` no longer
 installs td-sandbox and has no way to retire a program: a
 `~/.local/bin/td-sandbox` an earlier `./install-apps` left on a development
 host is stale, no longer updated, and should be removed by hand.
@@ -49,11 +51,23 @@ account's home. td-sandbox keeps none of them: `inspect`, `list` and
 The human keeps one record per sandbox under
 `~/.local/share/td-sandbox/.profiles/NAME`, private: `record`, `lock` and a
 `session-ID` file per active CLI shell or command. The record is exact: the line
-`td-sandbox-profile-v1`, an optional `runtime=RUNTIME`, then an optional
+`td-sandbox-profile-v1`, an optional `runtime=RUNTIME`, an optional
+`home=personal-path`, then an optional
 `old-home=PATH` naming the home of the profile it was imported from. A
 name is the ledger's: 1–64 lowercase ASCII letters, digits, `.`, `_` or
 `-`, beginning with a letter. CLI sessions share the record's kernel file
-lock. Changing the runtime or removing the record takes it exclusively.
+lock. Changing the runtime or home location, or removing the record, takes it exclusively.
+
+The optional private `mounts` file stores only explicit destinations, one
+home-relative source and destination per tab-separated line. A separate
+`mounts.lock` serializes edits and layout reads during grant changes.
+A layout-changing edit records its source in `mounts.pending` before asking
+root. A successful grant response commits the destination file. After a failed
+or interrupted edit, the next launch reports the source to share or unshare
+again. Readers hold the layout lock until the jailed relay reports that
+its command has started and the mounts are in place.
+A profile without destination rows uses default mounts. Running sessions keep
+their existing views. Removing a record discards its destination overrides.
 
 A sandbox is **held** when its account's home holds files or the grant
 table holds a row of its name; root answers `status NAME` with `absent`
@@ -71,12 +85,27 @@ sandbox, so a lost record never costs a sandbox its files or grants.
 - `adopt NAME` writes a record for a held sandbox that has none: one whose
   record was lost, removed or restored from before it was made. It is
   refused for a free or absent one, which `create` makes.
-- `share NAME PATH --read|--write` resolves PATH and asks root to grant it
+- `share NAME PATH --read|--write [--at DEST]` resolves PATH and asks root to grant it
   `ro` or `rw` by its path relative to the canonical home; a directory
   that is not below the home cannot be shared. Root's writer refuses what
   it refuses for any grant (WORKLOADS.md, "Grants"), by its reason.
+  By default a grant of `~/src/project` appears at `~/src/project` in
+  the sandbox's private home. Its original absolute path also works for
+  scripts and existing sandboxes. An explicit `--at work/project` places
+  the view under the sandbox home; `--at /work/project` places it at
+  that absolute path in the jail. An explicit destination replaces both
+  default locations. Repeating the share changes the destination and
+  access for new sessions. An existing directory's private contents are
+  covered while mounted. Symlinks and files in its path refuse the launch.
   `unshare NAME PATH` revokes, taking a path that is gone, or the
   `~/PATH` form `inspect` shows.
+- `home NAME PATH` places the sandbox account's private home at the human's
+  canonical home path inside new sessions. PATH accepts the human's home
+  or its canonical spelling. The initial directory, `$HOME`, passwd entry
+  and home-relative tools use that location. Only explicit directory
+  grants expose host files there. Other files, including dotfiles, use
+  the same private storage across launches and location changes.
+  `home NAME private` restores the default account path.
 - `network NAME off|host` sets the network row.
 - `runtime NAME RUNTIME|native|native-glibc` changes the record alone.
 - `delete NAME` asks root to `delete`, then removes the record. Root
@@ -128,9 +157,7 @@ below the human's home at the same access, and to give host network
 where the policy did. The old home is left as it was, never moved or
 mounted: a sandbox starts with an empty home of its account's, and
 `inspect` names where the old one lies. A sandbox sees its shares at
-their own paths below the human's home, not inside its home; the
-`~/sandbox` link the old default's home held is gone, and the report
-says so.
+both their default paths. The import report describes the new mounts.
 
 An old profile whose name a sandbox already has is never imported into:
 one root holds is adopted as it is, its record naming no old home, and
@@ -226,7 +253,7 @@ launch requires the runtime to be installed again.
 
 A sandbox's processes run as its account inside and outside the jail.
 They reach the human's files only through the views root publishes from
-the grant table, each bound at the human's own path, a view's files
+the grant table, bound at their configured destinations, a view's files
 keeping the human as their owner on disk; executable views are the
 account kind's choice, never a row's or a request's (td-authd/DESIGN.md,
 "Grant views"). Its home is the account's alone. Writable grants entrust
@@ -283,9 +310,9 @@ td-sandbox share default ~/src/project --write
 td-sandbox inspect default
 ```
 
-Use `--read` for read-only access. Open a new `td-term (sandbox)` and
-change to the checkout's absolute path under the human's home. The
-sandbox has its own `~`. For a normal clone the grant includes its
+Use `--read` for read-only access. From Super+Enter, choose
+`td-term (sandbox)`, then `default`. Run `cd ~/src/project` in the
+new shell. Files saved elsewhere in the sandbox home stay private. For a normal clone the grant includes its
 `.git` directory. A linked worktree whose `.git` file points outside
 the grant also needs access to the backing repository at its original
 path. To revoke the share, run `td-sandbox unshare default ~/src/project`
@@ -306,7 +333,8 @@ boot. Live media state lasts only as long as that live home does.
 
 `shell` and `run` send one launch request, `start NAME RUNTIME TERM` or
 `run NAME RUNTIME pty|pipes TERM WORD...`, each word `x` and its
-argument's bytes in lowercase hex. `shell` runs the workspace's `/bin/sh -i`, which
+argument's bytes in lowercase hex. A profile using the personal home path
+selects `start-home` or `run-home` with the same arguments. `shell` runs the workspace's `/bin/sh -i`, which
 root names; no shell the caller names is offered. Root answers `ok`, or
 `refused` and why. After `ok` root starts td-jail's workspace kind as the
 sandbox's account with the accepted connection on its stdin and stdout,
@@ -380,8 +408,10 @@ next registration, listing or stop removes unlocked markers.
 
 The crate's library shares its CLI implementation, profile reader, intake
 and relay codecs with td-agent. `client::Sandbox` reads an existing profile
-without creating or locking it and asks root for its account and grants.
-Its pipes-mode launch uses the existing `run` request. The stream adapter
+and holds its layout lock while asking root for its account and grants. A
+tool launch rechecks the saved settings and holds the lock through the
+first frame from the jailed command relay. Changed settings require fresh tool preparation.
+Its pipes-mode launch uses `run` or `run-home` according to the profile. The stream adapter
 frames stdin, yields stdout alone, bounds retained stderr to 4096 bytes,
 and refuses malformed frames, an unreported end or a nonzero exit. A
 partial input-frame failure shuts down the channel and cannot be retried
@@ -396,10 +426,9 @@ orders deletion against every running instance. Profile and grant edits
 affect new launches; an existing jail retains its views.
 
 The client owns its new name/share-vector and stderr growth through
-`td-alloc`. Its two PathBuf joins (profile directory and absolute grant
-path), filesystem canonicalization, derived snapshot Clone, account-home
+`td-alloc`. Its profile-directory PathBuf join, filesystem canonicalization, derived snapshot Clone, account-home
 constructor, and std io::Error boxing remain specific adapter debt. The
-source inventory records the joins; implicit/dependency allocations stay
+source inventory records the join; implicit/dependency allocations stay
 outside its proof. It calls the existing record/intake/frame readers,
 whose legacy debt is unchanged. Moving the CLI into lib.rs transfers its
 inventory entries without increasing them. Bootstrap and relay adoption

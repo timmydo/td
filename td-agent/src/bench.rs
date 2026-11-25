@@ -585,6 +585,9 @@ mod tests {
     #[test]
     fn a_named_sandbox_uses_only_its_existing_home_and_grants() {
         let sandbox = td_sandbox::client::Sandbox {
+            personal_home_path: false,
+            mount_layout: Default::default(),
+            profiles: Default::default(),
             name: "default".into(),
             runtime: Some("freedesktop-platform-25-08".into()),
             home: "/var/lib/td/workloads/98304".into(),

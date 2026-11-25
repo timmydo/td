@@ -73,6 +73,9 @@ mod revocation;
 mod rollback;
 // The saved hostname's bounded read and synced write, and the synced write
 // the backoff file shares: td-firstboot's provisioning source.
+#[allow(dead_code, reason = "sandbox clients also edit the layout")]
+#[path = "../../engine/src/sandbox_layout.rs"]
+mod sandbox_layout;
 #[path = "../../td-firstboot/src/saved.rs"]
 mod saved;
 mod secret_intake;

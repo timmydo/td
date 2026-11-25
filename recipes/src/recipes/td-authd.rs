@@ -328,6 +328,10 @@ pub fn recipe() -> Recipe {
             "{src}/engine/src/workload_accounts.rs",
             include_str!("../../../engine/src/workload_accounts.rs"),
         ),
+        (
+            "{src}/engine/src/sandbox_layout.rs",
+            include_str!("../../../engine/src/sandbox_layout.rs"),
+        ),
         // The grant table the launch publishes from and the manifest it
         // writes for td-jail.
         (

@@ -15,6 +15,9 @@ mod import;
 mod intake;
 mod relay;
 mod sessions;
+use td_alloc as allocation;
+#[path = "../../engine/src/sandbox_layout.rs"]
+mod sandbox_layout;
 mod state;
 mod wire;
 #[path = "../../engine/src/workspace_intake.rs"]
@@ -46,8 +49,10 @@ const HELP: &str = "td-sandbox COMMAND\n\
   list                        list sandboxes with their accounts and networks\n\
   runtimes                    list supported runtimes to install in td-software\n\
   inspect NAME                show account, home, network, runtime and grants\n\
-  share NAME PATH --read|--write  share a directory below your home\n\
+  share NAME PATH --read|--write [--at DEST]\n\
+                              mount in the sandbox home, or at absolute DEST\n\
   unshare NAME PATH\n\
+  home NAME PATH|private      place the private home at your home path or its account path\n\
   network NAME off|host\n\
   runtime NAME RUNTIME|native-glibc|native\n\
                               bind a declared Flathub runtime at /usr, or\n\
@@ -59,8 +64,7 @@ const HELP: &str = "td-sandbox COMMAND\n\
   stop NAME [ID]              stop one session (ID required when several run)\n\
   delete NAME                 delete an inactive sandbox, its grants and\n\
                               its home's contents; its account is kept\n\
-  Sandboxes run only on td: every command but help, runtimes, runtime, sessions and stop asks\n\
-  root's workspace intake.\n";
+  Sandboxes run on td. Grant changes and launches use root's workspace intake.\n";
 
 /// How long `init-default` waits for root's intake at boot.
 const BOOT_PATIENCE: Duration = Duration::from_secs(10);
@@ -259,12 +263,57 @@ fn network_text(host: bool) -> &'static str {
     }
 }
 
-fn inspect(profile: &state::Profile, grants: &intake::Grants) -> io::Result<String> {
+fn validate_mounts(
+    added: Option<&str>,
+    layout: &sandbox_layout::Layout,
+    grants: &intake::Grants,
+    human: &Path,
+    personal: bool,
+) -> io::Result<()> {
+    let account_home = workload_accounts::Kind::Sandbox.home(grants.uid);
+    let home = if personal { human } else { &account_home };
+    let mut targets = Vec::new();
+    for path in grants
+        .directories
+        .iter()
+        .map(|(p, _)| p.as_str())
+        .filter(|p| Some(*p) != added)
+        .chain(added)
+    {
+        let (target, original) = layout.targets(path, home, human)?;
+        for mount in std::iter::once(target).chain(original) {
+            if targets
+                .iter()
+                .any(|prior: &PathBuf| sandbox_layout::overlaps(prior, &mount))
+            {
+                return Err(failure(format_args!(
+                    "sandbox mount destination {} overlaps another mount",
+                    mount.display()
+                )));
+            }
+            td_alloc::push(&mut targets, mount).map_err(refused)?;
+        }
+    }
+    Ok(())
+}
+
+fn inspect(
+    profile: &state::Profile,
+    layout: &sandbox_layout::Layout,
+    grants: &intake::Grants,
+    human: &Path,
+) -> io::Result<String> {
+    let account_home = workload_accounts::Kind::Sandbox.home(grants.uid);
+    let home = if profile.personal_home_path {
+        human
+    } else {
+        &account_home
+    };
     let mut shown = text(format_args!(
         "Account: {}{}\nHome: {}\nNetwork: {}\nRuntime: {}\n",
         workload_accounts::WORKLOAD_ACCOUNT_PREFIX,
         grants.uid,
-        workload_accounts::Kind::Sandbox.home(grants.uid).display(),
+        home.display(),
         network_text(grants.host),
         profile.runtime.as_deref().unwrap_or("native")
     ))?;
@@ -273,6 +322,15 @@ fn inspect(profile: &state::Profile, grants: &intake::Grants) -> io::Result<Stri
             "{}: ~/{path}\n",
             if *write { "Write" } else { "Read" }
         ))?;
+        if let Some(target) = layout.get(path) {
+            let prefix = if target.starts_with('/') { "" } else { "~/" };
+            let mapped = text(format_args!(
+                "{} -> {prefix}{target}\n",
+                line.trim_end_matches('\n')
+            ))?;
+            td_alloc::push_str(&mut shown, &mapped).map_err(refused)?;
+            continue;
+        }
         td_alloc::push_str(&mut shown, &line).map_err(refused)?;
     }
     if let Some(old) = &profile.old_home {
@@ -294,8 +352,9 @@ fn session(
     shell: bool,
 ) -> io::Result<u8> {
     let session = sessions::Session::register(profile)?;
+    let (guard, layout) = profile.layout()?;
     let channel = intake::Root::new()
-        .launch(line)
+        .launch(&intake::with_layout(line, &layout)?)
         .map_err(|e| failure(format_args!("sandbox {name}: {}", explain(name, e))))?;
     let banner = if shell {
         // The terminal relay disables output newline translation.
@@ -311,7 +370,7 @@ fn session(
     } else {
         None
     };
-    relay::outside(channel, &session.marker, terminal, banner)
+    relay::outside(channel, &session.marker, terminal, banner, guard)
 }
 
 /// The compiled choices, not a claim that their payloads are installed.
@@ -450,7 +509,11 @@ fn run() -> io::Result<u8> {
         "inspect" => {
             end(&mut args)?;
             let profile = state::Profile::read(&profiles, &name)?;
-            print!("{}", inspect(&profile, &grants(&root, &name)?)?);
+            let (_guard, layout) = profile.layout()?;
+            print!(
+                "{}",
+                inspect(&profile, &layout, &grants(&root, &name)?, &canonical)?
+            );
         }
         "network" => {
             let host = match word(args.next())?.as_str() {
@@ -463,6 +526,27 @@ fn run() -> io::Result<u8> {
             root.ask(&intake::network(&name, host)?)?
                 .accepted()
                 .map_err(|e| explain(&name, e))?;
+        }
+        "home" => {
+            let choice = word(args.next())?;
+            end(&mut args)?;
+            let personal = match choice.as_str() {
+                "private" => false,
+                path if Path::new(path) == canonical || Path::new(path) == home => true,
+                _ => {
+                    return Err(failure(format_args!(
+                        "choose {} or private",
+                        canonical.display()
+                    )))
+                }
+            };
+            let mut profile = state::Profile::open(&profiles, &name, state::Access::Change)?;
+            let (_lock, layout) = profile.layout()?;
+            if layout.mounts().next().is_some() {
+                validate_mounts(None, &layout, &grants(&root, &name)?, &canonical, personal)?;
+            }
+            profile.personal_home_path = personal;
+            profile.save()?;
         }
         "runtime" => {
             let choice = word(args.next())?;
@@ -481,27 +565,73 @@ fn run() -> io::Result<u8> {
                 "--write" => true,
                 _ => return Err(error(HELP)),
             };
+            let target = match args.next() {
+                None => None,
+                Some(flag) if flag == "--at" => Some(word(args.next())?),
+                _ => return Err(error(HELP)),
+            };
             end(&mut args)?;
-            state::Profile::read(&profiles, &name)?;
+            let profile = state::Profile::open(&profiles, &name, state::Access::Session)?;
             let relative = grant_path(&canonical, &path)?;
-            root.ask(&intake::grant(&name, write, &relative)?)?
-                .accepted()
+            let target = target
+                .as_deref()
+                .map(sandbox_layout::destination)
+                .transpose()?;
+            profile
+                .change_mount(
+                    &relative,
+                    |layout| {
+                        let current = grants(&root, &name)?;
+                        layout.retain(|src| {
+                            src != relative
+                                && current.directories.iter().any(|(path, _)| path == src)
+                        });
+                        if let Some(target) = target {
+                            layout.add(&relative, target)?;
+                        }
+
+                        validate_mounts(
+                            Some(&relative),
+                            layout,
+                            &current,
+                            &canonical,
+                            profile.personal_home_path,
+                        )
+                    },
+                    |_| root.ask(&intake::grant(&name, write, &relative)?),
+                )
                 .map_err(|e| explain(&name, e))?;
         }
         "unshare" => {
             let path = PathBuf::from(args.next().ok_or_else(|| error(HELP))?);
             end(&mut args)?;
-            state::Profile::read(&profiles, &name)?;
+            let profile = state::Profile::open(&profiles, &name, state::Access::Session)?;
             let relative = unshare_path(&canonical, &home, &path)?;
-            match root
-                .ask(&intake::revoke(&name, &relative)?)?
-                .accepted()
-                .map_err(|e| explain(&name, e))?
-                .as_str()
-            {
-                "revoked\n" => {}
-                _ => return Err(error("folder was not shared")),
-            }
+            profile
+                .change_mount(
+                    &relative,
+                    |layout| {
+                        layout.retain(|src| src != relative);
+                        Ok(())
+                    },
+                    |retry| {
+                        if retry
+                            && !grants(&root, &name)?
+                                .directories
+                                .iter()
+                                .any(|(source, _)| source == &relative)
+                        {
+                            return Ok(intake::Answer::Ok(String::new()));
+                        }
+                        match root.ask(&intake::revoke(&name, &relative)?)? {
+                            intake::Answer::Ok(answer) if answer != "revoked\n" => {
+                                Err(error("unexpected revoke reply"))
+                            }
+                            answer => Ok(answer),
+                        }
+                    },
+                )
+                .map_err(|e| explain(&name, e))?;
         }
         "delete" => {
             end(&mut args)?;
@@ -528,7 +658,7 @@ fn run() -> io::Result<u8> {
                         "shell requires an interactive terminal; use run for pipes",
                     ));
                 }
-                intake::start(&name, runtime, &term)?
+                intake::start(&name, runtime, &term, profile.personal_home_path)?
             } else {
                 if args.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
                     return Err(error(HELP));
@@ -543,7 +673,14 @@ fn run() -> io::Result<u8> {
                 if argv.is_empty() {
                     return Err(error(HELP));
                 }
-                intake::run(&name, runtime, terminal, &term, &argv)?
+                intake::run(
+                    &name,
+                    runtime,
+                    terminal,
+                    &term,
+                    &argv,
+                    profile.personal_home_path,
+                )?
             };
             return session(&profile, &name, &line, terminal, command == "shell");
         }
@@ -566,6 +703,20 @@ pub fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn changed_home_and_absolute_mounts_must_leave_separate_destinations() -> io::Result<()> {
+        let human = Path::new("/var/home/alice");
+        let grants = intake::grants("98304 off 2\nrw\tsrc/td\nro\tbooks\n")?;
+        let mut layout = sandbox_layout::Layout::default();
+        layout.add("books", "/var/home/alice")?;
+        assert!(validate_mounts(None, &layout, &grants, human, true).is_err());
+        assert!(sandbox_layout::destination("/oldroot/nested").is_err());
+        assert!(sandbox_layout::destination(&"a".repeat(256)).is_err());
+        assert!(sandbox_layout::destination("~/~/double").is_err());
+        assert!(sandbox_layout::destination("/root-write-probe").is_err());
+        Ok(())
+    }
 
     #[test]
     fn launcher_lists_readable_profiles_in_private_directories() -> io::Result<()> {
@@ -803,7 +954,12 @@ mod tests {
         let profile = state::Profile::read(&profiles, "default")?;
         let grants = intake::grants("98304 off 2\nro\tMy Pictures\nrw\tsandbox\n")?;
         assert_eq!(
-            inspect(&profile, &grants)?,
+            inspect(
+                &profile,
+                &Default::default(),
+                &grants,
+                Path::new("/var/home/alice")
+            )?,
             "Account: tdw98304\nHome: /var/lib/td/workloads/98304\nNetwork: off\n\
              Runtime: native\nRead: ~/My Pictures\nWrite: ~/sandbox\n\
              Old home: /h/.local/share/td-sandbox/default/home (from before sandbox \

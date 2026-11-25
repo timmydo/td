@@ -120,7 +120,10 @@ delete sandboxes, change their grants and network, and start a shell or
 command in one; root starts it as the account in td-jail's workspace
 kind with the sandbox's directory rows published as executable views and
 its network row applied (td-authd/DESIGN.md, "Workspace launch intake";
-td-sandbox/DESIGN.md). A deletion clears the name's rows, empties the
+td-sandbox/DESIGN.md). The sandbox may mount its account storage at the
+human's canonical home path inside the jail. Shares default to their home-relative paths in the private home. Their
+original absolute paths remain available unless the human selects another
+mount point. Only those views contain the human's files. A deletion clears the name's rows, empties the
 home as the account and marks it deleted, keeping the ledger row; root
 never creates over a sandbox holding files or grants, which td-sandbox
 adopts instead. The profiles td-sandbox kept before are imported once,
@@ -439,7 +442,7 @@ own account.
    `td-login exec-service-as` with the connection as the jail's channel;
    td-jail's workspace kind admits a sandbox's or workspace's ledger
    account alone, with root's spec, the account's
-   home and its manifest's views at the human's own paths,
+   home and its manifest's views at the sandbox's configured paths,
    td-authd/DESIGN.md, "Workspace launch intake"); then td-sandbox's
    cutover (landed: the intake also creates a sandbox through
    `allocate-workload`, never over one holding files or grants, which

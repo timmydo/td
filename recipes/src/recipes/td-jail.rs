@@ -40,6 +40,10 @@ const MODULES: &[(&str, &str)] = &[
         "primary_account",
         include_str!("../../../td-authd/src/primary_account.rs"),
     ),
+    (
+        "sandbox_layout",
+        include_str!("../../../engine/src/sandbox_layout.rs"),
+    ),
     ("seccomp", include_str!("../../../td-jail/src/seccomp.rs")),
     ("sys", include_str!("../../../td-jail/src/sys.rs")),
     (

@@ -2193,8 +2193,8 @@ byte by byte to its newline so nothing after it is taken; single spaces,
 no control character:
 
 ```
-start NAME RUNTIME TERM
-run NAME RUNTIME pty|pipes TERM WORD...
+start|start-home NAME RUNTIME TERM
+run|run-home NAME RUNTIME pty|pipes TERM WORD...
 create NAME
 delete NAME
 status NAME
@@ -2207,6 +2207,17 @@ workspace delete SLOT
 workspace status SLOT
 workspace launch SLOT development|isolated RUNTIME WORD...
 ```
+
+`start-home` and `run-home` add the fixed spec line
+`home-location=personal` after the account's `home` line. The jail derives
+the mount destination from the primary account. Both forms use the same
+account storage and manifest grants as `start` and `run`.
+
+A sandbox launch may prefix its request with `mounts N` and N lines
+of `SOURCE<TAB>DEST`. N is 1 to 32. Each path is at most 1024 bytes.
+The same request deadline applies throughout. Root validates the layout
+and appends its `mount=SOURCE<TAB>DEST` lines to the sealed spec. The jail
+applies them only to grant views it independently admitted for this account.
 
 `NAME` is a ledger name (td-sandbox's old names that begin with a digit
 or a hyphen are not), `RUNTIME` `native`, `native-glibc`

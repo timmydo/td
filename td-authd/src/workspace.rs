@@ -175,6 +175,8 @@ impl Mode {
 /// of type `term`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Launch {
+    pub(crate) mounts: crate::sandbox_layout::Layout,
+    pub(crate) personal_home_path: bool,
     pub(crate) runtime: Option<&'static str>,
     pub(crate) mode: Mode,
     pub(crate) term: String,
@@ -321,9 +323,11 @@ impl Request {
             }
         };
         let (name, verb) = match verb {
-            "start" => {
+            "start" | "start-home" => {
                 let [name, runtime, term] = words(rest).ok_or_else(malformed)?;
                 let launch = Launch {
+                    mounts: Default::default(),
+                    personal_home_path: verb.ends_with("-home"),
                     runtime: runtime_of(runtime)?,
                     mode: Mode::Pty,
                     term: term_of(term)?,
@@ -331,7 +335,7 @@ impl Request {
                 };
                 (name, Verb::Launch(launch))
             }
-            "run" => {
+            "run" | "run-home" => {
                 let mut words = rest.split(' ');
                 let (Some(name), Some(runtime), Some(mode), Some(term)) =
                     (words.next(), words.next(), words.next(), words.next())
@@ -339,6 +343,8 @@ impl Request {
                     return Err(malformed());
                 };
                 let launch = Launch {
+                    mounts: Default::default(),
+                    personal_home_path: verb.ends_with("-home"),
                     runtime: runtime_of(runtime)?,
                     mode: Mode::parse(mode).ok_or_else(malformed)?,
                     term: term_of(term)?,
@@ -612,14 +618,45 @@ fn refuse(stream: &mut UnixStream, why: &str) {
 fn read_request(stream: &mut UnixStream) -> Result<Request, String> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
     // Only a workspace instance's line may pass `MAX_REQUEST`.
-    let line = read_line(stream, deadline, |line| {
-        if line.len() < MAX_REQUEST || line.starts_with(INSTANCE) {
-            MAX_INSTANCE_REQUEST
-        } else {
-            MAX_REQUEST
+    let request_line = |stream: &mut UnixStream| {
+        read_line(stream, deadline, |line| {
+            if line.len() < MAX_REQUEST || line.starts_with(INSTANCE) {
+                MAX_INSTANCE_REQUEST
+            } else {
+                MAX_REQUEST
+            }
+        })
+    };
+    let mut line = request_line(stream)?;
+    let mut layout = crate::sandbox_layout::Layout::default();
+    let mapped = line.starts_with(b"mounts ");
+    if mapped {
+        let count = std::str::from_utf8(&line)
+            .ok()
+            .and_then(|s| s.strip_prefix("mounts "))
+            .and_then(|s| s.strip_suffix('\n'))
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| (1..=crate::sandbox_layout::MAX_MOUNTS).contains(n))
+            .ok_or("invalid sandbox mount count")?;
+        for _ in 0..count {
+            let row = read_line(stream, deadline, |_| 2050)?;
+            let fields = std::str::from_utf8(&row)
+                .ok()
+                .and_then(|s| s.strip_suffix('\n'))
+                .ok_or("invalid sandbox mount row")?;
+            layout
+                .row(fields)
+                .map_err(|e| message(format_args!("{e}")))?;
         }
-    })?;
+        line = request_line(stream)?;
+    }
     let mut request = Request::parse(&line)?;
+    if mapped {
+        let Verb::Launch(launch) = &mut request.verb else {
+            return Err("mounts require a sandbox launch".into());
+        };
+        launch.mounts = layout;
+    }
     if let Verb::Instance(instance) = &mut request.verb {
         read_plan(
             stream,
@@ -703,6 +740,7 @@ fn spec_text(
     runtime: Option<&str>,
     entry: &Path,
     home: &Path,
+    personal_home_path: bool,
 ) -> Result<String, String> {
     let profile = match network {
         Network::Host => "profile=development\n",
@@ -720,6 +758,9 @@ fn spec_text(
         .chain(["home=", spec_line(home)?, "\n"])
     {
         allocation::push_str(&mut spec, part).map_err(refused)?;
+    }
+    if personal_home_path {
+        allocation::push_str(&mut spec, "home-location=personal\n").map_err(refused)?;
     }
     Ok(spec)
 }
@@ -1719,7 +1760,18 @@ impl Serve for Root<'_> {
         let network = table.network(Kind::Sandbox, name);
         let entry = fs::canonicalize(ENTRY).map_err(|e| message(format_args!("{ENTRY}: {e}")))?;
         let command = launch.words()?;
-        let text = spec_text(network, launch.runtime, &entry, &Kind::Sandbox.home(uid))?;
+        let mut text = spec_text(
+            network,
+            launch.runtime,
+            &entry,
+            &Kind::Sandbox.home(uid),
+            launch.personal_home_path,
+        )?;
+        let mounts = launch
+            .mounts
+            .encode("mount=")
+            .map_err(|e| message(format_args!("{e}")))?;
+        allocation::push_str(&mut text, &mounts).map_err(refused)?;
         let spec = specs().write(uid, id, &text)?;
         Ok(Prepared {
             uid,

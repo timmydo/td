@@ -4042,6 +4042,18 @@ with the kind's own departures:
   of stage 2's argv. When the spec names a
   repository, a plain `worktree` holding a `.git` is refused: a git
   worktree is a `checkout`, whose `.git` is protected.
+- **Sandbox home location.** A sandbox's root-owned development spec may
+  place `home-location=personal` after `home`. The jail admits the ledger
+  account's private home as usual and mounts it at the primary account's
+  `/var/home/NAME` in the instance. Each authenticated view has a default
+  destination relative to the private home and also retains its original
+  absolute path when those paths differ. A `mount=SOURCE<TAB>DEST` line
+  overrides these destinations for that source alone. Relative destinations
+  resolve under the private home; absolute destinations use the jail root.
+  A mount cannot cover the home, another view, or the jail's system trees.
+  Views inside the writable home are hardened in private staging and
+  recursively bound onto descriptor-pinned real directories.
+  The private home and grants retain their own contents and mount policy.
 - **Mount flags.** Every directory is `nosuid,nodev`. The home and the
   shared directories are `noexec` in the isolated profile; development's
   private home and admitted shared directories, a ledger caller's views

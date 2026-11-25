@@ -49,6 +49,12 @@ mod mount_identity;
     path = "../../td-authd/src/primary_account.rs"
 )]
 mod primary_account;
+#[allow(dead_code, reason = "sandbox clients also encode the layout")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/sandbox_layout.rs"
+)]
+mod sandbox_layout;
 mod seccomp;
 mod sys;
 mod transition;
@@ -1474,8 +1480,8 @@ mod confinement {
             "let flags = sys::MS_BIND\n        | if source_kind == FilesystemSourceKind::Directory {\n            sys::MS_REC"
         ));
         // The definition, its two application callers, and the workspace
-        // kind's system trees, /etc files and directories, and programs.
-        assert_eq!(TRANSITION.matches("mount_bind_kind(").count(), 7);
+        // kind's system trees, /etc, programs and pinned private-home view.
+        assert_eq!(TRANSITION.matches("mount_bind_kind(").count(), 8);
         // A flag the host set is kept: read-only and noexec only ever add.
         assert_eq!(
             TRANSITION
