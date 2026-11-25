@@ -694,17 +694,20 @@ fn generation_cleanup_runs_after_an_internal_cleanup_error() {
         session.answer(Request::Cancel([42; 32])).unwrap(),
         [0x95, 0]
     );
-    // The host has no production /bin/td-secret cleanup helper. The retained
-    // fatal supervisor result must not suppress generation cleanup afterwards.
-    assert!(!std::path::Path::new("/bin/td-secret").exists());
+    let Some(Active::Secret(operation)) = session.operation.as_mut() else {
+        panic!("missing cancelled unlock");
+    };
     let until = Instant::now() + WAIT;
-    loop {
-        if session.tick().is_err() {
-            break;
+    let failure = loop {
+        match operation.poll_fixture(|_| fixture("failing_cleanup_child")) {
+            Err(error) => break error,
+            Ok(event) => assert_eq!(event, Event::Waiting),
         }
         assert!(Instant::now() < until);
         thread::sleep(Duration::from_millis(1));
-    }
+    };
+    assert!(failure.contains("unlock cleanup did not finish successfully"));
+    assert_eq!(session.tick().unwrap_err(), failure);
     let mut called = false;
     session
         .close_with(|owner| {

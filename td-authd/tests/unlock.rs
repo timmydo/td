@@ -106,6 +106,15 @@ fn fixture(name: &str) -> Command {
     command
 }
 
+impl Unlock {
+    pub(crate) fn poll_fixture(
+        &mut self,
+        cleanup: impl FnOnce(u32) -> Command,
+    ) -> Result<Event, String> {
+        self.poll_with(cleanup)
+    }
+}
+
 fn advance(unlock: &mut Unlock) -> Result<Event, String> {
     let until = Instant::now() + Duration::from_secs(3);
     loop {

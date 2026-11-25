@@ -87,6 +87,10 @@ pub(crate) fn fixture(selector: u8) -> Inspection {
     with_limit(selector, STORE_RESULT)
 }
 
+pub(crate) fn launch_login_fixture(path: &std::path::Path) -> Result<Inspection, String> {
+    Inspection::spawn(Command::new(path), LOGIN_RESULT, LIFETIME, Writes::Stdin)
+}
+
 /// The child as the login helper, with its result bound.
 pub(crate) fn login_fixture(selector: u8) -> Inspection {
     with_limit(selector, LOGIN_RESULT)

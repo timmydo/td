@@ -9,25 +9,18 @@ use std::fs::{self, Permissions};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const USER: &str = "tester";
 
 /// A root holding `var/lib/td/login` as the test's own 0700 directory, and
 /// a hostname file.
 pub(crate) struct Root {
-    root: PathBuf,
+    root: crate::test_temp::TempDir,
 }
 
 impl Root {
     pub(crate) fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "td-authd-login-status-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = crate::test_temp::TempDir::new("td-authd-login-status").unwrap();
         fs::DirBuilder::new()
             .mode(0o755)
             .recursive(true)
@@ -86,13 +79,6 @@ pub(crate) fn status_under(root: &Path, helper: Helper) -> Status {
     status.hostname = root.join("hostname");
     status.helper = helper;
     status
-}
-
-impl Drop for Root {
-    fn drop(&mut self) {
-        let _ = fs::set_permissions(self.login(), Permissions::from_mode(0o700));
-        let _ = fs::remove_dir_all(&self.root);
-    }
 }
 
 /// A helper launch that plays the child fixture `selector` and counts its
@@ -230,11 +216,10 @@ fn a_helper_that_fails_in_any_way_reads_as_could_not_be_read() {
         root.status(helper).answer(false, 0, false).unwrap(),
         answer(&UNREADABLE, "td-laptop")
     );
-    // A helper that cannot start: the production launch, whose
-    // /bin/td-secret this host does not have, and a refused launch.
-    assert!(!Path::new("/bin/td-secret").exists());
+    // Exercise an actual exec failure as well as a refused launch.
+    let missing = root.path().join("absent-helper");
     for helper in [
-        Box::new(Inspection::login) as Helper,
+        Box::new(move |_| crate::inspection::tests::launch_login_fixture(&missing)) as Helper,
         Box::new(|_| Err("refused".to_string())),
     ] {
         assert_eq!(
