@@ -2308,12 +2308,29 @@ mod tests {
         std::process::exit(code);
     }
 
+    /// The orphan's parent for `pid_namespace_orphan_probe`, armed only by its
+    /// environment field: it starts the orphan, which reports its pid and
+    /// blocks reading the release FIFO, and exits without waiting for it.
+    #[test]
+    fn pid_namespace_orphan_parent() {
+        let Ok(dir) = std::env::var("TD_TEST_PIDNS_ORPHAN_PARENT") else {
+            return;
+        };
+        let spawned = std::process::Command::new("sh")
+            .current_dir(dir)
+            .args(["-c", "echo $$ > orphan.pid && read go < release"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn();
+        std::process::exit(if spawned.is_ok() { 0 } else { 125 });
+    }
+
     /// The program half of `pid_namespace_init_reaps_an_orphan_while_the_program_runs`,
     /// selected by `--exact` and armed only by its environment field like the
     /// exec helper above. It orphans a shell onto namespace PID 1, waits until
     /// the namespace's own /proc names PID 1 as that shell's parent, and only
-    /// then releases the shell to exit: a child that exits while its launching
-    /// shell still lives can be reaped by THAT shell, which would prove nothing.
+    /// then releases the shell to exit: a child that exits while its original
+    /// parent still lives can be reaped by that parent, which would prove nothing.
     /// Exit 0 once the released orphan is gone, 3 if it is still there five
     /// seconds later. A Rust process never reaps children it did not spawn, so
     /// were THIS process PID 1 the orphan would stay a zombie.
@@ -2337,19 +2354,26 @@ mod tests {
         let dir = PathBuf::from(dir);
         let pidfile = dir.join("orphan.pid");
         let release = dir.join("release");
-        // `sh -c 'X &'` exits the instant X is forked, so X is parentless and
-        // the kernel hands it to PID 1; X reports itself, then blocks opening
-        // the FIFO to read until the probe opens it to write the release. A
-        // FIFO rather than a polled file: no sleep, and nothing beyond POSIX sh.
-        let script = format!(
-            "mkfifo {r} || exit 1; sh -c 'echo $$ > {p}; read go < {r}' &",
-            p = pidfile.display(),
-            r = release.display()
-        );
-        let orphaned = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .status();
+        // `pid_namespace_orphan_parent` spawns X and exits without waiting,
+        // so X is parentless and the kernel hands it to PID 1; X reports
+        // itself, then blocks opening the FIFO to read until the probe opens
+        // it to write the release. A FIFO rather than a polled file: no
+        // sleep. Not `sh -c 'X &'`: td-sh joins its jobs before it exits.
+        let fifo = std::process::Command::new("mkfifo").arg(&release).status();
+        if !fifo.map(|s| s.success()).unwrap_or(false) {
+            fail(125, "could not make the release FIFO");
+        }
+        let orphaned = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "gates::tests::pid_namespace_orphan_parent",
+                    "--quiet",
+                    "--test-threads=1",
+                ])
+                .env("TD_TEST_PIDNS_ORPHAN_PARENT", &dir)
+                .status()
+        });
         if !orphaned.map(|s| s.success()).unwrap_or(false) {
             fail(125, "could not fork the orphan");
         }
