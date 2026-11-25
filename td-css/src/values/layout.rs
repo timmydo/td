@@ -147,6 +147,59 @@ const SELF_POSITIONS: &[&str] = &[
     "flex-start",
     "flex-end",
 ];
+/// `justify-items` and `justify-self` add left and right, and the
+/// items `legacy`.
+const JUSTIFY_ITEMS: &[&str] = &[
+    "normal",
+    "stretch",
+    "baseline",
+    "center",
+    "start",
+    "end",
+    "self-start",
+    "self-end",
+    "flex-start",
+    "flex-end",
+    "left",
+    "right",
+    "legacy",
+];
+const JUSTIFY_SELF: &[&str] = &[
+    "auto",
+    "normal",
+    "stretch",
+    "baseline",
+    "center",
+    "start",
+    "end",
+    "self-start",
+    "self-end",
+    "flex-start",
+    "flex-end",
+    "left",
+    "right",
+];
+const JUSTIFY_SELF_POSITIONS: &[&str] = &[
+    "center",
+    "start",
+    "end",
+    "self-start",
+    "self-end",
+    "flex-start",
+    "flex-end",
+    "left",
+    "right",
+];
+const GRID_TEMPLATE: &[Property] = &[GridTemplateRows, GridTemplateColumns, GridTemplateAreas];
+const GRID: &[Property] = &[
+    GridTemplateRows,
+    GridTemplateColumns,
+    GridTemplateAreas,
+    GridAutoRows,
+    GridAutoColumns,
+    GridAutoFlow,
+];
+const GRID_AREA: &[Property] = &[GridRowStart, GridColumnStart, GridRowEnd, GridColumnEnd];
 const OVERFLOW: &[&str] = &["visible", "hidden", "clip", "scroll", "auto"];
 pub(super) fn targets(name: &str) -> Option<&'static [Property]> {
     match name {
@@ -162,6 +215,14 @@ pub(super) fn targets(name: &str) -> Option<&'static [Property]> {
         "flex" => Some(&[FlexGrow, FlexShrink, FlexBasis]),
         "flex-flow" => Some(&[FlexDirection, FlexWrap]),
         "gap" => Some(&[RowGap, ColumnGap]),
+        "grid-template" => Some(GRID_TEMPLATE),
+        "grid" => Some(GRID),
+        "grid-row" => Some(&[GridRowStart, GridRowEnd]),
+        "grid-column" => Some(&[GridColumnStart, GridColumnEnd]),
+        "grid-area" => Some(GRID_AREA),
+        "place-content" => Some(&[AlignContent, JustifyContent]),
+        "place-items" => Some(&[AlignItems, JustifyItems]),
+        "place-self" => Some(&[AlignSelf, JustifySelf]),
         _ => None,
     }
 }
@@ -211,6 +272,18 @@ pub(super) fn extra(p: Property) -> bool {
             | RowGap
             | ColumnGap
             | Order
+            | GridTemplateColumns
+            | GridTemplateRows
+            | GridTemplateAreas
+            | GridAutoColumns
+            | GridAutoRows
+            | GridAutoFlow
+            | GridRowStart
+            | GridRowEnd
+            | GridColumnStart
+            | GridColumnEnd
+            | JustifyItems
+            | JustifySelf
     )
 }
 pub(super) fn parse(
@@ -251,7 +324,12 @@ pub(super) fn parse(
             _ => None,
         },
         FlexBasis => keyword(v, &["content"]).or(parse_length(p, v)?),
-        JustifyContent | AlignItems | AlignSelf | AlignContent => alignment(p, v),
+        JustifyContent | AlignItems | AlignSelf | AlignContent | JustifyItems | JustifySelf => {
+            alignment(p, v)
+        }
+        GridTemplateColumns | GridTemplateRows | GridTemplateAreas | GridAutoColumns
+        | GridAutoRows | GridAutoFlow | GridRowStart | GridRowEnd | GridColumnStart
+        | GridColumnEnd => super::grid::parse(p, v, memory)?,
         RowGap | ColumnGap => keyword(v, &["normal"]).or(parse_length(p, v)?),
         LineHeight => {
             if let Some(v) = keyword(v, &["normal"]) {
@@ -331,6 +409,10 @@ pub(super) fn shorthand(
         "flex" => flex(v, memory)?,
         "flex-flow" => flex_flow(v, memory)?,
         "gap" => gap(v, memory)?,
+        "grid-template" => super::grid::template_shorthand(v, memory)?,
+        "grid" => super::grid::grid(v, memory)?,
+        "grid-row" | "grid-column" | "grid-area" => super::grid::lines(targets, v, memory)?,
+        "place-content" | "place-items" | "place-self" => place(targets, v, memory)?,
         _ => border(v, targets, memory)?,
     };
     if let Some(parsed) = parsed {
@@ -539,15 +621,19 @@ fn gap(
     Ok(Some(output))
 }
 
-/// Box Alignment 3's values of the four alignment longhands flex
-/// layout reads. `first baseline` computes to `baseline`; a `safe` or
-/// `unsafe` overflow position is accepted before a positional value and
-/// dropped, td-layout not telling them apart.
+/// Box Alignment 3's values of the six alignment longhands. `first
+/// baseline` computes to `baseline`; a `safe` or `unsafe` overflow
+/// position is accepted before a positional value and dropped, td-layout
+/// not telling them apart; `justify-items`' `legacy` and a position, in
+/// either order, compute to `legacy left`, `legacy right` or `legacy
+/// center`.
 fn alignment(p: Property, v: &[Component]) -> Option<Specified> {
     let (words, positions, baselines) = match p {
         JustifyContent => (JUSTIFY_CONTENT, JUSTIFY_POSITIONS, false),
         AlignContent => (ALIGN_CONTENT, CONTENT_POSITIONS, true),
         AlignItems => (ALIGN_ITEMS, SELF_POSITIONS, true),
+        JustifyItems => (JUSTIFY_ITEMS, JUSTIFY_SELF_POSITIONS, true),
+        JustifySelf => (JUSTIFY_SELF, JUSTIFY_SELF_POSITIONS, true),
         _ => (ALIGN_SELF, SELF_POSITIONS, true),
     };
     let mut parts = v.iter().filter(|c| !c.whitespace());
@@ -558,6 +644,23 @@ fn alignment(p: Property, v: &[Component]) -> Option<Specified> {
     if parts.next().is_some() {
         return None;
     }
+    if p == JustifyItems {
+        let legacy = |c: &Component| c.ident().is_some_and(|n| n.eq_ignore_ascii_case("legacy"));
+        let position = match (legacy(first), legacy(second)) {
+            (true, false) => Some(second),
+            (false, true) => Some(first),
+            _ => None,
+        };
+        if let Some(position) = position {
+            return Some(Specified::Ready(ComputedValue::Keyword(
+                match syntax::keyword(position.ident()?, &["left", "right", "center"])? {
+                    "left" => "legacy left",
+                    "right" => "legacy right",
+                    _ => "legacy center",
+                },
+            )));
+        }
+    }
     let second = std::slice::from_ref(second);
     match syntax::keyword(first.ident()?, &["safe", "unsafe", "first", "last"])? {
         "safe" | "unsafe" => keyword(second, positions),
@@ -566,6 +669,50 @@ fn alignment(p: Property, v: &[Component]) -> Option<Specified> {
             .map(|_| Specified::Ready(ComputedValue::Keyword("last baseline"))),
         _ => None,
     }
+}
+
+/// `place-content`, `place-items` and `place-self` (Box Alignment 3
+/// §5.3, §6.3, §6.4; `targets` the align then the justify longhand): an
+/// align value and an optional justify value, which copies the align
+/// one when omitted, but for `place-content`'s baselines, which
+/// justify-content lacks and whose copy is `start`.
+fn place(
+    targets: &[Property],
+    v: &[Component],
+    memory: &Budget,
+) -> Result<Option<BudgetVec<(Property, Specified)>>, Error> {
+    let [align, justify] = targets else {
+        return Ok(None);
+    };
+    // An align value is one word or two: try the split after each.
+    let words = v.iter().enumerate().filter(|(_, c)| !c.whitespace());
+    for (i, _) in words.take(2) {
+        let Some((head, tail)) = v.split_at_checked(i + 1) else {
+            break;
+        };
+        let Some(first) = alignment(*align, head) else {
+            continue;
+        };
+        let second = if tail.iter().all(Component::whitespace) {
+            alignment(*justify, head).or_else(|| {
+                matches!(
+                    first,
+                    Specified::Ready(ComputedValue::Keyword("baseline" | "last baseline"))
+                )
+                .then_some(Specified::Ready(ComputedValue::Keyword("start")))
+            })
+        } else {
+            alignment(*justify, tail)
+        };
+        let Some(second) = second else {
+            continue;
+        };
+        let mut output = td_alloc::BudgetVec::with_capacity(memory, 2)?;
+        output.try_push((*align, first))?;
+        output.try_push((*justify, second))?;
+        return Ok(Some(output));
+    }
+    Ok(None)
 }
 
 /// `border-spacing` (CSS 2.2 §17.6.1), one longhand: one length for both

@@ -41,6 +41,10 @@ impl Linear {
         }
         .map(|n| n)
     }
+    /// Whether computing it reads a font size.
+    pub(crate) fn font_relative(&self) -> bool {
+        self.em != 0.0 || self.rem != 0.0
+    }
     pub(crate) fn compute(
         self,
         em: f64,

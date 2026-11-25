@@ -143,9 +143,31 @@ fn each_added_longhand_has_a_typed_value() {
         (RowGap, "10%", ComputedValue::Length(Length::Percent(10.0))),
         (ColumnGap, "1em", ComputedValue::Length(Length::Px(16.0))),
         (Order, "-3", ComputedValue::Number(-3.0)),
+        // The grid longhands' keywords; grid_tests.rs has their lists,
+        // areas and lines.
+        (GridTemplateColumns, "none", ComputedValue::Keyword("none")),
+        (GridTemplateRows, "NONE", ComputedValue::Keyword("none")),
+        (GridTemplateAreas, "none", ComputedValue::Keyword("none")),
+        (GridAutoColumns, "auto", ComputedValue::Keyword("auto")),
+        (GridAutoRows, "Auto", ComputedValue::Keyword("auto")),
+        (
+            GridAutoFlow,
+            "dense column",
+            ComputedValue::Keyword("column dense"),
+        ),
+        (GridRowStart, "auto", ComputedValue::Keyword("auto")),
+        (GridRowEnd, "auto", ComputedValue::Keyword("auto")),
+        (GridColumnStart, "auto", ComputedValue::Keyword("auto")),
+        (GridColumnEnd, "auto", ComputedValue::Keyword("auto")),
+        (
+            JustifyItems,
+            "right legacy",
+            ComputedValue::Keyword("legacy right"),
+        ),
+        (JustifySelf, "left", ComputedValue::Keyword("left")),
     ];
     assert_eq!(cases.len() + 25, Property::ALL.len());
-    assert_eq!(Property::ALL.len(), 71);
+    assert_eq!(Property::ALL.len(), 83);
     for (p, value, want) in cases {
         assert_eq!(
             child(&format!("{}:{value}", p.name())).get(p),

@@ -227,4 +227,42 @@ mod cases {
         let positive = at(&set, 3, None, "order:0;flex-grow:+0");
         assert!(shared(&positive, &initial));
     }
+
+    #[test]
+    fn a_group_marks_exactly_its_slots_unlike_the_initial_values() {
+        let bit = |p: Property| 1u64 << p.rare().unwrap();
+        let set = StyleSet::new(&[]).unwrap();
+        let style = at(
+            &set,
+            3,
+            None,
+            "order:2;grid-row-start:3;opacity:1;flex-grow:-0;justify-items:normal",
+        );
+        // `opacity:1` and `justify-items:normal` are initial: unmarked.
+        assert_eq!(
+            style.rare.set,
+            bit(Order) | bit(GridRowStart) | bit(FlexGrow)
+        );
+        // A write back to the initial value unmarks its slot.
+        let mut s = style.try_clone().unwrap();
+        s.set(Order, ComputedValue::Number(0.0)).unwrap();
+        s.set(FlexGrow, ComputedValue::Number(0.0)).unwrap();
+        assert_eq!(s.rare.set, bit(GridRowStart));
+        s.set(GridRowStart, ComputedValue::Keyword("auto")).unwrap();
+        assert_eq!(s.rare.set, 0);
+        assert!(s.rare.same(&Rare::initial().unwrap()));
+        // A signed zero's other sign is marked, unequal to the bit and
+        // equal under `==`.
+        let mut z = at(&set, 3, None, "").try_clone().unwrap();
+        z.set(Order, ComputedValue::Number(-0.0)).unwrap();
+        assert_eq!(z.rare.set, bit(Order));
+        assert!(!z.rare.same(&Rare::initial().unwrap()));
+        assert_eq!(*z.rare, Rare::initial().unwrap());
+        // Every marked slot is unlike its seed, and every other its seed.
+        for (slot, p) in Property::rare_roster().iter().enumerate() {
+            let seed = p.seed().unwrap();
+            let value = style.rare.values.get(slot).unwrap();
+            assert_eq!(style.rare.set >> slot & 1 == 1, !value.same(&seed), "{p:?}");
+        }
+    }
 }

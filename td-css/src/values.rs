@@ -4,8 +4,13 @@ use crate::syntax::{Component, Declaration, Token};
 use crate::{calc, variables, Error};
 use td_alloc::{Budget, BudgetMap, BudgetShared, BudgetString, BudgetVec};
 mod color;
+mod grid;
 mod layout;
 use color::parse_color;
+pub use grid::{
+    Breadth, GridArea, GridAreas, GridLine, Repeat, TrackItem, TrackList, TrackSize,
+    MAX_GRID_AREAS, MAX_GRID_LINE, MAX_GRID_TRACKS,
+};
 
 pub const MAX_FAMILIES: usize = 32;
 pub const MAX_ABSOLUTE_VALUE: f64 = 1_000_000.0;
@@ -84,6 +89,18 @@ pub enum Property {
     RowGap,
     ColumnGap,
     Order,
+    GridTemplateColumns,
+    GridTemplateRows,
+    GridTemplateAreas,
+    GridAutoColumns,
+    GridAutoRows,
+    GridAutoFlow,
+    GridRowStart,
+    GridRowEnd,
+    GridColumnStart,
+    GridColumnEnd,
+    JustifyItems,
+    JustifySelf,
 }
 
 impl Property {
@@ -159,6 +176,18 @@ impl Property {
         Self::RowGap,
         Self::ColumnGap,
         Self::Order,
+        Self::GridTemplateColumns,
+        Self::GridTemplateRows,
+        Self::GridTemplateAreas,
+        Self::GridAutoColumns,
+        Self::GridAutoRows,
+        Self::GridAutoFlow,
+        Self::GridRowStart,
+        Self::GridRowEnd,
+        Self::GridColumnStart,
+        Self::GridColumnEnd,
+        Self::JustifyItems,
+        Self::JustifySelf,
     ];
 
     pub fn name(self) -> &'static str {
@@ -234,6 +263,18 @@ impl Property {
             Self::RowGap => "row-gap",
             Self::ColumnGap => "column-gap",
             Self::Order => "order",
+            Self::GridTemplateColumns => "grid-template-columns",
+            Self::GridTemplateRows => "grid-template-rows",
+            Self::GridTemplateAreas => "grid-template-areas",
+            Self::GridAutoColumns => "grid-auto-columns",
+            Self::GridAutoRows => "grid-auto-rows",
+            Self::GridAutoFlow => "grid-auto-flow",
+            Self::GridRowStart => "grid-row-start",
+            Self::GridRowEnd => "grid-row-end",
+            Self::GridColumnStart => "grid-column-start",
+            Self::GridColumnEnd => "grid-column-end",
+            Self::JustifyItems => "justify-items",
+            Self::JustifySelf => "justify-self",
         }
     }
 
@@ -338,7 +379,7 @@ impl Property {
     /// call returning its Result through memory stalled there on store
     /// forwarding.
     #[inline(always)]
-    fn seed(self) -> Option<ComputedValue> {
+    pub(crate) fn seed(self) -> Option<ComputedValue> {
         Some(match self {
             Self::Display => ComputedValue::Keyword("inline"),
             Self::Color => ComputedValue::Color(Color::BLACK),
@@ -377,10 +418,24 @@ impl Property {
                 horizontal: 0.0,
                 vertical: 0.0,
             },
-            Self::TableLayout | Self::AlignSelf => ComputedValue::Keyword("auto"),
-            Self::FlexDirection => ComputedValue::Keyword("row"),
+            Self::TableLayout
+            | Self::AlignSelf
+            | Self::GridAutoColumns
+            | Self::GridAutoRows
+            | Self::GridRowStart
+            | Self::GridRowEnd
+            | Self::GridColumnStart
+            | Self::GridColumnEnd
+            | Self::JustifySelf => ComputedValue::Keyword("auto"),
+            Self::GridTemplateColumns | Self::GridTemplateRows | Self::GridTemplateAreas => {
+                ComputedValue::Keyword("none")
+            }
+            Self::FlexDirection | Self::GridAutoFlow => ComputedValue::Keyword("row"),
             Self::FlexWrap => ComputedValue::Keyword("nowrap"),
+            // `justify-items`' initial `legacy` computes to `normal` but
+            // under a `legacy` position (`legacy_justify`).
             Self::JustifyContent
+            | Self::JustifyItems
             | Self::AlignItems
             | Self::AlignContent
             | Self::RowGap
@@ -485,6 +540,12 @@ pub enum ComputedValue {
     Color(Color),
     Length(Length),
     FontFamily(BudgetShared<BudgetVec<Family>>),
+    /// `grid-template-*` and `grid-auto-*` other than their keywords.
+    GridTracks(BudgetShared<TrackList>),
+    /// `grid-template-areas` other than `none`.
+    GridAreas(BudgetShared<GridAreas>),
+    /// A grid-placement longhand other than `auto`.
+    GridLine(BudgetShared<GridLine>),
     Weight(u16),
     Decoration(Decoration),
     /// `border-spacing`: horizontal then vertical, nonnegative px.
@@ -496,14 +557,20 @@ pub enum ComputedValue {
 
 /// The rare group's length: the longhands from `Property::FIRST_RARE` on.
 pub(crate) const RARE: usize = Property::ALL.len() - Property::FIRST_RARE as usize;
+// `Rare::set` marks a slot a bit.
+const _: () = assert!(RARE <= u64::BITS as usize);
 
 /// The rare longhands' computed values, in roster order. None inherits,
 /// so a style that sets none shares its style set's initial group, and
 /// a declaration that sets one copies it (DESIGN.md, "Computed-style
-/// sharing"). Every value is plain: none owns storage.
-#[derive(Debug, PartialEq)]
+/// sharing"). Its grid values share their storage with the copies made
+/// of it. `set` marks the slots whose value is not the initial one, to
+/// the bit, so fingerprints and comparisons visit those alone, and a
+/// group's cost does not grow with the roster.
+#[derive(Debug)]
 pub(crate) struct Rare {
     pub(crate) values: [ComputedValue; RARE],
+    pub(crate) set: u64,
 }
 impl Rare {
     pub(crate) fn initial() -> Result<Self, Error> {
@@ -511,22 +578,67 @@ impl Rare {
         for (slot, property) in values.iter_mut().zip(Property::rare_roster()) {
             *slot = property.seed().ok_or(Error::InvalidContext)?;
         }
-        Ok(Self { values })
+        Ok(Self { values, set: 0 })
     }
     pub(crate) fn try_copy(&self) -> Result<Self, Error> {
         let mut values = [const { ComputedValue::Number(0.0) }; RARE];
         for (slot, value) in values.iter_mut().zip(&self.values) {
             *slot = value.try_clone()?;
         }
-        Ok(Self { values })
+        Ok(Self {
+            values,
+            set: self.set,
+        })
+    }
+    /// Write one slot, marked unless its value is the initial one to the
+    /// bit.
+    pub(crate) fn write(&mut self, slot: usize, value: ComputedValue) -> Result<(), Error> {
+        let initial = Property::rare_roster()
+            .get(slot)
+            .and_then(|p| p.seed())
+            .ok_or(Error::InvalidContext)?;
+        let bit = u32::try_from(slot)
+            .ok()
+            .and_then(|s| 1u64.checked_shl(s))
+            .ok_or(Error::InvalidContext)?;
+        if value.same(&initial) {
+            self.set &= !bit;
+        } else {
+            self.set |= bit;
+        }
+        *self.values.get_mut(slot).ok_or(Error::InvalidContext)? = value;
+        Ok(())
+    }
+    /// The marked slots of `set`, in order, with this group's values.
+    pub(crate) fn slots(&self, set: u64) -> impl Iterator<Item = (usize, &ComputedValue)> {
+        let mut bits = set;
+        std::iter::from_fn(move || {
+            while bits != 0 {
+                let slot = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(value) = self.values.get(slot) {
+                    return Some((slot, value));
+                }
+            }
+            None
+        })
     }
     /// Equal to the bit, so a group shared between styles never gives
-    /// one of them another's signed zero.
+    /// one of them another's signed zero; unmarked slots are equal.
     pub(crate) fn same(&self, other: &Self) -> bool {
-        self.values
-            .iter()
-            .zip(&other.values)
-            .all(|(a, b)| a.same(b))
+        self.set == other.set
+            && self
+                .slots(self.set)
+                .zip(other.slots(other.set))
+                .all(|((_, a), (_, b))| a.same(b))
+    }
+}
+/// As styles' `==`: -0 and 0 alike, so two groups apart by a signed zero
+/// alone, which mark different slots, are equal.
+impl PartialEq for Rare {
+    fn eq(&self, other: &Self) -> bool {
+        self.slots(self.set | other.set)
+            .all(|(slot, value)| other.values.get(slot) == Some(value))
     }
 }
 
@@ -583,7 +695,7 @@ impl ComputedStyle {
             return Ok(());
         };
         let mut rare = self.rare.try_copy()?;
-        *rare.values.get_mut(slot).ok_or(Error::InvalidContext)? = value;
+        rare.write(slot, value)?;
         self.rare = BudgetShared::new(self.values.budget(), rare)?;
         Ok(())
     }
@@ -618,6 +730,7 @@ impl ComputedValue {
                     vertical: d,
                 },
             ) => bits(*a, *c) && bits(*b, *d),
+            (Self::GridTracks(a), Self::GridTracks(b)) => BudgetShared::ptr_eq(a, b) || a.same(b),
             _ => self == other,
         }
     }
@@ -629,7 +742,9 @@ impl ComputedValue {
             Self::Keyword(v) => Self::Keyword(v),
             Self::Color(v) => Self::Color(*v),
             Self::Length(v) => Self::Length(*v),
-            Self::FontFamily(_) => return None,
+            Self::FontFamily(_) | Self::GridTracks(_) | Self::GridAreas(_) | Self::GridLine(_) => {
+                return None
+            }
             Self::Weight(v) => Self::Weight(*v),
             Self::Decoration(v) => Self::Decoration(*v),
             Self::Spacing {
@@ -641,22 +756,22 @@ impl ComputedValue {
             },
         })
     }
+    /// A plain value copied inline; one owning storage shares it.
+    #[inline(always)]
     pub fn try_clone(&self) -> Result<Self, Error> {
+        match self.plain() {
+            Some(value) => Ok(value),
+            None => self.share(),
+        }
+    }
+    #[inline(never)]
+    fn share(&self) -> Result<Self, Error> {
         Ok(match self {
-            Self::Number(v) => Self::Number(*v),
-            Self::Keyword(v) => Self::Keyword(v),
-            Self::Color(v) => Self::Color(*v),
-            Self::Length(v) => Self::Length(*v),
             Self::FontFamily(v) => Self::FontFamily(v.try_clone()?),
-            Self::Weight(v) => Self::Weight(*v),
-            Self::Spacing {
-                horizontal,
-                vertical,
-            } => Self::Spacing {
-                horizontal: *horizontal,
-                vertical: *vertical,
-            },
-            Self::Decoration(v) => Self::Decoration(*v),
+            Self::GridTracks(v) => Self::GridTracks(v.try_clone()?),
+            Self::GridAreas(v) => Self::GridAreas(v.try_clone()?),
+            Self::GridLine(v) => Self::GridLine(v.try_clone()?),
+            plain => plain.plain().ok_or(Error::InvalidContext)?,
         })
     }
 }
@@ -673,6 +788,7 @@ impl Specified {
             Self::Calculated(v) => Self::Calculated(*v),
             Self::RelativeWeight(v) => Self::RelativeWeight(*v),
             Self::Spacing(axes) => Self::Spacing(axes.try_clone()?),
+            Self::Tracks(list) => Self::Tracks(list.try_clone()?),
         })
     }
 }
@@ -731,6 +847,9 @@ pub(crate) enum Specified {
     /// `border-spacing`'s two axes, each a length or calc(), shared so
     /// every other value stays as small as it was.
     Spacing(BudgetShared<(Axis, Axis)>),
+    /// A track list whose lengths need the element's font sizes; one
+    /// that needs none is computed as parsed, `Ready`.
+    Tracks(BudgetShared<TrackList<Axis>>),
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Axis {
@@ -818,6 +937,12 @@ impl Declarations {
             Self::Many(values) => values.is_empty(),
         }
     }
+    pub(crate) fn as_slice(&self) -> &[ValueDeclaration] {
+        match self {
+            Self::Single(value) => value.as_slice(),
+            Self::Many(values) => values,
+        }
+    }
 }
 pub(crate) enum DeclarationIter {
     Single(std::option::IntoIter<ValueDeclaration>),
@@ -854,15 +979,33 @@ pub(crate) fn parse_declaration(
         memory,
     )
 }
+/// The properties `@supports` reports unsupported though the cascade
+/// computes them, until `display: grid` parses (DESIGN.md §4, "Grid"):
+/// every `grid*` name, `justify-items` and `justify-self`, and
+/// `place-items` and `place-self` whole, conservatively: their align
+/// halves act in flex, but their justify halves await grid.
+pub(crate) fn awaits_grid_layout(name: &str) -> bool {
+    const JUSTIFY: &[&str] = &["justify-items", "justify-self", "place-items", "place-self"];
+    name.get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("grid"))
+        || JUSTIFY.iter().any(|j| name.eq_ignore_ascii_case(j))
+}
 fn parse_named(
     name: &str,
     values: &[Component],
     important: bool,
     memory: &Budget,
 ) -> Result<Declarations, Error> {
-    let name = syntax::lower_text(memory, name)?;
+    let lowered = syntax::lower_text(memory, name)?;
+    // Grid 1's gap names, aliases (Box Alignment 3 §8.4).
+    let name = match lowered.as_str() {
+        "grid-gap" => "gap",
+        "grid-row-gap" => "row-gap",
+        "grid-column-gap" => "column-gap",
+        name => name,
+    };
     let values = syntax::trim(values);
-    let sides = match name.as_str() {
+    let sides = match name {
         "margin" => Some(MARGINS),
         "padding" => Some(PADDINGS),
         "border-width" => Some(BORDERS),
@@ -875,14 +1018,16 @@ fn parse_named(
     };
     if has_var {
         let mut out = BudgetVec::new(memory)?;
-        let targets = sides.or_else(|| layout::targets(&name));
+        let targets = sides.or_else(|| layout::targets(name));
         let pending = variables::Pending {
-            name: name.try_clone()?,
+            name: lowered.try_clone()?,
             tokens: BudgetShared::new(memory, syntax::copy_components(values, memory)?)?,
         };
-        for property in Property::ALL.iter().copied().filter(|p| {
-            targets.map_or_else(|| p.name() == name.as_str(), |sides| sides.contains(p))
-        }) {
+        for property in Property::ALL
+            .iter()
+            .copied()
+            .filter(|p| targets.map_or_else(|| p.name() == name, |sides| sides.contains(p)))
+        {
             out.try_push(ValueDeclaration {
                 property,
                 value: Specified::Pending(pending.try_clone()?),
@@ -934,14 +1079,10 @@ fn parse_named(
         }
         return Ok(Declarations::Many(out));
     }
-    if layout::targets(&name).is_some() {
-        return layout::shorthand(&name, values, important, memory).map(Declarations::Many);
+    if layout::targets(name).is_some() {
+        return layout::shorthand(name, values, important, memory).map(Declarations::Many);
     }
-    let Some(property) = Property::ALL
-        .iter()
-        .copied()
-        .find(|p| p.name() == name.as_str())
-    else {
+    let Some(property) = Property::ALL.iter().copied().find(|p| p.name() == name) else {
         return Ok(Declarations::Single(None));
     };
     Ok(Declarations::Single(
@@ -953,23 +1094,52 @@ fn parse_named(
     ))
 }
 
+/// A pending value substituted and reparsed; None for any other value,
+/// which the caller computes as it is, uncopied. `grid_items` counts what
+/// an areas grammar reparses, where the substitution counts a string as
+/// one component and a 64th of its bytes: each string byte and named
+/// cell, and AREA_ITEMS for each area it builds.
 pub(crate) fn resolve_pending(
     property: Property,
     value: &Specified,
     custom: &variables::CustomProperties,
     budget: &mut variables::Budget,
-) -> Result<Specified, Error> {
+    grid_items: &mut usize,
+) -> Result<Option<Specified>, Error> {
     let Specified::Pending(pending) = value else {
-        return value.try_clone();
+        return Ok(None);
     };
     let Some(tokens) = variables::substitute(&pending.tokens, custom, budget)? else {
-        return Ok(Specified::Unset);
+        return Ok(Some(Specified::Unset));
     };
-    Ok(parse_named(&pending.name, &tokens, false, &budget.memory)?
-        .into_iter()
-        .find(|d| d.property == property)
-        .map(|d| d.value)
-        .unwrap_or(Specified::Unset))
+    let areas = matches!(
+        pending.name.as_str(),
+        "grid-template-areas" | "grid-template" | "grid"
+    );
+    if areas {
+        for c in tokens.iter() {
+            if let Component::Token(Token::String(text)) = c {
+                let cells = grid::named_cells(text);
+                *grid_items = grid_items.saturating_add(text.len()).saturating_add(cells);
+            }
+        }
+    }
+    let declarations = parse_named(&pending.name, &tokens, false, &budget.memory)?;
+    if areas {
+        for d in declarations.as_slice() {
+            if let Specified::Ready(ComputedValue::GridAreas(built)) = &d.value {
+                let units = built.areas().len().saturating_mul(grid::AREA_ITEMS);
+                *grid_items = grid_items.saturating_add(units);
+            }
+        }
+    }
+    Ok(Some(
+        declarations
+            .into_iter()
+            .find(|d| d.property == property)
+            .map(|d| d.value)
+            .unwrap_or(Specified::Unset),
+    ))
 }
 
 fn keyword(values: &[Component], options: &'static [&'static str]) -> Option<Specified> {
@@ -1358,6 +1528,7 @@ pub(crate) fn compute_value(
             ))
         }
         Specified::Spacing(axes) => spacing(axes, font_size, root_font_size),
+        Specified::Tracks(list) => tracks(list, font_size, root_font_size, memory)?,
         Specified::Length(value, unit) => {
             let em = if property == Property::FontSize {
                 parent.map(ComputedStyle::font_size).unwrap_or(16.0)
@@ -1376,6 +1547,19 @@ pub(crate) fn compute_value(
         }
     };
     Ok(result)
+}
+/// A font-relative track list computed, out of line as `spacing`.
+#[inline(never)]
+fn tracks(
+    list: &TrackList<Axis>,
+    em: f64,
+    root_font_size: f64,
+    memory: &Budget,
+) -> Result<ComputedValue, Error> {
+    Ok(ComputedValue::GridTracks(BudgetShared::new(
+        memory,
+        grid::compute(list, em, root_font_size, memory)?,
+    )?))
 }
 /// `border-spacing` computed: out of compute_value's common path, which
 /// every property of every element takes.
@@ -1417,6 +1601,35 @@ pub(crate) fn finish(
     parent: Option<&ComputedStyle>,
 ) -> Result<(), Error> {
     layout::finish(style, parent)
+}
+
+/// The parent's `justify-items` when it is a `legacy` with a position,
+/// which a child's `legacy` takes (Box Alignment 3 §6.1); None, without
+/// a read, when the parent shares the style set's initial group.
+#[inline]
+pub(crate) fn legacy_justify(
+    parent: Option<&ComputedStyle>,
+    initial: &BudgetShared<Rare>,
+) -> Option<&'static str> {
+    let parent = parent.filter(|p| !BudgetShared::ptr_eq(&p.rare, initial))?;
+    match parent.rare.values.get(Property::JustifyItems.rare()?) {
+        Some(ComputedValue::Keyword(word)) if word.starts_with("legacy ") => Some(word),
+        _ => None,
+    }
+}
+/// `justify-items` computed: `legacy` alone, `initial` and `unset` take
+/// `legacy`, the parent's legacy position or else `normal`.
+pub(crate) fn justify_items(
+    specified: &Specified,
+    value: ComputedValue,
+    legacy: Option<&'static str>,
+) -> ComputedValue {
+    match (specified, &value) {
+        (Specified::Initial | Specified::Unset, _) | (_, ComputedValue::Keyword("legacy")) => {
+            ComputedValue::Keyword(legacy.unwrap_or("normal"))
+        }
+        _ => value,
+    }
 }
 
 #[cfg(test)]

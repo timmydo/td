@@ -1,6 +1,9 @@
 //! Document-local interning, including independently shared custom maps.
 use crate::syntax::{Component, Token};
-use crate::values::{ComputedStyle, ComputedValue, Family, Length, Rare, RARE};
+use crate::values::{
+    Breadth, ComputedStyle, ComputedValue, Family, GridArea, GridAreas, GridLine, Length, Rare,
+    Repeat, TrackItem, TrackList, TrackSize,
+};
 use crate::variables::CustomProperties;
 use crate::Error;
 use std::hash::{Hash, Hasher};
@@ -139,7 +142,13 @@ impl StylePool {
                 if BudgetShared::ptr_eq(&old.rare, &style.rare) {
                     return Ok(*id);
                 }
-                visit_count(&mut self.work, RARE, self.limits.work)?;
+                // `==` reads the slots either group marks.
+                let group_work = 1 + style
+                    .rare
+                    .slots(old.rare.set | style.rare.set)
+                    .map(|(_, value)| self::value_work(value))
+                    .sum::<usize>();
+                visit_count(&mut self.work, group_work, self.limits.work)?;
                 if *old.rare == *style.rare {
                     return Ok(*id);
                 }
@@ -203,16 +212,27 @@ impl StylePool {
                 return Ok(*loose);
             }
         }
-        let group_work = group.values.iter().map(value_work).sum::<usize>();
+        let group_work = group_work(group);
         self.visit(group_work)?;
         // Groups are told apart to the bit, so their bucket key is too:
         // keyed by the loose fingerprint, a group's 2^11 sign variants
-        // would share one bucket a page could fill without the key.
+        // would share one bucket a page could fill without the key. Both
+        // visit the marked slots alone, the others being initial; the
+        // loose one passes over a slot `==` its initial value, a signed
+        // zero's other sign, as an unmarked slot.
         let mut exact = Fingerprint::new(self.seed);
         let mut loose = Fingerprint::new(self.seed);
-        for value in &group.values {
+        exact.add(group.set);
+        for (slot, value) in group.slots(group.set) {
+            exact.add(slot as u64);
             hash_value(value, Zero::Bits, &mut exact);
-            hash_value(value, Zero::Equal, &mut loose);
+            let initial = crate::Property::rare_roster()
+                .get(slot)
+                .and_then(|p| p.seed());
+            if initial.as_ref() != Some(value) {
+                loose.add(slot as u64);
+                hash_value(value, Zero::Equal, &mut loose);
+            }
         }
         let (key, loose) = (exact.finish(), loose.finish());
         if let Some(bucket) = self.rare.get(key, &mut self.work, self.limits.work)? {
@@ -232,8 +252,10 @@ impl StylePool {
         if self.styles.len() >= self.limits.styles {
             return Err(Error::Limit("MAX_STYLES"));
         }
-        // Its index entry, as a style's, and its doubled storage.
-        self.charge(128 + 2 * size_of::<Rare>())?;
+        // Its index entry, as a style's, its doubled storage, and its
+        // grid values' own.
+        let owned = group.values.iter().map(owned_charge).sum::<usize>();
+        self.charge(128 + 2 * size_of::<Rare>() + owned)?;
         self.rare
             .get_or_insert_with(key, &mut self.work, self.limits.work, BudgetVec::new)?
             .try_push((group.try_clone()?, loose))?;
@@ -506,8 +528,29 @@ fn visit_count(work: &mut usize, amount: usize, max: usize) -> Result<(), Error>
         .ok_or(Error::Limit("MAX_POOL_WORK"))?;
     Ok(())
 }
+#[inline(always)]
 fn value_work(value: &ComputedValue) -> usize {
     1 + match value {
+        ComputedValue::FontFamily(_)
+        | ComputedValue::GridTracks(_)
+        | ComputedValue::GridAreas(_)
+        | ComputedValue::GridLine(_) => owned_work(value),
+        _ => 0,
+    }
+}
+/// A group's visits: one, and its marked slots', which alone its
+/// fingerprints and comparisons read.
+fn group_work(group: &Rare) -> usize {
+    1 + group
+        .slots(group.set)
+        .map(|(_, value)| value_work(value))
+        .sum::<usize>()
+}
+/// A family list's name bytes, or a grid value's items and name bytes:
+/// out of line, as few values own storage.
+#[inline(never)]
+fn owned_work(value: &ComputedValue) -> usize {
+    match value {
         ComputedValue::FontFamily(families) => families
             .iter()
             .map(|family| match family {
@@ -515,6 +558,33 @@ fn value_work(value: &ComputedValue) -> usize {
                 Family::Named(s) => s.len(),
             })
             .sum(),
+        ComputedValue::GridTracks(list) => {
+            list.items().len() + list.names().iter().map(|n| n.len() + 1).sum::<usize>()
+        }
+        ComputedValue::GridAreas(areas) => areas.areas().iter().map(|a| a.name.len() + 1).sum(),
+        ComputedValue::GridLine(line) => line.name.as_ref().map_or(0, |n| n.len()),
+        _ => 0,
+    }
+}
+/// What a rare value's own storage is charged: doubled, as a style's
+/// font families, each name as a family's.
+fn owned_charge(value: &ComputedValue) -> usize {
+    let name = |text: &crate::syntax::Text| 2 * text.heap_capacity() + 32;
+    match value {
+        ComputedValue::GridTracks(list) => {
+            2 * size_of::<TrackList>()
+                + 2 * list.items.capacity() * size_of::<TrackItem>()
+                + 2 * list.names.capacity() * size_of::<crate::syntax::Text>()
+                + list.names().iter().map(name).sum::<usize>()
+        }
+        ComputedValue::GridAreas(areas) => {
+            2 * size_of::<GridAreas>()
+                + 2 * areas.areas.capacity() * size_of::<GridArea>()
+                + areas.areas().iter().map(|a| name(&a.name)).sum::<usize>()
+        }
+        ComputedValue::GridLine(line) => {
+            2 * size_of::<GridLine>() + line.name.as_ref().map_or(0, name)
+        }
         _ => 0,
     }
 }
@@ -657,27 +727,91 @@ fn hash_number(value: f64, zero: Zero, hash: &mut impl Hasher) {
     let alike = matches!(zero, Zero::Equal) && value == 0.0;
     (if alike { 0 } else { value.to_bits() }).hash(hash);
 }
+#[inline(always)]
+fn hash_length(length: &Length, zero: Zero, hash: &mut impl Hasher) {
+    std::mem::discriminant(length).hash(hash);
+    match length {
+        Length::Px(n) | Length::Percent(n) => hash_number(*n, zero, hash),
+        Length::Calc {
+            px,
+            percent,
+            non_negative,
+        } => {
+            hash_number(*px, zero, hash);
+            hash_number(*percent, zero, hash);
+            non_negative.hash(hash);
+        }
+        Length::Auto => {}
+    }
+}
+fn hash_breadth(breadth: &Breadth, zero: Zero, hash: &mut impl Hasher) {
+    std::mem::discriminant(breadth).hash(hash);
+    match breadth {
+        Breadth::Length(length) => hash_length(length, zero, hash),
+        Breadth::Flex(n) => hash_number(*n, zero, hash),
+        Breadth::Auto | Breadth::MinContent | Breadth::MaxContent => {}
+    }
+}
+/// A grid value's contents: out of line, as no common value is one.
+#[inline(never)]
+fn hash_grid(value: &ComputedValue, zero: Zero, hash: &mut impl Hasher) {
+    match value {
+        ComputedValue::GridTracks(list) => hash_tracks(list, zero, hash),
+        ComputedValue::GridAreas(areas) => {
+            (areas.rows(), areas.columns(), areas.areas().len()).hash(hash);
+            for area in areas.areas() {
+                area.name.hash(hash);
+                (area.row_start, area.row_end).hash(hash);
+                (area.column_start, area.column_end).hash(hash);
+            }
+        }
+        ComputedValue::GridLine(line) => {
+            (line.span, line.integer).hash(hash);
+            line.name.hash(hash);
+        }
+        _ => {}
+    }
+}
+fn hash_tracks(list: &TrackList, zero: Zero, hash: &mut impl Hasher) {
+    list.items().len().hash(hash);
+    for item in list.items() {
+        std::mem::discriminant(item).hash(hash);
+        match item {
+            TrackItem::Names { start, len } => (start, len).hash(hash),
+            TrackItem::Repeat { repeat, len } => {
+                std::mem::discriminant(repeat).hash(hash);
+                if let Repeat::Count(n) = repeat {
+                    n.hash(hash);
+                }
+                len.hash(hash);
+            }
+            TrackItem::Size(size) => {
+                std::mem::discriminant(size).hash(hash);
+                match size {
+                    TrackSize::Breadth(b) => hash_breadth(b, zero, hash),
+                    TrackSize::MinMax(a, b) => {
+                        hash_breadth(a, zero, hash);
+                        hash_breadth(b, zero, hash);
+                    }
+                    TrackSize::FitContent(length) => hash_length(length, zero, hash),
+                }
+            }
+        }
+    }
+    list.names().len().hash(hash);
+    for name in list.names() {
+        name.hash(hash);
+    }
+}
 fn hash_value(value: &ComputedValue, zero: Zero, hash: &mut impl Hasher) {
     std::mem::discriminant(value).hash(hash);
     match value {
         ComputedValue::Number(n) => hash_number(*n, zero, hash),
         ComputedValue::Keyword(s) => s.hash(hash),
         ComputedValue::Color(c) => (c.red, c.green, c.blue, c.alpha).hash(hash),
-        ComputedValue::Length(length) => {
-            std::mem::discriminant(length).hash(hash);
-            match length {
-                Length::Px(n) | Length::Percent(n) => hash_number(*n, zero, hash),
-                Length::Calc {
-                    px,
-                    percent,
-                    non_negative,
-                } => {
-                    hash_number(*px, zero, hash);
-                    hash_number(*percent, zero, hash);
-                    non_negative.hash(hash);
-                }
-                Length::Auto => {}
-            }
+        ComputedValue::Length(length) => hash_length(length, zero, hash),
+        ComputedValue::GridTracks(_) | ComputedValue::GridAreas(_) | ComputedValue::GridLine(_) => {
+            hash_grid(value, zero, hash)
         }
         ComputedValue::FontFamily(families) => {
             for family in families.iter() {
@@ -1540,6 +1674,10 @@ mod tests {
             works.push(pool.work() - work);
         }
         let group = 128 + 2 * size_of::<Rare>();
+        // 1,040 with 19 longhands: 48 bytes a rare longhand, a value staying
+        // 24, and 16 for the doubled mask of marked slots.
+        assert_eq!(group, 1_632);
+        assert_eq!(size_of::<ComputedValue>(), 24);
         // The second shares the first's group: a style's charge alone.
         let [_, style, two, three, four]: [usize; 5] = charges.try_into().unwrap();
         let [_, shared, _, new, found]: [usize; 5] = works.try_into().unwrap();
@@ -1553,11 +1691,14 @@ mod tests {
             13_056 - 19 * 176 + 2 * size_of::<BudgetShared<Rare>>()
         );
         assert_eq!(style, 9_728);
-        // The known group costs nothing; another is hashed (19 values)
-        // and looked up, then inserted (two operations) or compared once
-        // with its equal (19 more).
-        assert_eq!(new - found, 19 + 2 + 4);
-        assert_eq!(shared - found, 19 + 2 + 19);
+        // The known group costs nothing; another is hashed (a visit and
+        // one a marked slot, not one each of the 31 values) and looked
+        // up, then inserted (two operations) or compared once with its
+        // equal (as many as hashing). The initial group marks none; the
+        // second's marks `order`.
+        assert_eq!(new - found, 1 + 2 + 4);
+        assert_eq!(crate::values::RARE, 31);
+        assert_eq!(shared - found, 2 + 2 + 2);
         assert_eq!(pool.rare.len, 3);
     }
     #[test]
@@ -1652,5 +1793,185 @@ mod tests {
             // At most a custom map's, a group's and a style's, each element.
             assert!(pool.comparisons <= 3 * elements, "{}", pool.comparisons);
         }
+    }
+    #[test]
+    #[allow(clippy::panic, clippy::indexing_slicing)]
+    fn equal_grid_values_built_apart_share_a_style_and_unequal_ones_do_not() {
+        let declarations: Vec<String> = [
+            "grid-template-columns:[a] 1px repeat(2, 1fr);grid-area:x;grid-template-areas:'x y'",
+            "grid-template-columns:[a] 1px repeat(2, 1fr);grid-area:x;grid-template-areas:'x y'",
+            "grid-template-columns:[a] 1px repeat(2, 2fr);grid-area:x;grid-template-areas:'x y'",
+            "grid-template-columns:[b] 1px repeat(2, 1fr);grid-area:x;grid-template-areas:'x y'",
+            "grid-template-columns:[a] 1px repeat(3, 1fr);grid-area:x;grid-template-areas:'x y'",
+            "grid-template-columns:[a] 1px repeat(2, 1fr);grid-area:z;grid-template-areas:'x y'",
+            "grid-template-columns:[a] 1px repeat(2, 1fr);grid-area:x;grid-template-areas:'x x'",
+            "grid-template-columns:[a] 1px repeat(2, 1fr);grid-area:x;grid-template-areas:'x y'",
+            // Font-relative lists computed per element, equal at 16px.
+            "grid-auto-rows:1em",
+            "grid-auto-rows:16px",
+            "grid-auto-rows:1em",
+        ]
+        .map(String::from)
+        .to_vec();
+        let source = styles(&declarations);
+        let tracks = |s: &ComputedStyle| match s.get(crate::Property::GridTemplateColumns) {
+            Some(ComputedValue::GridTracks(l)) => l.try_clone().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert!(!BudgetShared::ptr_eq(
+            &tracks(&source[0]),
+            &tracks(&source[1])
+        ));
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let ids: Vec<StyleId> = source
+            .into_iter()
+            .map(|s| pool.intern(s).unwrap())
+            .collect();
+        assert_eq!(ids[1], ids[0]);
+        assert_eq!(ids[7], ids[0]);
+        for (i, id) in ids.iter().enumerate().take(7).skip(2) {
+            assert!(ids.iter().take(i).all(|other| other != id), "{i}");
+        }
+        assert_eq!((ids[9], ids[10]), (ids[8], ids[8]));
+        // One canonical group, so one canonical list.
+        assert!(BudgetShared::ptr_eq(
+            &tracks(pool.get(ids[0]).unwrap()),
+            &tracks(pool.get(ids[7]).unwrap())
+        ));
+        assert_eq!((pool.len(), pool.rare.len), (7, 7));
+    }
+    #[test]
+    fn grid_values_differing_only_in_contents_do_not_share_a_bucket() {
+        let declarations: Vec<String> = (0..300)
+            .map(|i| match i % 3 {
+                0 => format!("grid-template-columns:[a] 1px {i}fr"),
+                1 => format!("grid-template-areas:'a{i} b'"),
+                _ => format!("grid-row-start:{i} name"),
+            })
+            .collect();
+        let (_, comparisons) = interned(&declarations);
+        assert!(comparisons < 300 + 16, "{comparisons}");
+    }
+    #[test]
+    #[allow(clippy::panic, clippy::indexing_slicing)]
+    fn grid_track_lists_keep_a_signed_zero_to_the_bit() {
+        let [a, b, c] = styles(&[
+            "grid-template-rows:-0px minmax(-0px, 1fr) 0fr".to_string(),
+            "grid-template-rows:0px minmax(0px, 1fr) -0fr;width:1px".to_string(),
+            "grid-template-rows:0px minmax(0px, 1fr) -0fr".to_string(),
+        ])
+        .try_into()
+        .unwrap();
+        let first = |s: &ComputedStyle| match s.get(crate::Property::GridTemplateRows) {
+            Some(ComputedValue::GridTracks(l)) => match l.items().first() {
+                Some(TrackItem::Size(TrackSize::Breadth(Breadth::Length(Length::Px(px))))) => *px,
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        assert!(first(&a).is_sign_negative());
+        assert!(first(&b).is_sign_positive());
+        assert_eq!(a, c);
+        let (Some(x), Some(y)) = (
+            a.get(crate::Property::GridTemplateRows),
+            c.get(crate::Property::GridTemplateRows),
+        ) else {
+            panic!()
+        };
+        assert!(!x.same(y));
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let ids = [pool.intern(a).unwrap(), pool.intern(b).unwrap()];
+        assert!(first(pool.get(ids[0]).unwrap()).is_sign_negative());
+        assert!(first(pool.get(ids[1]).unwrap()).is_sign_positive());
+        assert_eq!(pool.rare.len, 2);
+        // Apart by those signs alone, styles are one, the first.
+        assert_eq!(pool.intern(c).unwrap(), ids[0]);
+        // Its group is the second's, to the bit.
+        assert_eq!(pool.rare.len, 2);
+        // A flex factor's sign alone tells groups apart too.
+        let [p, n] = styles(&[
+            "grid-template-rows:0fr".to_string(),
+            "grid-template-rows:-0fr".to_string(),
+        ])
+        .try_into()
+        .unwrap();
+        let (Some(x), Some(y)) = (
+            p.get(crate::Property::GridTemplateRows),
+            n.get(crate::Property::GridTemplateRows),
+        ) else {
+            panic!()
+        };
+        assert!(!x.same(y));
+        assert_eq!(x, y);
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let (first, second) = (pool.intern(p).unwrap(), pool.intern(n).unwrap());
+        assert_eq!(first, second);
+        assert_eq!(pool.rare.len, 2);
+    }
+    #[test]
+    #[allow(clippy::panic, clippy::indexing_slicing)]
+    fn a_group_holding_grid_values_is_charged_by_their_contents() {
+        let list = |n: usize| {
+            let tracks: Vec<String> = (0..n).map(|i| format!("[l{i}] {i}px")).collect();
+            format!("grid-template-columns:{}", tracks.join(" "))
+        };
+        let declarations: Vec<String> = vec![
+            "width:1px".into(),
+            "order:1".into(),
+            list(1),
+            list(100),
+            "grid-row:span 2 name-of-a-line-past-sixty-two-bytes-0123456789abcdefghijklmnopqrstuvwxyz"
+                .into(),
+            "grid-template-areas:'a b' 'c d'".into(),
+        ];
+        let source = styles(&declarations);
+        let owned: Vec<usize> = source
+            .iter()
+            .map(|s| s.rare.values.iter().map(owned_charge).sum())
+            .collect();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let mut charges = Vec::new();
+        for style in source {
+            let bytes = pool.charged_bytes();
+            pool.intern(style).unwrap();
+            charges.push(pool.charged_bytes() - bytes);
+        }
+        let group = 128 + 2 * size_of::<Rare>();
+        // The first also interns the custom map and the initial group.
+        for (charge, owned) in charges.iter().zip(&owned).skip(1) {
+            assert_eq!(*charge, 9_728 + group + owned);
+        }
+        let item = size_of::<TrackItem>();
+        let text = size_of::<crate::syntax::Text>();
+        assert_eq!(owned[1], 0);
+        // A name and a size, the name inline: their doubled storage with
+        // the capacity td-alloc reserved, and 32 a name.
+        assert!(owned[2] >= 2 * size_of::<TrackList>() + 2 * 2 * item + 2 * text + 32);
+        assert!(owned[3] >= owned[2] + 2 * 198 * item + 2 * 99 * text + 99 * 32);
+        // A name past 62 bytes has storage of its own, doubled.
+        assert!(owned[4] >= 2 * size_of::<GridLine>() + 2 * 72 + 32);
+        assert!(owned[5] >= 2 * size_of::<GridAreas>() + 2 * 4 * size_of::<GridArea>() + 4 * 32);
+    }
+    #[test]
+    fn huge_distinct_track_lists_are_refused_by_their_charge() {
+        // A thousand tracks an element, each list distinct: about 0.1 MB
+        // a group, so MAX_POOL_BYTES binds after some 500 elements.
+        let tracks = vec!["1px"; crate::values::MAX_GRID_TRACKS - 1].join(" ");
+        let declarations: Vec<String> = (0..700)
+            .map(|i| format!("grid-template-columns:{i}px {tracks}"))
+            .collect();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let mut refused = None;
+        for (i, style) in styles(&declarations).into_iter().enumerate() {
+            if let Err(error) = pool.intern(style) {
+                refused = Some((i, error));
+                break;
+            }
+        }
+        let (at, error) = refused.unwrap();
+        assert_eq!(error, Error::Limit("MAX_POOL_BYTES"));
+        assert!((400..700).contains(&at), "{at}");
+        assert!(pool.charged_bytes() <= MAX_POOL_BYTES);
+        assert_eq!(pool.len(), at);
     }
 }

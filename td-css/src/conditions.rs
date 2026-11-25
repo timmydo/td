@@ -296,6 +296,9 @@ fn atom(v: &Component, env: Option<&Environment>, memory: &Budget) -> Result<Opt
     let [d] = parsed.value().as_slice() else {
         return Ok(Some(Truth::False));
     };
+    if values::awaits_grid_layout(d.name()) {
+        return Ok(Some(Truth::False));
+    }
     Ok(Some(Truth::from(
         crate::variables::parse(d, memory)?.is_some()
             || !values::parse_declaration(d, memory)?.is_empty(),

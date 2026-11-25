@@ -53,6 +53,8 @@ const CUSTOM_WORK_OFFSET: usize = 12;
 const CUSTOM_WORK_MIN: usize = 8;
 const MATCH_BYTES_PER_WORK: usize = 16;
 const SUBSTITUTION_BYTES_PER_WORK: usize = 64;
+// A reparsed areas string byte, or a computed font-relative track.
+const GRID_ITEM_WORK: usize = 1;
 /// Layout work units between cancel-flag reads.
 pub(crate) const CANCEL_INTERVAL: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +163,7 @@ pub struct CascadeWork {
     pub custom_copies: usize,
     pub substitution_components: usize,
     pub substitution_bytes: usize,
+    pub grid_items: usize,
     pub total: usize,
 }
 impl CascadeWork {
@@ -182,6 +185,7 @@ impl CascadeWork {
             (local, per_name),
             (stats.match_bytes / MATCH_BYTES_PER_WORK, 1),
             (stats.substitution_bytes / SUBSTITUTION_BYTES_PER_WORK, 1),
+            (stats.grid_items, GRID_ITEM_WORK),
         ];
         let mut units = ELEMENT_WORK;
         for (count, weight) in terms {
@@ -209,6 +213,7 @@ impl CascadeWork {
         self.substitution_bytes = self
             .substitution_bytes
             .saturating_add(stats.substitution_bytes);
+        self.grid_items = self.grid_items.saturating_add(stats.grid_items);
         self.total = units
             .and_then(|n| n.checked_add(self.total))
             .filter(|n| *n <= ceiling)
@@ -1352,6 +1357,76 @@ mod tests {
                 Err(Error::Limit("MAX_CASCADE_WORK"))
             );
         }
+    }
+    #[test]
+    fn grid_reparses_and_font_relative_tracks_are_charged_their_items() {
+        let each = |css: &str| {
+            let set = sheets(css);
+            let one = page_work(&set, 1, Limits::default()).unwrap();
+            let three = page_work(&set, 3, Limits::default()).unwrap();
+            (three.total - one.total) / 2
+        };
+        // Areas rows through var(): the substitution charges a string as
+        // a component and a 64th of its bytes, the reparse a unit a byte.
+        let row: Vec<String> = (0..1000).map(|c| format!("n{c}")).collect();
+        let row = row.join(" ");
+        let rows = format!("'{row}' ").repeat(20);
+        let bytes = 20 * row.len();
+        let substituted =
+            |property: &str| each(&format!("body{{--t:{rows}}}p{{{property}:var(--t)}}"));
+        let width = substituted("width");
+        let areas = substituted("grid-template-areas");
+        assert!(width < bytes / 8, "{width}");
+        assert!(areas >= width + bytes, "{areas} {width} {bytes}");
+        // `grid` reparses its value once a longhand, six times.
+        assert!(substituted("grid") >= width + 6 * bytes);
+        // The ceiling refuses such a page within some 1,300 paragraphs.
+        assert!(MAX_CASCADE_WORK / bytes <= 1309);
+        // One row of 1,000 short distinct names: a byte and a cell each,
+        // and two units an area for its name's allocation, in any order.
+        let mut names: Vec<String> = Vec::new();
+        for a in "abcdefghijklmnopqrstuvwxyz0123456789".chars() {
+            for b in "abcdefghijklmnopqrstuvwxyz0123456789-_".chars() {
+                names.push(format!("{a}{b}"));
+            }
+        }
+        names.sort();
+        names.truncate(1000);
+        let ascending = names.join(" ");
+        names.reverse();
+        let descending = names.join(" ");
+        let row = |names: &str| {
+            each(&format!(
+                "body{{--t:\"{names}\"}}p{{display:none;grid-template-areas:var(--t)}}"
+            ))
+        };
+        let (up, down) = (row(&ascending), row(&descending));
+        assert_eq!(up, down);
+        let width = each(&format!(
+            "body{{--t:\"{ascending}\"}}p{{display:none;width:var(--t)}}"
+        ));
+        assert_eq!(names.len(), 1000);
+        assert!(
+            down >= width + ascending.len() + 1000 + 2 * 1000,
+            "{down} {width}"
+        );
+        // The ceiling refuses it within some 20,600 paragraphs.
+        assert!(MAX_CASCADE_WORK / down <= 20_600);
+        // A font-relative list computes per element, a unit an item, even
+        // where display:none keeps the element out of the pool; one in px
+        // computed once, as parsed.
+        let tracks = |unit: &str| {
+            let list = vec![unit; 1000].join(" ");
+            each(&format!(
+                "p{{display:none;grid-template-columns:{list};grid-template-rows:{list};\
+                 grid-auto-columns:{list};grid-auto-rows:{list}}}"
+            ))
+        };
+        let relative = tracks("minmax(1em,2em)");
+        let absolute = tracks("minmax(1px,2px)");
+        assert!(absolute < 1000, "{absolute}");
+        assert!(relative >= absolute + 4000, "{relative} {absolute}");
+        assert!(tracks("calc(1em + 1px)") >= absolute + 4000);
     }
     #[test]
     fn page_like_cascades_stay_far_under_the_ceiling() {

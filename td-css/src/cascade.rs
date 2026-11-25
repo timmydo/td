@@ -157,6 +157,12 @@ pub struct ComputeStats {
     pub local_custom_properties: usize,
     /// Inherited custom properties copied into the element's changed map.
     pub custom_copies: usize,
+    /// Grid work the counters above do not see: each string byte and
+    /// named cell a `var()` value reparsed as `grid-template-areas` rows
+    /// tokenizes and two for each area it builds, and each item of a
+    /// font-relative track list computed for the element (DESIGN.md §4,
+    /// "Grid").
+    pub grid_items: usize,
 }
 
 struct Work {
@@ -529,15 +535,16 @@ impl StyleSet {
                 .get(&property)
                 .map(|winner: &Winner| &winner.value)
                 .unwrap_or(&Specified::Unset);
-            let specified = values::resolve_pending(
+            let resolved = values::resolve_pending(
                 property,
                 specified,
                 &style.custom,
                 &mut work.substitution,
+                &mut work.stats.grid_items,
             )?;
             let value = values::compute_value(
                 property,
-                &specified,
+                resolved.as_ref().unwrap_or(specified),
                 parent,
                 font_size,
                 color,
@@ -566,33 +573,54 @@ impl StyleSet {
             root_font_size
         };
         let mut rare: Option<values::Rare> = None;
+        let legacy = values::legacy_justify(parent, &self.rare);
+        let mut justify = false;
         for (property, winner) in winners.iter().rev() {
             let Some(slot) = property.rare() else {
                 break;
             };
-            let specified = values::resolve_pending(
+            let resolved = values::resolve_pending(
                 *property,
                 &winner.value,
                 &style.custom,
                 &mut work.substitution,
+                &mut work.stats.grid_items,
             )?;
-            let value = values::compute_value(
+            let specified = resolved.as_ref().unwrap_or(&winner.value);
+            // A font-relative list computes per element, an item each.
+            if let Specified::Tracks(list) = specified {
+                work.stats.grid_items = work.stats.grid_items.saturating_add(list.items().len());
+            }
+            let mut value = values::compute_value(
                 *property,
-                &specified,
+                specified,
                 parent,
                 font_size,
                 color,
                 root_font_size,
                 &memory,
             )?;
+            if *property == Property::JustifyItems {
+                justify = true;
+                value = values::justify_items(specified, value, legacy);
+            }
             if rare.is_none() {
                 if style.rare.values.get(slot).is_some_and(|v| v.same(&value)) {
                     continue;
                 }
                 rare = Some(style.rare.try_copy()?);
             }
-            if let Some(target) = rare.as_mut().and_then(|g| g.values.get_mut(slot)) {
-                *target = value;
+            if let Some(group) = rare.as_mut() {
+                group.write(slot, value)?;
+            }
+        }
+        // An unset `justify-items` takes its parent's legacy position.
+        if let (Some(word), false, Some(slot)) = (legacy, justify, Property::JustifyItems.rare()) {
+            if rare.is_none() {
+                rare = Some(style.rare.try_copy()?);
+            }
+            if let Some(group) = rare.as_mut() {
+                group.write(slot, values::ComputedValue::Keyword(word))?;
             }
         }
         if let Some(rare) = rare {

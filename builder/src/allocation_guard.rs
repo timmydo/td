@@ -326,6 +326,7 @@ const CSS_STORAGE_SOURCES: &[&str] = &[
     "td-css/src/conditions.rs",
     "td-css/src/values.rs",
     "td-css/src/values/layout.rs",
+    "td-css/src/values/grid.rs",
     "td-css/src/variables.rs",
     "td-css/src/sharing.rs",
     "td-css/src/calc.rs",

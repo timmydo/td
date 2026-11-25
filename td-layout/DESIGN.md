@@ -2365,7 +2365,54 @@ units, plus:
 - five for each substitution component, graph visit or reference;
 - for each custom name the element declares itself, 6 times the bit
   length of their number less 12, at least 8, since a name costs more as
-  the element's own map grows.
+  the element's own map grows;
+- one for each of td-css's `grid_items`: a string byte and a named cell
+  a `var()` value reparsed as `grid-template-areas` rows tokenizes, and
+  two for each area it builds, each time a longhand reparses it, and an
+  item of a font-relative track list computed for the element
+  (td-css/DESIGN.md §4, "Grid").
+
+Review of the grid longhands found both uncounted: a substituted string
+is a component and a 64th of its bytes, but the areas grammar reads it
+a byte at a time and looks each cell up, and a list in `em` is computed
+again for every element, `display: none` ones too. 200 thousand-cell
+rows reparsed on each of 1,000 `<p>` took 18.0 s for 17,486,961 units,
+1,027 ns a unit, and 262,000 hidden `<p>` each computing four
+1,000-track lists 19.1 s, about 436 ns a unit; the same rows through
+`width` took 23 ms. Measured as below (release, 2026-11-25, pinned to
+one CPU, load average 3 to 5), each unit now costs:
+
+| Shape | Units an element | ns a unit | Page |
+| --- | ---: | ---: | ---: |
+| `grid-template-areas: var(--t)`, 200 rows of 1,000 cells, 100 `<p>` | 1,197,602 | 16.1 | 1.9 s accepted |
+| the same, 1,000 `<p>` | — | — | refused in 2.1 s |
+| one row of 1,000 two-letter names, descending, `display: none`, 20,000 `<p>` | 6,225 | 16.7 | 2.1 s accepted |
+| the same ascending | 6,225 | 16.5 | 2.1 s accepted |
+| the same with its first name again at its end, invalid | 4,229 | 19.1 | 1.6 s accepted |
+| one name across 1,000 cells | 4,227 | 4.7 | 0.4 s accepted |
+| 300 names ascending | 1,992 | 15.4 | 0.6 s accepted |
+| 100 names ascending, 120,000 `<p>` | 782 | 13.9 | 1.3 s accepted |
+| four lists of 1,000 `minmax(1em,2em)`, `display: none`, 20,000 `<p>` | 4,167 | 17.5 | 1.5 s accepted |
+| the same, 262,000 `<p>` | — | — | refused in 2.3 s |
+| the same of `minmax(calc(1em + 1px),2em)`, 262,000 `<p>` | — | — | refused in 2.3 s |
+
+A third review found the areas grammar's name lookup quadratic: each
+new name was a sorted insertion, shifting the names after it, so a
+reparsed row of distinct names arriving in descending order shifted
+them all, and each area's name allocation went uncounted. With 120,000
+hidden `<p>` (before, then after the binary search, pending runs and
+the cell and area units, all refused MAX_CASCADE_WORK but where
+accepted):
+
+| Row reparsed on every `<p>` | Before | After |
+| --- | ---: | ---: |
+| 1,000 two-letter names, descending | 17.5 s | 2.2 s |
+| the same ascending | 6.3 s | 2.1 s |
+| the same descending through `grid` | 18.3 s | 2.2 s |
+| the same descending, displayed (MAX_POOL_WORK) | 5.3 s | 1.6 s |
+| 300 names, descending / ascending | 7.7 / 5.1 s | 2.0 / 2.0 s |
+| 100 names, descending / ascending, accepted | 2.2 / 1.8 s | 1.3 / 1.3 s |
+| one name across 1,000 cells | 1.1 s | 0.6 s |
 
 Review of the first ceiling found four costs td-css did not count: an
 element that changed one custom name copied its whole inherited map
@@ -2396,7 +2443,7 @@ audit:
 | dependency graph, cycle detection, resolved values (`variables::compute`, `cycles`) | quadratic in names, by visiting order | indexed by position |
 | the element's custom winners (`compute_inner`) | quadratic in names, descending | collected, sorted, last per name |
 | the element's custom map, merged with the parent's | linear, appends | one ordered merge, copies charged |
-| winning declarations, computed values, `font` prefix | by property | bounded by the 56-longhand roster |
+| winning declarations, computed values, `font` prefix | by property | bounded by the 83-longhand roster |
 | candidate rules (`RuleIndex::candidates`) | none: sorted and deduplicated once | charged per candidate, more past 2,048 |
 | style pool buckets, custom buckets, map and token identities | a shift of the index's length per new key | charged that length against `MAX_POOL_WORK` |
 

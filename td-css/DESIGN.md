@@ -419,8 +419,10 @@ and opacity's number/percentage range from
 The flex longhands and shorthands follow
 [Flexbox Level 1](https://www.w3.org/TR/css-flexbox-1/) and the
 alignment longhands [Box Alignment Level
-3](https://www.w3.org/TR/css-align-3/), as far as flex layout reads them;
-the `place-*` shorthands are not parsed yet.
+3](https://www.w3.org/TR/css-align-3/), as far as flex layout reads them,
+and the grid longhands and shorthands [CSS Grid Level
+2](https://www.w3.org/TR/css-grid-2/) without subgrid or masonry, which
+no layout reads yet (below, "Grid").
 
 | Property | Accepted values | Initial; inherited |
 |---|---|---|
@@ -456,6 +458,13 @@ the `place-*` shorthands are not parsed yet.
 | align-content | normal, space-between, space-around, space-evenly, stretch, baseline, first baseline, last baseline, and center, start, end, flex-start, flex-end, each after an optional safe or unsafe | normal; no |
 | row-gap, column-gap | normal, nonnegative length/percentage | normal; no |
 | order | integer | 0; no |
+| grid-template-columns, grid-template-rows | none, or a track list | none; no |
+| grid-template-areas | none, or one or more strings | none; no |
+| grid-auto-columns, grid-auto-rows | one or more track sizes | auto; no |
+| grid-auto-flow | row or column, dense, or both | row; no |
+| grid-row-start, grid-row-end, grid-column-start, grid-column-end | auto, a custom-ident, a nonzero integer and an optional custom-ident, or span with a positive integer, a custom-ident or both | auto; no |
+| justify-items | normal, stretch, baseline, first baseline, last baseline, legacy, legacy with left, right or center, and center, start, end, self-start, self-end, flex-start, flex-end, left, right, each after an optional safe or unsafe | legacy, computing to normal; no |
+| justify-self | auto and justify-items' values but the legacy ones | auto; no |
 
 Line-height numbers stay numbers through inheritance; lengths and
 percentages compute against the declaring element's font size and then
@@ -470,9 +479,9 @@ item's main axis, where it is the automatic minimum (td-layout/DESIGN.md
 
 The flex and alignment longhands compute to keywords, numbers and
 lengths only: no td-css computation depends on them but blockification
-on a parent's `display`. With `clear`, `opacity`, the four offsets and
-`table-layout`, they are the rare group a style shares until a rule
-sets one ("Computed-style sharing"). td-layout lays rows, wrapping rows and
+on a parent's `display`. With `clear`, `opacity`, the four offsets,
+`table-layout` and the grid longhands (below), they are the rare group
+a style shares until a rule sets one ("Computed-style sharing"). td-layout lays rows, wrapping rows and
 columns (td-layout/DESIGN.md §5, "Flex"), `wrap-reverse` as `wrap` and
 `column-reverse` as `column`, and reads `order` to place the items of a
 row laid on one line (td-layout/DESIGN.md §5, "Order"). A flex factor
@@ -483,7 +492,7 @@ lengths, as width's are; a gap's `normal` stays a keyword. Box Alignment
 3's `first baseline` computes to `baseline` and `last baseline` stays
 two words; a `safe` or `unsafe` overflow position is accepted before a
 positional keyword (none other) and dropped, as td-layout will not tell
-them apart. Left and right are justify-content's alone, and
+them apart. Left and right are the justify longhands' alone, and
 self-start and self-end the items' and self's. The `flex` shorthand is
 `none` (0 0 auto) or `<grow> <shrink>? || <basis>`: an omitted factor
 is 1 and an omitted basis 0%, so `auto` is 1 1 auto, a lone number n is
@@ -604,6 +613,131 @@ tables, forms and hidden inputs is keyed by tag in the rule index, so a
 page without those elements tests none of them; a test holds that the
 sheet has no rule the index tests against every element.
 
+### Grid
+
+The twelve grid longhands (the table above) are parsed and computed for
+a grid layout td-layout does not have yet. `display: grid` and
+`display: inline-grid` stay invalid until it does, so `@supports
+(display: grid)` stays false and a page's fallback for it, a block or
+flex `display` declared before, keeps winning, as flex's `display`
+values waited for row layout; no grid item is blockified. `@supports`
+reports every `grid*` property (the `grid-*gap` aliases among them),
+`justify-items`, `justify-self`, `place-items` and `place-self`
+unsupported until then too, though the cascade computes them: a page
+that gates its grid layout on one of them, not on `display: grid`,
+would otherwise drop its fallback for a grid td lays as blocks.
+`values::awaits_grid_layout` names them, and `display: grid` landing
+removes its one use in `conditions`. `place-items` and `place-self`
+are withheld whole, conservatively: their align halves act in flex, but
+their justify halves await grid. `place-content` sets flex's alignment
+alone and stays supported.
+
+A track list is line-name lists, track sizes and `repeat()`. A name is
+a custom-ident other than `span` and `auto`, kept as written. A size is
+a nonnegative length, percentage or calc(), a nonnegative `fr` flex
+factor clamped to MAX_ABSOLUTE_VALUE, `auto`, `min-content`,
+`max-content`, `minmax(min, max)` whose minimum is no flex factor, or
+`fit-content()` of a length or percentage. `repeat()` takes a positive
+integer, `auto-fill` or `auto-fit`, then names and sizes and no
+`repeat()`. A list holds at most one automatic repeat, and then every
+size in it, inside the repeat or out, must be fixed: a length or
+percentage, or a `minmax()` with one. Two name lists side by side are
+invalid but in `grid-template`'s areas form, where a row's trailing
+names and the next row's leading ones are one line, and one list. The
+`grid-auto-*` longhands take sizes alone. `subgrid` and `masonry` are
+invalid. The templates' `none` and the auto longhands' `auto` compute to
+keywords, any other list to `ComputedValue::GridTracks`, a `TrackList`
+of items in order (a name list's range of the names stored beside them,
+a size, or a `repeat()` with the length of the body after it), its
+repeats kept compact. Lengths compute as flex-basis's: px at the
+element's font sizes, percentages and calc()'s percentage kept, calc()
+clamped to nonnegative. A list with no em or rem computes once, as
+parsed, and every element it applies to shares it; one with them
+computes per element, and ComputeStats' `grid_items` counts its items
+each time, which td-layout weighs a cascade work unit each (its
+DESIGN.md §6), even for an element `display: none` keeps out of the
+pool. A dimension past f64's range, `1e400px` or `1e400fr`, is invalid,
+as td's every length is, where browsers clamp it.
+
+`grid-template-areas` tokenizes each string as Grid 2 §7.3.1 does: a
+run of ident code points is a named cell, a run of `.` a null cell,
+whitespace separates them, and any other character invalidates the
+declaration, as do a string of no cells, strings of unequal cell
+counts, and a name whose cells do not fill a rectangle. It computes to
+`ComputedValue::GridAreas`: the row and column counts and each named
+area's zero-based rows and columns, ends exclusive, sorted by name. A
+placement longhand computes to `auto` or `ComputedValue::GridLine`, a
+span flag, an integer and a name: a lone name has integer 0, a span
+without an integer 1. `span` comes first or last, never between the
+integer and the name (§8.3's `span && [<integer> || <custom-ident>]`).
+Integers are nonzero and spans positive, both clamped as parsed to
+±MAX_GRID_LINE (10,000), as Gecko clamps them, at any length: one past
+f64's range clamps as its sign's infinity.
+`grid-auto-flow` computes to `row`, `column`, `row dense` or `column
+dense` (`dense` alone is `row dense`), dense kept though nothing reads
+it yet.
+
+`justify-items` and `justify-self` take `align-items`' and
+`align-self`'s values as above, `safe` and `unsafe` dropped and `first
+baseline` computed to `baseline`, and add `left` and `right`.
+`justify-items` adds Box Alignment 3 §6.1's `legacy`: with `left`,
+`right` or `center`, in either order, it computes to `legacy left`,
+`legacy right` or `legacy center`, which a child's `legacy`, `initial`
+or `unset`, or an unset `justify-items`, takes from its parent; under
+any other parent they compute to `normal`. The cascade reads the parent
+for it only when the parent's rare group is not its style set's
+initial one, so a page without it reads nothing more. `anchor-center`
+is not parsed. The other alignment longhands and the gaps already held
+the values grid uses (`normal`, `stretch` and `space-evenly` for
+content), so they are unchanged.
+
+`grid-template` is `none`, `<rows> / <columns>`, or the areas form:
+rows each of optional names, a string, an optional size (`auto`
+otherwise) and optional names, then an optional `/` and columns of
+names and sizes alone (`none` without them); it sets its three
+longhands. `grid` is a `grid-template`, `<rows> / auto-flow dense?
+<auto-columns>?` or `auto-flow dense? <auto-rows>? / <columns>`, with
+`auto-flow` and `dense` in either order, and resets the others of its
+six longhands (templates, auto sizes and flow), not the gaps (Grid 2
+§7.8); its auto sizes are `grid-auto-*`'s, so a lone `auto` computes to
+the keyword and leaves the initial group shared.
+`grid-row` and `grid-column` take one or two lines and `grid-area` one
+to four, `/` apart; an omitted line copies a lone custom-ident and is
+`auto` otherwise (§8.4): the end copies the start, and `grid-area`'s
+column start and row end copy the row start and its column end the
+column start. `place-content`, `place-items` and `place-self` take an
+align value then an optional justify value, which copies the align one
+when omitted, but that `place-content`'s baselines, which
+justify-content lacks, give it `start`. `grid-gap`, `grid-row-gap` and
+`grid-column-gap` are Box Alignment 3 §8.4's legacy names of `gap`,
+`row-gap` and `column-gap`. A list past MAX_GRID_TRACKS tracks or
+names, or areas past it in rows or columns or past MAX_GRID_AREAS
+names, is invalid, as an out-of-range value is: the declaration is
+dropped and its sheet compiles on.
+
+A sheet's areas strings are tokenized once, with it. One a `var()`
+brings is reparsed for each element and each longhand the declaration
+sets (three for `grid-template`, six for `grid`), and the areas grammar
+reads it a byte at a time, looks each named cell's name up and
+allocates each area's name, where the substitution counts a string as
+one component and a 64th of its bytes: `grid_items` counts each such
+byte and named cell each time, and two more for each area a valid value
+builds, so a page of 200 thousand-cell rows, or of one row of 1,000
+distinct names, reparsed on every paragraph is refused
+MAX_CASCADE_WORK, not run for minutes. The bytes one element can
+reparse are bounded by its MAX_SUBSTITUTION_BYTES (4 MiB), some 75 ms,
+before td-layout weighs them.
+
+A name is looked up by binary search among the distinct names seen,
+kept sorted, and updated in place. A cell whose name is new is
+appended to a pending run, which is sorted once and merged into a new
+sorted list, equal names joined, when it holds 64 cells and as many as
+the list: inserting each new name into the sorted list shifted its
+tail, quadratic in names arriving in descending order, which a
+reparsed row of 1,000 descending names paid on every element (17.5 s
+to refusal, against 6.3 s ascending). Every rectangle is checked before
+any name is allocated, so an invalid value allocates none.
+
 ## 5. Bounds and failure
 
 Syntax and work limits are compiled constants. Caller-supplied memory
@@ -692,6 +826,9 @@ MAX_STYLE_BYTES.
 | MAX_SUBSTITUTION_COMPONENTS | 262,144 charged component/reference/graph visits per compute |
 | MAX_SUBSTITUTION_BYTES | 4 MiB cumulative charged payload/name bytes per compute |
 | MAX_FAMILIES | 32 names in a font-family value |
+| MAX_GRID_TRACKS | 1,000 explicit tracks per track list, integer `repeat()`s expanded and an automatic repeat's tracks counted once; 1,000 line names per list as written; 1,000 rows and 1,000 columns per `grid-template-areas`; past it the declaration is invalid, not a refusal |
+| MAX_GRID_AREAS | 1,000 named areas per `grid-template-areas`; past it the declaration is invalid |
+| MAX_GRID_LINE | 10,000, the magnitude grid line integers and spans clamp to as parsed |
 | MAX_ABSOLUTE_VALUE | 1,000,000 for computed px, percentages and supplied root font size |
 
 Recovered syntax errors use a saturating counter. Tokenization and syntax
@@ -720,7 +857,7 @@ All td-css-owned heap storage uses td-alloc. Token text up to 14 UTF-8
 bytes lives inline in its enclosing owner.
 Text from 15 through 62 bytes uses one shared fixed SmallText allocation;
 longer text uses a shared BudgetString. Custom maps, retained custom-token
-arrays, font families and rare-property groups use immutable BudgetShared owners; nested component arrays use BudgetVec.
+arrays, font families, rare-property groups and grid track lists, areas, lines and a track list's names use immutable BudgetShared owners; nested component arrays use BudgetVec.
 Component construction counts immediate children with a fixed bounded
 delimiter stack before reserving exact capacity.
 Mutable arrays and small ordered maps use BudgetVec and BudgetMap.
@@ -779,15 +916,15 @@ td-css does not give yet.
 `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
-the fixed 71-longhand roster, in declaration order: the 52 a style holds
-itself, then the 19 of its shared rare group ("Computed-style
+the fixed 83-longhand roster, in declaration order: the 52 a style holds
+itself, then the 31 of its shared rare group ("Computed-style
 sharing"), which no caller sees but in that order. `initial` supplies context-free seeds; border
 colors, border widths, overflow and display also undergo the contextual
 computation above. `ComputedStyle::new(&Budget)` fallibly builds initial values with invisible
 borders. `try_clone` replaces owned Clone, and `Property::initial(&Budget)`
 is fallible for owning values. `ComputedStyle::get` yields immutable typed
 values (keywords, RGBA colors, px/percentage/auto and unresolved calc() lengths, family lists,
-weights, scalar numbers, decoration flags and border spacing's px pair); `font_size` and `color` are convenient
+weights, scalar numbers, decoration flags, border spacing's px pair, and the grid track lists (`TrackList`), areas (`GridAreas`) and lines (`GridLine`) §4 describes, read through accessors); `font_size` and `color` are convenient
 typed accessors. `custom_property(name)` exposes an immutable computed
 token slice, or None for missing/guaranteed-invalid values. A computed style owns its values and cannot be populated
 with caller-constructed non-finite values. The crate documentation has
@@ -1114,14 +1251,16 @@ collided bucket is bounded by MAX_STYLE_COMPARISONS and MAX_POOL_WORK,
 and equality, not the key, decides sharing.
 
 A style holds its 52 common longhands itself and shares a group of
-the 19 rarely set ones, the roster's last (`Property::FIRST_RARE` on):
-`clear`, `opacity`, `top`, `right`, `bottom`, `left`, `table-layout`
-and the twelve flex and alignment longhands. None inherits, and most
-elements set none: §8's corpus lists `opacity` (328 declarations over
-eight sites) among its frequent properties but neither `clear` nor the
-offsets, which only positioned boxes read, and only tables and flex
-boxes set the rest. No common longhand's computation reads one, nor
-does `finish`.
+the 31 rarely set ones, the roster's last (`Property::FIRST_RARE` on):
+`clear`, `opacity`, `top`, `right`, `bottom`, `left`, `table-layout`,
+the twelve flex and alignment longhands and the twelve grid ones (§4,
+"Grid"). None inherits, and most elements set none: §8's corpus lists
+`opacity` (328 declarations over eight sites) among its frequent
+properties but neither `clear` nor the offsets, which only positioned
+boxes read, and only tables, flex and grid boxes set the rest. No
+common longhand's computation reads one, nor does `finish`; the one
+rare value read from a parent is `justify-items`' legacy position (§4,
+"Grid"), and only from a parent whose group is not the initial one.
 A style set holds one initial group, which every style it computes
 shares until a rule sets one of them, so an element that sets none
 never computes, stores, fingerprints or compares them. A winning rare
@@ -1129,8 +1268,13 @@ declaration is substituted and computed as any is, after the common
 longhands and so with the element's own font size; `inherit` reads
 the parent's group and `initial` and `unset` the initial values. The
 first value that differs from the initial group's copies the group
-(19 plain values) and writes the copy; one that computes to the
-initial value copies nothing. `get` takes one branch to the group, and
+(31 values, a grid value's storage shared by its handle, not copied)
+and writes the copy; one that computes to the initial value copies
+nothing. A group marks, in a 64-bit `set`, the slots whose value is not
+its initial one to the bit, kept by every write, so the pool's
+fingerprints and comparisons visit the marked slots alone and a
+group's cost does not grow with the roster: adding the grid longhands
+added nothing to the hashing of a flex group. `get` takes one branch to the group, and
 `set`, which `finish` and tests write through, copies a group before
 writing a rare value, so no group is written once shared. Display,
 float, position, overflow, box-sizing, the minimum and maximum sizes
@@ -1145,31 +1289,44 @@ that same allocation at once, without a visit. Its fingerprint is kept
 there, not in the group: the key is the pool's, a group is shared by
 pools of different keys (its style set's documents), and an unkeyed
 digest a group carried would let a page search for collisions offline.
-Any other group is fingerprinted over its 19 values with the pool's
-key, looked up, and compared with its bucket's (19 visits and a
-comparison each against MAX_STYLE_COMPARISONS), then either replaced
-by its canonical equal or retained, charged once: 128 bytes for its
-index entry and its doubled storage, 1,040 bytes in all. Nothing is
+Any other group is fingerprinted over its mark and its marked slots,
+each slot's number and value, a grid value by its contents (a track
+list's items and names, an areas value's names and ranges, a line's
+name), with the pool's key, looked up, and compared with its bucket's
+(a visit, and a visit a marked value and a track list's item or a name
+byte, as its work, and a comparison each against
+MAX_STYLE_COMPARISONS), then either replaced by its canonical equal or
+retained, charged once: 128 bytes for its index entry and its doubled
+storage, 1,632 bytes in all (1,040 with 19 longhands and no mark), and
+its grid values' own storage, doubled as a style's font families are:
+a track list's or an areas value's owner and its arrays at their
+capacity, and each name twice its heap capacity and 32 bytes. A group
+holding a value is charged it however many groups share its handle, so
+two distinct groups with one track list are charged it twice. Nothing is
 looked up by a group's address, which a freed group's successor
 reuses, so the pool's work on groups depends on the page alone. Groups
 compare to the bit, as the cascade does a value against the initial
 group's, so a group shared between styles never gives one another's
 signed zero: `order:-0` keeps its sign, where `==` would take it for
-the initial 0. Its bucket is keyed to the bit as well: eleven rare
-longhands can be a zero of either sign, and a fingerprint that hashed
+the initial 0; a track list compares by address, then its items to the
+bit. Its bucket is keyed to the bit as well: eleven rare longhands
+(and any track list's sizes) can be a zero of either sign, and a
+fingerprint that hashed
 signed zeros alike gave a group's 2,048 variants one bucket a page
 could fill without the key (1,500 elements over them, or 10,000 over
 256, were refused MAX_STYLE_COMPARISONS; both are now admitted, three
 styles, with each variant retained). Each variant is charged its
-1,040 bytes though its style merges, so a page of tens of thousands
+1,632 bytes though its style merges, so a page of tens of thousands
 of distinct signed-zero combinations (64,000 elements over 64 `order`
-classes and 1,024 variants, about 1.5 MB) is refused MAX_POOL_BYTES
+classes and 1,024 variants, about 1.7 MB) is refused MAX_POOL_BYTES
 where a style holding every longhand admitted it in 6.5 MB. The one
-pass over its values also gives a second fingerprint that hashes signed zeros alike, kept
-beside the group and in `known`; a style's fingerprint folds that one
-as one word, as styles' `==` does, and the pool compares two styles'
-canonical groups by address, then, for groups apart by a signed zero
-alone (19 visits more), by `==`, so such styles are one style, the
+pass over its marked slots also gives a second fingerprint that hashes
+signed zeros alike and passes over a slot `==` its initial value (the
+initial zero's other sign, marked though `==`), kept beside the group
+and in `known`; a style's fingerprint folds that one as one word, as
+styles' `==` does, and the pool compares two styles' canonical groups
+by address, then, for groups apart by a signed zero alone (a visit and
+one a slot either marks), by `==`, so such styles are one style, the
 first, as when a style held every longhand. `ComputedStyle`'s own
 equality compares groups by address, then by `==`.
 
@@ -1256,15 +1413,21 @@ every process and with fixed keys):
 
 A style is charged 9,728 bytes with its 52 common longhands and its
 group's handle (13,056 when it held all 71, 10,944 with 59), and each
-distinct rare group 1,040 bytes once, so MAX_POOL_BYTES admits some
-6,900 distinct styles (6,896 of `<p style="width:Npx">`, each
-distinct; 5,137 when a style held every longhand, some 6,100 before
-the flex longhands), 6,230 that each bring a group of their own as
-well (`<p style="order:N">`; 5,137 before), and some 5,500 elements
-each with its own custom map (5,495; 4,317 before the group). Real pages hold a few hundred
-(*Germany* 466, The Guardian 734). Each common longhand added lowers
-both by 176 bytes a style; a rare one adds 48 bytes to each distinct
-group alone.
+distinct rare group 1,632 bytes once and its grid values' storage, so
+MAX_POOL_BYTES admits some 6,900 distinct styles (6,896 of `<p
+style="width:Npx">`, each distinct; 5,137 when a style held every
+longhand, some 6,100 before the flex longhands), 5,905 that each bring
+a group of their own as well (`<p style="order:N">`; 6,230 with 19
+rare longhands, 5,137 before the group), and some 5,500 elements each
+with its own custom map (5,495 of `<p style="--x:N">`, as with 19;
+4,317 before the group). Each figure is a page of such paragraphs
+through td-layout's StyledDocument at default limits, HTML_UA_CSS its
+sheet; a bare pool of the paragraphs' styles alone admits one or two
+more.
+Real pages hold a few hundred (*Germany* 466, The Guardian
+734). Each common longhand added lowers both by 176 bytes a style; a
+rare one adds 48 bytes to each distinct group alone, the grid ones 576
+and the mark 16.
 
 A lookup or an insertion on these pages probes 1.0 to 1.9 slots on
 average, growth's moves aside (The Guardian's 13,169 token addresses
@@ -1369,6 +1532,59 @@ CSS-wide keywords and `!important` (their layouts on 500 of them).
 Pool work, and whether a page is admitted, is the same in every
 process: 300 to 1,000 loads each of the pages that refused up to 4% of
 loads under the averaged probe allowance (above) were all admitted.
+
+The grid longhands grew the group from 19 values to 31, and with it
+every rare group's hashing and comparison by 63%, the flex bars' pool
+work by 15% and their instructions by 13%, until the group's mark
+(above) limited both to its marked slots. The same change computes a
+winning declaration's specified value in place, where the cascade
+cloned each before computing it. Measured 2026-11-25 against the parent
+(the cascade, boxes and pool over a parsed document, release, pinned
+to one CPU, user-mode `perf stat`, four cascades less one, median of
+five, the builds interleaved, load average 3.9 to 4.7) on the 2 MiB
+shapes above and the two Wikipedia pages fetched that day with their
+sheets:
+
+| Page | Instructions parent / grid (M) | Pool work parent / grid |
+| --- | ---: | ---: |
+| 2 MiB blocks | 5,906 / 5,596 (−5.2%) | 15,733,116 / 15,733,098 |
+| 2 MiB table rows | 4,934 / 4,696 (−4.8%) | 12,206,881 / 12,206,863 |
+| 2 MiB nested tables | 8,028 / 7,634 (−4.9%) | 20,344,397 / 20,344,379 |
+| 2 MiB floats | 4,682 / 4,444 (−5.1%) | 12,102,439 / 12,102,421 |
+| 2 MiB inline-blocks | 2,680 / 2,523 (−5.9%) | 8,137,928 / 8,137,910 |
+| 2 MiB nested lists | 5,756 / 5,456 (−5.2%) | 15,324,677 / 15,324,659 |
+| 2 MiB inline tables | 5,936 / 5,646 (−4.9%) | 14,984,247 / 14,984,229 |
+| 2 MiB flex bars | 6,490 / 6,057 (−6.7%) | 20,385,253 / 16,643,683 (−18.4%) |
+| 2 MiB flex cards | 5,999 / 5,668 (−5.5%) | 15,514,244 / 14,605,158 (−5.9%) |
+| 2 MiB Bootstrap-like grid | 4,915 / 4,548 (−7.5%) | 14,422,630 / 11,961,185 (−17.1%) |
+| 20,000 `<p style="order:K">` | 1,159 / 1,070 (−7.7%) | 3,131,756 / 2,474,873 (−21.0%) |
+| 100,000 `<p style="--x:K">` | 5,267 / 5,049 (−4.1%) | 12,492,179 / 12,492,161 |
+| Wikipedia, *Cascading Style Sheets* | 1,796 / 1,785 (−0.6%) | 791,352 / 785,313 |
+| Wikipedia, *Germany* | 3,737 / 3,709 (−0.7%) | 1,536,223 / 1,520,808 |
+
+A page setting no grid longhand computes the same values, to the bit,
+the same styles and numbers, cascade work and layouts at 1280 and 832
+px and windowed, on all of these and on 3,000 generated pages; its
+charge grows 592 bytes a distinct group (`known` initial group
+included) and its pool work falls with the rare values it sets (18
+visits less where it sets none: the initial group's 19 visits are one).
+The Wikipedia pages' sheets set grid longhands on a few elements, so
+their declaration counts grow and five styles more are retained (365
+to 370 and 457 to 462, *Germany*'s charge 7,971,810 to 8,065,970
+bytes); every other longhand's value and every box is unchanged. On a
+page that sets them, the styles the pool retains change, and with them
+which of two styles `==` but apart by a signed zero comes first: the
+pool merges such styles into the first (above), so an element may take
+the other zero, `margin:-0` for `0`, as it may whenever a page's styles
+change. Review found 9 of 1,500 generated pages setting grid longhands
+laid out apart from the parent by that alone. A group's grid values
+are hashed by their contents, not their handles, so a page that sets a
+1,000-track list on every element pays some 1,000 visits an element:
+2 MiB of `<div><p>` with four such lists in em and a 20 by 50 areas
+value on `*` is refused MAX_POOL_WORK in 0.63 s, the parent admitting
+it, without them, in 0.56; 2 MiB of inline styles each with its own
+1,000-track list (some 500 styles, 55 MB charged) is admitted in 160
+ms, and of 300-cell inline areas values (776 styles) in 81 ms.
 
 PoolLimits may lower MAX_STYLES (16,384), MAX_POOL_BYTES (64 MiB),
 MAX_POOL_WORK (67,108,864 visits: fields, components and string bytes
