@@ -31,6 +31,8 @@ mod inline_flex_tests;
 #[cfg(test)]
 mod inline_table_tests;
 mod intrinsic;
+#[cfg(test)]
+mod relay_tests;
 mod table;
 
 pub const MAX_VIEWPORT: f64 = td_css::values::MAX_ABSOLUTE_VALUE;
@@ -271,6 +273,12 @@ pub fn layout_with_budget(
         flex_watch: None,
         flex_lead: None,
         flex_first: None,
+        flex_wants: 0,
+        flex_depends: 0,
+        relaying: 0,
+        flex_marks: BudgetVec::new(memory)?,
+        flex_measure: false,
+        flex_natural: false,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -381,6 +389,24 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     flex_watch: Option<usize>,
     flex_lead: Option<usize>,
     flex_first: Option<f64>,
+    /// On a page with flex containers: whether the content of the box
+    /// being laid would lay otherwise at another definite height of it,
+    /// gathered as it is laid; the last box laid's, which a flex item
+    /// takes; and the re-lays of flex items at their used sizes open
+    /// around what is being laid (§5, "Flex", "Laying again").
+    flex_wants: u8,
+    flex_depends: u8,
+    relaying: u32,
+    /// The state before each item of the lines and columns being laid
+    /// that may be laid again, a stack as `flex` is.
+    flex_marks: BudgetVec<flex::Mark>,
+    /// The next box laid is a column item of percentage height measured
+    /// for its automatic minimum, and laid again at its used height.
+    flex_measure: bool,
+    /// The next box laid is a column item whose height as laid at an
+    /// auto height is its automatic minimum's content height: a row
+    /// laid in it lays its stretched items so first.
+    flex_natural: bool,
     left: f64,
     top: f64,
     right: f64,
@@ -797,6 +823,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 }
                 BoxKind::Image => {
                     let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+                    if self.styled.has_flex() && flex::percent_height(style) {
+                        self.flex_wants |= flex::HEIGHT | flex::PERCENT;
+                    }
                     let dims = dimensions(
                         self.styled,
                         b,
@@ -1483,13 +1512,31 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         if root {
             self.floats.open(&mut self.counters)?;
         }
+        // What this box's content gathers, and what its parent's had.
+        let wants = self
+            .styled
+            .has_flex()
+            .then(|| std::mem::replace(&mut self.flex_wants, 0));
+        // A flex item measured for its column lays its content as at an
+        // auto height (§5, "Flex", "Laying again").
+        let basis = if wants.is_some() && std::mem::take(&mut self.flex_measure) {
+            None
+        } else {
+            dims.height
+        };
+        let natural_wanted = wants.is_some() && std::mem::take(&mut self.flex_natural);
         let mut content = None;
         let mut natural = if b.kind == BoxKind::Image {
             content = dims.auto_height;
             dims.height.unwrap_or(0.0)
         } else if self.styled.has_flex() && self.flex_container(&b)? {
+            let laid = Dimensions {
+                height: basis,
+                ..dims
+            };
+            self.flex_natural = natural_wanted;
             let (used, own) =
-                self.flex_content(id, &b, &dims, (content_x, content_y, offset), depth)?;
+                self.flex_content(id, &b, &laid, (content_x, content_y, offset), depth)?;
             content = Some(own);
             used
         } else {
@@ -1501,9 +1548,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         x: content_x,
                         y: content_y,
                         width: dims.width,
-                        height: dims.height.unwrap_or(0.0),
+                        height: basis.unwrap_or(0.0),
                     },
-                    definite: dims.height,
+                    definite: basis,
                     offset,
                     strut: b.style,
                     block: Some(id),
@@ -1532,6 +1579,16 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             self.lineless(fragment)?;
         }
         self.natural = content.unwrap_or(natural);
+        if let Some(wants) = wants {
+            self.flex_depends = self.flex_wants;
+            let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+            self.flex_wants = wants
+                | if flex::percent_height(style) {
+                    flex::HEIGHT | flex::PERCENT
+                } else {
+                    0
+                };
+        }
         let height = dims
             .height
             .unwrap_or(natural)

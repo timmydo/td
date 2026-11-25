@@ -604,10 +604,11 @@ mod cases {
     // Flex pages: rows of links, words and boxes, items moved by their
     // alignment and auto margins, nested rows, and rows in floats, cells,
     // inline-blocks and list items, with floats, inline-blocks, tables
-    // and lists in their items.
+    // and lists in their items; grown cards, centred text and boxes of
+    // percentage height or offset, which lay again at their used sizes.
 
     fn flex_item(r: &mut Rng, depth: usize, out: &mut String) {
-        match r.below(17) {
+        match r.below(22) {
             0..=2 => words(r, out),
             3 | 4 => {
                 let _ = write!(out, "<a href=/l>{}</a>", r.word());
@@ -666,6 +667,54 @@ mod cases {
             15 => wrapped(out, "<i style=order:-1;padding-top:3px>", "</i>", |out| {
                 words(r, out)
             }),
+            17 if depth < 2 => {
+                // A card: a growing body over a footer.
+                out.push_str("<div style=display:flex;flex-direction:column;flex:1>");
+                wrapped(out, "<div style=flex:1>", "</div>", |out| {
+                    for _ in 0..1 + r.below(2) {
+                        flex_item(r, depth + 1, out);
+                    }
+                });
+                out.push_str("<div>foot</div></div>");
+            }
+            18 => {
+                let height = [
+                    "height:100%",
+                    "height:50%",
+                    "min-height:60%",
+                    "max-height:40%",
+                ][r.below(4) as usize];
+                wrapped(out, &format!("<div style={height}>"), "</div>", |out| {
+                    words(r, out);
+                    if r.below(2) == 0 {
+                        wrapped(out, "<p style=margin:0;height:50%>", "</p>", |out| {
+                            words(r, out)
+                        });
+                    }
+                });
+            }
+            19 => wrapped(
+                out,
+                "<div><p style=margin:0;position:relative;top:25%>",
+                "</p></div>",
+                |out| words(r, out),
+            ),
+            20 => {
+                let align = ["center", "end", "start"][r.below(3) as usize];
+                let _ = write!(
+                    out,
+                    "<a style=display:flex;align-items:{align}>{}</a>",
+                    r.word()
+                );
+            }
+            21 if depth < 2 => {
+                wrapped(
+                    out,
+                    "<div style=flex:1;display:flex;align-items:center>",
+                    "</div>",
+                    |out| flex_item(r, depth + 1, out),
+                );
+            }
             _ => wrapped(out, "<b style=flex:1;min-width:0>", "</b>", |out| {
                 inline(r, 2, out);
             }),
@@ -695,10 +744,12 @@ mod cases {
             "flex-direction:column;",
             "flex-direction:column;min-height:120px;",
             "flex-direction:column;height:150px;",
-        ][r.below(10) as usize];
+            "flex-direction:column;height:180px;row-gap:5%;",
+            "height:90px;",
+        ][r.below(12) as usize];
         let _ = write!(
             out,
-            "<{tag} style=display:{display};{lay}align-items:{align};justify-content:{justify};column-gap:{}px;row-gap:{}px>",
+            "<{tag} style=display:{display};align-items:{align};justify-content:{justify};column-gap:{}px;row-gap:{}px;{lay}>",
             r.below(3) * 4,
             r.below(3) * 3
         );

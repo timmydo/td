@@ -2574,8 +2574,8 @@ order; each is its own design amendment when it starts:
   inline-block taking the newline its first text would, then the rest
   of flexbox (`wrap-reverse` and `column-reverse`, a column's wrapping
   and shrinking, `order` in rows wrapping onto lines and columns,
-  re-laying a
-  grown or stretched item's content) and grid;
+  laying a grown or stretched item's content again past two nested
+  re-lays and at the line `align-content` grows) and grid;
   pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.

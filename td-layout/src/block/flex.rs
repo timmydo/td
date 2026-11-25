@@ -16,11 +16,25 @@ const ONE: i64 = 1 << 20;
 /// 2^58, and a share's product, under 2^58 times a weight scaled under
 /// 2^68, within i128.
 const NONE: i64 = 64 * crate::MAX_COORDINATE as i64;
+/// An item's geometry is an index, under MAX_BOXES, in these bits.
+const INDEX: u32 = (1 << 29) - 1;
 /// No geometry: an anonymous item's.
-const NO_GEOMETRY: u32 = u32::MAX;
-/// A table item's geometry, read for its baseline alone: an index, under
-/// MAX_BOXES, with this bit set.
+const NO_GEOMETRY: u32 = INDEX;
+/// A table item's geometry, read for its baseline alone: its index with
+/// this bit set.
 const TABLE_GEOMETRY: u32 = 1 << 31;
+/// The bits an item's geometry keeps what its content wants of its
+/// height, `HEIGHT` and `PERCENT` shifted: what `FlexItem::wants` reads.
+const WANTS: u32 = 3 << 29;
+/// What a box's content wants of its height: it would lay otherwise at
+/// another definite height; and it holds percentages of it, which resolve
+/// once it is definite, whatever it is.
+pub(super) const HEIGHT: u8 = 1;
+pub(super) const PERCENT: u8 = 2;
+/// The re-lays of items at their used sizes that may be open around what
+/// is laid: past them an item keeps the content it was laid with, as at
+/// its hypothetical size (DESIGN.md §5, "Flex", "Laying again").
+const MAX_RELAY: u32 = 2;
 
 /// What a flex item is laid from.
 #[derive(Clone, Copy)]
@@ -161,13 +175,63 @@ pub(super) struct FlexItem {
     boxes: (u32, u32),
     markers: (u32, u32),
     /// Its own geometry, `NO_GEOMETRY` for an anonymous item: a u32 the
-    /// record keeps to 224 bytes with its `order`.
+    /// record keeps to 224 bytes with its `order`, and `WANTS`.
     geometry: u32,
     /// Its margin box's height as laid.
     outer: f64,
     bounds: Option<Rect>,
     /// Its `order`, an integer, -0 as 0.
     order: i32,
+}
+
+/// What laying from an item on changed of the layout's state, as it was
+/// before: what a re-lay restores, then lays from the item again.
+#[derive(Clone, Copy)]
+pub(super) struct Mark {
+    at: u32,
+    lines: u32,
+    boxes: u32,
+    markers: u32,
+    counted: (u32, u32, u32),
+    cuts: crate::inline::Cuts,
+    list_cursor: u32,
+    last_baseline: Option<f64>,
+    first_line: bool,
+    first_index: Option<u32>,
+    flex_watch: Option<u32>,
+    flex_lead: Option<u32>,
+    nested: u32,
+}
+
+/// The content height the item `item`, laid as `geometry`, is stretched
+/// to in a line `line` tall, within its own bounds.
+fn stretched(item: &FlexItem, geometry: &super::BoxGeometry, line: f64) -> f64 {
+    let decoration = geometry.padding.plus(geometry.border_widths).vertical();
+    (line - geometry.margin.vertical() - decoration)
+        .min(item.max_height)
+        .max(item.min_height)
+        .max(0.0)
+}
+
+/// Whether `style`'s height, its bounds or its relative vertical offset
+/// are a percentage, of its containing block's height where that is
+/// definite.
+pub(super) fn percent_height(style: &ComputedStyle) -> bool {
+    [Property::Height, Property::MinHeight, Property::MaxHeight]
+        .into_iter()
+        .any(|p| percentage(style, p))
+        || ((percentage(style, Property::Top) || percentage(style, Property::Bottom))
+            && keyword(style, Property::Position) == "relative")
+}
+
+/// Whether `style`'s `p` is a percentage or a sum holding one.
+fn percentage(style: &ComputedStyle, p: Property) -> bool {
+    matches!(
+        style.get(p),
+        Some(ComputedValue::Length(
+            Length::Percent(_) | Length::Calc { .. }
+        ))
+    )
 }
 
 impl FlexItem {
@@ -205,11 +269,22 @@ impl FlexItem {
     /// Its own geometry's index, None for an anonymous item and for a
     /// table, which sizes itself and is not stretched.
     fn geometry(&self) -> Option<usize> {
-        (self.geometry & TABLE_GEOMETRY == 0).then_some(self.geometry as usize)
+        let at = self.geometry & INDEX;
+        (at != NO_GEOMETRY && self.geometry & TABLE_GEOMETRY == 0).then_some(at as usize)
     }
     /// Its own border box's index, a table's too.
     fn border_box(&self) -> Option<usize> {
-        (self.geometry != NO_GEOMETRY).then_some((self.geometry & !TABLE_GEOMETRY) as usize)
+        let at = self.geometry & INDEX;
+        (at != NO_GEOMETRY).then_some(at as usize)
+    }
+    /// What its content, as laid, wants of its height: `HEIGHT`,
+    /// `PERCENT` or both; once its column is resolved, `HEIGHT` where it
+    /// is laid again at its used size.
+    fn wants(&self) -> u8 {
+        ((self.geometry & WANTS) >> 29) as u8
+    }
+    fn set_wants(&mut self, wants: u8) {
+        self.geometry = (self.geometry & !WANTS) | ((u32::from(wants) << 29) & WANTS);
     }
     /// Its sizes within 0 to NONE.
     fn bound(&mut self) {
@@ -475,6 +550,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         let lay = Lay::of(style);
         let (base, lines, retain) = (self.flex.len(), self.flex_lines.len(), self.retain);
+        let marks = self.flex_marks.len();
+        let natural = std::mem::take(&mut self.flex_natural);
         let last_baseline = self.last_baseline;
         let wanted = std::mem::replace(&mut self.flex_wanted, false);
         let watch = std::mem::replace(&mut self.flex_watch, wanted.then_some(base));
@@ -482,7 +559,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let laid = if lay.column {
             self.flex_column(id, b, dims, place, base, depth)
         } else {
-            self.flex_rows(id, b, dims, place, (base, lines), depth)
+            self.flex_rows(id, b, dims, place, (base, lines, natural), depth)
         };
         // A container's lines, as a table's, are no inline-block's last.
         self.last_baseline = last_baseline;
@@ -491,6 +568,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         self.flex_lead = lead;
         self.flex.truncate(base);
         self.flex_lines.truncate(lines);
+        self.flex_marks.truncate(marks);
         let (used, content, baseline) = laid?;
         if wanted {
             self.flex_first = baseline.map(|y| y - offset.1);
@@ -571,7 +649,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         b: &BoxNode,
         dims: &Dimensions,
         place: Place,
-        (base, first): (usize, usize),
+        (base, first, natural): (usize, usize, bool),
         depth: usize,
     ) -> Result<(f64, f64, Option<f64>), Error> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
@@ -580,6 +658,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let room = down(width);
         let gap = length(style, Property::ColumnGap, Some(width)).map_or(0, |g| units(g.max(0.0)));
         let row_gap = length(style, Property::RowGap, place.definite).map_or(0.0, |g| g.max(0.0));
+        if lay.wrap && percentage(style, Property::RowGap) {
+            self.flex_wants |= HEIGHT | PERCENT;
+        }
         let row_gap = px(units(row_gap));
         let align = keyword(style, Property::AlignItems);
         self.flex_items(b, align)?;
@@ -624,6 +705,31 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     || item.autos.top
                     || item.autos.bottom
             });
+        // Its content lays otherwise at another definite height where
+        // that would move or stretch its lines, or its items in a line.
+        let open = if lay.wrap {
+            !matches!(
+                content,
+                "start" | "flex-start" | "baseline" | "last baseline"
+            )
+        } else {
+            self.flex
+                .get(base..end)
+                .ok_or(Error::Invalid)?
+                .iter()
+                .any(|item| match item.source {
+                    Source::Element(_) => {
+                        matches!(item.cross, Cross::Stretch | Cross::Center | Cross::End)
+                            || item.autos.top
+                            || item.autos.bottom
+                    }
+                    // An anonymous item's box is not stretched; it moves.
+                    Source::Run(..) => matches!(item.cross, Cross::Center | Cross::End),
+                })
+        };
+        if open {
+            self.flex_wants |= HEIGHT;
+        }
         let mut retained = spread || aligned;
         let outermost = retained && self.retain == 0;
         if retained {
@@ -648,7 +754,28 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 },
                 ..place
             };
-            let tallest = self.lay_items(id, b.style, &row, start, end, depth)?;
+            // A line of definite cross size, a definite height's one line
+            // or one its least and greatest heights fix, lays its
+            // stretched items at it, definite once known (§9.4 step 11);
+            // any other may lay them again once its cross size is known
+            // (below, "Laying again"), as one whose items' heights as laid
+            // at an auto height are its column's automatic minimum
+            // (`natural`) does.
+            let again = self.relaying < MAX_RELAY;
+            let fixed = (dims.min_height == dims.max_height).then_some(dims.min_height);
+            let cross = match place.definite.or(fixed) {
+                Some(height) if again && !lay.wrap && !natural => Some(px(holding(height))),
+                _ => None,
+            };
+            // Its height is its tallest item's within `bounds`.
+            let bounds = match place.definite {
+                _ if lay.wrap => (0.0, f64::INFINITY),
+                Some(height) => (height, height),
+                None => (dims.min_height, dims.max_height),
+            };
+            let laying = (cross, (again && cross.is_none()).then_some(bounds));
+            let (span, marks) = ((start, end), self.flex_marks.len());
+            let tallest = self.lay_items((id, b.style), &row, span, laying, depth)?;
             let (baseline, tallest) = self.line_baseline(start, end, tallest)?;
             self.flex_lines.get_mut(at).ok_or(Error::Invalid)?.baseline = baseline;
             extent += px(holding(tallest.max(0.0)));
@@ -672,7 +799,19 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             }
             let line = self.flex_lines.get_mut(at).ok_or(Error::Invalid)?;
             line.height = height;
-            let line = *line;
+            let relaid = self.restretched(marks, height)?;
+            self.flex_marks.truncate(marks);
+            if let Some(mark) = relaid {
+                self.restore(&mark)?;
+                self.relaying += 1;
+                let span = (mark.at as usize, end);
+                let laid = self.lay_items((id, b.style), &row, span, (Some(height), None), depth);
+                self.relaying -= 1;
+                laid?;
+                let (baseline, _) = self.line_baseline(start, end, tallest)?;
+                self.flex_lines.get_mut(at).ok_or(Error::Invalid)?.baseline = baseline;
+            }
+            let line = *self.flex_lines.get(at).ok_or(Error::Invalid)?;
             if !spread {
                 self.align_items(start, end, line)?;
                 // A line's items are final once aligned, as a table's row.
@@ -1281,24 +1420,146 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         Ok(first.1)
     }
     /// Lays the items `start..end` once each, at its x and the line's
-    /// top, keeping what it laid; returns the tallest margin box.
+    /// top, a stretched one at the line's cross size `cross` where that
+    /// is known, keeping what it laid; returns the tallest margin box.
+    /// Where the line's height is its tallest item's within `marking`'s
+    /// bounds, each stretched item whose content wants its height and
+    /// that may be the first laid again leaves the state before it in
+    /// `flex_marks`, from which the line may be laid again.
     fn lay_items(
         &mut self,
-        id: BoxId,
-        strut: StyleId,
+        (id, strut): (BoxId, StyleId),
         place: &Place,
-        start: usize,
-        end: usize,
+        (start, end): (usize, usize),
+        (cross, marking): (Option<f64>, Option<(f64, f64)>),
         depth: usize,
     ) -> Result<f64, Error> {
         let mut tallest = 0.0f64;
+        // The line is at least `floor`, its tallest item so far within
+        // its bounds, and at most `cap`; an item is laid again where it
+        // holds percentages or its stretch at the line's height is other
+        // than it laid. One whose stretch from the floor to the cap is
+        // what it laid never is; one whose stretch at the floor or the
+        // cap is not certainly is, and is the last marked (`settled`).
+        // Any other is laid again only at a line taller than it, and so
+        // is every item before it shorter, not at its `max-height`: the
+        // least such marked (`least`) is laid again where it is.
+        let (mut least, mut settled) = (i64::MAX, false);
         for at in start..end {
             let item = self.flex.get(at).ok_or(Error::Invalid)?;
             let x = place.container.x + px(item.x);
-            let item = self.lay_one(at, id, strut, place, x, depth)?;
+            let mark = if marking.is_some()
+                && !settled
+                && item.cross == Cross::Stretch
+                && matches!(item.source, Source::Element(_))
+            {
+                self.mark(at)
+            } else {
+                None
+            };
+            let item = self.lay_one(at, id, strut, place, (x, cross), depth)?;
+            let geometry = item.geometry().and_then(|at| self.boxes.get(at));
+            if let (Some(mark), Some(geometry), Some((low, high))) = (mark, geometry, marking) {
+                let line = |height: f64| px(holding(height.min(high).max(low)));
+                let laid = units(geometry.content.height);
+                let floor = units(stretched(&item, geometry, line(tallest)));
+                let cap = units(stretched(&item, geometry, line(f64::INFINITY)));
+                let outer = units(item.outer);
+                let certain = item.wants() & PERCENT != 0 || laid < floor || laid > cap;
+                let never = !certain && laid == cap;
+                if item.wants() != 0 && !never && (certain || outer < least) {
+                    self.counters.admit_growth(&mut self.flex_marks)?;
+                    self.flex_marks.try_push(mark)?;
+                    least = least.min(outer);
+                    settled = certain;
+                }
+            }
             tallest = tallest.max(item.outer);
         }
         Ok(tallest)
+    }
+    /// The state before the item `at` is laid, from which it and those
+    /// after it may be laid again: none while an outside marker waits for
+    /// the next line, which the item's first line would take.
+    fn mark(&self, at: usize) -> Option<Mark> {
+        if !self.waiting.is_empty() {
+            return None;
+        }
+        let small = |n: usize| u32::try_from(n).ok();
+        let some = |n: Option<usize>| match n {
+            Some(n) => small(n).map(Some),
+            None => Some(None),
+        };
+        Some(Mark {
+            at: small(at)?,
+            lines: small(self.lines.len())?,
+            boxes: small(self.boxes.len())?,
+            markers: small(self.markers.len())?,
+            counted: (
+                small(self.counters.lines)?,
+                small(self.counters.fragments)?,
+                small(self.counters.indents)?,
+            ),
+            cuts: self.counters.cuts,
+            list_cursor: small(self.list_cursor)?,
+            last_baseline: self.last_baseline,
+            first_line: self.first_line,
+            first_index: some(self.first_index)?,
+            flex_watch: some(self.flex_watch)?,
+            flex_lead: some(self.flex_lead)?,
+            nested: small(self.nested.len())?,
+        })
+    }
+    /// Drops what was laid since `mark` and restores the state it held,
+    /// a unit of work for each line, box and marker dropped: each item is
+    /// laid whole, its floats, inline sequences and markers settled in it,
+    /// so the stacks it used are as `mark` found them.
+    fn restore(&mut self, mark: &Mark) -> Result<(), Error> {
+        let n = |n: u32| n as usize;
+        let (lines, boxes, markers) = (n(mark.lines), n(mark.boxes), n(mark.markers));
+        if !self.waiting.is_empty() || self.nested.len() != n(mark.nested) {
+            return Err(Error::Invalid);
+        }
+        let dropped = self.lines.len().saturating_sub(lines)
+            + self.boxes.len().saturating_sub(boxes)
+            + self.markers.len().saturating_sub(markers);
+        self.counters.step(dropped)?;
+        self.lines.truncate(lines);
+        self.boxes.truncate(boxes);
+        self.markers.truncate(markers);
+        let (counted, fragments, indents) = mark.counted;
+        (
+            self.counters.lines,
+            self.counters.fragments,
+            self.counters.indents,
+        ) = (n(counted), n(fragments), n(indents));
+        self.counters.cuts = mark.cuts;
+        self.list_cursor = n(mark.list_cursor);
+        self.last_baseline = mark.last_baseline;
+        self.first_line = mark.first_line;
+        self.first_index = mark.first_index.map(n);
+        self.flex_watch = mark.flex_watch.map(n);
+        self.flex_lead = mark.flex_lead.map(n);
+        // What an outermost container keeps from here is laid again.
+        self.filtered = (self.filtered.0.min(lines), self.filtered.1.min(markers));
+        Ok(())
+    }
+    /// The first of the marks from `marks` whose item is laid again in a
+    /// line `line` tall: stretched, its content holding percentages of
+    /// its height, which a stretched item's resolve against (§9.8), or
+    /// otherwise wanting it and stretched from the height it laid.
+    fn restretched(&self, marks: usize, line: f64) -> Result<Option<Mark>, Error> {
+        for mark in self.flex_marks.get(marks..).ok_or(Error::Invalid)? {
+            let item = self.flex.get(mark.at as usize).ok_or(Error::Invalid)?;
+            let Some(geometry) = item.geometry().and_then(|at| self.boxes.get(at)) else {
+                continue;
+            };
+            let content = stretched(item, geometry, line);
+            if item.wants() & PERCENT != 0 || units(content) != units(geometry.content.height) {
+                return Ok(Some(*mark));
+            }
+        }
+        Ok(None)
     }
     /// Lays the item `at`, a row's at `x` and the line's top, a column's
     /// at its main offset, keeping its own bounds and what it laid.
@@ -1308,7 +1569,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         id: BoxId,
         strut: StyleId,
         place: &Place,
-        x: f64,
+        (x, size): (f64, Option<f64>),
         depth: usize,
     ) -> Result<FlexItem, Error> {
         let mut item = *self.flex.get(at).ok_or(Error::Invalid)?;
@@ -1332,9 +1593,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             f64::NEG_INFINITY,
         );
         let laid = if column {
-            self.lay_column_item(&mut item, id, place, depth)
+            self.lay_column_item(&mut item, id, place, size, depth)
         } else {
-            self.lay_flex_item(&mut item, id, strut, place, x, depth)
+            self.lay_flex_item(&mut item, (id, strut), place, (x, size), depth)
         };
         let own = (self.left, self.top, self.right, self.bottom);
         (self.left, self.top, self.right, self.bottom) = outer;
@@ -1374,14 +1635,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         *self.flex.get_mut(at).ok_or(Error::Invalid)? = item;
         Ok(item)
     }
-    /// Lays one item at `x`, its margin box's left, and the line's top.
+    /// Lays one item at `x`, its margin box's left, and the line's top,
+    /// stretched to the line's cross size `size` where that is known.
     fn lay_flex_item(
         &mut self,
         item: &mut FlexItem,
-        id: BoxId,
-        strut: StyleId,
+        (id, strut): (BoxId, StyleId),
         place: &Place,
-        x: f64,
+        (x, size): (f64, Option<f64>),
         depth: usize,
     ) -> Result<(), Error> {
         let top = place.container.y;
@@ -1432,11 +1693,23 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         self.inline_table(child, dims, &room, top + dims.margin.top, depth + 1)?;
                     item.outer = height + dims.margin.vertical();
                     item.geometry = self.table_box(&c)?;
+                    let style = self.styled.style(c.style).ok_or(Error::Invalid)?;
+                    if percent_height(style) {
+                        self.flex_wants |= HEIGHT | PERCENT;
+                    }
                     return Ok(());
                 }
                 dims.width = px(item.target);
                 dims.margin.left = px(item.before);
                 dims.margin.right = px(item.after);
+                let stretched = item.cross == Cross::Stretch && size.is_some();
+                if let Some(line) = size.filter(|_| stretched) {
+                    let content = (line - dims.margin.vertical() - dims.decoration().vertical())
+                        .min(item.max_height)
+                        .max(item.min_height)
+                        .max(0.0);
+                    dims.height = Some(content);
+                }
                 let height = self.block(
                     child,
                     c,
@@ -1452,6 +1725,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     .filter(|at| self.boxes.get(*at).is_some_and(|g| g.node == c.node));
                 item.geometry = own.map(index).transpose()?.unwrap_or(NO_GEOMETRY);
                 item.outer = height + dims.margin.vertical();
+                if stretched {
+                    // Its height as laid at an auto height: what its line
+                    // and its container's content take.
+                    let natural = self.natural.min(dims.max_height).max(dims.min_height);
+                    item.outer = natural + dims.decoration().vertical() + dims.margin.vertical();
+                }
+                item.set_wants(self.flex_depends);
             }
         }
         Ok(())
@@ -1540,12 +1820,30 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     ) -> Result<(f64, f64, Option<f64>), Error> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         let gap = length(style, Property::RowGap, place.definite).map_or(0, |g| units(g.max(0.0)));
+        if percentage(style, Property::RowGap) {
+            self.flex_wants |= HEIGHT | PERCENT;
+        }
         let align = keyword(style, Property::AlignItems);
         let justified = main_justify(keyword(style, Property::JustifyContent), Lay::of(style));
         let floor = match place.definite {
             Some(height) => Some(units(height)),
             None => (dims.min_height > 0.0).then(|| units(dims.min_height)),
         };
+        let moved = matches!(
+            justified,
+            "end"
+                | "flex-end"
+                | "right"
+                | "center"
+                | "space-between"
+                | "space-around"
+                | "space-evenly"
+        );
+        // Its content lays otherwise at another definite height where
+        // free space would move its items.
+        if moved {
+            self.flex_wants |= HEIGHT;
+        }
         if floor.is_none() {
             return self.flex_column_laid(id, b, dims, &place, (base, gap, align), depth);
         }
@@ -1558,17 +1856,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         // bottom margin or growth: decided from styles before each item is
         // laid, as a table decides its rows'.
         let mut done = false;
-        let mut opened = matches!(
-            justified,
-            "end"
-                | "flex-end"
-                | "right"
-                | "center"
-                | "space-between"
-                | "space-around"
-                | "space-evenly"
-        );
+        let mut opened = moved;
         let (mut retained, mut outermost) = (false, false);
+        // The state before the first item whose content depends on its
+        // height, from which the column may be laid again once its items'
+        // sizes are resolved (below, "Laying again").
+        let (marking, mut settled) = (self.relaying < MAX_RELAY, false);
+        let marks = self.flex_marks.len();
         let mut y = 0i64;
         for at in base..end {
             if at > base {
@@ -1595,8 +1889,25 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 self.retain = self.retain.checked_add(1).ok_or(Error::Invalid)?;
                 retained = true;
             }
+            // Laid again only where a flex container or the column's
+            // height is definite, an item holding percentages then is and
+            // is the last marked (`laid_again`).
+            let pending = match self.flex.get(at).ok_or(Error::Invalid)?.source {
+                Source::Element(c) if marking && !settled => {
+                    let c = self.styled.box_node(c).ok_or(Error::Invalid)?;
+                    let again = place.definite.is_some() || self.flex_container(c)?;
+                    again.then(|| self.mark(at)).flatten()
+                }
+                _ => None,
+            };
             self.flex.get_mut(at).ok_or(Error::Invalid)?.laid = y;
-            let item = self.lay_one(at, id, b.style, &place, place.container.x, depth)?;
+            let laying = (place.container.x, None);
+            let item = self.lay_one(at, id, b.style, &place, laying, depth)?;
+            if let Some(mark) = pending.filter(|_| item.wants() != 0) {
+                self.counters.admit_growth(&mut self.flex_marks)?;
+                self.flex_marks.try_push(mark)?;
+                settled = place.definite.is_some() && item.wants() & PERCENT != 0;
+            }
             y = y.saturating_add(item.outer_main());
             if !coordinate(px(y)) {
                 return Err(Error::Limit("MAX_COORDINATE"));
@@ -1604,7 +1915,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             opened |= opens;
             if !done && floor.is_some_and(|floor| y >= floor) {
                 done = true;
-                if retained {
+                // An item that may be laid again holds the window: what
+                // it would filter would move under the marks.
+                if retained && self.flex_marks.len() == marks {
                     if outermost {
                         self.keep_window()?;
                     }
@@ -1628,6 +1941,15 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         let lay = Lay::of(style);
         self.place_items(base, end, room, gap, justified, lay)?;
+        let relaid = self.resized(marks, end, place.definite.is_some())?;
+        self.flex_marks.truncate(marks);
+        if let Some(mark) = relaid {
+            self.restore(&mark)?;
+            self.relaying += 1;
+            let laid = self.relay_column((id, b.style), &place, (mark.at as usize, end), depth);
+            self.relaying -= 1;
+            laid?;
+        }
         for at in base..end {
             self.settle(at)?;
         }
@@ -1642,6 +1964,78 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             None => None,
         };
         Ok((px(main.max(0)), px(y.max(0)), baseline))
+    }
+    /// The first of the marks from `marks` whose item is laid again at
+    /// its used main size: its content holding percentages of its height,
+    /// which resolve against it in a column of `definite` height (§9.8),
+    /// or otherwise wanting it and resized from the height it laid. Each
+    /// item from it to `end` keeps `HEIGHT` where it is laid again so, and
+    /// wants nothing else.
+    fn resized(&mut self, marks: usize, end: usize, definite: bool) -> Result<Option<Mark>, Error> {
+        let mut first = None;
+        for mark in self.flex_marks.get(marks..).ok_or(Error::Invalid)? {
+            let item = self.flex.get(mark.at as usize).ok_or(Error::Invalid)?;
+            if self.laid_again(item, definite)? {
+                first = Some(*mark);
+                break;
+            }
+        }
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        for at in first.at as usize..end {
+            let item = *self.flex.get(at).ok_or(Error::Invalid)?;
+            let again = item.wants() != 0 && self.laid_again(&item, definite)?;
+            let item = self.flex.get_mut(at).ok_or(Error::Invalid)?;
+            item.set_wants(if again { HEIGHT } else { 0 });
+        }
+        Ok(Some(first))
+    }
+    /// Whether the column item `item` is laid again at its used size: in
+    /// a column of `definite` height where its content holds percentages
+    /// of it or it is resized, else where it is resized and a flex
+    /// container.
+    fn laid_again(&self, item: &FlexItem, definite: bool) -> Result<bool, Error> {
+        if definite && item.wants() & PERCENT != 0 {
+            return Ok(true);
+        }
+        let resized = item
+            .geometry()
+            .and_then(|at| self.boxes.get(at))
+            .is_some_and(|g| units(g.content.height) != item.target);
+        if !resized || definite {
+            return Ok(resized);
+        }
+        // In a column of least height its used height is no definite one
+        // for percentages: a flex container in it is laid at it, as its
+        // own content's, and nothing else.
+        let Source::Element(child) = item.source else {
+            return Ok(false);
+        };
+        let c = self.styled.box_node(child).ok_or(Error::Invalid)?;
+        self.flex_container(c)
+    }
+    /// Lays the column items `start..end` again at their main offsets, as
+    /// resolved and placed, each marked by `resized` at its main size, the
+    /// rest as before, keeping their resolved sizes and margins.
+    fn relay_column(
+        &mut self,
+        (id, strut): (BoxId, StyleId),
+        place: &Place,
+        (start, end): (usize, usize),
+        depth: usize,
+    ) -> Result<(), Error> {
+        for at in start..end {
+            let item = *self.flex.get(at).ok_or(Error::Invalid)?;
+            let before = if item.autos.top { item.before } else { 0 };
+            self.flex.get_mut(at).ok_or(Error::Invalid)?.laid = item.x.saturating_add(before);
+            let size = (item.wants() != 0).then(|| px(item.target));
+            self.lay_one(at, id, strut, place, (place.container.x, size), depth)?;
+            let laid = self.flex.get_mut(at).ok_or(Error::Invalid)?;
+            (laid.x, laid.target, laid.before, laid.after) =
+                (item.x, item.target, item.before, item.after);
+        }
+        Ok(())
     }
     /// Lays a column of no definite or least height, which leaves its
     /// items no free space, so none grows or moves: each as it is met,
@@ -1668,7 +2062,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             item.laid = y;
             self.counters.admit_growth(&mut self.flex)?;
             self.flex.try_push(item)?;
-            let item = self.lay_one(base, id, b.style, place, place.container.x, depth)?;
+            let laying = (place.container.x, None);
+            let item = self.lay_one(base, id, b.style, place, laying, depth)?;
             let target = item.clamp(item.base);
             let laid = self.flex.get_mut(base).ok_or(Error::Invalid)?;
             (laid.target, laid.x) = (target, y);
@@ -1699,6 +2094,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         item: &mut FlexItem,
         id: BoxId,
         place: &Place,
+        size: Option<f64>,
         depth: usize,
     ) -> Result<(), Error> {
         let width = place.container.width;
@@ -1793,6 +2189,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     let laid = (child, dims, share);
                     let height = self.table_item(laid, &room, top + dims.margin.top, depth + 1)?;
                     item.geometry = self.table_box(&c)?;
+                    if percent_height(style) {
+                        self.flex_wants |= HEIGHT | PERCENT;
+                    }
                     height
                 } else {
                     let outer = dims.width
@@ -1816,6 +2215,41 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         }
                         _ => place.container.x + px(units(across(item.cross, free))),
                     };
+                    // In a column of least height its used height is no
+                    // definite one (§9.8): one of auto height is laid at it
+                    // as at its least and greatest, its content's
+                    // percentages of it auto.
+                    match size {
+                        Some(size) if place.definite.is_none() && dims.height.is_none() => {
+                            (dims.min_height, dims.max_height) = (size, size);
+                        }
+                        Some(_) => dims.height = size,
+                        None => {}
+                    }
+                    // Its content's percentages of its own percentage
+                    // height are no content of it (§4.5), which, measured
+                    // as at an auto height, it is laid again at its used
+                    // height for, whatever it holds: only where it is
+                    // marked to be (`flex_column`, `mark`).
+                    let measure = size.is_none()
+                        && place.definite.is_some()
+                        && self.relaying < MAX_RELAY
+                        && self.waiting.is_empty()
+                        && percentage(style, Property::Height);
+                    self.flex_measure = measure;
+                    // Its height as laid at an auto height is its
+                    // automatic minimum's content height, which binds
+                    // where its base is a definite `flex-basis` (one from
+                    // its height is never below it): a row in it lays its
+                    // stretched items so (`flex_rows`).
+                    let based = !matches!(
+                        style.get(Property::FlexBasis),
+                        Some(ComputedValue::Length(Length::Auto)) | None
+                    ) && length(style, Property::FlexBasis, place.definite).is_some();
+                    self.flex_natural = size.is_none()
+                        && based
+                        && length(style, Property::MinHeight, place.definite).is_none()
+                        && matches!(keyword(style, Property::OverflowY), "visible" | "clip");
                     let height = self.block(
                         child,
                         c,
@@ -1825,12 +2259,33 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         depth + 1,
                     )?;
                     natural = self.natural;
+                    let mut depends = self.flex_depends;
+                    if measure {
+                        depends |= HEIGHT | PERCENT;
+                    }
+                    // Percentages in it resolve once its column's height
+                    // is definite, and so its own after flexing (§9.8).
+                    if depends & PERCENT != 0 {
+                        self.flex_wants |= HEIGHT | PERCENT;
+                    }
+                    // Its container's content lays otherwise at another
+                    // definite height where it may grow, move or take a
+                    // share of that height: a percentage `flex-basis`
+                    // lays otherwise only where that height changes.
+                    if item.grow > 0
+                        || item.autos.top
+                        || item.autos.bottom
+                        || percentage(style, Property::FlexBasis)
+                    {
+                        self.flex_wants |= HEIGHT;
+                    }
                     let own = self
                         .boxes
                         .len()
                         .checked_sub(1)
                         .filter(|at| self.boxes.get(*at).is_some_and(|g| g.node == c.node));
                     item.geometry = own.map(index).transpose()?.unwrap_or(NO_GEOMETRY);
+                    item.set_wants(depends);
                     height
                 };
                 item.outer = height + dims.margin.vertical();

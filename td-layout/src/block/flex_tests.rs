@@ -1242,8 +1242,9 @@ mod cases {
             400.0,
         );
         assert_eq!(laid.border("r"), (0.0, 0.0, 400.0, 80.0));
-        // Grown, its items are not laid again: as laid, 20 px tall.
-        assert_eq!(laid.border("b"), (16.0, 0.0, 16.0, 20.0));
+        // Grown, it is laid again at its used height, its items
+        // stretched to it.
+        assert_eq!(laid.border("b"), (16.0, 0.0, 16.0, 80.0));
         assert_eq!(laid.border("c"), (0.0, 80.0, 400.0, 20.0));
     }
 

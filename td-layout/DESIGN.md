@@ -1394,13 +1394,14 @@ lies at the right and `flex-end` at the left, while `start`, `end`,
 and their lines kept, in tree order, each line of a wrapping one
 mirrored alone. Nothing moves across a line once laid.
 
-**Laying.** Each item is laid once, at its final x and the line's top:
-a block in its own context at its resolved main size, its used
-margins, its own height (a percentage of the container's definite
-height, else auto), and its percentages against the container's
-content width; an anonymous item as a cell's run, at its main size; a
-table by its table, as an inline table is laid (§5, "Inline-blocks"),
-in the room its main size and margins leave.
+**Laying.** Each item is laid once, at its final x and the line's top,
+or again at its used height (below, "Laying again"): a block in its own
+context at its resolved main size, its used margins, its own height (a
+percentage of the container's definite height, else auto), and its
+percentages against the container's content width; an anonymous item as
+a cell's run, at its main size; a table by its table, as an inline table
+is laid (§5, "Inline-blocks"), in the room its main size and margins
+leave.
 
 **Cross axis** (§9.4, §8.3, §8.4). A single line's cross size is the
 container's definite height, else its tallest item's margin box within
@@ -1422,13 +1423,23 @@ down only, as `safe` alignment has it. Then an item whose `align-self`
 whose height and vertical margins are auto, and which is a block, keeps
 what it laid and has its content and border heights rewritten to the
 line's less its margins, within its own min and max heights, as a cell
-takes its row's height; it is not laid again. Every other item is
-aligned in the line: `center`, `end`, `flex-end` and `self-end` move it
-down, auto vertical margins share positive free space as `margin: auto`
-centres, the baselines as below, and the rest leave it at the top. An
-item moves down only, its lines, boxes and markers with it as a cell's
-content moves (§5, "Tables", "Rows and cells"): one taller than the line
-stays at its top, as `safe` alignment has it.
+takes its row's height, unless its content wants that height (below,
+"Laying again"). A line whose cross size is known before its items are
+laid, the one line of a row that does not wrap and whose height is
+definite, or fixed by equal least and greatest heights as a flex
+container grown in a column of least height is laid, lays each stretched
+item at it once instead, the container's content height then its items'
+heights as laid at it. A row that is a column item whose base is a
+definite `flex-basis` and whose least height is automatic (`min-height:
+auto`, its overflow visible or clipped), its content's height then its
+minimum (§4.5), where a percentage in a stretched item is no content of
+it, lays its items as other lines do. Every other item is aligned in the
+line: `center`, `end`, `flex-end` and `self-end` move it down, auto
+vertical margins share positive free space as `margin: auto` centres,
+the baselines as below, and the rest leave it at the top. An item moves
+down only, its lines, boxes and markers with it as a cell's content
+moves (§5, "Tables", "Rows and cells"): one taller than the line stays
+at its top, as `safe` alignment has it.
 
 **Baselines** (§8.3, §8.5, §9.4 steps 6 and 7). In a row, an item
 aligned `baseline`, `first baseline` or `last baseline` (laid as
@@ -1493,24 +1504,25 @@ horizontal margin) the container's content width less its margins, as
 block flow gives it; any other its own width or its shrink-to-fit one
 (above, "Floats"), at the container's left, centre or right by its
 alignment, or as auto horizontal margins place it, which take the free
-space first, never left of the container, as `safe` alignment has it.
-A table item is laid as block flow lays one, its own auto horizontal
-margins sharing the room it leaves, else placed by its alignment as
-any other. An item's hypothetical main size is its definite
-`flex-basis` (a length, or a percentage of the container's definite
-height) or definite `height`, `box-sizing` applying, within its min and
-max heights and, where its `min-height` is auto and it is no scroll
-container (`overflow-y` visible or clip), its automatic minimum (§4.5):
-its content's height at an auto height (a flex container's its lines'
-or items' before its own height applies; a picture of specified width
-the height that width gives it were its `height` auto), or its own
-height where that is less, a table's its height as laid; else its
-height as laid. Each item is laid where the hypothetical sizes of those
-before it end, so that an item only moves down. Where the container's
-height is definite or has a minimum and the items leave free space,
-their lengths are resolved as a row's are, and they grow by
-`flex-grow`, each grown box's content and border heights rewritten as
-a stretch rewrites them; then auto vertical margins take what is left,
+space first, never left of the container, as `safe` alignment has it. A
+table item is laid as block flow lays one, its own auto horizontal
+margins sharing the room it leaves, else placed by its alignment as any
+other. An item's hypothetical main size is its definite `flex-basis` (a
+length, or a percentage of the container's definite height) or definite
+`height`, `box-sizing` applying, within its min and max heights and,
+where its `min-height` is auto and it is no scroll container
+(`overflow-y` visible or clip), its automatic minimum (§4.5): its
+content's height at an auto height (a flex container's its lines' or
+items' before its own height applies; a picture of specified width the
+height that width gives it were its `height` auto), or its own height
+where that is less, a table's its height as laid; else its height as
+laid. Each item is laid where the hypothetical sizes of those before it
+end, so that an item only moves down. Where the container's height is
+definite or has a minimum and the items leave free space, their lengths
+are resolved as a row's are, and they grow by `flex-grow`, each grown
+box's content and border heights rewritten as a stretch rewrites them,
+or the item laid again at its used height where its content wants it
+(below, "Laying again"); then auto vertical margins take what is left,
 else `justify-content` places the items in it, `left` and `right` as
 `start`. Each item then moves down by what grew and opened before it,
 its lines, boxes and markers with it. Items are not shrunk: where they
@@ -1519,11 +1531,69 @@ space moves none. So the sticky footer, a `body` column of `height:
 100%` in an `html` of `height: 100%` (or of a px `min-height`; td-css
 drops `vh`) whose `main` has `flex: 1`, grows its `main` and puts its
 footer at the bottom. A grown table item takes its share of the column,
-so what follows it lies below that, but its box keeps its rows'
-height: its rows are not laid again. A column of no definite or least
-height has no free space, so nothing in it grows or moves: each item
-is laid at its hypothetical size as it is met, as block flow lays a
-child.
+so what follows it lies below that, but its box keeps its rows' height:
+its rows are not laid again. A column of no definite or least height has
+no free space, so nothing in it grows or moves: each item is laid at its
+hypothetical size as it is met, as block flow lays a child.
+
+**Laying again** (§9.4 step 11, §9.8). A stretched or flexed item's used
+size is definite, and what it holds is laid against it: an item whose
+content would lay otherwise at another definite height of it is laid
+again at its used height, as a block of that explicit height lays it.
+Whether it would is a laid fact, gathered bottom-up as `block` lays a
+box on a page with flex containers: a box's content wants its height
+where a box in it, laid as its child or its item, has a percentage
+`height`, `min-height` or `max-height`, a relatively positioned one a
+percentage `top` or `bottom`, or a picture in its lines a percentage
+height, which also resolves against a height that does not change, once
+it is definite; where it is a flex container its height would move or
+stretch: a row that does not wrap holding an element item stretched,
+centred, at the end or with an auto vertical margin, or an anonymous
+item centred or at the end, a wrapping row whose `align-content` is not
+a start or whose `row-gap` is a percentage, a column holding an item
+that grows, has an auto vertical margin or a percentage `flex-basis`, or
+whose `justify-content` is not a start or `row-gap` a percentage; or
+where it is a column an item of which holds percentages of its height,
+which is definite once the column's is (§9.8). A box of auto height
+passes none of its content's wants on: a percentage of it stays auto at
+any height of its parent. So text, inline content and plain blocks never
+want, and a nest of stretched blocks holding them is never laid again.
+Once a line is laid and its cross size known, the first of its stretched
+items whose content holds percentages of its height, or wants its height
+and is stretched from the height it laid, and every item after it in the
+line, are laid again, once, at their places, each stretched one at the
+line's cross size; once a column of definite or least height is resolved
+and placed, the first item whose content wants its height and whose used
+height is other than it laid, or whose content holds percentages of it
+in a column of definite height, and every item after it, are laid again
+at their resolved offsets, each such one at its used height and the rest
+as before, so that nothing then moves. A column of least height gives no
+definite height (§9.8): there only an item that is a flex container is
+laid again, of auto height at its used height as its least and greatest,
+so its own lines or items are laid within it and percentages of it stay
+auto, as a percentage in any item there does, as browsers have it; a
+stretched item of a row there is definite once its line's height is
+known (§9.4 step 11), as anywhere. A flex container of px `height` grown
+there is still laid at its used height as a definite one, so a 50% item
+in it is half that height, where browsers keep it auto. An item of
+percentage height in a column of definite height lays its content for
+its hypothetical size and automatic minimum as at an auto height, so a
+percentage of that height in it is no content of it (§4.5), and is laid
+again at its used height whatever it holds; where it could not be, its
+first line awaited by an outside marker or itself laid in two open
+re-lays, it is laid once at its definite height. Before the first such
+item is laid its state is kept: the lines, boxes and markers laid, the
+line, fragment, indent and cut counts, the list cursor, the last
+baseline, a cell's first line and an inline flex container's first item
+and line, each item laid whole so that its floats, inline sequences and
+outside markers are settled within it. What was laid from it on is
+dropped and that state restored, then each item laid again, so its lines
+stay in tree order and an `<ol>` numbers as before. An outside marker
+waiting for the next line, which an item's first line would take, keeps
+that item from being laid again. Re-lays nest at most `MAX_RELAY` (2)
+deep: an item laid in two open re-lays is laid once, as at its
+hypothetical size, and so is everything it holds, as the build before
+lays it; nor is a line or column laid again inside them.
 
 **Measured widths.** Measured for a cell, a float, an inline-block or
 an item, a row's max-content width is the sum of its items'
@@ -1553,44 +1623,44 @@ or offsets would lay an item above, or in a line before, one laid before
 it, which the down-only, tree-order laying cannot; and items paint in
 tree order, not order-modified order. As in a cell (§5, "Tables"), a
 relative offset on a box within an item moves the baseline read from its
-lines, as browsers' do not; the item's own does not. A stretched or
-grown item's content is not laid again at its new size: a percentage
-height in it stays auto, where §9.8 makes it definite, and a flex
-container in it keeps the cross size its items were laid at, so a row
-grown in a column does not stretch its own items further: a card deck's
-footer that an auto top margin would put at the foot of a stretched card
-stays under its text, a card centred in a grown `main` stays at its top,
-and the holy grail's grown middle row does not stretch its columns to
-the height it grows to. A picture keeps the height its own size gives
-whatever width it flexes to, and a picture and a table are not
-stretched; a table item is never wider than its columns' preferred
-width, nor narrower than their minimum. A picture item in a column whose
-width its height gives is not shrunk below its laid height, where a
-browser would shrink it to its natural height and give it the width that
-height does: td keeps its ratio, taller than a browser's, rather than
-draw it distorted at its laid width; one whose width `max-width` clamps
-against a CSS height keeps block flow's size, off its ratio, where a
-browser restores it. A picture whose height a column's growth or
-shrinking changes keeps its laid width, so it is drawn off its ratio
-where its width is auto and it is not stretched (a 100x50 picture grown
-to 180 px is 100x180, a browser's 360x180). Nor do the automatic minimum
-and a flex container's content height reach an item whose content has a
-percentage height of the item's definite height: `<div style="flex: 1;
-height: 100%">` in a column of 300 px holding a `height: 100%` child
-keeps 300 px where a browser shrinks it to its share, the child
-resolving against 300 px as content; that waits for a grown item's
-content to be laid again. Cross-axis alignment and `align-content` are
-safe, as above. td does not scroll a box and draws one that would as
-visible (td-web/DESIGN.md §10), so a column never shrinks an item that
-would scroll or hides its overflow (`overflow-y` `auto`, `scroll` or
-`hidden`) below the height it laid, whatever its `min-height`,
-`flex-basis` or factors, where §4.5 lets it shrink to 0: a `main` that
-scrolls between a header and a footer in a browser, or a hidden box
-holding such a pane, is laid whole, its footer below it. One collapsed
-to a `height` or `max-height` of 0 still lays 0 tall and hides its
-content; `clip` keeps the spec's minimum. A container's lines, like a
-table's, are no inline-block's last in flow: `last_baseline` is restored
-around it (§5, "Inline-blocks", "Baseline").
+lines, as browsers' do not; the item's own does not. An item laid in two
+open re-lays keeps the content it was laid with at its hypothetical
+size, a percentage height in it auto and a flex container in it at the
+cross size its items were laid at (above, "Laying again"): a card's
+grown body three re-lays deep keeps its footer under its text. A
+stretched item of a wrapping row whose `align-content` grows its line is
+laid again at the line's own cross size, not the grown one; one whose
+first line an outside marker waits for is not laid again; and a table in
+block flow within an item, its percentage height of the item the only
+want, does not make the item laid again. An item after the first laid
+again in its line or column is laid again inside that re-lay, so reaches
+`MAX_RELAY` a level sooner than one before it: in a deck whose card's
+body is a growing column, the card is laid as browsers lay it where a
+sidebar of percentage height follows it, and its body at its
+hypothetical size where one comes before it. A picture keeps the height
+its own size gives whatever width it flexes to, and a picture and a
+table are not stretched; a table item is never wider than its columns'
+preferred width, nor narrower than their minimum. A picture item in a
+column whose width its height gives is not shrunk below its laid height,
+where a browser would shrink it to its natural height and give it the
+width that height does: td keeps its ratio, taller than a browser's,
+rather than draw it distorted at its laid width; one whose width
+`max-width` clamps against a CSS height keeps block flow's size, off its
+ratio, where a browser restores it. A picture whose height a column's
+growth or shrinking changes keeps its laid width, so it is drawn off its
+ratio where its width is auto and it is not stretched (a 100x50 picture
+grown to 180 px is 100x180, a browser's 360x180). Cross-axis alignment
+and `align-content` are safe, as above. td does not scroll a box and
+draws one that would as visible (td-web/DESIGN.md §10), so a column
+never shrinks an item that would scroll or hides its overflow
+(`overflow-y` `auto`, `scroll` or `hidden`) below the height it laid,
+whatever its `min-height`, `flex-basis` or factors, where §4.5 lets it
+shrink to 0: a `main` that scrolls between a header and a footer in a
+browser, or a hidden box holding such a pane, is laid whole, its footer
+below it. One collapsed to a `height` or `max-height` of 0 still lays 0
+tall and hides its content; `clip` keeps the spec's minimum. A
+container's lines, like a table's, are no inline-block's last in flow:
+`last_baseline` is restored around it (§5, "Inline-blocks", "Baseline").
 
 **Windows.** Whether anything will move down is decided from styles
 before what it moves is laid: in a row, an item aligned `center` or at
@@ -1611,10 +1681,19 @@ at most one flex line above it; a wrapping row whose lines
 `align-content` may move, once all are laid or they reach its definite
 or least height, past which no free space is left and the lines laid are
 aligned as they lie; a column once its items reach its definite or least
-height, past which nothing moves, or once all are laid. So a sticky
-footer's column holds nothing past its first screen: its `main` grows,
-but nothing before it does, so nothing moves it. A windowed layout
-equals the filtered whole one.
+height, past which nothing moves, or once all are laid. A line or column
+laid again is laid again before its items are final, and so before the
+window is kept from it: what is dropped is its own and its items', laid
+whole since the window was last kept, and what is laid again is laid at
+its final places, kept or filtered as it is met as anything laid is, the
+outermost container keeping the window from where it was dropped. A
+column keeps the window once its items reach its height only where none
+laid before then may be laid again, else once they are placed, so what
+is laid again is the same wherever the column lies, in a cell, a float
+or the page. So a sticky footer's column holds nothing past its first
+screen: its `main` grows, but nothing before it does or wants its
+height, so nothing moves it. A windowed layout equals the filtered whole
+one.
 
 **Bounds.** Each item is a 224-byte record, and each line a 24-byte one
 (a row that does not wrap holding one), in budgeted stacks a nested
@@ -1628,23 +1707,75 @@ measured at most once, charged as measuring is (`MEASURE_BOX` and its
 scalars), laid once and moved at most twice (its line by
 `align-content`, then itself in the line), its lines, boxes and markers
 a unit each. A line's baseline-sharing items are a unit each; an item's
-`order` is read with its `align-self`, and a row laid on one line
-where any is not 0 is a unit an item more and sorts their 8-byte keys in
-a budgeted scratch vector, without allocating more. Inline flex
-containers cost what as many inline-blocks holding flex containers do,
-linearly. Every size is clamped to `MAX_COORDINATE` and every factor to
-2^40 units of 2^-20, and the weights a share is taken by are scaled to
-fit 2^68 together, so every share is exact integer arithmetic within
-i128 whatever a page sets. Resolving charges a unit an item, and each
-pass of §9.7's loop three units an item, frozen or not: a pass freezes
-one item at least, so n items take n passes at most, but in 1/64 px each
-pass freezing one leaves the next a gap smaller by its share, and a
-cascade built to freeze one an item, factors halving, runs some 17
-passes for 16 items. Nested containers of auto width measure their
-content once a level, as nested floats and tables do (§5, "Tables",
-"Bounds"): charged, and refused by name past `MAX_LAYOUT_WORK`. A
-container's items are laid one level below it, as a block's children
-are, and `MAX_DEPTH` bounds the nesting.
+`order` is read with its `align-self`, and a row laid on one line where
+any is not 0 is a unit an item more and sorts their 8-byte keys in a
+budgeted scratch vector, without allocating more. Inline flex containers
+cost what as many inline-blocks holding flex containers do, linearly.
+Laying again (above) keeps a 104-byte mark, its counts 32-bit, for an
+item whose content wants its height only where it may be the first laid
+again. In a line, whose height is its tallest item's within its bounds,
+a stretched item is: certainly, where its content holds percentages of
+it or its stretch at the least or the greatest height the line may take
+is other than it laid, and then it is the last marked; never, where its
+stretch at the greatest is what it laid (at its `max-height`, or a line
+of definite height as tall); else only at a line taller than it, and
+then so is every item before it shorter and not at its `max-height`, so
+it is marked only where shorter than each such marked before it. In a
+column of definite height every item may be, until one holding
+percentages, which is laid again; in one of least height only a flex
+container may. The marks are a budgeted stack as the items' is, charged
+with the layout's output, so a row of 120,000 items each wanting its
+height (1.6 MiB), stretched with or without a `max-height`, and a column
+of definite height of 120,000 grown items each holding a percentage
+height, keep one mark each, laying in the bytes the build before did; a
+column of definite or least height whose items are each a grown flex
+container wanting its height keeps a mark for each, some 230 bytes an
+item as the stack grows (120,000 charge 26 MiB more than the build
+before, 227.9 MB, and 128,000 are refused `MAX_PAGE_BYTES`). What a
+box's content wants is a field `block` writes only on a page with flex
+containers, and an item keeps it in its geometry's spare bits, so the
+record stays 224 bytes. A percentage height in a table cell, which no
+`block` of the cell lays, makes the item holding the table want its
+height, laid again for nothing. A line or column is laid again in one
+pass, from the first item laid again, each line, box and marker it drops
+a unit of work: a line or column of n items each laid again costs about
+twice laying it once, more where the second lay takes another path, and
+one whose last item alone is laid again about one item more. A Bootstrap
+grid of `h-100` cards (a wrapping row of `col-4` columns, each card a
+column of percentage height) lays each column again at its line's
+height, each card then a column of definite height, so each column's
+content is laid twice: 1.6 to 2.15 times the build before's work, as the
+page holds more or less beside its cards (1.6 to 1.8 times on 2 MiB
+grids whose rows measure their columns' widths, 2.0 on 2 MiB grids of
+`border-box` cards, 2.15 on a smaller grid, 1,380,820 work against
+641,908, in 1.9 times the time). A box is laid once in each open lay of
+its ancestors' lines and columns, so where m of them lay again it is
+laid at most 1 + m + m(m - 1)/2 times, re-lays nesting at most
+`MAX_RELAY` deep; that work is charged as any laying and refused by name
+past `MAX_LAYOUT_WORK`. The worst a page asks is such a nest: 250
+growing columns each nested in the last, of `min-height: 100em` and a
+font a little smaller each, 1,751 bytes, each laid again at its grown
+height, cost 26.1 million work and 1.3 s, some 15,000 work an input
+byte; three such nests are refused `MAX_LAYOUT_WORK` after 3.3 s. The
+worst found nests rows and stretched columns: `<x><y>` 125 deep (1,751
+bytes, `x{display:flex;flex:1;font-size:.99em;min-height:100em}
+y{display:flex;flex-direction:column;flex:1}`), each row's column
+stretched and grown again, is refused `MAX_LAYOUT_WORK` after 1.3 s,
+where the build before laid it in 141,260 work: a page it laid is
+refused. 64 deep (897 bytes) costs 13.7 million work and 280 ms. Every
+size is clamped to `MAX_COORDINATE` and every factor to 2^40 units of
+2^-20, and the weights a share is taken by are scaled to fit 2^68
+together, so every share is exact integer arithmetic within i128
+whatever a page sets. Resolving charges a unit an item, and each pass of
+§9.7's loop three units an item, frozen or not: a pass freezes one item
+at least, so n items take n passes at most, but in 1/64 px each pass
+freezing one leaves the next a gap smaller by its share, and a cascade
+built to freeze one an item, factors halving, runs some 17 passes for 16
+items. Nested containers of auto width measure their content once a
+level, as nested floats and tables do (§5, "Tables", "Bounds"): charged,
+and refused by name past `MAX_LAYOUT_WORK`. A container's items are laid
+one level below it, as a block's children are, and `MAX_DEPTH` bounds
+the nesting.
 
 **Measured.** Release, the host of §6, §6's deterministic metrics,
 2026-11-24 under a load average of about 3.5, pinned to one CPU, medians
@@ -1683,7 +1814,36 @@ many navbars with one `order: -1` link, 87 ms and 2.9% more work; and
 2.0 MiB of 16,342 two-item inline flex containers in paragraphs, 49,026
 lines at 1280 px in 90 ms, 5,615,128 work, 83.1 MiB, against 82 ms,
 4,989,840 work and 85.6 MiB for 14,054 inline-blocks each holding such a
-row (71 ms, 79.6 MiB as block-level rows before).
+row (71 ms, 79.6 MiB as block-level rows before). Laying again
+(2026-11-24, load average 13 to 20, pinned to one CPU, least of five
+rounds of five, interleaved with the build before): the nine shapes
+without flex, navbars, flex rows, columns of definite height, rows of
+definite height and a sticky footer whose `main` holds text lay
+identical boxes, lines, markers and work, whole and windowed, at 1280,
+832 and 200 px, and a Bootstrap grid of 2.0 MiB as many boxes and lines
+in the same work, charging up to 736 bytes more for the mark stack on
+pages with flex, in the same time within the noise (42 to 79 ms, -3% to
++5%); none is laid again. 2.0 MiB of card decks (two column cards, a
+growing body and a footer each) lay none again where the cards are as
+tall, and 7,142 at 200 px, 13.5% more work and 74 ms against 59; 2.1 MiB
+of a shell of nested stretched rows and columns lays 9,998 again at 832
+and 200 px, each a row stretched to its line holding a stretched item,
+28% more work and 108 ms against 82, where its items' boxes are then
+stretched as browsers' are; 1.6 MiB of cards nesting four grown columns
+lays 9,522 again, two per card, 68% more work and 61 ms against 34.
+Laying again whatever a measured item holds, centred text, and marks for
+the first item a line may lay again (2026-11-25, load average 3 to 4,
+pinned to one CPU, least of three rounds of five) lay the shapes above
+as the previous sentence has them, those laid again the same re-lays and
+work, those with flex charging 240 to 928 bytes more than the build
+before for the mark stack; 2.0 MiB of navbars nesting rows of centred
+links lays none again, identical work, and 2.0 MiB of the `h-100` grid
+above 4,794 columns again, 1.7 times the work, 62 ms against 36,
+charging 2 KiB more. Marking from a line's bounds, a column of least
+height's flex containers laid at their used height, and a definite base
+the only one to lay a row at an auto height (2026-11-25, load average 3
+to 4, pinned to one CPU) lay every shape above as the build before them
+did, boxes, lines, markers and work, charging within 240 bytes of it.
 
 ## 6. Work bounds, resize and validation
 
