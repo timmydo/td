@@ -1698,8 +1698,9 @@ CSS background images and SVG are not fetched.
 byte offset in its decoded text on a scalar boundary, or before or
 after a replaced element. Places are ordered by the tree-order table,
 four bytes a node (1 MiB at td-html's `MAX_NODES`). td-layout lays
-normal flow, tables and flex rows in tree order (a flex item's lines,
-as a table cell's, item by item whatever its alignment moved; an
+normal flow, tables and flex containers in tree order (a flex item's
+lines, as a table cell's, item by item and line by line whatever its
+alignment moved or a `row-reverse` row mirrored; an
 anonymous item's naming its container and ending its paragraph,
 td-layout/DESIGN.md §5, "Flex"), puts a float's lines after
 the line it was met in (td-layout/DESIGN.md §5, "Floats") and an
@@ -2222,10 +2223,10 @@ Not shown, each a later amendment: script (§1); forms beyond what
 their elements lay out (a `button`'s or `textarea`'s text shows, an
 `input` nothing, and nothing is submitted); positioning other than
 static and relative (td-css computes no other, so `absolute`, `fixed`
-and `sticky` stay in flow); flex layout beyond td-layout's single
-row (a column, and a wrapping row whose items do not fit one line,
-laid as block flow, `order` and baseline alignment unread,
-td-layout/DESIGN.md §5, "Flex"), and grid
+and `sticky` stay in flow); flex layout's reversed lines and columns
+(`wrap-reverse` laid as `wrap`, `column-reverse` as `column`), a
+column's wrapping and shrinking, `order` and baseline alignment
+(td-layout/DESIGN.md §5, "Flex"), and grid
 until td-layout has it, laid in normal flow as td-layout specifies,
 nothing hidden by it; floats and inline-blocks, inline tables among them, are
 td-layout's
@@ -2559,8 +2560,9 @@ order; each is its own design amendment when it starts:
   `vertical-align`, find across an inline-block's edge (a browser's
   text runs on into it), a copy ending where a line starts with an
   inline-block taking the newline its first text would, then the rest
-  of flexbox (wrapping, columns, inline-flex's baseline, `order`) and
-  grid; pseudo-elements and
+  of flexbox (`wrap-reverse` and `column-reverse`, a column's wrapping
+  and shrinking, inline-flex's baseline, `order`) and grid;
+  pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.
 - **Pictures.** `srcset` and `<picture>`; an SVG subset.

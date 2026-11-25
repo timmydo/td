@@ -470,11 +470,10 @@ item's main axis, where it is the automatic minimum (td-layout/DESIGN.md
 
 The flex and alignment longhands compute to keywords, numbers and
 lengths only: no td-css computation depends on them but blockification
-on a parent's `display`. td-layout lays one row (td-layout/DESIGN.md
-§5, "Flex"): a column, and a wrapping row whose items do not fit
-one line, it lays as block flow for now, and it does not read
-`order`, `align-content` or `row-gap`. A flex factor clamps to
-MAX_ABSOLUTE_VALUE and
+on a parent's `display`. td-layout lays rows, wrapping rows and
+columns (td-layout/DESIGN.md §5, "Flex"), `wrap-reverse` as `wrap` and
+`column-reverse` as `column`, and does not read `order`. A flex factor
+clamps to MAX_ABSOLUTE_VALUE and
 `order`, an integer token, to the 32-bit range browsers keep it in.
 `flex-basis: content` is a keyword, auto and a length-percentage are
 lengths, as width's are; a gap's `normal` stays a keyword. Box Alignment

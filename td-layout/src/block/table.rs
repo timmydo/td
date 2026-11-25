@@ -12,6 +12,9 @@ use crate::{MAX_COLSPAN, MAX_COORDINATE, MAX_ROWSPAN, MAX_TABLE_COLUMNS};
 pub(super) enum Source<'e> {
     Root(BoxId, Dimensions),
     Inline(BoxId, Dimensions),
+    /// A table in a flex column: a root but for the share of the free
+    /// space its alignment puts before it where neither margin is auto.
+    Item(BoxId, Dimensions, f64),
     Anonymous(&'e Events, Range<usize>),
 }
 /// A table measured for its intrinsic widths: a table box, or a run of
@@ -456,6 +459,19 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         depth: usize,
     ) -> Result<(f64, Option<f64>), Error> {
         self.laid_table(Source::Inline(id, dims), place, y, depth)
+    }
+    /// Lays the table `id`, `dims` as a flex column's item at `y`: as
+    /// `table` lays one, its auto margins sharing the room it leaves,
+    /// else `share` of that room before it (DESIGN.md §5, "Flex").
+    pub(super) fn table_item(
+        &mut self,
+        (id, dims, share): (BoxId, Dimensions, f64),
+        place: &Place,
+        y: f64,
+        depth: usize,
+    ) -> Result<f64, Error> {
+        self.laid_table(Source::Item(id, dims, share), place, y, depth)
+            .map(|(height, _)| height)
     }
     fn laid_table(
         &mut self,
@@ -1368,8 +1384,12 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     ) -> Result<(f64, Option<f64>), Error> {
         let container = place.container;
         let inline = matches!(source, Source::Inline(..));
+        let share = match source {
+            Source::Item(_, _, share) => share,
+            _ => 0.0,
+        };
         let (frame, walk, margin, relative) = match source {
-            Source::Root(id, dims) | Source::Inline(id, dims) => {
+            Source::Root(id, dims) | Source::Inline(id, dims) | Source::Item(id, dims, _) => {
                 let b = self.styled.box_node(id).ok_or(Error::Invalid)?;
                 let frame = self.frame(
                     Some((id, &dims)),
@@ -1440,12 +1460,18 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             (true, false) => free,
             (false, _) => left.unwrap_or(0.0),
         };
+        // A flex column's alignment, which is no margin.
+        let aligned = if left_auto || right_auto {
+            0.0
+        } else {
+            free * share
+        };
         let margin_right = match (left_auto, right_auto) {
             (true, true) => free / 2.0,
             (false, true) => free,
             (_, false) => right.unwrap_or(0.0),
         };
-        let x = container.x + margin_left;
+        let x = container.x + margin_left + aligned;
         let content_x = x + decoration.left;
         // Columns' x from the content edge.
         let mut at = frame.across;

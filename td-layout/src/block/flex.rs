@@ -1,9 +1,9 @@
-//! CSS Flexbox 1 single-line row layout: flex items (§4), their base and
-//! hypothetical sizes and automatic minimum (§9.2, §4.5), resolving
+//! CSS Flexbox 1 layout: flex items (§4), their base and hypothetical
+//! sizes and automatic minimum (§9.2, §4.5), lines (§9.3), resolving
 //! flexible lengths (§9.7), main-axis alignment with auto margins and
-//! `justify-content` (§9.5, §8.1, §8.2), and the line's cross size,
-//! stretch and cross-axis alignment (§9.4, §8.3). See DESIGN.md §5,
-//! "Flex".
+//! `justify-content` (§9.5, §8.1, §8.2), and the lines' cross sizes,
+//! `align-content`, stretch and cross-axis alignment (§9.4, §8.3, §8.4),
+//! in rows, wrapping rows and columns. See DESIGN.md §5, "Flex".
 use super::table::{down, px, units};
 use super::*;
 use crate::flex_container;
@@ -36,26 +36,35 @@ struct Autos {
     bottom: bool,
 }
 
-/// How a flex container is laid: one row, one row where its items fit
-/// it unwrapped (`flex-wrap: wrap`), or block flow (a column).
+impl Autos {
+    /// Its main-axis margins' autos, at the main start and end.
+    fn main(self, column: bool) -> (bool, bool) {
+        if column {
+            (self.top, self.bottom)
+        } else {
+            (self.left, self.right)
+        }
+    }
+}
+
+/// How a flex container is laid: a column, or a row that may wrap and
+/// may run from the right.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Lay {
-    Row,
-    Wrap,
-    Column,
+pub(super) struct Lay {
+    column: bool,
+    wrap: bool,
+    reverse: bool,
 }
 
 impl Lay {
     pub(super) fn of(style: &ComputedStyle) -> Self {
-        if matches!(
-            keyword(style, Property::FlexDirection),
-            "column" | "column-reverse"
-        ) {
-            Lay::Column
-        } else if matches!(keyword(style, Property::FlexWrap), "wrap" | "wrap-reverse") {
-            Lay::Wrap
-        } else {
-            Lay::Row
+        let direction = keyword(style, Property::FlexDirection);
+        let column = matches!(direction, "column" | "column-reverse");
+        Self {
+            column,
+            // A column is one line, `wrap-reverse` laid as `wrap`.
+            wrap: !column && matches!(keyword(style, Property::FlexWrap), "wrap" | "wrap-reverse"),
+            reverse: direction == "row-reverse",
         }
     }
 }
@@ -102,7 +111,7 @@ enum Cross {
     Stretch,
 }
 
-/// A flex item: its sizes in 1/64 px, of its content box but for a
+/// A flex item: its main sizes in 1/64 px, of its content box but for a
 /// table's, whose are its border box's, and, once laid, what it laid.
 #[derive(Clone, Copy)]
 pub(super) struct FlexItem {
@@ -119,18 +128,21 @@ pub(super) struct FlexItem {
     /// Flex factors in 1/ONE.
     grow: i64,
     shrink: i64,
-    /// Its padding, border and margins but auto ones, horizontally.
+    /// Its padding, border and margins but auto ones, along the main axis.
     around: i64,
     /// Auto margins: left, right, top, bottom.
     autos: Autos,
-    /// Its used left and right margins.
-    left: i64,
-    right: i64,
+    /// Its used main-axis margins, at its main start and end: left and
+    /// right in a row, top and bottom in a column.
+    before: i64,
+    after: i64,
     frozen: bool,
     /// The sign of its last clamp: below its minimum, above its maximum.
     violation: i8,
-    /// Its margin box's x from the container's content edge.
+    /// Its margin box's main offset from the container's content edge,
+    /// and, in a column, the one it was laid at.
     x: i64,
+    laid: i64,
     cross: Cross,
     /// Its own min and max content heights, which a stretch keeps to.
     min_height: f64,
@@ -160,11 +172,12 @@ impl FlexItem {
             shrink: ONE,
             around: 0,
             autos: Autos::default(),
-            left: 0,
-            right: 0,
+            before: 0,
+            after: 0,
             frozen: false,
             violation: 0,
             x: 0,
+            laid: 0,
             cross,
             min_height: 0.0,
             max_height: f64::INFINITY,
@@ -191,6 +204,19 @@ impl FlexItem {
     fn clamp(&self, size: i64) -> i64 {
         size.min(self.max).max(self.min).max(0)
     }
+    /// Its hypothetical outer main size (§9.2 step 3).
+    fn outer_main(&self) -> i64 {
+        self.clamp(self.base).saturating_add(self.around)
+    }
+}
+
+/// A flex line: its items, a range of the item stack, and its cross
+/// size once laid.
+#[derive(Clone, Copy)]
+pub(super) struct FlexLine {
+    start: u32,
+    end: u32,
+    height: f64,
 }
 
 /// An index into the layout's output, which fits a u32 as `MAX_LINES`,
@@ -227,8 +253,9 @@ fn cross(own: &str, container: &str) -> Cross {
 }
 
 /// Where the item `at` of `count` starts past the space before it, of
-/// `free` laid by `justify-content` (§8.2): every share a floor of the
-/// cumulative one, so the shares sum exactly.
+/// `free` laid by `justify-content` (§8.2), or the line `at` by
+/// `align-content` (§8.4): every share a floor of the cumulative one, so
+/// the shares sum exactly.
 fn justify(value: &str, free: i64, at: i64, count: i64) -> i64 {
     let share = |part: i64, whole: i64| -> i64 {
         if whole <= 0 {
@@ -245,6 +272,30 @@ fn justify(value: &str, free: i64, at: i64, count: i64) -> i64 {
         "space-evenly" if free > 0 => share(at + 1, count + 1),
         "space-around" | "space-evenly" => center,
         _ => 0,
+    }
+}
+
+/// `justify-content` as laid from the main start: in a row from the
+/// right, `start`, `end`, `left` and `right`, which keep to the writing
+/// mode, swap, as the positions are mirrored after; in a column `left`
+/// and `right` are `start` (Box Alignment 3 §6.1).
+fn main_justify(value: &str, lay: Lay) -> &str {
+    match value {
+        "left" | "right" if lay.column => "start",
+        "start" | "left" if lay.reverse => "end",
+        "end" | "right" if lay.reverse => "start",
+        other => other,
+    }
+}
+
+/// 1/64 px rounded up, but for what lies within 1e-9 of a unit: a line
+/// or container that holds its tallest item.
+fn holding(v: f64) -> i64 {
+    let whole = units(v);
+    if px(whole) + 1e-9 < v {
+        whole + 1
+    } else {
+        whole
     }
 }
 
@@ -269,7 +320,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
     }
     /// The intrinsic widths of `b`'s content in 1/64 px: a row's its
-    /// items', else its children's as block flow, a column's among them.
+    /// items', else its children's as block flow, a column's the largest
+    /// of its items' contributions among them (§9.9.1).
     pub(super) fn box_content(
         &mut self,
         b: &BoxNode,
@@ -278,10 +330,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     ) -> Result<(i64, i64), Error> {
         if self.flex_container(b)? {
             let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
-            match Lay::of(style) {
-                Lay::Row => return self.flex_intrinsic(b, false, depth),
-                Lay::Wrap => return self.flex_intrinsic(b, true, depth),
-                Lay::Column => {}
+            let lay = Lay::of(style);
+            if !lay.column {
+                return self.flex_intrinsic(b, lay.wrap, depth);
             }
         }
         self.content_with(b.first_child, None, b.style, lead, depth)
@@ -362,11 +413,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         };
         Ok((least.max(0), most.saturating_add(gaps).max(0)))
     }
-    /// Lays the flex container `id`'s items in one row in its content
-    /// box, at `x`, `y` with `offset` and `dims` its own, as `block`
-    /// lays a block's children, and returns its content height: the
-    /// line's cross size (§9.4). A column, and a wrapping row whose
-    /// items do not fit it unwrapped, lay their children as block flow.
+    /// Lays the flex container `id`'s items in its content box, at `x`,
+    /// `y` with `offset` and `dims` its own, as `block` lays a block's
+    /// children, and returns its content height: its lines' cross sizes
+    /// and the gaps between them (§9.4), or a column's main size.
     #[cold]
     #[inline(never)]
     pub(super) fn flex_content(
@@ -376,7 +426,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         dims: &Dimensions,
         (x, y, offset): (f64, f64, (f64, f64)),
         depth: usize,
-    ) -> Result<f64, Error> {
+    ) -> Result<(f64, f64), Error> {
         if depth > self.counters.limits.depth {
             return Err(Error::Limit("MAX_DEPTH"));
         }
@@ -393,61 +443,65 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             block: Some(id),
         };
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
-        if Lay::of(style) != Lay::Column {
-            let base = self.flex.len();
-            let laid = self.flex_line(id, b, dims, place, base, depth);
-            self.flex.truncate(base);
-            if let Some(line) = laid? {
-                return Ok(line);
-            }
-        }
-        // A flex container is no list item, so has no inside marker.
-        self.children(b.first_child, None, place, depth, None)
+        let lay = Lay::of(style);
+        let (base, lines, retain) = (self.flex.len(), self.flex_lines.len(), self.retain);
+        let last_baseline = self.last_baseline;
+        let laid = if lay.column {
+            self.flex_column(id, b, dims, place, base, depth)
+        } else {
+            self.flex_rows(id, b, dims, place, (base, lines), depth)
+        };
+        // A container's lines, as a table's, are no inline-block's last.
+        self.last_baseline = last_baseline;
+        self.retain = retain;
+        self.flex.truncate(base);
+        self.flex_lines.truncate(lines);
+        laid
     }
-    fn flex_line(
+    /// Lays a row's items on its lines, one where it does not wrap, the
+    /// lines down the page `row-gap` apart (§9.3, §9.4, §8.4).
+    fn flex_rows(
         &mut self,
         id: BoxId,
         b: &BoxNode,
         dims: &Dimensions,
         place: Place,
-        base: usize,
+        (base, first): (usize, usize),
         depth: usize,
-    ) -> Result<Option<f64>, Error> {
+    ) -> Result<(f64, f64), Error> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+        let lay = Lay::of(style);
         let width = place.container.width;
         let room = down(width);
         let gap = length(style, Property::ColumnGap, Some(width)).map_or(0, |g| units(g.max(0.0)));
+        let row_gap = length(style, Property::RowGap, place.definite).map_or(0.0, |g| g.max(0.0));
+        let row_gap = px(units(row_gap));
         let align = keyword(style, Property::AlignItems);
         self.flex_items(b, align)?;
-        let count = self.flex.len() - base;
-        for at in base..self.flex.len() {
+        let end = self.flex.len();
+        for at in base..end {
             self.size_item(at, &place, depth)?;
         }
-        let gaps = gap.saturating_mul(count.saturating_sub(1) as i64);
-        // A wrapping row whose items' hypothetical sizes do not fit it
-        // unwrapped is laid as block flow, decided before anything is.
-        // Each item's base size, margins and padding with border are
-        // rounded to 1/64 px apart, half a unit each at most, and the
-        // room down: two units an item and one more are that rounding,
-        // so percentages summing to 100% fit at every width.
-        if Lay::of(style) == Lay::Wrap {
-            let items = self.flex.get(base..).ok_or(Error::Invalid)?;
-            let hypothetical = items.iter().fold(gaps, |sum, item| {
-                sum.saturating_add(item.clamp(item.base) + item.around)
-            });
-            let slack = 2i64.saturating_mul(count as i64).saturating_add(1);
-            if hypothetical > room.saturating_add(slack) {
-                return Ok(None);
-            }
-        }
-        self.resolve(base, room.saturating_sub(gaps), depth)?;
-        let justified = keyword(style, Property::JustifyContent);
-        self.place_items(base, room, gap, justified)?;
+        self.break_lines(base, end, room, gap, lay.wrap)?;
+        let justified = main_justify(keyword(style, Property::JustifyContent), lay);
         // Decided before anything is laid: whether any item will move
-        // down once the line's height is known.
-        let moves = self
+        // down once its line's cross size is known, and whether
+        // `align-content` may move lines laid before others, which free
+        // space in a container of definite or least height can, until
+        // the lines laid reach that height.
+        let content = keyword(style, Property::AlignContent);
+        let floor = place
+            .definite
+            .or((dims.min_height > 0.0).then_some(dims.min_height));
+        let mut spread = lay.wrap
+            && floor.is_some()
+            && !matches!(
+                content,
+                "start" | "flex-start" | "baseline" | "last baseline"
+            );
+        let aligned = self
             .flex
-            .get(base..)
+            .get(base..end)
             .ok_or(Error::Invalid)?
             .iter()
             .any(|item| {
@@ -455,69 +509,239 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     || item.autos.top
                     || item.autos.bottom
             });
-        let outermost = moves && self.retain == 0;
-        if moves {
+        let mut retained = spread || aligned;
+        let outermost = retained && self.retain == 0;
+        if retained {
             if outermost {
                 self.filtered = (self.lines.len(), self.markers.len());
             }
             self.retain = self.retain.checked_add(1).ok_or(Error::Invalid)?;
         }
-        let last_baseline = self.last_baseline;
-        let laid = self.lay_items(id, b.style, &place, base, depth);
-        let line = laid.and_then(|tallest| self.align_items(base, tallest, dims, &place));
-        self.last_baseline = last_baseline;
-        if moves {
+        let mut top = 0.0f64;
+        // Its lines' height before its own height applies.
+        let mut extent = 0.0f64;
+        for at in first..self.flex_lines.len() {
+            let line = *self.flex_lines.get(at).ok_or(Error::Invalid)?;
+            let (start, end) = (line.start as usize, line.end as usize);
+            let gaps = gap.saturating_mul(end.saturating_sub(start + 1) as i64);
+            self.resolve(start, end, room.saturating_sub(gaps), depth)?;
+            self.place_items(start, end, room, gap, justified, lay)?;
+            let row = Place {
+                container: Rect {
+                    y: place.container.y + top,
+                    ..place.container
+                },
+                ..place
+            };
+            let tallest = self.lay_items(id, b.style, &row, start, end, depth)?;
+            extent += px(holding(tallest.max(0.0)));
+            if at + 1 < self.flex_lines.len() {
+                extent += row_gap;
+            }
+            // One line: the container's definite height, else its items'
+            // within its own min and max heights (§9.4 step 8); one of
+            // several, its tallest item's (step 8).
+            let height = if lay.wrap {
+                tallest.max(0.0)
+            } else {
+                match place.definite {
+                    Some(height) => height,
+                    None => tallest.max(0.0).min(dims.max_height).max(dims.min_height),
+                }
+            };
+            let height = px(holding(height));
+            if !coordinate(top + height) {
+                return Err(Error::Limit("MAX_COORDINATE"));
+            }
+            self.flex_lines.get_mut(at).ok_or(Error::Invalid)?.height = height;
+            if !spread {
+                self.align_items(start, end, height)?;
+                // A line's items are final once aligned, as a table's row.
+                if outermost && retained {
+                    self.keep_window()?;
+                }
+            }
+            top += height;
+            // Lines reaching the container's height leave no free space:
+            // none spreads, and those laid are aligned as they lie.
+            if spread && floor.is_some_and(|floor| holding(floor) <= units(top)) {
+                spread = false;
+                for pending in first..=at {
+                    let line = *self.flex_lines.get(pending).ok_or(Error::Invalid)?;
+                    self.align_items(line.start as usize, line.end as usize, line.height)?;
+                }
+                if outermost {
+                    self.keep_window()?;
+                }
+                if !aligned {
+                    self.retain -= 1;
+                    retained = false;
+                }
+            }
+            if at + 1 < self.flex_lines.len() {
+                top += row_gap;
+            }
+        }
+        if !lay.wrap {
+            return Ok((top, extent));
+        }
+        let cross = match place.definite {
+            Some(height) => height,
+            None => top.min(dims.max_height).max(dims.min_height),
+        };
+        let cross = px(holding(cross));
+        if spread {
+            self.spread_lines(first, units(cross - top), content)?;
+            if outermost {
+                self.keep_window()?;
+            }
+        }
+        if retained {
             self.retain -= 1;
         }
-        let line = line?;
-        if outermost {
-            self.keep_window()?;
+        Ok((cross, extent))
+    }
+    /// Breaks the items `start..end` into lines (§9.3 step 5): each as
+    /// many as fit its room with the gaps between them, two units an item
+    /// and one more of it being their sizes' rounding to 1/64 px, so
+    /// percentages summing to 100% fit at every width; at least one.
+    fn break_lines(
+        &mut self,
+        start: usize,
+        end: usize,
+        room: i64,
+        gap: i64,
+        wrap: bool,
+    ) -> Result<(), Error> {
+        self.counters.step(end - start)?;
+        let mut first = start;
+        let mut used = 0i64;
+        for at in start..end {
+            let size = self.flex.get(at).ok_or(Error::Invalid)?.outer_main();
+            let count = (at - first) as i64;
+            if count == 0 {
+                used = size;
+                continue;
+            }
+            let next = used.saturating_add(gap).saturating_add(size);
+            let slack = 2i64.saturating_mul(count + 1).saturating_add(1);
+            if wrap && next > room.saturating_add(slack) {
+                self.flex_line(first, at)?;
+                first = at;
+                used = size;
+            } else {
+                used = next;
+            }
         }
-        Ok(Some(line))
+        if first < end || !wrap {
+            self.flex_line(first, end)?;
+        }
+        Ok(())
+    }
+    fn flex_line(&mut self, start: usize, end: usize) -> Result<(), Error> {
+        let line = FlexLine {
+            start: index(start)?,
+            end: index(end)?,
+            height: 0.0,
+        };
+        self.counters.admit_growth(&mut self.flex_lines)?;
+        self.flex_lines.try_push(line)?;
+        Ok(())
+    }
+    /// Places the lines from `first` in `free` space, the container's
+    /// cross size less theirs, by `align-content` (§8.4, §9.4 step 9,
+    /// §9.6 step 16):
+    /// `normal` and `stretch` grow each line by a share, the rest move
+    /// them; never up, as `safe` alignment. Then aligns each line's items.
+    fn spread_lines(&mut self, first: usize, free: i64, content: &str) -> Result<(), Error> {
+        let count = (self.flex_lines.len() - first) as i64;
+        let free = free.max(0);
+        let stretch = matches!(content, "normal" | "stretch");
+        let mut grown = 0i64;
+        for at in first..self.flex_lines.len() {
+            let n = (at - first) as i64;
+            let mut line = *self.flex_lines.get(at).ok_or(Error::Invalid)?;
+            let (shift, extra) = if stretch {
+                let before = grown;
+                grown = (i128::from(free) * i128::from(n + 1) / i128::from(count)) as i64;
+                (before, grown - before)
+            } else {
+                (justify(content, free, n, count), 0)
+            };
+            let (start, end) = (line.start as usize, line.end as usize);
+            if shift > 0 && start < end {
+                let span = |a: (u32, u32), b: (u32, u32)| (a.0 as usize, b.1 as usize);
+                let first = *self.flex.get(start).ok_or(Error::Invalid)?;
+                let last = *self.flex.get(end - 1).ok_or(Error::Invalid)?;
+                let laid = (
+                    span(first.lines, last.lines),
+                    span(first.boxes, last.boxes),
+                    span(first.markers, last.markers),
+                );
+                self.move_down(laid, px(shift))?;
+                for item in self.flex.get_mut(start..end).ok_or(Error::Invalid)? {
+                    if let Some(rect) = item.bounds.as_mut() {
+                        rect.y += px(shift);
+                    }
+                }
+            }
+            line.height += px(extra);
+            self.align_items(start, end, line.height)?;
+            *self.flex_lines.get_mut(at).ok_or(Error::Invalid)? = line;
+        }
+        Ok(())
     }
     /// The flex items of `b`, onto the stack: each element child, and
     /// each run of other children holding more than white space (§4).
     fn flex_items(&mut self, b: &BoxNode, align: &str) -> Result<(), Error> {
         let mut next = b.first_child;
-        let mut run: Option<BoxId> = None;
-        let mut solid = false;
-        loop {
-            let child = match next {
-                Some(id) => {
-                    self.counters.step(1)?;
-                    Some((id, *self.styled.box_node(id).ok_or(Error::Invalid)?))
-                }
-                None => None,
-            };
-            let element =
-                child.is_some_and(|(_, c)| matches!(c.kind, BoxKind::Block | BoxKind::Image));
-            if child.is_none() || element {
-                if let Some(first) = run.take().filter(|_| solid) {
-                    let item = FlexItem::new(Source::Run(first, next), cross("auto", align));
-                    self.counters.admit_growth(&mut self.flex)?;
-                    self.flex.try_push(item)?;
-                }
-                solid = false;
-            }
-            let Some((id, c)) = child else {
-                return Ok(());
-            };
-            if element {
+        while let Some(item) = self.next_flex_item(&mut next, align)? {
+            self.counters.admit_growth(&mut self.flex)?;
+            self.flex.try_push(item)?;
+        }
+        Ok(())
+    }
+    /// The flex item from `next` on, which it moves past: an element
+    /// child, or a run of other children up to the next element holding
+    /// more than white space; each child looked at a unit of work.
+    fn next_flex_item(
+        &mut self,
+        next: &mut Option<BoxId>,
+        align: &str,
+    ) -> Result<Option<FlexItem>, Error> {
+        let element = |c: &BoxNode| matches!(c.kind, BoxKind::Block | BoxKind::Image);
+        while let Some(first) = *next {
+            self.counters.step(1)?;
+            let c = *self.styled.box_node(first).ok_or(Error::Invalid)?;
+            if element(&c) {
+                *next = c.next_sibling;
                 let style = self.styled.style(c.style).ok_or(Error::Invalid)?;
                 let item = FlexItem::new(
-                    Source::Element(id),
+                    Source::Element(first),
                     cross(keyword(style, Property::AlignSelf), align),
                 );
-                self.counters.admit_growth(&mut self.flex)?;
-                self.flex.try_push(item)?;
-            } else {
-                run = run.or(Some(id));
+                return Ok(Some(item));
+            }
+            let mut solid = !self.blank(&c)?;
+            let mut cursor = c.next_sibling;
+            while let Some(at) = cursor {
+                let c = *self.styled.box_node(at).ok_or(Error::Invalid)?;
+                if element(&c) {
+                    break;
+                }
+                self.counters.step(1)?;
                 if !solid {
                     solid = !self.blank(&c)?;
                 }
+                cursor = c.next_sibling;
             }
-            next = c.next_sibling;
+            *next = cursor;
+            if solid {
+                let item = FlexItem::new(Source::Run(first, cursor), cross("auto", align));
+                return Ok(Some(item));
+            }
         }
+        Ok(None)
     }
     /// An item's flex base size, the bounds of its main size and its
     /// factors (§9.2 steps 3 and 4, §4.5), measuring its content at most
@@ -560,11 +784,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     width,
                     false,
                 );
-                (item.left, item.right) = (units(margin.left), units(margin.right));
+                (item.before, item.after) = (units(margin.left), units(margin.right));
                 let table = self.role(&c)? == Some(TableRole::Table);
                 let picture = c.kind == BoxKind::Image;
                 let decoration = dims.decoration().horizontal();
-                item.around = item.left + item.right;
+                item.around = item.before + item.after;
                 if !table {
                     item.around += units(decoration);
                 }
@@ -644,15 +868,16 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         *self.flex.get_mut(at).ok_or(Error::Invalid)? = item;
         Ok(())
     }
-    /// Resolves the items' flexible lengths in `room`, their content
-    /// width's less the gaps (§9.7): each item's target main size.
-    fn resolve(&mut self, base: usize, room: i64, depth: usize) -> Result<(), Error> {
-        let count = self.flex.len() - base;
+    /// Resolves the flexible lengths of the items `start..end` in `room`,
+    /// their line's main size less the gaps (§9.7): each item's target
+    /// main size.
+    fn resolve(&mut self, start: usize, end: usize, room: i64, depth: usize) -> Result<(), Error> {
+        let count = end - start;
         self.counters.step(count)?;
-        let items = self.flex.get_mut(base..).ok_or(Error::Invalid)?;
-        let hypothetical: i64 = items.iter().fold(0i64, |sum, item| {
-            sum.saturating_add(item.clamp(item.base) + item.around)
-        });
+        let items = self.flex.get_mut(start..end).ok_or(Error::Invalid)?;
+        let hypothetical: i64 = items
+            .iter()
+            .fold(0i64, |sum, item| sum.saturating_add(item.outer_main()));
         let growing = hypothetical < room;
         // Inflexible items take their hypothetical size.
         for item in items.iter_mut() {
@@ -665,7 +890,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         // A shrinking line's flexible items need their automatic minimum.
         if !growing {
-            for at in base..self.flex.len() {
+            for at in start..end {
                 let item = *self.flex.get(at).ok_or(Error::Invalid)?;
                 if !item.pending || item.frozen {
                     continue;
@@ -688,12 +913,12 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     .saturating_add(item.around)
             })
         };
-        let initial = room.saturating_sub(used(self.flex.get(base..).ok_or(Error::Invalid)?));
+        let initial = room.saturating_sub(used(self.flex.get(start..end).ok_or(Error::Invalid)?));
         loop {
             // Each pass visits every item, a unit each: a cascade of
             // freezes is charged as it goes.
             self.counters.step(3 * count)?;
-            let items = self.flex.get_mut(base..).ok_or(Error::Invalid)?;
+            let items = self.flex.get_mut(start..end).ok_or(Error::Invalid)?;
             let factors: i128 = items
                 .iter()
                 .filter(|item| !item.frozen)
@@ -761,26 +986,31 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             }
         }
     }
-    /// Each item's x and used horizontal margins: auto margins share the
-    /// positive free space, else `justify-content` places the items in
-    /// it, or past it where it is negative (§8.1, §8.2, §9.5).
+    /// Each item's main offset and used main margins: auto margins share
+    /// the positive free space, else `justify-content` places the items
+    /// in it, or past it where it is negative (§8.1, §8.2, §9.5): a
+    /// column's items never move up for it (`settle`). A row from the
+    /// right has its offsets mirrored.
     fn place_items(
         &mut self,
-        base: usize,
+        start: usize,
+        end: usize,
         room: i64,
         gap: i64,
         justified: &str,
+        lay: Lay,
     ) -> Result<(), Error> {
-        let items = self.flex.get_mut(base..).ok_or(Error::Invalid)?;
+        let items = self.flex.get_mut(start..end).ok_or(Error::Invalid)?;
         let count = items.len() as i64;
         let used = items.iter().fold(0i64, |sum, item| {
             sum.saturating_add(item.target).saturating_add(item.around)
         });
         let gaps = gap.saturating_mul((count - 1).max(0));
         let free = room.saturating_sub(used).saturating_sub(gaps);
+        let main = |item: &FlexItem| item.autos.main(lay.column);
         let autos = items
             .iter()
-            .map(|item| i64::from(item.autos.left) + i64::from(item.autos.right))
+            .map(|item| i64::from(main(item).0) + i64::from(main(item).1))
             .sum::<i64>();
         let mut cursor = 0i64;
         if free > 0 && autos > 0 {
@@ -792,79 +1022,110 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 after - before
             };
             for item in items.iter_mut() {
-                if item.autos.left {
-                    item.left = share(&mut seen);
+                let (before, after) = main(item);
+                if before {
+                    item.before = share(&mut seen);
                 }
-                if item.autos.right {
-                    item.right = share(&mut seen);
+                if after {
+                    item.after = share(&mut seen);
                 }
                 item.x = cursor;
                 cursor = cursor
-                    .saturating_add(
-                        item.target + item.around + item.left * i64::from(item.autos.left),
-                    )
-                    .saturating_add(item.right * i64::from(item.autos.right))
+                    .saturating_add(item.target + item.around + item.before * i64::from(before))
+                    .saturating_add(item.after * i64::from(after))
                     .saturating_add(gap);
             }
-            return Ok(());
+        } else {
+            for (at, item) in items.iter_mut().enumerate() {
+                let (before, after) = main(item);
+                if before {
+                    item.before = 0;
+                }
+                if after {
+                    item.after = 0;
+                }
+                item.x = cursor.saturating_add(justify(justified, free, at as i64, count));
+                cursor = cursor
+                    .saturating_add(item.target)
+                    .saturating_add(item.around)
+                    .saturating_add(gap);
+            }
         }
-        for (at, item) in items.iter_mut().enumerate() {
-            if item.autos.left {
-                item.left = 0;
+        if lay.reverse {
+            for item in items.iter_mut() {
+                let (before, after) = main(item);
+                let outer = item
+                    .target
+                    .saturating_add(item.around)
+                    .saturating_add(item.before * i64::from(before))
+                    .saturating_add(item.after * i64::from(after));
+                item.x = room.saturating_sub(item.x).saturating_sub(outer);
             }
-            if item.autos.right {
-                item.right = 0;
-            }
-            item.x = cursor.saturating_add(justify(justified, free, at as i64, count));
-            cursor = cursor
-                .saturating_add(item.target)
-                .saturating_add(item.around)
-                .saturating_add(gap);
         }
         Ok(())
     }
-    /// Lays each item once, at its x and the line's top, keeping what it
-    /// laid; returns the tallest margin box.
+    /// Lays the items `start..end` once each, at its x and the line's
+    /// top, keeping what it laid; returns the tallest margin box.
     fn lay_items(
         &mut self,
         id: BoxId,
         strut: StyleId,
         place: &Place,
-        base: usize,
+        start: usize,
+        end: usize,
         depth: usize,
     ) -> Result<f64, Error> {
         let mut tallest = 0.0f64;
-        for at in base..self.flex.len() {
-            let mut item = *self.flex.get(at).ok_or(Error::Invalid)?;
+        for at in start..end {
+            let item = self.flex.get(at).ok_or(Error::Invalid)?;
             let x = place.container.x + px(item.x);
-            let (lines, markers, boxes) = (self.lines.len(), self.markers.len(), self.boxes.len());
-            let outer = (self.left, self.top, self.right, self.bottom);
-            (self.left, self.top, self.right, self.bottom) = (
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                f64::NEG_INFINITY,
-            );
-            let laid = self.lay_flex_item(&mut item, id, strut, place, x, depth);
-            let own = (self.left, self.top, self.right, self.bottom);
-            (self.left, self.top, self.right, self.bottom) = outer;
-            laid?;
-            item.bounds = (own.0 <= own.2).then_some(Rect {
-                x: own.0,
-                y: own.1,
-                width: own.2 - own.0,
-                height: own.3 - own.1,
-            });
-            item.lines = (index(lines)?, index(self.lines.len())?);
-            item.markers = (index(markers)?, index(self.markers.len())?);
-            item.boxes = (index(boxes)?, index(self.boxes.len())?);
-            if !coordinate(item.outer) {
-                return Err(Error::Limit("MAX_COORDINATE"));
-            }
+            let item = self.lay_one(at, id, strut, place, x, depth)?;
             tallest = tallest.max(item.outer);
-            *self.flex.get_mut(at).ok_or(Error::Invalid)? = item;
         }
         Ok(tallest)
+    }
+    /// Lays the item `at`, a row's at `x` and the line's top, a column's
+    /// at its main offset, keeping its own bounds and what it laid.
+    fn lay_one(
+        &mut self,
+        at: usize,
+        id: BoxId,
+        strut: StyleId,
+        place: &Place,
+        x: f64,
+        depth: usize,
+    ) -> Result<FlexItem, Error> {
+        let mut item = *self.flex.get(at).ok_or(Error::Invalid)?;
+        let (lines, markers, boxes) = (self.lines.len(), self.markers.len(), self.boxes.len());
+        let outer = (self.left, self.top, self.right, self.bottom);
+        (self.left, self.top, self.right, self.bottom) = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        let laid = if Lay::of(self.styled.style(strut).ok_or(Error::Invalid)?).column {
+            self.lay_column_item(&mut item, id, place, depth)
+        } else {
+            self.lay_flex_item(&mut item, id, strut, place, x, depth)
+        };
+        let own = (self.left, self.top, self.right, self.bottom);
+        (self.left, self.top, self.right, self.bottom) = outer;
+        laid?;
+        item.bounds = (own.0 <= own.2).then_some(Rect {
+            x: own.0,
+            y: own.1,
+            width: own.2 - own.0,
+            height: own.3 - own.1,
+        });
+        item.lines = (index(lines)?, index(self.lines.len())?);
+        item.markers = (index(markers)?, index(self.markers.len())?);
+        item.boxes = (index(boxes)?, index(self.boxes.len())?);
+        if !coordinate(item.outer) {
+            return Err(Error::Limit("MAX_COORDINATE"));
+        }
+        *self.flex.get_mut(at).ok_or(Error::Invalid)? = item;
+        Ok(item)
     }
     /// Lays one item at `x`, its margin box's left, and the line's top.
     fn lay_flex_item(
@@ -907,7 +1168,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 if self.role(&c)? == Some(TableRole::Table) {
                     // A table sizes itself in the room its main size and
                     // margins leave, its own margins inside that room.
-                    let shift = if item.autos.left { px(item.left) } else { 0.0 };
+                    let shift = if item.autos.left {
+                        px(item.before)
+                    } else {
+                        0.0
+                    };
                     let room = Place {
                         container: Rect {
                             x: x + shift,
@@ -922,8 +1187,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     return Ok(());
                 }
                 dims.width = px(item.target);
-                dims.margin.left = px(item.left);
-                dims.margin.right = px(item.right);
+                dims.margin.left = px(item.before);
+                dims.margin.right = px(item.after);
                 let height = self.block(
                     child,
                     c,
@@ -943,33 +1208,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         }
         Ok(())
     }
-    /// The line's cross size, and each item stretched to it or moved down
-    /// within it by its auto margins or alignment (§9.4, §8.1, §8.3):
-    /// never up, as `safe` alignment. Returns the line's cross size.
-    fn align_items(
-        &mut self,
-        base: usize,
-        tallest: f64,
-        dims: &Dimensions,
-        place: &Place,
-    ) -> Result<f64, Error> {
-        // One line: the container's definite height, else its items'
-        // within its own min and max heights (§9.4 step 8).
-        let line = match place.definite {
-            Some(height) => height,
-            None => tallest.max(0.0).min(dims.max_height).max(dims.min_height),
-        };
-        // In whole 1/64 px, never less than it holds.
-        let whole = units(line);
-        let line = px(if px(whole) + 1e-9 < line {
-            whole + 1
-        } else {
-            whole
-        });
-        if !coordinate(line) {
-            return Err(Error::Limit("MAX_COORDINATE"));
-        }
-        for at in base..self.flex.len() {
+    /// Each of the items `start..end` stretched to their line's cross size
+    /// `line`, or moved down within it by its auto margins or alignment
+    /// (§9.4, §8.1, §8.3): never up, as `safe` alignment.
+    fn align_items(&mut self, start: usize, end: usize, line: f64) -> Result<(), Error> {
+        for at in start..end {
             let item = *self.flex.get(at).ok_or(Error::Invalid)?;
             let free = line - item.outer;
             if item.cross == Cross::Stretch {
@@ -1029,6 +1272,384 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 })?;
             }
         }
-        Ok(line)
+        Ok(())
+    }
+    /// Lays a column's items down the page at their hypothetical main
+    /// sizes, then grows them into free space a definite or least height
+    /// leaves and places them by auto margins or `justify-content`, each
+    /// moving down only (§9.2 to §9.7, §8.1, §8.2); returns its main size.
+    /// Items are not shrunk: where they overflow, they stay as laid.
+    fn flex_column(
+        &mut self,
+        id: BoxId,
+        b: &BoxNode,
+        dims: &Dimensions,
+        place: Place,
+        base: usize,
+        depth: usize,
+    ) -> Result<(f64, f64), Error> {
+        let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
+        let gap = length(style, Property::RowGap, place.definite).map_or(0, |g| units(g.max(0.0)));
+        let align = keyword(style, Property::AlignItems);
+        let justified = main_justify(keyword(style, Property::JustifyContent), Lay::of(style));
+        let floor = match place.definite {
+            Some(height) => Some(units(height)),
+            None => (dims.min_height > 0.0).then(|| units(dims.min_height)),
+        };
+        if floor.is_none() {
+            return self.flex_column_laid(id, b, dims, &place, (base, gap, align), depth);
+        }
+        self.flex_items(b, align)?;
+        let end = self.flex.len();
+        // Free space, and so any move, needs a definite or least height,
+        // and none is left once the items laid reach it. Short of it, an
+        // item moves only where `justify-content` places items off the
+        // start, by its own auto top margin, or by an earlier item's auto
+        // bottom margin or growth: decided from styles before each item is
+        // laid, as a table decides its rows'.
+        let mut done = false;
+        let mut opened = matches!(
+            justified,
+            "end"
+                | "flex-end"
+                | "right"
+                | "center"
+                | "space-between"
+                | "space-around"
+                | "space-evenly"
+        );
+        let (mut retained, mut outermost) = (false, false);
+        let mut y = 0i64;
+        for at in base..end {
+            if at > base {
+                y = y.saturating_add(gap);
+            }
+            let (moves, opens) = match self.flex.get(at).ok_or(Error::Invalid)?.source {
+                Source::Element(child) => {
+                    let c = self.styled.box_node(child).ok_or(Error::Invalid)?;
+                    let style = self.styled.style(c.style).ok_or(Error::Invalid)?;
+                    let auto = |p| length(style, p, Some(place.container.width)).is_none();
+                    let grows = factor(style, Property::FlexGrow) > 0;
+                    (
+                        auto(Property::MarginTop),
+                        grows || auto(Property::MarginBottom),
+                    )
+                }
+                Source::Run(..) => (false, false),
+            };
+            if !done && !retained && (opened || moves) {
+                outermost = self.retain == 0;
+                if outermost {
+                    self.filtered = (self.lines.len(), self.markers.len());
+                }
+                self.retain = self.retain.checked_add(1).ok_or(Error::Invalid)?;
+                retained = true;
+            }
+            self.flex.get_mut(at).ok_or(Error::Invalid)?.laid = y;
+            let item = self.lay_one(at, id, b.style, &place, place.container.x, depth)?;
+            y = y.saturating_add(item.outer_main());
+            if !coordinate(px(y)) {
+                return Err(Error::Limit("MAX_COORDINATE"));
+            }
+            opened |= opens;
+            if !done && floor.is_some_and(|floor| y >= floor) {
+                done = true;
+                if retained {
+                    if outermost {
+                        self.keep_window()?;
+                    }
+                    self.retain -= 1;
+                    retained = false;
+                }
+            }
+        }
+        let main = match place.definite {
+            Some(height) => units(height),
+            None => y.min(units(dims.max_height)).max(units(dims.min_height)),
+        };
+        let gaps = gap.saturating_mul(end.saturating_sub(base + 1) as i64);
+        let room = main.saturating_sub(gaps);
+        if y < main {
+            self.resolve(base, end, room, depth)?;
+        } else {
+            for item in self.flex.get_mut(base..end).ok_or(Error::Invalid)? {
+                item.target = item.clamp(item.base);
+            }
+        }
+        let lay = Lay::of(style);
+        self.place_items(base, end, room, gap, justified, lay)?;
+        for at in base..end {
+            self.settle(at)?;
+        }
+        if retained {
+            self.retain -= 1;
+            if outermost {
+                self.keep_window()?;
+            }
+        }
+        Ok((px(main.max(0)), px(y.max(0))))
+    }
+    /// Lays a column of no definite or least height, which leaves its
+    /// items no free space, so none grows or moves: each as it is met,
+    /// at its hypothetical main size, its record dropped once it is laid.
+    fn flex_column_laid(
+        &mut self,
+        id: BoxId,
+        b: &BoxNode,
+        dims: &Dimensions,
+        place: &Place,
+        (base, gap, align): (usize, i64, &str),
+        depth: usize,
+    ) -> Result<(f64, f64), Error> {
+        let mut next = b.first_child;
+        let mut y = 0i64;
+        let mut first = true;
+        while let Some(mut item) = self.next_flex_item(&mut next, align)? {
+            if !first {
+                y = y.saturating_add(gap);
+            }
+            first = false;
+            item.laid = y;
+            self.counters.admit_growth(&mut self.flex)?;
+            self.flex.try_push(item)?;
+            let item = self.lay_one(base, id, b.style, place, place.container.x, depth)?;
+            let target = item.clamp(item.base);
+            let laid = self.flex.get_mut(base).ok_or(Error::Invalid)?;
+            (laid.target, laid.x) = (target, y);
+            self.settle(base)?;
+            self.flex.truncate(base);
+            y = y.saturating_add(target).saturating_add(item.around);
+            if !coordinate(px(y)) {
+                return Err(Error::Limit("MAX_COORDINATE"));
+            }
+        }
+        Ok((px(y.min(units(dims.max_height)).max(0)), px(y.max(0))))
+    }
+    /// Lays one column item at its main offset as laid, at its cross
+    /// size: a stretched block the container's width less its margins,
+    /// any other its own or shrink-to-fit, placed across by its auto
+    /// margins or alignment; then its hypothetical main size, its laid
+    /// height but for a definite `flex-basis` (§9.2).
+    fn lay_column_item(
+        &mut self,
+        item: &mut FlexItem,
+        id: BoxId,
+        place: &Place,
+        depth: usize,
+    ) -> Result<(), Error> {
+        let width = place.container.width;
+        let top = place.container.y + px(item.laid);
+        let across = |cross: Cross, free: f64| match cross {
+            Cross::Center => (free / 2.0).max(0.0),
+            Cross::End => free.max(0.0),
+            _ => 0.0,
+        };
+        match item.source {
+            Source::Run(first, until) => {
+                let room = if item.cross == Cross::Stretch {
+                    width
+                } else {
+                    let (least, most) =
+                        self.content_with(Some(first), until, place.strut, None, depth + 1)?;
+                    px(most).min(px(least).max(width))
+                };
+                let x = place.container.x + px(units(across(item.cross, width - room)));
+                item.outer = self.children(
+                    Some(first),
+                    until,
+                    Place {
+                        container: Rect {
+                            x,
+                            y: top,
+                            width: room,
+                            height: 0.0,
+                        },
+                        definite: None,
+                        offset: place.offset,
+                        strut: place.strut,
+                        block: Some(id),
+                    },
+                    depth + 1,
+                    None,
+                )?;
+                item.base = holding(item.outer);
+                item.min = item.base;
+            }
+            Source::Element(child) => {
+                let c = *self.styled.box_node(child).ok_or(Error::Invalid)?;
+                let style = self.styled.style(c.style).ok_or(Error::Invalid)?;
+                item.grow = factor(style, Property::FlexGrow);
+                item.shrink = factor(style, Property::FlexShrink);
+                let side = |p| length(style, p, Some(width)).is_none();
+                item.autos = Autos {
+                    left: side(Property::MarginLeft),
+                    right: side(Property::MarginRight),
+                    top: side(Property::MarginTop),
+                    bottom: side(Property::MarginBottom),
+                };
+                let table = self.role(&c)? == Some(TableRole::Table);
+                let picture = c.kind == BoxKind::Image;
+                let stretch = item.cross == Cross::Stretch
+                    && !table
+                    && !picture
+                    && !item.autos.left
+                    && !item.autos.right
+                    && length(style, Property::Width, Some(width)).is_none();
+                let mut dims = if stretch || table {
+                    self.block_dimensions(&c, width, place.definite)?
+                } else {
+                    self.shrink_dimensions(child, &c, place, depth)?
+                };
+                // Auto main margins are 0 until free space is shared.
+                if item.autos.top {
+                    dims.margin.top = 0.0;
+                }
+                if item.autos.bottom {
+                    dims.margin.bottom = 0.0;
+                }
+                (item.before, item.after) = (units(dims.margin.top), units(dims.margin.bottom));
+                let vertical = dims.decoration().vertical();
+                let mut natural = 0.0;
+                let height = if table {
+                    // A table is laid as block flow lays one, its auto
+                    // margins sharing the room it leaves, else placed in
+                    // it by its alignment.
+                    let room = Place {
+                        container: Rect {
+                            y: top,
+                            ..place.container
+                        },
+                        ..*place
+                    };
+                    let share = match item.cross {
+                        Cross::Center => 0.5,
+                        Cross::End => 1.0,
+                        _ => 0.0,
+                    };
+                    let item = (child, dims, share);
+                    self.table_item(item, &room, top + dims.margin.top, depth + 1)?
+                } else {
+                    let outer = dims.width
+                        + dims.decoration().horizontal()
+                        + dims.margin.left
+                        + dims.margin.right;
+                    let free = width - outer;
+                    let x = match (item.autos.left, item.autos.right) {
+                        (true, true) => {
+                            dims.margin.left = (free / 2.0).max(0.0);
+                            dims.margin.right = (free - dims.margin.left).max(0.0);
+                            place.container.x
+                        }
+                        (true, false) => {
+                            dims.margin.left = free.max(0.0);
+                            place.container.x
+                        }
+                        (false, true) => {
+                            dims.margin.right = free.max(0.0);
+                            place.container.x
+                        }
+                        _ => place.container.x + px(units(across(item.cross, free))),
+                    };
+                    let height = self.block(
+                        child,
+                        c,
+                        dims,
+                        (x, top + dims.margin.top),
+                        place.offset,
+                        depth + 1,
+                    )?;
+                    natural = self.natural;
+                    let own = self
+                        .boxes
+                        .len()
+                        .checked_sub(1)
+                        .filter(|at| self.boxes.get(*at).is_some_and(|g| g.node == c.node));
+                    item.geometry = own.map(index).transpose()?;
+                    height
+                };
+                item.outer = height + dims.margin.vertical();
+                let decoration = if table { 0.0 } else { vertical };
+                item.around = item.before + item.after + units(decoration);
+                let laid = holding(height - decoration).max(0);
+                let border_box = keyword(style, Property::BoxSizing) == "border-box";
+                let content = |v: f64| {
+                    if border_box && !table {
+                        units((v - decoration).max(0.0))
+                    } else {
+                        units(v.max(0.0))
+                    }
+                };
+                let definite = place.definite;
+                let basis = match style.get(Property::FlexBasis) {
+                    Some(ComputedValue::Keyword(_)) => None,
+                    Some(ComputedValue::Length(Length::Auto)) | None => {
+                        length(style, Property::Height, definite).map(content)
+                    }
+                    Some(_) => length(style, Property::FlexBasis, definite).map(content),
+                };
+                let low = length(style, Property::MinHeight, definite).map(content);
+                item.max = length(style, Property::MaxHeight, definite).map_or(NONE, content);
+                let overflow = keyword(style, Property::OverflowY);
+                let automatic = low.is_none() && matches!(overflow, "visible" | "clip");
+                item.base = basis.unwrap_or(laid);
+                item.min = match low {
+                    Some(low) => low,
+                    // Its content's height at an auto height, or its own
+                    // where that is less (§4.5); a table's as laid.
+                    None if automatic && table => laid.min(item.max),
+                    None if automatic => holding(natural).min(laid).min(item.max),
+                    None => 0,
+                };
+                // td does not scroll a box (td-web/DESIGN.md §10): a box
+                // that would scroll, or hides what a scroll pane in it
+                // would, is no smaller than it laid.
+                if matches!(overflow, "auto" | "scroll" | "hidden") {
+                    item.min = item.min.max(laid);
+                }
+            }
+        }
+        item.bound();
+        Ok(())
+    }
+    /// Moves a column item down to its main offset and gives its box its
+    /// target main size and used auto margins.
+    fn settle(&mut self, at: usize) -> Result<(), Error> {
+        let item = *self.flex.get(at).ok_or(Error::Invalid)?;
+        let before = if item.autos.top { item.before } else { 0 };
+        let shift = item
+            .x
+            .saturating_add(before)
+            .saturating_sub(item.laid)
+            .max(0);
+        let shift = px(shift);
+        if shift != 0.0 {
+            let range = |(start, end): (u32, u32)| (start as usize, end as usize);
+            let laid = (range(item.lines), range(item.boxes), range(item.markers));
+            self.move_down(laid, shift)?;
+        }
+        if let Some(at) = item.geometry {
+            let geometry = self.boxes.get_mut(at as usize).ok_or(Error::Invalid)?;
+            let decoration = geometry.padding.plus(geometry.border_widths).vertical();
+            let content = px(item.target);
+            if units(geometry.content.height) != item.target {
+                geometry.content.height = content;
+                geometry.border.height = content + decoration;
+            }
+            if item.autos.top {
+                geometry.margin.top = px(item.before);
+            }
+            if item.autos.bottom {
+                geometry.margin.bottom = px(item.after);
+            }
+            let border = geometry.border;
+            self.bounds(border)?;
+        }
+        if let Some(rect) = item.bounds {
+            self.bounds(Rect {
+                y: rect.y + shift,
+                ..rect
+            })?;
+        }
+        Ok(())
     }
 }

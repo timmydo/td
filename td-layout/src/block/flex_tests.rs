@@ -602,96 +602,94 @@ mod cases {
         assert_eq!(measured("flex:1 0 100px"), (100.0, 100.0));
     }
 
-    /// A column lays its children as block flow, and so does a wrapping
-    /// row whose items' hypothetical sizes do not fit it unwrapped, as a
-    /// layout without flex did; one whose items fit lays one row.
-    #[test]
-    fn columns_and_wrapping_rows_that_do_not_fit_lay_as_block_flow() {
-        let stacked = |laid: &Laid, ids: &[&str], width: f64| {
-            for (at, id) in ids.iter().enumerate() {
-                let (x, y, w, _) = laid.border(id);
-                assert_eq!((x, w), (0.0, width), "{id}");
-                assert!(at == 0 || y >= laid.border(ids[at - 1]).1 + 20.0, "{id}");
-            }
-        };
-        let page = "<body id=f><header id=a>head</header><main id=b style=flex:1>main text</main>\
-                    <footer id=c>foot</footer>";
-        let css = "body{min-height:300px}#f{display:flex;flex-direction:column}";
-        let laid = Laid::new(page, css, 400.0);
-        stacked(&laid, &["a", "b", "c"], 400.0);
-        assert_eq!(laid.border("f").3, 300.0);
-        // Laid as the same page without flex.
-        let request = Request::new(400.0, 600.0);
-        assert_eq!(
-            drawn(&styled_layout(page, css, &request, Limits::default())),
-            drawn(&styled_layout(
-                page,
-                "body{min-height:300px}",
-                &request,
-                Limits::default()
-            ))
-        );
-        let words = "one two three four five six seven eight nine ten";
-        let laid = Laid::new(
-            &format!("<div id=f><p id=a>{words}<p id=b>{words}<p id=c>{words}</div>"),
-            "#f{display:flex;flex-direction:column-reverse}",
-            200.0,
-        );
-        stacked(&laid, &["a", "b", "c"], 200.0);
-        let cols = "<div id=f><div id=a>a</div><div id=b>b</div><div id=c>c</div>\
-                    <div id=d>d</div></div>";
-        for css in [
-            ".col{flex:0 0 100%;max-width:100%}",
-            ".col{width:100%}",
-            ".col{flex:0 0 50%}",
-            ".col{flex:0 0 130px}",
-        ] {
-            let laid = Laid::new(
-                &cols
-                    .replace("<div id=", "<div class=col id=")
-                    .replacen("class=col ", "", 1),
-                &format!("#f{{display:flex;flex-wrap:wrap;column-gap:4px}}{css}"),
-                400.0,
-            );
-            stacked(&laid, &["a", "b", "c", "d"], 400.0);
-            let laid = Laid::new(
-                &cols
-                    .replace("<div id=", "<div class=col id=")
-                    .replacen("class=col ", "", 1),
-                &format!("#f{{display:flex;flex-wrap:wrap-reverse;column-gap:4px}}{css}"),
-                400.0,
-            );
-            stacked(&laid, &["a", "b", "c", "d"], 400.0);
+    fn cols(n: usize) -> String {
+        let mut html = String::from("<div id=f>");
+        for id in ["a", "b", "c", "d", "e", "f"].iter().take(n) {
+            html.push_str(&format!("<div class=col id={id}>{id}</div>"));
         }
-        // Items that fit, the gaps with them, lay one row.
+        html + "</div>"
+    }
+
+    /// A wrapping row breaks its items into lines, each as many as fit it
+    /// with the gaps between them, each line its tallest item's height,
+    /// the lines `row-gap` apart: Bootstrap's halves lay two by two, and
+    /// the inputs a layout of one row or of block flow got wrong lay as
+    /// browsers lay them.
+    #[test]
+    fn wrapping_rows_break_into_lines() {
+        let wrap = "#f{display:flex;flex-wrap:wrap}";
+        let laid = Laid::new(&cols(4), &format!("{wrap}.col{{flex:0 0 50%}}"), 400.0);
+        assert_eq!(
+            [
+                laid.border("a"),
+                laid.border("b"),
+                laid.border("c"),
+                laid.border("d")
+            ],
+            [
+                (0.0, 0.0, 200.0, 20.0),
+                (200.0, 0.0, 200.0, 20.0),
+                (0.0, 20.0, 200.0, 20.0),
+                (200.0, 20.0, 200.0, 20.0)
+            ]
+        );
+        assert_eq!(laid.border("f"), (0.0, 0.0, 400.0, 40.0));
+        // wrap-reverse is laid as wrap.
+        let reverse = Laid::new(
+            &cols(4),
+            "#f{display:flex;flex-wrap:wrap-reverse}.col{flex:0 0 50%}",
+            400.0,
+        );
+        assert_eq!(drawn(&reverse.out), drawn(&laid.out));
+        for css in [".col{flex:0 0 100%;max-width:100%}", ".col{width:100%}"] {
+            let laid = Laid::new(&cols(3), &format!("{wrap}{css}"), 400.0);
+            assert_eq!(
+                laid.spans(&["a", "b", "c"]),
+                vec![(0.0, 400.0), (0.0, 400.0), (0.0, 400.0)]
+            );
+            assert_eq!(
+                [laid.border("a").1, laid.border("b").1, laid.border("c").1],
+                [0.0, 20.0, 40.0]
+            );
+        }
+        // Three of 130 px and two gaps fit 400; the fourth wraps, a
+        // row-gap below.
         let laid = Laid::new(
-            &cols
-                .replace("<div id=", "<div class=col id=")
-                .replacen("class=col ", "", 1),
-            "#f{display:flex;flex-wrap:wrap;column-gap:4px}.col{flex:0 0 97px}",
+            &cols(4),
+            "#f{display:flex;flex-wrap:wrap;gap:10px 4px}.col{flex:0 0 130px}",
             400.0,
         );
         assert_eq!(
             laid.spans(&["a", "b", "c", "d"]),
-            vec![(0.0, 97.0), (101.0, 97.0), (202.0, 97.0), (303.0, 97.0)]
+            vec![(0.0, 130.0), (134.0, 130.0), (268.0, 130.0), (0.0, 130.0)]
         );
-        // A pixel over is no rounding: stacked.
+        assert_eq!(laid.border("d").1, 30.0);
+        assert_eq!(laid.border("f").3, 50.0);
+        // Four of 97 px and three gaps fill 400 exactly; at 97.25 px the
+        // fourth wraps.
         let laid = Laid::new(
-            &cols
-                .replace("<div id=", "<div class=col id=")
-                .replacen("class=col ", "", 1),
+            &cols(4),
+            "#f{display:flex;flex-wrap:wrap;column-gap:4px}.col{flex:0 0 97px}",
+            400.0,
+        );
+        assert_eq!(laid.border("d"), (303.0, 0.0, 97.0, 20.0));
+        let laid = Laid::new(
+            &cols(4),
             "#f{display:flex;flex-wrap:wrap;column-gap:4px}.col{flex:0 0 97.25px}",
             400.0,
         );
-        stacked(&laid, &["a", "b", "c", "d"], 400.0);
+        assert_eq!(laid.border("c").0, 202.5);
+        assert_eq!(laid.border("d"), (0.0, 20.0, 97.25, 20.0));
+        // Each line is its tallest item's height, which a stretched item
+        // takes; a line's items grow into its free space.
         let laid = Laid::new(
-            &cols
-                .replace("<div id=", "<div class=col id=")
-                .replacen("class=col ", "", 1),
-            "#f{display:flex;flex-wrap:wrap}.col{flex:1 1 25%}",
+            "<div id=f><div id=a>x<br>y</div><div id=b>b</div><div id=c>c</div></div>",
+            "#f{display:flex;flex-wrap:wrap}#a,#b{flex:0 0 150px}#c{flex:1 0 300px}",
             400.0,
         );
-        assert_eq!(laid.border("d"), (300.0, 0.0, 100.0, 20.0));
+        assert_eq!(laid.border("a"), (0.0, 0.0, 150.0, 40.0));
+        assert_eq!(laid.border("b"), (150.0, 0.0, 150.0, 40.0));
+        assert_eq!(laid.border("c"), (0.0, 40.0, 400.0, 20.0));
         // A wrapping row measures as its widest item at least and its
         // items' sum at most, and lays at what it measured.
         let css = "#g{display:flex;flex-wrap:wrap;column-gap:6px}#w{float:left}";
@@ -701,7 +699,8 @@ mod cases {
         assert_eq!(laid.spans(&["a", "b"]), vec![(0.0, 16.0), (22.0, 48.0)]);
         let laid = Laid::new(html, css, 20.0);
         assert_eq!(laid.border("w").2, 24.0);
-        assert_eq!(laid.spans(&["a", "b"]), vec![(0.0, 24.0), (0.0, 24.0)]);
+        assert_eq!(laid.border("a"), (0.0, 0.0, 16.0, 20.0));
+        assert_eq!(laid.border("b"), (0.0, 20.0, 24.0, 40.0));
         // A text run is an item measured alike.
         let laid = Laid::new(
             "<div id=w><div id=g><b id=b>cd efg</b>ab</div></div>",
@@ -709,14 +708,473 @@ mod cases {
             20.0,
         );
         assert_eq!(laid.border("w").2, 24.0);
-        // A column measures as block flow.
+    }
+
+    /// Lines in a container of definite or least height are placed by
+    /// `align-content`, `normal` stretching them; without one they pack
+    /// at the start, and they never move up.
+    #[test]
+    fn align_content_places_the_lines() {
+        let tops = |content: &str, height: &str| {
+            let laid = Laid::new(
+                &cols(4),
+                &format!(
+                    "#f{{display:flex;flex-wrap:wrap;align-content:{content};{height}}}\
+                     .col{{flex:0 0 50%}}"
+                ),
+                400.0,
+            );
+            (laid.border("a").1, laid.border("c").1, laid.border("c").3)
+        };
+        let definite = "height:200px";
+        assert_eq!(tops("flex-start", definite), (0.0, 20.0, 20.0));
+        assert_eq!(tops("start", definite), (0.0, 20.0, 20.0));
+        assert_eq!(tops("end", definite), (160.0, 180.0, 20.0));
+        assert_eq!(tops("flex-end", definite), (160.0, 180.0, 20.0));
+        assert_eq!(tops("center", definite), (80.0, 100.0, 20.0));
+        assert_eq!(tops("space-between", definite), (0.0, 180.0, 20.0));
+        assert_eq!(tops("space-around", definite), (40.0, 140.0, 20.0));
+        assert_eq!(tops("space-evenly", definite), (53.328125, 126.65625, 20.0));
+        assert_eq!(tops("stretch", definite), (0.0, 100.0, 100.0));
+        assert_eq!(tops("normal", definite), (0.0, 100.0, 100.0));
+        assert_eq!(tops("normal", "min-height:200px"), (0.0, 100.0, 100.0));
+        assert_eq!(tops("center", "min-height:200px"), (80.0, 100.0, 20.0));
+        // No height: packed at the start; too little: not moved up.
+        assert_eq!(tops("center", ""), (0.0, 20.0, 20.0));
+        assert_eq!(tops("center", "height:30px"), (0.0, 20.0, 20.0));
+        assert_eq!(tops("end", "height:30px"), (0.0, 20.0, 20.0));
+        assert_eq!(tops("normal", "height:30px"), (0.0, 20.0, 20.0));
+        // Items aligned in a stretched line.
         let laid = Laid::new(
-            html,
+            &cols(4),
+            "#f{display:flex;flex-wrap:wrap;height:200px;align-items:center}\
+             .col{flex:0 0 50%}",
+            400.0,
+        );
+        assert_eq!((laid.border("a").1, laid.border("c").1), (40.0, 140.0));
+    }
+
+    /// A column lays its items down the page, stretched across or at
+    /// their shrink-to-fit widths placed by their alignment or auto
+    /// margins; grows them into the free space of a definite or least
+    /// height, or places them in it by auto margins or
+    /// `justify-content`: the sticky footer.
+    #[test]
+    fn columns_lay_down_the_page() {
+        let page = "<body id=f><header id=a>head</header><main id=b style=flex:1>main text</main>\
+                    <footer id=c>foot</footer>";
+        let laid = Laid::new(
+            page,
+            "body{min-height:300px}#f{display:flex;flex-direction:column}",
+            400.0,
+        );
+        assert_eq!(
+            [laid.border("a"), laid.border("b"), laid.border("c")],
+            [
+                (0.0, 0.0, 400.0, 20.0),
+                (0.0, 20.0, 400.0, 260.0),
+                (0.0, 280.0, 400.0, 20.0)
+            ]
+        );
+        assert_eq!(laid.border("f").3, 300.0);
+        let items = "<div id=f><i id=a>ab</i><i id=b>abcd</i></div>";
+        let at = |css: &str| {
+            let laid = Laid::new(
+                items,
+                &format!("#f{{display:flex;flex-direction:column;{css}}}i{{display:block}}"),
+                400.0,
+            );
+            (laid.border("a"), laid.border("b"))
+        };
+        assert_eq!(at(""), ((0.0, 0.0, 400.0, 20.0), (0.0, 20.0, 400.0, 20.0)));
+        assert_eq!(
+            at("align-items:center"),
+            ((192.0, 0.0, 16.0, 20.0), (184.0, 20.0, 32.0, 20.0))
+        );
+        assert_eq!(
+            at("align-items:end"),
+            ((384.0, 0.0, 16.0, 20.0), (368.0, 20.0, 32.0, 20.0))
+        );
+        assert_eq!(
+            at("align-items:flex-start"),
+            ((0.0, 0.0, 16.0, 20.0), (0.0, 20.0, 32.0, 20.0))
+        );
+        assert_eq!(at("row-gap:10px").1, (0.0, 30.0, 400.0, 20.0));
+        // Cross auto margins: centred, or at the end.
+        let laid = Laid::new(
+            items,
+            "#f{display:flex;flex-direction:column}i{display:block}#a{margin:0 auto}\
+             #b{margin-left:auto}",
+            400.0,
+        );
+        assert_eq!(
+            (laid.border("a"), laid.border("b")),
+            ((192.0, 0.0, 16.0, 20.0), (368.0, 20.0, 32.0, 20.0))
+        );
+        let justified = |css: &str| at(&format!("height:200px;{css}"));
+        let tops = |css: &str| {
+            let (a, b) = justified(css);
+            (a.1, b.1)
+        };
+        assert_eq!(tops("justify-content:flex-start"), (0.0, 20.0));
+        assert_eq!(tops("justify-content:end"), (160.0, 180.0));
+        assert_eq!(tops("justify-content:center"), (80.0, 100.0));
+        assert_eq!(tops("justify-content:space-between"), (0.0, 180.0));
+        assert_eq!(tops("justify-content:space-around"), (40.0, 140.0));
+        assert_eq!(tops("justify-content:space-evenly"), (53.328125, 126.65625));
+        assert_eq!(tops("justify-content:right"), (0.0, 20.0));
+        // Too little room: neither shrunk nor moved up.
+        assert_eq!(
+            at("height:30px;justify-content:end"),
+            ((0.0, 0.0, 400.0, 20.0), (0.0, 20.0, 400.0, 20.0))
+        );
+        // A main auto margin takes the free space first.
+        let laid = Laid::new(
+            items,
+            "#f{display:flex;flex-direction:column;height:200px;justify-content:center}\
+             i{display:block}#b{margin-top:auto}",
+            400.0,
+        );
+        assert_eq!(laid.border("b"), (0.0, 180.0, 400.0, 20.0));
+        assert_eq!(laid.geometry("b").margin.top, 160.0);
+        // Growing: equally from a basis of 0, by factors, within bounds.
+        let (a, b) = justified("}i{flex:1");
+        assert_eq!(
+            (a, b),
+            ((0.0, 0.0, 400.0, 100.0), (0.0, 100.0, 400.0, 100.0))
+        );
+        let (a, b) = justified("}#a{flex-grow:3}#b{flex-grow:1;max-height:30px");
+        assert_eq!((a.3, b.1, b.3), (170.0, 170.0, 30.0));
+        // Not below its content's height, its automatic minimum.
+        let laid = Laid::new(
+            "<div id=f><i id=a>a<br>b<br>c</i><i id=b>d</i></div>",
+            "#f{display:flex;flex-direction:column;height:100px}i{display:block;flex:1}",
+            400.0,
+        );
+        assert_eq!(
+            (laid.border("a").3, laid.border("b")),
+            (60.0, (0.0, 60.0, 400.0, 40.0))
+        );
+        // A definite basis, a length or a percentage of the height.
+        let (a, b) = justified("}#a{flex:0 0 50px}#b{flex:0 0 25%");
+        assert_eq!((a.3, b.1, b.3), (50.0, 50.0, 50.0));
+        // column-reverse is laid as column, and a column does not wrap.
+        for css in [
+            "flex-direction:column-reverse",
+            "flex-flow:column wrap;height:30px",
+        ] {
+            let laid = Laid::new(
+                items,
+                &format!("#f{{display:flex;{css}}}i{{display:block}}"),
+                400.0,
+            );
+            assert_eq!(laid.border("b"), (0.0, 20.0, 400.0, 20.0), "{css}");
+        }
+        // A column measures as its widest item.
+        let laid = Laid::new(
+            "<div id=w><div id=g><b id=a>ab</b><b id=b>cd efg</b></div></div>",
             "#g{display:flex;flex-direction:column}#w{float:left}",
             400.0,
         );
         assert_eq!(laid.border("w").2, 48.0);
-        stacked(&laid, &["a", "b"], 48.0);
+        assert_eq!(laid.spans(&["a", "b"]), vec![(0.0, 48.0), (0.0, 48.0)]);
+    }
+
+    /// A table or picture in a column is placed across by its auto
+    /// margins, else its alignment, as rows and pictures in rows are.
+    #[test]
+    fn tables_and_pictures_in_columns_are_placed_across() {
+        let at = |item: &str, css: &str| {
+            let html = format!("<div id=f>{item}</div>");
+            let css = format!("#f{{display:flex;flex-direction:column}}{css}");
+            Laid::new(&html, &css, 400.0).border("t")
+        };
+        let table = "<table id=t><tr><td>ab</table>";
+        assert_eq!(at(table, ""), (0.0, 0.0, 20.0, 24.0));
+        assert_eq!(at(table, "#t{margin:0 auto}"), (190.0, 0.0, 20.0, 24.0));
+        assert_eq!(
+            at(table, "#t{margin-left:auto;width:50%}"),
+            (200.0, 0.0, 200.0, 24.0)
+        );
+        assert_eq!(
+            at(table, "#f{height:300px}#t{margin:auto}"),
+            (190.0, 138.0, 20.0, 24.0)
+        );
+        assert_eq!(at(table, "#t{align-self:center}"), (190.0, 0.0, 20.0, 24.0));
+        // Its used margins, as any aligned item's: alignment is no margin.
+        let margins = |css: &str| {
+            let html = format!("<div id=f>{table}</div>");
+            let css = format!("#f{{display:flex;flex-direction:column}}{css}");
+            let m = Laid::new(&html, &css, 400.0).geometry("t").margin;
+            (m.left, m.right)
+        };
+        assert_eq!(margins("#t{align-self:center}"), (0.0, 0.0));
+        assert_eq!(margins("#t{align-self:end;margin-left:5px}"), (5.0, 0.0));
+        assert_eq!(margins("#t{margin:0 auto}"), (190.0, 190.0));
+        assert_eq!(at(table, "#t{align-self:end}"), (380.0, 0.0, 20.0, 24.0));
+        assert_eq!(
+            at(table, "#f{align-items:flex-end}#t{margin-left:10px}"),
+            (380.0, 0.0, 20.0, 24.0)
+        );
+        // Grown, it takes the room but its box keeps its rows' height.
+        let laid = Laid::new(
+            &format!("<div id=f>{table}<p id=a>x</p></div>"),
+            "#f{display:flex;flex-direction:column;height:300px}#t{flex:1}",
+            400.0,
+        );
+        assert_eq!(
+            (laid.border("t"), laid.border("a").1),
+            ((0.0, 0.0, 20.0, 24.0), 280.0)
+        );
+        let picture = "<img id=t width=40 height=30>";
+        assert_eq!(at(picture, ""), (0.0, 0.0, 40.0, 30.0));
+        assert_eq!(at(picture, "#t{margin:0 auto}"), (180.0, 0.0, 40.0, 30.0));
+        assert_eq!(
+            at(picture, "#t{margin-left:auto}"),
+            (360.0, 0.0, 40.0, 30.0)
+        );
+        assert_eq!(
+            at(picture, "#t{align-self:center}"),
+            (180.0, 0.0, 40.0, 30.0)
+        );
+        assert_eq!(at(picture, "#t{align-self:end}"), (360.0, 0.0, 40.0, 30.0));
+        assert_eq!(
+            at(picture, "#f{height:300px}#t{margin:auto}"),
+            (180.0, 135.0, 40.0, 30.0)
+        );
+    }
+
+    /// A column item's automatic minimum is its content's height at an
+    /// auto height, or its own where that is less (§4.5); a box that
+    /// would scroll, which td does not, keeps its content's height.
+    #[test]
+    fn column_minimums_and_scroll_containers() {
+        let laid = Laid::new(
+            "<div id=f><i id=a></i><i id=b>y</i></div>",
+            "#f{display:flex;flex-direction:column;height:300px}i{display:block}\
+             #a{height:50px}#b{flex:1;height:100%}",
+            400.0,
+        );
+        assert_eq!(laid.border("b"), (0.0, 50.0, 400.0, 250.0));
+        let laid = Laid::new(
+            "<div id=f><i id=a></i><i id=b>y</i></div>",
+            "#f{display:flex;flex-direction:column;height:300px}i{display:block}\
+             #a{height:50px}#b{flex:0 0 50px;height:200px}",
+            400.0,
+        );
+        assert_eq!(laid.border("b"), (0.0, 50.0, 400.0, 50.0));
+        // Content taller than its height: the content's, as laid.
+        let laid = Laid::new(
+            "<div id=f><i id=a>a<br>b<br>c</i></div>",
+            "#f{display:flex;flex-direction:column;height:300px}i{display:block}\
+             #a{flex:0 0 10px;height:20px}",
+            400.0,
+        );
+        assert_eq!(laid.border("a").3, 20.0);
+        // A page whose `main` scrolls in a browser: laid whole.
+        let page = format!(
+            "<body><header id=h>head</header><main id=m>{}</main><footer id=c>foot</footer>",
+            "<p>line</p>".repeat(35)
+        );
+        let sheet = "html,body{height:100%}body{display:flex;flex-direction:column}main{flex:1}";
+        let at = |css: &str| {
+            let laid = Laid::new(&page, &format!("{sheet}main{{{css}}}"), 400.0);
+            (laid.border("m"), laid.border("c").1)
+        };
+        for css in [
+            "overflow-y:auto",
+            "overflow:scroll",
+            "overflow-y:auto;min-height:0;flex:1 1 0",
+            "overflow-y:hidden",
+            "overflow:hidden;min-height:0",
+        ] {
+            assert_eq!(at(css), ((0.0, 20.0, 400.0, 700.0), 720.0), "{css}");
+        }
+        // One that clips is as the spec has it, and one collapsed to no
+        // height hides its content.
+        assert_eq!(
+            at("overflow-y:clip;min-height:0"),
+            ((0.0, 20.0, 400.0, 560.0), 580.0)
+        );
+        assert_eq!(at("min-height:0"), ((0.0, 20.0, 400.0, 560.0), 580.0));
+        assert_eq!(at(""), ((0.0, 20.0, 400.0, 700.0), 720.0));
+        assert_eq!(
+            at("overflow:hidden;flex:none;height:0"),
+            ((0.0, 20.0, 400.0, 0.0), 20.0)
+        );
+        // A hidden box holding the pane that would scroll, its items in a
+        // row or a column.
+        let page = format!(
+            "<body><header>head</header><div id=m><aside>side</aside><div class=p>{}</div>\
+             </div><footer id=c>foot</footer>",
+            "<p>line</p>".repeat(35)
+        );
+        for (lay, height) in [("row", 700.0), ("column", 720.0)] {
+            let css = format!(
+                "html,body{{height:100%}}body{{display:flex;flex-direction:column}}\
+                 #m{{flex:1;overflow:hidden;display:flex;flex-direction:{lay}}}\
+                 .p{{flex:1;overflow-y:auto}}"
+            );
+            let laid = Laid::new(&page, &css, 400.0);
+            assert_eq!(
+                (laid.border("m"), laid.border("c").1),
+                ((0.0, 20.0, 400.0, height), height + 20.0),
+                "{lay}"
+            );
+        }
+    }
+
+    /// A flex container's automatic minimum as an item is its own lines'
+    /// or items' height, whatever its definite height; a picture of
+    /// specified width's the height that width gives.
+    #[test]
+    fn nested_containers_and_pictures_take_their_contents_minimum() {
+        for inner in ["", "flex-direction:column", "flex-wrap:wrap"] {
+            let html = format!(
+                "<div id=f><i id=a></i><div id=b style=\"display:flex;{inner}\"><i>y</i></div></div>"
+            );
+            let laid = Laid::new(
+                &html,
+                "#f{display:flex;flex-direction:column;height:300px}i{display:block}\
+                 #a{height:50px}#b{flex:1;height:100%}",
+                400.0,
+            );
+            assert_eq!(laid.border("b"), (0.0, 50.0, 400.0, 250.0), "{inner}");
+        }
+        let at = |css: &str| {
+            let laid = Laid::new(
+                "<div id=f><img id=p width=40 height=50></div>",
+                &format!("#f{{display:flex;flex-direction:column}}#p{{{css}}}"),
+                400.0,
+            );
+            laid.border("p")
+        };
+        // A picture whose width its height gives keeps its laid height,
+        // so its ratio; one of specified width takes its auto height.
+        assert_eq!(at("flex:0 0 10px;height:80px"), (0.0, 0.0, 64.0, 80.0));
+        assert_eq!(at("flex:0 0 10px;height:30px"), (0.0, 0.0, 24.0, 30.0));
+        assert_eq!(at("flex:0 0 60px;height:80px"), (0.0, 0.0, 64.0, 80.0));
+        assert_eq!(
+            at("flex:0 0 10px;width:30px;height:80px"),
+            (0.0, 0.0, 30.0, 37.5)
+        );
+    }
+
+    /// A column in a row is measured as its widest item, and a row in a
+    /// column is laid across it.
+    #[test]
+    fn columns_in_rows_and_rows_in_columns() {
+        let laid = Laid::new(
+            "<div id=f><div id=c><b id=a>ab</b><b id=b>cd efg</b></div><i id=r>r</i></div>",
+            "#f{display:flex}#c{display:flex;flex-direction:column}",
+            400.0,
+        );
+        assert_eq!(laid.border("c"), (0.0, 0.0, 48.0, 40.0));
+        assert_eq!(laid.border("r"), (48.0, 0.0, 8.0, 40.0));
+        let laid = Laid::new(
+            "<div id=f><div id=r><b id=a>ab</b><b id=b>cd</b></div><i id=c>c</i></div>",
+            "#f{display:flex;flex-direction:column;height:100px}#r{display:flex;flex:1}\
+             i{display:block}",
+            400.0,
+        );
+        assert_eq!(laid.border("r"), (0.0, 0.0, 400.0, 80.0));
+        // Grown, its items are not laid again: as laid, 20 px tall.
+        assert_eq!(laid.border("b"), (16.0, 0.0, 16.0, 20.0));
+        assert_eq!(laid.border("c"), (0.0, 80.0, 400.0, 20.0));
+    }
+
+    /// A row from the right mirrors its items' places, `flex-start` at
+    /// the right, while `start` and `end` keep to the writing mode; a
+    /// wrapping one mirrors each line.
+    #[test]
+    fn row_reverse_mirrors_the_main_axis() {
+        let xs = |css: &str| {
+            let laid = Laid::new(
+                &cols(3),
+                &format!(
+                    "#f{{display:flex;flex-direction:row-reverse;{css}}}.col{{flex:0 0 40px}}"
+                ),
+                400.0,
+            );
+            [laid.border("a").0, laid.border("b").0, laid.border("c").0]
+        };
+        assert_eq!(xs(""), [360.0, 320.0, 280.0]);
+        assert_eq!(xs("justify-content:flex-start"), [360.0, 320.0, 280.0]);
+        assert_eq!(xs("justify-content:flex-end"), [80.0, 40.0, 0.0]);
+        assert_eq!(xs("justify-content:start"), [80.0, 40.0, 0.0]);
+        assert_eq!(xs("justify-content:left"), [80.0, 40.0, 0.0]);
+        assert_eq!(xs("justify-content:end"), [360.0, 320.0, 280.0]);
+        assert_eq!(xs("justify-content:right"), [360.0, 320.0, 280.0]);
+        assert_eq!(xs("justify-content:center"), [220.0, 180.0, 140.0]);
+        assert_eq!(xs("justify-content:space-between"), [360.0, 180.0, 0.0]);
+        assert_eq!(
+            xs("justify-content:space-around"),
+            [313.34375, 180.0, 46.671875]
+        );
+        assert_eq!(xs("column-gap:10px"), [360.0, 310.0, 260.0]);
+        let laid = Laid::new(
+            &cols(4),
+            "#f{display:flex;flex-flow:row-reverse wrap}.col{flex:0 0 150px}",
+            400.0,
+        );
+        assert_eq!(
+            [
+                laid.border("a"),
+                laid.border("b"),
+                laid.border("c"),
+                laid.border("d")
+            ],
+            [
+                (250.0, 0.0, 150.0, 20.0),
+                (100.0, 0.0, 150.0, 20.0),
+                (250.0, 20.0, 150.0, 20.0),
+                (100.0, 20.0, 150.0, 20.0)
+            ]
+        );
+        // Its lines stay in tree order.
+        let laid = Laid::new(
+            &cols(3),
+            "#f{display:flex;flex-direction:row-reverse}",
+            400.0,
+        );
+        let texts: Vec<String> = laid.lines().into_iter().map(|l| l.2).collect();
+        assert_eq!(texts, ["a", "b", "c"]);
+    }
+
+    /// A column of stretched items without margins lays as block flow,
+    /// and so does a wrapping row whose every item fills its line.
+    #[test]
+    fn a_column_and_full_lines_lay_as_block_flow() {
+        let inner = "<p>some words here to wrap around the line and more of them</p>\
+            <ul><li>an item<li>another <b>bold</b> one</ul>\
+            <div style=overflow:hidden><div style=float:left;width:30px>fl</div>beside the float, words</div>\
+            text between\
+            <table><tr><td>a cell<td>another</table><img width=40 height=10>\
+            <div style=padding:3px;border:2px>padded and bordered</div>";
+        for width in [120.0, 333.0, 800.0] {
+            let request = Request::new(width, 600.0);
+            let block = styled_layout(
+                &format!("<div id=f>{inner}</div><p>after"),
+                "#f{display:block}img{display:block}",
+                &request,
+                Limits::default(),
+            );
+            for css in [
+                "#f{display:flex;flex-direction:column}",
+                "#f{display:flex;flex-wrap:wrap}#f>*{flex:0 0 100%;box-sizing:border-box}\
+                 #f>img{flex:0 1 auto}",
+            ] {
+                let flex = styled_layout(
+                    &format!("<div id=f>{inner}</div><p>after"),
+                    css,
+                    &request,
+                    Limits::default(),
+                );
+                assert_eq!(drawn(&flex), drawn(&block), "{width} {css}");
+                assert_eq!(flex.height, block.height);
+                assert_eq!(flex.markers.len(), block.markers.len());
+            }
+        }
     }
 
     /// Percentages summing to 100% fit a wrapping row at every width,
@@ -1214,11 +1672,14 @@ mod cases {
     #[test]
     fn windowed_layouts_equal_filtered_whole_ones() {
         let mut html = String::new();
-        for n in 0..54 {
+        for n in 0..63 {
             let align = ["center", "end", "start", "stretch"][n % 4];
-            let lay = ["", " c", " w"][n % 3];
+            let lay = ["", " c", " w", " r", " w h", " c h", " w r", " c m", " w m"][n % 9];
+            let content = ["normal", "center", "space-between", "end", "space-around"][n % 5];
+            let justify = ["normal", "center", "end", "space-evenly"][n % 4];
             html.push_str(&format!(
-                "<div class='f{lay}' style=align-items:{align}><p>word{n} more words here to wrap\
+                "<div class='f{lay}' style=align-items:{align};align-content:{content};\
+                 justify-content:{justify}><p>word{n} more words here to wrap\
                  <br>and on</p><span>item <b>bold</b></span>"
             ));
             match n % 6 {
@@ -1245,38 +1706,16 @@ mod cases {
         let doc = td_html::document::parse(&html).unwrap();
         let css = sheets(
             ".f{display:flex;column-gap:4px;padding:2px}.fl{float:left;width:60px}\
-             .ib{display:inline-block}li{list-style-position:outside}             .c{flex-direction:column}.w{flex-wrap:wrap}.w>*{flex-basis:30px}",
+             .ib{display:inline-block}li{list-style-position:outside}             .c{flex-direction:column}.w{flex-wrap:wrap}.w>*{flex-basis:30px}\
+             .r{flex-direction:row-reverse}.h{height:150px}.m{min-height:150px}\
+             .c>p{flex-grow:1}.c>span{margin-top:auto}",
         );
         let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
         assert!(styled.has_flex() && styled.has_floats() && styled.has_inline_blocks());
-        // How many wrapping containers lay their items in a row.
-        let rows = |out: &Layout| {
-            let mut seen = std::collections::BTreeMap::new();
-            for g in &out.boxes {
-                let Some(parent) = doc.node(g.node).and_then(|n| n.parent()) else {
-                    continue;
-                };
-                let class = doc
-                    .node(parent)
-                    .and_then(|n| n.element())
-                    .and_then(|e| e.attribute("class"));
-                if class == Some("f w") {
-                    seen.entry(parent).or_insert_with(Vec::new).push(g.border.x);
-                }
-            }
-            seen.values()
-                .filter(|xs| xs.iter().any(|x| *x != xs[0]))
-                .count()
-        };
         for width in [160.0, 400.0] {
             let request = Request::new(width, 600.0);
             let full = layout(&styled, &mut Metrics, &request).unwrap();
             assert!(full.markers.len() >= 18);
-            let rows = rows(&full);
-            assert!(
-                if width > 200.0 { rows > 4 } else { rows < 4 },
-                "{width} {rows}"
-            );
             let tall = full.height;
             for window in [
                 0.0..100.0,
@@ -1352,7 +1791,368 @@ mod cases {
         assert!(large < 11 * small, "{small} {large}");
         assert!(large < 100 * 100_000, "{large}");
         // An item's record is the size DESIGN.md's bounds charge.
-        assert_eq!(std::mem::size_of::<crate::block::flex::FlexItem>(), 216);
+        assert_eq!(std::mem::size_of::<crate::block::flex::FlexItem>(), 224);
+    }
+
+    /// Many lines, each one item, and a long column holding its free
+    /// space open, cost what as many blocks do, linearly; a long sticky
+    /// footer page laid in windows equals the filtered whole, its items
+    /// final once those laid reach its least height.
+    #[test]
+    fn many_lines_and_long_columns_are_linear() {
+        let work = |n: usize, css: &str| {
+            let html = format!("<div id=f>{}</div>", "<i>x</i>".repeat(n));
+            let out = styled_layout(&html, css, &Request::new(1000.0, 600.0), Limits::default());
+            assert_eq!(out.lines.len(), n);
+            out.work
+        };
+        for css in [
+            "#f{display:flex;flex-wrap:wrap}i{display:block;flex:0 0 100%}",
+            "#f{display:flex;flex-wrap:wrap;height:3000000px;align-content:center}\
+             i{display:block;flex:0 0 100%}",
+            "#f{display:flex;flex-direction:column;height:3000000px}\
+             i{display:block;margin-top:auto}",
+        ] {
+            let (small, large) = (work(10_000, css), work(100_000, css));
+            assert!(large < 11 * small, "{css} {small} {large}");
+        }
+        let html = format!(
+            "<body id=f><header>head</header><main>{}</main><footer>foot</footer>",
+            "<p>some words here to wrap around the line</p>".repeat(300)
+        );
+        let doc = td_html::document::parse(&html).unwrap();
+        let css = sheets("body{display:flex;flex-direction:column;min-height:2000px}main{flex:1}");
+        let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
+        let request = Request::new(200.0, 600.0);
+        let full = layout(&styled, &mut Metrics, &request).unwrap();
+        for window in [
+            0.0..100.0,
+            1990.0..2100.0,
+            5000.0..5200.0,
+            full.height - 50.0..full.height,
+        ] {
+            let mut asked = request.clone();
+            asked.window = Some(window.clone());
+            let subset = layout(&styled, &mut Metrics, &asked).unwrap();
+            let kept = |y: f64, h: f64| y + h > window.start && y < window.end;
+            assert_eq!(
+                subset.lines.iter().collect::<Vec<_>>(),
+                full.lines
+                    .iter()
+                    .filter(|l| kept(l.y, l.height))
+                    .collect::<Vec<_>>(),
+                "{window:?}"
+            );
+            assert_eq!(subset.boxes, full.boxes);
+        }
+    }
+
+    /// Lines `align-content` moves after all are laid, and a column's
+    /// items moved by growth before them, are kept for a window as the
+    /// filtered whole; a sticky footer's `main`, which nothing before it
+    /// moves, is laid for a window as block flow is, holding no line
+    /// above the window.
+    #[test]
+    fn windows_over_moved_lines_and_columns() {
+        let check = |html: &str, css: &str, windows: &[std::ops::Range<f64>]| {
+            let doc = td_html::document::parse(html).unwrap();
+            let css = sheets(css);
+            let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
+            let request = Request::new(200.0, 600.0);
+            let full = layout(&styled, &mut Metrics, &request).unwrap();
+            let mut bytes = vec![];
+            for window in windows {
+                let mut asked = request.clone();
+                asked.window = Some(window.clone());
+                let subset = layout(&styled, &mut Metrics, &asked).unwrap();
+                let kept = |y: f64, h: f64| y + h > window.start && y < window.end;
+                assert_eq!(
+                    subset.lines.iter().collect::<Vec<_>>(),
+                    full.lines
+                        .iter()
+                        .filter(|l| kept(l.y, l.height))
+                        .collect::<Vec<_>>(),
+                    "{window:?}"
+                );
+                assert_eq!(subset.boxes, full.boxes, "{window:?}");
+                bytes.push(subset.page_bytes);
+            }
+            (full, bytes)
+        };
+        let item = "<div class=i>one two<br>three</div>";
+        for content in ["center", "space-between", "end", "stretch", "space-evenly"] {
+            let html = format!("<div id=f>{}</div><p>after", item.repeat(40));
+            let css = format!(
+                "#f{{display:flex;flex-wrap:wrap;height:3000px;align-content:{content}}}\
+                 .i{{flex:0 0 50%}}"
+            );
+            let (full, _) = check(&html, &css, &[0.0..100.0, 1000.0..1100.0, 2900.0..3100.0]);
+            assert!(full.height > 3000.0);
+        }
+        // Lines past the height, released once they reach it, their
+        // items aligned in them.
+        let html = format!(
+            "<div id=f>{}</div><p>after",
+            (item.to_owned() + "<i>x</i>").repeat(40)
+        );
+        let css = "#f{display:flex;flex-wrap:wrap;height:300px;align-items:center}\
+                   .i,i{display:block;flex:0 0 50%}";
+        check(&html, css, &[0.0..100.0, 280.0..320.0, 700.0..800.0]);
+        // A short page whose footer the growing `main` moves to the foot.
+        let html = format!(
+            "<body><header>head</header><main>{}</main><footer>foot<br>note</footer>",
+            "<p>words to wrap here</p>".repeat(5)
+        );
+        let css = "body{display:flex;flex-direction:column;min-height:2000px}main{flex:1}";
+        let (full, _) = check(&html, css, &[0.0..50.0, 1950.0..2050.0, 1990.0..1995.0]);
+        assert_eq!(full.height, 2000.0);
+        // A long one: `main` reaches the least height, nothing moves.
+        let html = format!(
+            "<body><header>head</header><main>{}</main><footer>foot</footer>",
+            "<p>words to wrap here</p>".repeat(2000)
+        );
+        let tall = 2.0 * 20.0 * 2000.0;
+        let (_, bytes) = check(&html, css, &[0.0..600.0, tall - 600.0..tall]);
+        // The window at the foot holds, laying, no more than either holds
+        // once laid: its `main`'s 4,000 lines above it are never kept.
+        let doc = td_html::document::parse(&html).unwrap();
+        let styled =
+            StyledDocument::new(&doc, &sheets(css), html.len(), Limits::default()).unwrap();
+        let mut foot = Request::new(200.0, 600.0);
+        foot.window = Some(tall - 600.0..tall);
+        foot.bytes = Some(bytes[0].max(bytes[1]) + 16 * 1024);
+        assert!(layout(&styled, &mut Metrics, &foot).is_ok());
+    }
+
+    /// Lines reaching a wrapping container's height leave no free space
+    /// for `align-content`: kept for a window at the foot no more than
+    /// `flex-start` keeps; and a column of no definite or least height,
+    /// which moves nothing, keeps no more than block flow does.
+    #[test]
+    fn filled_lines_and_unmoving_columns_are_not_kept() {
+        let peak = |html: &str, css: &str, ceiling: Option<usize>| {
+            let doc = td_html::document::parse(html).unwrap();
+            let styled =
+                StyledDocument::new(&doc, &sheets(css), html.len(), Limits::default()).unwrap();
+            let tall = layout(&styled, &mut Metrics, &Request::new(400.0, 600.0))
+                .unwrap()
+                .height;
+            let mut request = Request::new(400.0, 600.0);
+            request.window = Some(tall - 600.0..tall);
+            request.bytes = ceiling;
+            layout(&styled, &mut Metrics, &request).map(|out| out.page_bytes)
+        };
+        let html = format!(
+            "<div id=f>{}</div>",
+            "<div class=i>one two<br>three</div>".repeat(3000)
+        );
+        let wrap = "#f{display:flex;flex-wrap:wrap}.i{flex:0 0 50%}";
+        let least = peak(
+            &html,
+            &format!("{wrap}#f{{align-content:flex-start}}"),
+            None,
+        )
+        .unwrap();
+        for lay in [
+            "min-height:1px",
+            "height:200px",
+            "height:200px;align-content:center",
+        ] {
+            let css = format!("{wrap}#f{{{lay}}}");
+            assert!(peak(&html, &css, Some(least + 16 * 1024)).is_ok(), "{lay}");
+        }
+        // Those laid before the height is reached are aligned as they lie.
+        let laid = Laid::new(
+            "<div id=f><i id=a>a<br>b</i><i id=b>c</i><i id=c>d</i><i id=d>e</i></div>",
+            "#f{display:flex;flex-wrap:wrap;height:40px;align-items:center}\
+             i{display:block;flex:0 0 50%}",
+            400.0,
+        );
+        assert_eq!(
+            [laid.border("b").1, laid.border("c").1, laid.border("d").1],
+            [10.0, 40.0, 40.0]
+        );
+        // Lines short of it are kept until they are spread.
+        let css = format!("{wrap}#f{{height:200000px;align-content:center}}");
+        assert!(peak(&html, &css, Some(least + 16 * 1024)).is_err());
+        let html = format!("<div id=f>{}</div>", "<i>x</i>".repeat(20_000));
+        let block = peak(&html, "i{display:block}", None).unwrap();
+        let css = "#f{display:flex;flex-direction:column}i{display:block}";
+        assert!(peak(&html, css, Some(block + 16 * 1024)).is_ok());
+    }
+
+    /// Columns nested in rows, each measured by the row and laid by it:
+    /// charged, refused by name past the work limit, and bounded by depth.
+    #[test]
+    fn columns_nested_in_rows_are_bounded() {
+        let nest = |d: usize| {
+            let mut html = String::new();
+            for level in 0..d {
+                let class = if level % 2 == 0 { "f" } else { "f c" };
+                html.push_str(&format!("<div class='{class}'>a "));
+            }
+            html + "x" + &"</div>".repeat(d)
+        };
+        let css = ".f{display:flex}.c{flex-direction:column}";
+        let work = |d: usize, limits: Limits| {
+            let html = nest(d);
+            let doc = td_html::document::parse(&html).unwrap();
+            let styled = StyledDocument::new(&doc, &sheets(css), html.len(), limits).unwrap();
+            layout(&styled, &mut Metrics, &Request::new(400.0, 600.0)).map(|out| out.work)
+        };
+        let (ten, twenty) = (
+            work(10, Limits::default()).unwrap(),
+            work(20, Limits::default()).unwrap(),
+        );
+        assert!(twenty > 2 * ten, "{ten} {twenty}");
+        let limits = Limits {
+            work: ten,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            work(20, limits),
+            Err(Error::Limit("MAX_LAYOUT_WORK"))
+        ));
+        let limits = Limits {
+            depth: 44,
+            ..Limits::default()
+        };
+        assert!(work(38, limits).is_ok());
+    }
+
+    /// A seeded oracle over wrapping rows of random bases, factors,
+    /// bounds, margins and gaps: each line as many items as fit it, the
+    /// next line's first not fitting; on each line, in order and apart,
+    /// within their bounds, summing exactly where a flexible item is
+    /// unclamped, sharing in proportion to their factors within 1/64 px.
+    #[test]
+    fn wrapped_lines_meet_the_spec_invariants() {
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: u64) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (self.0 >> 33) % n
+            }
+        }
+        let mut checked = (0, 0);
+        for seed in 0..300u64 {
+            let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5eed);
+            let count = 2 + r.below(12) as usize;
+            let width = 100 + r.below(500);
+            let gap = r.below(4) * 3;
+            let mut html = String::from("<div id=f>");
+            // basis, grow, shrink, min, max, left and right margins.
+            let mut items = vec![];
+            for at in 0..count {
+                let item = (
+                    r.below(250) as f64,
+                    [0.0, 0.5, 1.0, 2.0][r.below(4) as usize],
+                    [0.0, 1.0, 2.0][r.below(3) as usize],
+                    if r.below(3) == 0 {
+                        r.below(80) as f64
+                    } else {
+                        0.0
+                    },
+                    if r.below(3) == 0 {
+                        r.below(250) as f64
+                    } else {
+                        f64::INFINITY
+                    },
+                    r.below(3) as f64 * 4.0,
+                    r.below(2) as f64 * 5.0,
+                );
+                let max = if item.4.is_finite() {
+                    format!("max-width:{}px;", item.4)
+                } else {
+                    String::new()
+                };
+                html.push_str(&format!(
+                    "<i id=i{at} style='flex:{} {} {}px;min-width:{}px;{max}margin:0 {}px 0 {}px'></i>",
+                    item.1, item.2, item.0, item.3, item.6, item.5
+                ));
+                items.push(item);
+            }
+            html.push_str("</div>");
+            let laid = Laid::new(
+                &html,
+                &format!(
+                    "#f{{display:flex;flex-wrap:wrap;column-gap:{gap}px;row-gap:3px}}\
+                     i{{display:block;height:10px}}"
+                ),
+                width as f64,
+            );
+            let got: Vec<BoxGeometry> = (0..count)
+                .map(|at| *laid.geometry(&format!("i{at}")))
+                .collect();
+            type Item = (f64, f64, f64, f64, f64, f64, f64);
+            let clamp = |i: &Item, v: f64| v.min(i.4).max(i.3);
+            let outer = |i: &Item| clamp(i, i.0) + i.5 + i.6;
+            // Group by line: each line 13 px below the last.
+            let mut lines: Vec<Vec<usize>> = vec![];
+            for (at, g) in got.iter().enumerate() {
+                let line = (g.border.y / 13.0).round() as usize;
+                assert_eq!(g.border.y, line as f64 * 13.0, "{seed} {html}");
+                if line == lines.len() {
+                    lines.push(vec![]);
+                }
+                assert_eq!(line + 1, lines.len(), "{seed} in tree order");
+                lines[line].push(at);
+            }
+            let room = width as f64;
+            for (n, line) in lines.iter().enumerate() {
+                let used: f64 = line.iter().map(|&at| outer(&items[at])).sum::<f64>()
+                    + gap as f64 * (line.len() - 1) as f64;
+                // Fits, within the rounding's slack, unless alone.
+                let slack = (2 * line.len() + 1) as f64 / 64.0;
+                assert!(line.len() == 1 || used <= room + slack, "{seed} {html}");
+                if let Some(next) = lines.get(n + 1) {
+                    let more = used + gap as f64 + outer(&items[next[0]]);
+                    assert!(more > room + slack - 2.0 / 64.0, "{seed} {html}");
+                }
+                let growing = used < room;
+                let mut end = f64::NEG_INFINITY;
+                let mut sum = gap as f64 * (line.len() - 1) as f64;
+                let mut free = vec![];
+                for &at in line {
+                    let (item, g) = (&items[at], &got[at]);
+                    let w = g.content.width;
+                    let start = g.border.x - item.5;
+                    if end.is_finite() {
+                        assert_eq!(start, end + gap as f64, "{seed} {html}");
+                    } else {
+                        assert_eq!(start, 0.0, "{seed} {html}");
+                    }
+                    end = g.border.x + w + item.6;
+                    assert_eq!(w, clamp(item, w), "{seed} {html}");
+                    sum += w + item.5 + item.6;
+                    let factor = if growing { item.1 } else { item.2 };
+                    if factor > 0.0 && w > item.3 && w < item.4.max(item.3) {
+                        free.push((
+                            w - item.0,
+                            if growing { factor } else { factor * item.0 },
+                            factor,
+                        ));
+                    }
+                }
+                if free.iter().map(|f| f.2).sum::<f64>() >= 1.0 {
+                    assert_eq!(sum, room, "{seed} {html}");
+                    checked.0 += 1;
+                }
+                for (a, wa, _) in &free {
+                    for (b, wb, _) in &free {
+                        assert!(
+                            (a * wb - b * wa).abs() <= (wa + wb) / 64.0 + 1e-9,
+                            "{seed} {html}"
+                        );
+                    }
+                }
+            }
+            checked.1 += (lines.len() > 1) as usize;
+        }
+        assert!(checked.0 > 150 && checked.1 > 150, "{checked:?}");
     }
 
     /// A cascade of freezes, each pass freezing one item as the free

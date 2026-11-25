@@ -261,7 +261,9 @@ pub fn layout_with_budget(
         floats: Floats::new(memory)?,
         nested: BudgetVec::new(memory)?,
         flex: BudgetVec::new(memory)?,
+        flex_lines: BudgetVec::new(memory)?,
         last_baseline: None,
+        natural: 0.0,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -350,10 +352,17 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// The flex items of the containers being laid, a stack: a nested
     /// container's after its ancestors' (§5, "Flex").
     flex: BudgetVec<flex::FlexItem>,
+    /// The lines of the wrapping containers being laid, a stack as
+    /// `flex` is.
+    flex_lines: BudgetVec<flex::FlexLine>,
     /// The baseline of the last line laid in flow, on a page with
     /// inline-blocks: an inline-block's own is its last line's (§5,
     /// "Inline-blocks"). Nested items and tables keep it as they found it.
     last_baseline: Option<f64>,
+    /// The content height the last block laid would take at an auto
+    /// height, a flex container's its lines' or items' and a picture's
+    /// its own: a flex column item's automatic minimum (§5, "Flex").
+    natural: f64,
     left: f64,
     top: f64,
     right: f64,
@@ -421,6 +430,10 @@ struct Dimensions {
     min_height: f64,
     max_height: f64,
     relative: (f64, f64),
+    /// A picture of specified width: its height were its `height` auto,
+    /// which its width keeps; None for any other box, whose width an
+    /// auto height would change or which is no picture.
+    auto_height: Option<f64>,
 }
 impl Dimensions {
     fn decoration(self) -> Edges {
@@ -1442,10 +1455,15 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         if root {
             self.floats.open(&mut self.counters)?;
         }
+        let mut content = None;
         let mut natural = if b.kind == BoxKind::Image {
+            content = dims.auto_height;
             dims.height.unwrap_or(0.0)
         } else if self.styled.has_flex() && self.flex_container(&b)? {
-            self.flex_content(id, &b, &dims, (content_x, content_y, offset), depth)?
+            let (used, own) =
+                self.flex_content(id, &b, &dims, (content_x, content_y, offset), depth)?;
+            content = Some(own);
+            used
         } else {
             self.children(
                 b.first_child,
@@ -1485,6 +1503,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             natural = natural.max(fragment.height);
             self.lineless(fragment)?;
         }
+        self.natural = content.unwrap_or(natural);
         let height = dims
             .height
             .unwrap_or(natural)
@@ -1836,6 +1855,7 @@ fn sized(
             .map(|v| content(v, decor.vertical()))
             .unwrap_or(f64::INFINITY),
     };
+    let mut auto_height = None;
     let (used_width, used_height) = if b.kind == BoxKind::Image {
         let element = styled
             .document()
@@ -1848,13 +1868,24 @@ fn sized(
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .filter(|n| n.is_finite() && (0.0..=MAX_VIEWPORT).contains(n))
         };
+        let attributes = (attribute("width"), attribute("height"));
         let (w, h) = replaced(
             (specified_width, specified_height),
-            (attribute("width"), attribute("height")),
+            attributes,
             intrinsic,
             stretch,
             bounds,
         );
+        if specified_width.is_some() {
+            let auto = replaced(
+                (specified_width, None),
+                attributes,
+                intrinsic,
+                stretch,
+                bounds,
+            );
+            auto_height = Some(auto.1);
+        }
         (w, Some(h))
     } else {
         (
@@ -1909,6 +1940,7 @@ fn sized(
         min_height,
         max_height,
         relative,
+        auto_height,
     })
 }
 #[derive(Clone, Copy)]

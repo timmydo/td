@@ -1,6 +1,6 @@
 //! A generated oracle for copying (td-web/DESIGN.md §10, "Copying"):
 //! seeded pages of floats, inline-blocks, tables, inline tables, lists
-//! and flex rows and columns, and what a copy of them holds, worked from the lines and the
+//! and flex rows, wrapping rows and columns, and what a copy of them holds, worked from the lines and the
 //! boxes they lie in rather than from what `copy` keeps as it walks; the
 //! marker checks alone read the walk, for the order lines begin in. A
 //! failing check names the generator, the page's seed and the selection,
@@ -674,12 +674,25 @@ mod cases {
     fn flex(r: &mut Rng, depth: usize, out: &mut String) {
         let align = ["center", "end", "start", "stretch"][r.below(4) as usize];
         let justify = ["normal", "center", "space-between", "end"][r.below(4) as usize];
-        // Rows, wrapping rows that fit one line or not, and columns.
-        let lay = ["", "", "flex-wrap:wrap;", "flex-direction:column;"][r.below(4) as usize];
+        // Rows, from either side, wrapping rows whose lines a height may
+        // spread, and columns a height or least height may grow.
+        let lay = [
+            "",
+            "",
+            "flex-direction:row-reverse;",
+            "flex-wrap:wrap;",
+            "flex-flow:row-reverse wrap;",
+            "flex-wrap:wrap;height:120px;align-content:space-around;",
+            "flex-wrap:wrap;min-height:90px;",
+            "flex-direction:column;",
+            "flex-direction:column;min-height:120px;",
+            "flex-direction:column;height:150px;",
+        ][r.below(10) as usize];
         let _ = write!(
             out,
-            "<div style=display:flex;{lay}align-items:{align};justify-content:{justify};column-gap:{}px>",
-            r.below(3) * 4
+            "<div style=display:flex;{lay}align-items:{align};justify-content:{justify};column-gap:{}px;row-gap:{}px>",
+            r.below(3) * 4,
+            r.below(3) * 3
         );
         for _ in 0..1 + r.below(5) {
             flex_item(r, depth, out);
