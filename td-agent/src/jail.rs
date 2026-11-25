@@ -1278,26 +1278,29 @@ mod tests {
 
     #[test]
     fn the_path_named_is_the_hosts_as_it_resolves_into_a_bound_tree() {
-        let scratch = crate::store::tests::Scratch::new("system-path");
-        let link = scratch.0.join("profile-bin");
-        std::os::unix::fs::symlink("/usr", &link).unwrap();
-        let file = scratch.0.join("file");
+        let scratch = td_fs::TempDir::new("system-path").unwrap();
+        let link = scratch.join("profile-bin");
+        std::os::unix::fs::symlink("/bin", &link).unwrap();
+        let file = scratch.join("file");
         fs::write(&file, "").unwrap();
         let path = std::env::join_paths([
             link.as_path(),
-            scratch.0.as_path(),
-            Path::new("/usr"),
-            Path::new("usr"),
-            Path::new("/usr/no-such-directory-here"),
+            scratch.path(),
+            Path::new("/bin"),
+            Path::new("bin"),
+            Path::new("/bin/no-such-directory-here"),
             file.as_path(),
         ])
         .unwrap();
         // The link as it resolves, once; a directory outside the bound
         // trees, a relative one, one missing and a file left out.
-        assert_eq!(system_path(Some(&path)), [PathBuf::from("/usr")]);
+        assert_eq!(
+            system_path(Some(&path)),
+            [fs::canonicalize("/bin").unwrap()]
+        );
         assert!(system_path(None).is_empty());
         let many = std::env::join_paths(
-            std::iter::repeat_n(link.as_path(), 2).chain(std::iter::once(Path::new("/usr"))),
+            std::iter::repeat_n(link.as_path(), 2).chain(std::iter::once(Path::new("/bin"))),
         )
         .unwrap();
         assert_eq!(system_path(Some(&many)).len(), 1);

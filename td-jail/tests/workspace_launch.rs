@@ -20,7 +20,9 @@ echo "home=$HOME path=$PATH"
 touch built && echo "worktree=writable"
 touch "$HOME/h" && echo "home=writable"
 touch "$SHARED/x" 2>/dev/null || echo "shared=read-only"
-touch /usr/x 2>/dev/null || echo "usr=read-only"
+bin=$(readlink -f /bin) || exit 1
+tree=${bin#/}
+grep -Eq "^[^ ]+ [^ ]+ [^ ]+ [^ ]+ /${tree%%/*} ro[, ]" /proc/self/mountinfo && echo "bin=read-only"
 printf '#!/bin/sh\necho ran\n' > "$TMPDIR/s" && chmod +x "$TMPDIR/s" && "$TMPDIR/s" | sed 's/^/tmp=/'
 grep -q '^Seccomp:[[:space:]]*2' /proc/self/status && echo "seccomp=filtered"
 grep -q '^CapEff:[[:space:]]*0*$' /proc/self/status && echo "capabilities=none"
@@ -31,18 +33,20 @@ ls / | tr '\n' ' ' | sed 's/^/root=/'; echo
 
 /// A scratch workspace under `name` with the shell probe as its entry;
 /// returns its directory and its spec.
-fn prepare(name: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+fn prepare(name: &str) -> Result<(td_fs::TempDir, PathBuf), Box<dyn Error>> {
     prepare_with(name, None)
 }
 
 /// As `prepare`, with `entry` as the entry when given.
-fn prepare_with(name: &str, entry: Option<&Path>) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
-    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&base);
+fn prepare_with(
+    name: &str,
+    entry: Option<&Path>,
+) -> Result<(td_fs::TempDir, PathBuf), Box<dyn Error>> {
+    let parent = fs::canonicalize(env!("CARGO_TARGET_TMPDIR"))?;
+    let base = td_fs::TempDir::new_in(&parent, name)?;
     for name in ["home", "tree", "shared", "bin"] {
         fs::create_dir_all(base.join(name))?;
     }
-    let base = fs::canonicalize(&base)?;
     fs::set_permissions(base.join("home"), fs::Permissions::from_mode(0o700))?;
     let probe = base.join("bin/probe");
     let entry = entry.map_or(probe.clone(), Path::to_path_buf);
@@ -59,8 +63,9 @@ fn prepare_with(name: &str, entry: Option<&Path>) -> Result<(PathBuf, PathBuf), 
     fs::write(
         &spec,
         format!(
-            "format=1\nentry={}\npath=/usr\nhome={}\nworktree={}\nread={}\n",
+            "format=1\nentry={}\npath={}\nhome={}\nworktree={}\nread={}\n",
             entry.display(),
+            fs::canonicalize("/bin")?.display(),
             base.join("home").display(),
             base.join("tree").display(),
             shared.display()
@@ -98,9 +103,12 @@ fn a_workspace_launch_is_confined_and_speaks_on_its_channel() -> Result<(), Box<
         "worktree=writable".into(),
         "home=writable".into(),
         // The spec's path directory first, then the fixed list.
-        "path=/usr:/usr/local/bin:/usr/bin:/bin:".into(),
+        format!(
+            "path=/opt/workspace/path:{}:/opt/workspace/bin:/usr/local/bin:/usr/bin:/bin:",
+            fs::canonicalize("/bin")?.display()
+        ),
         "shared=read-only".into(),
-        "usr=read-only".into(),
+        "bin=read-only".into(),
         "tmp=ran".into(),
         "seccomp=filtered".into(),
         "capabilities=none".into(),
@@ -124,7 +132,6 @@ fn a_workspace_launch_is_confined_and_speaks_on_its_channel() -> Result<(), Box<
         !root.split(' ').any(|name| name == "root" || name == "boot"),
         "{root}"
     );
-    fs::remove_dir_all(&base)?;
     Ok(())
 }
 
@@ -307,7 +314,6 @@ fn the_git_chain_protects_a_repository_and_a_jailed_git_commits() -> Result<(), 
         );
         assert!(fs::read_to_string(repository.join("refs/heads/main")).is_ok());
     }
-    fs::remove_dir_all(&base)?;
     Ok(())
 }
 
@@ -331,7 +337,7 @@ fn bound_git() -> Option<String> {
 #[test]
 #[ignore = "needs unprivileged user namespaces and a host /bin/sh"]
 fn a_datagram_channel_is_refused() -> Result<(), Box<dyn Error>> {
-    let (base, spec) = prepare("workspace-datagram")?;
+    let (_base, spec) = prepare("workspace-datagram")?;
     let (_ours, theirs) = UnixDatagram::pair()?;
     let output = Command::new(env!("CARGO_BIN_EXE_td-jail"))
         .arg("--workspace")
@@ -347,7 +353,6 @@ fn a_datagram_channel_is_refused() -> Result<(), Box<dyn Error>> {
         stderr.contains("not an unnamed, connected Unix stream socket"),
         "{stderr}"
     );
-    fs::remove_dir_all(&base)?;
     Ok(())
 }
 
@@ -360,7 +365,7 @@ fn a_datagram_channel_is_refused() -> Result<(), Box<dyn Error>> {
 #[ignore = "needs unprivileged user namespaces and a host /bin/sh"]
 fn the_workspace_filter_holds_for_a_rust_program() -> Result<(), Box<dyn Error>> {
     let me = fs::canonicalize(std::env::current_exe()?)?;
-    let (base, spec) = prepare_with("workspace-rust", Some(&me))?;
+    let (_base, spec) = prepare_with("workspace-rust", Some(&me))?;
     let (mut ours, theirs) = UnixStream::pair()?;
     let child = Command::new(env!("CARGO_BIN_EXE_td-jail"))
         .arg("--workspace")
@@ -395,7 +400,6 @@ fn the_workspace_filter_holds_for_a_rust_program() -> Result<(), Box<dyn Error>>
             "{line} absent from:\n{reply}"
         );
     }
-    fs::remove_dir_all(&base)?;
     Ok(())
 }
 

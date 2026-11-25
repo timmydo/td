@@ -2487,10 +2487,8 @@ mod tests {
     #[test]
     fn admission_requires_direct_private_disjoint_trees() {
         use std::os::unix::fs::symlink;
-        let base = std::env::temp_dir().join(format!("td-jail-workspace-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        let base = fs::canonicalize(&base).unwrap();
+        let owned = crate::test_temp::TempDir::new("td-jail-workspace").unwrap();
+        let base = fs::canonicalize(owned.path()).unwrap();
         let uid = fs::metadata(&base).unwrap().uid();
         let dir = |name: &str, mode: u32| {
             let path = base.join(name);
@@ -2574,13 +2572,14 @@ mod tests {
         assert!(admit_spec(twice).is_err());
 
         // Path directories, a bound system tree's own, in order, each once.
+        let bin = fs::canonicalize("/bin").unwrap();
         let mut searched = spec(&[&entry], &home, &[&tree], &[]);
-        searched.path = vec!["/usr".into()];
-        assert_eq!(admit_spec(searched).unwrap().path, [PathBuf::from("/usr")]);
+        searched.path = vec![bin.clone()];
+        assert_eq!(admit_spec(searched).unwrap().path, [bin.clone()]);
         for path in [
-            vec![PathBuf::from("/usr"), "/usr".into()],
+            vec![bin.clone(), bin.clone()],
             vec![tree.clone()],
-            vec!["/usr/no-such-directory-here".into()],
+            vec![bin.join("no-such-directory-here")],
         ] {
             let mut searched = spec(&[&entry], &home, &[&tree], &[]);
             searched.path = path;
@@ -2658,7 +2657,6 @@ mod tests {
             &[base.to_str().unwrap()],
         )
         .is_err());
-        fs::remove_dir_all(&base).unwrap();
     }
 
     /// A workspace account binds, of its manifest's views, those its
@@ -3469,18 +3467,9 @@ mod tests {
             assert!(!path_directory_named(Path::new(bad)), "{bad}");
         }
         // As it resolves: a directory there, not a link or a file.
-        assert!(admit_path_directory(Path::new("/usr")).is_ok());
-        assert!(admit_path_directory(Path::new("/usr/no-such-directory-here")).is_err());
-        // A file or a link there, whichever the host has: `/usr` is bound
-        // by every instance, and `/usr/bin` holds `env` on every host.
-        let other = ["/usr/bin", "/bin"]
-            .into_iter()
-            .filter_map(|dir| fs::read_dir(dir).ok())
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()))
-            .unwrap();
-        assert!(admit_path_directory(&other).is_err(), "{}", other.display());
+        let bin = fs::canonicalize("/bin").unwrap();
+        assert!(admit_path_directory(&bin).is_ok());
+        assert!(admit_path_directory(&bin.join("no-such-directory-here")).is_err());
+        assert!(admit_path_directory(&bin.join("sh")).is_err());
     }
 }
