@@ -703,6 +703,8 @@ fn backup_status(destination: &Path, maximum_age: u64) -> Result<bool> {
     observe_backup_status(destination, maximum_age)
 }
 
+// td-mta-deploy's early retirement judges the newest archive by these
+// rules too (activation_retire_backup.rs); change both together.
 fn observe_backup_status(destination: &Path, maximum_age: u64) -> Result<bool> {
     let (archives, total, _) = inventory(destination)?;
     let receiver = receiver_initialized(destination)?;

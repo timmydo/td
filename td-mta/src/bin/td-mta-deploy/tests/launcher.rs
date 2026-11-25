@@ -148,6 +148,10 @@ fn retiring_rollback_material_needs_irreversible_and_runs_alone() {
     let retire = args(&["--retire-rollback", "--irreversible"]);
     let opts = parse(&retire).unwrap();
     assert!(opts.retire && opts.irreversible && !opts.socket && !opts.binaries);
+    assert!(!opts.all);
+    let early = args(&["--retire-rollback", "--irreversible", "--all"]);
+    let opts = parse(&early).unwrap();
+    assert!(opts.retire && opts.irreversible && opts.all);
     let rev = "0123456789abcdef0123456789abcdef01234567";
     let deploy = args(&["--irreversible", "--schema-target", "7", "--revision", rev]);
     let opts = parse(&deploy).unwrap();
@@ -199,6 +203,20 @@ fn retiring_rollback_material_needs_irreversible_and_runs_alone() {
         ]),
         args(&["--retire-rollback", "--irreversible", "--postgres-binaries"]),
         args(&["--postgres-binaries", "--irreversible"]),
+        // Early retirement is a retirement, irreversible like the rest.
+        args(&["--all"]),
+        args(&["--retire-rollback", "--all"]),
+        args(&["--irreversible", "--all"]),
+        args(&[
+            "--irreversible",
+            "--all",
+            "--schema-target",
+            "7",
+            "--revision",
+            rev,
+        ]),
+        args(&["--postgres-binaries", "--all"]),
+        args(&["--recover", "--all"]),
     ] {
         assert!(parse(&refused).is_err(), "{refused:?}");
     }
@@ -1100,6 +1118,36 @@ fn a_refusal_names_the_command_it_asks_for() {
     let (argv, needs) = end.approve.unwrap();
     assert_eq!(argv, ["td-mta/deploy", "--skip-tests"]);
     assert_eq!(needs, ["skip-tests-approval"]);
+    // --all is a decision of its own, whatever else the command takes.
+    let only_all = held(Ended {
+        result: "refused",
+        error: None,
+        next: Some(vec!["td-mta/deploy".to_string(), "--all".to_string()]),
+        approve: None,
+        not_before: None,
+    });
+    assert!(only_all.next.is_none());
+    assert_eq!(only_all.approve.unwrap().1, ["early-retire-approval"]);
+    let early: Vec<String> = ["--retire-rollback", "--irreversible", "--all"]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    // A refusal before the job that names this run again holds it too.
+    let again_early = again(&early, &[]).unwrap();
+    let refused = refused_end("x".to_string(), Some(again_early), &early).unwrap();
+    assert_eq!(refused.result, "refused");
+    assert!(refused.next.is_none());
+    let (argv, needs) = refused.approve.unwrap();
+    assert_eq!(
+        argv,
+        [
+            "td-mta/deploy",
+            "--retire-rollback",
+            "--irreversible",
+            "--all"
+        ]
+    );
+    assert_eq!(needs, ["irreversible-approval", "early-retire-approval"]);
     for broken in [
         "run td-mta/deploy --irreversible --schema-target 4",
         "run td-mta/deploy --irreversible --schema-target 4 --revision abc",
@@ -1337,7 +1385,72 @@ fn a_job_outcome_names_what_follows_from_its_end() {
     assert_eq!(checked.result, "check-failed");
     assert_eq!(checked.not_before, Some(1_700_000_000));
     assert_eq!(approval(&checked), retirement);
+    // Early retirement without a ready backup newer than its material,
+    // and after it with the Debian tree kept: --all is never `next`.
+    let (early_args, early) = run_of(&[
+        "--retire-rollback",
+        "--irreversible",
+        "--all",
+        "--config",
+        "/t.json",
+    ]);
+    let early = early.unwrap();
+    let at_early = |j: &Job| ended(&early, early_args, j).unwrap();
+    let early_again = (
+        "td-mta/deploy --retire-rollback --irreversible --all --config /t.json".to_string(),
+        vec!["irreversible-approval", "early-retire-approval"],
+    );
+    for (record, not_before) in [
+        (
+            format!(
+                r#"{{"error":"{} 1700000000, the newest rollback material's last write: the newest scheduled backup, /b/backup-1-1.dump, was created at 1","rollback_retire_not_before":1700003000}}"#,
+                crate::activate::NO_BACKUP
+            ),
+            Some(1_700_003_000),
+        ),
+        (
+            format!(
+                r#"{{"error":"{} the rollback material: the scheduled backup in /b is stale"}}"#,
+                crate::activate::NO_BACKUP
+            ),
+            None,
+        ),
+    ] {
+        let waiting = at_early(&job(Some(1), &record, Some(false), Some(true)));
+        assert_eq!(waiting.result, "deferred");
+        assert_eq!(waiting.not_before, not_before);
+        assert_eq!(approval(&waiting), early_again);
+    }
+    let unreadable = r#"{"error":"td-mta-maint-backup-status.service does not run install-td-mta --backup-status --destination DIR"}"#;
+    let failed = at_early(&job(Some(1), unreadable, Some(false), Some(true)));
+    assert_eq!(failed.result, "failed");
+    assert!(failed.next.is_none() && failed.approve.is_none());
+    let early_done = r#"{"rollback_retire_mode":"all"}"#;
+    let done = at_early(&job(Some(0), early_done, Some(false), Some(true)));
+    assert_eq!(done.result, "succeeded");
+    assert!(done.next.is_none() && done.approve.is_none());
+    // A controller that ran the windowed form did not do what was asked.
+    for record in ["{}", r#"{"rollback_retire_mode":"window"}"#] {
+        let windowed = at_early(&job(Some(0), record, Some(false), Some(true)));
+        assert_eq!(windowed.result, "failed");
+        assert!(windowed.error.unwrap().contains("rollback_retire_mode"));
+        assert!(windowed.next.is_none() && windowed.approve.is_none());
+    }
+    let busy = at_early(&job(
+        Some(1),
+        &format!(r#"{{"error":"{}"}}"#, crate::LOCKED),
+        Some(false),
+        Some(true),
+    ));
+    assert_eq!(busy.result, "busy");
+    assert_eq!(approval(&busy), early_again);
     let tree = r#"{"debian_tree_kept":"why"}"#;
+    let tree_early = r#"{"debian_tree_kept":"why","rollback_retire_mode":"all"}"#;
+    let kept_early = at_early(&job(Some(0), tree_early, Some(false), Some(true)));
+    assert_eq!(
+        argv(&kept_early),
+        "td-mta/deploy --postgres-binaries --config /t.json"
+    );
     let kept = at_retire(&job(Some(0), tree, Some(false), Some(true)));
     assert_eq!(
         argv(&kept),

@@ -3,10 +3,15 @@
 //! uploaded closures, the loopback TLS material and CA key the socket
 //! cutover retired), the physical recovery copies activations took, and
 //! the retained Debian PostgreSQL tree once a verified switch left it.
-//! Irreversible, so the job must say so.
+//! Irreversible, so the job must say so. Early retirement (`RETIRE_ALL`)
+//! removes it all whatever its age, once a ready scheduled backup is
+//! newer than all of it.
 use super::*;
 use crate::common::DEBIAN_POSTGRES;
 use fence::PG_FENCE;
+
+#[path = "activation_retire_backup.rs"]
+mod backup;
 
 /// How long rollback material stays after the change that left it.
 pub(super) const WINDOW: u64 = 7 * 24 * 3600;
@@ -130,13 +135,14 @@ pub(super) struct Material {
 }
 
 /// What retiring at `now` does with `material`: the paths past the window,
-/// and the earliest time one still inside it may go.
-pub(super) fn due(material: &[Material], now: u64) -> R<(Vec<&Path>, Option<u64>)> {
+/// or every path with `all`, and the earliest time one still inside it
+/// may go.
+pub(super) fn due(material: &[Material], now: u64, all: bool) -> R<(Vec<&Path>, Option<u64>)> {
     let mut past = Vec::new();
     let mut next: Option<u64> = None;
     for item in material {
         let until = item.since.saturating_add(WINDOW);
-        if until <= now {
+        if all || until <= now {
             td_alloc::push(&mut past, item.path.as_path())?;
         } else {
             next = Some(next.map_or(until, |n| n.min(until)));
@@ -300,6 +306,18 @@ impl Deployment {
             || Ok(Path::new(FENCE).try_exists()? || Path::new(PG_FENCE).try_exists()?),
             || Ok(self.previous == self.candidate && fs::canonicalize(ACTIVE)? == self.previous),
         )?;
+        let all = self.record.get(RETIRE_ALL).and_then(Json::as_bool) == Some(true);
+        let mode = if all { "all" } else { "window" };
+        set(&mut self.record, RETIRE_MODE, Json::Str(owned(mode)?))?;
+        // Early, a backup that is not ready refuses before anything else.
+        let backup = if all {
+            let backup = self.scheduled_backup()?;
+            set(&mut self.record, "rollback_retire_backup", backup.json()?)?;
+            self.backup_ready(&backup)?;
+            Some(backup)
+        } else {
+            None
+        };
         // Rollback material is what an unhealthy host needs.
         self.check_source()?;
         self.journal_identity()?;
@@ -344,7 +362,9 @@ impl Deployment {
                 td_alloc::push(&mut tombstones, item)?;
             }
         }
-        let (past, next) = due(&material, now_secs()?)?;
+        // Early, nothing goes unless the backup is newer than all of it.
+        let planned = backup::retiring(&material, now_secs()?, all, backup.as_ref());
+        let (past, next) = self.awaiting_backup(planned)?;
         if let Some(next) = next {
             set(
                 &mut self.record,

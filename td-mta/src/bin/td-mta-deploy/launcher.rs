@@ -41,12 +41,14 @@ const STEPPING_LEFT: &str = "the stepping-stone job ended unseen or left the dep
 const UNNAMED: &str = "an irreversible deployment names its migration: pass --irreversible --schema-target N --revision HEX together";
 /// The refusal when main no longer selects an authorised revision.
 const MOVED: &str = "main no longer selects the revision --revision authorised: its migration needs its own decision";
+/// An `--all` job whose receipt does not say it retired early.
+const NOT_EARLY: &str = "the job finished without recording an early retirement (rollback_retire_mode is not all): its receipt says what it removed";
 const CHECK_LOST: &str = "the check-only job did not report or its fence could not be read; it takes no fence and changes nothing, so run it again once its unit has stopped";
 const CHECK_FENCED: &str = "a deployment fence is held, which a check-only job never takes: /var/lib/td-mta-operator/deployment-fence names the job that holds it";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
        td-mta/deploy --postgres-socket [--plan] [OPTIONS]
        td-mta/deploy --postgres-binaries [--to-debian] [OPTIONS]
-       td-mta/deploy --retire-rollback --irreversible [OPTIONS]
+       td-mta/deploy --retire-rollback --irreversible [--all] [OPTIONS]
        td-mta/deploy --recover [OPTIONS]
        td-mta/deploy --rollback [OPTIONS]
        td-mta/deploy --restore-shared-services [OPTIONS]
@@ -71,7 +73,9 @@ release in between needs; --to-debian returns it to the retained Debian one.
 directory and stops before it changes anything.
 --retire-rollback deletes rollback material older than seven days: earlier
 job directories, physical recovery copies, and the Debian PostgreSQL tree
-once a verified switch left it. --recover finishes or rolls back a job
+once a verified switch left it; --all deletes it whatever its age, once a
+ready scheduled backup is newer than all of it, and with it --to-debian,
+--rollback and the recovery copies. --recover finishes or rolls back a job
 whose controller stopped inside its writer fence, as that controller
 would have, keeping the live release otherwise. --rollback reactivates
 the release replaced by the activation that installed the live one,
@@ -108,6 +112,8 @@ struct Options<'a> {
     binaries: bool,
     to_debian: bool,
     retire: bool,
+    /// Retire all rollback material, whatever its age.
+    all: bool,
     recover: bool,
     rollback: bool,
     restore: bool,
@@ -132,6 +138,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         binaries: false,
         to_debian: false,
         retire: false,
+        all: false,
         recover: false,
         rollback: false,
         restore: false,
@@ -161,6 +168,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             "--postgres-binaries" => out.binaries = true,
             "--to-debian" => out.to_debian = true,
             "--retire-rollback" => out.retire = true,
+            "--all" => out.all = true,
             "--recover" => out.recover = true,
             "--rollback" => out.rollback = true,
             "--restore-shared-services" => out.restore = true,
@@ -218,6 +226,7 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         out.binaries || !out.to_debian,
         "--to-debian belongs to --postgres-binaries",
     )?;
+    require(out.retire || !out.all, "--all belongs to --retire-rollback")?;
     require(
         !(out.retire && (out.socket || out.binaries || out.skip || out.window)),
         "retiring rollback material is its own job and has no writer window",
@@ -1193,6 +1202,7 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
     }
     if opts.retire {
         set(&mut spec, "mode", Json::Str(owned("retire-rollback")?))?;
+        set(&mut spec, crate::activate::RETIRE_ALL, Json::Bool(opts.all))?;
     }
     if opts.recover {
         set(&mut spec, "mode", Json::Str(owned("recover")?))?;
@@ -1508,6 +1518,7 @@ struct Ended {
 const DECISIONS: &[(&str, &str)] = &[
     ("--irreversible", "irreversible-approval"),
     ("--skip-tests", "skip-tests-approval"),
+    ("--all", "early-retire-approval"),
 ];
 
 /// `end` with a `next` that takes a decision moved to `approve`: what
@@ -1893,6 +1904,9 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
                     },
                 ),
                 Some(crate::activate::INSIDE_WINDOW) => ("deferred", Some(again(args, &[])?)),
+                Some(e) if e.starts_with(crate::activate::NO_BACKUP) => {
+                    ("deferred", Some(again(args, &[])?))
+                }
                 Some(e) => match named(e) {
                     Some(flags) if !(unrecoverable || opts.recover && flags == ["--recover"]) => {
                         ("failed", Some(command(opts, &flags)?))
@@ -1917,6 +1931,17 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             }
         }
     };
+    // An early retirement the controller did not run as one removed
+    // less than was asked.
+    if opts.all && end.result == "succeeded" && text(crate::activate::RETIRE_MODE) != Some("all") {
+        return Ok(Ended {
+            result: "failed",
+            error: Some(owned(NOT_EARLY)?),
+            next: None,
+            approve: None,
+            not_before: None,
+        });
+    }
     Ok(held(end))
 }
 

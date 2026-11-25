@@ -344,7 +344,7 @@ store, and nothing builds into it on the host.
 - The extracted Debian PostgreSQL stays beside it for rollback and the
   explicit return (`--to-debian`), outside td's store and this class,
   until `--retire-rollback` removes it seven days after a verified switch
-  left it.
+  left it, or sooner with `--all` behind a newer scheduled backup.
 
 ## Rust toolchain and dependencies
 

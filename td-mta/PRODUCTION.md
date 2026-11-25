@@ -589,7 +589,8 @@ DELETE on `td_mta.leases` every later one needs, or its `config-check`
 refuses the selected configuration, which a convergence under the live
 release may have written (select that job's `config_previous_version`
 first). Retirement removes job
-directories after seven days, and with them what a rollback reads. A
+directories after seven days (at once with `--all`), and with them what
+a rollback reads. A
 second `--rollback` returns to the release the first one replaced, and
 a plain `./td-mta/deploy` selects the newest verified main again, so
 land the fix first. Rolling back the executable never restores a
@@ -724,6 +725,48 @@ configuration convergence job's receipt is the only copy of its
 `config_previous_version` and, after `uncertain`, of the retained
 selection request: resolve an uncertain request before its job
 directory is seven days old.
+
+Once the operator has decided a change will not be rolled back, `--all`
+retires the material at once instead of after its seven days:
+
+```text
+./td-mta/deploy --retire-rollback --irreversible --all
+```
+
+It removes every piece whatever its age, under the same checks, and
+with it every way back the material kept: `--postgres-binaries
+--to-debian` (the Debian tree goes once a verified switch left it),
+`--rollback` and `--restore-shared-services` (the receipts they read),
+the original data directory a migration left, and every physical
+recovery copy. A configuration convergence's receipt goes too, with its
+`config_previous_version` and any retained selection request: resolve
+an `uncertain` convergence first. What remains to recover from is the
+scheduled logical backup, so `--all` requires a ready one newer than
+all of it. It reads the directory `td-mta-maint-backup-status.service`
+checks (its `--destination`, `/var/lib/td-mta/backups/scheduled`, and
+`--maximum-age-seconds`, as systemd runs it), which
+`td-mta-maint-backup.service` must name as the one it writes, and
+judges the newest archive by that job's rules: its
+`backup-STAMP-PID.json` receipt matches the `.dump`, its
+`created_unix_seconds` is within the maximum age, and no `last-error`
+is present. The health checks then run the status job itself. Before
+the health checks the backup must be `ready`, and before any removal
+created after the newest piece's last write (the Debian tree's, its
+recorded switch). Otherwise it refuses with `no ready scheduled backup
+newer than` the material, naming what it found, removes nothing and,
+when systemd can say, records as `rollback_retire_not_before` when the
+next scheduled backup will have ended: its timer's next start plus the
+backup job's start timeout. A refused run leaves its own job directory,
+which the next backup must also be newer than, so run it again only
+after that time. A backup directory or receipt it cannot read, or one
+the status job would refuse, fails the run instead, naming the
+directory; so do status and backup jobs naming different directories.
+The receipt records the mode (`rollback_retire_mode`, `window` or
+`all`) and, for `all`, the backup it judged (`rollback_retire_backup`:
+destination, archive, status and `created_unix_seconds`), and the
+launcher reports an `--all` job whose receipt does not record `all` as
+`failed`. Without `--all` no backup is read and the window applies as
+above.
 
 
 ### Leaving loopback TLS
@@ -1254,7 +1297,8 @@ configuration"; every other mode holds the following:
     for that migration. `next` is null; `approve` is the command that
     authorises exactly that revision's migration;
   - `deferred`: `--retire-rollback` found all its material inside the
-    window; `approve` repeats it, not before `not_before`.
+    window, or with `--all` found no ready scheduled backup newer than
+    its material; `approve` repeats it, not before `not_before`.
 - `error`: on a refusal or failure, the message, which the command also
   prints on standard error before exiting nonzero. A refused
   `--postgres-socket --plan` check that got past its preflight also
@@ -1281,7 +1325,8 @@ configuration"; every other mode holds the following:
   takes a decision an agent takes only on purpose, in the same
   `{"argv": [...], "needs": [...]}` shape. `needs` names each decision:
   `irreversible-approval` for `--irreversible` (a migration, or
-  retiring rollback material) and `skip-tests-approval` for
+  retiring rollback material), `early-retire-approval` for `--all`
+  (retiring it inside its window) and `skip-tests-approval` for
   `--skip-tests`. An agent runs it only when the operator made that
   decision for this run;
 - `status`: a job's last receipt status, such as `verified deployment`,
@@ -1290,7 +1335,9 @@ configuration"; every other mode holds the following:
   the job's receipt, or its `refusal.json`; absent when neither was
   read;
 - `not_before`: with `deferred` or a retirement that left material, the
-  Unix time the next retirement may remove some;
+  Unix time the next retirement may remove some (after `--all` refused
+  for want of a backup, when the next scheduled backup will have ended;
+  absent when systemd cannot say);
 - `host_key`: with `--write-target --host-key-sha256`, what happened to
   the enrolled key.
 

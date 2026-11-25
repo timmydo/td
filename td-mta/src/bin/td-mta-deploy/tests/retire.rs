@@ -18,18 +18,33 @@ fn material_goes_only_after_its_seven_days() {
             since: 1_000_000 + 6 * day,
         },
     ];
-    let (past, next) = due(&material, 1_000_000 + 7 * day).unwrap();
+    let (past, next) = due(&material, 1_000_000 + 7 * day, false).unwrap();
     assert_eq!(past, [Path::new("/old")]);
     assert_eq!(next, Some(1_000_000 + 12 * day));
-    let (past, next) = due(&material, 1_000_000 + 7 * day - 1).unwrap();
+    let (past, next) = due(&material, 1_000_000 + 7 * day - 1, false).unwrap();
     assert!(past.is_empty());
     assert_eq!(next, Some(1_000_000 + 7 * day));
-    let (past, next) = due(&material, 1_000_000 + 20 * day).unwrap();
+    let (past, next) = due(&material, 1_000_000 + 20 * day, false).unwrap();
     assert_eq!(past.len(), 3);
     assert_eq!(next, None);
-    let (past, next) = due(&[], 0).unwrap();
+    let (past, next) = due(&[], 0, false).unwrap();
     assert!(past.is_empty() && next.is_none());
     assert_eq!(WINDOW, 7 * day);
+    // Early, everything goes whatever its age, and nothing waits.
+    for now in [0, 1_000_000, 1_000_000 + 7 * day - 1] {
+        let (past, next) = due(&material, now, true).unwrap();
+        assert_eq!(
+            past,
+            [
+                Path::new("/old"),
+                Path::new("/young"),
+                Path::new("/younger")
+            ]
+        );
+        assert_eq!(next, None);
+    }
+    let (past, next) = due(&[], 0, true).unwrap();
+    assert!(past.is_empty() && next.is_none());
 }
 
 #[test]

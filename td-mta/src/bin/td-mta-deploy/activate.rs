@@ -65,6 +65,12 @@ pub(crate) const UNRECOVERABLE: &[&str] = &[SOCKET_FENCE, NO_FENCE];
 /// The refusals whose outcome names the command that follows.
 pub(crate) const MIGRATES: &str = "this release migrates the database, which cannot be rolled back";
 pub(crate) const INSIDE_WINDOW: &str = "all rollback material is inside its 7-day window: run td-mta/deploy --retire-rollback --irreversible after rollback_retire_not_before";
+/// How every refusal of early retirement for want of a backup begins.
+pub(crate) const NO_BACKUP: &str = "no ready scheduled backup newer than";
+/// The job key that asks for early retirement, and the receipt's record
+/// of the mode a retirement ran in.
+pub(crate) const RETIRE_ALL: &str = "retire_all";
+pub(crate) const RETIRE_MODE: &str = "rollback_retire_mode";
 const SELECTED: &str = "SELECT encode(version_id,'hex') FROM td_mta.config_selection";
 
 fn now() -> R<f64> {
