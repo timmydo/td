@@ -262,16 +262,19 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
     );
     std::fs::create_dir_all(&far).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
-    let (pid, down) = (far.join("ssh.pid"), far.join("down"));
+    let down = far.join("down");
     let tries = far.join("ssh.tries");
-    // What the last try was run with: only one a person asked for may prompt.
-    let last_try_prompts = || {
-        !std::fs::read_to_string(&tries)
-            .unwrap()
+    // A reconnect's pid and prompt policy are one observation.
+    let last_attempt = || {
+        let tries = std::fs::read_to_string(&tries).unwrap();
+        let (complete, _) = tries.rsplit_once('\n').unwrap();
+        let (pid, args) = complete
             .lines()
             .next_back()
             .unwrap()
-            .contains("BatchMode=yes")
+            .split_once(' ')
+            .unwrap();
+        (pid.parse::<u32>().unwrap(), !args.contains("BatchMode=yes"))
     };
     let ssh = bin.join("ssh");
     std::fs::write(
@@ -279,13 +282,11 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
         format!(
             "#!/bin/sh\n\
              if [ -e '{down}' ]; then echo 'ssh: no route to host' >&2; exit 255; fi\n\
-             echo $$ > '{pid}'\n\
-             echo \"$*\" >> '{tries}'\n\
+             echo \"$$ $*\" >> '{tries}'\n\
              export HOME='{far}' XDG_STATE_HOME='{far}/state' XDG_CONFIG_HOME='{far}/config'\n\
              unset WAYLAND_DISPLAY\n\
              exec '{program}' attach\n",
             down = down.display(),
-            pid = pid.display(),
             tries = tries.display(),
             far = far.display(),
             program = env!("CARGO_BIN_EXE_td-agent"),
@@ -335,7 +336,7 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
         agent.state().contains("composer=1	").then_some(())
     });
     std::fs::write(&down, "").unwrap();
-    let was = std::fs::read_to_string(&pid).unwrap();
+    let was = last_attempt().0;
     let killed = Command::new("sh")
         .args(["-c", &format!("kill {was}")])
         .status()
@@ -358,7 +359,7 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
     assert!(logged(&agent, &["hi"]));
 
     // The first, before there was a window, could ask; these could not.
-    assert!(last_try_prompts(), "the first");
+    assert!(last_attempt().1, "the first");
 
     // A dialog open as the link returns is not closed under the person: its keys
     // stay its own, and do not reach the composer behind it.
@@ -373,12 +374,12 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
     wait(&agent, "the item opens the key dialog", || {
         agent.state().contains("dialog=entry").then_some(())
     });
-    let before = std::fs::read_to_string(&pid).unwrap();
+    let before = last_attempt().0;
     std::fs::remove_file(&down).unwrap();
     wait(&agent, "the far side is reached again", || {
-        (std::fs::read_to_string(&pid).unwrap() != before).then_some(())
+        (last_attempt().0 != before).then_some(())
     });
-    assert!(!last_try_prompts(), "nobody asked for that one");
+    assert!(!last_attempt().1, "nobody asked for that one");
     compositor.chord(&[], KEY_S);
     compositor.chord(&[], KEY_K);
     assert!(agent.state().contains("not connected to box"), "it waits");
@@ -409,7 +410,7 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
 
     // Another window takes over, as one at that machine might. This one says so,
     // and logs in no more: left alone, two would take it back from each other.
-    let before = std::fs::read_to_string(&pid).unwrap();
+    let before = last_attempt().0;
     let (ours, theirs) = UnixStream::pair().unwrap();
     let mut other = Command::new(env!("CARGO_BIN_EXE_td-agent"))
         .arg("attach")
@@ -440,11 +441,7 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
             .then_some(())
     });
     std::thread::sleep(Duration::from_secs(3));
-    assert_eq!(
-        std::fs::read_to_string(&pid).unwrap(),
-        before,
-        "no more logins"
-    );
+    assert_eq!(last_attempt().0, before, "no more logins");
     drop(elsewhere);
     other.wait().unwrap();
 
@@ -459,46 +456,44 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
     let hi = open(&agent);
     compositor.chord(&[], KEY_ENTER);
     wait(&agent, "asked, it connects again", || {
-        (std::fs::read_to_string(&pid).unwrap() != before
-            && !agent.state().contains("not connected to box"))
-        .then_some(())
+        (last_attempt().0 != before && !agent.state().contains("not connected to box"))
+            .then_some(())
     });
-    assert!(last_try_prompts(), "that one was asked for");
+    assert!(last_attempt().1, "that one was asked for");
     wait(&agent, "it has what it had open", || {
         (open(&agent) == hi).then_some(())
     });
 
     // A message into a link already dead, which only the far side's end says:
     // nothing of it was heard of, so it comes back when ssh notices.
-    let before = std::fs::read_to_string(&pid).unwrap();
-    let signal = |signal: &str, pid: &str| {
+    let before = last_attempt().0;
+    let signal = |signal: &str, pid: u32| {
         let sent = Command::new("sh")
             .args(["-c", &format!("kill -{signal} {pid}")])
             .status()
             .unwrap();
         assert!(sent.success());
     };
-    signal("STOP", before.trim());
+    signal("STOP", before);
     compositor.chord(&[], KEY_Q);
     compositor.chord(&[], KEY_ENTER);
     wait(&agent, "the composer has let it go", || {
         agent.state().contains("composer=0\t").then_some(())
     });
-    signal("KILL", before.trim());
+    signal("KILL", before);
     wait(&agent, "it comes back", || {
         agent.state().contains("composer=1\t").then_some(())
     });
     wait(&agent, "the window connects again", || {
-        (std::fs::read_to_string(&pid).unwrap() != before
-            && !agent.state().contains("not connected to box"))
-        .then_some(())
+        (last_attempt().0 != before && !agent.state().contains("not connected to box"))
+            .then_some(())
     });
 
     // A window opened there while this one's link is dying: this one never hears
     // it was let go, tries again by itself when ssh notices, and does not put the
     // other out, but says so and leaves it to the person.
-    let before = std::fs::read_to_string(&pid).unwrap();
-    signal("STOP", before.trim());
+    let before = last_attempt().0;
+    signal("STOP", before);
     let (ours, theirs) = UnixStream::pair().unwrap();
     let mut other = Command::new(env!("CARGO_BIN_EXE_td-agent"))
         .arg("attach")
@@ -529,15 +524,15 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
     wait(&agent, "the other is told what is there", || {
         elsewhere.recv().ok().flatten()
     });
-    signal("KILL", before.trim());
+    signal("KILL", before);
     wait(&agent, "this one tried again, and was sent away", || {
         agent
             .state()
             .contains("Return in composer retries")
             .then_some(())
     });
-    assert_ne!(std::fs::read_to_string(&pid).unwrap(), before);
-    assert!(!last_try_prompts(), "nobody asked for that one");
+    assert_ne!(last_attempt().0, before);
+    assert!(!last_attempt().1, "nobody asked for that one");
     assert!(
         agent.state().contains("conversations=1\t"),
         "it still shows what it had"
@@ -546,12 +541,11 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
     drop(elsewhere);
     other.wait().unwrap();
     assert!(agent.state().contains("composer=1\t"), "q stayed");
-    let before = std::fs::read_to_string(&pid).unwrap();
+    let before = last_attempt().0;
     compositor.chord(&[], KEY_ENTER);
     wait(&agent, "asked, it connects again", || {
-        (std::fs::read_to_string(&pid).unwrap() != before
-            && !agent.state().contains("not connected to box"))
-        .then_some(())
+        (last_attempt().0 != before && !agent.state().contains("not connected to box"))
+            .then_some(())
     });
 
     // Another conversation, the more recent, and back on the first: where a far
@@ -583,7 +577,7 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
     });
 
     // Stopped there, it stays stopped, however long the wait.
-    let before = std::fs::read_to_string(&pid).unwrap();
+    let before = last_attempt().0;
     let stopped = Command::new(env!("CARGO_BIN_EXE_td-agent"))
         .args(["serve", "--stop"])
         .env_clear()
@@ -600,15 +594,14 @@ fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() 
             .then_some(())
     });
     std::thread::sleep(Duration::from_secs(3));
-    assert_eq!(std::fs::read_to_string(&pid).unwrap(), before);
+    assert_eq!(last_attempt().0, before);
     assert!(!far.join("state/td-agent/stop.sock").exists());
 
     // Asked, what starts there opens its most recent, which is not what was open.
     compositor.chord(&[], KEY_ENTER);
     wait(&agent, "asked, it connects again", || {
-        (std::fs::read_to_string(&pid).unwrap() != before
-            && !agent.state().contains("not connected to box"))
-        .then_some(())
+        (last_attempt().0 != before && !agent.state().contains("not connected to box"))
+            .then_some(())
     });
     wait(&agent, "it goes back to what it had open", || {
         (open(&agent) == hi).then_some(())
