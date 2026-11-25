@@ -531,14 +531,13 @@ impl Worker {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use ::td_fs::TempDir;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Child;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     const ID: &str = "0123456789abcdef0123456789abcdef";
     struct Fixture {
-        root: PathBuf,
+        root: TempDir,
         server: Option<Child>,
     }
     impl Drop for Fixture {
@@ -547,7 +546,6 @@ mod tests {
                 let _ = server.kill();
                 let _ = server.wait();
             }
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
     fn program(name: &str) -> PathBuf {
@@ -558,7 +556,7 @@ mod tests {
                 let p = PathBuf::from("/run/current-system/profile/sbin").join(name);
                 p.is_file().then_some(p)
             })
-            .map(|p| fs::canonicalize(p).unwrap())
+            .map(|p| std::path::absolute(p).unwrap())
             .unwrap_or_else(|| panic!("host fixture needs {name}"))
     }
     fn invoke(command: &mut Command) -> String {
@@ -574,7 +572,7 @@ mod tests {
             .into()
     }
     #[test]
-    #[ignore = "requires host Git, OpenSSH daemon/client, rustc and GCC"]
+    #[ignore = "requires host Git, OpenSSH daemon/client, rustc and its linker"]
     fn ssh_clone_keeps_retained_base_private_worktree_and_user_edits() {
         if let Some(root) = std::env::var_os("TD_VM_CLONE_CRASH_CHILD") {
             let root = PathBuf::from(root);
@@ -607,25 +605,8 @@ mod tests {
         }
         let uid = fs::metadata("/proc/self").unwrap().uid();
         // The host OpenSSH's StrictModes deliberately rejects /tmp even for private children.
-        // Concurrent hosted checks run in their own PID namespaces over the one
-        // HOME, so the pid alone can repeat: take the first name this creates.
         let home = PathBuf::from(std::env::var_os("HOME").expect("host HOME"));
-        let root = (0..1024)
-            .map(|_| {
-                home.join(format!(
-                    ".td-vm-clone-test-{}-{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, Ordering::Relaxed)
-                ))
-            })
-            .find(
-                |root| match fs::DirBuilder::new().mode(0o700).create(root) {
-                    Ok(()) => true,
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-                    Err(e) => panic!("{}: {e}", root.display()),
-                },
-            )
-            .expect("no free clone test directory name in HOME");
+        let root = TempDir::new_in(&home, ".td-vm-clone-test").unwrap();
         let mut f = Fixture { root, server: None };
         let keygen = program("ssh-keygen");
         let git_bin = program("git");
@@ -719,7 +700,7 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let user = invoke(Command::new(program("id")).arg("-un"));
+        let user = invoke(Command::new(program("id")).args(["-u", "-n"]));
         let plan = Plan {
             id: ID.into(),
             branch: "task".into(),
@@ -779,7 +760,7 @@ fn main() {{
 "#)).unwrap();
         invoke(
             Command::new(program("rustc"))
-                .args(["--edition", "2021", "-C", "linker=gcc"])
+                .args(["--edition", "2021", "-C", "linker-features=-lld"])
                 .arg(&source)
                 .arg("-o")
                 .arg(&dispatcher),

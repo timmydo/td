@@ -752,7 +752,7 @@ fn main() {
 "#).unwrap();
         let cargo = fixture.0.join("cargo");
         assert!(Command::new("rustc")
-            .arg("-Clinker=gcc")
+            .arg("-Clinker-features=-lld")
             .arg(&source)
             .arg("-o")
             .arg(&cargo)

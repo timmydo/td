@@ -7,7 +7,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+use td_fs::TempDir;
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const BIN: &str = env!("CARGO_BIN_EXE_td-vm-registrar");
 const GIT_BIN: &str = env!("CARGO_BIN_EXE_td-vm-git");
@@ -44,12 +45,6 @@ fn in_trusted_root(name: &str) -> Result<bool> {
     Ok(true)
 }
 
-struct Root(PathBuf);
-impl Drop for Root {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -76,18 +71,13 @@ fn host_git() -> Result<PathBuf> {
     }
     Err("host Git not found".into())
 }
-fn fixture() -> Result<(Root, PathBuf)> {
+fn fixture() -> Result<(TempDir, PathBuf)> {
     fixture_format("sha1")
 }
-fn fixture_format(format: &str) -> Result<(Root, PathBuf)> {
-    let root = Root(std::env::temp_dir().join(format!(
-        "td-registrar-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    )));
-    DirBuilder::new().mode(0o700).create(&root.0)?;
+fn fixture_format(format: &str) -> Result<(TempDir, PathBuf)> {
+    let root = TempDir::new("td-registrar")?;
     let git = host_git()?;
-    let repo = root.0.join("origin.git");
+    let repo = root.join("origin.git");
     invoke(
         Command::new(&git)
             .args(["init", "--bare", "--initial-branch=main"])
@@ -95,7 +85,7 @@ fn fixture_format(format: &str) -> Result<(Root, PathBuf)> {
             .arg(&repo),
         true,
     )?;
-    let seed = root.0.join("seed");
+    let seed = root.join("seed");
     invoke(
         Command::new(&git)
             .args(["init", "--initial-branch=main"])
@@ -125,9 +115,9 @@ fn fixture_format(format: &str) -> Result<(Root, PathBuf)> {
             .arg("main"),
         true,
     )?;
-    let policy = root.0.join("private/registry");
-    fs::copy(GIT_BIN, root.0.join("td-vm-git"))?;
-    fs::set_permissions(root.0.join("td-vm-git"), fs::Permissions::from_mode(0o700))?;
+    let policy = root.join("private/registry");
+    fs::copy(GIT_BIN, root.join("td-vm-git"))?;
+    fs::set_permissions(root.join("td-vm-git"), fs::Permissions::from_mode(0o700))?;
     invoke(
         Command::new(GIT_BIN)
             .arg("init")
@@ -199,10 +189,10 @@ fn starting_commits_survive_moving_refs_gc_and_revoke_retries() -> Result<()> {
     for format in ["sha1", "sha256"] {
         let (root, policy) = fixture_format(format)?;
         let uid = fs::metadata("/proc/self")?.uid();
-        let directory = root.0.join("socket");
+        let directory = root.join("socket");
         let server = launch(&directory, &policy, uid)?;
         let git = host_git()?;
-        let repo = root.0.join("origin.git");
+        let repo = root.join("origin.git");
         let run = |args: &[&str], success| -> Result<String> {
             let output = invoke(
                 Command::new(&git).arg("--git-dir").arg(&repo).args(args),
@@ -259,7 +249,7 @@ fn starting_commits_survive_moving_refs_gc_and_revoke_retries() -> Result<()> {
         );
         request(&directory, uid, &["start", ID, "task", &replacement], false)?;
         // A normal clone's head mapping excludes internal refs. Fetch the anchor explicitly.
-        let clone = root.0.join("clone");
+        let clone = root.join("clone");
         invoke(
             Command::new(&git)
                 .args(["init", "--initial-branch=main"])
@@ -343,7 +333,7 @@ fn registrar_authenticates_accounts_and_preserves_registry_across_restart() -> R
     }
     let (root, policy) = fixture()?;
     let uid = fs::metadata("/proc/self")?.uid();
-    let directory = root.0.join("socket");
+    let directory = root.join("socket");
     let initial = fs::read(&policy)?;
     let wrong = launch(&directory, &policy, uid + 1)?;
     request(&directory, uid, &["enroll", ID, "task", KEY], false)?;
@@ -406,7 +396,7 @@ fn client_sends_no_request_to_a_different_account() -> Result<()> {
         return Ok(());
     }
     let (root, _policy) = fixture()?;
-    let directory = root.0.join("fake");
+    let directory = root.join("fake");
     fs::create_dir(&directory)?;
     let listener = UnixListener::bind(directory.join("control"))?;
     let wrong = fs::metadata("/proc/self")?.uid() + 1;
@@ -426,7 +416,7 @@ fn registrar_refuses_exposed_registry_and_non_socket_replacement() -> Result<()>
     }
     let (root, policy) = fixture()?;
     let uid = fs::metadata("/proc/self")?.uid();
-    let directory = root.0.join("socket");
+    let directory = root.join("socket");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o644))?;
     invoke(
         Command::new(BIN)
@@ -465,17 +455,17 @@ fn manager_profile_authenticates_exact_origin_and_preserves_failed_updates() -> 
     }
     let (root, policy) = fixture()?;
     let uid = fs::metadata("/proc/self")?.uid();
-    let directory = root.0.join("socket");
+    let directory = root.join("socket");
     let _server = launch(&directory, &policy, uid)?;
-    let client = root.0.join("td-vm-registrar");
-    let git = root.0.join("git");
+    let client = root.join("td-vm-registrar");
+    let git = root.join("git");
     for (source, destination) in [(PathBuf::from(BIN), &client), (host_git()?, &git)] {
         fs::copy(source, destination)?;
         fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
     }
-    let home = root.0.join("vms");
-    let input = root.0.join("profile");
-    let repository = root.0.join("origin.git");
+    let home = root.join("vms");
+    let input = root.join("profile");
+    let repository = root.join("origin.git");
     let profile = format!("TDVM-GIT-PROFILE-1\nrepository={}\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid={uid}\nsocket={}\nregistrar={}\ngit={}\nhost-key=ssh-ed25519 {KEY}\nauthor-name=Fixture\nauthor-email=fixture@example.invalid\n", repository.display(), directory.display(), client.display(), git.display());
     fs::write(&input, &profile)?;
     fs::set_permissions(&input, fs::Permissions::from_mode(0o600))?;
@@ -529,7 +519,7 @@ fn manager_profile_authenticates_exact_origin_and_preserves_failed_updates() -> 
     )?;
     manager(&["git-profile", "check"], false)?;
     // A second valid bare repository must not pass against the first registrar.
-    let other = root.0.join("other.git");
+    let other = root.join("other.git");
     invoke(
         Command::new(&git)
             .args(["clone", "--bare"])
@@ -700,17 +690,17 @@ fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> R
     }
     let (root, policy) = fixture()?;
     let uid = fs::metadata("/proc/self")?.uid();
-    let socket = root.0.join("socket");
+    let socket = root.join("socket");
     let server = launch(&socket, &policy, uid)?;
-    let client = root.0.join("td-vm-registrar");
-    let git = root.0.join("git");
+    let client = root.join("td-vm-registrar");
+    let git = root.join("git");
     for (source, destination) in [(PathBuf::from(BIN), &client), (host_git()?, &git)] {
         fs::copy(source, destination)?;
         fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
     }
-    let repository = root.0.join("origin.git");
-    let home = root.0.join("vms");
-    let input = root.0.join("profile");
+    let repository = root.join("origin.git");
+    let home = root.join("vms");
+    let input = root.join("profile");
     fs::write(&input, format!("TDVM-GIT-PROFILE-1\nrepository={}\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid={uid}\nsocket={}\nregistrar={}\ngit={}\nhost-key=ssh-ed25519 {KEY}\nauthor-name=Fixture\nauthor-email=fixture@example.invalid\n", repository.display(), socket.display(), client.display(), git.display()))?;
     fs::set_permissions(&input, fs::Permissions::from_mode(0o600))?;
     let manager = |args: &[&str], success| {
@@ -838,11 +828,11 @@ fn registrar_crash_retains_dispatcher_lifetime_before_rebind() -> Result<()> {
     }
     let (root, policy) = fixture()?;
     let uid = fs::metadata("/proc/self")?.uid();
-    let socket = root.0.join("socket");
-    let source = root.0.join("delayed.rs");
-    let marker = root.0.join("running");
-    let release = root.0.join("release");
-    let done = root.0.join("done");
+    let socket = root.join("socket");
+    let source = root.join("delayed.rs");
+    let marker = root.join("running");
+    let release = root.join("release");
+    let done = root.join("done");
     // A host-only Rust dispatcher fixture keeps the production stdin contract.
     fs::write(
         &source,
@@ -869,7 +859,7 @@ fn main() {{
     )?;
     invoke(
         Command::new("rustc")
-            .args(["--edition", "2021", "-C", "linker=gcc"])
+            .args(["--edition", "2021", "-C", "linker-features=-lld"])
             .arg(&source)
             .arg("-o")
             .arg(installed(&policy)?),

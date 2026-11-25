@@ -1135,10 +1135,10 @@ td-link, which links Rust and compiles no C, and it ships no `gcc`. Rust
 builds and tests link through it, `gate-crates crypto-cargo` among them
 (no admitted crate compiles C, so its wrapper takes the provisioned `cc`,
 td-link there, as Rust's linker driver only; no td host has run it yet),
-but what needs host C fails there: the td-update,
-td-vm and td-vm-guest test fixtures that link with `-Clinker=gcc` (GNU ld,
-not bundled LLD) for want of a `gcc`; run `ready` on a host with a C
-toolchain. Nor is a workspace naming a Flathub runtime one, whose `/usr`
+and the td-update, td-vm and td-vm-guest tests that compile Rust helpers
+let rustc use the host's default linker driver. Those fixtures disable
+rustc's bundled LLD selection so the Guix driver keeps its runtime paths.
+Tests that compile C still require a host C toolchain. Nor is a workspace naming a Flathub runtime one, whose `/usr`
 would supply that `gcc`: td-builder refuses to run on a td system that
 has a `/usr` (TRUST.md, "Trust zones").
 

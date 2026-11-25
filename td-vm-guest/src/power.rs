@@ -241,8 +241,7 @@ mod tests {
     #[test]
     #[ignore = "requires host rustc and its linker"]
     fn handoff_pins_argv_and_bounds_reply_exit_and_blocked_connect() {
-        let root = std::env::temp_dir().join(format!("td-power-child-{}", std::process::id()));
-        fs::create_dir(&root).unwrap();
+        let root = ::td_fs::TempDir::new("td-power-child").unwrap();
         let source = root.join("fixture.rs");
         fs::write(&source, format!(r#"
 use std::{{fs,env,io::Write,os::unix::net::UnixStream,path::Path}};
@@ -264,7 +263,7 @@ fn main() {{
 }}
 "#, pid=root.join("pid"), socket=root.join("control"))).unwrap();
         assert!(Command::new("rustc")
-            .args(["-C", "linker=gcc"])
+            .args(["-C", "linker-features=-lld"])
             .arg(&source)
             .arg("-o")
             .arg(root.join("ok"))
@@ -303,6 +302,5 @@ fn main() {{
         }
         drop(listener);
         drop(lease);
-        fs::remove_dir_all(root).unwrap();
     }
 }
