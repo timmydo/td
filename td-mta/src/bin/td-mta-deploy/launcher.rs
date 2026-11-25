@@ -565,6 +565,61 @@ impl Local {
         crate::postgres_minors::covered(minor)?;
         Ok(minor)
     }
+    /// What `job` needs on the host's filesystems, as root reads them over
+    /// SSH, refusing when one is short.
+    fn free_space(&self, job: crate::space::Job, mut sizes: crate::space::Sizes) -> R<()> {
+        use crate::space;
+        let run = |args: &[&str]| -> R<(Option<i32>, String)> {
+            let mut command = Vec::new();
+            td_alloc::extend_from_slice(&mut command, &["sudo", "-n", "env", "LC_ALL=C"])?;
+            td_alloc::extend_from_slice(&mut command, args)?;
+            let output = self.host.exec(
+                &mut self.ssh(&command)?,
+                &[],
+                Duration::from_secs(40),
+                false,
+            )?;
+            // ssh's own failure is not the command's.
+            require(
+                output.status.code() != Some(255),
+                "SSH failed measuring free space",
+            )?;
+            Ok((
+                output.status.code(),
+                owned(std::str::from_utf8(&output.stdout)?.trim())?,
+            ))
+        };
+        if job.measures_data() {
+            (sizes.data, sizes.wal) = space::data_sizes(&run)?;
+        }
+        let verdicts = space::assess(&space::writes(job, &sizes)?, |place| {
+            space::volume(&run, place)
+        })?;
+        match space::refusal(job, &verdicts)? {
+            Some(message) => Err(message.into()),
+            None => Ok(()),
+        }
+    }
+    /// Room for the built closure's NARs in the job directory, and in the
+    /// store for those of paths it does not hold yet.
+    fn upload_space(&self, built: &[closure::Built]) -> R<()> {
+        let mut sizes = crate::space::Sizes::default();
+        for item in built {
+            let size = fs::metadata(&item.nar)?.len();
+            sizes.upload = sizes
+                .upload
+                .checked_add(size)
+                .ok_or("closure size overflow")?;
+            let path = fmt(format_args!("/td/store/{}", item.basename))?;
+            if self.remote_status(&["sudo", "-n", "test", "-e", &path])? != Some(0) {
+                sizes.unpack = sizes
+                    .unpack
+                    .checked_add(size)
+                    .ok_or("closure size overflow")?;
+            }
+        }
+        self.free_space(crate::space::Job::Upload, sizes)
+    }
     fn cargo(&self, checkout: &Path) -> R<Command> {
         let mut build = Command::new("cargo");
         build.current_dir(checkout);
@@ -898,6 +953,9 @@ fn write_job_outcome(out: &mut impl std::io::Write, end: &Ended, job: &Job) -> R
     {
         set(&mut details, "journal_cap", Json::Str(owned(cap)?))?;
     }
+    if let Some(space) = job.record.as_ref().and_then(|r| r.get("free_space")) {
+        set(&mut details, "free_space", crate::common::copy_json(space)?)?;
+    }
     // Only a record read names where it came from.
     if job.record.is_some() {
         set(&mut details, "receipt", Json::Str(owned(&job.receipt)?))?;
@@ -1009,6 +1067,15 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
     } else {
         None
     };
+    // Before a build of up to hours, room for the first switch's
+    // rehearsal. From a td closure the build may be the live one, which a
+    // rerun only verifies, so that is measured once it is known. The
+    // closure and GIN sizes come later; the controller measures again.
+    if let Some((source, _)) = live_server.as_ref().filter(|_| !opts.to_debian) {
+        if source == DEBIAN_SOURCE {
+            local.free_space(crate::space::Job::Switch, crate::space::Sizes::default())?;
+        }
+    }
     let cache = child(&local.root, ".td-build-cache")?;
     fs::create_dir_all(&cache)?;
     let scratch = td_fs::TempDir::new_in(&cache, "mta-deploy")?;
@@ -1021,6 +1088,15 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
             let td_minor = postgres_minor(store_basename(&server.basename, "postgresql-x86-64")?)?;
             // Before anything reaches the host: the table covers the move.
             crate::postgres_minors::movable(live_minor, td_minor)?;
+            // Before it reaches the host: room for it there, and for the
+            // rehearsal of a move between td closures.
+            if live_server
+                .as_ref()
+                .is_some_and(|(source, _)| source != DEBIAN_SOURCE && *source != server.basename)
+            {
+                local.free_space(crate::space::Job::Switch, crate::space::Sizes::default())?;
+            }
+            local.upload_space(&built)?;
             Some(built)
         }
         _ => None,

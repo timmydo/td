@@ -1475,6 +1475,48 @@ fn a_job_outcome_names_what_follows_from_its_end() {
         let error = crate::journald::effective(text).unwrap_err().to_string();
         assert!(super::named(&error).is_none(), "{error}");
     }
+    // A short filesystem is the operator's to free: no command follows,
+    // and the outcome carries what was measured.
+    let sizes = crate::space::Sizes {
+        data: 1 << 30,
+        ..crate::space::Sizes::default()
+    };
+    let writes = crate::space::writes(crate::space::Job::Migration, &sizes).unwrap();
+    let verdicts = crate::space::assess(&writes, |_| {
+        Ok(crate::space::Volume {
+            device: 1,
+            mount: "/".into(),
+            available: 1 << 30,
+        })
+    })
+    .unwrap();
+    let message = crate::space::refusal(crate::space::Job::Migration, &verdicts)
+        .unwrap()
+        .unwrap();
+    let mut record = Json::Obj(Vec::new());
+    set(&mut record, "error", Json::Str(message.clone())).unwrap();
+    set(
+        &mut record,
+        "free_space",
+        crate::space::json(&verdicts).unwrap(),
+    )
+    .unwrap();
+    let short = job(Some(1), &record.to_string(), Some(false), Some(true));
+    let full = at_deploy(&short);
+    assert_eq!(full.result, "failed");
+    assert!(full.next.is_none() && full.approve.is_none());
+    let mut written = Vec::new();
+    write_job_outcome(&mut written, &full, &short).unwrap();
+    let line = String::from_utf8(written).unwrap();
+    assert!(
+        line.contains(r#""free_space":[{"mount":"/","needed":"#),
+        "{line}"
+    );
+    // Refused by the launcher before any job, it names none either.
+    let next = refused_next(&message, deploy_args).unwrap();
+    let refused = refused_end(message, next);
+    assert_eq!(refused.result, "refused");
+    assert!(refused.next.is_none() && refused.approve.is_none());
     let changed = r#"{"error":"production release changed"}"#;
     let other = at_deploy(&job(Some(1), changed, Some(false), Some(true)));
     assert_eq!(other.result, "failed");

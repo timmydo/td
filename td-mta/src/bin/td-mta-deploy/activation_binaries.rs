@@ -8,9 +8,7 @@
 //! `--retire-rollback` removes it after its window.
 use super::*;
 use crate::{
-    common::{
-        banner_minor, free_bytes, postgres_minor, store_basename, DEBIAN_LIBRARIES, DEBIAN_TOOLS,
-    },
+    common::{banner_minor, postgres_minor, store_basename, DEBIAN_LIBRARIES, DEBIAN_TOOLS},
     isolation::files::{self, Held, Setting},
     physical::SOCKET_DIR,
     postgres_minors::{self, Check, Note, GIN_BYTES, GIN_INDEXES, REINDEX_GIN},
@@ -851,6 +849,23 @@ impl Deployment {
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
+        // Before the closure enters the store: room for it, the rehearsal
+        // and the GIN rebuild, which writes each new index beside the old
+        // one, and its WAL.
+        let gin = if closure.rebuilds_gin()? {
+            self.sql("owner", GIN_BYTES, &[], false)?.parse()?
+        } else {
+            0
+        };
+        let unpack = store::unpacked(&self.work, &closure)?;
+        self.free_space(
+            space::Job::Switch,
+            space::Sizes {
+                gin,
+                unpack,
+                ..space::Sizes::default()
+            },
+        )?;
         let mut switch = Switch::from(source, previous);
         self.note_switch(&switch)?;
         self.guarded(
@@ -1096,6 +1111,7 @@ impl Deployment {
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
         self.healthy(&self.previous)?;
+        self.free_space(space::Job::ToDebian, space::Sizes::default())?;
         let mut switch = Switch::from(source, previous);
         self.note_switch(&switch)?;
         self.guarded(
@@ -1193,14 +1209,6 @@ impl Deployment {
             if let Check::Cluster(count) = note.check {
                 concerned(release, note, &self.sql("owner", count, &[], false)?)?;
             }
-        }
-        // REINDEX writes each new index beside the old one, and its WAL.
-        if closure.rebuilds_gin()? {
-            let size: u64 = self.sql("owner", GIN_BYTES, &[], false)?.parse()?;
-            require(
-                free_bytes(Path::new(PGDATA))? > size.saturating_mul(2).saturating_add(GIB),
-                "too little space beside the data directory for the GIN rebuild",
-            )?;
         }
         Ok(())
     }

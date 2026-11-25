@@ -101,7 +101,7 @@ impl Receiver {
                         "physical backup preparation timeout",
                     )?;
                     require(
-                        free_bytes(&wal)? > 8 * GIB,
+                        free_bytes(&wal)? > crate::space::RECEIVER_FREE,
                         "physical recovery disk reserve",
                     )?;
                     require(spool_size(&wal)? <= GIB, "WAL spool budget")?;

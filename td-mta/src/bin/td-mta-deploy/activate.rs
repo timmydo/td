@@ -1,11 +1,12 @@
 //! Production cutover. A positively closed writer fence is required to rewind
 //! the database. Once writers might have been admitted, recover forward.
 use crate::{
-    common::{child, digest, durable, fmt, free_bytes, owned, require, set, Host},
+    common::{child, digest, durable, fmt, owned, require, set, Host},
     isolation,
-    physical::{Recovery, GIB, MAIL, PGDATA, SYSTEM},
+    physical::{Recovery, MAIL, PGDATA, SYSTEM},
     probes::Probes,
     service_database::{self, Passwords, ROLES},
+    space,
     target::HostConfig,
     R,
 };
@@ -437,7 +438,24 @@ impl Deployment {
             !migrate || !self.rolling_back(),
             "the release rolled back to would migrate the database: deploy a forward fix",
         )?;
+        // Measured before the authorisation is judged, so the run that
+        // names the migration records in free_space whether it fits.
+        let fits = if migrate {
+            self.free_space(space::Job::Migration, space::Sizes::default())
+        } else {
+            Ok(())
+        };
         if migrate && !authorised(&self.record, target) {
+            // A shortage is in free_space already; a failed measure is not.
+            if let Err(error) = &fits {
+                if self.record.get("free_space").is_none() {
+                    set(
+                        &mut self.record,
+                        "free_space_error",
+                        Json::Str(fmt(format_args!("{error}"))?),
+                    )?;
+                }
+            }
             return Err(migrates(
                 self.old_version,
                 target,
@@ -446,6 +464,7 @@ impl Deployment {
             )?
             .into());
         }
+        fits?;
         let mut recovery = None;
         let result = self.cutover(migrate, &mut recovery);
         let result = if result.is_err() {
@@ -507,25 +526,35 @@ impl Deployment {
         result.and(logs).and(cleanup)
     }
 
-    /// Room at `path` for a rehearsal's base backup and trial of the live
-    /// databases.
-    fn rehearsal_capacity(&self, path: &Path) -> R<()> {
-        let size = self
-            .sql(
-                "owner",
-                "SELECT sum(pg_database_size(oid)) FROM pg_database",
+    /// The free space `job` needs, measured as root on this host and
+    /// recorded in the receipt; a short filesystem refuses before the job
+    /// writes anything ("Free space for copies").
+    fn free_space(&mut self, job: space::Job, mut sizes: space::Sizes) -> R<()> {
+        let host = &self.host;
+        let run = |args: &[&str]| -> R<(Option<i32>, String)> {
+            let (program, rest) = args.split_first().ok_or("empty command")?;
+            let output = host.exec(
+                host.cmd(program).args(rest),
                 &[],
+                Duration::from_secs(40),
                 false,
-            )?
-            .parse::<u64>()?;
-        require(
-            free_bytes(path)?
-                > size
-                    .checked_mul(2)
-                    .and_then(|n| n.checked_add(4 * GIB))
-                    .ok_or("rehearsal size overflow")?,
-            "rehearsal capacity",
-        )
+            )?;
+            Ok((
+                output.status.code(),
+                owned(std::str::from_utf8(&output.stdout)?.trim())?,
+            ))
+        };
+        if job.measures_data() {
+            (sizes.data, sizes.wal) = space::data_sizes(&run)?;
+        }
+        let verdicts = space::assess(&space::writes(job, &sizes)?, |place| {
+            space::volume(&run, place)
+        })?;
+        set(&mut self.record, "free_space", space::json(&verdicts)?)?;
+        match space::refusal(job, &verdicts)? {
+            Some(message) => Err(message.into()),
+            None => Ok(()),
+        }
     }
 
     /// A fresh verified base backup on the recovery volume for `trial`,
@@ -538,7 +567,6 @@ impl Deployment {
             Json::Str(owned(copy.work.to_str().ok_or("recovery path")?)?),
         )?;
         let result = (|| -> R<()> {
-            self.rehearsal_capacity(&copy.work)?;
             copy.base_backup(self)?;
             trial(self, &mut copy)
         })();
@@ -576,18 +604,6 @@ impl Deployment {
 
     fn cutover(&mut self, migration: bool, recovery: &mut Option<Recovery>) -> R<()> {
         if migration {
-            let size = self
-                .sql(
-                    "owner",
-                    "SELECT sum(pg_database_size(oid)) FROM pg_database",
-                    &[],
-                    false,
-                )?
-                .parse::<u64>()?;
-            require(
-                free_bytes(Path::new(PGDATA))? > size.saturating_add(2 * GIB),
-                "primary rollback space",
-            )?;
             let copy = Recovery::new(self)?;
             set(
                 &mut self.record,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::{common::free_bytes, physical::GIB};
 use std::{
     io::{Read, Seek, SeekFrom},
     os::unix::process::CommandExt,
@@ -296,23 +297,6 @@ impl Deployment {
             !mounts.lines().any(|m| Path::new(m).starts_with(PGDATA)),
             "mounted PGDATA subtree",
         )?;
-        let size =
-            self.host.out(
-                self.host
-                    .cmd("du")
-                    .args(["--apparent-size", "-s", "-B1", PGDATA]),
-            )?;
-        let size = size
-            .split_ascii_whitespace()
-            .next()
-            .ok_or("primary size unavailable")?
-            .parse::<u64>()?;
-        if warm {
-            require(
-                free_bytes(Path::new(PGDATA))? > size.saturating_add(2 * GIB),
-                "primary preseed space",
-            )?;
-        }
         let timeout = self.host.remaining()?.min(Duration::from_secs(900));
         let mut proc = self
             .host

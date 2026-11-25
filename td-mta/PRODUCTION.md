@@ -344,6 +344,76 @@ systemctl status td-mta-maint-backup-status.service
 
 Recovery archives are retained data, not disposable cache.
 
+## Free space for copies
+
+A job that writes a base backup, a trial copy, a physical recovery copy
+or a new closure first measures each filesystem it will write and
+refuses, before it writes any of them, unless each has more free than
+the job needs there. The live data directory's allocated size (`du -s
+-x -B1`, its `pg_wal` included) is `DATA`; a base backup leaves the
+live `pg_wal` behind and streams its own, so `BASE` is `DATA` less
+`pg_wal`. On one filesystem the job needs the sum of what it writes
+there plus what it keeps free: the larger of the 4 GiB reserve and any
+guard a running step holds there. Filesystems are told apart by device,
+so writes on one add up.
+
+| Job | Recovery volume (`/data`) | Data directory's filesystem (`/`) | Store and job directories (`/`) |
+| --- | --- | --- | --- |
+| Migrating activation | 3 × `BASE` (base backup, migration trial, replay trial) + `BASE` (the migration trial's rewrites and WAL) + 3 GiB WAL + 1 GiB bootstrap archive + 8 GiB the WAL receiver keeps free | `DATA` (the primary's cold copy) + 4 GiB | |
+| `--postgres-binaries` | 2 × `BASE` (rehearsal base backup and trial) + 2 × `GIN` (the trial's rebuild) + 4 GiB | 2 × `GIN` (production's rebuild) + 4 GiB | the NARs of closure paths not yet in `/td/store` + 4 GiB |
+| `--postgres-binaries --to-debian` | | 1 GiB (no copy; PostgreSQL restarts) | |
+| Closure upload (the launcher, after the build) | | | the NARs into the job directory + those it will unpack into `/td/store` + 4 GiB |
+
+`GIN` is the size of the GIN indexes a minor-release note rebuilds, 0
+for none; a rebuild writes each new index beside the old one, and its
+WAL. The WAL a recovery copy holds is bounded by the receiver's 1 GiB
+spool budget, its replay archive and the replay trial's restored copy
+of it; the bootstrap archive (the live release, its PostgreSQL and the
+configuration) is taken as 1 GiB, and an unpacked store path as its
+NAR's size, block rounding coming out of the reserve. The return to
+Debian keeps only 1 GiB, as the way back from a nearly full root. On
+production the data directory, store and job directories share the
+root, so a switch needs its closure, its GIN rebuild and one 4 GiB
+reserve free there. The measure assumes ordinary filesystems: a pooled
+one (btrfs subvolumes, ZFS datasets) shares free space across devices,
+and a compressed source copies larger than `du` reads it.
+
+Where it is measured, always before the job's copies, fence and store
+paths:
+
+- A migrating activation, after the candidate is built and classified,
+  before it judges the migration's authorisation: the run refused as
+  `refused-irreversible` records in `free_space` whether the migration
+  fits, so check that no row's `needed` reaches its `available` before
+  taking its `approve` (a measurement that failed is in
+  `free_space_error` instead); the authorised run refuses if one does.
+- `--postgres-binaries`, in the launcher before its build when the live
+  server is Debian's, after the build when it moves between td
+  closures (a rerun on the closure it runs measures only the upload of
+  its NARs), again for the upload, and in the controller before it
+  installs anything.
+- `--to-debian`, in the controller before its fence.
+
+Jobs that copy nothing measure nothing: a binary-only activation,
+`--converge-config` with or without `--plan`, `--recover`,
+`--retire-rollback`, and, but for its NAR upload, a switch rerun on the
+server it already runs.
+The receipt's `free_space` lists each filesystem's `mount`, `needed` and
+`available` in bytes and what makes up `needed` (`parts`), and the
+outcome line repeats it.
+
+A refusal begins `too little free space for`, names each short mount
+with what it needs and has, and comes before any copy, fence or store
+path; what the preflight did before it (a candidate build, service
+logins) stays, as for an unauthorised migration. Its outcome is
+`failed`, or `refused` from the launcher, with `next` null: freeing
+space is the operator's choice. On the root: `sudo journalctl
+--vacuum-size=500M`, removing identified obsolete candidate build trees
+and inactive releases ("Diagnose and retain evidence"). On the recovery
+volume: rollback material past its seven days (`--retire-rollback`,
+itself an irreversible decision). Never remove backups, migration data
+or the live data directory to make room. Then run the job again.
+
 ## Update and roll back
 
 Updates and their rollback run from the development machine through
@@ -373,8 +443,8 @@ Use the PostgreSQL 17 client binaries alongside the installed server.
 Place the private base, WAL spool and isolated trial on the recovery
 volume under `/data`. The live cluster uses an external configuration
 file; retain it separately and give the trial its own configuration and
-socket directory. Budget space for two cluster copies and the WAL spool
-before each window.
+socket directory. The deployment refuses a window the recovery volume
+or the root cannot hold ("Free space for copies").
 
 For physical backup access, provision a dedicated `LOGIN REPLICATION
 NOSUPERUSER` PostgreSQL role with a private SCRAM credential. Restrict
@@ -590,8 +660,10 @@ restart while the file exists creates the socket closed. Admission removes
 the file first, then sets the socket back to 0660. A start after an
 interrupted step therefore follows the file, which is the fence's state. It verifies the named restore point and selected
 mail evidence before attempting DDL. A preseeded, primary-device copy
-is synchronized by content after clean PostgreSQL shutdown. Budget
-space for this additional data directory and time to read both copies.
+is synchronized by content after clean PostgreSQL shutdown; the
+deployment refuses before its copies unless the data directory's
+filesystem holds it ("Free space for copies"). Budget time to read both
+copies.
 The actual upgrade and runtime checks use the candidate data directory
 on its own trial socket. The original shut-down primary remains in the private
 job directory. Before writer admission a failed migration can reopen that
@@ -1152,7 +1224,10 @@ configuration"; every other mode holds the following:
 - `host_key`: with `--write-target --host-key-sha256`, what happened to
   the enrolled key;
 - `journal_cap`: after a job that ensured the journal's bound ("Journal
-  size"), `installed`, `restarted` or `unchanged`.
+  size"), `installed`, `restarted` or `unchanged`;
+- `free_space`: after a job that measured the filesystems it writes
+  ("Free space for copies"), each one's `mount`, `needed`, `available`
+  and `parts`.
 
 ### Isolating production service accounts
 
@@ -1383,38 +1458,38 @@ The in-place switch needs all six gates:
    count is zero, and a GIN rebuild finds GIN indexes only in `td_mta`.
 
 Gates 1 to 3 run on the live server through the owner login (`td_mta`)
-and the marker login (`postgres`), and the notes' cluster counts
-through the owner login. When a note rebuilds GIN indexes, the
-filesystem of the data directory must have free twice their size and a
-GiB more; that refusal leaves the live server running until space is
-freed. For gate 5 the controller takes a fresh online base backup,
-checks it with td's `pg_controldata`, and
-starts td's server on it with the production `postgresql.conf` and
-`pg_hba.conf`, overriding only the trial's paths and socket, plus a peer
-rule that lets root in as `setup_admin` on that copy alone. Through a
-holder, root, the replication and marker logins and every login of the
-live release must work; the trial's executable
-must be td's, with every executable mapping inside the closure and no
-loader variable. As the copy's superuser it repeats gates 1 and 2 in
-every database that takes connections, scans every stored value for lz4
-(gate 2's scan; the error and the receipt's `postgres_lz4_values` name
-each offending column), and requires that each database's collation version
-and each used libc collation's version are what td glibc reports, and
-that every installed extension is available to td's server. It runs
-every database count of the minor-release notes, and when a note
-rebuilds GIN indexes it rebuilds, through the owner login as production
-will, every GIN index of `td_mta` (td-mta's trigram search index) in one
-transaction of at most 600 seconds, timing it, and requires none in
-another database. That time sizes the production rebuild: unless
-`--window-seconds` is at least twice it and thirty seconds more, the
-switch refuses before fencing and names a window a quarter longer, in
-whole minutes, to run again with.
+and the marker login (`postgres`), and the notes' cluster counts through
+the owner login. Before the closure enters the store, the recovery
+volume must hold the rehearsal's base backup and trial, and the root the
+closure and, when a note rebuilds GIN indexes, twice their size ("Free
+space for copies"); that refusal leaves the live server running until
+space is freed. For gate 5 the controller takes a fresh online base
+backup, checks it with td's `pg_controldata`, and starts td's server on
+it with the production `postgresql.conf` and `pg_hba.conf`, overriding
+only the trial's paths and socket, plus a peer rule that lets root in as
+`setup_admin` on that copy alone. Through a holder, root, the
+replication and marker logins and every login of the live release must
+work; the trial's executable must be td's, with every executable mapping
+inside the closure and no loader variable. As the copy's superuser it
+repeats gates 1 and 2 in every database that takes connections, scans
+every stored value for lz4 (gate 2's scan; the error and the receipt's
+`postgres_lz4_values` name each offending column), and requires that
+each database's collation version and each used libc collation's version
+are what td glibc reports, and that every installed extension is
+available to td's server. It runs every database count of the
+minor-release notes, and when a note rebuilds GIN indexes it rebuilds,
+through the owner login as production will, every GIN index of `td_mta`
+(td-mta's trigram search index) in one transaction of at most 600
+seconds, timing it, and requires none in another database. That time
+sizes the production rebuild: unless `--window-seconds` is at least
+twice it and thirty seconds more, the switch refuses before fencing and
+names a window a quarter longer, in whole minutes, to run again with.
 The receipt's `postgres_minor_notes` lists each note with `verified`,
 `GIN rebuild rehearsed` or `exempt` and its reason, and
-`postgres_gin_rebuild_trial_ms` the trial's time. Through the
-owner login `pg_trgm` must answer and serve a probe of td-mta's search
-through its trigram index, and td's `pg_dump --schema-only` of
-`td_mta` must complete. The copy is then removed.
+`postgres_gin_rebuild_trial_ms` the trial's time. Through the owner
+login `pg_trgm` must answer and serve a probe of td-mta's search through
+its trigram index, and td's `pg_dump --schema-only` of `td_mta` must
+complete. The copy is then removed.
 
 The unit must be `Type=exec` or `Type=simple` (td's server does not
 notify systemd), run exactly

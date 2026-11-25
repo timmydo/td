@@ -84,6 +84,25 @@ fn nar_file(work: &Path, basename: &str) -> R<PathBuf> {
     child(work, &fmt(format_args!("{basename}.nar"))?)
 }
 
+/// The bytes of the uploaded NARs of closure paths not yet in the store,
+/// the measure of what unpacking them takes there.
+pub(super) fn unpacked(work: &Path, closure: &Closure) -> R<u64> {
+    let mut total = 0u64;
+    for entry in [&closure.glibc, &closure.postgres] {
+        if child(Path::new(STORE), &entry.basename)?.try_exists()? {
+            continue;
+        }
+        let size = match fs::symlink_metadata(nar_file(work, &entry.basename)?) {
+            Ok(meta) => meta.len(),
+            // Placing it refuses without its NAR.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
+        total = total.checked_add(size).ok_or("closure size overflow")?;
+    }
+    Ok(total)
+}
+
 // A host program the extracted Debian tools' library path must not reach.
 fn operator(host: &Host) -> Command {
     let mut cmd = host.cmd(OPERATOR);

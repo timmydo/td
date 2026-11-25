@@ -1,7 +1,7 @@
 //! Private online base backup, named recovery point and migration rehearsal.
 use crate::activate::Deployment;
 use crate::common::{
-    child, digest, durable, fmt, free_bytes, owned, private_dir, random_hex, require, set, Host,
+    child, digest, durable, fmt, owned, private_dir, random_hex, require, set, Host,
     DEBIAN_POSTGRES,
 };
 use crate::{isolation, service_database, R};
@@ -280,22 +280,6 @@ impl Recovery {
         require(
             h.sql("owner", SETTINGS, &[], false)? == "t|on|t|t|t|t|t",
             "physical backup prerequisites",
-        )?;
-        let size = h
-            .sql(
-                "owner",
-                "SELECT sum(pg_database_size(oid)) FROM pg_database",
-                &[],
-                false,
-            )?
-            .parse::<u64>()?;
-        require(
-            free_bytes(&self.work)?
-                > size
-                    .checked_mul(4)
-                    .and_then(|n| n.checked_add(9 * GIB))
-                    .ok_or("physical backup size overflow")?,
-            "backup capacity",
         )?;
         self.receiver = Some(Receiver::start(&h.host, &self.work)?);
         self.wait(
