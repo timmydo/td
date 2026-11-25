@@ -446,48 +446,25 @@ block goes under it, deliberately: a block that hid the bar would be a worse
 lie than the one it answers. This block IS the bar, so drawn in that order it
 would be painted away by the very strip it is promising.
 
-The NETWORK field is leftmost of the readings, as the ethernet stanza is in
-the config this follows. It names the interface, whether it is up, and the
-address — and the address is the part with a story. Nothing td writes down
-records it: td-netd prints the acquired lease to stdout and drops it,
-`/run/resolv.conf` gets nameservers only, and the generated `/etc/hosts` is
-loopback. So the address comes from `/proc/net/fib_trie`, the kernel's own
-routing dump, where a local address is a `/32 host LOCAL` leaf. That file is
-the only one that has it without a `SIOCGIFADDR` ioctl, which would be a new
-syscall on a surface that has none and so an `UNSAFE.md` amendment for a
-status field.
+The NETWORK field is the leftmost reading. Each second the sampler opens
+`/run/td-netd/status`, which td-netd publishes by atomic rename. The first
+64 bytes cover the connected interface name, its IPv4 address and the
+following netmask marker. A retryable renewal failure keeps the connected
+prefix while the lease is valid. For a connected lease the sampler reads only this
+prefix and the named interface's sysfs `operstate`. This works for Ethernet
+and Wi-Fi even with other interfaces present. A down or lower-layer-down
+link shows `DOWN` immediately, including while the previous lease is still
+published. Other driver states besides `up` leave the state unknown.
 
-The dump says which addresses EXIST and never whose they are, and that governs
-the whole field. An address is attributable only when there is exactly one
-non-loopback interface it could belong to; with a second one present the named
-interface may not be the one holding the lease, and `NET eth0 <eth1's address>`
-is a well-formed line that is wrong. Wrong is worse than absent on a status
-bar. More than one non-loopback local address is refused for the same reason,
-and loopback — present in every routing table — is never the answer. The one
-residual is an address aliased onto `lo` itself, which the `127.` filter does
-not catch and nothing here can attribute.
-
-So the address is THREE states rather than two, and they read differently:
-`NET eth0 10.0.2.15` when it is known, bare `NET eth0 UP` when the table says
-there is genuinely none, and `NET eth0 UP ?` when there is one but nothing
-attributes it — `?` keeping the meaning it has everywhere else on this bar,
-could not be determined. Collapsing the last two would tell an operator their
-link has no lease while the machine is reachable. `DOWN` outranks any address
-still configured, since a stale address on a link with no carrier is not
-somewhere to reach this machine.
-
-Link state comes from `operstate`, and only `up`, `down` and `lowerlayerdown`
-are answers. A driver with no carrier reporting writes `unknown`; reading that
-as down would put `DOWN` beside a working interface and suppress its address
-with it, so `unknown`, `dormant`, `testing` and `notpresent` leave the state
-unknown instead.
-
-The interface is chosen by td-netd's own rule (skip `lo`, sort, prefer a name
-beginning with `e`), which is a SECOND COPY of that convention rather than a
-shared one, since the two crates share no library: a change there is a bar
-naming an interface nothing configured. Non-UTF-8 names are kept lossily for
-that reason too — dropping one would be the two crates sorting different
-lists.
+If the connected record is absent, malformed or names an interface with
+unreadable state, the sampler falls back to the kernel. It skips loopback,
+sorts the interface names and prefers one beginning with `e`. With a single
+non-loopback interface it reads `/proc/net/fib_trie` for a unique local
+non-loopback IPv4 address. The routing table does not identify the owning
+interface, so multiple interfaces or multiple distinct addresses leave
+the address unknown. A known address reads `NET eth0 10.0.2.15`. On an up
+link, a table with no such address gives `NET eth0 UP`, and an unknown
+address gives `NET eth0 UP ?`.
 
 There is no WIRELESS field. The kernel drives one wireless device, the
 ThinkPad T14s's, and td-netd owns its association; while the radio holds

@@ -3,6 +3,7 @@ use crate::text::{Text, CELL_HEIGHT};
 use crate::ui;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -58,7 +59,7 @@ pub struct Link {
 /// reachable.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Address {
-    /// One local address, and one interface it could belong to.
+    /// An address attributed to this interface.
     Known(String),
     /// The routing table has no non-loopback local address at all.
     Absent,
@@ -85,9 +86,13 @@ pub struct Readings {
 }
 
 impl Readings {
-    /// Read from a `/proc` and a `/sys` root — parameters so the tests can hand
-    /// them fixtures, since the host's own are neither fixed nor reproducible.
-    pub fn sample(proc_root: &Path, sys_root: &Path, epoch_secs: Option<u64>) -> Self {
+    /// Read kernel statistics and the network manager's published status.
+    pub fn sample(
+        proc_root: &Path,
+        sys_root: &Path,
+        netd_status: &Path,
+        epoch_secs: Option<u64>,
+    ) -> Self {
         let loadavg = std::fs::read_to_string(proc_root.join("loadavg")).ok();
         let meminfo = std::fs::read_to_string(proc_root.join("meminfo")).ok();
         let uptime = std::fs::read_to_string(proc_root.join("uptime")).ok();
@@ -110,7 +115,7 @@ impl Readings {
             total_kb,
             uptime_secs: uptime.as_deref().and_then(parse_uptime_secs),
             epoch_secs,
-            link: sample_link(proc_root, sys_root),
+            link: sample_link(proc_root, sys_root, netd_status),
             audio: None,
         }
     }
@@ -122,7 +127,7 @@ struct CpuTemperature(Option<i32>);
 impl CpuTemperature {
     fn sample(sys_root: &Path) -> Self {
         let mut path = [0; 4096];
-        let readings = sysfs_child(&mut path, sys_root, b"class/hwmon")
+        let readings = sysfs_child(&mut path, sys_root, &[b"class/hwmon"])
             .and_then(|class| std::fs::read_dir(class).ok());
         let hottest = readings
             .into_iter()
@@ -131,10 +136,10 @@ impl CpuTemperature {
             .filter_map(|entry| {
                 let chip = entry.path();
                 let mut name = [0; 64];
-                let driver = attribute(&chip, b"name", &mut name)?;
+                let driver = attribute(&chip, &[b"name"], &mut name)?;
                 let millidegrees = |file: &[u8]| {
                     let mut value = [0; 64];
-                    attribute(&chip, file, &mut value)?
+                    attribute(&chip, &[file], &mut value)?
                         .parse::<i32>()
                         .ok()
                         .filter(|v| (-273_150..=200_000).contains(v))
@@ -164,19 +169,21 @@ impl std::fmt::Display for CpuTemperature {
 
 // Kernel attribute names and values are small. Keep the per-tick path and
 // read buffers bounded, including when a test supplies its own sysfs root.
-fn sysfs_child<'a>(buffer: &'a mut [u8], dir: &Path, name: &[u8]) -> Option<&'a Path> {
+fn sysfs_child<'a>(buffer: &'a mut [u8], dir: &Path, parts: &[&[u8]]) -> Option<&'a Path> {
     let mut output = &mut *buffer;
     let length = output.len();
     output.write_all(dir.as_os_str().as_bytes()).ok()?;
-    output.write_all(b"/").ok()?;
-    output.write_all(name).ok()?;
+    for part in parts {
+        output.write_all(b"/").ok()?;
+        output.write_all(part).ok()?;
+    }
     let used = length - output.len();
     Some(Path::new(std::ffi::OsStr::from_bytes(buffer.get(..used)?)))
 }
 
-fn attribute<'a>(dir: &Path, name: &[u8], buffer: &'a mut [u8; 64]) -> Option<&'a str> {
+fn attribute<'a>(dir: &Path, parts: &[&[u8]], buffer: &'a mut [u8; 64]) -> Option<&'a str> {
     let mut path = [0; 4096];
-    let mut file = std::fs::File::open(sysfs_child(&mut path, dir, name)?).ok()?;
+    let mut file = std::fs::File::open(sysfs_child(&mut path, dir, parts)?).ok()?;
     let n = file.read(buffer).ok()?;
     if n == buffer.len() {
         return None;
@@ -184,19 +191,63 @@ fn attribute<'a>(dir: &Path, name: &[u8], buffer: &'a mut [u8; 64]) -> Option<&'
     std::str::from_utf8(buffer.get(..n)?).ok().map(str::trim)
 }
 
+fn link_state<'a>(sys_root: &Path, name: &str, value: &'a mut [u8; 64]) -> Option<&'a str> {
+    attribute(
+        sys_root,
+        &[b"class/net", name.as_bytes(), b"operstate"],
+        value,
+    )
+}
+
+fn connected_link(sys_root: &Path, status: &Path) -> Option<Link> {
+    // td-netd renames each snapshot into place. Reopen it each tick and read
+    // only the prefix containing the interface and address, even for long DNS lists.
+    let mut prefix = [0; 64];
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000 | 0x800) // O_NOFOLLOW | O_NONBLOCK
+        .open(status)
+        .ok()?;
+    let n = file.read(&mut prefix).ok()?;
+    let text = std::str::from_utf8(prefix.get(..n)?).ok()?;
+    let (name, lease) = text.split_once(": connected, address ")?;
+    let (ip, _) = lease.split_once(" netmask ")?;
+    if name.is_empty()
+        || name.len() > 15
+        || matches!(name, "." | ".." | "lo")
+        || name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | ':'))
+    {
+        return None;
+    }
+    let address: std::net::Ipv4Addr = ip.parse().ok()?;
+    if address.is_unspecified() || address.is_loopback() {
+        return None;
+    }
+    let mut value = [0; 64];
+    let state = link_state(sys_root, name, &mut value)?;
+    Some(Link {
+        name: crate::allocation::string(name).ok(),
+        up: operational(state),
+        address: crate::allocation::string(ip).map_or(Address::Unattributable, Address::Known),
+    })
+}
+
 /// The interface, whether it is up, and its address. Each is answered on its
 /// own: a name with no operstate is still worth showing, and an address with
 /// no name is not a thing this can produce.
-fn sample_link(proc_root: &Path, sys_root: &Path) -> Link {
+fn sample_link(proc_root: &Path, sys_root: &Path, netd_status: &Path) -> Link {
+    if let Some(link) = connected_link(sys_root, netd_status) {
+        return link;
+    }
     let names = interface_names(sys_root);
     let name = choose_interface(&names);
     let up = name.as_deref().and_then(|name| {
         // `operstate` over `carrier`: reading `carrier` on a down interface is
         // an EINVAL rather than a `0`, so the two failure modes would be the
         // same answer here.
-        let text = std::fs::read_to_string(sys_root.join("class/net").join(name).join("operstate"))
-            .ok()?;
-        operational(&text)
+        operational(link_state(sys_root, name, &mut [0; 64])?)
     });
     // Only ONE interface makes the address attributable. The dump says which
     // addresses exist and not whose they are, so with a second interface
@@ -244,10 +295,7 @@ fn interface_names(sys_root: &Path) -> Vec<String> {
     names
 }
 
-/// The interface to report on, by the SAME rule `td-netd` configures one with:
-/// prefer a name beginning with `e`, else the first. A second copy of a
-/// convention rather than a shared one — the two crates share no library — so
-/// a change there is a bar naming an interface nothing configured.
+/// Without a connected lease, prefer an Ethernet name among the visible interfaces.
 fn choose_interface(names: &[String]) -> Option<String> {
     let ethernet = names.iter().position(|name| name.starts_with('e'));
     match ethernet {
@@ -256,12 +304,7 @@ fn choose_interface(names: &[String]) -> Option<String> {
     }
 }
 
-/// This machine's own IPv4, out of `/proc/net/fib_trie`. Nothing td writes
-/// records it — `td-netd` prints the lease and drops it, and `/etc/hosts` gets
-/// loopback only — so the kernel's own routing dump is the one file that has
-/// it without a `SIOCGIFADDR` ioctl, which would be a new syscall on a surface
-/// that has none.
-///
+/// Kernel fallback when td-netd has no usable connected snapshot.
 /// A local address is a `/32 host LOCAL` leaf, whose value is on the `|--` line
 /// above it. Loopback is skipped, and an ambiguous answer — more than one
 /// non-loopback local address — is refused rather than guessed at, since the
@@ -832,11 +875,12 @@ fn tick(
     runtime: &Mutex<crate::runtime::Runtime>,
     proc_root: &Path,
     sys_root: &Path,
+    netd_status: &Path,
     epoch_secs: Option<u64>,
     clock: &Clock,
     reported: &mut Reported,
 ) -> Tick {
-    let mut readings = Readings::sample(proc_root, sys_root, epoch_secs);
+    let mut readings = Readings::sample(proc_root, sys_root, netd_status, epoch_secs);
     readings.audio = match runtime.lock() {
         Ok(runtime) => runtime.audio_shown(),
         Err(_) => return Tick::Poisoned,
@@ -901,6 +945,7 @@ pub fn start(
                     &runtime,
                     &proc_root,
                     &sys_root,
+                    Path::new("/run/td-netd/status"),
                     unix_epoch_secs(),
                     &clock,
                     &mut reported,
@@ -944,6 +989,8 @@ mod tests {
     }
 
     struct Fixture {
+        _root: crate::temp_dir::TempDir,
+        netd_status: PathBuf,
         proc_root: std::path::PathBuf,
         sys_root: std::path::PathBuf,
     }
@@ -955,6 +1002,15 @@ mod tests {
             Self::with_net(loadavg, meminfo, uptime, &[], "")
         }
 
+        fn sample(&self, epoch_secs: Option<u64>) -> Readings {
+            Readings::sample(
+                &self.proc_root,
+                &self.sys_root,
+                &self.netd_status,
+                epoch_secs,
+            )
+        }
+
         fn with_net(
             loadavg: &str,
             meminfo: &str,
@@ -962,13 +1018,9 @@ mod tests {
             interfaces: &[(&str, &str)],
             fib_trie: &str,
         ) -> Self {
-            let stem = format!(
-                "td-bar-{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            );
-            let proc_root = std::env::temp_dir().join(format!("{stem}-proc"));
-            let sys_root = std::env::temp_dir().join(format!("{stem}-sys"));
+            let root = crate::temp_dir::TempDir::new("td-bar").unwrap();
+            let proc_root = root.path().join("proc");
+            let sys_root = root.path().join("sys");
             std::fs::create_dir_all(&proc_root).unwrap();
             std::fs::write(proc_root.join("loadavg"), loadavg).unwrap();
             std::fs::write(proc_root.join("meminfo"), meminfo).unwrap();
@@ -983,16 +1035,11 @@ mod tests {
                 std::fs::write(dir.join("operstate"), operstate).unwrap();
             }
             Self {
+                netd_status: root.path().join("status"),
+                _root: root,
                 proc_root,
                 sys_root,
             }
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.proc_root);
-            let _ = std::fs::remove_dir_all(&self.sys_root);
         }
     }
 
@@ -1024,7 +1071,7 @@ Local:
     #[test]
     fn a_sample_reads_every_field_from_its_proc_root() {
         let fixture = Fixture::new("0.42 0.31 0.28 2/517 9182\n", MEMINFO, "187245.31 91.2\n");
-        let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(1_770_000_000));
+        let readings = fixture.sample(Some(1_770_000_000));
         assert_eq!(readings.load_centi, Some(42));
         assert_eq!(readings.total_kb, Some(8_039_384));
         // Used is total minus AVAILABLE, not minus free.
@@ -1054,7 +1101,12 @@ Local:
         let sample = || {
             line(
                 &Clock::Utc,
-                &Readings::sample(root.path(), root.path(), Some(0)),
+                &Readings::sample(
+                    root.path(),
+                    root.path(),
+                    &root.path().join("status"),
+                    Some(0),
+                ),
             )
         };
         chip("hwmon0", "nvme", "99000", "100000");
@@ -1076,7 +1128,7 @@ Local:
             &[("eth0", "up\n"), ("lo", "unknown\n")],
             FIB_TRIE,
         );
-        let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
+        let readings = fixture.sample(Some(0));
         assert_eq!(readings.link.name.as_deref(), Some("eth0"));
         assert_eq!(readings.link.up, Some(true));
         assert_eq!(
@@ -1089,7 +1141,7 @@ Local:
     #[test]
     fn a_down_interface_says_so_and_an_up_one_with_no_lease_says_that() {
         let down = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "down\n")], "");
-        let readings = Readings::sample(&down.proc_root, &down.sys_root, Some(0));
+        let readings = down.sample(Some(0));
         assert_eq!(readings.link.up, Some(false));
         assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 DOWN"));
 
@@ -1104,7 +1156,7 @@ Local:
             &[("eth0", "up\n")],
             "  |-- 127.0.0.1\n     /32 host LOCAL\n",
         );
-        let readings = Readings::sample(&leaseless.proc_root, &leaseless.sys_root, Some(0));
+        let readings = leaseless.sample(Some(0));
         assert_eq!(readings.link.address, Address::Absent);
         assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 UP  LOAD"));
 
@@ -1112,9 +1164,54 @@ Local:
         // going unanswered, and `?` is what the rest of this bar spells that
         // with.
         let blind = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "up\n")], "");
-        let readings = Readings::sample(&blind.proc_root, &blind.sys_root, Some(0));
+        let readings = blind.sample(Some(0));
         assert_eq!(readings.link.address, Address::Unattributable);
         assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 UP ?  LOAD"));
+    }
+
+    #[test]
+    fn the_network_field_follows_the_connected_lease_on_a_multi_interface_host() {
+        let fixture = Fixture::with_net(
+            "0\n",
+            MEMINFO,
+            "0\n",
+            &[
+                ("eth0", "up"),
+                ("lo", "unknown"),
+                ("sit0", "down"),
+                ("wlan0", "up"),
+            ],
+            "",
+        );
+        let status = |name, ip| {
+            let next = fixture.netd_status.with_extension("new");
+            std::fs::write(&next, format!("{name}: connected, address {ip} netmask 255.255.255.0 gateway 10.18.11.4 dns [10.18.11.4]\n")).unwrap();
+            std::fs::rename(next, &fixture.netd_status).unwrap();
+        };
+        let sample = || line(&Clock::Utc, &fixture.sample(Some(0)));
+        status("eth0", "10.18.11.8");
+        assert!(sample().starts_with("NET eth0 10.18.11.8  LOAD"));
+        std::fs::write(&fixture.netd_status,
+            "eth0: connected, address 10.18.11.8 netmask 255.255.255.0 gateway 10.18.11.4 dns [10.18.11.4]; DHCP renewal failed: timed out; retrying before expiry\n").unwrap();
+        assert!(sample().starts_with("NET eth0 10.18.11.8  LOAD"));
+        status("wlan0", "192.168.1.7");
+        assert!(sample().starts_with("NET wlan0 192.168.1.7  LOAD"));
+        std::fs::write(fixture.sys_root.join("class/net/wlan0/operstate"), "down").unwrap();
+        assert!(sample().starts_with("NET wlan0 DOWN  LOAD"));
+        for (name, ip) in [
+            ("gone0", "10.0.0.2"),
+            ("eth0", "invalid"),
+            ("../eth0", "10.0.0.2"),
+        ] {
+            status(name, ip);
+            assert!(sample().starts_with("NET eth0 UP ?  LOAD"));
+        }
+        std::fs::write(
+            &fixture.netd_status,
+            "eth0: carrier detected; requesting DHCP lease\n",
+        )
+        .unwrap();
+        assert!(sample().starts_with("NET eth0 UP ?  LOAD"));
     }
 
     #[test]
@@ -1130,7 +1227,7 @@ Local:
             &[("eth0", "up\n"), ("eth1", "up\n"), ("lo", "unknown\n")],
             FIB_TRIE,
         );
-        let readings = Readings::sample(&two.proc_root, &two.sys_root, Some(0));
+        let readings = two.sample(Some(0));
         assert_eq!(readings.link.name.as_deref(), Some("eth0"));
         assert_eq!(readings.link.address, Address::Unattributable);
         assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 UP ?  LOAD"));
@@ -1144,7 +1241,7 @@ Local:
             &[("eth0", "up\n"), ("lo", "unknown\n")],
             FIB_TRIE,
         );
-        let readings = Readings::sample(&one.proc_root, &one.sys_root, Some(0));
+        let readings = one.sample(Some(0));
         assert_eq!(
             readings.link.address,
             Address::Known("10.0.2.15".to_string())
@@ -1170,7 +1267,7 @@ Local:
             &[("eth0", "unknown\n")],
             FIB_TRIE,
         );
-        let readings = Readings::sample(&unknown.proc_root, &unknown.sys_root, Some(0));
+        let readings = unknown.sample(Some(0));
         assert_eq!(readings.link.up, None);
         // The address still shows: an unknown link state is no reason to
         // withhold an address the routing table has.
@@ -1179,7 +1276,7 @@ Local:
         // Named, but with no readable state and no address at all: `?`.
         let stateless = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[], "");
         std::fs::create_dir_all(stateless.sys_root.join("class").join("net").join("eth0")).unwrap();
-        let readings = Readings::sample(&stateless.proc_root, &stateless.sys_root, Some(0));
+        let readings = stateless.sample(Some(0));
         assert_eq!(readings.link.name.as_deref(), Some("eth0"));
         assert_eq!(readings.link.up, None);
         assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 ?  LOAD"));
@@ -1191,7 +1288,7 @@ Local:
         // this machine, so DOWN outranks it. Deliberate, and it would not be
         // held by any other test here.
         let down = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "down\n")], FIB_TRIE);
-        let readings = Readings::sample(&down.proc_root, &down.sys_root, Some(0));
+        let readings = down.sample(Some(0));
         assert_eq!(
             readings.link.address,
             Address::Known("10.0.2.15".to_string())
@@ -1200,7 +1297,7 @@ Local:
     }
 
     #[test]
-    fn the_interface_is_chosen_as_td_netd_chooses_one() {
+    fn the_fallback_prefers_an_ethernet_interface() {
         // Loopback is never it, a name beginning with `e` wins over one that
         // does not whatever the sort order, and the sort is what decides
         // between two of the same kind.
@@ -1290,7 +1387,7 @@ Local:
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let readings = Readings::sample(&empty, &empty, None);
+        let readings = Readings::sample(&empty, &empty, &empty, None);
         assert_eq!(readings, Readings::default());
         assert_eq!(
             line(&Clock::Utc, &readings),
@@ -1300,7 +1397,7 @@ Local:
         // Present but unparseable is the same answer, and each field fails on
         // its own: a garbled loadavg must not take the clock down with it.
         let fixture = Fixture::new("not-a-number\n", "MemTotal: elephants\n", "\n");
-        let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
+        let readings = fixture.sample(Some(0));
         assert_eq!(readings.load_centi, None);
         assert_eq!(readings.total_kb, None);
         assert_eq!(readings.used_kb, None);
@@ -1316,7 +1413,7 @@ Local:
         // MemAvailable absent: "used" is unanswerable, so the whole segment
         // is, rather than reporting a total beside a made-up used.
         let fixture = Fixture::new("0.00 0 0 1/1 1\n", "MemTotal:        1048576 kB\n", "0\n");
-        let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
+        let readings = fixture.sample(Some(0));
         assert_eq!(readings.total_kb, Some(1_048_576));
         assert_eq!(readings.used_kb, None);
         assert!(line(&Clock::Utc, &readings).contains("MEM ?"));
@@ -1702,6 +1799,7 @@ Local:
                 &runtime,
                 &fixture.proc_root,
                 &fixture.sys_root,
+                &fixture.netd_status,
                 Some(at),
                 &Clock::Utc,
                 reported,
@@ -1758,13 +1856,14 @@ Local:
                 &runtime,
                 &fixture.proc_root,
                 &fixture.sys_root,
+                &fixture.netd_status,
                 Some(0),
                 &Clock::Utc,
                 &mut reported
             ),
             Tick::Continue(None)
         );
-        let mut expected = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
+        let mut expected = fixture.sample(Some(0));
         expected.audio = Some(level);
         let expected = super::line(&Clock::Utc, &expected).unwrap();
         assert_eq!(
@@ -1804,16 +1903,14 @@ Local:
                 &runtime,
                 &fixture.proc_root,
                 &fixture.sys_root,
+                &fixture.netd_status,
                 Some(0),
                 &clock,
                 &mut reported
             ),
             Tick::Continue(None)
         );
-        let expected = line(
-            &clock,
-            &Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0)),
-        );
+        let expected = line(&clock, &fixture.sample(Some(0)));
         let mut runtime = runtime.lock().unwrap();
         runtime.fail_next_repaint();
         // An identical published line requires no paint. A UTC line from the

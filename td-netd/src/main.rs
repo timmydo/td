@@ -947,13 +947,14 @@ fn lease_status(name: &str, lease: &Lease) -> String {
 }
 
 /// What this daemon owns under `/run`, which the root start makes its account's
-/// (`privilege::shed`). Nothing else reads these but its own `status` verb.
+/// (`privilege::shed`). The compositor reads the connected lease prefix
+/// from the same snapshot as `td-netd status`.
 pub const RUN_DIR: &str = "/run/td-netd";
 const LOCK_PATH: &str = "/run/td-netd/lock";
 const STATUS_PATH: &str = "/run/td-netd/status";
 const STATUS_NEW_PATH: &str = "/run/td-netd/status.new";
 
-fn report(message: &str) -> io::Result<()> {
+fn report(message: &(impl std::fmt::Display + ?Sized)) -> io::Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1289,9 +1290,15 @@ fn cmd_watch(wifi_owner: Option<u32>) -> io::Result<ExitCode> {
                     }
                     Err(e) => {
                         rejected = e.kind() == io::ErrorKind::AddrNotAvailable;
-                        report(&format!(
-                            "{name}: DHCP renewal failed: {e}; retrying before expiry"
-                        ))?;
+                        if !rejected && uptime()?.saturating_sub(*acquired) < lease_duration(lease)
+                        {
+                            report(&format_args!(
+                                "{}; DHCP renewal failed: {e}; retrying before expiry",
+                                lease_status(name, lease)
+                            ))?;
+                        } else {
+                            report(&format_args!("{name}: DHCP renewal failed: {e}"))?;
+                        }
                     }
                 }
                 retry = uptime()?
