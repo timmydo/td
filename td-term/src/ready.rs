@@ -18,7 +18,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
-use td_ui::pty;
+use td_pty as pty;
 
 pub const MARKER: &str = "TD-TERM-READY";
 

@@ -29,13 +29,13 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use td_pty::{self as pty, Pty};
 use td_ui::client::{App, Changed, Client, ClipboardEvent, Handled, KeyboardEvent, Tag, DISPLAY};
 use td_ui::clipboard::{Incoming, Outgoing};
 use td_ui::data;
 use td_ui::face::{Face, Sizing, MAX_PIXELS_PER_EM, MIN_PIXELS_PER_EM};
 use td_ui::keyboard::Stroke;
 use td_ui::pointer::{self, Wheel};
-use td_ui::pty::{self, Pty};
 use td_ui::raster::{MAX_AXIS, MAX_FRAME_BYTES};
 use td_ui::vt::Terminal;
 use td_ui::vt_keys as keys;
@@ -438,7 +438,7 @@ struct Child {
     /// The name a `--command` program's last screen is reported under, and
     /// `None` for the default shell.
     program: Option<String>,
-    /// Never joined (see td-ui's `pty`); held so the handles are not dropped
+    /// Never joined (see td-pty); held so the handles are not dropped
     /// by accident into something that would.
     _threads: Vec<JoinHandle<Result<()>>>,
     /// td's readiness socket; the desktop profile publishes none.
@@ -2808,7 +2808,7 @@ fn paste_input(bytes: Vec<u8>, bracketed: bool) -> Result<Vec<u8>> {
         return Ok(bytes);
     }
     let size = bytes.len().saturating_add(if bracketed { 12 } else { 0 });
-    if size > keys::MAX_INPUT_BYTES {
+    if size > pty::MAX_INPUT_BYTES {
         return Err("encoded paste exceeds the input queue bound".into());
     }
     if !bracketed {
@@ -4222,7 +4222,7 @@ mod tests {
         window.output(b"\x1b[?1003h").unwrap();
         assert!(window
             .input
-            .push(&vec![b'a'; keys::MAX_INPUT_BYTES])
+            .push(&vec![b'a'; pty::MAX_INPUT_BYTES])
             .unwrap());
         hover(&mut window, 3, 3);
         assert!(!bell(&mut window), "a dropped motion report is quiet");
@@ -6125,12 +6125,12 @@ mod tests {
         assert!(paste_input(b"\x1b[201~rm".to_vec(), true).is_err());
         assert!(paste_input(vec![0xff], false).is_err());
         assert!(paste_input(Vec::new(), true).unwrap().is_empty());
-        assert!(paste_input(vec![b'x'; keys::MAX_INPUT_BYTES - 11], true).is_err());
+        assert!(paste_input(vec![b'x'; pty::MAX_INPUT_BYTES - 11], true).is_err());
         assert_eq!(
-            paste_input(vec![b'x'; keys::MAX_INPUT_BYTES - 12], true)
+            paste_input(vec![b'x'; pty::MAX_INPUT_BYTES - 12], true)
                 .unwrap()
                 .len(),
-            keys::MAX_INPUT_BYTES
+            pty::MAX_INPUT_BYTES
         );
     }
 

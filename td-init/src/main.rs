@@ -461,7 +461,7 @@ mod confinement {
     ///
     /// The live claim needs a PTY slave on descriptor zero, which this crate
     /// cannot create — it has no `TIOCGPTPEER`. No shipped launch names the
-    /// mode now (td-term's own shell claims its session through td-ui), so
+    /// mode now (td-term's own shell claims its session through td-pty), so
     /// this ordering check is what holds for the positive path.
     #[test]
     fn the_stdin_session_is_claimed_in_the_only_order_that_works() {

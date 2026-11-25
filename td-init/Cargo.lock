@@ -3,24 +3,17 @@
 version = 4
 
 [[package]]
-name = "td-alloc"
-version = "0.1.0"
-
-[[package]]
 name = "td-init"
 version = "0.1.0"
 dependencies = [
+ "td-pty",
  "td-source-scan",
- "td-ui",
 ]
+
+[[package]]
+name = "td-pty"
+version = "0.1.0"
 
 [[package]]
 name = "td-source-scan"
 version = "0.1.0"
-
-[[package]]
-name = "td-ui"
-version = "0.1.0"
-dependencies = [
- "td-alloc",
-]

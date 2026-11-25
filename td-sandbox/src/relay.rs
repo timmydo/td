@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
-use td_ui::pty::{ChildCommand, Pty, RelayTerminal};
+use td_pty::{ChildCommand, Pty, RelayTerminal};
 
 struct Running(Child);
 impl Drop for Running {
@@ -415,7 +415,7 @@ pub fn inside(arguments: Vec<OsString>) -> io::Result<u8> {
     let mut pumps = Vec::new();
     if let Some(pty) = &pty {
         child = Running(
-            td_ui::pty::spawn(
+            td_pty::spawn(
                 &ChildCommand {
                     program,
                     arguments: args,

@@ -388,10 +388,7 @@ mod tests {
     fn real_keyboard_byte_pauses_before_enter_and_both_lines_restore() {
         use std::sync::mpsc;
         use term::Termios;
-        let ptys = [
-            td_ui::pty::Pty::open().unwrap(),
-            td_ui::pty::Pty::open().unwrap(),
-        ];
+        let ptys = [td_pty::Pty::open().unwrap(), td_pty::Pty::open().unwrap()];
         let peers: Vec<File> = ptys.iter().map(|pty| pty.peer().unwrap()).collect();
         let settings = |file: &File| {
             let mut bytes = [0u8; std::mem::size_of::<term::Bytes>()];

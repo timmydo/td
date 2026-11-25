@@ -30,13 +30,13 @@ path = "src/bin/spec_helpers.rs"
 name = "td_sh"
 path = "src/lib.rs"
 
-# td-ui drives the terminal job-control test through its PTY and key encoder.
+# td-pty drives the terminal job-control test through a real PTY.
 # The confinement tests strip comments through td-source-scan. Dev-only:
 # the recipe compiles this crate with a direct rustc and no `--test`.
 [dev-dependencies]
 td-fs = { path = "../td-fs" }
+td-pty = { path = "../td-pty" }
 td-source-scan = { path = "../td-source-scan" }
-td-ui = { path = "../td-ui" }
 
 # td-sh is a TARGET-built program, NOT part of the control-plane engine workspace.
 # It is standalone — its own workspace root — with its own lock, so the engine's

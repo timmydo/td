@@ -1639,9 +1639,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Toolkit edits affect its standalone consumers and their target recipes;
-    // locally derived source identities and realized-output checks apply.
-    if p.starts_with("td-ui/") && !p.contains("..") {
+    // Toolkit and PTY edits affect their standalone consumers and their
+    // target recipes; locally derived source identities and realized-output
+    // checks apply.
+    if (p.starts_with("td-ui/") || p.starts_with("td-pty/")) && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -3044,13 +3045,16 @@ fn run_self_test_over(root: &Path) -> Vec<String> {
     assert_preflight!("td-compositor/src/font_data.rs", "cargo-test");
     assert_target!("td-compositor/tools/import-unifont.rs", "recipe-checks");
     assert_preflight!("td-compositor/tools/import-unifont.rs", "cargo-test");
-    // td-term's terminal model, renderer, keyboard encoder and PTY mechanism
-    // live in td-ui, whose consumers' target recipes they change; pty.rs is
-    // the only permitted caller of td-ui's confined terminal ioctls.
+    // td-term's terminal model, renderer and keyboard encoder live in td-ui
+    // and its PTY mechanism in td-pty, whose consumers' target recipes they
+    // change; td-pty's crate root is the only caller of its confined
+    // terminal ioctls.
     assert_target!("td-ui/src/vt_keys.rs", "recipe-checks");
     assert_preflight!("td-ui/src/vt_keys.rs", "cargo-test");
-    assert_target!("td-ui/src/pty.rs", "recipe-checks");
-    assert_preflight!("td-ui/src/pty.rs", "cargo-test");
+    assert_target!("td-pty/src/lib.rs", "recipe-checks");
+    assert_preflight!("td-pty/src/lib.rs", "cargo-test");
+    assert_target!("td-pty/src/sys.rs", "recipe-checks");
+    assert_preflight!("td-pty/src/sys.rs", "cargo-test");
     assert_target!("td-ui/src/vt_render.rs", "recipe-checks");
     assert_preflight!("td-ui/src/vt_render.rs", "cargo-test");
     // Rendered goldens route like the terminal corpus beside them.
@@ -7485,6 +7489,12 @@ mod tests {
             readers_of("td-boot"),
             ["td-authd", "td-install", "td-kexec", "td-update"]
         );
+        // The PTY's readers are its two programs and two test consumers;
+        // the toolkit is not one.
+        assert_eq!(
+            readers_of("td-pty"),
+            ["td-init", "td-sandbox", "td-sh", "td-term"]
+        );
         // Dev-dependency edges count: a td-source-scan change runs every
         // consumer's confinement tests.
         assert_eq!(
@@ -10476,16 +10486,13 @@ mod tests {
             [
                 "td-agent",
                 "td-authd",
-                "td-boot",
                 "td-compositor",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
-                "td-init",
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",
-                "td-kexec",
                 "td-login",
                 "td-mail",
                 "td-mixer",
@@ -10500,11 +10507,9 @@ mod tests {
                 "td-pinentry",
                 "td-portal",
                 "td-review",
-                "td-sandbox",
                 "td-seatd",
                 "td-secret",
                 "td-setup",
-                "td-sh",
                 "td-software",
                 "td-ssh",
                 "td-ssh-interop",
@@ -10519,26 +10524,25 @@ mod tests {
         );
         // td-agent's, td-photo's, td-mail's, td-pass's, td-pinentry's and
         // td-web's native cases make their commands three, as td-setup's are;
-        // td-dua, td-news, td-review, td-sandbox, td-software and td-term,
-        // toolkit consumers with no native case, add two each, as does
+        // td-dua, td-news, td-review, td-software and td-term, toolkit
+        // consumers with no native case, add two each, as does
         // td-page, the page engine td-web draws through td-ui.
         // td-crypto's test-only P-256 oracle is td-fido's, which reads no
         // compositor source, so td-crypto is not a reader here. The native mail read
         // fixture makes td-mta a reader through td-mail.
         // td-open, which mounts td-secret's descriptor module, adds two;
         // the installation fixture,
-        // reading td-install's codecs, adds two, and td-init, whose
-        // secret-line PTY test opens its terminal through td-ui, adds two;
-        // td-boot, which includes td-init's console identity by `#[path]`,
-        // and td-kexec and td-update, which read td-boot, add two each, as do
-        // td-ssh, which mounts td-login's sources, and td-ssh-interop, its driver.
+        // reading td-install's codecs, adds two; td-update adds two, as do
+        // td-ssh, which mounts td-login's sources, and td-ssh-interop, its
+        // driver. td-sandbox, td-init and td-sh take their PTY from td-pty,
+        // not the toolkit, so neither they nor td-boot and td-kexec, which
+        // read td-init's console identity, are readers here.
         // td-passkeys names the notebook in its manifest, so the conservative
         // reader graph includes its test and Clippy legs.
         // The format check rides with the workspace.
-        // td-sh exercises its job control through the toolkit PTY in its tests.
         // td-picture reads td-ui for its pictures: its test and Clippy legs,
         // as does td-mixer for its panel.
-        assert_eq!(comp.len(), 95, "{comp:?}");
+        assert_eq!(comp.len(), 85, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -10547,17 +10551,14 @@ mod tests {
                 "td-agent",
                 "td-audio",
                 "td-authd",
-                "td-boot",
                 "td-busd",
                 "td-compositor",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
-                "td-init",
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",
-                "td-kexec",
                 "td-login",
                 "td-mail",
                 "td-mixer",
@@ -10572,11 +10573,9 @@ mod tests {
                 "td-pinentry",
                 "td-portal",
                 "td-review",
-                "td-sandbox",
                 "td-seatd",
                 "td-secret",
                 "td-setup",
-                "td-sh",
                 "td-software",
                 "td-ssh",
                 "td-ssh-interop",
@@ -10602,7 +10601,6 @@ mod tests {
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
-                "td-init",
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",
@@ -10621,11 +10619,9 @@ mod tests {
                 "td-pinentry",
                 "td-portal",
                 "td-review",
-                "td-sandbox",
                 "td-seatd",
                 "td-secret",
                 "td-setup",
-                "td-sh",
                 "td-software",
                 "td-ssh",
                 "td-ssh-interop",

@@ -14,8 +14,8 @@ that td-editor draws, and the paged list `List` built on the panel's row
 painter, the single-line text entry `TextEntry`, the button strip
 `Buttons` and the slider `Slider`, the widgets no scene drew, and the
 terminal's reusable half: the VT parser and model, its renderer, the
-keyboard chord encoder, the terminfo compiler and the PTY with its
-threads. td-editor is its first consumer; the installer front end
+keyboard chord encoder and the terminfo compiler; the PTY with its
+threads is td-pty's (`td-pty/DESIGN.md`). td-editor is its first consumer; the installer front end
 `td-setup` (its welcome page landed), td-portal's file chooser, td-photo,
 the terminal `td-term` and the disk usage analyzer `td-dua` follow.
 This document is the component contract and the starting point for
@@ -155,10 +155,11 @@ toolkit, and what another program could reuse to embed a terminal moved
 here out of the compositor: the VT parser and model (`vt`) with its
 native corpus under `spec/vt` and the libvterm importer
 `td-ui-import-libvterm`, the renderer (`vt_render`) with its PPM goldens
-under `spec/vt_render`, the terminfo compiler (`vt_terminfo`), and the
-PTY with its reader, writer and waiter threads (`pty`), whose four
-`ioctl(2)` requests joined the raw module under `UNSAFE.md` §19. The `mail`,
-`news` and `web` jails allow neither those requests nor everything else this crate can call
+under `spec/vt_render`, and the terminfo compiler (`vt_terminfo`). The
+PTY with its reader, writer and waiter threads is td-pty's (`UNSAFE.md`
+§29), so that programs and tests needing only a terminal device do not
+depend on the toolkit. The `mail`,
+`news` and `web` jails allow neither the PTY's requests nor everything else this crate can call
 (`APPLICATIONS.md`, "Per-application allowlists"), so a program in those packages
 that starts using more of the crate re-derives its list. Newly built beside them: `vt_keys`, the chord encoder that replaces the
 compositor's evdev key table, so the terminal reads the chords the
@@ -937,34 +938,14 @@ of its own files may name each module.
   (a press, release or motion of a `Button`) at a cell with its
   `PointerModifiers` under a `vt::MouseMode`, a bounded `Report` of at
   most `MAX_REPORT` bytes in X10's or SGR's encoding; `Viewport` with
-  `Scrollback`, the scrollback view anchored to a line; `InputQueue`, the
-  whole-or-nothing queue both encoders feed; `MAX_SEQUENCE`,
-  `MAX_INPUT_BYTES`, and `selftest`. Pure and keymap-independent: it
+  `Scrollback`, the scrollback view anchored to a line; `MAX_SEQUENCE`,
+  and `selftest`. The whole-or-nothing queue both encoders feed is
+  td-pty's `InputQueue`. Pure and keymap-independent: it
   knows chords, never keycodes, and cells, never pixels.
 - `vt_terminfo`: `parse` of the capability source into an `Entry` of
   `Capability` values, `compile` to the legacy binary format, `decode` back
   to `Decoded`, `entry` (the compiled `td-term` entry), `INSTALL_PATH`
   (`share/terminfo/t/td-term`), and `selftest`. Pure.
-- `pty`: `Pty` (`open` unlocks `/dev/ptmx` opened without acquiring it,
-  `master`, `into_master`, `peer` for the slave by descriptor, `window`,
-  and `resize`, which publishes a grid and reads it back before trusting
-  it), `WindowSize` and `window_size`, `grid_size` and `grid_for_tile`,
-  `ChildCommand` and `spawn` (a caller-composed command on the slave, the
-  environment cleared and set to the caller's list of OS-string pairs, a
-  program named without a slash found on that list's `PATH` by std's
-  rule, leading a new session
-  whose controlling terminal is the slave exactly when `leads_session` is
-  set), the threads
-  `spawn_reader`, `spawn_writer` and `spawn_waiter` (named `pty-output`,
-  `pty-input` and `pty-child`, each reporting its own ending on the
-  caller's channel as `Output` or `Waited` and running the caller's
-  `notify` after each send), `Input`, the bounded queue the loop fills and
-  the writer drains (`new`, `push`, `close`), `write_input`, the
-  `DEV_PTMX`, `READ_CHUNK`, `MAX_OUTPUT_BYTES` and `MAX_OUTPUT_CHUNKS`
-  constants, and `selftest`. `Input::take_for_test` is test support,
-  public because a consumer's tests are another crate and hidden from the
-  crate's documentation. Which account, environment and command a
-  terminal runs is its caller's policy, never this module's.
 
 ## Driving
 
@@ -1425,9 +1406,8 @@ not frames, and stays its own).
   `theme_file`, which reads `XDG_CONFIG_HOME` and `HOME` for the theme
   file's path, reads that one file under the same checks to
   `MAX_FILE_BYTES`, and replaces it by making its directory (0700),
-  try-locking it and renaming a private (0600) sibling over the file;
-  and `pty`, which opens `/dev/ptmx`, spawns the caller's command and
-  owns the threads around it. `xdg`'s `from_env` reads one base
+  try-locking it and renaming a private (0600) sibling over the file.
+  `xdg`'s `from_env` reads one base
   directory's variable and `HOME`. Apart from `open`'s `BROWSER`,
   `face_file`'s three directory values, `theme_file`'s two and `xdg`'s
   two they read no environment variable, taking the display values,
@@ -1676,24 +1656,21 @@ not frames, and stays its own).
 - Production code has no `unwrap`, `expect`, panics or panicking indexing;
   invalid input returns a diagnostic or error naming the item.
 - `unsafe` is confined to `sys`, the transport's raw module, under
-  `UNSAFE.md` §19: three function-scoped allowances, one syscall
+  `UNSAFE.md` §19: two function-scoped allowances, one syscall
   instruction carrying `recvmsg`, `sendmsg`, `fcntl` pinned to
-  `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `poll` over the connection's
-  stream and its waker, `ioctl` pinned to the five PTY requests
-  `TIOCSPTLCK`, `TIOCGPTPEER`, `TIOCSWINSZ`, `TIOCGWINSZ` and `TIOCSCTTY`,
-  one wrapper each with the request never a parameter, and `setsid`, one
-  descriptor adoption site, one pre-exec hook that makes a PTY child lead
-  a session on its slave, and a crate root that denies it. Only `wayland`,
-  `clipboard` and `pty` name the module, the transport through its four
-  wrappers, the clipboard's destination owner through the two status
-  ones, and the PTY through the four ioctl ones and the session hook, each
-  at one site. Reusing it does not transfer
-  authorization to a new consumer, which gets its own roster entry;
-  td-term reaches the PTY only through `pty::Pty` and forbids `unsafe`.
+  `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, and `poll` over the
+  connection's stream and its waker, one descriptor adoption site, and a
+  crate root that denies it. Only `wayland` and `clipboard` name the
+  module, the transport through its four wrappers and the clipboard's
+  destination owner through the two status ones, each at one site.
+  Reusing it does not transfer authorization to a new consumer, which
+  gets its own roster entry. The toolkit has no PTY: td-term takes it
+  from td-pty (`UNSAFE.md` §29) and forbids `unsafe`.
 - The terminal modules keep the bounds `td-term/DESIGN.md` §2 states
-  (CSI parameters, grid, history, reply, keyboard-queue and PTY-output
-  ceilings), admit a key sequence or a reply whole or not at all, and
-  never join a PTY reader or writer on a teardown path (§4 there). That
+  for them (CSI parameters, grid, history and reply ceilings) and admit
+  a reply whole or not at all; the keyboard-queue and PTY-output
+  ceilings and the rule never to join a PTY reader or writer on a
+  teardown path (§4 there) are td-pty's. That
   document is the terminal's behavioural specification; this one does not
   restate it.
 - The shared font, wire, filter and report-text sources are mounted here by
@@ -2121,11 +2098,9 @@ structural rendition, palette, cursor, selection, bell and viewport
 oracles, writing an actual frame and a diff beneath the build's temporary
 output on a mismatch, and holds `render_with` to its outline oracles over
 fonts the tests encode (`tests/fonts`, mounted by path). `vt_keys.rs` pins
-the chord table, the viewport and the input queue; `vt_terminfo.rs` its
-capability order, binary layout, decoder refusals, key bytes and
-per-capability effects; and `pty.rs` carries kernel tests over a real PTY:
-unlock, peer, published and read-back sizes, a child's view of the slave
-and grid, and the reader, writer and waiter lifecycles.
+the chord table and the viewport; and `vt_terminfo.rs` its capability
+order, binary layout, decoder refusals, key bytes and per-capability
+effects. td-pty's own tests cover the input queue and a real PTY.
 `td-ui-import-libvterm` is a developer tool, run only by hand against a
 supplied archive tree.
 
@@ -2144,24 +2119,20 @@ values, opens its file
 nonblocking under its bound, makes and locks its directory and writes
 only a private `create_new` sibling it renames over the file; and the
 raw layer: the complete
-fingerprint of `sys.rs`, its syscall and flag values, its three
+fingerprint of `sys.rs`, its syscall and flag values, its two
 function-only allowances, the single instruction and adoption sites, that
 the crate root denies `unsafe` and declares the module private, that
-`wayland`, `clipboard` and `pty` are its only callers, the transport through
+`wayland` and `clipboard` are its only callers, the transport through
 exactly five wrapper calls (the poll over two readable-only entries among
-them), the clipboard's destination owner through exactly five status calls,
-and the PTY through exactly its four ioctl wrappers and its session hook,
-each at one site, with `SYS_IOCTL` named only at its definition and its five
-wrappers, `SYS_SETSID` and the pre-exec hook each at one site, and each
-request constant and the peer flags only at their definition and their one
-use, the master opened with `O_NOCTTY`, every published size read back, and
-the child's environment cleared, that no production module calls the test
-support (the client's `unconfigure` and `input_mut`,
-`pty::Input::take_for_test`), and that the client is the toolkit's one
+them) and the clipboard's destination owner through exactly five status
+calls, each at one site, that the module names no terminal request,
+session call or signal mask, that no production module calls the test
+support (the client's `unconfigure` and `input_mut`), and that the client is the toolkit's one
 consumer of a received right, through the pinned keymap reader with its
 format, size and regular-file checks and the send that hands its right on.
-For the terminal it pins `pty`, `vt`, `vt_keys`, `vt_render` and
-`vt_terminfo` as public modules, `vt_keys` among the pure set, and `vt`,
+For the terminal it pins `vt`, `vt_keys`, `vt_render` and `vt_terminfo`
+as public modules and that the crate declares no `pty`, `vt_keys` among
+the pure set, and `vt`,
 `vt_render` and `vt_terminfo` as pure production text -- no environment,
 filesystem, network, process, time, I/O, embedded file, path mount or nested
 module before the test tail -- whose tails are exactly their specification
@@ -4336,7 +4307,7 @@ and samples, so the GPU path takes the terminal's glyphs as it takes the
 raster's.
 
 The terminal reports no pixel size through `TIOCSWINSZ`: its pixel
-fields are zero (`pty::grid_size`), whatever the cell.
+fields are zero (td-pty's `grid_size`), whatever the cell.
 The compositor's chrome fits the outline face to the same cell, through
 `sfnt`, `coverage`, `atlas`, `face` and `face_file` mounted by path
 (td-compositor/DESIGN.md, "Chrome text"); those five modules name only
@@ -4947,7 +4918,8 @@ regressions. Those increments extend the original sequence below.
 23. td-term on td-ui: td-term its own crate and static binary over the
     toolkit, out of the compositor multicall: the VT model and its
     corpus, the renderer and its goldens, the terminfo compiler, and the
-    PTY with its four ioctl requests (`UNSAFE.md` §19) moved here;
+    PTY with its four ioctl requests (now td-pty's, `UNSAFE.md` §29)
+    moved here;
     `vt_keys`, the chord encoder, and the client's `activated`,
     `presented` and `focus_serial` accessors newly built; `reportable`
     and `proc_status` mounted; td-term's window, session policy and
@@ -5052,25 +5024,6 @@ regressions. Those increments extend the original sequence below.
     height and baseline that size's line, a smaller glyph on the row's
     baseline (`top_at`), measured by `advance_at`; plain on the cell.
     td-agent's top two heading levels are its first consumer. Landed.
-
-## Foreground terminal relay
-
-`pty::RelayTerminal`, used by td-sandbox, owns a borrowed-terminal duplicate,
-the exact original Linux termios bytes and the calling thread's signal mask.
-It enters raw byte mode with VMIN=0/VTIME=1, reads at most one timeout per
-poll, and restores both on return/drop. The caller spawns children before
-entering the guard, so they do not inherit its blocked termination signals;
-subsequent reader threads live only as long as that frontend process.
-HUP/INT/QUIT/TERM/TSTP are blocked and synchronously consumed, never handled
-by a Rust signal handler. Suspension requests terminate the relay; SIGKILL
-cannot restore attributes. The safe API exposes enter/read/window/signal and
-restore, not arbitrary ioctl requests or signal sets. UNSAFE.md section 19
-records the added requests and syscalls; the complete raw-source fingerprint,
-call inventory, and a PTY restoration test pin the implementation.
-
-The relay terminal guard cannot cross threads: its signal mask belongs to
-the entering thread. Restoration attempts both termios and the signal mask,
-even if the terminal has disappeared.
 
 Allocation helpers use the sibling `td-alloc` implementation under its
 reservation and error contract (`td-alloc/DESIGN.md`).

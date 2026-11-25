@@ -15,6 +15,7 @@ license = "MIT"
 
 [dependencies]
 td-fs = { path = "../td-fs" }
+td-pty = { path = "../td-pty" }
 td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]

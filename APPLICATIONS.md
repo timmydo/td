@@ -3719,7 +3719,7 @@ glibc, and more often an ordinary change to a program in those packages or a cra
 they link, such as td-mail, td-news, td-open, td-secret, td-web, td-ui, td-fs,
 td-kv, td-html, td-css, td-dom, td-layout, td-charset, td-png, td-jpeg, td-url or td-fetch-client. Each new reach for an
 operating-system facility is a question for this section: `std::fs::hard_link`, `UnixStream::shutdown`, `File::set_times`,
-`UnixListener`, td-ui's PTY and its `Connection::waker` datagram pair are all off
+`UnixListener`, td-pty's PTY and td-ui's `Connection::waker` datagram pair are all off
 these lists today. Deriving them again is
 the reviewer's to do; a number gone missing fails as `ENOSYS` in that program, not as
 a wider jail, and only on the path that reaches it.

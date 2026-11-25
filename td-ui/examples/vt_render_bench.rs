@@ -19,10 +19,12 @@ use std::time::{Duration, Instant};
 use td_ui::face::{Face, Sizing};
 use td_ui::font::{self, Font};
 use td_ui::pinned_face;
-use td_ui::pty::READ_CHUNK;
 use td_ui::vt::Terminal;
 use td_ui::vt_render::{self, Palette, Snapshot, BYTES_PER_PIXEL};
 use td_ui::wayland::backing_file;
+
+/// What one PTY read delivers to td-term: td-pty's `READ_CHUNK`.
+const READ_CHUNK: usize = 8 * 1024;
 
 type Result<T> = std::result::Result<T, String>;
 

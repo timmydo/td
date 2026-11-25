@@ -10,7 +10,7 @@
 # local-source-roster > seed/local-source-roster.txt` when a recipe adds,
 # removes, or renames a `local_source'/`local_source_trees' declaration —
 # an ordinary edit inside a staged tree does not move a row.
-td-agent-source td-agent td-civil,td-editor,td-encoding,td-fetch-client,td-fs,td-html,td-jpeg,td-json,td-markdown,td-png,td-remote,td-sandbox,td-toml,td-alloc,td-ui,td-url,td-util,td-compositor,engine,td-inflate,td-test-compositor
+td-agent-source td-agent td-civil,td-editor,td-encoding,td-fetch-client,td-fs,td-html,td-jpeg,td-json,td-markdown,td-png,td-pty,td-remote,td-sandbox,td-toml,td-alloc,td-ui,td-url,td-util,td-compositor,engine,td-inflate,td-test-compositor
 td-disks-source td-disks td-btrfs,td-fs
 td-dua-source td-dua td-civil,td-json,td-alloc,td-ui,td-compositor
 td-editor-source td-editor td-civil,td-remote,td-alloc,td-ui,td-compositor,td-fs,td-test-compositor
@@ -24,12 +24,12 @@ td-pass-source td-pass td-secret,td-passkeys,td-json,td-luks,td-primitives,td-pr
 td-photo-source td-photo td-av1,td-civil,td-fs,td-jpeg,td-alloc,td-ui,td-compositor,td-test-compositor
 td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-alloc,td-ui,td-tpm,td-fido,td-test-compositor
 td-review-source td-review td-fs,td-alloc,td-ui,td-compositor
-td-sandbox-source td-sandbox td-fs,td-alloc,td-ui,td-compositor,engine
+td-sandbox-source td-sandbox td-fs,td-alloc,td-pty,engine
 td-setup-source td-setup td-install,td-alloc,td-ui,td-compositor,td-protector,td-luks,td-encoding,td-tpm,td-fido,td-json,td-fat,engine,td-test-compositor
 td-software-source td-software td-civil,td-fs,td-alloc,td-ui,td-compositor,engine
 td-ssh-interop-source td-ssh-interop td-firstboot
 td-ssh-source td-ssh td-primitives,td-encoding,td-login,td-fs,td-source-scan,engine
 td-taskmgr-source td-taskmgr td-alloc,td-ui,td-compositor,td-fs,td-test-compositor
-td-term-source td-term td-fs,td-alloc,td-ui,td-compositor
+td-term-source td-term td-fs,td-alloc,td-pty,td-ui,td-compositor
 td-time-source td-time td-civil,td-fs,engine
 td-web-source td-web td-av1,td-avif,td-busd,td-charset,td-css,td-dom,td-fetch-client,td-fs,td-gif,td-html,td-jpeg,td-layout,td-page,td-picture,td-png,td-alloc,td-ui,td-url,td-webp,td-util,td-compositor,engine,td-inflate,td-test-compositor

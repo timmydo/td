@@ -118,7 +118,6 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "notices.rs",
                 "open.rs",
                 "pinned_face.rs",
-                "pty.rs",
                 "replay.rs",
                 "sys.rs",
                 "theme_file.rs",
@@ -163,17 +162,16 @@ fn source_inventory_and_shared_mounts_are_closed() {
             text.matches("unsafe").count(),
             match name.as_str() {
                 "lib.rs" => 1,
-                "sys.rs" => 6,
+                "sys.rs" => 4,
                 _ => 0,
             },
             "unsafe keyword in {name}"
         );
         // The raw module is named by the crate root's private declaration,
-        // by the transport's two imports and five wrapper calls, by the
-        // clipboard's import and five status calls and by the PTY's import,
-        // four ioctl wrapper calls and its spawn's session hook; no other
-        // module, shared source or
-        // test-support reader reaches it.
+        // by the transport's two imports and five wrapper calls and by the
+        // clipboard's import and five status calls; no other module, shared
+        // source or test-support reader reaches it. The PTY's raw layer is
+        // td-pty's.
         // The socket's pinned procfs pathname has a `sys` segment that is
         // not raw-module access.
         let raw_text = if name == "control_socket.rs" {
@@ -189,7 +187,6 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "lib.rs" => 1,
                 "wayland.rs" => 7,
                 "clipboard.rs" => 6,
-                "pty.rs" => 15,
                 _ => 0,
             },
             "raw-module access in {name}"
@@ -278,12 +275,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
             },
             "pops: the transport's own test, the client's accessor, keymap reader and send: {name}"
         );
-        for support in [
-            ".unconfigure(",
-            ".input_mut(",
-            ".take_for_test(",
-            ".generation_for_test(",
-        ] {
+        for support in [".unconfigure(", ".input_mut(", ".generation_for_test("] {
             assert_eq!(
                 text.matches(support).count(),
                 0,
@@ -417,7 +409,8 @@ fn source_inventory_and_shared_mounts_are_closed() {
             assert!(compact.contains("modsys;"), "the raw module is declared");
             assert!(!compact.contains("pubmodsys"), "the raw module is private");
             assert!(compact.contains("pubmodwayland;"));
-            for terminal in ["pty", "vt", "vt_keys", "vt_render", "vt_terminfo"] {
+            assert!(!compact.contains("modpty;"), "the PTY is td-pty's");
+            for terminal in ["vt", "vt_keys", "vt_render", "vt_terminfo"] {
                 assert!(compact.contains(&format!("pubmod{terminal};")));
             }
             for (file, declaration) in [
@@ -597,7 +590,7 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0xf8b81ee83fa4a5e0,
+        hash, 0x06e1d4018d1c7abe,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -605,20 +598,7 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "const SYS_RECVMSG: usize = 47;",
         "const SYS_FCNTL: usize = 72;",
         "const SYS_POLL: usize = 7;",
-        "const SYS_IOCTL: usize = 16;",
-        "const SYS_SETSID: usize = 112;",
-        "const SYS_RT_SIGPROCMASK: usize = 14;",
-        "const SYS_RT_SIGTIMEDWAIT: usize = 128;",
-        "const TCGETS: usize = 0x5401;",
-        "const TCSETS: usize = 0x5402;",
-        "const RELAY_SIGNALS: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 14) | (1 << 19);",
         "const POLLIN: i16 = 1;",
-        "const TIOCSPTLCK: usize = 0x4004_5431;",
-        "const TIOCGPTPEER: usize = 0x5441;",
-        "const TIOCSWINSZ: usize = 0x5414;",
-        "const TIOCGWINSZ: usize = 0x5413;",
-        "const TIOCSCTTY: usize = 0x540e;",
-        "const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;",
         "const F_DUPFD_CLOEXEC: usize = 1030;",
         "const F_GETFL: usize = 3;",
         "const F_SETFL: usize = 4;",
@@ -645,49 +625,27 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "pub(crate) fn readable(\n    stream: &UnixStream,\n    waker: &UnixDatagram,\n    timeout_ms: u16,\n) -> io::Result<[bool; 2]>",
         "SYS_POLL,\n        fds.as_mut_ptr() as usize,\n        fds.len(),\n        usize::from(timeout_ms),",
         "events: POLLIN,",
-        "pub(crate) fn unlock_pty(master: &File) -> io::Result<()>",
-        "let unlocked: i32 = 0;",
-        "SYS_IOCTL,\n        master.as_raw_fd() as usize,\n        TIOCSPTLCK,\n        (&unlocked as *const i32) as usize,",
-        "pub(crate) fn pty_peer(master: &File) -> io::Result<File>",
-        "SYS_IOCTL,\n        master.as_raw_fd() as usize,\n        TIOCGPTPEER,\n        PTY_PEER_FLAGS,",
-        "Ok(File::from(adopt(fd)))",
-        "pub(crate) fn set_window_size(terminal: &File, words: [u16; 4]) -> io::Result<()>",
-        "SYS_IOCTL,\n        terminal.as_raw_fd() as usize,\n        TIOCSWINSZ,\n        (&words as *const [u16; 4]) as usize,",
-        "pub(crate) fn window_size(terminal: &File) -> io::Result<[u16; 4]>",
-        "let mut words = [0u16; 4];",
-        "SYS_IOCTL,\n        terminal.as_raw_fd() as usize,\n        TIOCGWINSZ,\n        (&mut words as *mut [u16; 4]) as usize,",
-        "fn lead_session_on_stdin() -> io::Result<()> {\n    result(syscall3(SYS_SETSID, 0, 0, 0))?;\n    result(syscall3(SYS_IOCTL, 0, TIOCSCTTY, 0)).map(|_| ())\n}",
-        "#[allow(unsafe_code)]\npub(crate) fn lead_session(command: &mut Command) {",
-        "unsafe {\n        command.pre_exec(lead_session_on_stdin);\n    }",
     ] {
         assert!(raw.contains(pin), "{pin}");
     }
-    // ioctl(2) is exactly the five PTY requests, each at its one wrapper:
-    // the request is never a parameter. setsid(2) is the pre-exec hook's
-    // alone, and the hook is installed at one site.
-    assert_eq!(raw.matches("SYS_IOCTL").count(), 8);
-    for request in [
-        "TIOCSPTLCK",
-        "TIOCGPTPEER",
-        "TIOCSWINSZ",
-        "TIOCGWINSZ",
-        "TIOCSCTTY",
+    assert_eq!(raw.matches("#[allow(unsafe_code)]").count(), 2);
+    // No terminal request, session call or signal mask: those are td-pty's.
+    for absent in [
+        "SYS_IOCTL",
+        "SYS_SETSID",
+        "SYS_RT_SIG",
+        "pre_exec",
+        "CommandExt",
+        "TIOC",
         "TCGETS",
         "TCSETS",
     ] {
-        assert_eq!(raw.matches(request).count(), 2, "{request}");
+        assert!(!raw.contains(absent), "{absent}");
     }
-    assert_eq!(raw.matches("SYS_SETSID").count(), 2);
-    assert_eq!(raw.matches("SYS_RT_SIGPROCMASK").count(), 3);
-    assert_eq!(raw.matches("SYS_RT_SIGTIMEDWAIT").count(), 2);
-    assert_eq!(raw.matches("pre_exec").count(), 1);
-    assert_eq!(raw.matches("lead_session_on_stdin").count(), 2);
-    assert_eq!(raw.matches("#[allow(unsafe_code)]").count(), 3);
-    assert_eq!(raw.matches("PTY_PEER_FLAGS").count(), 2);
     assert_eq!(
         raw.matches("adopt(").count(),
-        4,
-        "the adoption site and its three callers"
+        3,
+        "the adoption site and its two callers"
     );
     assert!(!raw.contains("#![allow("));
     assert_eq!(raw.matches("core::arch::asm!").count(), 1);
@@ -765,35 +723,6 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     assert!(client.contains("!metadata.is_file() || metadata.len() < u64::from(size)"));
     assert!(!client.contains("from_raw_fd") && !client.contains("as_raw_fd"));
     assert!(!client.contains("mmap"));
-    // The PTY is the only caller of the four device ioctls and of the
-    // session hook's installer, each at one site: the master is
-    // opened without acquiring it and unlocked, its slave taken from it by
-    // descriptor, every published size read back before it is trusted, and
-    // a child made to lead a session on the slave exactly when it asks.
-    let pty = include_str!("../src/pty.rs");
-    let pty = pty.split("\n#[cfg(test)]\n#[allow(").next().unwrap();
-    assert_eq!(pty.matches("sys::").count(), 11);
-    assert_eq!(pty.matches("use crate::sys;").count(), 1);
-    for call in [
-        "sys::unlock_pty(&master)",
-        "sys::pty_peer(&self.master)",
-        "sys::set_window_size(&self.master, winsize_words(requested))",
-        "sys::window_size(&terminal)",
-        "    if command.leads_session {\n        sys::lead_session(&mut process);\n    }",
-    ] {
-        assert_eq!(pty.matches(call).count(), 1, "{call}");
-    }
-    assert!(pty.contains(".custom_flags(O_NOCTTY)"));
-    assert!(pty.contains("pub const DEV_PTMX: &str = \"/dev/ptmx\";"));
-    assert_eq!(pty.matches(".open(").count(), 1, "one device opened");
-    assert!(pty.contains(".open(DEV_PTMX)"));
-    assert!(pty.contains("const O_NOCTTY: i32 = 0o400;"));
-    assert!(pty.contains("let observed = window_size(&self.master)?;"));
-    assert!(!pty.contains("from_raw_fd") && !pty.contains("as_raw_fd"));
-    assert!(
-        pty.contains(".env_clear()"),
-        "a child's environment is its caller's"
-    );
     let transport = include_str!("../src/wayland.rs");
     assert_eq!(transport.matches("sys::").count(), 5);
     for call in [

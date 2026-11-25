@@ -1445,7 +1445,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// One pseudo-terminal standing in for a line (td-ui's PTY, a test-only
+    /// One pseudo-terminal standing in for a line (td-pty's PTY, a test-only
     /// dependency): its master, a reader of everything shown on it, and the
     /// slave reopened as the applet opens a line, through the descriptor's
     /// `/proc` link with `O_NOCTTY` and `O_NONBLOCK`.
@@ -1456,12 +1456,12 @@ mod tests {
         /// A slave held open throughout: a PTY whose every slave is closed
         /// reads as hung up on the master side.
         held: File,
-        _pty: td_ui::pty::Pty,
+        _pty: td_pty::Pty,
     }
 
     impl Pty {
         fn open() -> Pty {
-            let pty = td_ui::pty::Pty::open().unwrap();
+            let pty = td_pty::Pty::open().unwrap();
             let master = pty.master().try_clone().unwrap();
             let mut output = master.try_clone().unwrap();
             let (seen, screen) = mpsc::channel::<Vec<u8>>();

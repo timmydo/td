@@ -10906,6 +10906,9 @@ chmod 755 '{}'
         assert!(toolkit.contains_key("td-portal-test"));
         assert!(toolkit.contains_key("td-photo-test"));
         assert!(toolkit.contains_key("td-term-test"));
+        let pty = checks_reaching(&["td-pty"]).expect("sibling reach");
+        assert!(pty.contains_key("td-term-test"));
+        assert!(pty.contains_key("td-sandbox-test"));
         assert!(reached.contains_key("td-term-test"));
         // Both directions: every selected owner reads the crate somewhere in
         // its closure, and every check owner that does is selected — the

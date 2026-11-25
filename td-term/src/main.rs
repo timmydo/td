@@ -177,7 +177,7 @@ fn selftest(out: &mut impl Write) -> Result<(), String> {
     td_ui::vt_keys::selftest()?;
     td_ui::vt_render::selftest()?;
     terminfo::selftest()?;
-    td_ui::pty::selftest()?;
+    td_pty::selftest()?;
     session::selftest()?;
     job::selftest()?;
     ready::selftest()?;

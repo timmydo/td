@@ -714,6 +714,7 @@ mod tests {
                 "td-portal",
                 "td-primitives",
                 "td-protector",
+                "td-pty",
                 "td-pulse",
                 "td-regex",
                 "td-remote",

@@ -1,15 +1,25 @@
+#![deny(unsafe_code)]
+
 //! A PTY and the threads around it, for a terminal that runs a child.
 //!
 //! `Pty` opens `/dev/ptmx` without acquiring it, unlocks it, sizes it and
-//! hands out its slave by descriptor, through the four `ioctl(2)` requests
-//! UNSAFE.md section 19 pins in the raw layer. `spawn` starts a caller-composed
+//! hands out its slave by descriptor, through the four device `ioctl(2)`
+//! requests UNSAFE.md section 29 pins in the raw layer. `spawn` starts a caller-composed
 //! command on the slave; one reader, one writer and one waiter thread then
 //! carry output, keyboard input and the child's exit, each reporting its
 //! own ending on a channel, since nothing may join a thread parked in a
 //! read. Which account, environment and command a terminal runs is its
-//! caller's policy (td-term/DESIGN.md), not this module's.
+//! caller's policy (td-term/DESIGN.md), not this crate's. `RelayTerminal`
+//! puts this process's own terminal in raw mode for a foreground relay.
+//!
+//! td-term, td-sandbox and the PTY tests of td-init and td-sh share it, so
+//! none of them depends on the UI toolkit for a terminal device.
 
-use crate::sys;
+mod queue;
+mod sys;
+
+pub use queue::{InputQueue, MAX_INPUT_BYTES};
+
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -357,7 +367,7 @@ fn write_chunk(sink: &mut impl Write, bytes: &[u8]) -> Result<usize, String> {
 
 /// Drain a keyboard queue into the child, consuming only what was taken.
 #[allow(dead_code)]
-pub fn write_input(master: &File, queue: &mut crate::vt_keys::InputQueue) -> Result<(), String> {
+pub fn write_input(master: &File, queue: &mut InputQueue) -> Result<(), String> {
     let mut sink = master;
     while !queue.is_empty() {
         let taken = write_chunk(&mut sink, queue.front(READ_CHUNK))?;
@@ -382,7 +392,7 @@ pub struct Input {
 }
 
 struct Pending {
-    queue: crate::vt_keys::InputQueue,
+    queue: InputQueue,
     closed: bool,
     failed: Option<String>,
 }
@@ -391,7 +401,7 @@ impl Input {
     pub fn new() -> Arc<Input> {
         Arc::new(Input {
             pending: Mutex::new(Pending {
-                queue: crate::vt_keys::InputQueue::new(),
+                queue: InputQueue::new(),
                 closed: false,
                 failed: None,
             }),
@@ -633,8 +643,9 @@ fn reap_unwatched(held: &Mutex<Option<Child>>, cause: &str) -> String {
     }
 }
 
-/// The packaged binary's own check of the grid arithmetic and the
-/// `winsize` field order. It opens no device: the live ioctl round trip is
+/// The packaged binary's own check of the grid arithmetic, the `winsize`
+/// field order and one atomic input-queue rejection. It opens no device:
+/// the live ioctl round trip is
 /// a host test, because a target selftest runs wherever the artifact does,
 /// including where devpts is not mounted.
 pub fn selftest() -> Result<(), String> {
@@ -650,6 +661,21 @@ pub fn selftest() -> Result<(), String> {
     {
         return Err("PTY selftest derived the wrong grid".into());
     }
+    let mut queue = InputQueue::new();
+    if !queue.push(b"a") || queue.is_empty() || queue.len() != 1 {
+        return Err("keyboard queue selftest lost an admitted sequence".into());
+    }
+    let mut narrow = InputQueue::with_capacity(1);
+    if narrow.push(b"\x1bOA") || !narrow.take_dropped() || !narrow.is_empty() {
+        return Err("keyboard queue selftest split an oversized sequence".into());
+    }
+    if queue.front(MAX_INPUT_BYTES) != b"a" {
+        return Err("keyboard queue selftest lost its bytes".into());
+    }
+    queue.consume(MAX_INPUT_BYTES);
+    if !queue.is_empty() {
+        return Err("keyboard queue selftest kept written bytes".into());
+    }
     Ok(())
 }
 
@@ -662,7 +688,7 @@ pub fn selftest() -> Result<(), String> {
 ///
 /// ```compile_fail
 /// fn require_send<T: Send>() {}
-/// require_send::<td_ui::pty::RelayTerminal>();
+/// require_send::<td_pty::RelayTerminal>();
 /// ```
 pub struct RelayTerminal {
     terminal: File,
@@ -818,7 +844,7 @@ mod tests {
 
         // Through the bounded queue, as the writer thread will: the queue is
         // what makes a partial write recoverable.
-        let mut queue = crate::vt_keys::InputQueue::new();
+        let mut queue = InputQueue::new();
         assert!(queue.push(b"input\n"));
         write_input(pty.master(), &mut queue).unwrap();
         assert!(queue.is_empty(), "the writer consumed only what it wrote");
@@ -894,7 +920,7 @@ mod tests {
             leads_session,
             arguments: vec![
                 "--exact".into(),
-                "pty::tests::pty_child_fixture".into(),
+                "tests::pty_child_fixture".into(),
                 "--ignored".into(),
                 "--nocapture".into(),
             ],
@@ -1009,7 +1035,7 @@ mod tests {
                 leads_session: true,
                 arguments: vec![
                     "--exact".into(),
-                    "pty::tests::pty_silent_child_fixture".into(),
+                    "tests::pty_silent_child_fixture".into(),
                     "--ignored".into(),
                     "--nocapture".into(),
                 ],
@@ -1111,7 +1137,7 @@ mod tests {
             leads_session: false,
             arguments: vec![
                 "--exact".into(),
-                "pty::tests::pty_silent_child_fixture".into(),
+                "tests::pty_silent_child_fixture".into(),
                 "--ignored".into(),
                 "--nocapture".into(),
             ],
@@ -1352,7 +1378,7 @@ mod tests {
             if !input.push(&sequence).unwrap() {
                 break;
             }
-            assert!(input.queued().unwrap() <= crate::vt_keys::MAX_INPUT_BYTES);
+            assert!(input.queued().unwrap() <= MAX_INPUT_BYTES);
         }
         input.close().unwrap();
         drop(_slave);
@@ -1382,10 +1408,10 @@ mod tests {
         }
         let queued = input.queued().unwrap();
         assert_eq!(queued, admitted * sequence.len());
-        assert!(queued <= crate::vt_keys::MAX_INPUT_BYTES);
+        assert!(queued <= MAX_INPUT_BYTES);
         // The refusal is the queue being unable to take a WHOLE sequence, not
         // it being full: there is room left, just not this much.
-        assert!(queued + sequence.len() > crate::vt_keys::MAX_INPUT_BYTES);
+        assert!(queued + sequence.len() > MAX_INPUT_BYTES);
     }
 
     #[test]
@@ -1398,7 +1424,7 @@ mod tests {
             leads_session: false,
             arguments: vec![
                 "--exact".into(),
-                "pty::tests::pty_child_fixture".into(),
+                "tests::pty_child_fixture".into(),
                 "--ignored".into(),
                 "--nocapture".into(),
             ],
@@ -1450,7 +1476,7 @@ mod tests {
             leads_session: false,
             arguments: vec![
                 "--exact".into(),
-                "pty::tests::pty_silent_child_fixture".into(),
+                "tests::pty_silent_child_fixture".into(),
                 "--ignored".into(),
                 "--nocapture".into(),
             ],

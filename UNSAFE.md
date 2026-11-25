@@ -13,8 +13,8 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 `sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
 can stay `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-EIGHT
-numbered target-side exceptions, TWENTY-SIX of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-NINE
+numbered target-side exceptions, TWENTY-SEVEN of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary, or in the twenty-sixth's case
 its CPU instructions, or the twenty-eighth's checked storage (the crate itself
@@ -39,9 +39,8 @@ the first surface to pin its allowance to the entry point rather than the
 module — see §13 for the escape a module-level one permits. The fourteenth,
 `td-editor`, also uses a function-level allowance: one syscall instruction,
 with no descriptor adoption and no mapping since its Wayland transport
-moved to the nineteenth, `td-ui`, which has one instruction, one
-adoption site for freshly installed descriptors and one pre-exec hook
-for a PTY child's session. The
+moved to the nineteenth, `td-ui`, which has one instruction and one
+adoption site for freshly installed descriptors. The
 fifteenth, `td-secret`, shares the portal transport and adds a scoped
 terminal/process-protection instruction for its manual token check. The sixteenth,
 `td-authd`, confines kernel sender credentials and pidfds to one instruction
@@ -52,7 +51,7 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts twenty-six live surfaces in twenty-eight numbered entries. The
+roster counts twenty-seven live surfaces in twenty-nine numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
@@ -74,6 +73,9 @@ of its own: its six function-scoped allowances call cryptographic instructions
 that a runtime check found on the CPU. The twenty-seventh, `td-ssh`, has one
 function-scoped instruction for eight syscalls, among them seven value-pinned
 terminal requests, and one pre-exec hook for an account child's session.
+The twenty-ninth, `td-pty`, carries the PTY device, session and
+foreground-relay syscalls: one instruction, one adoption site for the
+slave and one pre-exec hook for a PTY child's session.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -207,7 +209,7 @@ one.
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd or the workspace client stream; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed file-grant values below; plus the separate named credential intake module below |
 | 17 | `td-mail` | retired: `term_sys.rs`, td-sh's terminal half, went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§17](#17-td-mail--retired) |
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
-| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
+| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
 | 22 | `td-mta` | library `ppoll(2)` on bounded sets of borrowed connected sockets, listeners and wake receivers; binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; IPv6-only `socket(2)`, `setsockopt(2)` with fixed SO_REUSEADDR/IPV6_V6ONLY, `bind(2)`, `listen(2)` and one fresh descriptor adoption; see [§22](#22-td-mta--termination-signals-and-the-postgresql-client) |
@@ -217,6 +219,7 @@ one.
 | 26 | `td-primitives` | none: six calls into AES-NI, PCLMULQDQ, AVX2 and SHA code behind a runtime CPU check, touching no pointer; see §26 |
 | 27 | `td-ssh` | `setgroups(2)`, `setgid(2)`, `setuid(2)`, `prctl(2)` pinned to `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE`, `seccomp(2)` with one operation, `ioctl(2)` with seven value-pinned terminal requests, `setsid(2)`, `umask(2)` pinned to one floor operation; plus one scoped pre-exec hook — see [§27](#27-td-ssh--a-reduced-ssh-client-and-server) |
 | 28 | `td-alloc` | none: checked global allocation, Vec ownership adoption, strong reference counting and fixed UTF-8 views; see §28 |
+| 29 | `td-pty` | `ioctl(2)` with five value-pinned PTY and two termios requests, `setsid(2)` for a PTY child, `rt_sigprocmask(2)` and `rt_sigtimedwait(2)` over one compiled relay signal set; plus one scoped adoption of the slave and one scoped pre-exec hook — see [§29](#29-td-pty--the-pty-device-its-childs-session-and-the-foreground-relay) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -601,7 +604,7 @@ termios, flush and poll wrappers, through its `Termios` trait and
 `wait`, whose kernel implementations are the one place they are named;
 the applet's tests drive the two-line order through scripted lines and
 the canonical reading, both lines, a stopped line and its resumption
-through real pseudo-terminals, opened through td-ui's PTY requests (§19)
+through real pseudo-terminals, opened through td-pty's PTY requests (§29)
 as a test-only dependency because this roster has none. The confinement
 tests pin that `secretline.rs` names nothing in `sys`, opens its two
 fixed names with exactly those flags, saves before it silences, restores
@@ -3325,27 +3328,24 @@ td-sh's own entry.
 
 ## 19. `td-ui` — the shared Wayland client transport
 
-td-ui's `sys.rs` carries exactly EIGHT x86-64 Linux syscalls through one
+td-ui's `sys.rs` carries exactly FOUR x86-64 Linux syscalls through one
 function-scoped instruction: `recvmsg` (47), `sendmsg` (46), `fcntl` (72)
 pinned to `F_DUPFD_CLOEXEC` (1030) for the transport and to `F_GETFL` (3)
-and `F_SETFL` (4) for the clipboard destination owner, `poll` (7) for
-the connection's wait once a consumer holds its waker, `ioctl` (16)
-pinned to five PTY requests and two termios requests, `setsid`
-(112) for a PTY child that leads a session, and `rt_sigprocmask` (14)
-and `rt_sigtimedwait` (128) for the foreground relay described below. A second function-scoped
-allowance adopts newly installed nonnegative descriptors into `OwnedFd`,
-and a third installs that child's pre-exec hook. Safe `std` owns
+and `F_SETFL` (4) for the clipboard destination owner, and `poll` (7) for
+the connection's wait once a consumer holds its waker. A second
+function-scoped allowance adopts newly installed nonnegative descriptors
+into `OwnedFd`. Safe `std` owns
 connection setup, byte-only sends, timeouts, pool file creation and
 unlinking, positional pixel writes and
 keymap reads, and every close. No raw pointer or unowned received
 descriptor escapes the private module; the crate root denies `unsafe`,
-and the three allowances are the module's only ones. Other architectures
+and the two allowances are the module's only ones. Other architectures
 are refused at compile time rather than inheriting its ABI. The rest of
 the toolkit — the client over the transport, the raster, the chrome
 bands, the keymap compiler, the repeat policy, the pointer and
 data-device decoders, the widget window, the terminal model, renderer,
-keyboard encoder and terminfo compiler, the PTY's threads, and the
-mounted font, wire and report-text sources — has no raw boundary.
+keyboard encoder and terminfo compiler, and the mounted font, wire and
+report-text sources — has no raw boundary.
 
 This surface is the editor's transport subset, moved here so that every
 td-owned graphical program shares one client, with one change: the
@@ -3354,13 +3354,11 @@ after it, the editor's clipboard destination owner, so that every such
 program's clipboard writes through one owner; §14 records what the
 editor kept. Reusing this module does not transfer its authorization to
 a new consumer: a program that depends on td-ui inherits the transport
-through `wayland::Connection`, alone or beneath `client::Client`, the
-destination owner through `clipboard::Outgoing`, the terminal's device
-through `pty::Pty` and its child's session through `pty::spawn` with
-`ChildCommand::leads_session`, and nothing else, and one that needs a raw
-surface of its own gets its own roster entry. The PTY moved here from td-compositor
-(§6), which kept none of it, when td-term became its own program over the
-toolkit; td-term itself forbids `unsafe`.
+through `wayland::Connection`, alone or beneath `client::Client`, and
+the destination owner through `clipboard::Outgoing`, and nothing else,
+and one that needs a raw surface of its own gets its own roster entry.
+The PTY, which came here from td-compositor (§6) when td-term became its
+own program over the toolkit, is td-pty's (§29).
 
 The inherited-stream `fcntl` caller is pinned to `F_DUPFD_CLOEXEC`,
 minimum descriptor 3. It duplicates the borrowed `WAYLAND_SOCKET`
@@ -3432,39 +3430,6 @@ two are the connection's own, and the waker's end is drained with at
 most 64 safe nonblocking receives. The pollfd layout is asserted at
 eight bytes.
 
-The ioctl callers are `pty::Pty` and `pty::window_size`, one wrapper
-per request and the request never a parameter: `unlock_pty` passes
-`TIOCSPTLCK` (0x40045431) a pointer to a zero `i32` on its own frame;
-`pty_peer` passes `TIOCGPTPEER` (0x5441) the immediate flags
-`O_RDWR | O_NOCTTY | O_CLOEXEC` (0o2000402) and adopts the new slave
-descriptor the kernel installs, once, at the module's adoption site;
-`set_window_size` passes `TIOCSWINSZ` (0x5414) a pointer to four
-`u16` words on the caller's frame in the kernel's `struct winsize`
-order, and `window_size` passes `TIOCGWINSZ` (0x5413) a pointer to four
-zeroed words it then reads. Each wrapper borrows a safe `File`; the
-master is opened by safe `std` with `O_NOCTTY` from `/dev/ptmx`, so this
-process never acquires the terminal. `Pty::open` names no path, and
-`window_size` borrows a duplicate `std` made of whatever descriptor its
-caller lends; `TIOCGWINSZ` only reads, and a non-terminal answers
-`ENOTTY`. `Pty::resize` reads every published size back
-through `TIOCGWINSZ` before it is trusted. No request changes termios,
-and this process never takes a controlling terminal or a session. The
-slave is never looked up by `/dev/pts` name.
-
-The session callers are `pty::spawn`'s, for a `ChildCommand` whose
-`leads_session` is set: `lead_session` installs, through the module's
-third allowance, one pre-exec hook on the safe `Command` that already
-carries the slave on its three standard streams. `std` runs it in the
-forked child after that redirection and before exec; it issues `setsid`
-(112) with no arguments and then `ioctl` with `TIOCSCTTY` (0x540e) and
-argument zero on descriptor zero, never stealing a terminal another
-session holds. Those are two raw syscalls through the one instruction:
-nothing that allocates, locks or touches shared state, which is what a
-pre-exec hook may run. Either error is reported through `std`'s spawn
-error, so no child starts without the session it asked for. A child
-without `leads_session` gets no hook and leads no session, leaving the
-slave unowned for a program that claims a terminal in its own session.
-
 The only send caller is the connection's descriptor-send path. `sendmsg`
 carries exactly one borrowed `File` in a 24-byte ancillary extent,
 `cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies only
@@ -3500,7 +3465,7 @@ waits in the loop for at most the write deadline, without assuming
 ancillary boundaries coincide with wire-message boundaries.
 
 Confinement tests pin the complete raw source fingerprint, the syscall and
-flag values, the three function-only allowances, the single instruction and
+flag values, the two function-only allowances, the single instruction and
 adoption sites, that no other td-ui module names the raw module and that
 only `wayland.rs` calls its four transport wrappers (the poll with two
 readable-only entries) and only
@@ -3509,52 +3474,23 @@ alone, whose whole implementation is fingerprinted and whose five status
 calls are pinned each at its exact site and in its exact form, that
 the crate root denies `unsafe`, that the keymap reader and the send
 are the only pops beyond the FIFO's own accessor, the reader with its
-format, size and regular-file checks, and that `ioctl` is named at
-exactly its seven wrappers, each request constant at its definition and
-its one use, the peer flags likewise, `setsid` and the pre-exec hook each
-at one site, and `pty.rs` the only caller of the device and foreground
-relay wrappers and the hook's installer. The installer is called only under
-`leads_session`, opening the master with `O_NOCTTY` and reading every
-published size back. Kernel tests exercise transfer,
-close-on-exec duplication, refusal cleanup and truncated rights, poll
-readiness per entry with timeout and hangup, a real PTY's unlock,
-peer, published and read-back sizes and a child's view of them and of
-its session with and without `leads_session`, and the
+format, size and regular-file checks, and that the module names no
+terminal request, session call or signal mask. Kernel tests exercise
+transfer, close-on-exec duplication, refusal cleanup and truncated
+rights, poll readiness per entry with timeout and hangup, and the
 destination owner over real pipes and sockets: nonblocking mode and its
 restoration through a shared alias on completion, cancel and drop, the
 refusals, the deadline and the byte budget; a byte-level synthetic
 control test checks cleanup beyond unrecognized records and invalid
 entries.
 
-No mmap, ioctl beyond the five PTY and two termios requests, session
-call beyond the child's pre-exec hook, GPU access, poll beyond the
+No mmap, ioctl, session call, signal mask, GPU access, poll beyond the
 connection's two-entry wait, close syscall, credential call, raw
 environment-fd adoption or received-fd consumer beyond the keymap reader
-and the send hand-off is authorized here. A ninth syscall, fourth fcntl
-command, eighth ioctl request, another caller, or additional allowance
-amends this section
+and the send hand-off is authorized here. A fifth syscall, fourth fcntl
+command, another caller, or additional allowance amends this section
 and `td-ui/DESIGN.md` in the same landing; a consumer that takes a right
 from the FIFO records that consumer in its own section.
-
-### Foreground terminal relay
-
-The td-ui private sys module adds TCGETS=0x5401 and TCSETS=0x5402 over a
-borrowed File and exactly 36 bytes of Linux x86-64 kernel termios. The PTY
-module is the only caller. It preserves the original bytes, changes the
-compiled raw-mode flag masks plus VTIME/VMIN, and restores the original
-bytes. No arbitrary request, descriptor adoption or FFI is added.
-
-Two additional x86-64 syscalls use the existing instruction:
-rt_sigprocmask=14 fixes sigsetsize=8 and either SIG_BLOCK=0 with the compiled
-HUP/INT/QUIT/TERM/TSTP mask and an old-mask pointer, or SIG_SETMASK=2 with that
-saved mask and no output; rt_sigtimedwait=128 fixes the same compiled mask,
-null siginfo, zero two-i64 timeout and sigsetsize=8. EAGAIN/EINTR report no
-pending request. The API exposes no caller-selected signal set or handler.
-The thread-bound guard attempts terminal restoration before mask restoration,
-even when the first operation fails; neither Send nor Sync is implemented.
-No new unsafe allowance, instruction or adoption site is introduced. The
-raw-source fingerprint and inventory pin both wrappers and their sole PTY
-consumer. The frontend is safe Rust and consumes these through td-ui only.
 
 ## 20. `td-taskmgr` — descriptor-bound process signals
 
@@ -4116,6 +4052,109 @@ worker handoff, owner lifetime, typed destruction and unwind. The source
 confinement test pins the allowances and keeps unsafe out of other modules.
 No allocator override, syscall or external dependency is introduced.
 
+## 29. `td-pty` — the PTY device, its child's session and the foreground relay
+
+td-pty's `sys.rs` carries exactly FOUR x86-64 Linux syscalls through one
+function-scoped instruction: `ioctl` (16) pinned to five PTY requests and
+two termios requests, `setsid` (112) for a PTY child that leads a
+session, and `rt_sigprocmask` (14) and `rt_sigtimedwait` (128) for the
+foreground relay described below. A second function-scoped allowance
+adopts the slave descriptor `TIOCGPTPEER` installs into `OwnedFd`, and a
+third installs a PTY child's pre-exec hook. Safe `std` opens the master
+and owns every read, write, thread and close. No raw pointer or descriptor
+escapes the private module; the crate root denies `unsafe` and is the
+module's only caller, the bounded keyboard queue has no raw boundary, and
+the three allowances are the module's only ones. Other architectures are
+refused at compile time. The crate depends on nothing but `std`.
+
+The PTY is a crate of its own, apart from the toolkit (§19), so that a
+program running a child on a terminal or a test needing a real one does
+not stage the UI toolkit for it: td-term
+and td-sandbox depend on td-pty, and so do the PTY tests of td-init (§3)
+and td-sh (§8) as a dev-dependency. A consumer inherits the device
+through `Pty` and `window_size`, its child's session through `spawn`
+with `ChildCommand::leads_session`, and the relay through
+`RelayTerminal`, and nothing else; one that needs a raw surface of its
+own gets its own roster entry. td-term and td-sandbox forbid `unsafe`.
+
+The ioctl callers are `Pty` and `window_size`, one wrapper
+per request and the request never a parameter: `unlock_pty` passes
+`TIOCSPTLCK` (0x40045431) a pointer to a zero `i32` on its own frame;
+`pty_peer` passes `TIOCGPTPEER` (0x5441) the immediate flags
+`O_RDWR | O_NOCTTY | O_CLOEXEC` (0o2000402) and adopts the new slave
+descriptor the kernel installs, once, at the module's adoption site;
+`set_window_size` passes `TIOCSWINSZ` (0x5414) a pointer to four
+`u16` words on the caller's frame in the kernel's `struct winsize`
+order, and `window_size` passes `TIOCGWINSZ` (0x5413) a pointer to four
+zeroed words it then reads. Each wrapper borrows a safe `File`; the
+master is opened by safe `std` with `O_NOCTTY` from `/dev/ptmx`, so this
+process never acquires the terminal. `Pty::open` names no path, and
+`window_size` borrows a duplicate `std` made of whatever descriptor its
+caller lends; `TIOCGWINSZ` only reads, and a non-terminal answers
+`ENOTTY`. `Pty::resize` reads every published size back
+through `TIOCGWINSZ` before it is trusted. No device request changes
+termios (only the relay does, below, on this process's own terminal),
+and this process never takes a controlling terminal or a session. The
+slave is never looked up by `/dev/pts` name.
+
+The session callers are `spawn`'s, for a `ChildCommand` whose
+`leads_session` is set: `lead_session` installs, through the module's
+third allowance, one pre-exec hook on the safe `Command` that already
+carries the slave on its three standard streams. `std` runs it in the
+forked child after that redirection and before exec; it issues `setsid`
+(112) with no arguments and then `ioctl` with `TIOCSCTTY` (0x540e) and
+argument zero on descriptor zero, never stealing a terminal another
+session holds. Those are two raw syscalls through the one instruction:
+nothing that allocates, locks or touches shared state, which is what a
+pre-exec hook may run. Either error is reported through `std`'s spawn
+error, so no child starts without the session it asked for. A child
+without `leads_session` gets no hook and leads no session, leaving the
+slave unowned for a program that claims a terminal in its own session.
+
+Confinement tests pin the complete raw source fingerprint, the syscall and
+request values, the peer flags and the relay signal set, the three
+function-only allowances, the single instruction and adoption sites, that
+`ioctl` is named at exactly its seven wrappers, each request constant at
+its definition and its one use, `setsid` and the pre-exec hook each at
+one site, that the raw module is private and has no public item, and
+that the crate root is its only caller, each device, session and relay
+wrapper at one site. The installer is called only under `leads_session`,
+the master is opened with `O_NOCTTY`, and every published size is read
+back. The tests also pin that the source is exactly the crate root, the
+queue and the raw module, and that the manifest and lock name no
+dependency. Kernel tests exercise a real PTY's unlock, peer, published
+and read-back sizes, a child's view of them and of its session with and
+without `leads_session`, and the relay's exact restoration of terminal
+attributes.
+
+### Foreground terminal relay
+
+The private sys module carries TCGETS=0x5401 and TCSETS=0x5402 over a
+borrowed File and exactly 36 bytes of Linux x86-64 kernel termios. The
+crate root's `RelayTerminal` is the only caller. It preserves the original bytes, changes the
+compiled raw-mode flag masks plus VTIME/VMIN, and restores the original
+bytes. No arbitrary request, descriptor adoption or FFI is added.
+
+Two syscalls serve the relay:
+rt_sigprocmask=14 fixes sigsetsize=8 and either SIG_BLOCK=0 with the compiled
+HUP/INT/QUIT/TERM/TSTP mask and an old-mask pointer, or SIG_SETMASK=2 with that
+saved mask and no output; rt_sigtimedwait=128 fixes the same compiled mask,
+null siginfo, zero two-i64 timeout and sigsetsize=8. EAGAIN/EINTR report no
+pending request. The API exposes no caller-selected signal set or handler.
+The thread-bound guard attempts terminal restoration before mask restoration,
+even when the first operation fails; neither Send nor Sync is implemented.
+They add no allowance, instruction or adoption site. The raw-source
+fingerprint and inventory pin both wrappers and their sole caller, the
+crate root's `RelayTerminal`. td-sandbox's frontend is safe Rust and
+consumes the relay through td-pty only.
+
+No mmap, ioctl beyond the five PTY and two termios requests, session call
+beyond the child's pre-exec hook, signal set beyond the compiled relay
+mask, descriptor adoption beyond the slave, close syscall or credential
+call is authorized here. A fifth syscall, eighth ioctl request, another
+caller, or additional allowance amends this section and
+`td-pty/DESIGN.md` in the same landing.
+
 ## H1. `td-vm-registrar` — host Git account enrollment
 
 The host-only registrar in `td-vm` has exactly one x86-64 Linux syscall:
@@ -4228,8 +4267,8 @@ TIOCGPTPEER(0x5441) with flags RDWR|NOCTTY|CLOEXEC(0x80102), and one
 function-scoped adoption of the peer descriptor TIOCGPTPEER returns. It is
 td-authd's former test-and-relay PTY allocator, which td-secret's tests
 compiled by path, cut to those two requests when the relay left td-authd;
-td-ui's same two requests (§19) are not used because td-secret's
-direct-rustc recipe would then stage and build all of td-ui for its tests.
+td-pty carries the same two requests (§29); this fixture remains a
+second, test-only copy of them.
 td-secret's confinement test pins the instruction, both requests, the
 flags, the adoption, both scopes and the test-only declaration. It is
 absent from the production binary.

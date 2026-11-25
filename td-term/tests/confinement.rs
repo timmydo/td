@@ -65,10 +65,10 @@ fn the_crate_forbids_unsafe_and_reaches_no_raw_layer() {
             assert!(!production.contains(forbidden), "{name} names {forbidden}");
         }
     }
-    // The PTY device, its ioctls and its threads are td-ui's (UNSAFE.md
-    // section 19); the terminal holds only its policy.
+    // The PTY device, its ioctls and its threads are td-pty's (UNSAFE.md
+    // section 29); the terminal holds only its policy.
     let session = production("session.rs");
-    assert!(!session.contains("Command::"), "spawning is td-ui's");
+    assert!(!session.contains("Command::"), "spawning is td-pty's");
     assert!(session.contains("(\"TERM\".into(), \"td-term\".into()),"));
     assert!(session.contains("pub const DEFAULT_SHELL: &str = \"/bin/sh\";"));
     assert!(
@@ -79,7 +79,7 @@ fn the_crate_forbids_unsafe_and_reaches_no_raw_layer() {
     // file reads alone: no signal, no process, no ioctl of its own.
     let job = production("job.rs");
     assert!(job.contains("pub const PROC: &str = \"/proc\";"));
-    for forbidden in ["Command", "kill", "signal", "ioctl", "td_ui::pty"] {
+    for forbidden in ["Command", "kill", "signal", "ioctl", "td_pty"] {
         assert!(!job.contains(forbidden), "job.rs names {forbidden}");
     }
 }
@@ -109,16 +109,16 @@ fn the_words_units_and_the_boot_oracle_read_are_pinned() {
 }
 
 #[test]
-fn the_manifest_declares_the_toolkit_and_td_fs_and_joins_the_gate() {
+fn the_manifest_declares_the_toolkit_td_pty_and_td_fs_and_joins_the_gate() {
     let manifest = read("Cargo.toml");
     assert!(manifest.contains("[workspace]\n"), "own workspace root");
     assert!(
         manifest.contains(
-            "\n[dependencies]\ntd-fs = { path = \"../td-fs\" }\ntd-ui = { path = \"../td-ui\" }\n"
+            "\n[dependencies]\ntd-fs = { path = \"../td-fs\" }\ntd-pty = { path = \"../td-pty\" }\ntd-ui = { path = \"../td-ui\" }\n"
         ),
-        "td-fs and the toolkit by path"
+        "td-fs, the PTY and the toolkit by path"
     );
-    assert_eq!(manifest.matches("path =").count(), 2, "two dependencies");
+    assert_eq!(manifest.matches("path =").count(), 3, "three dependencies");
     for table in [
         "[dev-dependencies]",
         "[build-dependencies]",
@@ -141,9 +141,10 @@ fn the_manifest_declares_the_toolkit_and_td_fs_and_joins_the_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 4);
+    assert_eq!(lock.matches("[[package]]").count(), 5);
     assert!(lock.contains("name = \"td-alloc\""));
     assert!(lock.contains("name = \"td-fs\""));
+    assert!(lock.contains("name = \"td-pty\""));
     assert!(lock.contains("name = \"td-term\""));
     assert!(lock.contains("name = \"td-ui\""));
     assert!(!lock.contains("source ="), "no registry or git source");

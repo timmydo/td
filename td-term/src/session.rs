@@ -3,13 +3,13 @@
 //! literal argv; under the desktop profile the inherited environment, the
 //! person's shell and the terminfo entry written where the child finds it
 //! (td-term/DESIGN.md §7). Functions over the process's own status and
-//! account files, tested without a device; td-ui's `pty` owns the device
+//! account files, tested without a device; td-pty owns the device
 //! and the threads.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use td_pty::ChildCommand;
 use td_ui::proc_status::effective_uid;
-use td_ui::pty::ChildCommand;
 
 /// The shell td's session runs when no command is given.
 pub const DEFAULT_SHELL: &str = "/bin/sh";

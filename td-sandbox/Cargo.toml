@@ -13,7 +13,7 @@ doctest = false
 [dependencies]
 td-alloc = { path = "../td-alloc" }
 td-fs = { path = "../td-fs" }
-td-ui = { path = "../td-ui" }
+td-pty = { path = "../td-pty" }
 
 [package.metadata.td-gate]
 clippy-all-targets = true

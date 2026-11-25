@@ -14,7 +14,7 @@ workspace launch intake at `/run/td-authd/1000/workspace`
 human's peers alone. td-jail's workspace kind owns namespace, mount,
 identity, capability, seccomp and descendant confinement; APPLICATIONS.md
 section C is normative for that boundary. The frontend forbids unsafe code
-and depends only on td-fs and td-ui. Its executable is the workspace's
+and depends only on td-alloc, td-fs and td-pty. Its executable is the workspace's
 immutable entry; the target recipe stages engine's Flathub declarations
 (`flathub_app.rs`) and the ledger's names (`workload_accounts.rs`) too.
 
@@ -322,7 +322,7 @@ waits at most two minutes for a launch's answer and ten for any other,
 a deletion's emptying among them. Root refuses a launch of a deleted
 sandbox `deleted`, which td-sandbox tells as such.
 
-The entry opens a fresh PTY in the private devpts via td-ui, then spawns
+The entry opens a fresh PTY in the private devpts via td-pty, then spawns
 the command as a new session leader on its slave. For a PTY with
 `TERM=td-term`, the relay sets `COLORTERM=truecolor` and
 `TERMINFO=/etc/terminfo` in the child's environment. The workspace already
@@ -350,7 +350,7 @@ by about 200ms per reader; one that floods, by 4 MiB of delivery.
 Delivering queued output and the exit frame can wait for the host output
 consumer, but stop remains responsive even then.
 
-The outer foreground terminal guard uses td-ui's audited termios and signal
+The outer foreground terminal guard uses td-pty's audited termios and signal
 operations. It disables local canonical/echo/signal processing, reads with a
 100ms timeout and polls sizes; bytes such as Control-C go to the inner PTY's
 line discipline and foreground process group. HUP/INT/QUIT/TERM/TSTP are
@@ -423,7 +423,7 @@ never goes over a held sandbox, the deletion's order, mark and home
 emptying, root's reading of a home by its listing and mark, the refusal
 of a deleted sandbox's launches and grant changes, and the per-name
 ordering; td-jail's that td's account may not name the sandbox profile.
-td-ui tests verify exact terminal restoration and pin its raw surface.
+td-pty's tests verify exact terminal restoration and pin its raw surface.
 
 The `sandbox-evidence` boot oracle (`TD-SANDBOX-ACCOUNT-OK`) runs the
 whole path on an installed autotest image. As the human it creates a
@@ -447,4 +447,4 @@ must stay, and the home must hold root's mark alone; then the seeded
 `default` must write and run a script in `~/sandbox`. No pty session is
 driven, since no program in the image's `/bin` opens one for a test;
 `start` shares the launch path with `run` but for the relay's PTY, which
-td-ui's tests cover.
+td-pty's tests cover.

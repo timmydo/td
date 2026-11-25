@@ -3453,6 +3453,13 @@ td-protector/src/upgrade_tests.rs	allocating-conversion	21
 td-protector/src/upgrade_tests.rs	allocation-macro	29
 td-protector/src/upgrade_tests.rs	heap-owner	1
 td-protector/src/upgrade_tests.rs	unchecked-growth-or-clone	92
+td-pty/src/lib.rs	allocating-constructor	2
+td-pty/src/lib.rs	allocating-conversion	7
+td-pty/src/lib.rs	allocation-macro	25
+td-pty/src/lib.rs	heap-owner	2
+td-pty/src/lib.rs	unchecked-growth-or-clone	6
+td-pty/src/queue.rs	allocating-constructor	2
+td-pty/src/queue.rs	unchecked-growth-or-clone	1
 td-pulse/src/client.rs	unchecked-growth-or-clone	1
 td-pulse/src/tag.rs	allocating-constructor	1
 td-pulse/src/tag.rs	allocating-conversion	5
@@ -4111,11 +4118,6 @@ td-ui/src/pinned_face.rs	allocating-conversion	2
 td-ui/src/pinned_face.rs	allocation-macro	3
 td-ui/src/pinned_face.rs	unchecked-growth-or-clone	1
 td-ui/src/prose.rs	unchecked-growth-or-clone	9
-td-ui/src/pty.rs	allocating-constructor	1
-td-ui/src/pty.rs	allocating-conversion	7
-td-ui/src/pty.rs	allocation-macro	25
-td-ui/src/pty.rs	heap-owner	2
-td-ui/src/pty.rs	unchecked-growth-or-clone	4
 td-ui/src/raster.rs	allocating-constructor	2
 td-ui/src/raster.rs	allocation-macro	1
 td-ui/src/raster.rs	unchecked-growth-or-clone	3
@@ -4143,9 +4145,8 @@ td-ui/src/vt.rs	allocating-constructor	5
 td-ui/src/vt.rs	allocating-conversion	13
 td-ui/src/vt.rs	allocation-macro	12
 td-ui/src/vt.rs	unchecked-growth-or-clone	15
-td-ui/src/vt_keys.rs	allocating-constructor	3
 td-ui/src/vt_keys.rs	allocating-conversion	1
-td-ui/src/vt_keys.rs	unchecked-growth-or-clone	9
+td-ui/src/vt_keys.rs	unchecked-growth-or-clone	6
 td-ui/src/vt_render.rs	allocating-constructor	1
 td-ui/src/vt_render.rs	allocating-conversion	8
 td-ui/src/vt_render.rs	allocation-macro	13

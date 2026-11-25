@@ -11,10 +11,15 @@ name = "td-fs"
 version = "0.1.0"
 
 [[package]]
+name = "td-pty"
+version = "0.1.0"
+
+[[package]]
 name = "td-term"
 version = "0.1.0"
 dependencies = [
  "td-fs",
+ "td-pty",
  "td-ui",
 ]
 

@@ -34,11 +34,11 @@
 //! faces (`prose`: the faces, their metrics, wrapping and drawing), and
 //! the embeddable
 //! terminal (td-term/DESIGN.md): the VT model (`vt`), its renderer
-//! (`vt_render`), the chord encoder and scrollback viewport (`vt_keys`),
-//! the terminfo compiler (`vt_terminfo`) and the PTY with its threads
-//! (`pty`), and the colour themes a raster paints in (`theme`) with the
-//! file a program's choice is kept in (`theme_file`).
-//! Outside `wayland`, `client`, `clipboard`, `pty`, the private raw module
+//! (`vt_render`), the chord encoder and scrollback viewport (`vt_keys`)
+//! and the terminfo compiler (`vt_terminfo`) -- the PTY is td-pty's -- and
+//! the colour themes a raster paints in (`theme`) with the file a
+//! program's choice is kept in (`theme_file`).
+//! Outside `wayland`, `client`, `clipboard`, the private raw module
 //! beneath them, the driving adapters
 //! `control_socket`, `control_worker` and `replay`, the widget window
 //! `window`, and the face and theme files, nothing reads the environment,
@@ -100,7 +100,6 @@ pub mod pointer;
 #[path = "../../td-compositor/src/proc_status.rs"]
 pub mod proc_status;
 pub mod prose;
-pub mod pty;
 pub mod raster;
 pub mod repeat;
 pub mod replay;

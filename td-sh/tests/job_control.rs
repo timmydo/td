@@ -5,7 +5,10 @@ use std::path::Path;
 use std::process::Child;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::time::{Duration, Instant};
-use td_ui::{pty, vt_keys};
+use td_pty as pty;
+
+/// Ctrl-Z, the line discipline's default VSUSP character.
+const SUSPEND: &[u8] = &[0x1a];
 
 struct Session(Child);
 
@@ -74,11 +77,7 @@ fn terminal_suspend_and_resume() -> Result<(), Box<dyn std::error::Error>> {
     transcript.until(b"PROMPT ");
     input.write_all(b"./child -c 'echo REA''DY; read line; echo got=$line; exit 7'\n")?;
     transcript.until(b"READY\r\n");
-    input.write_all(
-        vt_keys::sequence("C-z", Default::default())
-            .unwrap()
-            .as_slice(),
-    )?;
+    input.write_all(SUSPEND)?;
     transcript.until(b"PROMPT ");
     input.write_all(b"jobs\n")?;
     transcript.until(b"Stopped");
@@ -91,16 +90,11 @@ fn terminal_suspend_and_resume() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(directory.path().join("alive"), b"")?;
     input.write_all(b"./child -c 'echo WOR''KING; while [ -f alive ] && [ ! -f proceed ]; do :; done; exit 12'\n")?;
     transcript.until(b"WORKING\r\n");
-    input.write_all(
-        vt_keys::sequence("C-z", Default::default())
-            .unwrap()
-            .as_slice(),
-    )?;
+    input.write_all(SUSPEND)?;
     transcript.until(b"PROMPT ");
     input.write_all(b"bg && : > proceed; wait $!; echo waited=$?\n")?;
     transcript.until(b"waited=12\r\n");
     // Suspending an explicitly selected older job makes it current again.
-    let suspend = vt_keys::sequence("C-z", Default::default()).unwrap();
     for (command, ready) in [
         (
             "./child -c 'echo FI''RST; read a; echo reading=$a; read b; echo first=$b'\n",
@@ -113,12 +107,12 @@ fn terminal_suspend_and_resume() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         input.write_all(command.as_bytes())?;
         transcript.until(ready);
-        input.write_all(suspend.as_slice())?;
+        input.write_all(SUSPEND)?;
         transcript.until(b"PROMPT ");
     }
     input.write_all(b"fg %1\nagain\n")?;
     transcript.until(b"reading=again\r\n");
-    input.write_all(suspend.as_slice())?;
+    input.write_all(SUSPEND)?;
     transcript.until(b"PROMPT ");
     input.write_all(b"fg\none\n")?;
     transcript.until(b"first=one\r\n");
@@ -133,7 +127,7 @@ fn terminal_suspend_and_resume() -> Result<(), Box<dyn std::error::Error>> {
         };
         writeln!(input, "./child -c 'echo PARK''ED; while [ -f alive ] && [ ! -f {end} ]; do :; done; echo done-{end}; {after}'")?;
         transcript.until(b"PARKED\r\n");
-        input.write_all(suspend.as_slice())?;
+        input.write_all(SUSPEND)?;
         transcript.until(b"PROMPT ");
     }
     input.write_all(

@@ -3,14 +3,16 @@
 td-term is td's terminal: one Wayland window over one PTY, a standalone
 program built on td's shared UI toolkit (`td-ui/DESIGN.md`). The terminal's
 reusable pieces -- the VT parser and model, its renderer, the keyboard chord
-encoder, the terminfo compiler, and the PTY with its threads -- live in td-ui
-so that another td-owned program can embed a terminal. This crate holds what
+encoder and the terminfo compiler -- live in td-ui so that another td-owned
+program can embed a terminal, and the PTY with its threads and bounded input
+queue lives in td-pty, which programs and tests that need a terminal device
+but no window share. This crate holds what
 makes them one terminal program: the window and its readiness, the child's
 session policy, the pointer and clipboard gestures, and the readiness socket.
 This document is the normative contract for the terminal as a whole, td-ui's
-terminal modules included, and the starting point for successive agents; the
+terminal modules and td-pty included, and the starting point for successive agents; the
 root `AGENTS.md` and `DEVELOPMENT.md` still govern changes and submission.
-The raw surface beneath the PTY is `UNSAFE.md` §19's; td-term itself forbids
+The raw surface beneath the PTY is `UNSAFE.md` §29's; td-term itself forbids
 `unsafe`.
 
 ## 1. td-term boundary and philosophy
@@ -54,10 +56,10 @@ The implementation has four separable layers:
 - PTY, Wayland, keyboard, and clock adapters around those pure layers.
 
 The parser and model are `td_ui::vt`, the renderer `td_ui::vt_render`, the
-keyboard encoder with its scrollback viewport and bounded input queue
-`td_ui::vt_keys`, and the terminfo entry `td_ui::vt_terminfo`. The adapters
-are `td_ui::pty` (the device, the child, and the reader, writer and waiter
-threads), `td_ui::client` (the Wayland client and its turn loop), and
+keyboard encoder with its scrollback viewport `td_ui::vt_keys`, and the
+terminfo entry `td_ui::vt_terminfo`. The adapters are `td_pty` (the device,
+the child, the reader, writer and waiter threads, and the bounded input
+queue), `td_ui::client` (the Wayland client and its turn loop), and
 td-term's own `app.rs` (the window), `session.rs` (account, environment and
 child command), `job.rs` (what a close would end), and `ready.rs` (the
 readiness socket and its probe).
@@ -1084,9 +1086,9 @@ is likewise the tty convention rather than a relaxation: owner read/write and
 tty group WRITE, which is how anything reaches a terminal it does not own,
 where the devpts default would be 0600 owned by group root.
 
-Stable Rust does not expose the required PTY operations. td-ui's raw module
-carries `ioctl(2)` pinned to exactly five requests, each at its own wrapper
-with the request never a parameter, and `UNSAFE.md` §19 is their normative
+Stable Rust does not expose the required PTY operations. td-pty's raw module
+carries `ioctl(2)` pinned to exactly five device requests, each at its own
+wrapper with the request never a parameter, and `UNSAFE.md` §29 is their normative
 record:
 
 - `TIOCSPTLCK=0x40045431`, to unlock the slave;
@@ -1097,8 +1099,8 @@ record:
 - `TIOCSCTTY=0x540e`, with `setsid(2)`, in the pre-exec hook that makes the
   default shell lead a session on the slave (below).
 
-td-ui's confinement tests pin the request values and the wrappers, with
-`td_ui::pty` the only caller of the four device wrappers and of the session
+td-pty's confinement tests pin the request values and the wrappers, with
+its crate root the only caller of the four device wrappers and of the session
 hook's installer, that only for a child that leads a session, each at one
 site. This setter applies only
 to the terminal's newly created PTY; it does not weaken the separate
@@ -1140,11 +1142,11 @@ axis in a configure keeps the size the surface already has on that axis.
 
 td-term's default child is `/bin/sh` leading a new session whose
 controlling terminal is the slave. Safe `Command` cannot call `setsid(2)`,
-so td-ui's `spawn` does it for a `ChildCommand` with `leads_session`: a
+so td-pty's `spawn` does it for a `ChildCommand` with `leads_session`: a
 pre-exec hook in the forked child, after `std` has put the slave on
 descriptors zero to two, issues `setsid(2)` and then `TIOCSCTTY` with
-argument zero on descriptor zero -- two raw syscalls on td-ui's raw surface
-(UNSAFE.md §19), nothing that allocates or locks -- and an error from either
+argument zero on descriptor zero -- two raw syscalls on td-pty's raw surface
+(UNSAFE.md §29), nothing that allocates or locks -- and an error from either
 fails the spawn rather than starting a shell with no job control. That
 failure is td-term's, in `start` before readiness is published, and its
 message names the session; the wrapper it replaced failed inside a child
@@ -1714,8 +1716,8 @@ terminal, and td-term's prove the program:
 - the encoder spells every chord in §3's table, the pointer's reports are
   what each mode asks for in each encoding, bounded to what X10's byte
   carries, the viewport moves, clamps, and survives eviction and clears as
-  specified, and the input queue admits or drops a sequence whole
-  (`vt_keys.rs`);
+  specified (`vt_keys.rs`), and the input queue admits or drops a
+  sequence whole (td-pty's `queue.rs`);
 - the compiled `td-term` terminfo entry decodes to exactly the capabilities
   exercised by the native corpus, its key capabilities are the encoder's
   bytes, and each capability that shares a case has an effect check
@@ -1725,7 +1727,7 @@ terminal, and td-term's prove the program:
   delivers output until hangup, the writer never holds its lock across a
   write, survives a child that never reads, reports its own death to the next
   push, and retires on close; and the waiter reports the child's exit and
-  reaps a child no thread will wait for (`pty.rs`);
+  reaps a child no thread will wait for (td-pty's `lib.rs`);
 - a search steps through history and the screen in one numbering, across
   wraps, in either case for a lowercase query, the alternate screen
   alone, as wide as the screen, within its query bound, and a match
@@ -1819,7 +1821,7 @@ terminal, and td-term's prove the program:
 - the account, environment, and child command are the specified ones,
   constructed rather than inherited, the default child is the shell leading
   a session and an explicit command is literal argv leading none
-  (`session.rs`), and td-ui's spawn makes a child lead a session on the
+  (`session.rs`), and td-pty's spawn makes a child lead a session on the
   slave exactly when asked;
 - a readiness line is refused for every way it can be wrong, a probe reads
   back exactly what was published, a live terminal is never displaced but a

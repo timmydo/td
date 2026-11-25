@@ -599,7 +599,7 @@ mod tests {
     fn a_live_terminal_reports_its_leaders_command() {
         use std::io::Write;
         use std::sync::mpsc::sync_channel;
-        use td_ui::pty::{self, ChildCommand, Output, Pty};
+        use td_pty::{self as pty, ChildCommand, Output, Pty};
         let pty = Pty::open().unwrap();
         let slave = pty.peer().unwrap();
         let program = std::env::current_exe().unwrap();

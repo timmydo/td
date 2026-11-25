@@ -88,6 +88,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-pty"
+version = "0.1.0"
+
+[[package]]
 name = "td-remote"
 version = "0.1.0"
 dependencies = [
@@ -100,7 +104,7 @@ version = "0.1.0"
 dependencies = [
  "td-alloc",
  "td-fs",
- "td-ui",
+ "td-pty",
 ]
 
 [[package]]
