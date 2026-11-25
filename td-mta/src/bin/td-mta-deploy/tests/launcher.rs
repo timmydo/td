@@ -1214,6 +1214,18 @@ fn a_job_outcome_names_what_follows_from_its_end() {
         Some(verified.receipt.as_str())
     );
     assert!(json.get("next").unwrap().is_null());
+    assert!(json.get("journal_cap").is_none());
+    // What the activation did about the journal's bound is reported.
+    let capped = job(
+        Some(0),
+        r#"{"status":"already deployed and healthy","journal_cap":"unchanged"}"#,
+        Some(false),
+        Some(true),
+    );
+    let mut written = Vec::new();
+    write_job_outcome(&mut written, &at_deploy(&capped), &capped).unwrap();
+    let line = String::from_utf8(written).unwrap();
+    assert!(line.contains(r#""journal_cap":"unchanged""#), "{line}");
     // Without a record read, the outcome names no record.
     let silent = job(Some(1), "", Some(false), Some(true));
     let mut written = Vec::new();
@@ -1444,6 +1456,25 @@ fn a_job_outcome_names_what_follows_from_its_end() {
         argv(&named),
         "td-mta/deploy --postgres-binaries --window-seconds 1320"
     );
+    // A journal drop-in someone else wrote is theirs to settle: no command
+    // follows its refusal.
+    let mut record = Json::Obj(Vec::new());
+    set(
+        &mut record,
+        "error",
+        Json::Str(crate::journald::FOREIGN.into()),
+    )
+    .unwrap();
+    let foreign = at_deploy(&job(Some(1), &record.to_string(), Some(false), Some(true)));
+    assert_eq!(foreign.result, "failed");
+    assert!(foreign.next.is_none() && foreign.approve.is_none());
+    for text in [
+        "",
+        "# /etc/systemd/journald.conf.d/td-mta.conf\n[Journal]\nSystemMaxUse=1G\n",
+    ] {
+        let error = crate::journald::effective(text).unwrap_err().to_string();
+        assert!(super::named(&error).is_none(), "{error}");
+    }
     let changed = r#"{"error":"production release changed"}"#;
     let other = at_deploy(&job(Some(1), changed, Some(false), Some(true)));
     assert_eq!(other.result, "failed");

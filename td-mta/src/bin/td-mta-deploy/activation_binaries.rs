@@ -810,7 +810,7 @@ impl Deployment {
         let closure = Closure::from_job(&self.record)?;
         self.check_source()?;
         self.socket_preflight()?;
-        crate::readiness::prepare(&self.host)?;
+        self.host_settings()?;
         if !self.host.debian_tools() && self.host.tool("postgres")? == closure.postgres()? {
             loader::check_loading(&self.host, &closure)?;
             self.td_process(self.pid(PG)?, &closure)?;
@@ -1070,7 +1070,7 @@ impl Deployment {
         )?;
         self.check_source()?;
         self.socket_preflight()?;
-        crate::readiness::prepare(&self.host)?;
+        self.host_settings()?;
         let source = Source::of(&self.host)?;
         if matches!(source, Source::Debian) {
             require(launcher.as_str() == DEBIAN_SOURCE, LIVE_CHANGED_BACK)?;

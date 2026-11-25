@@ -325,6 +325,26 @@ impl Deployment {
         Err(fmt(format_args!("{reason} timeout"))?.into())
     }
 
+    /// The permanent host settings every activation and PostgreSQL switch
+    /// ensures: the readiness jobs and the journal's size bound.
+    fn host_settings(&mut self) -> R<()> {
+        crate::readiness::prepare(&self.host)?;
+        let cap = crate::journald::ensure(&self.host)?;
+        set(
+            &mut self.record,
+            "journal_cap",
+            Json::Str(owned(cap.name())?),
+        )?;
+        if cap != crate::journald::Cap::Unchanged {
+            self.event(&fmt(format_args!(
+                "journal bound {}: {}",
+                cap.name(),
+                crate::journald::DROPIN
+            ))?)?;
+        }
+        Ok(())
+    }
+
     fn rolling_back(&self) -> bool {
         field(&self.record, "mode").ok() == Some("rollback")
     }
@@ -348,7 +368,7 @@ impl Deployment {
         )?;
         self.check_source()?;
         self.socket_preflight()?;
-        crate::readiness::prepare(&self.host)?;
+        self.host_settings()?;
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
         // Before the build: host.json's public_name must verify now. A

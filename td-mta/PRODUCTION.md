@@ -44,6 +44,7 @@ decision.
 | Binary selection (present only once switched) | `/etc/systemd/system/td-mta-postgres.service.d/91-td-mta-binaries.conf` and `/etc/systemd/system/td-mta-maint-backup.service.d/91-td-mta-binaries.conf` |
 | Per-profile readiness and diagnostics | `/var/lib/td-mta/mail/PROFILE/runtime` |
 | System service definitions | `/etc/systemd/system/td-mta-*.service` |
+| Journal size bound | `/etc/systemd/journald.conf.d/td-mta.conf` |
 | Root-owned deployment receipts and diagnostics | `/var/lib/td-mta-operator/` |
 | Native notification configuration and bounded state | `/var/lib/td-mta/mail/.operations/notifications/` |
 | Scheduled database backups | `/var/lib/td-mta/backups/scheduled/` |
@@ -249,6 +250,60 @@ increase it without checking disk capacity. Installed release directories and
 candidate builds are not automatically pruned. Keep current and known-good
 previous releases, then remove only identified inactive build trees. Do
 not treat migration data as build cache.
+
+## Journal size
+
+The systemd journal on the OS disk is bounded by td-mta's own journald
+drop-in, `/etc/systemd/journald.conf.d/td-mta.conf`, root-owned mode
+0644; the distribution's `/etc/systemd/journald.conf` stays as it is:
+
+```text
+# Written by td-mta-deploy (td-mta/PRODUCTION.md, "Journal size").
+[Journal]
+SystemMaxUse=500M
+SystemKeepFree=4G
+```
+
+journald's defaults let the persistent journal take 10% of its
+filesystem and keep 15% free, each at most 4 GiB: about 2.9 GiB of this
+29 GiB root. Durable application logs are in PostgreSQL
+(OBSERVABILITY.md), so the journal is a recent diagnostic window, which
+500M holds. `SystemKeepFree=4G` is systemd's default for this disk,
+stated so that neither a resized disk nor another default moves it:
+below it journald gives back archived files first. journald reads the
+file when it starts and enforces the bound as it rotates; `sudo
+journalctl --vacuum-size=500M` removes archived files beyond it at once.
+
+Every activation, rollback and PostgreSQL switch, `--to-debian`
+included, ensures the file in its preflight, beside the readiness jobs,
+so `./td-mta/deploy`, even with nothing newer to deploy, applies it. It
+creates `/etc/systemd/journald.conf.d` root-owned mode 0755 if absent;
+an existing one must be root's and writable by root alone.
+
+- Absent: the file is placed, `systemd-analyze cat-config
+  systemd/journald.conf` must show both settings as journald's last
+  word, and journald restarts under it (`systemctl restart
+  systemd-journald.service`; services' output streams survive in
+  journald's file descriptor store). The receipt records `journal bound
+  installed`. If the check fails the file goes again; if the restart
+  fails it goes and journald restarts once more without it.
+- Exactly that file (text, root ownership, mode 0644 and a single link):
+  it is kept. Unless `systemctl show --timestamp=unix` says journald
+  started in or after the second the file was written, journald
+  restarts (`journal bound restarted`), as after a controller that died
+  between the two. `restarted` on every run means this systemd cannot
+  print that time, and costs a journald restart per activation.
+- Anything else at that path, or a file journald reads later that sets
+  either key to another value: the job refuses, naming the file, and no
+  command follows. Compare the file with the text above, then remove it
+  (the next deployment writes this one) or make it exactly this one;
+  move a lasting difference into a reviewed change of this file.
+
+A rollback and the return to Debian refuse the same way: like the
+readiness jobs, the bound is a host setting every activation keeps, and
+settling a refusal is removing one file. The receipt's `journal_cap`,
+which the outcome line repeats, is `installed`, `restarted` or
+`unchanged`.
 
 ## Backup and recovery data disk
 
@@ -1095,7 +1150,9 @@ configuration"; every other mode holds the following:
   for want of a backup, when the next scheduled backup will have ended;
   absent when systemd cannot say);
 - `host_key`: with `--write-target --host-key-sha256`, what happened to
-  the enrolled key.
+  the enrolled key;
+- `journal_cap`: after a job that ensured the journal's bound ("Journal
+  size"), `installed`, `restarted` or `unchanged`.
 
 ### Isolating production service accounts
 

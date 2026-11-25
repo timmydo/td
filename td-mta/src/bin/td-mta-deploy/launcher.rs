@@ -890,6 +890,14 @@ fn write_job_outcome(out: &mut impl std::io::Write, end: &Ended, job: &Job) -> R
     {
         set(&mut details, "status", Json::Str(owned(status)?))?;
     }
+    if let Some(cap) = job
+        .record
+        .as_ref()
+        .and_then(|r| r.get("journal_cap"))
+        .and_then(Json::as_str)
+    {
+        set(&mut details, "journal_cap", Json::Str(owned(cap)?))?;
+    }
     // Only a record read names where it came from.
     if job.record.is_some() {
         set(&mut details, "receipt", Json::Str(owned(&job.receipt)?))?;

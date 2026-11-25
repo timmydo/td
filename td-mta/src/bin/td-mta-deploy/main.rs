@@ -3,6 +3,7 @@
 mod activate;
 mod common;
 mod isolation;
+mod journald;
 mod launcher;
 mod physical;
 #[cfg(test)]
