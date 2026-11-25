@@ -755,6 +755,20 @@ launcher reports an `--all` job whose receipt does not record `all` as
 `failed`. Without `--all` no backup is read and the window applies as
 above.
 
+### One-time migrations
+
+A migration that one host needs once is an idempotent command or
+script with a `--check` mode that changes nothing, and it ends with a
+`td-mta-deploy-outcome` line ([Command outcomes](#command-outcomes)).
+An agent can run it, and no step needs recovery by hand. It is written
+to the standard its single use needs: no production-grade generality,
+and review depth fitted to the risk. Its `--check` runs against the
+real host before the change is merged, so drift on the host surfaces
+in one pass rather than one refusal per run. Once every host has
+crossed, it is deleted with its runbook text (AGENTS.md, principle 4);
+anything a later retirement still reads is named with the point after
+which it goes.
+
 ### Converge the configuration
 
 Production's td-mta configuration is the defaults of the release it runs
