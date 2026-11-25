@@ -951,6 +951,24 @@ mod tests {
         assert_eq!(texts, ["one", "two"]);
     }
     #[test]
+    fn many_elements_over_few_rare_groups_and_custom_maps_are_admitted() {
+        // Each element's own group and map are freed once pooled, so the
+        // next one's may take its address: lookups the pool repeats.
+        let mut html = String::new();
+        for i in 0..8_000 {
+            html.push_str(&format!("<p style='order:{};--x:{}'>x", 1 + i % 30, i % 7));
+        }
+        html.push_str("<div class=f><a>a</a><b>b</b></div>");
+        let dom = td_html::document::parse(&html).unwrap();
+        let css = "p:nth-child(3n){flex-grow:2}.f{display:flex}.f a{order:1}";
+        for _ in 0..3 {
+            let styled =
+                StyledDocument::new(&dom, &sheets(css), html.len(), Limits::default()).unwrap();
+            // 30 orders and seven maps, coprime: 210 pairs.
+            assert!(styled.style_count() >= 210, "{}", styled.style_count());
+        }
+    }
+    #[test]
     fn custom_maps_are_part_of_identity_and_parent_inheritance() {
         let html = "<div style='--x:10px'><p>a<p>b</div><div style='--x:20px'><p>c</div>";
         let dom = td_html::document::parse(html).unwrap();

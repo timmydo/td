@@ -742,9 +742,7 @@ pub(super) fn finish(
 ) -> Result<(), Error> {
     for (width, kind) in BORDERS.iter().zip(BORDER_STYLES) {
         if matches!(word(style, *kind), Some("none" | "hidden")) {
-            style
-                .values
-                .try_insert(*width, ComputedValue::Length(Length::Px(0.0)))?;
+            style.set(*width, ComputedValue::Length(Length::Px(0.0)))?;
         }
     }
     let x = word(style, OverflowX);
@@ -757,16 +755,14 @@ pub(super) fn finish(
                 _ => None,
             };
             if let Some(next) = next {
-                style.values.try_insert(p, ComputedValue::Keyword(next))?;
+                style.set(p, ComputedValue::Keyword(next))?;
             }
         }
     }
     let floated = matches!(word(style, Float), Some("left" | "right"));
     let item = parent.is_some_and(|p| matches!(word(p, Display), Some("flex" | "inline-flex")));
     if item && floated {
-        style
-            .values
-            .try_insert(Float, ComputedValue::Keyword("none"))?;
+        style.set(Float, ComputedValue::Keyword("none"))?;
     }
     if parent.is_none() || floated || item {
         let next = match word(style, Display) {
@@ -780,9 +776,7 @@ pub(super) fn finish(
             _ => None,
         };
         if let Some(next) = next {
-            style
-                .values
-                .try_insert(Display, ComputedValue::Keyword(next))?;
+            style.set(Display, ComputedValue::Keyword(next))?;
         }
     }
     Ok(())

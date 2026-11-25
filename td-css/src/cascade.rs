@@ -7,7 +7,7 @@ use crate::values::{
 };
 use crate::variables::{self, CustomDeclaration};
 use crate::{Error, MAX_DECLARATIONS};
-use td_alloc::{Budget, BudgetMap, BudgetVec};
+use td_alloc::{Budget, BudgetMap, BudgetShared, BudgetVec};
 
 mod index;
 pub use index::MAX_INDEX_ENTRIES;
@@ -132,6 +132,9 @@ struct Rule {
 pub struct StyleSet {
     rules: BudgetVec<Rule>,
     index: index::RuleIndex,
+    /// The initial rare group every style that sets none of its
+    /// longhands shares.
+    rare: BudgetShared<values::Rare>,
 }
 
 /// Per-call counters, including partial work when computation is refused.
@@ -500,13 +503,16 @@ impl StyleSet {
             parent.map(|p| &p.custom),
             &mut work.substitution,
         )?;
+        let common = Property::common_roster();
         let mut style = ComputedStyle {
             custom,
-            values: td_alloc::BudgetMap::with_capacity(&memory, Property::ALL.len())?,
+            values: td_alloc::BudgetMap::with_capacity(&memory, common.len())?,
+            rare: self.rare.try_clone()?,
         };
-        // Dependency order: font size, then color, then all remaining values.
+        // Dependency order: font size, then color, then all remaining
+        // common values; the rare ones, which none depends on, after.
         let properties = [Property::FontSize, Property::Color].into_iter().chain(
-            Property::ALL
+            common
                 .iter()
                 .copied()
                 .filter(|p| !matches!(p, Property::FontSize | Property::Color)),
@@ -551,6 +557,47 @@ impl StyleSet {
             }
             style.values.try_insert(property, value)?;
         }
+        // Only the rare longhands a declaration won, which sort last; the
+        // shared initial group stands for the rest, and is copied once,
+        // when a value first differs from it.
+        let root_font_size = if parent.is_none() {
+            font_size
+        } else {
+            root_font_size
+        };
+        let mut rare: Option<values::Rare> = None;
+        for (property, winner) in winners.iter().rev() {
+            let Some(slot) = property.rare() else {
+                break;
+            };
+            let specified = values::resolve_pending(
+                *property,
+                &winner.value,
+                &style.custom,
+                &mut work.substitution,
+            )?;
+            let value = values::compute_value(
+                *property,
+                &specified,
+                parent,
+                font_size,
+                color,
+                root_font_size,
+                &memory,
+            )?;
+            if rare.is_none() {
+                if style.rare.values.get(slot).is_some_and(|v| v.same(&value)) {
+                    continue;
+                }
+                rare = Some(style.rare.try_copy()?);
+            }
+            if let Some(target) = rare.as_mut().and_then(|g| g.values.get_mut(slot)) {
+                *target = value;
+            }
+        }
+        if let Some(rare) = rare {
+            style.rare = BudgetShared::new(&memory, rare)?;
+        }
         values::finish(&mut style, parent)?;
         Ok(style)
     }
@@ -578,6 +625,7 @@ impl<'a> Compiler<'a> {
             output: StyleSet {
                 rules: BudgetVec::new(memory)?,
                 index: index::RuleIndex::new(memory)?,
+                rare: BudgetShared::new(memory, values::Rare::initial()?)?,
             },
             declarations: 0,
             walked: 0,

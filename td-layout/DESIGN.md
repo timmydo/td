@@ -2542,7 +2542,7 @@ maps and indexes 13,169 token arrays by address, each lookup and
 insertion a fixed two visits (td-css/DESIGN.md, "Computed-style
 sharing"). Most of the pool's work is traversing those maps and
 comparing them with equal ones, linear in their size; a page reaches
-MAX_POOL_WORK that way, or MAX_POOL_BYTES first, at some 4,300
+MAX_POOL_WORK that way, or MAX_POOL_BYTES first, at some 5,500
 distinct maps (td-css/DESIGN.md, "Computed-style sharing").
 
 ## 7. Independently landable increments

@@ -470,9 +470,12 @@ item's main axis, where it is the automatic minimum (td-layout/DESIGN.md
 
 The flex and alignment longhands compute to keywords, numbers and
 lengths only: no td-css computation depends on them but blockification
-on a parent's `display`. td-layout lays rows, wrapping rows and
+on a parent's `display`. With `clear`, `opacity`, the four offsets and
+`table-layout`, they are the rare group a style shares until a rule
+sets one ("Computed-style sharing"). td-layout lays rows, wrapping rows and
 columns (td-layout/DESIGN.md §5, "Flex"), `wrap-reverse` as `wrap` and
-`column-reverse` as `column`, and does not read `order`. A flex factor
+`column-reverse` as `column`, and reads `order` to place the items of a
+row laid on one line (td-layout/DESIGN.md §5, "Order"). A flex factor
 clamps to MAX_ABSOLUTE_VALUE and
 `order`, an integer token, to the 32-bit range browsers keep it in.
 `flex-basis: content` is a keyword, auto and a length-percentage are
@@ -717,7 +720,7 @@ All td-css-owned heap storage uses td-alloc. Token text up to 14 UTF-8
 bytes lives inline in its enclosing owner.
 Text from 15 through 62 bytes uses one shared fixed SmallText allocation;
 longer text uses a shared BudgetString. Custom maps, retained custom-token
-arrays and font families use immutable BudgetShared owners; nested component arrays use BudgetVec.
+arrays, font families and rare-property groups use immutable BudgetShared owners; nested component arrays use BudgetVec.
 Component construction counts immediate children with a fixed bounded
 delimiter stack before reserving exact capacity.
 Mutable arrays and small ordered maps use BudgetVec and BudgetMap.
@@ -776,7 +779,9 @@ td-css does not give yet.
 `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
-the fixed 71-longhand roster. `initial` supplies context-free seeds; border
+the fixed 71-longhand roster, in declaration order: the 52 a style holds
+itself, then the 19 of its shared rare group ("Computed-style
+sharing"), which no caller sees but in that order. `initial` supplies context-free seeds; border
 colors, border widths, overflow and display also undergo the contextual
 computation above. `ComputedStyle::new(&Budget)` fallibly builds initial values with invisible
 borders. `try_clone` replaces owned Clone, and `Property::initial(&Budget)`
@@ -1088,7 +1093,8 @@ independently, and inherited token allocations retain their BudgetShared sharing
 A fingerprint only selects an equality bucket. Signed zero hashes alike.
 No global cache or tree dependency is introduced. A custom map is keyed
 by the same fingerprint over its names and tokens. A complete
-style's fingerprint takes about 275 writes, some 1 KiB, which SipHash-1-3
+style's fingerprint takes about 245 writes (some 320 when a style held
+every longhand, below), which SipHash-1-3
 would run a round per 8-byte block over and buffer write by write; it is
 instead a fold of 64-bit words, each with the state and the pool's own
 key multiplied out to 128 bits and the halves combined (wyhash's mum
@@ -1107,9 +1113,86 @@ learns an address can collide styles. The defence either way is that a
 collided bucket is bounded by MAX_STYLE_COMPARISONS and MAX_POOL_WORK,
 and equality, not the key, decides sharing.
 
-Each element's style holds every longhand, so a longhand costs every
-element its computation, its insertion, and its share of the pool's
-fingerprint and equality test. The cascade reads the style's own font
+A style holds its 52 common longhands itself and shares a group of
+the 19 rarely set ones, the roster's last (`Property::FIRST_RARE` on):
+`clear`, `opacity`, `top`, `right`, `bottom`, `left`, `table-layout`
+and the twelve flex and alignment longhands. None inherits, and most
+elements set none: §8's corpus lists `opacity` (328 declarations over
+eight sites) among its frequent properties but neither `clear` nor the
+offsets, which only positioned boxes read, and only tables and flex
+boxes set the rest. No common longhand's computation reads one, nor
+does `finish`.
+A style set holds one initial group, which every style it computes
+shares until a rule sets one of them, so an element that sets none
+never computes, stores, fingerprints or compares them. A winning rare
+declaration is substituted and computed as any is, after the common
+longhands and so with the element's own font size; `inherit` reads
+the parent's group and `initial` and `unset` the initial values. The
+first value that differs from the initial group's copies the group
+(19 plain values) and writes the copy; one that computes to the
+initial value copies nothing. `get` takes one branch to the group, and
+`set`, which `finish` and tests write through, copies a group before
+writing a rare value, so no group is written once shared. Display,
+float, position, overflow, box-sizing, the minimum and maximum sizes
+and the border longhands stay common: the UA sheet or the usual author
+resets set them on many elements, and `finish` writes four of them.
+
+The pool canonicalizes groups by contents. No rare longhand inherits,
+so the one group that reaches it already canonical is a style set's
+initial group: the pool keeps the last group that arrived canonical,
+or became so, with its fingerprint, and takes a style whose group is
+that same allocation at once, without a visit. Its fingerprint is kept
+there, not in the group: the key is the pool's, a group is shared by
+pools of different keys (its style set's documents), and an unkeyed
+digest a group carried would let a page search for collisions offline.
+Any other group is fingerprinted over its 19 values with the pool's
+key, looked up, and compared with its bucket's (19 visits and a
+comparison each against MAX_STYLE_COMPARISONS), then either replaced
+by its canonical equal or retained, charged once: 128 bytes for its
+index entry and its doubled storage, 1,040 bytes in all. Nothing is
+looked up by a group's address, which a freed group's successor
+reuses, so the pool's work on groups depends on the page alone. Groups
+compare to the bit, as the cascade does a value against the initial
+group's, so a group shared between styles never gives one another's
+signed zero: `order:-0` keeps its sign, where `==` would take it for
+the initial 0. Its bucket is keyed to the bit as well: eleven rare
+longhands can be a zero of either sign, and a fingerprint that hashed
+signed zeros alike gave a group's 2,048 variants one bucket a page
+could fill without the key (1,500 elements over them, or 10,000 over
+256, were refused MAX_STYLE_COMPARISONS; both are now admitted, three
+styles, with each variant retained). Each variant is charged its
+1,040 bytes though its style merges, so a page of tens of thousands
+of distinct signed-zero combinations (64,000 elements over 64 `order`
+classes and 1,024 variants, about 1.5 MB) is refused MAX_POOL_BYTES
+where a style holding every longhand admitted it in 6.5 MB. The one
+pass over its values also gives a second fingerprint that hashes signed zeros alike, kept
+beside the group and in `known`; a style's fingerprint folds that one
+as one word, as styles' `==` does, and the pool compares two styles'
+canonical groups by address, then, for groups apart by a signed zero
+alone (19 visits more), by `==`, so such styles are one style, the
+first, as when a style held every longhand. `ComputedStyle`'s own
+equality compares groups by address, then by `==`.
+
+An element that sets a rare value pays for a copy, an allocation, and
+its group's hashing, lookup and comparison or insertion in the pool,
+where every element once paid for those longhands' computation,
+hashing and comparison. A novel style with a novel group costs about
+98 visits, against 88 when a style held every longhand (`<p
+style="order:N">`, each distinct: 196,524 visits for 2,000 against
+176,386), so pages of mostly distinct groups take 11 to 14% more pool
+work: 5,000 `<p style="order:N;width:Npx">`, each distinct, 515,676
+against 452,962. Pages whose elements share a few groups take less:
+2 MiB of flex bars, three elements in four setting one, 22,024,593
+against 21,745,786 (+1.3%), and fewer instructions; the Wikipedia
+pages, a fifth less (below). An element whose group is not canonical
+spends one equality probe more against MAX_STYLE_COMPARISONS than when
+a style held every longhand: at most 786,432 of its 1,048,576 at
+td-html's MAX_NODES, three a node (style, group and custom map), so
+another canonicalized group a style carried would reach the limit.
+
+Each element's style holds every common longhand, so a common longhand
+costs every element its computation, its insertion, and its share of
+the pool's fingerprint and equality test. The cascade reads the style's own font
 size and colour once each is computed, and an unset property, most of
 every element's, copies its parent's value or its initial one inline,
 with no Result between. Measured per cascade, release, pinned to one
@@ -1126,23 +1209,35 @@ cascade before these:
 The blocks cascade's wall time is 398 to 402 ms against 435 to 449
 (fastest of five, three processes each).
 
-The pool's four indexes (style buckets by fingerprint, custom-map
+The pool's five indexes (style buckets by fingerprint, custom-map
 buckets by fingerprint, canonical custom maps by address and their
-token arrays by address) are open-addressed tables of td-alloc storage,
-at most half full, their slots chosen by the key mixed twice with the
-pool's key, which enters each round, so a slot is no fixed function of
-the key XOR the pool's key. A lookup or an insertion is charged two
-visits whatever it probes, so a new key costs four (a lookup, then an
-insertion), and a table that would pass half full doubles, charged its
-new size, the slots it initialises, before anything is allocated or
-moved, so a refusal leaves it whole. The pool's work is therefore a function of the page
-alone, not of its key or the addresses ASLR gives it. Probes, which do
-depend on those, are counted apart: a table refuses `MAX_POOL_WORK`
-before the probe that would take it past eight an operation and 4,096
-more, and a growth's move, which cannot stop halfway, counts its probes
-after it, so the next probe refuses if they passed the cap; clustering
-cannot cost more than a bounded multiple of the work charged. Bucket order, and so every StyleId and every shared map,
-does not depend on the key either. Measured 2026-11-15, release, pinned
+token arrays by address, rare-group buckets by bitwise fingerprint) are
+open-addressed tables of td-alloc storage, at most half full, their
+slots chosen by the key mixed twice with the pool's key, which enters
+each round, so a slot is no fixed function of the key XOR the pool's
+key. A lookup or an insertion is charged two visits whatever it probes,
+so a new key costs four (a lookup, then an insertion), and a table that
+would pass half full doubles, charged its new size, the slots it
+initialises, before anything is allocated or moved, so a refusal leaves
+it whole. Probes, which depend on the key and the addresses ASLR gives
+the pool, are bounded by construction instead: no run of occupied slots
+reaches PROBE_LIMIT (64), so a probe for any key, present or absent,
+reads at most 64 slots however often it is made. An insertion that
+would make such a run doubles the table first, as does a growth whose
+move made one, up to SPREAD (4) times the half-full size its entries
+need, each size charged as any growth's; past that the insertion is
+refused `MAX_POOL_WORK` with the table whole, which only keys built
+against the pool's key can bring about, and a probe is refused before
+it would read a 65th slot. An allowance averaged over operations, as
+there was (eight an operation and 4,096), does not bound one key looked
+up again and again: an address a freed custom map or group left, which
+the next element's took, missed once an element over the same long
+run, and refused up to 4% of the loads of a page of many elements over
+a few values. Keyed homes make a run of 64 at most half full all but
+impossible (14,000 addresses at strides of 8 to 4,096 bytes made none
+longer than 31), so the pool's work is a function of the page alone in
+practice, not of its key or of ASLR. Bucket order, and so every StyleId
+and every shared map, does not depend on the key either. Measured 2026-11-15, release, pinned
 (fastest of five cascades, three processes; pool work identical in
 every process and with fixed keys):
 
@@ -1159,13 +1254,17 @@ every process and with fixed keys):
 | 5,000 elements reading a 60-deep `var()` chain | 72 to 74 | 6,650,828 |
 | an 8,000-property map and 2,000 children adding one each | `MAX_POOL_BYTES` at 100 | |
 
-A style is charged 13,056 bytes with the 71 longhands (10,944 with
-59), so MAX_POOL_BYTES admits some 5,100 distinct styles (6,100
-before the flex longhands; `<p style="width:Npx">`, each distinct)
-and some 4,300 elements each with its own custom map (5,000 before).
-Real pages hold a few hundred (*Germany* 465, The Guardian 734). Each
-longhand added lowers both, until the rarely set ones move to a group
-shared by default.
+A style is charged 9,728 bytes with its 52 common longhands and its
+group's handle (13,056 when it held all 71, 10,944 with 59), and each
+distinct rare group 1,040 bytes once, so MAX_POOL_BYTES admits some
+6,900 distinct styles (6,896 of `<p style="width:Npx">`, each
+distinct; 5,137 when a style held every longhand, some 6,100 before
+the flex longhands), 6,230 that each bring a group of their own as
+well (`<p style="order:N">`; 5,137 before), and some 5,500 elements
+each with its own custom map (5,495; 4,317 before the group). Real pages hold a few hundred
+(*Germany* 466, The Guardian 734). Each common longhand added lowers
+both by 176 bytes a style; a rare one adds 48 bytes to each distinct
+group alone.
 
 A lookup or an insertion on these pages probes 1.0 to 1.9 slots on
 average, growth's moves aside (The Guardian's 13,169 token addresses
@@ -1191,9 +1290,9 @@ measured as above (median of five, 2026-11-15, load average 3 to 5):
 
 The blocks cascade's wall time is 392 to 397 ms with them, 371 to 374
 without, 404 to 408 before both (fastest of five, three processes
-each). The longhands' own cost would need styles that do not hold
-every longhand (a rare-property group, shared until a rule sets one),
-which td-css does not have.
+each). The longhands' own cost needed styles that do not hold every
+longhand: `table-layout` has since moved to the rare group (above),
+and the two inheriting ones stay common.
 
 The twelve flex and alignment longhands (59 to 71) cost each element
 twelve more computed values, insertions, fingerprint words and equality
@@ -1225,7 +1324,51 @@ grows with its distinct styles: *Germany*'s 465 by 1,036,800 bytes
 (8.5 to 9.6 MB, 3.3% of its page charge), the 2 MiB shapes' three to
 eight by 6 to 17 KB. Pool work grows with the fingerprint and equality
 words: blocks 12,035,902 to 14,224,234 (+18%), *Germany* 1,669,380 to
-1,929,851. The rare-property group above is what would recover it.
+1,929,851.
+
+The rare-property group (above) recovers it. Measured 2026-11-25 as
+above (`StyledDocument::new`, release, pinned, user-mode `perf stat`,
+four less one, median of five, the two builds interleaved, load average
+3.2 to 7.9) on this change's own 2 MiB shapes, HTML_UA_CSS with a small
+author sheet where named (blocks are `<div><p>` pairs, 124,017
+elements; the flex bars set flex longhands on three elements in four;
+the cards and the Bootstrap-like grid set them on fewer), and the same
+four Wikipedia pages fetched again that day:
+
+| Page | Instructions every longhand / group (M) | Pool work every longhand / group |
+| --- | ---: | ---: |
+| 2 MiB blocks | 6,479 / 5,448 (−15.9%) | 19,346,338 / 14,633,828 |
+| 2 MiB table rows | 7,952 / 6,743 (−15.2%) | 21,696,106 / 16,411,221 |
+| 2 MiB nested tables | 10,051 / 8,460 (−15.8%) | 28,647,778 / 21,669,537 |
+| 2 MiB floats | 5,588 / 4,874 (−12.8%) | 16,444,126 / 13,844,073 |
+| 2 MiB inline-blocks | 2,994 / 2,481 (−17.2%) | 9,966,454 / 7,538,789 |
+| 2 MiB nested lists | 8,800 / 7,500 (−14.8%) | 24,790,690 / 18,751,999 |
+| 2 MiB inline tables | 2,952 / 2,467 (−16.4%) | 9,673,102 / 7,316,896 |
+| 2 MiB flex bars | 7,327 / 6,902 (−5.8%) | 21,745,786 / 22,024,593 (+1.3%) |
+| 2 MiB flex cards | 5,372 / 4,929 (−8.2%) | 15,476,470 / 14,682,926 |
+| 2 MiB Bootstrap-like grid | 3,738 / 3,452 (−7.6%) | 10,182,810 / 9,940,463 |
+| 20,000 `<p style="order:K">`, 30 values | 1,219 / 1,133 (−7.0%) | 3,118,162 / 3,158,381 (+1.3%) |
+| 100,000 `<p style="--x:K">`, 126 values | 6,667 / 5,837 (−12.5%) | 17,618,808 / 13,821,205 |
+| Wikipedia, *Cascading Style Sheets* | 1,851 / 1,798 (−2.9%) | 985,959 / 791,352 |
+| Wikipedia, *Germany* | 4,025 / 3,917 (−2.7%) | 1,929,774 / 1,535,926 |
+| Wikipedia, *List of countries and dependencies by population* | 3,414 / 3,335 (−2.3%) | 1,623,272 / 1,278,589 |
+| Wikipedia, *List of chemical elements* | 2,164 / 2,106 (−2.7%) | 1,222,049 / 967,584 |
+
+The blocks cascade's fastest run takes 499 ms against 625, the
+Wikipedia pages' cycles and times move within run-to-run noise, and
+their instructions fall. Every style is charged 3,328 bytes less, so a
+page's styled charge falls with its distinct styles: *Germany*'s 466
+from 9,565,490 to 8,060,402 bytes, *Cascading Style Sheets*' 365 from
+6,451,863 to 5,264,183, the 2 MiB shapes' three to nine by 9 to 25 KB.
+Every element's computed values, to the bit, its cascade work and
+boxes, every style and its number, and the layouts at 1280 and 832 px
+and windowed, are the same with the group as without it on all of
+these and on 3,000 generated pages setting rare longhands, signed zeros
+among them, through rules, inline styles, shorthands, `var()`,
+CSS-wide keywords and `!important` (their layouts on 500 of them).
+Pool work, and whether a page is admitted, is the same in every
+process: 300 to 1,000 loads each of the pages that refused up to 4% of
+loads under the averaged probe allowance (above) were all admitted.
 
 PoolLimits may lower MAX_STYLES (16,384), MAX_POOL_BYTES (64 MiB),
 MAX_POOL_WORK (67,108,864 visits: fields, components and string bytes

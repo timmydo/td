@@ -1,11 +1,11 @@
 //! Document-local interning, including independently shared custom maps.
 use crate::syntax::{Component, Token};
-use crate::values::{ComputedStyle, ComputedValue, Family, Length};
+use crate::values::{ComputedStyle, ComputedValue, Family, Length, Rare, RARE};
 use crate::variables::CustomProperties;
 use crate::Error;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
-use td_alloc::{Budget, BudgetError, BudgetVec};
+use td_alloc::{Budget, BudgetError, BudgetShared, BudgetVec};
 
 pub const MAX_STYLES: usize = 16_384;
 pub const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
@@ -44,6 +44,13 @@ pub struct StylePool {
     /// Canonical custom maps and their token arrays, by address.
     maps: Table<()>,
     tokens: Table<()>,
+    /// Canonical rare groups by bitwise fingerprint, each with the one
+    /// a style's folds.
+    rare: Table<BudgetVec<(BudgetShared<Rare>, u64)>>,
+    /// The last group to arrive already canonical, or to become so, and
+    /// its style fingerprint: a style set's initial group, which every
+    /// style that sets no rare longhand shares, is hashed once a run of them.
+    known: Option<(BudgetShared<Rare>, u64)>,
     limits: PoolLimits,
     bytes: usize,
     work: usize,
@@ -70,6 +77,8 @@ impl StylePool {
             custom: Table::new(memory, seed)?,
             maps: Table::new(memory, seed)?,
             tokens: Table::new(memory, seed)?,
+            rare: Table::new(memory, seed)?,
+            known: None,
             limits: PoolLimits {
                 styles: limits.styles.min(MAX_STYLES),
                 bytes: limits.bytes.min(MAX_POOL_BYTES),
@@ -100,24 +109,38 @@ impl StylePool {
     }
     pub fn intern(&mut self, mut style: ComputedStyle) -> Result<StyleId, Error> {
         self.share_custom(&mut style.custom)?;
+        let rare = self.share_rare(&mut style.rare)?;
         let mut hash = Fingerprint::new(self.seed);
         // Canonical maps have a stable address while retained by this pool.
         (std::ptr::from_ref(&*style.custom.entries).addr()).hash(&mut hash);
+        hash.add(rare);
         let value_work = style.values.values().map(value_work).sum::<usize>();
         self.visit(value_work)?;
         for (property, value) in &style.values {
             (*property as u8).hash(&mut hash);
-            hash_value(value, &mut hash);
+            hash_value(value, Zero::Equal, &mut hash);
         }
         let key = hash.finish();
         if let Some(bucket) = self.buckets.get(key, &mut self.work, self.limits.work)? {
             for id in bucket {
                 comparison(&mut self.comparisons, self.limits.comparisons)?;
                 visit_count(&mut self.work, value_work, self.limits.work)?;
-                if self.styles.get(id.0).is_some_and(|old| {
-                    std::ptr::eq(&*old.custom.entries, &*style.custom.entries)
-                        && old.values == style.values
-                }) {
+                let Some(old) = self.styles.get(id.0) else {
+                    continue;
+                };
+                if !std::ptr::eq(&*old.custom.entries, &*style.custom.entries)
+                    || old.values != style.values
+                {
+                    continue;
+                }
+                // Canonical groups differ only by a signed zero (`same` is
+                // bitwise, `==` is not): the styles are equal, as when a
+                // style held every longhand.
+                if BudgetShared::ptr_eq(&old.rare, &style.rare) {
+                    return Ok(*id);
+                }
+                visit_count(&mut self.work, RARE, self.limits.work)?;
+                if *old.rare == *style.rare {
                     return Ok(*id);
                 }
             }
@@ -167,6 +190,55 @@ impl StylePool {
             .filter(|n| *n <= self.limits.bytes)
             .ok_or(Error::Limit("MAX_POOL_BYTES"))?;
         Ok(())
+    }
+    /// Replace `group` with this pool's canonical equal, pooling it if
+    /// new, and return its fingerprint for a style's, which hashes signed
+    /// zeros alike as styles' `==` does. No rare longhand inherits, so the
+    /// one group that reaches the pool already canonical is a style set's
+    /// initial one: the group held in `known`, the same allocation, is
+    /// taken at once; any other is hashed by contents and compared.
+    fn share_rare(&mut self, group: &mut BudgetShared<Rare>) -> Result<u64, Error> {
+        if let Some((known, loose)) = &self.known {
+            if BudgetShared::ptr_eq(known, group) {
+                return Ok(*loose);
+            }
+        }
+        let group_work = group.values.iter().map(value_work).sum::<usize>();
+        self.visit(group_work)?;
+        // Groups are told apart to the bit, so their bucket key is too:
+        // keyed by the loose fingerprint, a group's 2^11 sign variants
+        // would share one bucket a page could fill without the key.
+        let mut exact = Fingerprint::new(self.seed);
+        let mut loose = Fingerprint::new(self.seed);
+        for value in &group.values {
+            hash_value(value, Zero::Bits, &mut exact);
+            hash_value(value, Zero::Equal, &mut loose);
+        }
+        let (key, loose) = (exact.finish(), loose.finish());
+        if let Some(bucket) = self.rare.get(key, &mut self.work, self.limits.work)? {
+            for (old, old_loose) in bucket {
+                comparison(&mut self.comparisons, self.limits.comparisons)?;
+                visit_count(&mut self.work, group_work, self.limits.work)?;
+                if old.same(group) {
+                    if BudgetShared::ptr_eq(old, group) {
+                        self.known = Some((old.try_clone()?, *old_loose));
+                    }
+                    *group = old.try_clone()?;
+                    return Ok(*old_loose);
+                }
+            }
+        }
+        // A novel group cannot equal any retained complete style.
+        if self.styles.len() >= self.limits.styles {
+            return Err(Error::Limit("MAX_STYLES"));
+        }
+        // Its index entry, as a style's, and its doubled storage.
+        self.charge(128 + 2 * size_of::<Rare>())?;
+        self.rare
+            .get_or_insert_with(key, &mut self.work, self.limits.work, BudgetVec::new)?
+            .try_push((group.try_clone()?, loose))?;
+        self.known = Some((group.try_clone()?, loose));
+        Ok(loose)
     }
     fn share_custom(&mut self, custom: &mut CustomProperties) -> Result<(), Error> {
         let identity = std::ptr::from_ref(&*custom.entries).addr() as u64;
@@ -234,25 +306,30 @@ impl StylePool {
 /// work is a function of the page, not of the key or the addresses it
 /// indexes.
 const OPERATION: usize = 2;
-/// The probes a table may take: this many an operation, and PROBE_SLACK
-/// more, past which it refuses `Limit("MAX_POOL_WORK")` before reading.
-const PROBE_CAP: usize = 8;
-const PROBE_SLACK: usize = 4096;
+/// The slots one operation may read. No run of occupied slots reaches it,
+/// so a probe for any key, present or absent, reads at most this many,
+/// however often it is made.
+const PROBE_LIMIT: usize = 64;
+/// How far past its half-full size a table may grow to keep its runs
+/// short: at most this many times the slots its entries would need.
+const SPREAD: usize = 4;
 /// An open-addressed table keyed by u64, at most half full, its slots
 /// chosen by the key mixed twice with the pool's seed. A lookup or an
-/// insertion is charged OPERATION visits before it probes; its probes,
-/// counted apart, are capped at PROBE_CAP an operation plus PROBE_SLACK,
-/// refused before the probe that would pass it, so the bound is real and
-/// the charge deterministic. Growth doubles the table, charged its new
-/// size before anything is allocated or moved, so a refusal leaves it
-/// whole; the move's probes count against the cap too, after it, so the
-/// next probe refuses if they passed it. Iteration order is the slots',
-/// on which no result depends.
+/// insertion is charged OPERATION visits before it probes. No run of
+/// occupied slots reaches PROBE_LIMIT: an insertion that would make one
+/// grows the table first, as does a growth whose move made one, up to
+/// SPREAD times its half-full size, and past that the insertion is
+/// refused `Limit("MAX_POOL_WORK")` with the table whole. A probe is
+/// refused before it would read a slot past PROBE_LIMIT, which only a
+/// table at that size can need. A growth doubles the table, charged its
+/// new size before anything is allocated or moved; its move, which
+/// cannot stop halfway, is counted in `probes`. Iteration order is the
+/// slots', on which no result depends.
 struct Table<V> {
     slots: BudgetVec<Option<(u64, V)>>,
     len: usize,
     seed: u64,
-    operations: usize,
+    /// Slots read, by operations and moves alike.
     probes: usize,
 }
 impl<V> Table<V> {
@@ -261,7 +338,6 @@ impl<V> Table<V> {
             slots: BudgetVec::new(memory)?,
             len: 0,
             seed,
-            operations: 0,
             probes: 0,
         })
     }
@@ -273,29 +349,16 @@ impl<V> Table<V> {
         mixed.add(0);
         mixed.finish() as usize
     }
-    /// One operation, charged and counted.
-    fn operation(&mut self, work: &mut usize, max: usize) -> Result<(), Error> {
-        visit_count(work, OPERATION, max)?;
-        self.operations = self.operations.saturating_add(1);
-        Ok(())
-    }
-    /// The slot holding `key`, else the empty one it would take; each
-    /// probe counted against the cap before it is read.
+    /// The slot holding `key`, else the empty one it would take; refused
+    /// before a read past PROBE_LIMIT.
     fn probe(&mut self, key: u64) -> Result<Result<usize, usize>, Error> {
         if self.slots.is_empty() {
             return Ok(Err(0));
         }
         let mask = self.slots.len() - 1;
-        let cap = self
-            .operations
-            .saturating_mul(PROBE_CAP)
-            .saturating_add(PROBE_SLACK);
         let mut at = self.home(key) & mask;
-        loop {
-            if self.probes >= cap {
-                return Err(Error::Limit("MAX_POOL_WORK"));
-            }
-            self.probes += 1;
+        for _ in 0..PROBE_LIMIT {
+            self.probes = self.probes.saturating_add(1);
             match self.slots.get(at) {
                 Some(Some((stored, _))) if *stored == key => return Ok(Ok(at)),
                 Some(Some(_)) => at = (at + 1) & mask,
@@ -303,9 +366,10 @@ impl<V> Table<V> {
                 None => return Err(Error::InvalidContext),
             }
         }
+        Err(Error::Limit("MAX_POOL_WORK"))
     }
     fn get(&mut self, key: u64, work: &mut usize, max: usize) -> Result<Option<&V>, Error> {
-        self.operation(work, max)?;
+        visit_count(work, OPERATION, max)?;
         Ok(match self.probe(key)? {
             Ok(at) => self.slots.get(at).and_then(Option::as_ref).map(|(_, v)| v),
             Err(_) => None,
@@ -318,19 +382,20 @@ impl<V> Table<V> {
         max: usize,
         make: impl FnOnce(&Budget) -> Result<V, BudgetError>,
     ) -> Result<&mut V, Error> {
-        self.operation(work, max)?;
+        visit_count(work, OPERATION, max)?;
         let at = match self.probe(key)? {
             Ok(at) => at,
-            Err(at) => {
-                self.operation(work, max)?;
-                let at = if self.reserve_one(work, max)? {
-                    match self.probe(key)? {
-                        Err(at) => at,
-                        Ok(_) => return Err(Error::InvalidContext),
-                    }
-                } else {
-                    at
-                };
+            Err(mut at) => {
+                visit_count(work, OPERATION, max)?;
+                if self.len.saturating_add(1).saturating_mul(2) > self.slots.len() {
+                    self.grow(work, max)?;
+                    at = self.vacancy(key)?;
+                }
+                // The run the entry would join, or bridge, stays short.
+                while self.run_through(at) >= PROBE_LIMIT {
+                    self.grow(work, max)?;
+                    at = self.vacancy(key)?;
+                }
                 let value = make(self.slots.budget())?;
                 let slot = self.slots.get_mut(at).ok_or(Error::InvalidContext)?;
                 *slot = Some((key, value));
@@ -344,39 +409,87 @@ impl<V> Table<V> {
             .map(|(_, value)| value)
             .ok_or(Error::InvalidContext)
     }
-    /// Room for one more entry with the table at most half full; whether
-    /// it grew. The charge and the allocation precede the move.
-    fn reserve_one(&mut self, work: &mut usize, max: usize) -> Result<bool, Error> {
-        if self.len.saturating_add(1).saturating_mul(2) <= self.slots.len() {
-            return Ok(false);
+    /// The empty slot an absent `key` would take.
+    fn vacancy(&mut self, key: u64) -> Result<usize, Error> {
+        match self.probe(key)? {
+            Err(at) => Ok(at),
+            Ok(_) => Err(Error::InvalidContext),
         }
-        let capacity = self.slots.len().saturating_mul(2).max(16);
-        visit_count(work, capacity, max)?;
-        // td-alloc's constructor, written in full as the allocation guard
-        // admits it.
-        let mut fresh = td_alloc::BudgetVec::with_capacity(self.slots.budget(), capacity)?;
-        for _ in 0..capacity {
-            fresh
-                .push_within_capacity(None)
-                .map_err(|_| Error::InvalidContext)?;
+    }
+    /// The occupied slots on either side of the empty slot `at`, and it:
+    /// the run an entry there would be part of, counted to PROBE_LIMIT.
+    fn run_through(&mut self, at: usize) -> usize {
+        let mask = self.slots.len().wrapping_sub(1);
+        let occupied = |slots: &BudgetVec<Option<(u64, V)>>, i: usize| {
+            slots.get(i & mask).is_some_and(Option::is_some)
+        };
+        let mut run = 1;
+        while run < PROBE_LIMIT && occupied(&self.slots, at.wrapping_add(run)) {
+            run += 1;
         }
-        let mask = capacity - 1;
-        let old = std::mem::replace(&mut self.slots, fresh);
-        // Counted, not refused: a move stopped halfway would lose entries.
-        let mut probes = 0usize;
-        for (key, value) in old.into_iter().flatten() {
-            let mut at = self.home(key) & mask;
-            probes = probes.saturating_add(1);
-            while self.slots.get(at).is_some_and(Option::is_some) {
-                at = (at + 1) & mask;
+        let mut back = 1;
+        while run < PROBE_LIMIT && occupied(&self.slots, at.wrapping_sub(back)) {
+            run += 1;
+            back += 1;
+        }
+        self.probes = self.probes.saturating_add(run);
+        run
+    }
+    /// The longest run of occupied slots, wrapping, counted to PROBE_LIMIT.
+    fn longest_run(&self) -> usize {
+        let (mut run, mut longest) = (0usize, 0usize);
+        for slot in self.slots.iter().chain(self.slots.iter().take(PROBE_LIMIT)) {
+            run = if slot.is_some() { run + 1 } else { 0 };
+            longest = longest.max(run);
+        }
+        longest.min(self.slots.len())
+    }
+    /// Double the table, then again while its move left a run at
+    /// PROBE_LIMIT, up to SPREAD times the half-full size of one entry
+    /// more; each size charged before it is allocated or moved into.
+    fn grow(&mut self, work: &mut usize, max: usize) -> Result<(), Error> {
+        let needed = self
+            .len
+            .saturating_add(1)
+            .saturating_mul(2)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(16);
+        loop {
+            let capacity = self.slots.len().saturating_mul(2).max(16);
+            if capacity > needed.saturating_mul(SPREAD) {
+                return Err(Error::Limit("MAX_POOL_WORK"));
+            }
+            visit_count(work, capacity, max)?;
+            // td-alloc's constructor, written in full as the allocation
+            // guard admits it.
+            let mut fresh = td_alloc::BudgetVec::with_capacity(self.slots.budget(), capacity)?;
+            for _ in 0..capacity {
+                fresh
+                    .push_within_capacity(None)
+                    .map_err(|_| Error::InvalidContext)?;
+            }
+            let mask = capacity - 1;
+            let old = std::mem::replace(&mut self.slots, fresh);
+            // Counted, not refused: a move stopped halfway would lose
+            // entries.
+            let mut probes = 0usize;
+            for (key, value) in old.into_iter().flatten() {
+                let mut at = self.home(key) & mask;
                 probes = probes.saturating_add(1);
+                while self.slots.get(at).is_some_and(Option::is_some) {
+                    at = (at + 1) & mask;
+                    probes = probes.saturating_add(1);
+                }
+                if let Some(slot) = self.slots.get_mut(at) {
+                    *slot = Some((key, value));
+                }
             }
-            if let Some(slot) = self.slots.get_mut(at) {
-                *slot = Some((key, value));
+            self.probes = self.probes.saturating_add(probes);
+            if self.longest_run() < PROBE_LIMIT {
+                return Ok(());
             }
         }
-        self.probes = self.probes.saturating_add(probes);
-        Ok(true)
     }
 }
 /// A custom map's bucket key, keyed as styles are: maps that collide
@@ -477,8 +590,10 @@ fn address_key(memory: &Budget) -> u64 {
 /// multiplied out to 128 bits and its halves folded (as wyhash's mum
 /// step), far cheaper than SipHash over a style's 230 or so small writes.
 /// The fold has no input difference that survives with certainty, and
-/// the key is unknown to a page, so colliding styles must be found by
-/// chance; a collided bucket is still bounded by MAX_STYLE_COMPARISONS and
+/// the key is unknown to a page, so values a table's equality tells apart
+/// share a bucket only by chance: each table hashes zeros as its equality
+/// compares them (styles' `==` alike, rare groups' `same` by sign). A
+/// collided bucket is still bounded by MAX_STYLE_COMPARISONS and
 /// MAX_POOL_WORK, and equality, not the key, decides sharing.
 struct Fingerprint {
     state: u64,
@@ -530,27 +645,35 @@ impl Hasher for Fingerprint {
         self.state
     }
 }
-fn hash_number(value: f64, hash: &mut impl Hasher) {
-    // PartialEq identifies signed zero; its fingerprints must agree too.
-    (if value == 0.0 { 0 } else { value.to_bits() }).hash(hash);
+/// How a fingerprint hashes a signed zero: as the equality it keys.
+#[derive(Clone, Copy)]
+enum Zero {
+    /// PartialEq's: -0 and 0 alike.
+    Equal,
+    /// `same`'s: to the bit.
+    Bits,
 }
-fn hash_value(value: &ComputedValue, hash: &mut impl Hasher) {
+fn hash_number(value: f64, zero: Zero, hash: &mut impl Hasher) {
+    let alike = matches!(zero, Zero::Equal) && value == 0.0;
+    (if alike { 0 } else { value.to_bits() }).hash(hash);
+}
+fn hash_value(value: &ComputedValue, zero: Zero, hash: &mut impl Hasher) {
     std::mem::discriminant(value).hash(hash);
     match value {
-        ComputedValue::Number(n) => hash_number(*n, hash),
+        ComputedValue::Number(n) => hash_number(*n, zero, hash),
         ComputedValue::Keyword(s) => s.hash(hash),
         ComputedValue::Color(c) => (c.red, c.green, c.blue, c.alpha).hash(hash),
         ComputedValue::Length(length) => {
             std::mem::discriminant(length).hash(hash);
             match length {
-                Length::Px(n) | Length::Percent(n) => hash_number(*n, hash),
+                Length::Px(n) | Length::Percent(n) => hash_number(*n, zero, hash),
                 Length::Calc {
                     px,
                     percent,
                     non_negative,
                 } => {
-                    hash_number(*px, hash);
-                    hash_number(*percent, hash);
+                    hash_number(*px, zero, hash);
+                    hash_number(*percent, zero, hash);
                     non_negative.hash(hash);
                 }
                 Length::Auto => {}
@@ -571,8 +694,8 @@ fn hash_value(value: &ComputedValue, hash: &mut impl Hasher) {
             horizontal,
             vertical,
         } => {
-            hash_number(*horizontal, hash);
-            hash_number(*vertical, hash);
+            hash_number(*horizontal, zero, hash);
+            hash_number(*vertical, zero, hash);
         }
     }
 }
@@ -597,8 +720,8 @@ mod tests {
             key(&|h| "none".hash(h)),
             key(&|h| (1u8, 2u8).hash(h)),
             key(&|h| (2u8, 1u8).hash(h)),
-            key(&|h| hash_number(0.0, h)),
-            key(&|h| hash_number(1.0, h)),
+            key(&|h| hash_number(0.0, Zero::Equal, h)),
+            key(&|h| hash_number(1.0, Zero::Equal, h)),
         ];
         for (i, a) in keys.iter().enumerate() {
             for b in keys.iter().skip(i + 1) {
@@ -607,8 +730,13 @@ mod tests {
         }
         // Equal values, equal keys: -0 and 0 compare equal.
         assert_eq!(
-            key(&|h| hash_number(-0.0, h)),
-            key(&|h| hash_number(0.0, h))
+            key(&|h| hash_number(-0.0, Zero::Equal, h)),
+            key(&|h| hash_number(0.0, Zero::Equal, h))
+        );
+        // A rare group's are its bits.
+        assert_ne!(
+            key(&|h| hash_number(-0.0, Zero::Bits, h)),
+            key(&|h| hash_number(0.0, Zero::Bits, h))
         );
     }
     /// Styles of the test tree's element 3 under each inline declaration.
@@ -645,15 +773,6 @@ mod tests {
         fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
             self.slots.iter_mut().flatten().map(|(_, value)| value)
         }
-        /// The most occupied slots in a row, wrapping.
-        fn longest_run(&self) -> usize {
-            let (mut run, mut longest) = (0, 0);
-            for slot in self.slots.iter().chain(self.slots.iter()) {
-                run = if slot.is_some() { run + 1 } else { 0 };
-                longest = longest.max(run);
-            }
-            longest.min(self.slots.len())
-        }
         /// Keys `seed` sends to slot 0 of every table up to 65,536 slots.
         fn colliding(seed: u64, count: usize) -> Vec<u64> {
             let memory = Budget::new(1 << 10).unwrap();
@@ -662,6 +781,18 @@ mod tests {
                 .filter(|k| table.home(*k) & 0xffff == 0)
                 .take(count)
                 .collect()
+        }
+        /// The slots a probe for `key` reads: its run from home, and the
+        /// slot that ends it.
+        fn reach(&self, key: u64) -> usize {
+            let mask = self.slots.len() - 1;
+            let mut at = self.home(key) & mask;
+            let mut read = 1;
+            while self.slots.get(at).is_some_and(Option::is_some) {
+                at = (at + 1) & mask;
+                read += 1;
+            }
+            read
         }
         /// Each key's slot, in key order.
         fn places(&self, keys: &[u64]) -> Vec<usize> {
@@ -673,6 +804,27 @@ mod tests {
                         .unwrap()
                 })
                 .collect()
+        }
+    }
+    #[test]
+    fn one_absent_key_looked_up_again_and_again_stays_within_its_allowance() {
+        // A freed group's address, reused by the next element's, is one
+        // absent key looked up once an element: its run is fixed, so an
+        // allowance averaged over operations ran out on every long one.
+        let memory = Budget::new(1 << 20).unwrap();
+        let max = usize::MAX;
+        let mut table = Table::new(&memory, 0x5eed).unwrap();
+        let mut work = 0;
+        for k in 0..127u64 {
+            table
+                .get_or_insert_with(0x7f00_0000_0000 + k * 64, &mut work, max, |_| Ok(()))
+                .unwrap();
+        }
+        assert_eq!((table.len, table.slots.len()), (127, 256));
+        let absent = (0..100_000u64).max_by_key(|k| table.reach(*k)).unwrap();
+        assert!(table.reach(absent) >= 12, "{}", table.reach(absent));
+        for _ in 0..5000 {
+            assert_eq!(table.get(absent, &mut work, max), Ok(None));
         }
     }
     #[test]
@@ -756,7 +908,7 @@ mod tests {
         assert_eq!((edge - spent, small.slots.len(), small.len), (36, 32, 9));
     }
     #[test]
-    fn the_seed_places_keys_and_probes_are_capped() {
+    fn the_seed_places_keys_and_no_run_reaches_the_probe_limit() {
         let memory = Budget::new(1 << 20).unwrap();
         let max = usize::MAX;
         let keys: Vec<u64> = (0..8u64).map(|k| k * 4096).collect();
@@ -771,104 +923,133 @@ mod tests {
             table.places(&keys)
         };
         assert_ne!(placed(1), placed(2));
-        // Keys a seed sends to one home: each insertion probes past all
-        // before it, until the cap, eight an operation and 4,096, refuses
+        // Keys the seed sends to one home in every table up to 65,536
+        // slots: each joins one run, which growth cannot part. The 64th
+        // would make it PROBE_LIMIT long; the table grows twice past its
+        // half-full 128 slots, to SPREAD times them, and then refuses it
         // with the table whole.
+        let colliding = Table::<()>::colliding(3, 80);
         let mut table = Table::new(&memory, 3).unwrap();
-        let colliding: Vec<u64> = (0..u64::MAX)
-            .filter(|k| table.home(*k) & 255 == 0)
-            .take(120)
-            .collect();
         let mut work = 0;
         let mut refused = None;
         for (n, key) in colliding.iter().enumerate() {
             let len = table.len;
-            match table.get_or_insert_with(*key, &mut work, max, |_| Ok(())) {
-                Ok(_) => {}
-                Err(error) => {
-                    assert_eq!(table.len, len);
-                    refused = Some((n, error));
-                    break;
-                }
+            if let Err(error) = table.get_or_insert_with(*key, &mut work, max, |_| Ok(())) {
+                assert_eq!(table.len, len);
+                refused = Some((n, error));
+                break;
             }
         }
-        let (n, error) = refused.unwrap();
-        assert_eq!(error, Error::Limit("MAX_POOL_WORK"));
-        assert!((60..120).contains(&n), "{n}");
-        assert_eq!(table.keys().count(), n);
-        assert!(table.probes >= table.operations * 8 + 4096);
-        // Work charged was the operations', whatever they probed.
-        assert_eq!(
-            work,
-            table.operations * 2 + (4..=8).map(|b| 1 << b).sum::<usize>()
-        );
+        assert_eq!(refused, Some((63, Error::Limit("MAX_POOL_WORK"))));
+        assert_eq!((table.len, table.slots.len()), (63, 512));
+        assert_eq!(table.longest_run(), 63);
+        // Each operation, two visits, and each size grown to, charged.
+        let operations = 63 * 2 + 2;
+        let growth: usize = (4..=9).map(|b| 1 << b).sum();
+        assert_eq!(work, operations * 2 + growth);
+        // Every key is found, and a lookup reads no more than the limit:
+        // an absent key of that home reads the run and the slot after it.
+        for key in colliding.iter().take(63) {
+            let before = table.probes;
+            assert_eq!(table.get(*key, &mut work, max), Ok(Some(&())));
+            assert!(table.probes - before <= PROBE_LIMIT);
+        }
+        let absent = *colliding.get(70).unwrap();
+        let before = table.probes;
+        assert_eq!(table.get(absent, &mut work, max), Ok(None));
+        assert_eq!(table.probes - before, PROBE_LIMIT);
     }
     #[test]
-    fn the_probe_cap_is_eight_an_operation_and_4096() {
+    fn a_probe_is_refused_before_it_reads_past_the_limit() {
         let memory = Budget::new(1 << 20).unwrap();
-        let mut table = Table::new(&memory, 1).unwrap();
         let (mut work, max) = (0, usize::MAX);
-        table
-            .get_or_insert_with(1, &mut work, max, |_| Ok(()))
-            .unwrap();
-        // A lookup of the one key probes one slot: admitted with exactly
-        // one left under the cap its operation brings, refused with none.
-        let cap = (table.operations + 1) * 8 + 4096;
-        table.probes = cap - 1;
-        assert_eq!(table.get(1, &mut work, max), Ok(Some(&())));
-        assert_eq!(table.probes, cap);
-        let cap = (table.operations + 1) * 8 + 4096;
-        table.probes = cap;
+        let mut table = Table::new(&memory, 1).unwrap();
+        for key in 0..200u64 {
+            table
+                .get_or_insert_with(key, &mut work, max, |_| Ok(()))
+                .unwrap();
+        }
+        for slot in table.slots.iter_mut() {
+            *slot = None;
+        }
+        // A run no insertion can make: PROBE_LIMIT slots from a key's home.
+        let mask = table.slots.len() - 1;
+        let home = table.home(2) & mask;
+        let filler = |i: usize| u64::MAX - i as u64;
+        for i in 0..PROBE_LIMIT - 1 {
+            *table.slots.get_mut((home + i) & mask).unwrap() = Some((filler(i), ()));
+        }
+        let before = table.probes;
+        assert_eq!(table.get(2, &mut work, max), Ok(None));
+        assert_eq!(table.probes - before, PROBE_LIMIT);
+        *table
+            .slots
+            .get_mut((home + PROBE_LIMIT - 1) & mask)
+            .unwrap() = Some((filler(PROBE_LIMIT), ()));
+        let before = table.probes;
         assert_eq!(
-            table.get(1, &mut work, max),
+            table.get(2, &mut work, max),
             Err(Error::Limit("MAX_POOL_WORK"))
         );
-        assert_eq!(table.probes, cap);
+        assert_eq!(table.probes - before, PROBE_LIMIT);
     }
     #[test]
-    fn a_growth_counts_its_move_and_the_next_probe_past_the_cap_refuses() {
+    fn a_move_that_leaves_a_long_run_grows_again_up_to_the_spread() {
+        let memory = Budget::new(1 << 20).unwrap();
+        let mut table = Table::new(&memory, 9).unwrap();
+        let mut work = 0;
+        for key in 0..100u64 {
+            table
+                .get_or_insert_with(key, &mut work, usize::MAX, |_| Ok(()))
+                .unwrap();
+        }
+        // Sixty-four keys of one home in every size, set in place as no
+        // insertion could: each move keeps their run whole.
+        for slot in table.slots.iter_mut() {
+            *slot = None;
+        }
+        for (at, key) in Table::<()>::colliding(9, 64).into_iter().enumerate() {
+            *table.slots.get_mut(at).unwrap() = Some((key, ()));
+        }
+        table.len = 64;
+        assert_eq!(table.slots.len(), 256);
+        let before = work;
+        assert_eq!(
+            table.grow(&mut work, usize::MAX),
+            Err(Error::Limit("MAX_POOL_WORK"))
+        );
+        // To 512, and again to SPREAD times the 256 its entries need.
+        assert_eq!((table.slots.len(), table.len), (1024, 64));
+        assert_eq!(work - before, 512 + 1024);
+        assert_eq!(table.longest_run(), 64);
+    }
+    #[test]
+    fn a_growth_counts_its_move_and_keeps_every_entry() {
         let memory = Budget::new(1 << 20).unwrap();
         let max = usize::MAX;
         let keys = Table::<()>::colliding(7, 9);
         let (ninth, eight) = keys.split_last().unwrap();
-        let filled = || {
-            let mut table = Table::new(&memory, 7).unwrap();
-            let mut work = 0;
-            for key in eight {
-                table
-                    .get_or_insert_with(*key, &mut work, max, |_| Ok(()))
-                    .unwrap();
-            }
+        let mut table = Table::new(&memory, 7).unwrap();
+        let mut work = 0;
+        for key in eight {
             table
-        };
+                .get_or_insert_with(*key, &mut work, max, |_| Ok(()))
+                .unwrap();
+        }
         // The ninth key probes past the eight before it, nine slots, then
         // grows: each moved key probes past those moved before it, 1 to
-        // 8, and the ninth probes nine slots again.
-        let mut table = filled();
-        let (before, mut work) = (table.probes, 0);
+        // 8; the ninth probes nine slots again, and its run is nine.
+        let before = table.probes;
         table
             .get_or_insert_with(*ninth, &mut work, max, |_| Ok(()))
             .unwrap();
-        assert_eq!(table.probes - before, 9 + 36 + 9);
-        // A move that passes the cap, here by 16, completes; the probe
-        // after it refuses with every entry kept, as does the next lookup,
-        // whose operation raises the cap by 8.
-        let mut table = filled();
-        table.probes = (table.operations + 2) * 8 + 4096 - 9 - 20;
-        assert_eq!(
-            table.get_or_insert_with(*ninth, &mut work, max, |_| Ok(())),
-            Err(Error::Limit("MAX_POOL_WORK"))
-        );
-        assert_eq!((table.slots.len(), table.len), (32, 8));
+        assert_eq!(table.probes - before, 9 + 36 + 9 + 9);
+        assert_eq!((table.slots.len(), table.len), (32, 9));
         let mut kept: Vec<u64> = table.keys().collect();
         kept.sort_unstable();
-        let mut eight = eight.to_vec();
-        eight.sort_unstable();
-        assert_eq!(kept, eight);
-        assert_eq!(
-            table.get(*ninth ^ 1, &mut work, max),
-            Err(Error::Limit("MAX_POOL_WORK"))
-        );
+        let mut all = keys.clone();
+        all.sort_unstable();
+        assert_eq!(kept, all);
     }
     #[test]
     fn a_slot_is_no_function_of_the_key_xor_the_seed() {
@@ -985,7 +1166,7 @@ mod tests {
             let mut hash = Fingerprint::new(pool.seed);
             for (property, value) in &style.values {
                 (*property as u8).hash(&mut hash);
-                hash_value(value, &mut hash);
+                hash_value(value, Zero::Equal, &mut hash);
             }
             hash.finish()
         };
@@ -1066,7 +1247,7 @@ mod tests {
             index: 3,
         };
         let style = source
-            .compute(&element, None, 16.0, "--x: red; color: var(--x)")
+            .compute(&element, None, 16.0, "--x: red; color: var(--x); order: 2")
             .unwrap();
         let memory = Budget::new(1024 * 1024).unwrap();
         let mut completed = false;
@@ -1091,6 +1272,13 @@ mod tests {
             for id in pool.buckets.values().flatten() {
                 assert!(pool.get(*id).is_some());
             }
+            if let Some((known, _)) = &pool.known {
+                assert!(pool
+                    .rare
+                    .values()
+                    .flatten()
+                    .any(|(g, _)| BudgetShared::ptr_eq(g, known)));
+            }
             match result {
                 Ok(_) => completed = true,
                 Err(error) => assert_eq!(error, Error::Memory(BudgetError::Allocation)),
@@ -1114,8 +1302,7 @@ mod tests {
         let first = pool.intern(a.try_clone().unwrap()).unwrap();
         assert_eq!(first, pool.intern(a).unwrap());
         let mut b = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
-        b.values
-            .try_insert(crate::Property::Opacity, ComputedValue::Number(0.5))
+        b.set(crate::Property::Opacity, ComputedValue::Number(0.5))
             .unwrap();
         assert_ne!(first, pool.intern(b).unwrap());
         assert_eq!(pool.len(), 2);
@@ -1210,18 +1397,15 @@ mod tests {
     fn signed_zero_and_collisions_use_equality() {
         let mut pool = StylePool::new(PoolLimits::default()).unwrap();
         let mut a = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
-        a.values
-            .try_insert(crate::Property::Opacity, ComputedValue::Number(-0.0))
+        a.set(crate::Property::LineHeight, ComputedValue::Number(-0.0))
             .unwrap();
         let id = pool.intern(a.try_clone().unwrap()).unwrap();
-        a.values
-            .try_insert(crate::Property::Opacity, ComputedValue::Number(0.0))
+        a.set(crate::Property::LineHeight, ComputedValue::Number(0.0))
             .unwrap();
         assert_eq!(id, pool.intern(a.try_clone().unwrap()).unwrap());
         let mut other = a.try_clone().unwrap();
         other
-            .values
-            .try_insert(crate::Property::Opacity, ComputedValue::Number(1.0))
+            .set(crate::Property::LineHeight, ComputedValue::Number(1.0))
             .unwrap();
         let other_id = pool.intern(other).unwrap();
         // Force an unequal candidate into every bucket, including a's.
@@ -1292,5 +1476,181 @@ mod tests {
         let a = ComputedStyle::new(&crate::memory().unwrap()).unwrap();
         pool.intern(a.try_clone().unwrap()).unwrap();
         assert_eq!(pool.intern(a), Err(Error::Limit("MAX_STYLE_COMPARISONS")));
+    }
+    #[test]
+    fn equal_rare_groups_built_apart_fingerprint_alike_and_pool_as_one() {
+        let [a, b, c, d] = styles(&[
+            "order:4".to_string(),
+            "order:4".to_string(),
+            "order:4;width:1px".to_string(),
+            "order:5".to_string(),
+        ])
+        .try_into()
+        .unwrap();
+        // Separate copies, equal by contents: the styles compare equal.
+        assert!(!BudgetShared::ptr_eq(&a.rare, &b.rare));
+        assert_eq!(a, b);
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let (mut ga, mut gb, mut gd) = (
+            a.rare.try_clone().unwrap(),
+            b.rare.try_clone().unwrap(),
+            d.rare.try_clone().unwrap(),
+        );
+        let key = pool.share_rare(&mut ga).unwrap();
+        assert_eq!(pool.share_rare(&mut gb).unwrap(), key);
+        assert!(BudgetShared::ptr_eq(&ga, &gb));
+        assert_ne!(pool.share_rare(&mut gd).unwrap(), key);
+        // A second pool, keyed apart, keys the group apart too.
+        let mut other = StylePool::new(PoolLimits {
+            seed: Some(pool.seed ^ 1),
+            ..PoolLimits::default()
+        })
+        .unwrap();
+        assert_ne!(other.share_rare(&mut a.rare.try_clone().unwrap()), Ok(key));
+        let first = pool.intern(a).unwrap();
+        assert_eq!(pool.intern(b).unwrap(), first);
+        let third = pool.intern(c).unwrap();
+        assert_ne!(third, first);
+        let canonical = &pool.get(first).unwrap().rare;
+        assert!(BudgetShared::ptr_eq(
+            canonical,
+            &pool.get(third).unwrap().rare
+        ));
+        assert!(BudgetShared::ptr_eq(canonical, &ga));
+        assert_eq!(pool.rare.len, 2);
+    }
+    #[test]
+    fn a_rare_group_is_charged_once_and_the_initial_one_hashed_once() {
+        let declarations: Vec<String> = [
+            "width:1px;order:4",
+            "width:2px;order:4",
+            "width:3px;order:5",
+            "width:4px",
+            "width:5px",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let mut charges = Vec::new();
+        let mut works = Vec::new();
+        for style in styles(&declarations) {
+            let (bytes, work) = (pool.charged_bytes(), pool.work());
+            pool.intern(style).unwrap();
+            charges.push(pool.charged_bytes() - bytes);
+            works.push(pool.work() - work);
+        }
+        let group = 128 + 2 * size_of::<Rare>();
+        // The second shares the first's group: a style's charge alone.
+        let [_, style, two, three, four]: [usize; 5] = charges.try_into().unwrap();
+        let [_, shared, _, new, found]: [usize; 5] = works.try_into().unwrap();
+        assert_eq!(two, style + group);
+        // The initial group, first seen with the fourth, then known.
+        assert_eq!(three, style + group);
+        assert_eq!(four, style);
+        // The 71-longhand style was charged 13,056: 19 values fewer, a handle more.
+        assert_eq!(
+            style,
+            13_056 - 19 * 176 + 2 * size_of::<BudgetShared<Rare>>()
+        );
+        assert_eq!(style, 9_728);
+        // The known group costs nothing; another is hashed (19 values)
+        // and looked up, then inserted (two operations) or compared once
+        // with its equal (19 more).
+        assert_eq!(new - found, 19 + 2 + 4);
+        assert_eq!(shared - found, 19 + 2 + 19);
+        assert_eq!(pool.rare.len, 3);
+    }
+    #[test]
+    fn interning_hashes_a_style_sets_initial_group_once() {
+        let declarations: Vec<String> = (0..100).map(|i| format!("width:{i}px")).collect();
+        let source = styles(&declarations);
+        let default = source.first().unwrap().rare.try_clone().unwrap();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        for style in source {
+            assert!(BudgetShared::ptr_eq(&style.rare, &default));
+            pool.intern(style).unwrap();
+        }
+        assert_eq!((pool.len(), pool.rare.len), (100, 1));
+        assert!(BudgetShared::ptr_eq(&pool.known.unwrap().0, &default));
+    }
+    #[test]
+    fn styles_differing_only_in_a_rare_value_do_not_share_a_bucket() {
+        // Their common values and custom maps are equal: the group's
+        // fingerprint alone keeps them apart.
+        let declarations: Vec<String> = (0..300).map(|i| format!("order:{i}")).collect();
+        let (_, comparisons) = interned(&declarations);
+        assert!(comparisons < 300 + 16, "{comparisons}");
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        for style in styles(&declarations) {
+            pool.intern(style).unwrap();
+        }
+        assert_eq!((pool.len(), pool.rare.len), (300, 300));
+    }
+    #[test]
+    fn a_pooled_group_never_gives_a_style_another_ones_signed_zero() {
+        let [a, b] = styles(&["top:-0px".to_string(), "top:0px;width:1px".to_string()])
+            .try_into()
+            .unwrap();
+        let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+        let first = pool.intern(a).unwrap();
+        let second = pool.intern(b).unwrap();
+        let top = |id| {
+            match pool.get(id).unwrap().get(crate::Property::Top) {
+                Some(ComputedValue::Length(Length::Px(px))) => Some(*px),
+                _ => None,
+            }
+            .unwrap()
+        };
+        assert!(top(first).is_sign_negative());
+        assert!(top(second).is_sign_positive());
+        // Buckets of their own, each one group.
+        assert_eq!(pool.rare.len, 2);
+        assert_eq!(pool.rare.values().flatten().count(), 2);
+        // Styles that differ by that sign alone are one style, the first,
+        // as when a style held every longhand.
+        let [c] = styles(&["top:0px".to_string()]).try_into().unwrap();
+        assert_eq!(pool.intern(c).unwrap(), first);
+    }
+    #[test]
+    fn a_groups_sign_variants_do_not_share_a_bucket() {
+        // Eleven rare longhands may be a zero of either sign: 2,048
+        // groups `==` one another, all apart to the bit. Hashed as `==`
+        // compares, they shared a bucket a page builds without the key.
+        const ZEROS: &[&str] = &[
+            "opacity:",
+            "top:",
+            "right:",
+            "bottom:",
+            "left:",
+            "flex-grow:",
+            "flex-shrink:",
+            "flex-basis:",
+            "row-gap:",
+            "column-gap:",
+            "order:",
+        ];
+        let variant = |signs: usize| {
+            let mut declaration = String::new();
+            for (bit, name) in ZEROS.iter().enumerate() {
+                declaration.push_str(name);
+                declaration.push_str(if signs >> bit & 1 == 1 { "-0" } else { "0" });
+                if !matches!(*name, "opacity:" | "flex-grow:" | "flex-shrink:" | "order:") {
+                    declaration.push_str("px");
+                }
+                declaration.push(';');
+            }
+            declaration
+        };
+        for (elements, variants) in [(1_500, 2_048), (10_000, 256)] {
+            let declarations: Vec<String> = (0..elements).map(|i| variant(i % variants)).collect();
+            let mut pool = StylePool::new(PoolLimits::default()).unwrap();
+            for style in styles(&declarations) {
+                pool.intern(style).unwrap();
+            }
+            assert_eq!(pool.len(), 1);
+            assert_eq!(pool.rare.len, elements.min(variants));
+            // At most a custom map's, a group's and a style's, each element.
+            assert!(pool.comparisons <= 3 * elements, "{}", pool.comparisons);
+        }
     }
 }

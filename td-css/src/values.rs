@@ -54,7 +54,6 @@ pub enum Property {
     OverflowX,
     OverflowY,
     Float,
-    Clear,
     Position,
     BoxSizing,
     MinWidth,
@@ -62,14 +61,16 @@ pub enum Property {
     MinHeight,
     MaxHeight,
     LetterSpacing,
+    ListStylePosition,
+    BorderCollapse,
+    BorderSpacing,
+    // The rare group (`Rare`): not inherited, rarely set, last.
+    Clear,
     Opacity,
     Top,
     Right,
     Bottom,
     Left,
-    ListStylePosition,
-    BorderCollapse,
-    BorderSpacing,
     TableLayout,
     FlexDirection,
     FlexWrap,
@@ -129,7 +130,6 @@ impl Property {
         Self::OverflowX,
         Self::OverflowY,
         Self::Float,
-        Self::Clear,
         Self::Position,
         Self::BoxSizing,
         Self::MinWidth,
@@ -137,14 +137,15 @@ impl Property {
         Self::MinHeight,
         Self::MaxHeight,
         Self::LetterSpacing,
+        Self::ListStylePosition,
+        Self::BorderCollapse,
+        Self::BorderSpacing,
+        Self::Clear,
         Self::Opacity,
         Self::Top,
         Self::Right,
         Self::Bottom,
         Self::Left,
-        Self::ListStylePosition,
-        Self::BorderCollapse,
-        Self::BorderSpacing,
         Self::TableLayout,
         Self::FlexDirection,
         Self::FlexWrap,
@@ -257,6 +258,26 @@ impl Property {
                 | Self::BorderCollapse
                 | Self::BorderSpacing
         )
+    }
+
+    /// The first longhand of the rare group, which ends the roster.
+    pub(crate) const FIRST_RARE: Self = Self::Clear;
+    /// Its slot in the rare group; None for a common longhand.
+    #[inline(always)]
+    pub(crate) fn rare(self) -> Option<usize> {
+        (self as usize).checked_sub(Self::FIRST_RARE as usize)
+    }
+    /// The longhands every style holds itself, in roster order.
+    pub(crate) fn common_roster() -> &'static [Self] {
+        Self::ALL
+            .get(..Self::FIRST_RARE as usize)
+            .unwrap_or_default()
+    }
+    /// The rare group's longhands, in slot order.
+    pub(crate) fn rare_roster() -> &'static [Self] {
+        Self::ALL
+            .get(Self::FIRST_RARE as usize..)
+            .unwrap_or_default()
     }
 
     fn margin(self) -> bool {
@@ -473,16 +494,62 @@ pub enum ComputedValue {
     },
 }
 
+/// The rare group's length: the longhands from `Property::FIRST_RARE` on.
+pub(crate) const RARE: usize = Property::ALL.len() - Property::FIRST_RARE as usize;
+
+/// The rare longhands' computed values, in roster order. None inherits,
+/// so a style that sets none shares its style set's initial group, and
+/// a declaration that sets one copies it (DESIGN.md, "Computed-style
+/// sharing"). Every value is plain: none owns storage.
 #[derive(Debug, PartialEq)]
+pub(crate) struct Rare {
+    pub(crate) values: [ComputedValue; RARE],
+}
+impl Rare {
+    pub(crate) fn initial() -> Result<Self, Error> {
+        let mut values = [const { ComputedValue::Number(0.0) }; RARE];
+        for (slot, property) in values.iter_mut().zip(Property::rare_roster()) {
+            *slot = property.seed().ok_or(Error::InvalidContext)?;
+        }
+        Ok(Self { values })
+    }
+    pub(crate) fn try_copy(&self) -> Result<Self, Error> {
+        let mut values = [const { ComputedValue::Number(0.0) }; RARE];
+        for (slot, value) in values.iter_mut().zip(&self.values) {
+            *slot = value.try_clone()?;
+        }
+        Ok(Self { values })
+    }
+    /// Equal to the bit, so a group shared between styles never gives
+    /// one of them another's signed zero.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        self.values
+            .iter()
+            .zip(&other.values)
+            .all(|(a, b)| a.same(b))
+    }
+}
+
+#[derive(Debug)]
 pub struct ComputedStyle {
+    /// The common longhands, those before `Property::FIRST_RARE`.
     pub(crate) values: BudgetMap<Property, ComputedValue>,
+    pub(crate) rare: BudgetShared<Rare>,
     pub(crate) custom: variables::CustomProperties,
+}
+impl PartialEq for ComputedStyle {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+            && (BudgetShared::ptr_eq(&self.rare, &other.rare) || *self.rare == *other.rare)
+            && self.custom == other.custom
+    }
 }
 
 impl ComputedStyle {
     pub fn new(memory: &Budget) -> Result<Self, Error> {
-        let mut values = td_alloc::BudgetMap::with_capacity(memory, Property::ALL.len())?;
-        for property in Property::ALL {
+        let common = Property::common_roster();
+        let mut values = td_alloc::BudgetMap::with_capacity(memory, common.len())?;
+        for property in common {
             let value = if property.border() {
                 ComputedValue::Length(Length::Px(0.0))
             } else {
@@ -492,6 +559,7 @@ impl ComputedStyle {
         }
         Ok(Self {
             values,
+            rare: BudgetShared::new(memory, Rare::initial()?)?,
             custom: variables::CustomProperties::new(memory)?,
         })
     }
@@ -503,11 +571,56 @@ impl ComputedStyle {
         }
         Ok(Self {
             values,
+            rare: self.rare.try_clone()?,
             custom: self.custom.try_clone()?,
         })
     }
+    /// Replace one value. A rare one copies the group, which other styles
+    /// may share, and writes the copy.
+    pub(crate) fn set(&mut self, property: Property, value: ComputedValue) -> Result<(), Error> {
+        let Some(slot) = property.rare() else {
+            self.values.try_insert(property, value)?;
+            return Ok(());
+        };
+        let mut rare = self.rare.try_copy()?;
+        *rare.values.get_mut(slot).ok_or(Error::InvalidContext)? = value;
+        self.rare = BudgetShared::new(self.values.budget(), rare)?;
+        Ok(())
+    }
 }
 impl ComputedValue {
+    /// Equal to the bit: unlike `==`, -0 and 0 differ.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        let bits = |a: f64, b: f64| a.to_bits() == b.to_bits();
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => bits(*a, *b),
+            (Self::Length(Length::Px(a)), Self::Length(Length::Px(b)))
+            | (Self::Length(Length::Percent(a)), Self::Length(Length::Percent(b))) => bits(*a, *b),
+            (
+                Self::Length(Length::Calc {
+                    px: a,
+                    percent: p,
+                    non_negative: n,
+                }),
+                Self::Length(Length::Calc {
+                    px: b,
+                    percent: q,
+                    non_negative: m,
+                }),
+            ) => bits(*a, *b) && bits(*p, *q) && n == m,
+            (
+                Self::Spacing {
+                    horizontal: a,
+                    vertical: b,
+                },
+                Self::Spacing {
+                    horizontal: c,
+                    vertical: d,
+                },
+            ) => bits(*a, *c) && bits(*b, *d),
+            _ => self == other,
+        }
+    }
     /// A copy of any value that owns no storage: all but font-family's.
     #[inline(always)]
     fn plain(&self) -> Option<Self> {
@@ -571,7 +684,10 @@ impl ComputedStyle {
     }
 
     pub fn get(&self, property: Property) -> Option<&ComputedValue> {
-        // Completed styles contain the entire ordered property roster.
+        if let Some(slot) = property.rare() {
+            return self.rare.values.get(slot);
+        }
+        // Completed styles hold every common longhand, in roster order.
         self.values
             .get_index(property as usize)
             .filter(|(key, _)| **key == property)
@@ -1302,3 +1418,6 @@ pub(crate) fn finish(
 ) -> Result<(), Error> {
     layout::finish(style, parent)
 }
+
+#[cfg(test)]
+mod rare_tests;
