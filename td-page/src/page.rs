@@ -327,11 +327,12 @@ pub struct Laid {
 }
 
 /// `painted`, in tree order with `parents` worked out over it, ordered
-/// by how many floats and inline-blocks each box lies in, the box's own
-/// counted, then by tree order: floats and inline-blocks after the
-/// in-flow boxes around them, and one within another after it (CSS 2.2
-/// appendix E paints an inline-block as an inline, after the blocks'
-/// backgrounds). A parent stays before its children, as it lies in no
+/// by how many floats, inline-blocks and flex items each box lies in,
+/// the box's own counted, then by tree order: floats and inline-blocks
+/// after the in-flow boxes around them, and one within another after it
+/// (CSS 2.2 appendix E paints an inline-block as an inline, after the
+/// blocks' backgrounds; Flexbox 1 §5.4 paints a flex item as an
+/// inline-block). A parent stays before its children, as it lies in no
 /// more of them than they.
 fn floats_last(
     layout: &Layout,
@@ -351,8 +352,13 @@ fn floats_last(
             .and_then(|&up| depth.get(up as usize))
             .copied()
             .unwrap_or(0);
+        let item = styled.has_flex()
+            && parents
+                .get(at as usize)
+                .and_then(|&up| layout.boxes.get(up as usize))
+                .is_some_and(|up| styled.is_flex_container(up));
         if let Some(slot) = depth.get_mut(at as usize) {
-            let apart = styled.is_float(geometry) || styled.is_inline_block(geometry);
+            let apart = item || styled.is_float(geometry) || styled.is_inline_block(geometry);
             *slot = parent.saturating_add(u32::from(apart));
         }
     }
@@ -729,7 +735,7 @@ impl Laid {
             || cancel.load(Ordering::SeqCst),
             memory,
         )?;
-        if styled.styled().has_nested_lines() {
+        if styled.styled().has_nested_lines() || styled.styled().has_flex() {
             floats_last(
                 &layout,
                 styled.styled(),
@@ -1207,6 +1213,46 @@ pub(crate) mod tests {
         };
         assert!(at("a") < at("c") && at("c") < at("t") && at("t") < at("d"));
         assert!(page.fits().next().is_none());
+    }
+
+    /// A flex item paints as an inline-block does (Flexbox 1 §5.4): after
+    /// the in-flow boxes around its container, so a block pulled up over
+    /// it does not cover it; items among themselves in tree order.
+    #[test]
+    fn flex_items_paint_after_the_blocks_around_them() {
+        let page = laid(
+            "<body style=margin:0><div id=x style=display:flex;background:blue>\
+             <div id=a style=background:red;width:50px><p id=p style=background:white>in\
+             </div><div id=b style=background:green;margin-left:-20px>two</div></div>\
+             <div id=c style=background:yellow;margin-top:-10px>next</div>",
+        );
+        assert!(page.styled().styled().has_flex());
+        let at = |id: &str| {
+            let node = page.tree().target(id).unwrap();
+            let geometry = page
+                .layout
+                .boxes
+                .iter()
+                .position(|g| g.node == node)
+                .unwrap() as u32;
+            page.painted().iter().position(|&p| p == geometry).unwrap()
+        };
+        assert!(at("x") < at("c"), "the container before the block after it");
+        assert!(at("c") < at("a") && at("a") < at("p") && at("p") < at("b"));
+        // Without flex, tree order.
+        let page = laid(
+            "<body style=margin:0><div id=x style=background:blue>\
+             <div id=a style=background:red;width:50px><p id=p style=background:white>in\
+             </div><div id=b style=background:green;margin-left:-20px>two</div></div>\
+             <div id=c style=background:yellow;margin-top:-10px>next</div>",
+        );
+        assert!(!page.styled().styled().has_flex());
+        let ranks: Vec<u32> = page
+            .painted()
+            .iter()
+            .map(|&at| page.tree().rank(page.geometry(at).unwrap().node))
+            .collect();
+        assert!(ranks.windows(2).all(|w| w[0] <= w[1]), "{ranks:?}");
     }
 
     #[test]

@@ -1700,12 +1700,13 @@ after a replaced element. Places are ordered by the tree-order table,
 four bytes a node (1 MiB at td-html's `MAX_NODES`). td-layout lays
 normal flow, tables and flex containers in tree order (a flex item's
 lines, as a table cell's, item by item and line by line whatever its
-alignment moved or a `row-reverse` row mirrored; an
-anonymous item's naming its container and ending its paragraph,
-td-layout/DESIGN.md §5, "Flex"), puts a float's lines after
+alignment or baseline moved, a `row-reverse` row mirrored or `order`
+placed it; an anonymous item's naming its container and ending its
+paragraph, td-layout/DESIGN.md §5, "Flex"), puts a float's lines after
 the line it was met in (td-layout/DESIGN.md §5, "Floats") and an
 inline-block's after the line holding it ("Inline-blocks"; an inline
-table is an inline-block here and below, its cells' lines its own), so
+table and an inline flex container are inline-blocks here and below,
+their cells' and items' lines their own), so
 its
 lines are in the tree order of their starts and the fragments in each
 in tree order, a float's or an inline-block's lines starting and ending
@@ -2046,17 +2047,26 @@ order, then every glyph.
    2.2 §14.2), else `PAPER`, over the whole pane.
 2. Each box in tree order: its background colour over its border box,
    then each border side as a fill of its width, every style but `none`
-   and `hidden` drawn solid. On a page with floats or inline-blocks,
-   boxes are ordered by how many floats and inline-blocks
-   (`StyledDocument::is_float`, `is_inline_block`) each lies in, its
-   own counted, then in tree order, so an in-flow block's background
-   after a float or an inline-block does not cover it, nor a float's
+   and `hidden` drawn solid. On a page with floats, inline-blocks or
+   flex containers, boxes are ordered by how many floats,
+   inline-blocks and flex items (`StyledDocument::is_float`,
+   `is_inline_block`, and a box whose nearest ancestor with geometry
+   `is_flex_container`) each lies in, its own counted, then in tree
+   order, so an in-flow block's background after a float, an
+   inline-block or a flex item does not cover it, nor a float's
    in-flow block a float within it (CSS 2.2 appendix E, floats after
    in-flow blocks' backgrounds, and inline-blocks with the inline
-   content after them); the count is worked out once down the tree
-   order, from each box's nearest ancestor with geometry. Two floats
-   that overlap each other paint by depth then tree order, not each
-   whole in turn. An inline-block's box paints here, and its lines in
+   content after them; Flexbox 1 §5.4 paints a flex item as an
+   inline-block, in tree order here, not `order`'s); the count is
+   worked out once down the tree order, from each box's nearest
+   ancestor with geometry. Boxes that overlap paint by depth then tree
+   order, not each float, inline-block or flex item whole in turn: two
+   floats, or a nested flex item's (or an inline-block's or a float's)
+   descendant and a later sibling item that overlaps it, so
+   `<div style=display:flex><div style=display:flex><div
+   style=background:red>` before a sibling item pulled over it by a
+   negative margin paints its red after that sibling, where Flexbox 1
+   §5.4 paints the first item whole before the second. An inline-block's box paints here, and its lines in
    step 3 with the page's.
 3. Each line's content: the backgrounds of a fragment's inline
    ancestors behind its extent, as one fill, since all lie over that
@@ -2225,10 +2235,12 @@ their elements lay out (a `button`'s or `textarea`'s text shows, an
 static and relative (td-css computes no other, so `absolute`, `fixed`
 and `sticky` stay in flow); flex layout's reversed lines and columns
 (`wrap-reverse` laid as `wrap`, `column-reverse` as `column`), a
-column's wrapping and shrinking, `order` and baseline alignment
-(td-layout/DESIGN.md §5, "Flex"), and grid
+column's wrapping and shrinking, `order` in a row wrapping onto
+lines or a column
+and `last baseline` (td-layout/DESIGN.md §5, "Flex"), and grid
 until td-layout has it, laid in normal flow as td-layout specifies,
-nothing hidden by it; floats and inline-blocks, inline tables among them, are
+nothing hidden by it; floats and inline-blocks, inline tables and inline
+flex containers among them, are
 td-layout's
 (td-layout/DESIGN.md §5, "Floats", "Inline-blocks"), their boxes
 painted after the in-flow boxes around them ("Painting") but their
@@ -2561,7 +2573,9 @@ order; each is its own design amendment when it starts:
   text runs on into it), a copy ending where a line starts with an
   inline-block taking the newline its first text would, then the rest
   of flexbox (`wrap-reverse` and `column-reverse`, a column's wrapping
-  and shrinking, inline-flex's baseline, `order`) and grid;
+  and shrinking, `order` in rows wrapping onto lines and columns,
+  re-laying a
+  grown or stretched item's content) and grid;
   pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.

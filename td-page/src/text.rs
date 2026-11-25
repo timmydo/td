@@ -2680,6 +2680,40 @@ mod tests {
         }
     }
 
+    /// An inline flex container copies as a flex container in an
+    /// inline-block does, its items in tree order whatever their `order`;
+    /// each piece starts on its own line.
+    #[test]
+    fn an_inline_flex_copies_as_its_items() {
+        for content in [
+            "<b>a</b><b>bb<br>cc</b>",
+            "<b style=order:1>a</b><b>bb</b>tail",
+            "<b style=align-self:baseline;padding-top:4px>a</b><b>b</b>",
+            "",
+        ] {
+            let inline = format!("<p>one <span style=display:inline-flex>{content}</span> two");
+            let boxed = format!(
+                "<p>one <span style=display:inline-block><span style=display:flex>{content}\
+                 </span></span> two"
+            );
+            let laid = laid(&inline);
+            assert_eq!(
+                all(&laid),
+                all(&crate::page::tests::laid(&boxed)),
+                "{inline}"
+            );
+            for (at, line) in laid.lines().iter().enumerate() {
+                for item in items(&laid, line) {
+                    assert_eq!(line_of(&laid, item.start), at, "{inline} {item:?}");
+                }
+            }
+        }
+        let laid = laid(
+            "<p>one <span style=display:inline-flex><b style=order:1>a</b><b>b</b></span> two",
+        );
+        assert_eq!(all(&laid), "one a\nb two");
+    }
+
     /// An inline table's cells copy as a table's in an inline-block do:
     /// tabs between a row's cells, newlines between its rows, its text
     /// its own paragraphs within the line holding it; every piece starts

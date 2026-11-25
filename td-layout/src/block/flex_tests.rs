@@ -1060,6 +1060,170 @@ mod cases {
         );
     }
 
+    /// `align-items: baseline` in a row: the items whose cross margins
+    /// are not auto share the line's baseline, their first line's or
+    /// their border box's bottom, each moving down to the lowest, the
+    /// line growing to hold them; `first` and `last baseline` alike.
+    #[test]
+    fn baseline_items_share_their_lines_baseline() {
+        let nav = "<div id=f><a id=a>ab</a><a id=b>cd</a><a id=c>ef</a></div>";
+        let at = |css: &str| {
+            let css = format!("#f{{display:flex}}#b{{font-size:24px}}{css}");
+            let laid = Laid::new(nav, &css, 400.0);
+            (
+                laid.border("a"),
+                laid.border("b"),
+                laid.border("c"),
+                laid.border("f").3,
+            )
+        };
+        let shared = (
+            (0.0, 7.5, 16.0, 20.0),
+            (16.0, 0.0, 16.0, 30.0),
+            (32.0, 7.5, 16.0, 20.0),
+            30.0,
+        );
+        for align in ["baseline", "first baseline", "last baseline"] {
+            assert_eq!(at(&format!("#f{{align-items:{align}}}")), shared, "{align}");
+        }
+        let laid = Laid::new(
+            nav,
+            "#f{display:flex;align-items:baseline}#b{font-size:24px}",
+            400.0,
+        );
+        assert_eq!(
+            laid.lines()
+                .iter()
+                .map(|l| (l.0, l.2.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(7.5, "ab"), (0.0, "cd"), (7.5, "ef")]
+        );
+        // Without baseline alignment, all at the top.
+        assert_eq!(at("#f{align-items:start}").0, (0.0, 0.0, 16.0, 20.0));
+        // An item of no line: its bottom, 40 px down; the line grows to
+        // hold the 24 px item moved 17.5 px down.
+        let laid = Laid::new(
+            "<div id=f><a id=a>ab</a><a id=b>cd</a><i id=d></i></div>",
+            "#f{display:flex;align-items:baseline}#b{font-size:24px}#d{height:40px;width:8px;margin-bottom:5px}",
+            400.0,
+        );
+        assert_eq!(laid.border("a"), (0.0, 25.0, 16.0, 20.0));
+        assert_eq!(laid.border("b"), (16.0, 17.5, 16.0, 30.0));
+        assert_eq!(laid.border("d"), (32.0, 0.0, 8.0, 40.0));
+        assert_eq!(laid.border("f").3, 47.5);
+        // An auto cross margin: it does not share it, but takes the space.
+        let (a, _, c, _) = at("#f{align-items:baseline}#c{margin-top:auto}");
+        assert_eq!((a.1, c.1), (7.5, 10.0));
+        let (a, ..) = at("#f{align-items:baseline}#c{margin-top:auto;padding-top:20px}");
+        assert_eq!(a.1, 7.5);
+        // One item alone shares it; the rest stretch.
+        let (a, b, ..) = at("#b{align-self:baseline}");
+        assert_eq!((a, b.1), ((0.0, 0.0, 16.0, 30.0), 0.0));
+        // A definite height: the line is it, its items still on their
+        // baseline.
+        let (a, _, _, f) = at("#f{align-items:baseline;height:100px}");
+        assert_eq!((a.1, f), (7.5, 100.0));
+        // Each line of a wrapping row its own.
+        let (a, b, c, f) = at("#f{align-items:baseline;flex-wrap:wrap;width:32px}");
+        assert_eq!((a.1, b.1, c.1, f), (7.5, 0.0, 30.0, 50.0));
+        // A column lays it at the start.
+        let (a, b, ..) = at("#f{align-items:baseline;flex-direction:column}");
+        assert_eq!((a, b), ((0.0, 0.0, 16.0, 20.0), (0.0, 20.0, 16.0, 30.0)));
+        // A margin and padding: its baseline from its margin box's top.
+        let (a, b, ..) = at("#f{align-items:baseline}#a{margin-top:3px;padding-top:4px}");
+        assert_eq!((a.1, b.1), (3.5, 0.0));
+        let (a, b, ..) = at("#f{align-items:baseline}#a{margin-top:6px;padding-top:4px}");
+        assert_eq!((a.1, b.1), (6.0, 2.5));
+        // An item's own relative offset moves it after it is aligned, not
+        // its baseline: it moves alone, the line as tall as before;
+        // td-css clamps a length to 1,000,000 px.
+        for (top, b) in [("7px", 7.0), ("-7px", -7.0), ("-99999999px", -1e6)] {
+            let css =
+                format!("#f{{display:flex;align-items:baseline}}#b{{position:relative;top:{top}}}");
+            let laid = Laid::new(nav, &css, 400.0);
+            assert_eq!(
+                (
+                    laid.border("a").1,
+                    laid.border("b").1,
+                    laid.border("c").1,
+                    laid.border("f").3
+                ),
+                (0.0, b, 0.0, 20.0),
+                "{top}"
+            );
+        }
+        let laid = Laid::new(
+            nav,
+            "#f{display:flex;align-items:baseline}#b{font-size:24px;position:relative;bottom:3px}",
+            400.0,
+        );
+        assert_eq!((laid.border("a").1, laid.border("b").1), (7.5, -3.0));
+        // In a baseline-aligned cell, the cell's baseline is its item's
+        // line, moved to the line's baseline.
+        let laid = Laid::new(
+            "<table><tr><td id=x>x<td><div id=f><b id=a>a</b>\
+             <b style=padding-top:10px>b</b></div></table>",
+            "td{vertical-align:baseline}table{border-spacing:0}\
+             #f{display:flex;align-items:baseline}",
+            400.0,
+        );
+        assert_eq!((laid.border("a").1, laid.lines()[0].0), (10.0, 10.0));
+    }
+
+    /// `order` places a row's items, which does not wrap, by `order` then
+    /// tree order, compared as integers (-0 is 0); they are laid, and
+    /// their lines kept, in tree order. A wrapping row and a column lay
+    /// them in tree order.
+    #[test]
+    fn order_places_a_rows_items() {
+        let items = "<div id=f><i id=a>a</i><i id=b>b</i><i id=c>c</i></div>";
+        let at = |css: &str| {
+            let css = format!("#f{{display:flex}}i{{display:block}}{css}");
+            let laid = Laid::new(items, &css, 400.0);
+            let x = |id: &str| laid.border(id).0;
+            let y = |id: &str| laid.border(id).1;
+            ((x("a"), x("b"), x("c")), (y("a"), y("b"), y("c")))
+        };
+        assert_eq!(at("").0, (0.0, 8.0, 16.0));
+        assert_eq!(at("#a{order:1}").0, (16.0, 0.0, 8.0));
+        assert_eq!(at("#c{order:-1}").0, (8.0, 16.0, 0.0));
+        assert_eq!(at("#a{order:2}#b{order:2}").0, (8.0, 16.0, 0.0));
+        assert_eq!(at("#b{order:-0}#c{order:-1}").0, (8.0, 16.0, 0.0));
+        assert_eq!(
+            at("#a{order:1}#f{flex-direction:row-reverse}").0,
+            (376.0, 392.0, 384.0)
+        );
+        assert_eq!(
+            at("#a{order:1}#f{justify-content:space-between}").0,
+            (392.0, 0.0, 196.0)
+        );
+        assert_eq!(
+            at("#a{order:1}#b{margin-left:auto}").0,
+            (392.0, 376.0, 384.0)
+        );
+        // Lines in tree order.
+        let laid = Laid::new(items, "#f{display:flex}i{display:block}#a{order:1}", 400.0);
+        assert_eq!(
+            laid.lines()
+                .iter()
+                .map(|l| (l.1, l.2.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(16.0, "a"), (0.0, "b"), (8.0, "c")]
+        );
+        // A wrapping row its items fit one line of: in `order`, as
+        // Bootstrap's `.order-*` rows at desktop widths; of several lines
+        // and a column: tree order.
+        assert_eq!(at("#a{order:1}#f{flex-wrap:wrap}").0, (16.0, 0.0, 8.0));
+        assert_eq!(
+            at("#a{order:1}#f{flex-wrap:wrap;width:16px}"),
+            ((0.0, 8.0, 0.0), (0.0, 0.0, 20.0))
+        );
+        assert_eq!(
+            at("#a{order:1}#f{flex-direction:column}").1,
+            (0.0, 20.0, 40.0)
+        );
+    }
+
     /// A column in a row is measured as its widest item, and a row in a
     /// column is laid across it.
     #[test]
@@ -1398,7 +1562,7 @@ mod cases {
         assert_eq!(styled_of("<p>a", "p{display:flex}"), (true, false, false));
         assert_eq!(
             styled_of("<p>a", "p{display:inline-flex}"),
-            (true, false, false)
+            (true, false, true)
         );
         assert_eq!(
             styled_of("<p>a", "html{display:flex}"),
@@ -1416,13 +1580,13 @@ mod cases {
             styled_of("<p>a<img>", "p{display:flex}img{float:left}"),
             (true, false, false)
         );
-        // inline-flex is laid as flex, block-level for now.
+        // inline-flex is laid whole in its line, as an inline-block.
         let laid = Laid::new(
             "<p>ab <span id=f><b>cd</b><b>ef</b></span> gh",
             "#f{display:inline-flex}",
             400.0,
         );
-        assert_eq!(laid.border("f"), (0.0, 20.0, 400.0, 20.0));
+        assert_eq!(laid.border("f"), (24.0, 0.0, 32.0, 20.0));
     }
 
     fn styled_layout(html: &str, css: &str, request: &Request<'_>, limits: Limits) -> Layout {
@@ -1673,14 +1837,15 @@ mod cases {
     fn windowed_layouts_equal_filtered_whole_ones() {
         let mut html = String::new();
         for n in 0..63 {
-            let align = ["center", "end", "start", "stretch"][n % 4];
+            let align = ["center", "end", "start", "stretch", "baseline"][n % 5];
             let lay = ["", " c", " w", " r", " w h", " c h", " w r", " c m", " w m"][n % 9];
             let content = ["normal", "center", "space-between", "end", "space-around"][n % 5];
             let justify = ["normal", "center", "end", "space-evenly"][n % 4];
             html.push_str(&format!(
                 "<div class='f{lay}' style=align-items:{align};align-content:{content};\
                  justify-content:{justify}><p>word{n} more words here to wrap\
-                 <br>and on</p><span>item <b>bold</b></span>"
+                 <br>and on</p><span style=order:{order}>item <b>bold</b></span>",
+                order = (n % 3) as i64 - 1
             ));
             match n % 6 {
                 0 => html.push_str("<ol><li>one<li>two<li>three</ol>"),
@@ -1696,7 +1861,9 @@ mod cases {
             if n % 5 == 0 {
                 html.push_str(
                     "<p>a para <span class=ib><span class=f style=align-items:center>\
-                     <b>a</b><b>b<br>c</b></span></span> after</p>\
+                     <b>a</b><b>b<br>c</b></span></span> and <span class='f if'>\
+                     <b style=order:1>an</b><b style=padding-top:9px>inline<br>flex</b></span>\
+                     after</p>\
                      <div class=fl><div class=f style=align-items:end><b>x</b><b>y<br>z</b></div></div>\
                      <table><tr><td><div class=f style=align-items:center><b>p</b><b>q<br>r</b></div>\
                      <td>cell</table><p>clear",
@@ -1708,6 +1875,7 @@ mod cases {
             ".f{display:flex;column-gap:4px;padding:2px}.fl{float:left;width:60px}\
              .ib{display:inline-block}li{list-style-position:outside}             .c{flex-direction:column}.w{flex-wrap:wrap}.w>*{flex-basis:30px}\
              .r{flex-direction:row-reverse}.h{height:150px}.m{min-height:150px}\
+             .if{display:inline-flex;align-items:baseline}\
              .c>p{flex-grow:1}.c>span{margin-top:auto}",
         );
         let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();

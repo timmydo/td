@@ -16,6 +16,11 @@ const ONE: i64 = 1 << 20;
 /// 2^58, and a share's product, under 2^58 times a weight scaled under
 /// 2^68, within i128.
 const NONE: i64 = 64 * crate::MAX_COORDINATE as i64;
+/// No geometry: an anonymous item's.
+const NO_GEOMETRY: u32 = u32::MAX;
+/// A table item's geometry, read for its baseline alone: an index, under
+/// MAX_BOXES, with this bit set.
+const TABLE_GEOMETRY: u32 = 1 << 31;
 
 /// What a flex item is laid from.
 #[derive(Clone, Copy)]
@@ -109,6 +114,8 @@ enum Cross {
     Center,
     End,
     Stretch,
+    /// In a row, on the line's baseline (§8.3); in a column, at the start.
+    Baseline,
 }
 
 /// A flex item: its main sizes in 1/64 px, of its content box but for a
@@ -139,8 +146,10 @@ pub(super) struct FlexItem {
     frozen: bool,
     /// The sign of its last clamp: below its minimum, above its maximum.
     violation: i8,
-    /// Its margin box's main offset from the container's content edge,
-    /// and, in a column, the one it was laid at.
+    /// Its margin box's main offset from the container's content edge;
+    /// in a column, the one it was laid at, and in a row, where it shares
+    /// its line's baseline, that baseline's offset from its margin box's
+    /// top as laid.
     x: i64,
     laid: i64,
     cross: Cross,
@@ -151,11 +160,14 @@ pub(super) struct FlexItem {
     lines: (u32, u32),
     boxes: (u32, u32),
     markers: (u32, u32),
-    /// Its own geometry, None for an anonymous item.
-    geometry: Option<u32>,
+    /// Its own geometry, `NO_GEOMETRY` for an anonymous item: a u32 the
+    /// record keeps to 224 bytes with its `order`.
+    geometry: u32,
     /// Its margin box's height as laid.
     outer: f64,
     bounds: Option<Rect>,
+    /// Its `order`, an integer, -0 as 0.
+    order: i32,
 }
 
 impl FlexItem {
@@ -184,10 +196,20 @@ impl FlexItem {
             lines: (0, 0),
             boxes: (0, 0),
             markers: (0, 0),
-            geometry: None,
+            geometry: NO_GEOMETRY,
             outer: 0.0,
             bounds: None,
+            order: 0,
         }
+    }
+    /// Its own geometry's index, None for an anonymous item and for a
+    /// table, which sizes itself and is not stretched.
+    fn geometry(&self) -> Option<usize> {
+        (self.geometry & TABLE_GEOMETRY == 0).then_some(self.geometry as usize)
+    }
+    /// Its own border box's index, a table's too.
+    fn border_box(&self) -> Option<usize> {
+        (self.geometry != NO_GEOMETRY).then_some((self.geometry & !TABLE_GEOMETRY) as usize)
     }
     /// Its sizes within 0 to NONE.
     fn bound(&mut self) {
@@ -204,6 +226,11 @@ impl FlexItem {
     fn clamp(&self, size: i64) -> i64 {
         size.min(self.max).max(self.min).max(0)
     }
+    /// Whether it shares its line's baseline: aligned to it, its cross
+    /// margins not auto (§8.3, §9.4 step 6).
+    fn shares_baseline(&self) -> bool {
+        self.cross == Cross::Baseline && !self.autos.top && !self.autos.bottom
+    }
     /// Its hypothetical outer main size (§9.2 step 3).
     fn outer_main(&self) -> i64 {
         self.clamp(self.base).saturating_add(self.around)
@@ -217,6 +244,8 @@ pub(super) struct FlexLine {
     start: u32,
     end: u32,
     height: f64,
+    /// The baseline its baseline-sharing items lie on, from its top.
+    baseline: f64,
 }
 
 /// An index into the layout's output, which fits a u32 as `MAX_LINES`,
@@ -237,7 +266,7 @@ fn factor(style: &ComputedStyle, p: Property) -> i64 {
 }
 
 /// An item's `align-self`, `auto` taking its container's `align-items`;
-/// baselines are laid as start for now.
+/// `last baseline` is laid as `first baseline`.
 fn cross(own: &str, container: &str) -> Cross {
     let value = if own == "auto" || own.is_empty() {
         container
@@ -248,6 +277,7 @@ fn cross(own: &str, container: &str) -> Cross {
         "normal" | "stretch" | "" => Cross::Stretch,
         "center" => Cross::Center,
         "end" | "flex-end" | "self-end" => Cross::End,
+        "baseline" | "first baseline" | "last baseline" => Cross::Baseline,
         _ => Cross::Start,
     }
 }
@@ -446,6 +476,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let lay = Lay::of(style);
         let (base, lines, retain) = (self.flex.len(), self.flex_lines.len(), self.retain);
         let last_baseline = self.last_baseline;
+        let wanted = std::mem::replace(&mut self.flex_wanted, false);
+        let watch = std::mem::replace(&mut self.flex_watch, wanted.then_some(base));
+        let lead = self.flex_lead.take();
         let laid = if lay.column {
             self.flex_column(id, b, dims, place, base, depth)
         } else {
@@ -454,9 +487,81 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         // A container's lines, as a table's, are no inline-block's last.
         self.last_baseline = last_baseline;
         self.retain = retain;
+        self.flex_watch = watch;
+        self.flex_lead = lead;
         self.flex.truncate(base);
         self.flex_lines.truncate(lines);
-        laid
+        let (used, content, baseline) = laid?;
+        if wanted {
+            self.flex_first = baseline.map(|y| y - offset.1);
+        }
+        Ok((used, content))
+    }
+    /// The baseline the item `item` gives, in the layout's coordinates
+    /// with the offset: its first line's, `line` where it was watched for
+    /// it, else its border box's bottom edge (§8.5), less its own relative
+    /// offset, which CSS applies once it is laid (CSS 2.2 §9.4.3), its
+    /// percentages of `definite`.
+    fn item_baseline(
+        &self,
+        item: &FlexItem,
+        line: Option<usize>,
+        definite: Option<f64>,
+    ) -> Result<Option<f64>, Error> {
+        let laid = match line.and_then(|at| self.lines.get(at)) {
+            Some(line) => line.y + line.baseline,
+            None => match item.border_box().and_then(|at| self.boxes.get(at)) {
+                Some(geometry) => geometry.border.y + geometry.border.height,
+                None => return Ok(None),
+            },
+        };
+        let Source::Element(child) = item.source else {
+            return Ok(Some(laid));
+        };
+        let c = self.styled.box_node(child).ok_or(Error::Invalid)?;
+        let style = self.styled.style(c.style).ok_or(Error::Invalid)?;
+        if keyword(style, Property::Position) != "relative" {
+            return Ok(Some(laid));
+        }
+        let down = length(style, Property::Top, definite)
+            .or_else(|| length(style, Property::Bottom, definite).map(|v| -v))
+            .unwrap_or(0.0);
+        Ok(Some(laid - down))
+    }
+    /// The table box `c` laid last, flagged as a table's.
+    fn table_box(&self, c: &BoxNode) -> Result<u32, Error> {
+        let own = self
+            .boxes
+            .len()
+            .checked_sub(1)
+            .filter(|at| self.boxes.get(*at).is_some_and(|g| g.node == c.node));
+        Ok(own
+            .map(index)
+            .transpose()?
+            .map_or(NO_GEOMETRY, |at| at | TABLE_GEOMETRY))
+    }
+    /// A row's first baseline, its first line laid at `top` and moved
+    /// down `shift`: that line's, where any item shares it, else its first
+    /// item's in `order` (§8.5).
+    fn rows_baseline(
+        &self,
+        first: usize,
+        lay: Lay,
+        (top, definite): (f64, Option<f64>),
+    ) -> Result<Option<f64>, Error> {
+        let Some(line) = self.flex_lines.get(first) else {
+            return Ok(None);
+        };
+        let (start, end) = (line.start as usize, line.end as usize);
+        let items = self.flex.get(start..end).ok_or(Error::Invalid)?;
+        if items.iter().any(|item| item.shares_baseline()) {
+            return Ok(Some(top + line.baseline));
+        }
+        let leading = self.flex.get(self.first_in_order(start, end, lay)?);
+        match leading {
+            Some(item) => self.item_baseline(item, self.flex_lead, definite),
+            None => Ok(None),
+        }
     }
     /// Lays a row's items on its lines, one where it does not wrap, the
     /// lines down the page `row-gap` apart (§9.3, §9.4, §8.4).
@@ -468,7 +573,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         place: Place,
         (base, first): (usize, usize),
         depth: usize,
-    ) -> Result<(f64, f64), Error> {
+    ) -> Result<(f64, f64, Option<f64>), Error> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         let lay = Lay::of(style);
         let width = place.container.width;
@@ -483,6 +588,16 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             self.size_item(at, &place, depth)?;
         }
         self.break_lines(base, end, room, gap, lay.wrap)?;
+        // A wrapping row its items fit one line of is placed in `order`
+        // as one that does not wrap: which line an item lands on does
+        // not depend on it.
+        let ordering = Lay {
+            wrap: lay.wrap && self.flex_lines.len() - first > 1,
+            ..lay
+        };
+        if self.flex_watch.is_some() {
+            self.flex_watch = Some(self.first_in_order(base, end, ordering)?);
+        }
         let justified = main_justify(keyword(style, Property::JustifyContent), lay);
         // Decided before anything is laid: whether any item will move
         // down once its line's cross size is known, and whether
@@ -505,7 +620,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             .ok_or(Error::Invalid)?
             .iter()
             .any(|item| {
-                matches!(item.cross, Cross::Center | Cross::End)
+                matches!(item.cross, Cross::Center | Cross::End | Cross::Baseline)
                     || item.autos.top
                     || item.autos.bottom
             });
@@ -525,7 +640,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             let (start, end) = (line.start as usize, line.end as usize);
             let gaps = gap.saturating_mul(end.saturating_sub(start + 1) as i64);
             self.resolve(start, end, room.saturating_sub(gaps), depth)?;
-            self.place_items(start, end, room, gap, justified, lay)?;
+            self.place_items(start, end, room, gap, justified, ordering)?;
             let row = Place {
                 container: Rect {
                     y: place.container.y + top,
@@ -534,6 +649,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 ..place
             };
             let tallest = self.lay_items(id, b.style, &row, start, end, depth)?;
+            let (baseline, tallest) = self.line_baseline(start, end, tallest)?;
+            self.flex_lines.get_mut(at).ok_or(Error::Invalid)?.baseline = baseline;
             extent += px(holding(tallest.max(0.0)));
             if at + 1 < self.flex_lines.len() {
                 extent += row_gap;
@@ -553,9 +670,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             if !coordinate(top + height) {
                 return Err(Error::Limit("MAX_COORDINATE"));
             }
-            self.flex_lines.get_mut(at).ok_or(Error::Invalid)?.height = height;
+            let line = self.flex_lines.get_mut(at).ok_or(Error::Invalid)?;
+            line.height = height;
+            let line = *line;
             if !spread {
-                self.align_items(start, end, height)?;
+                self.align_items(start, end, line)?;
                 // A line's items are final once aligned, as a table's row.
                 if outermost && retained {
                     self.keep_window()?;
@@ -568,7 +687,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 spread = false;
                 for pending in first..=at {
                     let line = *self.flex_lines.get(pending).ok_or(Error::Invalid)?;
-                    self.align_items(line.start as usize, line.end as usize, line.height)?;
+                    self.align_items(line.start as usize, line.end as usize, line)?;
                 }
                 if outermost {
                     self.keep_window()?;
@@ -582,24 +701,65 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 top += row_gap;
             }
         }
+        let origin = place.container.y + place.offset.1;
+        let baseline = self.rows_baseline(first, ordering, (origin, place.definite))?;
         if !lay.wrap {
-            return Ok((top, extent));
+            return Ok((top, extent, baseline));
         }
         let cross = match place.definite {
             Some(height) => height,
             None => top.min(dims.max_height).max(dims.min_height),
         };
         let cross = px(holding(cross));
+        let mut baseline = baseline;
         if spread {
-            self.spread_lines(first, units(cross - top), content)?;
+            let shift = self.spread_lines(first, units(cross - top), content)?;
             if outermost {
                 self.keep_window()?;
             }
+            // Spread lines moved their items' lines and boxes with them.
+            let top = (origin + px(shift), place.definite);
+            baseline = self.rows_baseline(first, ordering, top)?;
         }
         if retained {
             self.retain -= 1;
         }
-        Ok((cross, extent))
+        Ok((cross, extent, baseline))
+    }
+    /// The baseline of the line of items `start..end`, from its top, and
+    /// its tallest item: each baseline-sharing item's baseline is its
+    /// first line's, else its border box's bottom edge (`lay_one`), and
+    /// the line's the lowest of them, to which each moves down, so that
+    /// the line holds them so moved (§8.3, §9.4 steps 6 and 7).
+    fn line_baseline(
+        &mut self,
+        start: usize,
+        end: usize,
+        tallest: f64,
+    ) -> Result<(f64, f64), Error> {
+        let mut baseline = None::<f64>;
+        for at in start..end {
+            let item = self.flex.get(at).ok_or(Error::Invalid)?;
+            if !item.shares_baseline() {
+                continue;
+            }
+            self.counters.step(1)?;
+            let own = px(item.laid);
+            baseline = Some(baseline.map_or(own, |b| b.max(own)));
+        }
+        let Some(baseline) = baseline else {
+            return Ok((0.0, tallest));
+        };
+        let mut tallest = tallest;
+        for item in self.flex.get(start..end).ok_or(Error::Invalid)? {
+            if item.shares_baseline() {
+                tallest = tallest.max(baseline - px(item.laid) + item.outer);
+            }
+        }
+        if !coordinate(tallest) {
+            return Err(Error::Limit("MAX_COORDINATE"));
+        }
+        Ok((baseline, tallest))
     }
     /// Breaks the items `start..end` into lines (§9.3 step 5): each as
     /// many as fit its room with the gaps between them, two units an item
@@ -643,6 +803,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             start: index(start)?,
             end: index(end)?,
             height: 0.0,
+            baseline: 0.0,
         };
         self.counters.admit_growth(&mut self.flex_lines)?;
         self.flex_lines.try_push(line)?;
@@ -652,12 +813,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// cross size less theirs, by `align-content` (§8.4, §9.4 step 9,
     /// §9.6 step 16):
     /// `normal` and `stretch` grow each line by a share, the rest move
-    /// them; never up, as `safe` alignment. Then aligns each line's items.
-    fn spread_lines(&mut self, first: usize, free: i64, content: &str) -> Result<(), Error> {
+    /// them; never up, as `safe` alignment. Then aligns each line's items;
+    /// returns how far the first moved.
+    fn spread_lines(&mut self, first: usize, free: i64, content: &str) -> Result<i64, Error> {
         let count = (self.flex_lines.len() - first) as i64;
         let free = free.max(0);
         let stretch = matches!(content, "normal" | "stretch");
         let mut grown = 0i64;
+        let mut moved = 0i64;
         for at in first..self.flex_lines.len() {
             let n = (at - first) as i64;
             let mut line = *self.flex_lines.get(at).ok_or(Error::Invalid)?;
@@ -668,6 +831,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             } else {
                 (justify(content, free, n, count), 0)
             };
+            if at == first {
+                moved = shift.max(0);
+            }
             let (start, end) = (line.start as usize, line.end as usize);
             if shift > 0 && start < end {
                 let span = |a: (u32, u32), b: (u32, u32)| (a.0 as usize, b.1 as usize);
@@ -686,10 +852,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 }
             }
             line.height += px(extra);
-            self.align_items(start, end, line.height)?;
+            self.align_items(start, end, line)?;
             *self.flex_lines.get_mut(at).ok_or(Error::Invalid)? = line;
         }
-        Ok(())
+        Ok(moved)
     }
     /// The flex items of `b`, onto the stack: each element child, and
     /// each run of other children holding more than white space (§4).
@@ -716,10 +882,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             if element(&c) {
                 *next = c.next_sibling;
                 let style = self.styled.style(c.style).ok_or(Error::Invalid)?;
-                let item = FlexItem::new(
+                let mut item = FlexItem::new(
                     Source::Element(first),
                     cross(keyword(style, Property::AlignSelf), align),
                 );
+                item.order = match style.get(Property::Order) {
+                    Some(ComputedValue::Number(n)) if n.is_finite() => *n as i32,
+                    _ => 0,
+                };
                 return Ok(Some(item));
             }
             let mut solid = !self.blank(&c)?;
@@ -1000,12 +1170,23 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         justified: &str,
         lay: Lay,
     ) -> Result<(), Error> {
-        let items = self.flex.get_mut(start..end).ok_or(Error::Invalid)?;
-        let count = items.len() as i64;
+        // A row that does not wrap places its items in `order`; they are
+        // laid, and their lines kept, in tree order whatever it is.
+        let ordered = !lay.wrap && !lay.column && self.order_items(start, end)?;
+        let count = end.saturating_sub(start);
+        let at = |engine: &Self, k: usize| -> Result<usize, Error> {
+            if ordered {
+                let (_, at) = *engine.flex_order.get(k).ok_or(Error::Invalid)?;
+                Ok(at as usize)
+            } else {
+                Ok(start + k)
+            }
+        };
+        let items = self.flex.get(start..end).ok_or(Error::Invalid)?;
         let used = items.iter().fold(0i64, |sum, item| {
             sum.saturating_add(item.target).saturating_add(item.around)
         });
-        let gaps = gap.saturating_mul((count - 1).max(0));
+        let gaps = gap.saturating_mul((count as i64 - 1).max(0));
         let free = room.saturating_sub(used).saturating_sub(gaps);
         let main = |item: &FlexItem| item.autos.main(lay.column);
         let autos = items
@@ -1013,16 +1194,19 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             .map(|item| i64::from(main(item).0) + i64::from(main(item).1))
             .sum::<i64>();
         let mut cursor = 0i64;
-        if free > 0 && autos > 0 {
-            let mut seen = 0i64;
-            let share = |seen: &mut i64| -> i64 {
-                let before = (i128::from(free) * i128::from(*seen) / i128::from(autos)) as i64;
-                *seen += 1;
-                let after = (i128::from(free) * i128::from(*seen) / i128::from(autos)) as i64;
-                after - before
-            };
-            for item in items.iter_mut() {
-                let (before, after) = main(item);
+        let mut seen = 0i64;
+        let share = |seen: &mut i64| -> i64 {
+            let before = (i128::from(free) * i128::from(*seen) / i128::from(autos)) as i64;
+            *seen += 1;
+            let after = (i128::from(free) * i128::from(*seen) / i128::from(autos)) as i64;
+            after - before
+        };
+        let shared = free > 0 && autos > 0;
+        for k in 0..count {
+            let index = at(self, k)?;
+            let item = self.flex.get_mut(index).ok_or(Error::Invalid)?;
+            let (before, after) = main(item);
+            if shared {
                 if before {
                     item.before = share(&mut seen);
                 }
@@ -1034,17 +1218,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     .saturating_add(item.target + item.around + item.before * i64::from(before))
                     .saturating_add(item.after * i64::from(after))
                     .saturating_add(gap);
-            }
-        } else {
-            for (at, item) in items.iter_mut().enumerate() {
-                let (before, after) = main(item);
+            } else {
                 if before {
                     item.before = 0;
                 }
                 if after {
                     item.after = 0;
                 }
-                item.x = cursor.saturating_add(justify(justified, free, at as i64, count));
+                item.x = cursor.saturating_add(justify(justified, free, k as i64, count as i64));
                 cursor = cursor
                     .saturating_add(item.target)
                     .saturating_add(item.around)
@@ -1052,7 +1233,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             }
         }
         if lay.reverse {
-            for item in items.iter_mut() {
+            for item in self.flex.get_mut(start..end).ok_or(Error::Invalid)? {
                 let (before, after) = main(item);
                 let outer = item
                     .target
@@ -1063,6 +1244,41 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             }
         }
         Ok(())
+    }
+    /// Fills `flex_order` with the items `start..end` by `order`, then
+    /// tree order, where any has an `order` but 0: whether one does.
+    fn order_items(&mut self, start: usize, end: usize) -> Result<bool, Error> {
+        self.flex_order.clear();
+        let items = self.flex.get(start..end).ok_or(Error::Invalid)?;
+        if items.iter().all(|item| item.order == 0) {
+            return Ok(false);
+        }
+        self.counters.step(end.saturating_sub(start))?;
+        for at in start..end {
+            let order = self.flex.get(at).ok_or(Error::Invalid)?.order;
+            self.counters.admit_growth(&mut self.flex_order)?;
+            self.flex_order.try_push((order, index(at)?))?;
+        }
+        // Each key is unique, so an unstable sort keeps tree order among
+        // equal orders, and allocates nothing.
+        self.flex_order.sort_unstable();
+        Ok(true)
+    }
+    /// The first of the items `start..end` in `order`, a row's that does
+    /// not wrap (§5.4): its baseline its container's where none shares
+    /// its line's.
+    fn first_in_order(&self, start: usize, end: usize, lay: Lay) -> Result<usize, Error> {
+        let mut first = (i32::MAX, start);
+        if lay.wrap || lay.column {
+            return Ok(start);
+        }
+        for at in start..end {
+            let order = self.flex.get(at).ok_or(Error::Invalid)?.order;
+            if order < first.0 {
+                first = (order, at);
+            }
+        }
+        Ok(first.1)
     }
     /// Lays the items `start..end` once each, at its x and the line's
     /// top, keeping what it laid; returns the tallest margin box.
@@ -1097,6 +1313,17 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     ) -> Result<FlexItem, Error> {
         let mut item = *self.flex.get(at).ok_or(Error::Invalid)?;
         let (lines, markers, boxes) = (self.lines.len(), self.markers.len(), self.boxes.len());
+        // Its first line is kept whatever the window, as a cell's is,
+        // where it gives its line's baseline or its container's.
+        let column = Lay::of(self.styled.style(strut).ok_or(Error::Invalid)?).column;
+        let watched = self.flex_watch == Some(at);
+        if watched {
+            self.flex_watch = None;
+        }
+        let watch = (watched || (!column && item.shares_baseline())).then(|| {
+            let first_line = std::mem::replace(&mut self.first_line, true);
+            (first_line, self.first_index.take())
+        });
         let outer = (self.left, self.top, self.right, self.bottom);
         (self.left, self.top, self.right, self.bottom) = (
             f64::INFINITY,
@@ -1104,14 +1331,34 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             f64::NEG_INFINITY,
             f64::NEG_INFINITY,
         );
-        let laid = if Lay::of(self.styled.style(strut).ok_or(Error::Invalid)?).column {
+        let laid = if column {
             self.lay_column_item(&mut item, id, place, depth)
         } else {
             self.lay_flex_item(&mut item, id, strut, place, x, depth)
         };
         let own = (self.left, self.top, self.right, self.bottom);
         (self.left, self.top, self.right, self.bottom) = outer;
+        let mut taken = None;
+        if let Some((first_line, first_index)) = watch {
+            // An enclosing cell whose first line this was has it.
+            taken = std::mem::replace(&mut self.first_index, first_index);
+            if first_line && taken.is_some() {
+                self.first_index = taken;
+            }
+            self.first_line = first_line && taken.is_none();
+        }
         laid?;
+        if watched {
+            self.flex_lead = taken;
+        }
+        if !column && item.shares_baseline() {
+            // Its baseline from its margin box's top, as laid at the
+            // line's top.
+            let own = self
+                .item_baseline(&item, taken, place.definite)?
+                .map_or(item.outer, |y| y - place.offset.1 - place.container.y);
+            item.laid = units(own);
+        }
         item.bounds = (own.0 <= own.2).then_some(Rect {
             x: own.0,
             y: own.1,
@@ -1184,6 +1431,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     let (height, _) =
                         self.inline_table(child, dims, &room, top + dims.margin.top, depth + 1)?;
                     item.outer = height + dims.margin.vertical();
+                    item.geometry = self.table_box(&c)?;
                     return Ok(());
                 }
                 dims.width = px(item.target);
@@ -1202,7 +1450,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     .len()
                     .checked_sub(1)
                     .filter(|at| self.boxes.get(*at).is_some_and(|g| g.node == c.node));
-                item.geometry = own.map(index).transpose()?;
+                item.geometry = own.map(index).transpose()?.unwrap_or(NO_GEOMETRY);
                 item.outer = height + dims.margin.vertical();
             }
         }
@@ -1211,13 +1459,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// Each of the items `start..end` stretched to their line's cross size
     /// `line`, or moved down within it by its auto margins or alignment
     /// (§9.4, §8.1, §8.3): never up, as `safe` alignment.
-    fn align_items(&mut self, start: usize, end: usize, line: f64) -> Result<(), Error> {
+    fn align_items(&mut self, start: usize, end: usize, line: FlexLine) -> Result<(), Error> {
+        let (line, baseline) = (line.height, line.baseline);
         for at in start..end {
             let item = *self.flex.get(at).ok_or(Error::Invalid)?;
             let free = line - item.outer;
             if item.cross == Cross::Stretch {
-                if let Some(at) = item.geometry {
-                    let geometry = self.boxes.get_mut(at as usize).ok_or(Error::Invalid)?;
+                if let Some(at) = item.geometry() {
+                    let geometry = self.boxes.get_mut(at).ok_or(Error::Invalid)?;
                     let decoration = geometry.padding.plus(geometry.border_widths).vertical();
                     let margins = geometry.margin.vertical();
                     let content = (line - margins - decoration)
@@ -1242,8 +1491,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                     (true, false) => free,
                     _ => 0.0,
                 };
-                if let Some(at) = item.geometry {
-                    let geometry = self.boxes.get_mut(at as usize).ok_or(Error::Invalid)?;
+                if let Some(at) = item.geometry() {
+                    let geometry = self.boxes.get_mut(at).ok_or(Error::Invalid)?;
                     if top {
                         geometry.margin.top = above;
                     }
@@ -1256,6 +1505,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 match item.cross {
                     Cross::Center => free / 2.0,
                     Cross::End => free,
+                    Cross::Baseline => baseline - px(item.laid),
                     _ => 0.0,
                 }
             };
@@ -1287,7 +1537,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         place: Place,
         base: usize,
         depth: usize,
-    ) -> Result<(f64, f64), Error> {
+    ) -> Result<(f64, f64, Option<f64>), Error> {
         let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
         let gap = length(style, Property::RowGap, place.definite).map_or(0, |g| units(g.max(0.0)));
         let align = keyword(style, Property::AlignItems);
@@ -1387,7 +1637,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 self.keep_window()?;
             }
         }
-        Ok((px(main.max(0)), px(y.max(0))))
+        let baseline = match self.flex.get(base) {
+            Some(item) => self.item_baseline(item, self.flex_lead, place.definite)?,
+            None => None,
+        };
+        Ok((px(main.max(0)), px(y.max(0)), baseline))
     }
     /// Lays a column of no definite or least height, which leaves its
     /// items no free space, so none grows or moves: each as it is met,
@@ -1400,10 +1654,12 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         place: &Place,
         (base, gap, align): (usize, i64, &str),
         depth: usize,
-    ) -> Result<(f64, f64), Error> {
+    ) -> Result<(f64, f64, Option<f64>), Error> {
         let mut next = b.first_child;
         let mut y = 0i64;
         let mut first = true;
+        let mut baseline = None;
+        let mut leading = true;
         while let Some(mut item) = self.next_flex_item(&mut next, align)? {
             if !first {
                 y = y.saturating_add(gap);
@@ -1417,13 +1673,21 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             let laid = self.flex.get_mut(base).ok_or(Error::Invalid)?;
             (laid.target, laid.x) = (target, y);
             self.settle(base)?;
+            if std::mem::replace(&mut leading, false) {
+                let item = self.flex.get(base).ok_or(Error::Invalid)?;
+                baseline = self.item_baseline(item, self.flex_lead, place.definite)?;
+            }
             self.flex.truncate(base);
             y = y.saturating_add(target).saturating_add(item.around);
             if !coordinate(px(y)) {
                 return Err(Error::Limit("MAX_COORDINATE"));
             }
         }
-        Ok((px(y.min(units(dims.max_height)).max(0)), px(y.max(0))))
+        Ok((
+            px(y.min(units(dims.max_height)).max(0)),
+            px(y.max(0)),
+            baseline,
+        ))
     }
     /// Lays one column item at its main offset as laid, at its cross
     /// size: a stretched block the container's width less its margins,
@@ -1526,8 +1790,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         Cross::End => 1.0,
                         _ => 0.0,
                     };
-                    let item = (child, dims, share);
-                    self.table_item(item, &room, top + dims.margin.top, depth + 1)?
+                    let laid = (child, dims, share);
+                    let height = self.table_item(laid, &room, top + dims.margin.top, depth + 1)?;
+                    item.geometry = self.table_box(&c)?;
+                    height
                 } else {
                     let outer = dims.width
                         + dims.decoration().horizontal()
@@ -1564,7 +1830,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                         .len()
                         .checked_sub(1)
                         .filter(|at| self.boxes.get(*at).is_some_and(|g| g.node == c.node));
-                    item.geometry = own.map(index).transpose()?;
+                    item.geometry = own.map(index).transpose()?.unwrap_or(NO_GEOMETRY);
                     height
                 };
                 item.outer = height + dims.margin.vertical();
@@ -1627,8 +1893,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             let laid = (range(item.lines), range(item.boxes), range(item.markers));
             self.move_down(laid, shift)?;
         }
-        if let Some(at) = item.geometry {
-            let geometry = self.boxes.get_mut(at as usize).ok_or(Error::Invalid)?;
+        if let Some(at) = item.geometry() {
+            let geometry = self.boxes.get_mut(at).ok_or(Error::Invalid)?;
             let decoration = geometry.padding.plus(geometry.border_widths).vertical();
             let content = px(item.target);
             if units(geometry.content.height) != item.target {

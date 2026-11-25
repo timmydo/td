@@ -27,6 +27,8 @@ mod float_tests;
 #[cfg(test)]
 mod inline_block_tests;
 #[cfg(test)]
+mod inline_flex_tests;
+#[cfg(test)]
 mod inline_table_tests;
 mod intrinsic;
 mod table;
@@ -262,8 +264,13 @@ pub fn layout_with_budget(
         nested: BudgetVec::new(memory)?,
         flex: BudgetVec::new(memory)?,
         flex_lines: BudgetVec::new(memory)?,
+        flex_order: BudgetVec::new(memory)?,
         last_baseline: None,
         natural: 0.0,
+        flex_wanted: false,
+        flex_watch: None,
+        flex_lead: None,
+        flex_first: None,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -355,6 +362,9 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// The lines of the wrapping containers being laid, a stack as
     /// `flex` is.
     flex_lines: BudgetVec<flex::FlexLine>,
+    /// A row's items by `order` then tree order, as `place_items` places
+    /// them: scratch, refilled for each row that orders its items.
+    flex_order: BudgetVec<(i32, u32)>,
     /// The baseline of the last line laid in flow, on a page with
     /// inline-blocks: an inline-block's own is its last line's (§5,
     /// "Inline-blocks"). Nested items and tables keep it as they found it.
@@ -363,6 +373,14 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// height, a flex container's its lines' or items' and a picture's
     /// its own: a flex column item's automatic minimum (§5, "Flex").
     natural: f64,
+    /// The next flex container laid is an inline-flex, whose baseline its
+    /// line takes: it watches `flex_watch`, its first item, for its first
+    /// line, `flex_lead`, and leaves its first baseline in `flex_first`
+    /// (§5, "Flex").
+    flex_wanted: bool,
+    flex_watch: Option<usize>,
+    flex_lead: Option<usize>,
+    flex_first: Option<f64>,
     left: f64,
     top: f64,
     right: f64,
@@ -529,7 +547,10 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
                 let block = b.kind == BoxKind::Block
                     || (b.kind == BoxKind::Image
-                        && !matches!(keyword(style, Property::Display), "inline" | "inline-block"));
+                        && !matches!(
+                            keyword(style, Property::Display),
+                            "inline" | "inline-block" | "inline-table" | "inline-flex"
+                        ));
                 let floats = self.styled.has_floats()
                     && b.parent.is_some()
                     && float_side(style, b.kind).is_some();
@@ -1054,6 +1075,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             f64::NEG_INFINITY,
             f64::NEG_INFINITY,
         );
+        let flex = matches!(kind, Kind::Inline { .. }) && !table && self.flex_container(&b)?;
+        self.flex_wanted = flex;
         let laid = if table {
             self.inline_table(id, dims, place, y + dims.margin.top, depth + 1)
         } else {
@@ -1072,7 +1095,12 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         self.waiting = waiting;
         self.first_line = first_line;
         let last = std::mem::replace(&mut self.last_baseline, last_baseline);
-        let (laid, first_row) = laid?;
+        let (laid, mut first_row) = laid?;
+        if flex {
+            // An inline-flex's is its first baseline, as a table's is its
+            // first row's.
+            first_row = self.flex_first.take();
+        }
         let height = laid + dims.margin.vertical();
         let width = if table {
             // A table sizes itself: its margin box is that of its box, the
@@ -1900,7 +1928,10 @@ fn sized(
     } = bounds;
     let block = b.kind == BoxKind::Block
         || (b.kind == BoxKind::Image
-            && !matches!(keyword(style, Display), "inline" | "inline-block"));
+            && !matches!(
+                keyword(style, Display),
+                "inline" | "inline-block" | "inline-table" | "inline-flex"
+            ));
     if block {
         let free = width - used_width - decor.horizontal() - margin.horizontal();
         let auto_left = length(style, MarginLeft, Some(width)).is_none();

@@ -555,7 +555,7 @@ impl<'d> StyledDocument<'d> {
                     || (kind == BoxKind::Image
                         && !matches!(
                             keyword(computed, Property::Display),
-                            "inline" | "inline-block"
+                            "inline" | "inline-block" | "inline-table" | "inline-flex"
                         ))
                 {
                     out.geometry_count = out.geometry_count.checked_add(1).ok_or(Error::Invalid)?;
@@ -721,6 +721,16 @@ impl<'d> StyledDocument<'d> {
                 .style(geometry.style)
                 .is_some_and(|style| inline_block(style, BoxKind::Block))
     }
+    /// Whether `geometry` was laid for a flex container (DESIGN.md §5,
+    /// "Flex"), whose items paint as inline-blocks do: none on a page
+    /// without one.
+    pub fn is_flex_container(&self, geometry: &crate::block::BoxGeometry) -> bool {
+        self.flex
+            && !geometry.replaced
+            && self
+                .style(geometry.style)
+                .is_some_and(|style| flex_container(style, BoxKind::Block))
+    }
     pub fn style(&self, id: StyleId) -> Option<&ComputedStyle> {
         self.styles.get(id)
     }
@@ -854,7 +864,11 @@ impl StyledDocument<'static> {
 pub(crate) fn float_side(style: &ComputedStyle, kind: BoxKind) -> Option<Side> {
     let display = keyword(style, Property::Display);
     let block = kind == BoxKind::Block
-        || (kind == BoxKind::Image && !matches!(display, "inline" | "inline-block"));
+        || (kind == BoxKind::Image
+            && !matches!(
+                display,
+                "inline" | "inline-block" | "inline-table" | "inline-flex"
+            ));
     if !block || TableRole::of(display).is_some() {
         return None;
     }
@@ -865,18 +879,18 @@ pub(crate) fn float_side(style: &ComputedStyle, kind: BoxKind) -> Option<Side> {
     }
 }
 /// Whether a box of `kind` is an inline-block: a block whose display is
-/// `inline-block` or `inline-table`, laid whole in a line (DESIGN.md §5,
-/// "Inline-blocks"). td-css blockifies a floated one, so none floats; the
-/// root never is one, which its caller sees to.
+/// `inline-block`, `inline-table` or `inline-flex`, laid whole in a line
+/// (DESIGN.md §5, "Inline-blocks", "Flex"). td-css blockifies a floated
+/// one, so none floats; the root never is one, which its caller sees to.
 pub(crate) fn inline_block(style: &ComputedStyle, kind: BoxKind) -> bool {
     kind == BoxKind::Block
         && matches!(
             keyword(style, Property::Display),
-            "inline-block" | "inline-table"
+            "inline-block" | "inline-table" | "inline-flex"
         )
 }
 /// Whether a box of `kind` is a flex container: a block whose display is
-/// `flex` or `inline-flex`, the latter laid as the former for now
+/// `flex` or `inline-flex`, the latter an inline-block's content
 /// (DESIGN.md §5, "Flex").
 pub(crate) fn flex_container(style: &ComputedStyle, kind: BoxKind) -> bool {
     kind == BoxKind::Block && matches!(keyword(style, Property::Display), "flex" | "inline-flex")
