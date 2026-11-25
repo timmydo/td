@@ -48,8 +48,7 @@ fn check_mode(job: &td_json::Json, mode: &str) -> R<()> {
     require(
         declared
             == match mode {
-                "postgres-socket"
-                | "postgres-binaries"
+                "postgres-binaries"
                 | "postgres-to-debian"
                 | "retire-rollback"
                 | "recover"
@@ -134,7 +133,6 @@ fn run() -> R<()> {
     match args.as_slice() {
         [s, rest @ ..] if s == "__isolation" => isolation::helper(rest),
         [s] if s == "--activate" => supervise("activate"),
-        [s] if s == "--postgres-socket" => supervise("postgres-socket"),
         [s] if s == "--postgres-binaries" => supervise("postgres-binaries"),
         [s] if s == "--postgres-to-debian" => supervise("postgres-to-debian"),
         [s] if s == "--retire-rollback" => supervise("retire-rollback"),
@@ -191,10 +189,8 @@ mod tests {
     #[test]
     fn only_a_job_naming_a_postgres_operation_runs_it() -> R<()> {
         let plain = td_json::parse(r#"{"revision":"r"}"#)?;
-        let socket = td_json::parse(r#"{"revision":"r","mode":"postgres-socket"}"#)?;
         let other = td_json::parse(r#"{"revision":"r","mode":"activate"}"#)?;
         check_mode(&plain, "activate")?;
-        assert!(check_mode(&socket, "activate").is_err());
         assert!(check_mode(&other, "activate").is_err());
         for mode in ["restore-shared-services", "refresh-notifications"] {
             let named = td_json::parse(&format!(r#"{{"revision":"r","mode":"{mode}"}}"#))?;
@@ -202,15 +198,11 @@ mod tests {
             assert!(check_mode(&plain, mode).is_err());
             assert!(check_mode(&named, "activate").is_err());
         }
-        check_mode(&socket, "postgres-socket")?;
-        assert!(check_mode(&plain, "postgres-socket").is_err());
         let binaries = td_json::parse(r#"{"revision":"r","mode":"postgres-binaries"}"#)?;
         check_mode(&binaries, "postgres-binaries")?;
-        assert!(check_mode(&binaries, "postgres-socket").is_err());
-        assert!(check_mode(&socket, "postgres-binaries").is_err());
         assert!(check_mode(&plain, "postgres-binaries").is_err());
         assert!(check_mode(&binaries, "activate").is_err());
-        assert!(check_mode(&td_json::parse(r#"{"mode":1}"#)?, "postgres-socket").is_err());
+        assert!(check_mode(&td_json::parse(r#"{"mode":1}"#)?, "postgres-binaries").is_err());
         let retire = td_json::parse(r#"{"revision":"r","mode":"retire-rollback"}"#)?;
         check_mode(&retire, "retire-rollback")?;
         assert!(check_mode(&plain, "retire-rollback").is_err());

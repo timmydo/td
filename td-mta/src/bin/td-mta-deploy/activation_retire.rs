@@ -1,7 +1,6 @@
 //! Retiring rollback material once its window has passed: earlier job
 //! directories (receipts, the original data directory a migration left,
-//! uploaded closures, the loopback TLS material and CA key the socket
-//! cutover retired), the physical recovery copies activations took, and
+//! uploaded closures), the physical recovery copies activations took, and
 //! the retained Debian PostgreSQL tree once a verified switch left it.
 //! Irreversible, so the job must say so. Early retirement (`RETIRE_ALL`)
 //! removes it all whatever its age, once a ready scheduled backup is

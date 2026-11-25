@@ -37,7 +37,7 @@ decision.
 | Installed maintenance helper | `/opt/td-mta/bin/td-mta-operator` |
 | Mail state root | `/var/lib/td-mta/mail` |
 | Private PostgreSQL connection files | `/var/lib/td-mta/mail/runtime-connection`, `/var/lib/td-mta/mail/owner-connection` |
-| PostgreSQL socket directory, once cut over | `/var/lib/td-mta-postgres` (`td-mta:td-mta-db` 0750) |
+| PostgreSQL socket directory | `/var/lib/td-mta-postgres` (`td-mta:td-mta-db` 0750) |
 | Database writer fence (present only while fenced) | `/etc/td-mta/postgres-fence.conf` |
 | PostgreSQL server and tools, once switched | `/td/store/HASH-postgresql-x86-64-17.N/bin`, with td glibc in `/td/store/HASH-glibc-x86-64-VERSION` |
 | Retained Debian PostgreSQL, until retired | `/opt/td-mta/postgresql/usr/lib/postgresql/17/bin` |
@@ -107,11 +107,9 @@ reached the limit. The bounds are fixed constants, so raising them is a code
 change (DESIGN.md section 9).
 
 `td-mta-postgres.service` separately runs PostgreSQL 17. Production
-still serves it on loopback TCP 35432 with TLS, verified against a
-private CA under `/var/lib/td-mta/mail/tls`, until the pending cutover
-([Leaving loopback TLS](#leaving-loopback-tls)) moves it to the private
-Unix socket `/var/lib/td-mta-postgres/.s.PGSQL.35432`, with no TCP
-listener and no TLS. The socket is `td-mta:td-mta-db` mode 0660 in a
+serves it on the private Unix socket
+`/var/lib/td-mta-postgres/.s.PGSQL.35432`, with no TCP listener and no
+TLS. The socket is `td-mta:td-mta-db` mode 0660 in a
 0750 directory; PostgreSQL runs as `td-mta` and joins the memberless
 system group `td-mta-db` through its `90-td-mta-socket.conf` drop-in, so
 it can give the socket that group. Each login authenticates with SCRAM.
@@ -173,10 +171,8 @@ before touching the live installation.
 
 Public certificates renew through `td-mta-acme-production.service`, without
 certbot. Leave public TCP 80 reachable for HTTP-01 renewal, as well as SMTP 25
-and HTTPS 443. Until the socket cutover the database's loopback TLS leaf
-renews through `td-mta-maint-postgres-tls-renew.timer`, which the cutover
-retires; on the private socket the database has no certificate. Certificate management
-and software updates are independent.
+and HTTPS 443. On its private socket the database has no certificate.
+Certificate management and software updates are independent.
 
 Scheduled backups use `td-mta-maint-backup.timer`, retaining at most seven
 archives within a 4 GiB total bound and a 1 GiB per-archive bound. These bounds
@@ -331,10 +327,8 @@ its HBA entry to `local replication` and that role. Reload HBA and verify
 a replication connection whose libpq service names
 `host=/var/lib/td-mta-postgres` and `port=35432`. The mode-0600 passfile
 entry names that directory as its host, the PostgreSQL port, `replication`
-and the backup role. Until the socket cutover
-([Leaving loopback TLS](#leaving-loopback-tls)) production's entry is a
-loopback `hostssl` rule and its service and passfile name the loopback
-TLS server; the cutover rewrites them. Keep the credential with the backup operator. The streaming procedure uses no permanent replication
+and the backup role. Keep the credential with the backup operator. The
+streaming procedure uses no permanent replication
 slot and requires no change to `archive_mode`.
 
 Stage both binaries, the migration commands and the comparison queries.
@@ -472,8 +466,6 @@ and pushes that exact Git object into the host's build mirror over the SSH
 identity its [target configuration](#deploy-target-configuration) names.
 It checks the deployed tree and refuses divergent history. When no newer
 revision qualifies it checks the running release and leaves mail online.
-A host whose PostgreSQL still uses loopback TLS first takes a stepping
-stone instead ([Leaving loopback TLS](#leaving-loopback-tls)).
 The main-integration runner owns the verdicts (see DEVELOPMENT.md).
 To deploy the fetched main tip even when its integration verdict is missing
 or failed, run `./td-mta/deploy --skip-tests`. The deployment receipt records
@@ -660,9 +652,7 @@ every job's candidate copy and what the latest job left (`nothing to
 recover`). Once the fence is gone
 it removes the candidate copy, the start permit, the fence conditions,
 the working parts of a recovery copy and the decision, then records
-`recovered`. The
-loopback-TLS socket cutover is the one fenced job it refuses
-([Leaving loopback TLS](#leaving-loopback-tls)). A switch recovered forward leaves no Debian tree
+`recovered`. A switch recovered forward leaves no Debian tree
 window: `--postgres-binaries` naming the running closure verifies it and
 records one.
 
@@ -670,12 +660,9 @@ records one.
 
 Rollback material stays for seven days after its last write: each
 earlier job directory under `/var/lib/td-mta-operator` (its receipt, the
-original data directory a migration left, uploaded closures, and the
-loopback TLS material, CA key and retired check units the socket
-cutover moved there), and
+original data directory a migration left and uploaded closures), and
 each physical recovery copy under `/data/td-mta-physical-recovery` (base
-backup, WAL and `bootstrap.tar`; copies taken before the socket cutover
-hold the old TLS directory and its CA key). While td's server is
+backup, WAL and `bootstrap.tar`). While td's server is
 selected, the retained Debian tree `/opt/td-mta/postgresql` is material
 too, from the time the switch to the running td closure verified, which
 the switch records in
@@ -768,227 +755,6 @@ launcher reports an `--all` job whose receipt does not record `all` as
 `failed`. Without `--all` no backup is read and the window applies as
 above.
 
-
-### Leaving loopback TLS
-
-Production's move to the private socket is pending. Its PostgreSQL
-still listens on loopback TCP 35432 with TLS (`listen_addresses =
-'127.0.0.1'`, `ssl = on`, no Unix socket), `td-mta-maint-postgres-tls-renew.timer`
-renews the server's leaf, and the live release predates daceb7309, the
-first main commit whose td-mta admits the group-shared socket
-(`td_fs::check_server_socket`). Every main revision from c8f8e087d on
-refuses TCP+TLS connection files, and this controller activates no
-release on a loopback-TLS host; under a release older than daceb7309 the
-isolated services could not reach the socket `--postgres-socket`
-installs. The launcher therefore enforces one order, from the
-development checkout:
-
-1. `./td-mta/deploy --irreversible --revision STONE`, adding
-   `--skip-tests` when no stepping stone has a verdict: deploys the
-   stepping stone. A plain `./td-mta/deploy` refuses and names this
-   command, with STONE filled in, as `approve`. Its outcome names step 2.
-2. `./td-mta/deploy --postgres-socket`: the fenced transport cutover,
-   under the stepping stone. Run it first with `--plan` to check it
-   without changing anything (below).
-3. `./td-mta/deploy`: the newest verified main, as for any update. With
-   no passing verdict after 290c6de7d here it stays in the stepping-stone
-   range and says so; wait for the runner's verdict on a newer head, or
-   add `--skip-tests` to take the tip untested.
-4. `./td-mta/deploy --postgres-binaries`
-   ([Switch PostgreSQL to the td-built binaries](#switch-postgresql-to-the-td-built-binaries)).
-
-The launcher reads the host's state before building anything. The
-transport is the runtime connection file the controller judges, which
-`sudo sed` prints on the host with its password removed and the launcher
-parses as the controller does; the live release's capabilities are its
-ancestry, in the fetched history, against three reviewed constants in
-`td-mta/src/bin/td-mta-deploy/launcher_transport.rs`: daceb7309, 290c6de7d
-(c8f8e087d's parent, the last release that still reads TCP+TLS files)
-and the loopback-TLS controller below. While the host is on loopback TLS
-and the live release lacks daceb7309, every operation but a deploy
-refuses and names step 1; once it has it, every operation but
-`--postgres-socket` refuses and names step 2; `--converge-config` is
-among them, since the controller judges the transport before any mode.
-On the socket, `--postgres-binaries` and `--converge-config` refuse and
-name step 3 while the live release is a stepping stone (`--to-debian`
-stays open; convergence reads `td-mta/production-overrides.conf` from
-the live release, which no stepping stone has), adding `--skip-tests`
-when no main revision after 290c6de7d has a verdict here. Each refusal prints a
-`td-mta-deploy-outcome` line ([Command outcomes](#command-outcomes)).
-
-The stepping stone is the newest first-parent origin/main revision after
-the live release that contains daceb7309, is 290c6de7d or older, and has
-a passing main-integration verdict on this machine. The runner records
-verdicts only for the newest main head, so none can be produced for an
-older revision; with none in that range the deploy refuses and names
-`--skip-tests`, which takes the newest revision in the range, 290c6de7d,
-and records the override as for main. Newest, as for main: the oldest,
-daceb7309, would change the least, while every revision in the range
-from e691e72b7 on reaches the database through td-postgres's TLS client,
-which production has not run; the controller qualifies the candidate
-against the live database, and rehearses its migration on a copy, before
-any fence. It runs under the controller of daceb7309, the last
-one that activates a release on a loopback-TLS host, whose controller
-sources are the live release's own. The launcher builds it like any
-controller, from Cargo's frozen dependency set; that set includes
-tokio-postgres and its closure, which main no longer locks, so when the
-Cargo cache has lost them the deploy refuses and says to run `cargo
-fetch --locked --manifest-path td-mta/Cargo.toml` in a checkout of
-daceb7309. That controller predates `host.json` and fixes this host's
-name, build account and source mirror in its sources; the launcher reads
-them from there and refuses, naming the `host.json` field that differs,
-before anything reaches the host. Its probes also verify the listeners'
-certificate against its fixed public name (`mx.timmydouglas.com`), which
-the launcher does not compare with `host.json`, since a certificate may
-carry several names; if the certificate lacks it, the job fails at its
-preflight probes, before any fence. It also predates the
-`--irreversible` consent and migrates the database without asking
-(schema 45 to 46 here), so the launcher requires the flag, with
-`--revision` naming the stone and no `--schema-target`; budget the
-writer window as for any migration (`--window-seconds`). Budget disk
-too: the stepping stone keeps its `original-pgdata` and recovery copy,
-step 2 takes another base backup, and `--retire-rollback`, refused on a
-loopback-TLS host, retires only material older than seven days.
-
-It has no `--recover`. While its fence is held, its writer fence also
-includes an nftables table `td_mta_deploy_SUFFIX` (the job directory's
-suffix), which reserves the loopback database connection for root and
-does not survive a reboot. A stepping-stone job whose controller dies
-inside its fence is outside what `--recover` models, as is the socket
-cutover's, and while a fence is held on a loopback-TLS host every
-operation refuses and names no next step. While a `td-mta-deploy-*` unit
-is still active the launcher says so and prints it instead: the job owns
-its fence, so follow its journal and wait; touch nothing by hand while
-it runs. A job that hangs stays listed until its unit is stopped
-(`systemctl stop UNIT`), and a controller run by hand in a job
-directory is no unit, so its fence reads as held. Once none is
-running, recover it by hand:
-`/var/lib/td-mta-operator/deployment-fence` names the job. Check its
-receipt's events, the unit states, the selected executable, both PGDATA
-directories (the live one and the job's `original-pgdata`) and the
-recovery copy's receipt before reopening writers, and never restore a
-retained cluster after writers may have reopened without reconciling
-the mail accepted since.
-
-`--postgres-socket` then rehearses the cutover with the live release on
-a fresh copy before it changes production, and refuses there too if
-that release cannot reach the group-shared socket. It moves each
-loopback SCRAM rule in `pg_hba.conf` to the socket and carries no
-`local` rule but SCRAM or reject; production's `local all setup_admin
-trust` would admit every account in the socket group. Such a rule
-refuses the cutover unless `postgresql.conf`, the server's reading of it
-with `postgresql.auto.conf` and the running postmaster all have no Unix
-socket: it then admits no one, and the cutover drops it and names it in
-its receipt (events and `socket_hba_dropped`). That rule was an older
-install's superuser entry for a start under `bootstrap.conf`, which the
-cutover leaves naming retired TLS material, so afterwards no
-configuration admits a superuser to the live cluster: start a private
-copy with its own `hba_file` and a peer rule, as the rehearsals do. Its
-job directory under `/var/lib/td-mta-operator` keeps the replaced settings
-(`postgres-socket/original/`) and the retired TLS material, CA key
-included (`postgres-socket/retired/`), for the rollback window
-([Retiring rollback material](#retiring-rollback-material)).
-
-The material it retires is `/var/lib/td-mta/mail/tls` and, with isolated
-services, each `/var/lib/td-mta-services/ROLE/tls`; the cutover retires
-the jobs that check it with it. Staging recognises each only in the form
-its generator wrote, and refuses before any fence on any other unit,
-health line or notification check that names the material, as on a
-job that names an unconverted connection file:
-
-- The operations installer's expiry checks `td-mta-maint-tls-N`: a
-  service running exactly `OPENSSL x509 -in FILE -noout -checkend
-  2592000` on a file directly in one of those directories, with no
-  drop-in but a fence's own condition (an empty drop-in directory is
-  none), whose service and timer files are either the installer's own,
-  linked from its prefix's `share/td-mta/services`, byte for byte, with
-  the Shepherd definition beside them, if any, registering that service
-  and running that command; or root's regular-file copies in
-  `/etc/systemd/system`, as production has them: the timer byte for
-  byte, the service byte for byte or with exactly the six lines from
-  `User=td-mta` to `TasksMax=32` that production's hand-installed
-  maintenance services carry after `[Service]` (the readiness jobs'
-  template took them from there). A check's service and timer are both
-  copies or both linked from one directory. Their timers stay stopped
-  from the fence on (`retired_timers_excluded`). After verification the
-  job disables them, moves their files into `retired/units` beside the
-  renewal job's (`retired_units`), with, for linked files, the Shepherd
-  definition and any other unit file of the same name beside them in
-  the installer's directory (such as a timer disabled by hand), keeping
-  each file's owner and mode so that copying it back with `cp -p`
-  restores it, and removes the drop-in directory left beside
-  each once it holds nothing but the fence's condition
-  (`retired_unit_dropins`; one holding anything else stays, in
-  `retired_unit_dropins_left`). The installer's own files in `share`
-  that production copied stay where they are, linked by nothing.
-- `td-mta-health.service`: its readiness drop-in becomes the socket
-  layout's, and the unit file itself loses each `ExecStart=` expiry
-  check of a file in those directories (`OPENSSL x509 -in FILE`, then
-  `-noout -checkend 2592000` or `-checkend 2592000 -noout`, plain or
-  each word in double quotes; the drop-in's `ExecStart=` already
-  overrode them), every other line byte for byte.
-- The notification monitor's `tls-N` status checks of the same files:
-  `config.json` and `isolated.json` lose them
-  (`socket_notification_checks_dropped`). `isolated.json` must be as
-  the isolation helper writes it; `config.json`, which may carry the
-  operator's `alerts`, is written back in the installer's canonical
-  form, its other content unchanged.
-
-The unit file and the notification configurations are staged files, so
-the rollback before writer admission restores them; the retired units
-stay in the job directory for the rollback window. The receipt's
-`socket_retired_checks` names the checks. `install-td-mta
---operations-services` refuses a `--tls-certificate` that names no
-file, so generating from the old options brings none of them back.
-
-`./td-mta/deploy --postgres-socket --plan` runs the cutover's checks
-up to its rehearsal and stops before it changes anything: the
-preflight, with the readiness settings and the socket group read as
-they are (a check refuses while a readiness setting is missing, since
-the cutover installs those before it stages); staging, with every
-guard above; and what the cutover requires before its fence, read only:
-the fence and socket directories, if present, the recovery volume and
-its room for the rehearsal's base backup, the backup and health
-timers, and the public probes. It does not rehearse, since the
-rehearsal's base backup and trial server are neither cheap nor apart
-from the live host. Unlike the cutover, it does not stop at a refusal
-where the steps after it do not depend on it: each converted file, each
-setting, the health unit, each check unit, each job naming the old
-transport, each notification configuration and each requirement before
-the fence is checked on its own, and the outcome lists every refusal
-(`refusals`, the first also as `error`; the receipt's
-`socket_refusals`), a refusal of a converted file or setting prefixed
-with its path. The
-preflight before staging still stops it; a step whose input a refused
-step would have produced (`pg_hba.conf` after `postgresql.conf`, a
-passfile after its service file, the rehearsal's room after its volume)
-is skipped. A job naming a connection file whose conversion is refused
-is not reported again. The receipt's `socket_retired_checks` then names
-the check units found, verified or not.
-It writes its job directory (the receipt and the staged files), the
-controller under `/opt/td-mta/lib/td-mta/deploy` as every job does, and
-the activation lock; its health preflight starts the status and health
-oneshots, as every job's does. It reads systemd's loaded units, so run
-`systemctl daemon-reload` after clearing a refusal by hand. On the
-socket it runs that run's checks and names the check units a
-`--postgres-socket` there would retire. Its outcome is
-`socket-cutover-checked`, whose `next` is the cutover; a refusal is
-`failed`, naming what to clear.
-
-The renewal units `td-mta-maint-postgres-tls-renew.{service,timer}`
-are not checked: the cutover leaves their timer out of admission, and
-disables and stops them after verification. Only the installer's linked
-files move; a copy in `/etc/systemd/system` stays where it is, disabled,
-and is named in `retired_units_left`.
-
-Each refusal names the unit or file. To clear one, make it the form
-above or remove it by hand: disable and unlink a check that is not the
-installer's, drop a drop-in a check unit should not have, take a line
-naming the material out of the health unit, or remove the check from
-`config.json` and `isolated.json` (which stays the one compact line the
-isolation helper writes: `--refresh-notifications`, which derives it,
-refuses until the host is on the socket).
-
 ### Converge the configuration
 
 Production's td-mta configuration is the defaults of the release it runs
@@ -1065,10 +831,8 @@ with the outcome line of "Command outcomes"; a failure also prints
   - `refused`: the launcher, or the host job's preflight, refused
     before changing anything; a preflight that refused before its
     receipt names why from its `refusal.json`;
-  - `busy`: another job held the host's activation lock, or, on a host
-    still on loopback TLS, the launcher found a deployment job running,
-    so this one changed nothing; `next` repeats it once that job has
-    ended;
+  - `busy`: another job held the host's activation lock, so this one
+    changed nothing; `next` repeats it once that job has ended;
   - `unknown`: the job settled no result the launcher could read: the
     connection was lost, the receipt could not be read, or the job died
     or still runs. Read `receipt` on the host and the journal of `unit`;
@@ -1081,11 +845,8 @@ with the outcome line of "Command outcomes"; a failure also prints
   `request`, `receipt` and `unit`, when known.
 - `next`: after a successful plan, the apply command bound to its digest
   with the plan's `--config` and `--jmap-account`, needing nothing; after
-  `busy`, the same run; for a refusal by the host's transport, the step
-  that comes first ([Leaving loopback TLS](#leaving-loopback-tls)) with
-  `--config` and `--jmap-account`; else null. Convergence takes no
-  decision, so its own `next` never does; a transport step that takes
-  one is `approve` instead, as under "Command outcomes".
+  `busy`, the same run; else null. Convergence takes no decision, so its
+  `next` never does.
 
 To return to the previous configuration by hand, select the receipt's
 `config_previous_version` against the current generation with
@@ -1269,29 +1030,15 @@ configuration"; every other mode holds the following:
   - `unknown`: the SSH connection ended before the job reported, or the
     job failed and whether it left the deployment fence could not be
     read;
-  - `busy`: another job held the host's activation lock, or, on a host
-    still on loopback TLS, the launcher found a deployment job running
-    before it started its own, so this one changed nothing; `next`
-    repeats it once that job has ended (or `approve` does, when the run
-    took a decision). Each
+  - `busy`: another job held the host's activation lock, so this one
+    changed nothing; `next` repeats it once that job has ended (or
+    `approve` does, when the run took a decision). Each
     run builds and uploads the controller again and leaves a job
     directory, so wait for the running job (minutes, its window)
     rather than retrying at once;
-  - `refused`: the launcher refused before it started a job. A
-    transport refusal ([Leaving loopback TLS](#leaving-loopback-tls))
-    names the step to run instead, as `next`, or as `approve` when that
-    step takes `--irreversible` or `--skip-tests`. When main no longer
-    selects an authorised `--revision`, `next` (or `approve`, when the
-    run skipped tests) is the run without the authorisation;
-  - `stepping-stone-deployed`: a stepping-stone deploy verified; `next`
-    is `--postgres-socket`. A stepping-stone job that ends unseen or
-    leaves its fence is `unknown` or `failed` with `next` null, since
-    `--recover` does not model the loopback-TLS controller's jobs;
-  - `socket-cutover-checked`: `--postgres-socket --plan` ran its checks
-    and changed nothing; `next` is `--postgres-socket`, with this run's
-    `--window-seconds`. A check job that exits without saying so in its
-    receipt is `unknown` with `next` null; one that did not report is
-    `unknown` with `next` the check again, since it takes no fence;
+  - `refused`: the launcher refused before it started a job. When main
+    no longer selects an authorised `--revision`, `next` (or `approve`,
+    when the run skipped tests) is the run without the authorisation;
   - `refused-irreversible`: the deployment would migrate the database
     and was not given `--irreversible --schema-target N --revision HEX`
     for that migration. `next` is null; `approve` is the command that
@@ -1300,19 +1047,14 @@ configuration"; every other mode holds the following:
     window, or with `--all` found no ready scheduled backup newer than
     its material; `approve` repeats it, not before `not_before`.
 - `error`: on a refusal or failure, the message, which the command also
-  prints on standard error before exiting nonzero. A refused
-  `--postgres-socket --plan` check that got past its preflight also
-  has `refusals`, every refusal it found, the first being `error`. A job refused before
+  prints on standard error before exiting nonzero. A job refused before
   it reserved its receipt records why in `refusal.json` in its job
   directory, which the launcher reads in its place;
 - `next`: the command that follows, as `{"argv": [...], "needs":
   [...]}` with the options whose values the operator supplies, or
   `null`. It never takes a decision: a command that would is `approve`
   instead. A job that leaves the deployment fence held, or whose outcome
-  is unknown, is followed by `--recover` (except the stepping stone's,
-  and a socket cutover that left its fence, which `--recover` does not
-  model: their `next` is null; and a check, which takes no fence and is
-  followed by itself), which waits for no running
+  is unknown, is followed by `--recover`, which waits for no running
   job: it refuses while one holds the activation lock. A recovery that
   leaves the fence is followed by itself too, unless it refused the
   fence's kind, which no rerun changes.
@@ -1457,10 +1199,9 @@ On this host the root-only libpq service file is
 `/var/lib/td-mta-operator/physical-backup/service.conf`. Its
 `cutover_repl` profile uses `td_mta_cutover_backup` and `repl.pass`.
 The ordinary `cutover_marker` profile uses `td_mta_cutover_marker`,
-`marker.pass` and the `postgres` database. On the private socket both
-name `host=/var/lib/td-mta-postgres` and `port=35432`, and their
-passfile entries name that directory as the host; until then they name
-the loopback TLS server, and the socket cutover rewrites them. The controller passes each
+`marker.pass` and the `postgres` database. Both name
+`host=/var/lib/td-mta-postgres` and `port=35432`, and their passfile
+entries name that directory as the host. The controller passes each
 service file to `psql` explicitly through `PGSERVICEFILE`.
 The same operator directory supplies `compare-selected.sql`, a bounded
 read-only transaction producing deterministic rows for schema, epoch,
@@ -1479,10 +1220,7 @@ packages under `/opt/td-mta/postgresql`. td builds its own
 (`postgresql-x86-64`: no ICU, OpenSSL, lz4 or zstd), and TRUST.md, "td
 store on a foreign deployment host", says what enters the host's
 `/td/store` and what runs it. The switch keeps the live release and the
-data directory in place. The host must already use the private socket,
-and its live release must not be the loopback-TLS stepping stone (one
-from daceb7309 through 290c6de7d); the launcher refuses otherwise and
-names the step.
+data directory in place, on the private socket.
 
 What updating across each PostgreSQL 17 minor release asks of an
 installation is a reviewed table in the controller,

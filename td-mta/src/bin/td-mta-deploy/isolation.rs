@@ -18,7 +18,6 @@ mod scoped;
 mod tests;
 
 pub(crate) const NOTIFY: &str = "/var/lib/td-mta/mail/.operations/notifications";
-pub(crate) use scoped::NOTIFICATION_LIMIT;
 const BASE: &str = "/var/lib/td-mta-services";
 const MAIL: &str = "/var/lib/td-mta/mail";
 const BIN: &str = "/opt/td-mta/bin/td-mta";
@@ -87,17 +86,8 @@ pub(crate) fn installed() -> R<bool> {
 }
 
 /// Whether some but not all identity settings are in place.
-pub(crate) fn partial(tls: bool) -> R<bool> {
-    files::partial(&if tls {
-        files::production_tls()?
-    } else {
-        files::production()?
-    })
-}
-
-/// The identity settings as they were while PostgreSQL used loopback TLS.
-pub(crate) fn installed_tls() -> R<bool> {
-    files::installed(&files::production_tls()?)
+pub(crate) fn partial() -> R<bool> {
+    files::partial(&files::production()?)
 }
 
 pub(crate) fn install(host: &Host) -> R<()> {
@@ -314,20 +304,13 @@ pub(crate) fn socket_password<'a>(uri: &'a str, user: &str) -> R<&'a str> {
 }
 
 /// The memberless system group whose members may reach the shared socket.
-pub(crate) fn db_group(host: &Host, create: bool) -> R<u32> {
-    let lookup = || {
-        host.exec(
-            host.cmd("getent").args(["group", DB_GROUP]),
-            &[],
-            Duration::from_secs(10),
-            false,
-        )
-    };
-    let mut found = lookup()?;
-    if create && found.status.code() == Some(2) {
-        host.run(host.cmd("groupadd").args(["--system", DB_GROUP]))?;
-        found = lookup()?;
-    }
+pub(crate) fn db_group(host: &Host) -> R<u32> {
+    let found = host.exec(
+        host.cmd("getent").args(["group", DB_GROUP]),
+        &[],
+        Duration::from_secs(10),
+        false,
+    )?;
     require(found.status.success(), "missing PostgreSQL socket group")?;
     let row = std::str::from_utf8(&found.stdout)?.trim_end();
     let mut fields = row.split(':');
@@ -352,21 +335,6 @@ pub(crate) fn db_group(host: &Host, create: bool) -> R<u32> {
         require(ids.gid != gid, "socket group is an account's primary group")?;
     }
     Ok(gid)
-}
-
-/// The socket group's id, or None while it does not exist, which
-/// `db_group(host, true)` would create.
-pub(crate) fn db_group_present(host: &Host) -> R<Option<u32>> {
-    let found = host.exec(
-        host.cmd("getent").args(["group", DB_GROUP]),
-        &[],
-        Duration::from_secs(10),
-        false,
-    )?;
-    if found.status.code() == Some(2) {
-        return Ok(None);
-    }
-    db_group(host, false).map(Some)
 }
 
 fn make_directory(path: &Path, mode: u32) -> R<()> {
@@ -498,9 +466,9 @@ fn status_field<'a>(status: &'a str, field: &str) -> R<&'a str> {
         .ok_or("missing process credential field".into())
 }
 
-// `db` is the socket group's id once the services reach PostgreSQL through
-// the shared socket, and None on the loopback TLS layout.
-fn verify_live(host: &Host, role: &Role, account: Account, db: Option<u32>) -> R<()> {
+// `db` is the id of the group through which the services reach
+// PostgreSQL's shared socket.
+fn verify_live(host: &Host, role: &Role, account: Account, db: u32) -> R<()> {
     let pid: u32 = host
         .out(
             host.cmd("systemctl")
@@ -543,33 +511,25 @@ fn verify_live(host: &Host, role: &Role, account: Account, db: Option<u32>) -> R
     )
 }
 
-// With a socket group, a live service's groups are exactly its own and that
-// group. On the loopback TLS layout every listed group is its own.
-fn live_groups(groups: &str, own: u32, db: Option<u32>) -> R<bool> {
+// A live service's groups are exactly its own and the socket group.
+fn live_groups(groups: &str, own: u32, db: u32) -> R<bool> {
     let (mut seen_own, mut seen_db) = (false, false);
     for value in groups.split_whitespace() {
         let id = value.parse::<u32>()?;
         if id == own {
             seen_own = true;
-        } else if Some(id) == db {
+        } else if id == db {
             seen_db = true;
         } else {
             return Ok(false);
         }
     }
-    Ok(db.is_none() || (seen_own && seen_db))
+    Ok(seen_own && seen_db)
 }
 
-/// `tls` selects the settings of the loopback TLS layout, which only the
-/// private socket cutover still meets.
-pub(crate) fn verify(host: &Host, live: bool, tls: bool) -> R<()> {
-    let settings = if tls { installed_tls()? } else { installed()? };
-    require(settings, "isolated unit settings missing")?;
-    let db = if tls {
-        None
-    } else {
-        Some(db_group(host, false)?)
-    };
+pub(crate) fn verify(host: &Host, live: bool) -> R<()> {
+    require(installed()?, "isolated unit settings missing")?;
+    let db = db_group(host)?;
     for (role, account) in accounts(host, false)? {
         verify_unit(host, role.unit, role.user)?;
         if role.name != "acme" {

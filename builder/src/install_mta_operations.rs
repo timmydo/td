@@ -882,9 +882,8 @@ fn notification_config(opts: &Options, jobs: &[Job]) -> Result<Option<Json>> {
 }
 
 fn install(opts: &Options) -> Result<()> {
-    // A check of a file that is not there fails at every run. The socket
-    // cutover moves PostgreSQL's loopback TLS files aside and retires their
-    // checks; generation from the old options must not bring them back.
+    // A check of a file that is not there fails at every run: generation
+    // from options naming a removed certificate must not bring it back.
     if opts.tls.iter().any(|path| !path.is_file()) {
         return Err("each --tls-certificate must name an existing certificate file this account can reach: a check of a missing one fails at every run".into());
     }
@@ -1451,7 +1450,7 @@ mod tests {
             )
             .unwrap()
         };
-        // The socket cutover moved the file aside: its check is not generated.
+        // A removed certificate's check is not generated.
         assert!(install(&generate(&certificate))
             .unwrap_err()
             .contains("existing certificate file"));
@@ -1462,8 +1461,6 @@ mod tests {
         assert!(prefix
             .join("share/td-mta/services/td-mta-maint-tls-0.timer")
             .is_file());
-        // td-mta-deploy recognises the checks it retires by exactly this
-        // text (activation_retired_checks.rs): a change here is one there.
         let opts = generate(Path::new("/var/lib/td-mta/mail/tls/server.pem"));
         let jobs = jobs(&opts).unwrap();
         let generated = files(&jobs[0], &opts.state).unwrap();

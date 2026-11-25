@@ -7,21 +7,10 @@ use td_json::Json;
 
 const HEALTH: &str = "td-mta-health.service";
 const HEALTH_CHECKS: &str = include_str!("units/zz-readiness-jobs.conf");
-// The aggregate while PostgreSQL used loopback TLS: only the private socket
-// cutover expects and replaces it.
-const HEALTH_CHECKS_TLS: &str = include_str!("units/zz-readiness-jobs.tls.conf");
 const UNIT_DIR: &str = "/etc/systemd/system";
 const BUS_PATH: &str = "/org/freedesktop/systemd1/unit/td_2dmta_2dhealth_2eservice";
 
-fn checks(tls: bool) -> &'static str {
-    if tls {
-        HEALTH_CHECKS_TLS
-    } else {
-        HEALTH_CHECKS
-    }
-}
-
-pub(crate) fn settings(dir: &Path, tls: bool) -> R<Vec<Setting>> {
+pub(crate) fn settings(dir: &Path) -> R<Vec<Setting>> {
     let mut list = Vec::new();
     for role in crate::activate::PROFILES {
         let name = fmt(format_args!("td-mta-maint-mail-{role}"))?;
@@ -42,7 +31,7 @@ pub(crate) fn settings(dir: &Path, tls: bool) -> R<Vec<Setting>> {
         &mut list,
         Setting {
             path: child(dir, "td-mta-health.service.d/zz-readiness-jobs.conf")?,
-            text: owned(checks(tls))?,
+            text: owned(HEALTH_CHECKS)?,
             mode: 0o644,
         },
     )?;
@@ -165,11 +154,11 @@ fn check_job(property: &Json, role: &str) -> R<()> {
     )
 }
 
-fn qualify(host: &Host, tls: bool) -> R<()> {
+fn qualify(host: &Host) -> R<()> {
     check_commands(
         &command_property(host, HEALTH, BUS_PATH)?,
         false,
-        checks(tls),
+        HEALTH_CHECKS,
     )?;
     for role in crate::activate::PROFILES {
         let unit = fmt(format_args!("td-mta-maint-mail-{role}.service"))?;
@@ -191,55 +180,28 @@ fn qualify(host: &Host, tls: bool) -> R<()> {
     Ok(())
 }
 
-/// The production aggregate health drop-in of one transport layout.
-pub(crate) fn aggregate(tls: bool) -> R<Setting> {
-    settings(Path::new(UNIT_DIR), tls)?
-        .pop()
-        .ok_or_else(|| "missing aggregate health setting".into())
-}
-
-/// What `prepare` requires, changing nothing: true when every setting is
-/// in place and the aggregate qualifies, false when `prepare` would
-/// install the missing ones over the commands it replaces.
-pub(crate) fn check(host: &Host, tls: bool) -> R<bool> {
-    let mut complete = true;
-    for file in settings(Path::new(UNIT_DIR), tls)? {
-        complete &= files::present(&file)?;
-    }
-    if complete {
-        qualify(host, tls)?;
-    } else {
-        check_commands(
-            &command_property(host, HEALTH, BUS_PATH)?,
-            true,
-            checks(tls),
-        )?;
-    }
-    Ok(complete)
-}
-
-pub(crate) fn prepare(host: &Host, tls: bool) -> R<()> {
+pub(crate) fn prepare(host: &Host) -> R<()> {
     let mut missing = Vec::new();
-    for file in settings(Path::new(UNIT_DIR), tls)? {
+    for file in settings(Path::new(UNIT_DIR))? {
         if !files::present(&file)? {
             td_alloc::push(&mut missing, file)?;
         }
     }
     host.run(host.cmd("systemctl").arg("daemon-reload"))?;
     if missing.is_empty() {
-        return qualify(host, tls);
+        return qualify(host);
     }
     check_commands(
         &command_property(host, HEALTH, BUS_PATH)?,
         true,
-        checks(tls),
+        HEALTH_CHECKS,
     )?;
     let mut created = td_alloc::with_capacity(missing.len())?;
     let result = files::install_tracking(host, &missing, |file| {
         Ok(td_alloc::push(&mut created, file)?)
     })
     .and_then(|()| host.run(host.cmd("systemctl").arg("daemon-reload")))
-    .and_then(|()| qualify(host, tls));
+    .and_then(|()| qualify(host));
     if result.is_err() {
         let recovery = Host::default();
         recovery.recover();

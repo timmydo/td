@@ -159,7 +159,7 @@ fn read_manifest(path: &Path, source: &str, timeline: u32) -> R<(Json, u64)> {
 
 /// The recovery volume is a private root directory on another device
 /// than the live cluster's.
-pub(super) fn recovery_volume() -> R<()> {
+fn recovery_volume() -> R<()> {
     let meta = match fs::symlink_metadata(VOLUME) {
         Ok(meta) => meta,
         Err(e) => return Err(fmt(format_args!("private recovery mount {VOLUME}: {e}"))?.into()),
@@ -924,7 +924,7 @@ impl Recovery {
     pub(super) fn close(&mut self, h: &Deployment) -> R<()> {
         let receiver = self.stop_receiver();
         self.stop_copy(&h.host)?;
-        for name in ["migration", "replay", "transport", "binaries", "archive"] {
+        for name in ["migration", "replay", "binaries", "archive"] {
             let path = child(&self.work, name)?;
             if path.try_exists()? {
                 fs::remove_dir_all(path)?;
@@ -948,7 +948,7 @@ pub(super) fn close_dead(copy: Option<&Path>) -> R<()> {
                     .is_some_and(|n| n.starts_with("deploy-")),
             "the job's recovery copy is not on the recovery volume",
         )?;
-        for name in ["migration", "replay", "transport", "binaries", "archive"] {
+        for name in ["migration", "replay", "binaries", "archive"] {
             let path = child(copy, name)?;
             if path.try_exists()? {
                 fs::remove_dir_all(path)?;

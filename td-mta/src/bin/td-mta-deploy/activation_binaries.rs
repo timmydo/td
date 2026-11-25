@@ -810,7 +810,7 @@ impl Deployment {
         let closure = Closure::from_job(&self.record)?;
         self.check_source()?;
         self.socket_preflight()?;
-        crate::readiness::prepare(&self.host, false)?;
+        crate::readiness::prepare(&self.host)?;
         if !self.host.debian_tools() && self.host.tool("postgres")? == closure.postgres()? {
             loader::check_loading(&self.host, &closure)?;
             self.td_process(self.pid(PG)?, &closure)?;
@@ -956,7 +956,7 @@ impl Deployment {
             }
         }
         let uid = fs::metadata(PGDATA)?.uid();
-        let gid = isolation::db_group(&self.host, false)?;
+        let gid = isolation::db_group(&self.host)?;
         self.prepare_fence(true, false)?;
         self.fence(false, false)?;
         // The included file fences a restart from here on.
@@ -1070,7 +1070,7 @@ impl Deployment {
         )?;
         self.check_source()?;
         self.socket_preflight()?;
-        crate::readiness::prepare(&self.host, false)?;
+        crate::readiness::prepare(&self.host)?;
         let source = Source::of(&self.host)?;
         if matches!(source, Source::Debian) {
             require(launcher.as_str() == DEBIAN_SOURCE, LIVE_CHANGED_BACK)?;
@@ -1107,7 +1107,7 @@ impl Deployment {
 
     fn debian_cutover(&mut self, target: u32, switch: &mut Switch) -> R<()> {
         let uid = fs::metadata(PGDATA)?.uid();
-        let gid = isolation::db_group(&self.host, false)?;
+        let gid = isolation::db_group(&self.host)?;
         self.prepare_fence(true, false)?;
         self.fence(false, false)?;
         self.socket_fence = true;

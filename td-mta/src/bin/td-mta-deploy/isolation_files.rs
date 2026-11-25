@@ -32,10 +32,10 @@ fn dropin(units: &Path, unit: &str) -> R<PathBuf> {
 }
 
 // A service daemon reaches PostgreSQL's shared socket through its group; a
-// readiness job never touches the database. `tls` is the old layout.
-fn service_settings(role: &Role, daemon: bool, tls: bool) -> R<String> {
+// readiness job never touches the database.
+fn service_settings(role: &Role, daemon: bool) -> R<String> {
     let user = role.user;
-    let group = if daemon && !tls { DB_GROUP } else { "" };
+    let group = if daemon { DB_GROUP } else { "" };
     let mut settings = fmt(format_args!("[Service]\nUser={user}\nGroup={user}\nSupplementaryGroups={group}\nUMask=0077\nNoNewPrivileges=yes\nAmbientCapabilities=\nCapabilityBoundingSet=\n"))?;
     if daemon && role.low_port {
         push_str(&mut settings,"CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n")?;
@@ -61,7 +61,7 @@ fn service_settings(role: &Role, daemon: bool, tls: bool) -> R<String> {
     Ok(settings)
 }
 
-pub(super) fn settings(units: &Path, sudoers: &Path, tls: bool) -> R<Vec<Setting>> {
+pub(super) fn settings(units: &Path, sudoers: &Path) -> R<Vec<Setting>> {
     let mut settings = Vec::new();
     let mut sudo = String::new();
     for role in ROLES {
@@ -69,7 +69,7 @@ pub(super) fn settings(units: &Path, sudoers: &Path, tls: bool) -> R<Vec<Setting
             &mut settings,
             Setting {
                 path: dropin(units, role.unit)?,
-                text: service_settings(role, true, tls)?,
+                text: service_settings(role, true)?,
                 mode: 0o644,
             },
         )?;
@@ -81,7 +81,7 @@ pub(super) fn settings(units: &Path, sudoers: &Path, tls: bool) -> R<Vec<Setting
             &mut settings,
             Setting {
                 path: dropin(units, &unit)?,
-                text: service_settings(role, false, tls)?,
+                text: service_settings(role, false)?,
                 mode: 0o644,
             },
         )?;
@@ -127,11 +127,7 @@ pub(super) fn settings(units: &Path, sudoers: &Path, tls: bool) -> R<Vec<Setting
 }
 
 pub(crate) fn production() -> R<Vec<Setting>> {
-    settings(Path::new(SYSTEMD), Path::new(SUDOERS), false)
-}
-
-pub(crate) fn production_tls() -> R<Vec<Setting>> {
-    settings(Path::new(SYSTEMD), Path::new(SUDOERS), true)
+    settings(Path::new(SYSTEMD), Path::new(SUDOERS))
 }
 
 // Check from the root down so no lookup traverses an unchecked parent.

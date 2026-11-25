@@ -1,7 +1,6 @@
 //! The database writer fence on a disposable PostgreSQL 17 cluster: the
 //! included file decides the mode a start gives the socket, and the live
 //! mode decides who opens a new connection.
-use super::{postgresql_conf, socket_settings};
 use crate::{
     activate::fence::{close_socket, open_socket, SocketFence, FENCE_SETTING},
     postgres_fixture::{checked, run, wait, PgTools, Process},
@@ -63,19 +62,17 @@ fn real_postgres_fence_file_and_live_mode_close_new_connections() -> R<()> {
     };
     // The test account stands in for the socket group it is a member of.
     let group = fs::metadata(root)?.gid();
-    let settings = socket_settings(
-        sockets.to_str().ok_or("fixture path")?,
-        &group.to_string(),
-        fixture.fence.to_str().ok_or("fixture path")?,
-    )?;
+    // Production's socket settings, the fence include last.
     let conf = root.join("postgresql.conf");
     fs::write(
         &conf,
-        postgresql_conf(
-            "port = 35432\nlisten_addresses = '127.0.0.1'\nssl = on\n\
-             unix_socket_directories = ''\nmax_connections = 20\n",
-            &settings,
-        )?,
+        format!(
+            "port = 35432\nmax_connections = 20\nlisten_addresses = ''\nssl = off\n\
+             unix_socket_directories = '{}'\nunix_socket_group = '{group}'\n\
+             unix_socket_permissions = 0660\ninclude_if_exists = '{}'\n",
+            sockets.display(),
+            fixture.fence.display(),
+        ),
     )?;
     let start = |log: &str| -> R<Process> {
         let log = root.join(log);
@@ -116,29 +113,6 @@ fn real_postgres_fence_file_and_live_mode_close_new_connections() -> R<()> {
         let meta = fs::symlink_metadata(&fixture.socket)?;
         Ok((meta.mode() & 0o7777, meta.gid()))
     };
-
-    // What the cutover reads to call a local rule inert: `postgres -C`
-    // prints no socket directory as nothing, and postgresql.auto.conf
-    // overrides the file.
-    let bare = root.join("bare.conf");
-    fs::write(&bare, "port = 35432\nunix_socket_directories = ''\n")?;
-    let directories = || {
-        checked(
-            tools
-                .cmd("postgres")
-                .arg("-D")
-                .arg(&data)
-                .arg("-c")
-                .arg(format!("config_file={}", bare.display()))
-                .args(["-C", "unix_socket_directories"]),
-        )
-    };
-    assert_eq!(directories()?, "");
-    let auto = data.join("postgresql.auto.conf");
-    let generated = fs::read(&auto)?;
-    fs::write(&auto, "unix_socket_directories = '/tmp'\n")?;
-    assert_eq!(directories()?, "/tmp");
-    fs::write(&auto, generated)?;
 
     // A start while the file exists creates the socket closed.
     close_socket(&mut fixture)?;

@@ -28,25 +28,16 @@ mod converge;
 mod files;
 #[path = "launcher_host_key.rs"]
 mod host_key;
-#[path = "launcher_transport.rs"]
-mod transport;
 
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases/git-";
 const OPERATORS: &str = "/opt/td-mta/lib/td-mta/deploy";
-/// A socket cutover that left its fence.
-const SOCKET_LEFT: &str = "the socket cutover left the deployment fence, which --recover does not model: its receipt's socket_files and socket_originals name what it changed (td-mta/PRODUCTION.md, \"Leaving loopback TLS\")";
-/// A stepping-stone job that ended unseen or left its fence.
-const STEPPING_LEFT: &str = "the stepping-stone job ended unseen or left the deployment fence, and --recover does not model the loopback-TLS controller's jobs: td-mta/deploy reports whether it still runs or what its fence needs (td-mta/PRODUCTION.md, \"Leaving loopback TLS\")";
 /// The refusal of an irreversible deployment that names no migration.
 const UNNAMED: &str = "an irreversible deployment names its migration: pass --irreversible --schema-target N --revision HEX together";
 /// The refusal when main no longer selects an authorised revision.
 const MOVED: &str = "main no longer selects the revision --revision authorised: its migration needs its own decision";
 /// An `--all` job whose receipt does not say it retired early.
 const NOT_EARLY: &str = "the job finished without recording an early retirement (rollback_retire_mode is not all): its receipt says what it removed";
-const CHECK_LOST: &str = "the check-only job did not report or its fence could not be read; it takes no fence and changes nothing, so run it again once its unit has stopped";
-const CHECK_FENCED: &str = "a deployment fence is held, which a check-only job never takes: /var/lib/td-mta-operator/deployment-fence names the job that holds it";
 const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
-       td-mta/deploy --postgres-socket [--plan] [OPTIONS]
        td-mta/deploy --postgres-binaries [--to-debian] [OPTIONS]
        td-mta/deploy --retire-rollback --irreversible [--all] [OPTIONS]
        td-mta/deploy --recover [OPTIONS]
@@ -62,15 +53,11 @@ const HELP: &str = "Usage: td-mta/deploy [--skip-tests] [OPTIONS]
 Options: [--window-seconds 1..3600] [--jmap-account ACCOUNT] [--config FILE]
   [--irreversible --schema-target N --revision HEX] (required by a
   deployment that migrates the database: authorises the migration of
-  that revision to schema N, as the refusal names it; a stepping stone
-  takes --irreversible --revision HEX naming the stone)
+  that revision to schema N, as the refusal names it)
 Select a verified origin/main revision and deploy it to the configured host,
-move the live release's database from loopback TLS to its private socket, or
-switch it from the Debian PostgreSQL or another td closure to td's
+or switch its PostgreSQL from the Debian one or another td closure to td's
 source-built one, applying what the reviewed minor-release table says each
 release in between needs; --to-debian returns it to the retained Debian one.
---postgres-socket --plan stages and checks the socket cutover in its job
-directory and stops before it changes anything.
 --retire-rollback deletes rollback material older than seven days: earlier
 job directories, physical recovery copies, and the Debian PostgreSQL tree
 once a verified switch left it; --all deletes it whatever its age, once a
@@ -86,13 +73,6 @@ notification configuration from the managed config.json.
 --converge-config converges the selected configuration to the live release's
 defaults plus its td-mta/production-overrides.conf; --plan only reports, and
 --expect-digest applies only the configuration a plan reported.
-While PostgreSQL still uses loopback TLS and the live release predates
-group-socket admission, a deploy installs the newest verified stepping
-stone (td-mta/PRODUCTION.md, \"Leaving loopback TLS\") with the
-loopback-TLS controller; it needs --irreversible --revision naming the
-stone, and --skip-tests when no
-stepping stone has a verdict. Every other operation there refuses and
-names the step that comes next.
 Every command ends with a td-mta-deploy-outcome JSON line.
 The target is FILE, else $XDG_CONFIG_HOME/td-mta-deploy/target.json, else
 ~/.config/td-mta-deploy/target.json (td-mta/PRODUCTION.md). --write-target
@@ -108,7 +88,6 @@ struct Options<'a> {
     account: Option<&'a str>,
     config: Option<&'a str>,
     window: bool,
-    socket: bool,
     binaries: bool,
     to_debian: bool,
     retire: bool,
@@ -134,7 +113,6 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         account: None,
         config: None,
         window: false,
-        socket: false,
         binaries: false,
         to_debian: false,
         retire: false,
@@ -164,7 +142,6 @@ fn parse(args: &[String]) -> R<Options<'_>> {
             }
             "--jmap-account" => out.account = Some(it.next().ok_or("missing JMAP account")?),
             "--config" => out.config = Some(it.next().ok_or("missing target configuration")?),
-            "--postgres-socket" => out.socket = true,
             "--postgres-binaries" => out.binaries = true,
             "--to-debian" => out.to_debian = true,
             "--retire-rollback" => out.retire = true,
@@ -215,12 +192,8 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         }
     }
     require(
-        !((out.socket || out.binaries) && out.skip),
+        !(out.binaries && out.skip),
         "a PostgreSQL operation keeps the live release and selects no revision",
-    )?;
-    require(
-        !(out.socket && out.binaries),
-        "one PostgreSQL operation per job",
     )?;
     require(
         out.binaries || !out.to_debian,
@@ -228,31 +201,20 @@ fn parse(args: &[String]) -> R<Options<'_>> {
     )?;
     require(out.retire || !out.all, "--all belongs to --retire-rollback")?;
     require(
-        !(out.retire && (out.socket || out.binaries || out.skip || out.window)),
+        !(out.retire && (out.binaries || out.skip || out.window)),
         "retiring rollback material is its own job and has no writer window",
     )?;
     require(
         !(out.recover
-            && (out.socket
-                || out.binaries
-                || out.skip
-                || out.window
-                || out.retire
-                || out.irreversible)),
+            && (out.binaries || out.skip || out.window || out.retire || out.irreversible)),
         "recovery is its own job: it takes no other operation",
     )?;
     require(
         !(out.rollback
-            && (out.socket
-                || out.binaries
-                || out.skip
-                || out.retire
-                || out.recover
-                || out.irreversible)),
+            && (out.binaries || out.skip || out.retire || out.recover || out.irreversible)),
         "a rollback is its own binary-only activation",
     )?;
-    let others = out.socket
-        || out.binaries
+    let others = out.binaries
         || out.skip
         || out.retire
         || out.recover
@@ -272,13 +234,12 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         "retiring rollback material cannot be undone: pass --irreversible",
     )?;
     require(
-        !(out.irreversible && (out.socket || out.binaries)),
+        !(out.irreversible && out.binaries),
         "--irreversible applies to a deployment or --retire-rollback",
     )?;
     require(
         !(out.converge
             && (out.skip
-                || out.socket
                 || out.binaries
                 || out.retire
                 || out.recover
@@ -292,29 +253,19 @@ fn parse(args: &[String]) -> R<Options<'_>> {
         "--expect-digest applies to --converge-config",
     )?;
     require(
-        out.converge || out.socket || !out.plan,
-        "--plan applies to --converge-config and --postgres-socket",
+        out.converge || !out.plan,
+        "--plan applies to --converge-config",
     )?;
     require(
         !(out.plan && out.expect.is_some()),
         "--expect-digest binds an apply to a plan",
     )?;
     let deploying = out.irreversible && !out.retire;
-    // A stepping stone's controller reads no schema target; `deploy`
-    // requires one for every other deployment once it knows which.
     require(
-        deploying == out.revision.is_some() && (deploying || out.schema_target.is_none()),
+        deploying == out.revision.is_some() && deploying == out.schema_target.is_some(),
         UNNAMED,
     )?;
     Ok(out)
-}
-/// A deployment's authorisation names its migration's schema target,
-/// except a stepping stone's, whose controller reads none.
-fn named_migration(opts: &Options<'_>, stepping: bool) -> R<()> {
-    require(
-        stepping || !opts.irreversible || opts.retire || opts.schema_target.is_some(),
-        UNNAMED,
-    )
 }
 /// A file's text as the remote command printed it, which loses its final
 /// newline.
@@ -908,26 +859,14 @@ pub(super) fn run(args: &[String]) -> R<()> {
         Ok(Some(done)) => done,
         Err(error) => {
             let mut out = std::io::stdout().lock();
-            // A refusal naming what follows is this run's one line, for
-            // every mode; any other error of a convergence is its own.
-            let (message, next) = match error.downcast::<Refusal>() {
-                Ok(refusal) => (refusal.error, refusal.next),
-                Err(error) => {
-                    let message = fmt(format_args!("{error}"))?;
-                    if args.iter().any(|arg| arg == "--converge-config") {
-                        converge::unreported(
-                            &mut out,
-                            &mut session,
-                            &message,
-                            &converge::carried(args)?,
-                        )?;
-                        return Err(error);
-                    }
-                    let next = refused_next(&message, args)?;
-                    (message, next)
-                }
-            };
-            let end = refused_end(message, next, args)?;
+            let message = fmt(format_args!("{error}"))?;
+            // A convergence reports its own refusal.
+            if args.iter().any(|arg| arg == "--converge-config") {
+                converge::unreported(&mut out, &mut session, &message, &converge::carried(args)?)?;
+                return Err(error);
+            }
+            let next = refused_next(&message, args)?;
+            let end = refused_end(message, next);
             write_ended(&mut out, &end, Json::Obj(Vec::new()))?;
             return Err(end.error.unwrap_or_default().into());
         }
@@ -957,16 +896,6 @@ fn write_job_outcome(out: &mut impl std::io::Write, end: &Ended, job: &Job) -> R
     }
     if let Some(time) = end.not_before {
         set(&mut details, "not_before", Json::from(time))?;
-    }
-    // A check-only socket cutover's every refusal, the first its error.
-    if let Some(refusals @ Json::Arr(_)) =
-        job.record.as_ref().and_then(|r| r.get("socket_refusals"))
-    {
-        set(
-            &mut details,
-            "refusals",
-            crate::common::copy_json(refusals)?,
-        )?;
     }
     write_ended(out, end, details)
 }
@@ -1019,18 +948,7 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
         None => child(&home, ".local/state/td/main-integration")?,
     };
     let verdicts = child(&base, "verdicts")?;
-    let stone = transport::plan(&local, opts, &site, &tip, live, &verdicts)?;
-    let stepping = stone.is_some();
-    named_migration(opts, stepping)?;
-    let controller = if stepping {
-        owned(transport::TLS_CONTROLLER)?
-    } else {
-        controller
-    };
-    let (selected, verdict) = if let Some(stone) = stone {
-        stone
-    } else if opts.socket
-        || opts.binaries
+    let (selected, verdict) = if opts.binaries
         || opts.retire
         || opts.recover
         || opts.rollback
@@ -1086,12 +1004,7 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
     let cache = child(&local.root, ".td-build-cache")?;
     fs::create_dir_all(&cache)?;
     let scratch = td_fs::TempDir::new_in(&cache, "mta-deploy")?;
-    let binary = local.artifact(scratch.path(), &controller);
-    let binary = if stepping {
-        transport::built(binary)?
-    } else {
-        binary?
-    };
+    let binary = local.artifact(scratch.path(), &controller)?;
     let closure = match &live_server {
         Some((_, live_minor)) if !opts.to_debian => {
             let live_minor = *live_minor;
@@ -1181,9 +1094,6 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
         }
         None => None,
     };
-    // A stepping-stone job's spec is read by TLS_CONTROLLER: its load_job
-    // takes at most 4096 bytes and Deployment::new reads revision,
-    // previous, tree, main, controller and budget, keeping the rest.
     let mut spec = Json::Obj(Vec::new());
     for (k, v) in [
         ("previous", live),
@@ -1196,10 +1106,6 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
         set(&mut spec, k, Json::Str(owned(v)?))?;
     }
     set(&mut spec, "skip_tests", Json::Bool(opts.skip))?;
-    if opts.socket {
-        set(&mut spec, "mode", Json::Str(owned("postgres-socket")?))?;
-        set(&mut spec, "plan_only", Json::Bool(opts.plan))?;
-    }
     if opts.retire {
         set(&mut spec, "mode", Json::Str(owned("retire-rollback")?))?;
         set(&mut spec, crate::activate::RETIRE_ALL, Json::Bool(opts.all))?;
@@ -1279,10 +1185,6 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
     }
     set(&mut spec, "budget", Json::from(opts.budget))?;
     set(&mut spec, "verdict", verdict.map_or(Json::Null, Json::Str))?;
-    require(
-        !stepping || fmt(format_args!("{spec}"))?.len() <= 4096,
-        "the stepping-stone job exceeds what the loopback-TLS controller reads",
-    )?;
     local.save(&fmt(format_args!("{job}/job.json"))?, &spec)?;
     let receipt = fmt(format_args!("{job}/receipt.json"))?;
     println!("Production receipt: {receipt}");
@@ -1320,9 +1222,7 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
             "--property=KillMode=mixed",
             &working,
             &program,
-            if opts.socket {
-                "--postgres-socket"
-            } else if opts.to_debian {
+            if opts.to_debian {
                 "--postgres-to-debian"
             } else if opts.binaries {
                 "--postgres-binaries"
@@ -1467,7 +1367,6 @@ fn deploy(opts: &Options<'_>, args: &[String], state: &mut converge::Session) ->
         exit,
         fence,
         post,
-        stepping,
     }))
 }
 
@@ -1481,26 +1380,7 @@ struct Job {
     fence: Option<bool>,
     /// The public JMAP check after the job, when one was made.
     post: Option<bool>,
-    /// The job deployed a stepping stone under the loopback-TLS
-    /// controller, which --recover does not model.
-    stepping: bool,
 }
-
-/// A refusal before a job and the command that follows it, if any;
-/// `run` writes its outcome line.
-#[derive(Debug)]
-pub(super) struct Refusal {
-    pub(super) error: String,
-    pub(super) next: Option<Vec<String>>,
-}
-
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.error)
-    }
-}
-
-impl std::error::Error for Refusal {}
 
 /// A job's outcome: what happened and the command that follows.
 struct Ended {
@@ -1575,8 +1455,7 @@ fn command(opts: &Options<'_>, flags: &[&str]) -> R<Vec<String>> {
 
 /// Whether `opts` deploys a release: no other mode is named.
 fn activation(opts: &Options<'_>) -> bool {
-    !(opts.socket
-        || opts.binaries
+    !(opts.binaries
         || opts.retire
         || opts.recover
         || opts.rollback
@@ -1598,17 +1477,15 @@ fn again(args: &[String], extra: &[&str]) -> R<Vec<String>> {
     Ok(argv)
 }
 
-/// The end of a run refused before its job, naming `next`: `busy`, and
-/// this run again, while another job runs on a loopback-TLS host.
-fn refused_end(error: String, next: Option<Vec<String>>, args: &[String]) -> R<Ended> {
-    let busy = error == transport::RUNNING;
-    Ok(held(Ended {
-        result: if busy { "busy" } else { "refused" },
-        next: if busy { Some(again(args, &[])?) } else { next },
+/// The end of a run refused before its job, naming `next`.
+fn refused_end(error: String, next: Option<Vec<String>>) -> Ended {
+    held(Ended {
+        result: "refused",
+        next,
         error: Some(error),
         approve: None,
         not_before: None,
-    }))
+    })
 }
 
 /// What follows a refusal before any job: after main moved past an
@@ -1661,12 +1538,7 @@ fn unauthorised(args: &[String]) -> R<Vec<String>> {
 /// The flags of the command a refusal names in its `run td-mta/deploy
 /// --FLAG [VALUE]...`, up to the first word that is neither.
 fn named(error: &str) -> Option<Vec<&str>> {
-    let (_, rest) = error.split_once("run td-mta/deploy")?;
-    // Bare, it names plain td-mta/deploy, which names the step itself.
-    if rest.is_empty() || rest.starts_with([',', '.', ';', ':']) {
-        return Some(Vec::new());
-    }
-    let rest = rest.strip_prefix(' ')?;
+    let (_, rest) = error.split_once("run td-mta/deploy ")?;
     let mut flags = Vec::new();
     for word in rest.split_ascii_whitespace() {
         let value = word.bytes().all(|b| b.is_ascii_digit());
@@ -1708,13 +1580,7 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
         })
     };
     // A fence recovery refuses by its kind is not one a rerun finishes.
-    let unrecoverable = error
-        .as_deref()
-        .is_some_and(|e| crate::activate::UNRECOVERABLE.contains(&e));
-    let names_recover = error
-        .as_deref()
-        .and_then(named)
-        .is_some_and(|flags| flags == ["--recover"]);
+    let unrecoverable = error.as_deref() == Some(crate::activate::NO_FENCE);
     // What a finished job leaves to do: the switch it kept the Debian
     // tree for, or the retirement still to come.
     let finished = || -> R<Option<Vec<String>>> {
@@ -1726,44 +1592,7 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             None
         })
     };
-    let lost = matches!(job.exit, None | Some(255));
     let end = match (job.exit, job.fence) {
-        // The stepping stone ran under the loopback-TLS controller, whose
-        // jobs and fence --recover does not model.
-        (exit, fence) if job.stepping && exit != Some(0) && (lost || fence != Some(false)) => {
-            Ended {
-                result: if lost { "unknown" } else { "failed" },
-                error: Some(owned(STEPPING_LEFT)?),
-                next: None,
-                approve: None,
-                not_before: None,
-            }
-        }
-        (Some(0), _) if job.stepping && job.post == Some(false) => Ended {
-            result: "check-failed",
-            error: Some(owned(
-                "the stepping stone is deployed but the public JMAP check after it failed",
-            )?),
-            next: None,
-            approve: None,
-            not_before: None,
-        },
-        (Some(0), _) if job.stepping => Ended {
-            result: "stepping-stone-deployed",
-            error: None,
-            next: Some(command(opts, &["--postgres-socket"])?),
-            approve: None,
-            not_before: None,
-        },
-        // A check takes no fence and changes nothing: one that did not
-        // report is run again, never recovered.
-        (None | Some(255), _) if opts.socket && opts.plan => Ended {
-            result: "unknown",
-            error: Some(owned(CHECK_LOST)?),
-            next: Some(again(args, &[])?),
-            approve: None,
-            not_before: None,
-        },
         (None | Some(255), _) => unknown(
             "the SSH connection ended before the job reported: --recover finishes it once it stops",
         )?,
@@ -1786,38 +1615,6 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             approve: None,
             not_before,
         },
-        // A check-only run says it stopped before any change.
-        (Some(0), _) if opts.socket && opts.plan => {
-            let checked = job
-                .record
-                .as_ref()
-                .and_then(|r| r.get("socket_checked"))
-                .and_then(Json::as_bool)
-                == Some(true);
-            if checked {
-                Ended {
-                    result: "socket-cutover-checked",
-                    error: None,
-                    next: Some(transport::named_command(
-                        &["--postgres-socket"],
-                        None,
-                        opts,
-                    )?),
-                    approve: None,
-                    not_before: None,
-                }
-            } else {
-                Ended {
-                    result: "unknown",
-                    error: Some(owned(
-                        "the check-only job finished without saying it changed nothing: read its receipt",
-                    )?),
-                    next: None,
-                    approve: None,
-                    not_before: None,
-                }
-            }
-        }
         (Some(0), _) => Ended {
             result: "succeeded",
             error: None,
@@ -1833,29 +1630,6 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             approve: None,
             not_before: None,
         },
-        // A check takes no fence: one held is another job's.
-        (Some(_), Some(true)) if opts.socket && opts.plan && !names_recover => Ended {
-            result: "failed",
-            error: Some(fmt(format_args!(
-                "{}; {CHECK_FENCED}",
-                error.as_deref().unwrap_or("the job failed")
-            ))?),
-            next: None,
-            approve: None,
-            not_before: None,
-        },
-        // --recover does not model the socket cutover's fence; a fence
-        // the cutover found held, and names --recover for, it does.
-        (Some(_), Some(true)) if opts.socket && !names_recover => Ended {
-            result: "failed",
-            error: Some(fmt(format_args!(
-                "{}; {SOCKET_LEFT}",
-                error.as_deref().unwrap_or("the job failed")
-            ))?),
-            next: None,
-            approve: None,
-            not_before: None,
-        },
         (Some(_), Some(true)) => Ended {
             result: "failed",
             error: Some(error.map_or_else(|| owned("the job failed"), Ok)?),
@@ -1864,21 +1638,6 @@ fn ended(opts: &Options<'_>, args: &[String], job: &Job) -> R<Ended> {
             } else {
                 Some(recover()?)
             },
-            approve: None,
-            not_before: None,
-        },
-        // A refused check's fence does not bear on its result.
-        (Some(_), None) if opts.socket && opts.plan && error.is_some() => Ended {
-            result: "failed",
-            error,
-            next: None,
-            approve: None,
-            not_before: None,
-        },
-        (Some(_), None) if opts.socket && opts.plan => Ended {
-            result: "unknown",
-            error: Some(owned(CHECK_LOST)?),
-            next: Some(again(args, &[])?),
             approve: None,
             not_before: None,
         },

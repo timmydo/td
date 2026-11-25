@@ -249,7 +249,7 @@ impl Deployment {
             }
         }
         if self.isolated {
-            isolation::verify(&self.host, true, self.tls)?;
+            isolation::verify(&self.host, true)?;
         }
         for &role in PROFILES {
             let (uid, runtime) = self.profile_runtime(role)?;

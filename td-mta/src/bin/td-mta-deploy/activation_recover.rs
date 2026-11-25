@@ -82,7 +82,6 @@ pub(super) fn classify(
             stopped: events.contains(&SEALED),
         },
         "postgres-binaries" | "postgres-to-debian" => Interrupted::Switch,
-        "postgres-socket" => return Err(crate::activate::SOCKET_FENCE.into()),
         _ => return Err(crate::activate::NO_FENCE.into()),
     })
 }

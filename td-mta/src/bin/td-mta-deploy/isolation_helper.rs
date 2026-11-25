@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use td_json::Json;
 
-pub(crate) const NOTIFICATION_LIMIT: usize = 3 * 1024 * 1024;
+const NOTIFICATION_LIMIT: usize = 3 * 1024 * 1024;
 const JOURNAL_SIZE: usize = 96;
 #[path = "isolation_path_sys.rs"]
 mod path_sys;

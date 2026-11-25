@@ -39,7 +39,6 @@ mod transport;
 
 pub(crate) use binaries::{discard_nars, selected_store, BACKUP_DROPIN, BINARIES_DROPIN};
 pub(crate) use config::RESULTS as CONVERGE_RESULTS;
-pub(crate) use transport::{redacted_runtime_tls, REDACT_RUNTIME, RUNTIME_CONNECTION};
 
 const OP: &str = "/var/lib/td-mta-operator";
 const RELEASES: &str = "/opt/td-mta/lib/td-mta/releases";
@@ -58,10 +57,8 @@ const UNITS: &[&str] = &[
     ACME,
 ];
 const SHARED_RESTORED: &str = "shared release verified against current primary";
-/// The fences --recover refuses by their kind: no rerun finishes them.
-pub(crate) const SOCKET_FENCE: &str = "the fence belongs to the loopback-TLS socket cutover, which --recover does not model: its receipt's socket_files and socket_originals name what it changed";
+/// The fence --recover refuses by its kind: no rerun finishes it.
 pub(crate) const NO_FENCE: &str = "the fenced job's operation never holds a deployment fence";
-pub(crate) const UNRECOVERABLE: &[&str] = &[SOCKET_FENCE, NO_FENCE];
 /// The refusals whose outcome names the command that follows.
 pub(crate) const MIGRATES: &str = "this release migrates the database, which cannot be rolled back";
 pub(crate) const INSIDE_WINDOW: &str = "all rollback material is inside its 7-day window: run td-mta/deploy --retire-rollback --irreversible after rollback_retire_not_before";
@@ -190,7 +187,6 @@ pub(super) struct Deployment {
     admitting: bool,
     pg_stopped: bool,
     socket_fence: bool,
-    tls: bool,
     dropins_started: bool,
     cold: PathBuf,
     original: PathBuf,
@@ -207,21 +203,13 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "the controller must run as root on the host host.json's host_name names",
     )?;
     let work = std::env::current_dir()?;
-    // Settings of the loopback TLS layout differ from those this controller
-    // installs, so only the transport cutover may run against it. The
-    // launcher names the step a TLS host takes first (launcher_transport.rs).
-    let tls = transport::loopback_tls()?;
-    require(
-        !tls || mode == "postgres-socket",
-        "PostgreSQL still uses loopback TLS: run td-mta/deploy, which names the next step",
-    )?;
     host.select_tools(binaries::selected()?);
     let job = match mode {
         "rollback" => recover::rollback_job(job, Path::new(OP), &work, Path::new(RELEASES))?,
         "restore-shared-services" => recover::restore_job(job, Path::new(OP), &work)?,
         _ => job,
     };
-    let mut deployment = Deployment::new(host, work, job, tls, &config, mode == "recover")?;
+    let mut deployment = Deployment::new(host, work, job, &config, mode == "recover")?;
     // Reserve the job's receipt under the host lock. A repeated invocation
     // must leave the original event and recovery evidence intact.
     start_receipt(&deployment.receipt, &deployment.record)?;
@@ -229,7 +217,6 @@ pub(super) fn run(job: Json, mode: &str) -> R<()> {
         "refresh-notifications" => deployment.refresh_notifications(),
         "restore-shared-services" => deployment.restore_shared_services(),
         "activate" | "rollback" => deployment.execute(),
-        "postgres-socket" => deployment.postgres_socket(),
         "postgres-binaries" => deployment.postgres_binaries(),
         "postgres-to-debian" => deployment.postgres_to_debian(),
         "retire-rollback" => deployment.retire_rollback(),
@@ -253,7 +240,6 @@ impl Deployment {
         host: Host,
         work: PathBuf,
         mut job: Json,
-        tls: bool,
         config: &HostConfig,
         recover: bool,
     ) -> R<Self> {
@@ -278,14 +264,8 @@ impl Deployment {
         set(&mut job, "status", "preflight".into())?;
         set(&mut job, "started", now()?.into())?;
         set(&mut job, "events", Json::Arr(Vec::new()))?;
-        let isolated = if recover && isolation::partial(tls)? {
-            // A recovery removes the partial install its job left.
-            false
-        } else if tls {
-            isolation::installed_tls()?
-        } else {
-            isolation::installed()?
-        };
+        // A recovery removes the partial install its job left.
+        let isolated = !(recover && isolation::partial()?) && isolation::installed()?;
         Ok(Self {
             host,
             previous,
@@ -313,7 +293,6 @@ impl Deployment {
             admitting: false,
             pg_stopped: false,
             socket_fence: false,
-            tls,
             dropins_started: false,
             fence_owner: None,
         })
@@ -369,7 +348,7 @@ impl Deployment {
         )?;
         self.check_source()?;
         self.socket_preflight()?;
-        crate::readiness::prepare(&self.host, false)?;
+        crate::readiness::prepare(&self.host)?;
         self.journal_identity()?;
         self.config(&self.previous, &[], self.isolated)?;
         // Before the build: host.json's public_name must verify now. A
@@ -510,7 +489,7 @@ impl Deployment {
 
     /// Room at `path` for a rehearsal's base backup and trial of the live
     /// databases.
-    pub(super) fn rehearsal_capacity(&self, path: &Path) -> R<()> {
+    fn rehearsal_capacity(&self, path: &Path) -> R<()> {
         let size = self
             .sql(
                 "owner",
@@ -615,7 +594,7 @@ impl Deployment {
             self.dropins_started = true;
             isolation::install(&self.host)?;
             self.isolated = true;
-            isolation::verify(&self.host, false, self.tls)?;
+            isolation::verify(&self.host, false)?;
         }
         self.switch(&self.candidate)?;
         self.admit()?;

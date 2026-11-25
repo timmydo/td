@@ -248,9 +248,9 @@ fn clock_transfer_carries_or_clears_evidence_and_refuses_linked_ancestors() {
 #[ignore = "requires root-owned fixture in /run"]
 fn unit_install_and_rollback_recover_partial_install_and_preserve_operator_files() {
     let tmp = TempDir::new_in(Path::new("/run"), "isolation-settings").unwrap();
-    let list = files::settings(tmp.path(), &tmp.path().join("sudoers"), false).unwrap();
+    let list = files::settings(tmp.path(), &tmp.path().join("sudoers")).unwrap();
     let host = Host::default();
-    let readiness = crate::readiness::settings(tmp.path(), false).unwrap();
+    let readiness = crate::readiness::settings(tmp.path()).unwrap();
     // Adopt an existing installation with just the three original jobs.
     files::install(&host, &readiness[..3]).unwrap();
     let existing = fs::metadata(&readiness[0].path).unwrap().ino();
@@ -450,15 +450,13 @@ fn private_files_across_real_unix_uids() {
 
 #[test]
 fn live_groups_are_exactly_the_account_and_socket_group() {
-    assert!(live_groups("901 950", 901, Some(950)).unwrap());
-    assert!(live_groups("950 901", 901, Some(950)).unwrap());
-    assert!(!live_groups("901", 901, Some(950)).unwrap());
-    assert!(!live_groups("950", 901, Some(950)).unwrap());
-    assert!(!live_groups("901 950 27", 901, Some(950)).unwrap());
-    assert!(live_groups("901", 901, None).unwrap());
-    assert!(live_groups("", 901, None).unwrap());
-    assert!(!live_groups("901 950", 901, None).unwrap());
-    assert!(live_groups("x", 901, None).is_err());
+    assert!(live_groups("901 950", 901, 950).unwrap());
+    assert!(live_groups("950 901", 901, 950).unwrap());
+    assert!(!live_groups("901", 901, 950).unwrap());
+    assert!(!live_groups("950", 901, 950).unwrap());
+    assert!(!live_groups("", 901, 950).unwrap());
+    assert!(!live_groups("901 950 27", 901, 950).unwrap());
+    assert!(live_groups("x", 901, 950).is_err());
 }
 
 #[test]
