@@ -863,17 +863,20 @@ writes the primary selection. The pure model retains only the latest valid
 write until `take_clipboard_write`; the adapter likewise coalesces writes,
 applying at most one per 100 ms on an idle Wayland turn, after queued focus
 events, through the same source and transfer machinery as a local copy.
-It uses the last translated key's serial in the current keyboard focus;
-no key in this focus means no write. Focus or keyboard loss discards that
-serial and pending writes; a local copy supersedes a pending application
-write. A write observed without focus is discarded, never deferred until
-focus returns. A missing data device discards the request.
+Each write uses the serial of the latest translated key or pointer-button
+press or release since keyboard focus arrived. Without such input the
+terminal discards the write. On td the focusing press precedes keyboard enter. A release in the
+same pointer frame also precedes enter. A drag released after enter lets
+a mouse-reporting child copy its selection without a keypress. Losing focus or the keyboard clears the serial and pending
+writes. A local copy supersedes a pending application write. A write
+observed without focus or without a data device is discarded.
 
-This grants a child that has received keyboard input in the focused terminal
-clipboard-write authority, including remote programs over its PTY. It does
-not prove that a particular output sequence was caused by a copy shortcut;
-the serial is Wayland admission, not authentication. Clipboard reads remain
-unavailable to the child.
+Any such key or button in the focused terminal grants clipboard-write
+authority to whatever writes its PTY, including remote programs. Even a
+local drag to select streaming untrusted output grants that output this
+authority. The serial establishes no link between the input and a
+particular clipboard request. Clipboard reads remain unavailable to the
+child.
 
 The primary selection is td-term's where the compositor offers
 `zwp_primary_selection_device_manager_v1`, as sway does and td's compositor

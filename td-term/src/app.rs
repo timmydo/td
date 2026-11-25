@@ -608,6 +608,7 @@ pub struct Window {
     /// The model or the view changed under a picture that did not.
     stale: bool,
     keymap_ready: bool,
+    /// The last key's or button's serial in the current keyboard focus.
     clipboard_serial: Option<u32>,
     pending_clipboard: Option<(u32, String)>,
     clipboard_written: Option<u64>,
@@ -1340,6 +1341,11 @@ impl Window {
     }
 
     fn pointer(&mut self, event: pointer::Event) -> Result<()> {
+        if let pointer::Event::Button { serial, .. } = event {
+            if self.client.input().focused {
+                self.clipboard_serial = Some(serial);
+            }
+        }
         // A press ends a search, leaving the view where it is, so the press
         // acts on what it was made over.
         if matches!(event, pointer::Event::Button { pressed: true, .. }) {
@@ -3982,8 +3988,16 @@ mod tests {
 
     /// One button's press or release, and its frame.
     fn button(window: &mut Window, button: u32, pressed: bool) {
+        button_serial(window, button, pressed, 7);
+    }
+
+    fn button_serial(window: &mut Window, button: u32, pressed: bool, serial: u32) {
         window
-            .event(message(POINTER, 3, &[7, 0, button, u32::from(pressed)]))
+            .event(message(
+                POINTER,
+                3,
+                &[serial, 0, button, u32::from(pressed)],
+            ))
             .unwrap();
         window.event(message(POINTER, 5, &[])).unwrap();
     }
@@ -5899,6 +5913,42 @@ mod tests {
             Some("hello"),
             "old input cannot authorize a new focus"
         );
+    }
+
+    #[test]
+    fn application_clipboard_write_uses_the_latest_focused_button_or_key() {
+        let (mut window, peer) = presented();
+        let copy = |window: &mut Window, now, serial| {
+            window.output(b"\x1b]52;c;aGVsbG8=\x07").unwrap();
+            window.write_application_clipboard(now).unwrap();
+            let (requests, _) = peer::drain(&peer).unwrap();
+            let mut selection = requests
+                .iter()
+                .filter(|m| m.object == DEVICE && m.opcode == 1);
+            let observed = selection.next().map(|set| {
+                let mut body = Cursor::new(&set.payload);
+                body.u32().unwrap();
+                body.u32().unwrap()
+            });
+            assert_eq!(observed, serial);
+            assert!(selection.next().is_none());
+        };
+        window.output(b"\x1b[?1002h").unwrap();
+        hover(&mut window, 0, 0);
+        button_serial(&mut window, LEFT_BUTTON, true, 4);
+        focus(&mut window, 5);
+        copy(&mut window, 0, None);
+        button_serial(&mut window, LEFT_BUTTON, false, 6);
+        copy(&mut window, 100, Some(6));
+        press(&mut window, 30);
+        copy(&mut window, 200, Some(9));
+        button_serial(&mut window, LEFT_BUTTON, true, 10);
+        copy(&mut window, 300, Some(10));
+        button_serial(&mut window, LEFT_BUTTON, false, 11);
+        copy(&mut window, 400, Some(11));
+        window.event(message(KEYBOARD, 2, &[12, SURFACE])).unwrap();
+        focus(&mut window, 13);
+        copy(&mut window, 500, None);
     }
 
     #[test]
