@@ -7540,32 +7540,70 @@ mod tests {
         );
     }
 
+    // td-sh joins its background jobs at exit. Spawn the pipe holder from
+    // a separate parent so run_cmd observes a real exit before pipe EOF.
+    #[test]
+    fn watchdog_straggler_parent() {
+        let Ok(mode) = env::var("TD_TEST_WATCHDOG_STRAGGLER") else {
+            return;
+        };
+        let script = match mode.as_str() {
+            "quiet" => "",
+            "repeat" => {
+                r#"while kill -0 "$1" 2>/dev/null; do :; done
+                i=0
+                while [ "$i" -lt 30 ]; do echo 'expr: died again' >&2; i=$((i+1)); done
+                "#
+            }
+            _ => panic!("unknown straggler mode"),
+        };
+        let script = format!("{script}\necho $$ > holder.pid; sleep 30; : > sleep-returned");
+        let child = Command::new("sh")
+            .args(["-c", &script, "straggler", &std::process::id().to_string()])
+            .spawn();
+        std::process::exit(if child.is_ok() { 0 } else { 125 });
+    }
+
+    fn run_with_straggler(mode: &str, watch: &Watch) -> Result<(), String> {
+        let (_, mut envs) = sh_and_env();
+        envs.push(("TD_TEST_WATCHDOG_STRAGGLER".into(), mode.into()));
+        let dir = crate::test_temp::TempDir::new("td-watchdog-straggler").unwrap();
+        let exe = env::current_exe().unwrap();
+        run_cmd(
+            exe.to_str().unwrap(),
+            &[
+                "--exact",
+                "build::tests::watchdog_straggler_parent",
+                "--nocapture",
+            ],
+            dir.to_str().unwrap(),
+            &envs,
+            watch,
+        )?;
+        assert!(
+            !dir.join("sleep-returned").exists(),
+            "the holder returned from sleep before teardown"
+        );
+        let pid = fs::read_to_string(dir.join("holder.pid")).unwrap();
+        let pid = pid.trim().parse().unwrap();
+        assert_eq!(crate::run_record::starttime_of(pid).unwrap(), None);
+        Ok(())
+    }
+
     #[test]
     fn watchdog_keeps_a_green_exit_despite_a_repeating_straggler_during_drain() {
         // A command exits 0 but leaves a background straggler that SPAMS the
         // same stderr line while holding the pipes open. The straggler waits
-        // until the parent shell PID has disappeared; because a zombie still
-        // answers kill -0, that means run_cmd has reaped the shell and entered
+        // until the parent PID has disappeared; because a zombie still
+        // answers kill -0, that means run_cmd has reaped the parent and entered
         // the drain phase. It then emits enough repeated lines to record a trip
         // reason and sleeps while holding the pipe open, but the kill path is no
         // longer reachable: `killed` stays false, the recorded reason is dropped,
         // and the exit status (0) decides. The drain grace kills the straggler
         // group so run_cmd still returns promptly.
-        let (sh, envs) = sh_and_env();
         let t0 = Instant::now();
-        run_cmd(
-            &sh,
-            &[
-                "-c",
-                "parent=$$; (while kill -0 \"$parent\" 2>/dev/null; do :; done; \
-                 i=0; while [ \"$i\" -lt 30 ]; do echo 'expr: died again' >&2; i=$((i+1)); done; \
-                 sleep 30) & exit 0",
-            ],
-            ".",
-            &envs,
-            &w(600, 25, 0),
-        )
-        .expect("a green exit must win over a straggler's repeat spam during drain");
+        run_with_straggler("repeat", &w(600, 25, 0))
+            .expect("a green exit must win over a straggler's repeat spam during drain");
         assert!(
             t0.elapsed() < Duration::from_secs(10),
             "the drain grace must bound the repeating straggler"
@@ -7579,9 +7617,8 @@ mod tests {
         // returned at exit; the readers must not wait 30s for the sleep) and
         // must NOT red: the drain grace kills the straggler group, and the
         // command's own exit status decides.
-        let (sh, envs) = sh_and_env();
         let t0 = Instant::now();
-        run_cmd(&sh, &["-c", "sleep 30 & exit 0"], ".", &envs, &w(600, 0, 0))
+        run_with_straggler("quiet", &w(600, 0, 0))
             .expect("a green exit with a straggler must stay green");
         assert!(
             t0.elapsed() < Duration::from_secs(10),
