@@ -310,6 +310,10 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
         "host and target-static td-firstboot's workload grant table seeding, target-static td-authd's per-launch grant view publication and manifest writer, target-static td-jail's manifest admission and shared grant path validator, and td-agent's workspace refusals, which share its sensitive trees of the home",
     ),
     (
+        "engine/src/ipc_namespace.rs",
+        "target-static td-jail and host builder IPC isolation after mounting fresh procfs",
+    ),
+    (
         "engine/src/mount_identity.rs",
         "target-static td-jail's mountinfo identities and grant view admission, and target-static td-authd's grant view publication, one derivation for both",
     ),
@@ -2521,6 +2525,7 @@ fn run_self_test_over(root: &Path) -> Vec<String> {
         "engine/src/workload_grants.rs",
         "td-jail's manifest admission"
     );
+    assert_contains!("engine/src/ipc_namespace.rs", "target-static td-jail");
     assert_contains!(
         "engine/src/mount_identity.rs",
         "target-static td-authd's grant view publication"
@@ -2562,6 +2567,7 @@ fn run_self_test_over(root: &Path) -> Vec<String> {
         "engine/src/principals.rs",
         "engine/src/workload_accounts.rs",
         "engine/src/workload_grants.rs",
+        "engine/src/ipc_namespace.rs",
         "engine/src/mount_identity.rs",
         "engine/src/sha256.rs",
         "engine/src/flathub_app.rs",

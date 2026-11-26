@@ -331,13 +331,11 @@ implementation as well as the script entry point. The helpers remain control
 plane programs: compiling one inside td does not admit it as a target recipe
 tool or replace the target artifact graph.
 
-The native build sandboxes also accommodate the standard kernel's disabled
-SysV IPC and POSIX message queues. They inspect only their freshly mounted
-procfs before executing a workload. Available IPC facilities require a new,
-verified IPC namespace; only verified absence permits omitting it. Errors
-and exposed facilities without namespace support refuse the build. This
-preserves the deployed kernel policy; it does not infer isolation from the
-distribution identity or an inherited `/proc` view.
+The target kernel enables SysV shared memory for PostgreSQL. The native
+build sandboxes inspect their freshly mounted procfs before executing a
+workload. On IPC-capable kernels they create and verify a private IPC
+namespace. On older kernels they verify that SysV IPC and POSIX message
+queues are both absent. Errors stop the build.
 
 These helpers alone do not establish the complete repository workflow. Private
 writable store placement, capacity, workspace provisioning, and a two-guest

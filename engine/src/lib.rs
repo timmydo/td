@@ -56,6 +56,7 @@ pub mod bzip2;
 pub mod cpio;
 pub mod crc32;
 pub mod elf_edit;
+pub mod ipc_namespace;
 pub mod rust_dist;
 pub mod tar;
 pub mod tar_write;

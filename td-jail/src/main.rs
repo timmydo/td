@@ -31,6 +31,11 @@ mod flathub_app;
 #[allow(dead_code, reason = "shared PATH alias discovery and wire contract")]
 #[cfg_attr(not(feature = "target-recipe"), path = "../../engine/src/host_path.rs")]
 mod host_path;
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../engine/src/ipc_namespace.rs"
+)]
+mod ipc_namespace;
 #[allow(dead_code)]
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[cfg_attr(
@@ -1409,6 +1414,17 @@ mod confinement {
         assert!(SYS.contains("std::ptr::from_mut(&mut data) as usize"));
         assert!(SYS.contains("std::ptr::from_ref(&data) as usize"));
         assert!(SYS.contains("check(syscall5(SYS_UNSHARE, flags, 0, 0, 0, 0))"));
+        assert!(SYS.contains("const CLONE_NEWIPC: usize = 0x0800_0000;"));
+        assert!(SYS.contains("check(syscall5(SYS_UNSHARE, CLONE_NEWIPC, 0, 0, 0, 0))"));
+        let mount = TRANSITION.split_once("fn enter_mount_plan()").unwrap().1;
+        let (before_ipc, after_ipc) = mount
+            .split_once(
+                "crate::ipc_namespace::isolate(Path::new(&proc_directory), sys::unshare_ipc)?;",
+            )
+            .unwrap();
+        assert!(before_ipc.contains("let proc_target = cstring(&proc_directory)?;"));
+        assert!(before_ipc.contains("mount fresh PID-namespace procfs"));
+        assert!(after_ipc.starts_with("\n\n    let new_root ="));
         assert!(SYS.contains("const SECCOMP_SET_MODE_FILTER: usize = 1;"));
         assert!(SYS.contains("const SIOCGIFFLAGS: usize = 0x8913;"));
         assert!(SYS.contains("const SIOCSIFFLAGS: usize = 0x8914;"));

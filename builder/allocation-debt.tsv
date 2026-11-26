@@ -158,8 +158,8 @@ builder/src/run_record.rs	allocating-conversion	14
 builder/src/run_record.rs	allocation-macro	17
 builder/src/run_record.rs	unchecked-growth-or-clone	18
 builder/src/sandbox.rs	allocating-constructor	8
-builder/src/sandbox.rs	allocating-conversion	79
-builder/src/sandbox.rs	allocation-macro	63
+builder/src/sandbox.rs	allocating-conversion	76
+builder/src/sandbox.rs	allocation-macro	62
 builder/src/sandbox.rs	unchecked-growth-or-clone	24
 builder/src/scan.rs	allocating-constructor	1
 builder/src/scan.rs	allocating-conversion	2

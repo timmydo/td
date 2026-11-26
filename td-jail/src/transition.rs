@@ -3030,7 +3030,8 @@ fn install_application_seccomp_filter(
 
 fn enter_mount_plan() -> io::Result<()> {
     let procfs = cstring("proc")?;
-    let proc_target = cstring(&format!("{NEW_ROOT}/proc"))?;
+    let proc_directory = format!("{NEW_ROOT}/proc");
+    let proc_target = cstring(&proc_directory)?;
     sys::mount(
         Some(&procfs),
         &proc_target,
@@ -3039,6 +3040,7 @@ fn enter_mount_plan() -> io::Result<()> {
         None,
     )
     .map_err(|e| io::Error::other(format!("mount fresh PID-namespace procfs: {e}")))?;
+    crate::ipc_namespace::isolate(Path::new(&proc_directory), sys::unshare_ipc)?;
 
     let new_root = cstring(NEW_ROOT)?;
     let put_old = cstring(PUT_OLD)?;

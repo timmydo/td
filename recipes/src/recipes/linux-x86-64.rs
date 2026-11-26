@@ -187,6 +187,8 @@ const CONFIG: &[&str] = &[
     "CONFIG_USER_NS=y",
     "CONFIG_PID_NS=y",
     "CONFIG_UTS_NS=y",
+    "CONFIG_SYSVIPC=y",
+    "CONFIG_IPC_NS=y",
     "CONFIG_NET_NS=y",
     "CONFIG_AUDIT=y",
     "CONFIG_COMPAT_32BIT_TIME=y",
@@ -795,11 +797,8 @@ pub fn recipe() -> Recipe {
     //    identity; like SECCOMP_FILTER it has no independent policy choice and is
     //    guarded only after olddefconfig resolves the dependency graph.
     //
-    //    IPC_NS is NOT enabled and is guarded OFF. It is `default y` on `SYSVIPC ||
-    //    POSIX_MQUEUE`, both off, so it cannot be enabled alone — and the same
-    //    olddefconfig mechanism that handed us NET_NS would hand us an IPC namespace
-    //    the moment somebody pins SYSVIPC for an unrelated reason. td-jail omits
-    //    CLONE_NEWIPC until that is a decision rather than a side effect.
+    //    PostgreSQL needs SysV shared memory. Both td-jail and the builder give
+    //    workloads a private IPC namespace before executing them.
     //    Audio arrives here with td-audio (§K.4). SOUND/SND/SND_PCM are the core;
     //    SND_HDA_INTEL and SND_HDA_GENERIC are the codec path that covers both
     //    QEMU's `-device intel-hda` and ordinary desktop hardware (since 7.2
@@ -1462,6 +1461,8 @@ mod tests {
         ("CONFIG_USER_NS=y", "USER_NS off — unshare(CLONE_NEWUSER) returns EINVAL, so td-jail cannot build a sandbox at all"),
         ("CONFIG_PID_NS=y", "PID_NS off — a jailed app would see (and could signal) every process on the machine"),
         ("CONFIG_UTS_NS=y", "UTS_NS off — a jail could not present its own hostname"),
+        ("CONFIG_SYSVIPC=y", "PostgreSQL requires System V shared memory"),
+        ("CONFIG_IPC_NS=y", "jails and builds require private IPC objects"),
         ("CONFIG_NET_NS=y", "NET_NS off — a jail without shared=network could not be cut off from the network stack"),
         ("CONFIG_AUDIT=y", "AUDIT off — the physical Firefox proof cannot account for outer seccomp denials"),
         ("CONFIG_AUDITSYSCALL=y", "AUDITSYSCALL off — x86 seccomp audit records cannot carry syscall identity"),
@@ -1689,7 +1690,6 @@ mod tests {
         ("CONFIG_USB_NET_NET1080", "USB_NET_NET1080 on — NetChip host-to-host cables are USB drivers nothing asked for"),
         ("CONFIG_USB_NET_CDC_SUBSET", "USB_NET_CDC_SUBSET on — Belkin and ARM Linux host-to-host links are USB drivers nothing asked for"),
         ("CONFIG_USB_NET_ZAURUS", "USB_NET_ZAURUS on — Sharp Zaurus links are USB drivers nothing asked for"),
-        ("CONFIG_IPC_NS", "IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately"),
     ];
 
     /// The lock names this exact `CONFIG_X=value` line.

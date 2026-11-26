@@ -3773,6 +3773,16 @@ fn build_td_txt_probes() -> String {
 /// read for their VALUE in [`SANDBOX_KERNEL_UCOUNTS`] instead.
 const SANDBOX_KERNEL_NODES: &[(&str, &str, &str)] = &[
     (
+        "/proc/self/ns/ipc",
+        "CONFIG_IPC_NS",
+        "workloads cannot isolate their System V IPC objects",
+    ),
+    (
+        "/proc/sysvipc/shm",
+        "CONFIG_SYSVIPC",
+        "PostgreSQL cannot allocate System V shared memory",
+    ),
+    (
         "/proc/cgroups",
         "CONFIG_CGROUPS",
         "no cgroup v2 at all, so an application has no aggregate CPU, memory, or pid cap",
@@ -3884,14 +3894,9 @@ const SANDBOX_KERNEL_CGROUP2_ROWS: &[(&str, &str, &str, &str, &str)] = &[(
     "a jail cannot enforce CPU bandwidth",
 )];
 
-/// The per-namespace ucount ceilings, one per `CLONE_NEW*` td-jail's single `unshare(2)`
-/// asks for. Each is a kill switch a compiled-in namespace cannot survive: set to 0, the
+/// Per-namespace ucount ceilings for td-jail. Each is a kill switch a
+/// compiled-in namespace cannot survive: set to 0, the
 /// feature is present, its `/proc/self/ns/` node exists, and `unshare` fails `ENOSPC`.
-///
-/// All four are read, not just the user one. An earlier draft checked
-/// `max_user_namespaces` alone, which left three of the four namespaces in §C's
-/// `unshare` unguarded — and the pid one is the sharpest, since `CLONE_NEWPID` failing
-/// leaves an application looking at every process on the machine.
 ///
 /// Read for VALUE rather than existence: `kernel/ucount.c` registers the whole `user`
 /// table under CONFIG_SYSCTL, so the FILE is there on a kernel with no namespaces at
@@ -3901,6 +3906,7 @@ const SANDBOX_KERNEL_UCOUNTS: &[(&str, &str)] = &[
     ("max_user_namespaces", "CLONE_NEWUSER"),
     ("max_pid_namespaces", "CLONE_NEWPID"),
     ("max_uts_namespaces", "CLONE_NEWUTS"),
+    ("max_ipc_namespaces", "CLONE_NEWIPC"),
     ("max_net_namespaces", "CLONE_NEWNET"),
 ];
 
@@ -16877,6 +16883,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         "CONFIG_USER_NS",
         "CONFIG_PID_NS",
         "CONFIG_UTS_NS",
+        "CONFIG_IPC_NS",
+        "CONFIG_SYSVIPC",
         "CONFIG_NET_NS",
         "CONFIG_SECCOMP",
         "CONFIG_SECCOMP_FILTER",
@@ -17051,23 +17059,13 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
     }
 
-    /// IPC_NS is refused rather than merely unpinned. It is `default y` behind
-    /// `SYSVIPC || POSIX_MQUEUE`, so the same olddefconfig step that handed td `NET_NS`
-    /// unasked would hand it an IPC namespace the moment somebody pins SysV IPC for an
-    /// unrelated reason — and td-jail omits `CLONE_NEWIPC` on the strength of it being
-    /// off. A negative guard makes that a decision instead of a side effect.
     #[test]
-    fn ipc_ns_stays_refused_until_someone_argues_for_it() {
-        assert!(
-            !linux_locked("CONFIG_IPC_NS=y"),
-            "IPC_NS must stay off in the resolved lock, not just out of the pin list"
-        );
-        for symbol in ["CONFIG_IPC_NS", "CONFIG_SYSVIPC", "CONFIG_FUSE_FS"] {
-            assert!(
-                !config_table().contains(&format!("\"{symbol}=y\"")),
-                "{symbol} is deferred by APPLICATIONS.md §0 and must not be pinned on"
-            );
+    fn sysv_ipc_is_namespaced_and_fuse_remains_deferred() {
+        for symbol in ["CONFIG_SYSVIPC=y", "CONFIG_IPC_NS=y"] {
+            assert!(linux_locked(symbol));
+            assert!(config_table().contains(symbol));
         }
+        assert!(!config_table().contains("\"CONFIG_FUSE_FS=y\""));
     }
 
     /// Every probe leg can clear the flag, and the farm is quoted so the greeter's

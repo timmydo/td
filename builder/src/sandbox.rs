@@ -36,7 +36,7 @@
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr};
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
@@ -87,69 +87,7 @@ fn cstr(p: &Path) -> io::Result<CString> {
 /// before executing any workload. An inherited or caller-supplied /proc
 /// could hide the kernel interfaces that make the absence decision safe.
 fn isolate_ipc(fresh_proc: &Path) -> io::Result<()> {
-    let namespace = fresh_proc.join("self/ns/ipc");
-    match fs::read_link(&namespace) {
-        Ok(before) => {
-            sys::unshare(sys::CLONE_NEWIPC)?;
-            if fs::read_link(&namespace)? == before {
-                return Err(err("IPC namespace did not change".into()));
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            require_no_ipc_facilities(fresh_proc)?;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn require_no_ipc_facilities(fresh_proc: &Path) -> io::Result<()> {
-    for relative in ["sysvipc", "sys/fs/mqueue"] {
-        match fs::symlink_metadata(fresh_proc.join(relative)) {
-            Ok(_) => {
-                return Err(err(format!(
-                    "kernel exposes {relative} without an IPC namespace"
-                )))
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    let mut filesystems = String::new();
-    fs::File::open(fresh_proc.join("filesystems"))?
-        .take(65537)
-        .read_to_string(&mut filesystems)?;
-    if filesystems.len() > 65536 {
-        return Err(err("kernel filesystem list exceeds 64 KiB".into()));
-    }
-    let mut has_proc = false;
-    for line in filesystems.lines() {
-        let mut words = line.split_whitespace();
-        let first = words
-            .next()
-            .ok_or_else(|| err("empty kernel filesystem row".into()))?;
-        let kind = if first == "nodev" {
-            words
-                .next()
-                .ok_or_else(|| err("incomplete kernel filesystem row".into()))?
-        } else {
-            first
-        };
-        if words.next().is_some() {
-            return Err(err("malformed kernel filesystem row".into()));
-        }
-        if kind == "mqueue" {
-            return Err(err(
-                "kernel exposes POSIX message queues without an IPC namespace".into(),
-            ));
-        }
-        has_proc |= kind == "proc";
-    }
-    if !has_proc {
-        return Err(err("kernel filesystem list does not identify procfs".into()));
-    }
-    Ok(())
+    td_engine::ipc_namespace::isolate(fresh_proc, || sys::unshare(sys::CLONE_NEWIPC))
 }
 
 fn trusted_recipe_builder(builder: &str) -> bool {
@@ -2487,7 +2425,7 @@ mod tests {
         let root = _root_cleanup.join("fixture");
         fs::create_dir(&root).unwrap();
         fs::create_dir_all(root.join("sys/fs")).unwrap();
-        assert!(require_no_ipc_facilities(&root).is_err());
+        assert!(isolate_ipc(&root).is_err());
         for content in [
             "",
             "nodev\n",
@@ -2496,14 +2434,13 @@ mod tests {
             "nodev proc\nnodev mqueue\n",
         ] {
             fs::write(root.join("filesystems"), content).unwrap();
-            assert!(require_no_ipc_facilities(&root).is_err(), "{content:?}");
+            assert!(isolate_ipc(&root).is_err(), "{content:?}");
         }
         fs::write(
             root.join("filesystems"),
             "nodev\tproc\nnodev\ttmpfs\n\text4\n",
         )
         .unwrap();
-        require_no_ipc_facilities(&root).unwrap();
         isolate_ipc(&root).unwrap();
         fs::create_dir_all(root.join("self/ns")).unwrap();
         fs::write(root.join("self/ns/ipc"), b"not a namespace link").unwrap();
@@ -2512,14 +2449,31 @@ mod tests {
         for relative in ["sysvipc", "sys/fs/mqueue"] {
             let path = root.join(relative);
             fs::create_dir(&path).unwrap();
-            assert!(require_no_ipc_facilities(&root).is_err());
+            assert!(isolate_ipc(&root).is_err());
             fs::remove_dir(&path).unwrap();
             std::os::unix::fs::symlink("/absent-ipc-test-target", &path).unwrap();
-            assert!(require_no_ipc_facilities(&root).is_err());
+            assert!(isolate_ipc(&root).is_err());
             fs::remove_file(&path).unwrap();
         }
         fs::write(root.join("filesystems"), "x".repeat(65537)).unwrap();
-        assert!(require_no_ipc_facilities(&root).is_err());
+        assert!(isolate_ipc(&root).is_err());
+    }
+
+    #[test]
+    fn exposed_ipc_requires_successful_unshare_and_a_new_namespace_identity() {
+        let root = crate::test_temp::TempDir::new("td-ipc-identity").unwrap();
+        let parent = root.join("self/ns");
+        fs::create_dir_all(&parent).unwrap();
+        let ipc = parent.join("ipc");
+        std::os::unix::fs::symlink("ipc:[1]", &ipc).unwrap();
+        use td_engine::ipc_namespace::isolate;
+        assert!(isolate(root.path(), || Err(io::ErrorKind::PermissionDenied.into())).is_err());
+        assert!(isolate(root.path(), || Ok(())).is_err());
+        isolate(root.path(), || {
+            fs::remove_file(&ipc)?;
+            std::os::unix::fs::symlink("ipc:[2]", &ipc)
+        })
+        .unwrap();
     }
 
     #[test]
@@ -2528,7 +2482,9 @@ mod tests {
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert_eq!(production.matches("isolate_ipc(").count(), 3);
         assert_eq!(production.matches("sys::CLONE_NEWIPC").count(), 1);
-        assert!(production.contains("sys::unshare(sys::CLONE_NEWIPC)?;"));
+        assert!(production.contains(
+            "td_engine::ipc_namespace::isolate(fresh_proc, || sys::unshare(sys::CLONE_NEWIPC))"
+        ));
         let normalize = |text: &str| {
             text.chars()
                 .filter(|ch| !ch.is_whitespace())

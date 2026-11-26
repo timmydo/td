@@ -261,7 +261,7 @@ namespace identity must change. A missing IPC namespace is acceptable only
 when that fresh procfs has neither `sysvipc` nor `sys/fs/mqueue`, and its
 bounded, structurally checked filesystem inventory includes `proc` but no
 `mqueue`. Missing or malformed inventory and lookup errors refuse execution.
-This permits td's kernel with both IPC facilities disabled; it never omits
+This permits older kernels with both IPC facilities disabled; it never omits
 isolation for exposed facilities or after a failed IPC unshare. An inherited
 or caller-supplied proc tree cannot supply these witnesses. Confinement tests
 pin both callers immediately after their fresh proc mount and the one IPC
@@ -1899,6 +1899,9 @@ application design permits:
 `CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUTS`, with
 `CLONE_NEWNET` either absent for a declared shared network or present for
 an isolated one. There is no caller-provided flags word.
+After stage 2 mounts fresh procfs, a second wrapper accepts no arguments
+and issues only `unshare(CLONE_NEWIPC)` (0x08000000). Both the jail and
+the builder use the fresh-procfs checks in the builder section before executing a workload.
 The ioctl wrapper accepts no caller-provided request, descriptor or
 interface. Two requests serve loopback: `SIOCGIFFLAGS`=0x8913 and
 `SIOCSIFFLAGS`=0x8914 over a pinned 40-byte `ifreq` naming `lo`, preserving

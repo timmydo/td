@@ -25,6 +25,7 @@ const SYS_SECCOMP: usize = 317;
 
 const CLONE_NEWNS: usize = 0x0002_0000;
 const CLONE_NEWUTS: usize = 0x0400_0000;
+const CLONE_NEWIPC: usize = 0x0800_0000;
 const CLONE_NEWUSER: usize = 0x1000_0000;
 const CLONE_NEWPID: usize = 0x2000_0000;
 const CLONE_NEWNET: usize = 0x4000_0000;
@@ -273,6 +274,10 @@ pub fn unshare_namespaces(isolate_network: bool) -> io::Result<()> {
         true => ISOLATED_NETWORK_FLAGS,
     };
     check(syscall5(SYS_UNSHARE, flags, 0, 0, 0, 0))
+}
+
+pub(crate) fn unshare_ipc() -> io::Result<()> {
+    check(syscall5(SYS_UNSHARE, CLONE_NEWIPC, 0, 0, 0, 0))
 }
 
 fn loopback_request() -> IfreqFlags {

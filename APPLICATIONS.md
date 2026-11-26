@@ -166,12 +166,7 @@ That is one fewer symbol to argue for, and more importantly
 it is the mechanism to remember: **pinning a dependency can enable its
 dependants.**
 
-The same trap is latent in the other direction for `IPC_NS`, which is
-`default y` and depends on `SYSVIPC || POSIX_MQUEUE`. Enabling SysV IPC
-for some unrelated reason would bring an IPC namespace along without
-anyone pinning one — the opposite of the "cannot be enabled alone"
-consequence below, and worth knowing before someone pins `SYSVIPC`
-casually.
+The target explicitly pins both `SYSVIPC` and its dependent `IPC_NS`.
 
 The conclusions this section exists for survive unchanged: `USER_NS` and
 `SECCOMP` were genuinely off, so `unshare(CLONE_NEWUSER)` returned
@@ -220,18 +215,13 @@ in one commit than in twenty.
 **APPROVED by the maintainer, and LANDED.** The pin block below was a
 landing to write rather than a case still to argue, and §J's first risk
 retired with it.
-Two things the approval does not do, stated so the commit that carries
-it stays honest: it does not make the boot oracle optional — a kernel
-that regresses `USER_NS` or `SECCOMP` must red the image rather than the
-first application — and it does not extend to `SYSVIPC` or `FUSE_FS`,
-which are deferred below and each need their own argument when something
-wants them.
+The boot oracle must detect a kernel that regresses `USER_NS` or
+`SECCOMP`. `FUSE_FS` remains deferred until the Documents portal.
 
 Consequences worth stating separately:
 
-- **`IPC_NS` cannot be enabled alone.** It depends on `SYSVIPC ||
-  POSIX_MQUEUE`, both off. Either enable SysV IPC — which nothing else on
-  the image wants — or ship without an IPC namespace and record that.
+- **System V IPC** provides PostgreSQL shared memory. The target pins both
+  `SYSVIPC` and `IPC_NS` so each workload can own its objects.
 - **No FUSE ⇒ no Documents portal in its standard form** (§E). The
   document store is a FUSE filesystem mounted at `$XDG_RUNTIME_DIR/doc`
   — not `/run/flatpak/doc`, which an earlier draft wrote — and without
@@ -275,7 +265,7 @@ CONFIG_SND_ALOOP=y                 # explicit-only in-guest audio test oracle
 CONFIG_CGROUPS=y  CONFIG_MEMCG=y  CONFIG_CGROUP_PIDS=y
 CONFIG_CGROUP_SCHED=y  CONFIG_FAIR_GROUP_SCHED=y  CONFIG_CFS_BANDWIDTH=y
 # CONFIG_RT_GROUP_SCHED is not set  # fair-scheduler bandwidth only
-# IPC_NS deferred: needs SYSVIPC, which nothing else on the image wants
+CONFIG_SYSVIPC=y  CONFIG_IPC_NS=y
 # FUSE_FS deferred: lands with the Documents portal, not before
 ```
 
@@ -328,8 +318,8 @@ one class of failure a config guard structurally cannot see: a value.
 Each namespace has a ucount ceiling in `/proc/sys/user/max_*_namespaces`
 that a compiled-in namespace cannot survive being set to zero — the
 feature is present, its `/proc/self/ns/` node is there, and `unshare`
-returns `ENOSPC`. All four td-jail asks for are read, not just the user
-one.
+returns `ENOSPC`. The boot oracle reads the user, PID, UTS, IPC and
+network namespace ceilings.
 
 The gap that leaves is narrow and worth stating precisely, because
 "reads `/proc`" sounds much weaker than it is: procfs builds
@@ -355,18 +345,13 @@ observed. Resolving the pinned `linux-7.3.1` end to end confirms it:
 with `SECCOMP` pinned and `SECCOMP_FILTER` absent from the list, the
 resolved config carries `CONFIG_SECCOMP_FILTER=y`.
 
-**`IPC_NS` is now guarded OFF rather than merely left out**, which is
-this section's own `NET_NS` lesson applied in the other direction: a
-symbol that is `default y` behind a dependency somebody may pin later
-arrives unasked. `td-jail` omits `CLONE_NEWIPC` on the strength of it
-being off, so the guard is what makes that a decision.
-
-Native control-plane builds retain that kernel decision. The builder checks
-its own freshly mounted procfs before executing a workload: it creates and
-verifies a private IPC namespace when supported, or verifies that SysV IPC
-and POSIX message queues are both absent. Exposed facilities without namespace
-support are refused. `UNSAFE.md` owns the exact witnesses and call ordering;
-this does not change td-jail's namespace policy or enable a kernel feature.
+**IPC isolation.** The target kernel enables System V IPC for PostgreSQL.
+After mounting fresh procfs in its PID namespace, td-jail stage 2 or the
+builder reads `self/ns/ipc`, creates a private IPC namespace, and verifies
+that the link changed before it executes any workload. Every network policy
+uses the same IPC isolation. On older host kernels a missing link requires
+proof that both SysV IPC and POSIX message queues are absent. Any other
+failure stops the launch. `UNSAFE.md` specifies those witnesses.
 
 **`MEMCG` needed a different runtime witness, and the reason is a trap
 worth carrying into §P.** `/proc/cgroups` is the obvious place to look
@@ -678,7 +663,7 @@ td-svc
       │                                    registers with td-busd;
       │                                    single-threaded;
       │                                    unshare(NEWUSER|NEWNS|NEWPID|
-      │                                    NEWUTS[|NEWIPC][|NEWNET]);
+      │                                    NEWUTS[|NEWNET]);
       │                                    setgroups=deny, then uid_map
       │                                    and gid_map "1000 65536 1";
       │                                    prepare root + loopback; carry
@@ -2775,7 +2760,7 @@ After the proved application containment above, one `unshare(2)` in
 single-threaded stage 1:
 
 ```
-CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS [| CLONE_NEWIPC] [| CLONE_NEWNET]
+CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS [| CLONE_NEWNET]
 ```
 
 All in one call so the pid namespace is owned by the new user namespace —
@@ -2787,8 +2772,7 @@ fresh namespace is loopback **brought up** with a pinned
 `SIOCGIFFLAGS`/`SIOCSIFFLAGS` pair on the name `lo` — leaving it down
 turns "no internet" into "no sockets" for every app with a localhost
 helper, while issuing that ioctl against td's shared stack would mutate
-host policy. `NEWIPC` only
-once `CONFIG_IPC_NS` is on (§0). uid/gid maps are **identity** — `1000
+host policy. Stage 2 isolates IPC before workload execution (§0). uid/gid maps are **identity** — `1000
 1000 1` — because an app that sees uid 0 mis-chowns its own files, and
 `setgroups` is denied *before* the gid_map write (CVE-2014-8989); that
 ordering is ported verbatim from `map_userns_id`.
@@ -8336,7 +8320,7 @@ Ranked by how likely they are to change the plan:
    before the workstreams (§V).
 5. **The deny list's misses**, whose failure mode is silent while its
    false hits are loud. Mitigated by matching upstream's decade-tested
-   list, by td's kernel config independently removing io_uring/bpf/sysvipc,
+   list, by isolating System V IPC in a private namespace,
    and by each divergence being individually argued so review can attack
    it row by row.
 6. **Broker policy equivalence with `xdg-dbus-proxy`** — a subtle
