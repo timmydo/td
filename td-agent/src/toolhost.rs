@@ -1164,12 +1164,12 @@ mod tests {
     /// so the sender is never held at its window by a pipe nobody reads.
     #[test]
     fn input_past_a_closed_input_is_still_taken() {
-        let dir = scratch("serve-closed");
-        let mut client = host(vec![dir.clone()]);
+        let dir = td_fs::TempDir::new("serve-closed").unwrap();
+        let mut client = host(vec![dir.path().to_owned()]);
         let id = client
             .call(Call::Serve {
                 program: "sh".into(),
-                args: vec!["-c".into(), "exec 0<&-; sleep 6; echo ended".into()],
+                args: vec!["-c".into(), "exec sh -c 'sleep 6; echo ended' 0<&-".into()],
                 workdir: None,
             })
             .unwrap();
@@ -1187,7 +1187,6 @@ mod tests {
         let (output, _, done) = served(&mut client, id, Instant::now() + Duration::from_secs(20));
         assert_eq!(output, b"ended\n");
         assert_eq!(done.text, "exit status 0");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A program that never reads its input holds up nothing else: its

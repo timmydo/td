@@ -105,3 +105,7 @@ fn exit(result: Result<(), impl std::fmt::Display>) -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../td-fs/tests/support/pipe_parent.rs"]
+mod pipe_parent;

@@ -835,7 +835,13 @@ mod tests {
     #[test]
     fn a_descendant_holding_the_output_does_not_hold_the_call() {
         let started = Instant::now();
-        let exit = quick("sleep 5 & echo parent");
+        let exit = run(
+            crate::pipe_parent::parent("parent", false),
+            Duration::from_secs(10),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
         assert_eq!(exit.code, Some(0));
         assert!(exit.output.text().starts_with("parent"));
         assert!(started.elapsed() < Duration::from_secs(4));

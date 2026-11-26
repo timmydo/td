@@ -88,6 +88,9 @@ pub mod patch;
 pub mod peer;
 pub mod picker;
 pub mod picture;
+#[cfg(test)]
+#[path = "../../td-fs/tests/support/pipe_parent.rs"]
+mod pipe_parent;
 pub mod post;
 pub mod prompt;
 pub mod promptdialog;

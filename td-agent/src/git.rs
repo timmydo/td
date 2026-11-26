@@ -4179,10 +4179,7 @@ pub(crate) mod tests {
         }
         let started = Instant::now();
         let said = run(
-            Command::new("sh").args([
-                "-c",
-                "(for i in 1 2 3 4 5 6 7 8 9 10; do echo x >&2; sleep 0.3; done &); echo hi",
-            ]),
+            &mut crate::pipe_parent::parent("hi", true),
             64,
             Duration::from_secs(10),
         )
@@ -4257,8 +4254,7 @@ pub(crate) mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         // A process left holding the pipes does not hold the answer: the
         // shell's exit decides, after the grace.
-        let mut left = Command::new("sh");
-        left.args(["-c", "echo ok; sleep 30 & exit 0"]);
+        let mut left = crate::pipe_parent::parent("ok", false);
         let started = Instant::now();
         assert_eq!(
             run(&mut left, 64, Duration::from_secs(20)).unwrap(),

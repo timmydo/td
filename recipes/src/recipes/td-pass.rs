@@ -139,6 +139,7 @@ mod tests {
                 "td-ui = { path = \"../td-ui\" }",
                 "td-passkeys = { path = \"../td-passkeys\" }",
                 "td-secret = { path = \"../td-secret\" }",
+                "td-fs = { path = \"../td-fs\" }",
                 "td-test-compositor = { path = \"../td-test-compositor\" }"
             ]
         );

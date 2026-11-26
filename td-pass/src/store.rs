@@ -768,15 +768,15 @@ mod tests {
         if !sh() {
             return;
         }
-        let scratch = Scratch::new("held");
-        scratch.file("a.gpg", "x");
+        let scratch = td_fs::TempDir::new("held").unwrap();
+        fs::write(scratch.join("a.gpg"), "x").unwrap();
         let started = Instant::now();
         let read = read_with(
-            &scratch.0,
+            scratch.path(),
             &|_| Ok(()),
             &|| false,
             &mut |_, _| {},
-            &fake("cat; sleep 30 &"),
+            &|| crate::pipe_parent::parent("x", false),
         );
         match read {
             Err(Stop::Failed(text)) => assert!(text.contains("left its output open"), "{text}"),
