@@ -35,6 +35,7 @@ pub(crate) enum Notice {
     HostnameSaved,
     TimeSaved,
     VolumeSaved,
+    ProcessesSignalled,
     AdminKeySaved,
     /// Root's success for tag 46: the admin service started the job.
     AdminUpdateSubmitted,
@@ -237,7 +238,7 @@ impl Prepared {
             .filter(|value| *value >= 24)
             .ok_or("output cannot hold a complete trusted prompt")?;
         let mut lines = Vec::new();
-        if !request.website_rows(|args| {
+        if !request.bounded_rows(|args| {
             let line = crate::allocation::format(args).map_err(|_| String::new())?;
             crate::allocation::push(&mut lines, line).map_err(|_| String::new())
         })? {
@@ -734,6 +735,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::NoHostname => "NO SETTINGS CHANGE IS READY",
         Notice::HostnameSaved => "HOSTNAME SAVED",
         Notice::TimeSaved => "TIME SETTINGS SAVED",
+        Notice::ProcessesSignalled => "PROCESS SIGNAL RESULTS SENT",
         Notice::VolumeSaved => "VOLUME CHANGE APPLIED",
         Notice::AdminKeySaved => "REMOTE ADMIN KEY ENROLLED",
         Notice::AdminUpdateSubmitted => "UPDATE JOB SUBMITTED",

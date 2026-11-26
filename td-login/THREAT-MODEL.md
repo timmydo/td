@@ -1018,6 +1018,12 @@ Against A2, the parsers fail closed rather than fail soft:
   parses; a malformed group file fails the lookup rather than silently
   granting a smaller set.
 
+For an approved task-manager signal the trusted session resolves the
+target's pinned process identity and workload ledger account. The fixed
+delivery executable runs through `exec-service-as` as that account in
+the host PID namespace, so kernel signal permissions still apply.
+td-authd/DESIGN.md specifies the single-use consent and target checks.
+
 Workload accounts come from the workload account ledger
 (`td-authd/DESIGN.md`, "Workload account ledger") alone. `tda<uid>`, `tda`
 followed by digits, is an application account's reserved form, and

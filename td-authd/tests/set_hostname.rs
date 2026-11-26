@@ -159,13 +159,17 @@ pub(crate) fn submit_as(
 ) -> UnixStream {
     let (client, answer) = fixture.submit(intake, &frame(name));
     assert_eq!(answer, Some(ADMITTED));
+    set_consent_requester(intake, requester);
+    client
+}
+
+fn set_consent_requester(intake: &mut Intake, requester: u32) {
     let peer = intake
         .pending
         .as_mut()
         .and_then(|pending| pending.peer.as_mut())
         .unwrap();
     peer.credentials.uid = requester;
-    client
 }
 
 impl Fixture {
@@ -882,4 +886,79 @@ fn volume_changes_have_a_distinct_principal_and_refuse_malformed_values() {
         },
     )
     .is_err());
+}
+
+#[test]
+fn a_signal_frame_requires_a_pinned_review_and_one_trusted_consent() {
+    let tree = crate::test_temp::TempDir::new("signal-intake").unwrap();
+    let dir = tree.path().join("20");
+    fs::create_dir(&dir).unwrap();
+    fs::write(
+        dir.join("status"),
+        b"Uid: 98304 98304 98304 98304\nNStgid: 20 2\nPPid: 10\n",
+    )
+    .unwrap();
+    fs::write(dir.join("cgroup"), b"0::/td-workload-98304/session\n").unwrap();
+    let body = format!("SIGSTOP selected 20 20.{}", dir.metadata().unwrap().ino());
+    for expire in [false, true] {
+        let fixture = Fixture::new("td");
+        let mut intake = fixture.intake(granted);
+        let mut client = UnixStream::connect(fixture.scratch.path.join("intake")).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        intake.tick();
+        let mut greeting = [0; 8];
+        client.read_exact(&mut greeting).unwrap();
+        assert_eq!(&greeting, GREETING);
+        client.write_all(&[255]).unwrap();
+        client
+            .write_all(&(body.len() as u16).to_be_bytes())
+            .unwrap();
+        client.write_all(body.as_bytes()).unwrap();
+        let prepare = |body: &[u8], stream: &UnixStream, pid| {
+            crate::process_signals::Plan::prepare_in(
+                body,
+                stream,
+                pid,
+                tree.path().to_str().unwrap(),
+                || {
+                    crate::workload_accounts::Ledger::parse(
+                        "td-accounts-v1\nsandbox\tdemo\t98304\n",
+                    )
+                },
+            )
+        };
+        for _ in 0..8 {
+            intake.tick_with(prepare);
+        }
+        let mut reply = [0];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, [ADMITTED]);
+        set_consent_requester(&mut intake, PRIMARY_UID);
+        let ready = intake.select().unwrap();
+        assert_eq!(ready.operation(), elevation::Operation::SignalProcesses);
+        let mut change = intake.describe(PRIMARY_UID, ready).unwrap();
+        let request = change.request().clone();
+        assert!(change.commit(&request).is_err());
+        assert!(matches!(change.poll().unwrap(), Event::Present(_)));
+        let other = Request::new([8; 32], PRIMARY_UID, request.operation().clone()).unwrap();
+        assert!(change.presented(&other).is_err());
+        change.presented(&request).unwrap();
+        assert!(matches!(change.poll().unwrap(), Event::Commit(_)));
+        if expire {
+            change.commit(&request).unwrap();
+            change.helper = Some(crate::inspection::tests::fixture(0));
+            change.signal.as_mut().unwrap().expire();
+            assert!(matches!(change.poll().unwrap(), Event::Failed(_)));
+            assert!(change.helper.is_none());
+        } else {
+            change.cancel().unwrap();
+            assert!(change.commit(&request).is_err());
+        }
+        assert!(matches!(change.poll().unwrap(), Event::Failed(_)));
+        intake.finish(false);
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, [0]);
+    }
 }

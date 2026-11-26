@@ -328,7 +328,14 @@ mod tests {
             self.release.recv_timeout(Duration::from_secs(3)).unwrap();
             let mut rows = MemoryVec::new(&self.budget, 1).unwrap();
             rows.push(Text::new("owned fixture")).unwrap();
-            Ok((intent, Details { intent, rows }))
+            Ok((
+                intent,
+                Details {
+                    intent,
+                    rows,
+                    workload_requester: None,
+                },
+            ))
         }
         fn deliver(&mut self, intent: Intent, active: &AtomicU64) -> Results {
             let mut deliveries = MemoryVec::new(&self.budget, 1).unwrap();
@@ -470,7 +477,14 @@ mod tests {
             let mut rows = MemoryVec::new(&self.budget, 2).unwrap();
             rows.push(Text::new("first captured process")).unwrap();
             rows.push(Text::new("second captured process")).unwrap();
-            Ok((intent, Details { intent, rows }))
+            Ok((
+                intent,
+                Details {
+                    intent,
+                    rows,
+                    workload_requester: None,
+                },
+            ))
         }
         fn deliver(&mut self, intent: Intent, active: &AtomicU64) -> Results {
             let mut deliveries = MemoryVec::new(&self.budget, 2).unwrap();

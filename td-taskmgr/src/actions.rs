@@ -125,6 +125,7 @@ pub struct Intent {
 }
 #[derive(Debug)]
 pub struct Details {
+    pub workload_requester: Option<u32>,
     pub intent: Intent,
     pub rows: MemoryVec<Text<4096>>,
 }
@@ -133,6 +134,7 @@ pub enum Delivery {
     Sent,
     Exited,
     Permission,
+    Unconfirmed,
     Error(i32),
     Cancelled,
 }

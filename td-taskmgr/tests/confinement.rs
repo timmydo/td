@@ -144,7 +144,26 @@ fn process_signal_surface_is_fixed_and_private() {
             .unwrap_or_else(|| panic!("missing ordered peer-stop check {step}"))
             .1;
     }
-    assert_eq!(production.matches("signal_sys::send(").count(), 2);
+    let mut helper = production
+        .split_once("pub fn deliver_workload_signal(")
+        .unwrap()
+        .1
+        .split_once("fn request_workload(")
+        .unwrap()
+        .0;
+    assert!(!helper.contains("process_directory("));
+    for guard in [
+        "let signal = crate::actions::Signal::ALL",
+        "if !(65536..=131071).contains(&uid)",
+        "File::from(io::stdin().as_fd().try_clone_to_owned()?)",
+        "status.uid != uid",
+        "status.namespaces < 2",
+        "action_plan::protected(status, linux.own_pid)",
+        "signal_sys::send(&directory, signal)",
+    ] {
+        helper = helper.split_once(guard).unwrap().1;
+    }
+    assert_eq!(production.matches("signal_sys::send(").count(), 3);
     assert!(production.contains("File::open(\"/proc/self\")"));
     assert!(production.contains("action_plan::caller(status, self.own_pid)"));
     assert!(production.contains("action_plan::protected(status, self.own_pid)"));

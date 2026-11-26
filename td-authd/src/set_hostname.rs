@@ -52,7 +52,9 @@ impl Setting {
         &self.0
     }
     fn operation(&self) -> elevation::Operation {
-        if self.0.starts_with("publisher ") {
+        if self.0.starts_with("process ") {
+            elevation::Operation::SignalProcesses
+        } else if self.0.starts_with("publisher ") {
             elevation::Operation::ReplacePublisher
         } else if self.0.starts_with("admin-key ") {
             elevation::Operation::EnrollAdminKey
@@ -193,6 +195,7 @@ struct Pending {
     bytes: Vec<u8>,
     peer: Option<Peer>,
     name: Option<Setting>,
+    signal: Option<crate::process_signals::Plan>,
     acknowledged: bool,
     selected: bool,
     deadline: Option<Instant>,
@@ -212,6 +215,7 @@ impl Pending {
             bytes: Vec::with_capacity(80),
             peer: None,
             name: None,
+            signal: None,
             acknowledged: false,
             selected: false,
             deadline: Some(expires(5)?),
@@ -260,7 +264,11 @@ impl Pending {
     /// One length byte, then 1 to 63 name bytes `Hostname::parse` admits;
     /// `admit` then decides: its success sends admission byte 02, and its
     /// refusal that refusal's byte before the connection closes.
-    fn poll(&mut self, admit: impl FnOnce(&Setting) -> Result<(), Refused>) -> io::Result<()> {
+    fn poll(
+        &mut self,
+        admit: impl FnOnce(&Setting) -> Result<(), Refused>,
+        prepare: impl Fn(&[u8], &UnixStream, i32) -> Result<crate::process_signals::Plan, String>,
+    ) -> io::Result<()> {
         let mut admit = Some(admit);
         self.live()?;
         for _ in 0..4 {
@@ -306,17 +314,51 @@ impl Pending {
             }
             let expected = match self.bytes.first() {
                 Some(&length) if (1..=79).contains(&length) => usize::from(length) + 1,
+                Some(255) if self.bytes.len() < 3 => 3,
+                Some(255) => {
+                    let size = self
+                        .bytes
+                        .get(1..3)
+                        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+                        .map(u16::from_be_bytes)
+                        .map(usize::from)
+                        .filter(|n| (1..=crate::process_signals::FRAME).contains(n))
+                        .ok_or_else(|| error("invalid process signal frame"))?;
+                    size + 3
+                }
                 Some(_) => return Err(error("invalid hostname request length")),
                 None => 1,
             };
             if self.bytes.len() == expected && expected > 1 {
-                let text = std::str::from_utf8(
-                    self.bytes
-                        .get(1..)
-                        .ok_or_else(|| error("missing hostname"))?,
-                )
-                .map_err(error)?;
-                let name = Setting::parse(text).map_err(error)?;
+                let name = if self.bytes.first() == Some(&255) {
+                    let body = self
+                        .bytes
+                        .get(3..)
+                        .ok_or_else(|| error("missing process signal body"))?;
+                    let plan = prepare(
+                        body,
+                        &self.stream,
+                        self.peer
+                            .as_ref()
+                            .ok_or_else(|| error("missing sender"))?
+                            .credentials
+                            .pid,
+                    )
+                    .map_err(error)?;
+                    let name = Setting(
+                        crate::text(format_args!("process {}", plan.summary())).map_err(error)?,
+                    );
+                    self.signal = Some(plan);
+                    name
+                } else {
+                    let text = std::str::from_utf8(
+                        self.bytes
+                            .get(1..)
+                            .ok_or_else(|| error("missing hostname"))?,
+                    )
+                    .map_err(error)?;
+                    Setting::parse(text).map_err(error)?
+                };
                 let admit = admit
                     .take()
                     .ok_or_else(|| error("hostname admitted twice"))?;
@@ -327,21 +369,23 @@ impl Pending {
                 self.name = Some(name);
                 return self.live();
             }
-            let mut bytes = [0; 80];
+            let mut bytes = [0; 2048];
             let remaining = expected
                 .checked_sub(self.bytes.len())
                 .ok_or_else(|| error("invalid hostname cursor"))?;
             let bytes = bytes
-                .get_mut(..remaining)
+                .get_mut(..remaining.min(2048))
                 .ok_or_else(|| error("hostname frame overflow"))?;
             match sys::receive(&self.stream, bytes) {
                 Ok((count, sender)) => {
                     self.sender(sender)?;
-                    self.bytes.extend_from_slice(
+                    crate::allocation::extend_from_slice(
+                        &mut self.bytes,
                         bytes
                             .get(..count)
                             .ok_or_else(|| error("hostname receive count"))?,
-                    );
+                    )
+                    .map_err(|_| error("request buffer unavailable"))?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -439,6 +483,13 @@ impl Intake {
     }
 
     pub fn tick(&mut self) {
+        self.tick_with(crate::process_signals::Plan::prepare);
+    }
+
+    fn tick_with(
+        &mut self,
+        prepare: impl Fn(&[u8], &UnixStream, i32) -> Result<crate::process_signals::Plan, String>,
+    ) {
         if let Ok((stream, _)) = self.listener.accept() {
             if self.pending.is_none() && !self.in_flight {
                 self.pending = Pending::new(stream, self.owner).ok();
@@ -456,7 +507,7 @@ impl Intake {
         };
         // An admitted request counted at admission, however it ends.
         if request
-            .poll(|name| admit(places, status, *owner, name))
+            .poll(|name| admit(places, status, *owner, name), prepare)
             .is_err()
         {
             *pending = None;
@@ -507,7 +558,7 @@ impl Intake {
             .map(|peer| peer.credentials.uid)
             .ok_or("hostname request without a sender")?;
         let ready = Ready {
-            name: Setting::parse(name.name())?,
+            name: Setting(crate::owned(name.name())?),
             requester,
         };
         pending.selected = true;
@@ -518,7 +569,17 @@ impl Intake {
 
     /// The description of `ready` beside the saved name; the backoff
     /// counted it at admission.
-    pub fn describe(&self, owner: u32, ready: Ready) -> Result<Change, String> {
+    pub fn describe(&mut self, owner: u32, ready: Ready) -> Result<Change, String> {
+        if ready.operation() == elevation::Operation::SignalProcesses {
+            let plan = self
+                .pending
+                .as_mut()
+                .and_then(|pending| pending.signal.take())
+                .ok_or("missing pinned signal set")?;
+            let mut change = Change::start(owner, ready, Setting(String::new()), &self.places)?;
+            change.signal = Some(plan);
+            return Ok(change);
+        }
         let old = self.places.saved()?;
         Change::start(owner, ready, old, &self.places)
     }
@@ -639,6 +700,7 @@ pub(crate) struct Change {
     deadline: Instant,
     result: Option<bool>,
     helper: Option<Inspection>,
+    signal: Option<crate::process_signals::Plan>,
 }
 
 impl Change {
@@ -662,7 +724,12 @@ impl Change {
         let request = Request::new(
             nonce,
             owner,
-            if let Some(fingerprint) = ready.name.name().strip_prefix("publisher ") {
+            if let Some(summary) = ready.name.name().strip_prefix("process ") {
+                Operation::SignalProcesses {
+                    requester: ready.requester,
+                    setting: crate::owned(summary)?,
+                }
+            } else if let Some(fingerprint) = ready.name.name().strip_prefix("publisher ") {
                 Operation::ReplacePublisher {
                     requester: ready.requester,
                     fingerprint: fingerprint.into(),
@@ -710,6 +777,7 @@ impl Change {
                 .ok_or("hostname change deadline overflow")?,
             result: None,
             helper: None,
+            signal: None,
         })
     }
 
@@ -744,6 +812,19 @@ impl Change {
         self.admit(request)?;
         if !self.presented {
             return Err("hostname change was not presented".into());
+        }
+        if let Operation::SignalProcesses { setting, .. } = self.request.operation() {
+            let plan = self
+                .signal
+                .as_mut()
+                .filter(|p| p.summary() == setting)
+                .ok_or("signal set changed")?;
+            self.committed = true;
+            self.result = Some(false);
+            self.backoff.approved()?;
+            plan.approve()?;
+            self.result = None;
+            return Ok(());
         }
         if let Operation::ReplacePublisher { fingerprint, .. } = self.request.operation() {
             self.committed = true;
@@ -818,6 +899,18 @@ impl Change {
     }
 
     pub fn poll(&mut self) -> Result<Event, String> {
+        if let Some(plan) = self.signal.as_mut().filter(|_| self.committed) {
+            if self.result.is_none() {
+                self.result = plan.advance(&mut self.helper)?;
+            }
+            return Ok(match self.result {
+                Some(true) => Event::Complete,
+                Some(false) => {
+                    Event::Failed("signal delivery ended before every result was reported".into())
+                }
+                None => Event::Waiting,
+            });
+        }
         if let Some(helper) = &mut self.helper {
             match helper.finished()? {
                 None => return Ok(Event::Waiting),

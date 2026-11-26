@@ -3696,6 +3696,29 @@ leaves `@var`, the file included, as it is. A full or read-only `@var`
 fails the write, and so blocks updates and renames, until space is freed
 or the volume is writable again; the next admission then writes.
 
+**Process signals.** The installed settings intake also accepts a binary
+frame beginning with ff, a big-endian two-byte size and up to 9000 ASCII
+bytes. The words are the named signal, selected or subtree scope, selected
+host PID, and up to 256 PID.inode pairs in delivery order. Every fragment
+uses the same kernel-authenticated, live sender. Root pins each directory,
+checks the workload ledger, account credentials, PID namespace and session
+delegation, and verifies parent links between pinned members. Ordinary
+selected-process delivery excludes every namespace init. For a subtree
+SIGSTOP and SIGCONT take parents first and other signals take children first.
+
+The `signal-processes` principal grant allows the owner to present the
+immutable set as consent operation 47 through secure attention's H item.
+Its nonce binds that set, requesting process, signal and scope for one
+approval. Sandbox and workspace processes retain the workload session leaf. A
+packaged app must be in its named instance leaf below the app delegation.
+Every member must be in the same leaf. After confirmation root passes
+each retained process directory as standard input to a fixed td-taskmgr
+helper through td-login as the workload account. Only one helper runs at
+a time under a 90-second overall deadline. Each member's result byte is S
+for sent, X for exited, P for denied, E for error or ? for unknown. The requester reads
+the ordered results from its original connection. The final settings
+completion byte closes the request. Lost results have unknown outcome.
+
 **`set-hostname` after commit.** Root consumes the confirmation, then
 clears the backoff, then re-reads `/var/lib/td/hostname` with
 `td-firstboot hostname`'s bounds, refuses unless it holds the old name,

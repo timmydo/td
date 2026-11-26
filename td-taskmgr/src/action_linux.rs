@@ -30,11 +30,13 @@ pub(crate) struct Prepared {
     intent: Intent,
     targets: MemoryVec<Target>,
     deliveries: MemoryVec<Delivery>,
+    workload: bool,
 }
 pub(crate) struct Linux {
     budget: Arc<Budget>,
     reader: Reader,
     own_pid: u32,
+    own_uid: u32,
     generation: u64,
 }
 /// The paired compositor's physical force-quit, after td-login has entered
@@ -61,6 +63,152 @@ pub fn force_quit_peer(pid: u32, inode: u64) -> io::Result<()> {
     signal_sys::send(&directory, crate::actions::Signal::Kill)
 }
 
+/// Called by td-login after it drops to the one approved workload account.
+pub fn deliver_workload_signal(signal: &str, output: &mut impl std::io::Write) -> io::Result<()> {
+    use std::os::fd::AsFd;
+    let signal = crate::actions::Signal::ALL
+        .iter()
+        .copied()
+        .find(|s| s.label() == signal)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let budget = Budget::new(crate::budget::LIMIT).map_err(io::Error::other)?;
+    let mut linux = Linux::new(&budget, 1)?;
+    let uid = linux.own_uid;
+    if !(65536..=131071).contains(&uid) {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let directory = File::from(io::stdin().as_fd().try_clone_to_owned()?);
+    let result = (|| -> io::Result<()> {
+        let status = action_plan::status(linux.reader.process_file(
+            &directory,
+            "status",
+            PROCESS_BYTES,
+        )?)
+        .map_err(io::Error::other)?;
+        if status.uid != uid
+            || status.namespaces < 2
+            || action_plan::protected(status, linux.own_pid).is_err()
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        signal_sys::send(&directory, signal)
+    })();
+    let byte = match result {
+        Ok(()) => b'S',
+        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(ESRCH) => b'X',
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => b'P',
+        Err(_) => b'E',
+    };
+    output.write_all(&[byte])
+}
+
+fn request_workload(prepared: &mut Prepared, active: &AtomicU64) -> io::Result<()> {
+    use std::os::unix::{fs::MetadataExt, net::UnixStream};
+    for parent in ["/run", "/run/td-authd", "/run/td-authd/1000"] {
+        let m = std::fs::symlink_metadata(parent)?;
+        if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+    }
+    let wire = UnixStream::connect("/run/td-authd/1000/hostname")?;
+    workload_exchange(wire, prepared, active)
+}
+
+fn workload_exchange(
+    mut wire: std::os::unix::net::UnixStream,
+    prepared: &mut Prepared,
+    active: &AtomicU64,
+) -> io::Result<()> {
+    use std::io::{Read, Write as _};
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant};
+    let mut request = Text::<9000>::default();
+    let intent = prepared.intent;
+    let scope = if intent.scope == Scope::Selected {
+        "selected"
+    } else {
+        "subtree"
+    };
+    write!(
+        request,
+        "{} {scope} {}",
+        intent.signal.label(),
+        intent.key.pid
+    )
+    .map_err(io::Error::other)?;
+    for target in prepared.targets.iter() {
+        write!(
+            request,
+            " {}.{}",
+            target.observed.key.pid,
+            target.directory.metadata()?.ino()
+        )
+        .map_err(io::Error::other)?;
+    }
+    wire.set_read_timeout(Some(Duration::from_secs(5)))?;
+    wire.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut greeting = [0; 8];
+    wire.read_exact(&mut greeting)?;
+    if &greeting != b"TDHST01\n" {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    cancelled(active, intent.revision)?;
+    let bytes = request.as_str().as_bytes();
+    let size = u16::try_from(bytes.len()).map_err(io::Error::other)?;
+    wire.write_all(&[255])?;
+    wire.write_all(&size.to_be_bytes())?;
+    wire.write_all(bytes)?;
+    let mut admission = [0];
+    wire.read_exact(&mut admission)?;
+    if admission != [2] {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    prepared.deliveries.fill(Delivery::Unconfirmed);
+    wire.set_read_timeout(Some(Duration::from_millis(150)))?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut next = || -> io::Result<u8> {
+        loop {
+            cancelled(active, intent.revision)?;
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let mut byte = [0];
+            match wire.read_exact(&mut byte) {
+                Ok(()) => {
+                    let [received] = byte;
+                    return Ok(received);
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    for result in prepared.deliveries.iter_mut() {
+        *result = match next()? {
+            b'S' => Delivery::Sent,
+            b'X' => Delivery::Exited,
+            b'P' => Delivery::Permission,
+            b'E' => Delivery::Error(0),
+            b'?' => Delivery::Unconfirmed,
+            0 => return Err(io::Error::other("request declined or outcome unavailable")),
+            _ => return Err(io::ErrorKind::InvalidData.into()),
+        };
+    }
+    if next()? != 1 {
+        return Err(io::Error::other("signal request did not complete"));
+    }
+    Ok(())
+}
+
 fn cancelled(active: &AtomicU64, revision: u64) -> io::Result<()> {
     if revision == 0 || active.load(Ordering::Acquire) != revision {
         Err(io::Error::new(
@@ -80,6 +228,7 @@ impl Linux {
             budget: Arc::clone(budget),
             reader: Reader::new(budget, PROCESS_BYTES)?,
             own_pid: std::process::id(),
+            own_uid: 0,
             generation,
         };
         let directory = this.caller_directory()?;
@@ -96,6 +245,7 @@ impl Linux {
             PROCESS_BYTES,
         )?)
         .map_err(io::Error::other)?;
+        self.own_uid = status.uid;
         action_plan::caller(status, self.own_pid).map_err(io::Error::other)?;
         if process.key.pid != self.own_pid {
             return Err(io::Error::other("inconsistent caller PID view"));
@@ -176,7 +326,7 @@ impl Linux {
         observed: Input,
         active: &AtomicU64,
         revision: u64,
-    ) -> io::Result<Text<4096>> {
+    ) -> io::Result<(Text<4096>, bool)> {
         cancelled(active, revision)?;
         let status = action_plan::status(self.reader.process_file(
             directory,
@@ -219,7 +369,10 @@ impl Linux {
                     .map_err(io::Error::other)?;
             }
         }
-        Ok(row)
+        Ok((
+            row,
+            self.own_uid == 1000 && status.namespaces > 1 && (65536..=131071).contains(&status.uid),
+        ))
     }
     pub(crate) fn prepare(
         &mut self,
@@ -233,6 +386,9 @@ impl Linux {
             ));
         }
         self.caller_directory()?;
+        if intent.key.pid == self.own_pid {
+            return Err(io::Error::other("the task manager is protected"));
+        }
         let mut targets =
             MemoryVec::new(&self.budget, crate::actions::TARGETS).map_err(io::Error::other)?;
         if intent.scope == Scope::Selected {
@@ -290,10 +446,12 @@ impl Linux {
                 .push(Delivery::Cancelled)
                 .map_err(|_| io::Error::other("action result limit"))?;
         }
+        let mut workload = false;
         for target in targets.iter() {
-            let row = self
+            let (row, jailed) = self
                 .detail(&target.directory, target.observed, active, intent.revision)
                 .map_err(|error| member_error(target.observed.key.pid, error))?;
+            workload |= jailed;
             details
                 .push(row)
                 .map_err(|_| io::Error::other("action detail limit"))?;
@@ -315,14 +473,38 @@ impl Linux {
                 intent,
                 targets,
                 deliveries,
+                workload,
             },
             Details {
+                workload_requester: workload.then_some(self.own_pid),
                 intent,
                 rows: details,
             },
         ))
     }
     pub(crate) fn deliver(&mut self, mut prepared: Prepared, active: &AtomicU64) -> Results {
+        if prepared.workload {
+            if let Err(error) = request_workload(&mut prepared, active) {
+                let result = if error.kind() == io::ErrorKind::Interrupted {
+                    Delivery::Cancelled
+                } else if error.kind() == io::ErrorKind::PermissionDenied {
+                    Delivery::Permission
+                } else {
+                    Delivery::Unconfirmed
+                };
+                for entry in prepared
+                    .deliveries
+                    .iter_mut()
+                    .filter(|v| **v == Delivery::Cancelled)
+                {
+                    *entry = result;
+                }
+            }
+            return Results {
+                revision: prepared.intent.revision,
+                deliveries: prepared.deliveries,
+            };
+        }
         for (target, delivery) in prepared.targets.iter().zip(prepared.deliveries.iter_mut()) {
             let result = if cancelled(active, prepared.intent.revision).is_err() {
                 Delivery::Cancelled
@@ -578,6 +760,40 @@ mod tests {
             &[Delivery::Sent]
         );
         wait_exit(&mut killed);
+    }
+    #[test]
+    fn workload_exchange_submits_the_pinned_identity_and_reports_the_authority_reply() {
+        use std::io::{Read, Write};
+        use std::os::unix::{fs::MetadataExt, net::UnixStream};
+        let mut linux = setup();
+        let child = child();
+        let active = AtomicU64::new(1);
+        let request = intent(&mut linux, child.0.id(), 1, Signal::Stop);
+        let (mut prepared, _) = linux.prepare(request, &active).unwrap();
+        let inode = prepared
+            .targets
+            .first()
+            .unwrap()
+            .directory
+            .metadata()
+            .unwrap()
+            .ino();
+        let expected = format!("SIGSTOP selected {0} {0}.{inode}", child.0.id());
+        let (client, mut authority) = UnixStream::pair().unwrap();
+        let handler = std::thread::spawn(move || {
+            authority.write_all(b"TDHST01\n").unwrap();
+            let mut header = [0; 3];
+            authority.read_exact(&mut header).unwrap();
+            let [marker, a, b] = header;
+            assert_eq!(marker, 255);
+            let mut body = vec![0; usize::from(u16::from_be_bytes([a, b]))];
+            authority.read_exact(&mut body).unwrap();
+            assert_eq!(body, expected.as_bytes());
+            authority.write_all(&[2, b'X', 1]).unwrap();
+        });
+        workload_exchange(client, &mut prepared, &active).unwrap();
+        handler.join().unwrap();
+        assert_eq!(&*prepared.deliveries, &[Delivery::Exited]);
     }
     #[test]
     fn stale_descriptors_cancellation_key_mismatch_and_protected_self_refuse_retargeting() {

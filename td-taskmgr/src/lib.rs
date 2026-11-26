@@ -23,7 +23,7 @@ pub mod view;
 pub mod worker;
 
 mod action_linux;
-pub use action_linux::force_quit_peer;
+pub use action_linux::{deliver_workload_signal, force_quit_peer};
 mod action_plan;
 pub mod action_worker;
 pub mod actions;

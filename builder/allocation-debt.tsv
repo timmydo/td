@@ -1212,7 +1212,7 @@ td-authd/src/session.rs	unchecked-growth-or-clone	19
 td-authd/src/set_hostname.rs	allocating-constructor	2
 td-authd/src/set_hostname.rs	allocating-conversion	11
 td-authd/src/set_hostname.rs	allocation-macro	8
-td-authd/src/set_hostname.rs	unchecked-growth-or-clone	9
+td-authd/src/set_hostname.rs	unchecked-growth-or-clone	8
 td-authd/src/software.rs	allocating-conversion	12
 td-authd/src/software.rs	allocation-macro	12
 td-authd/src/software.rs	unchecked-growth-or-clone	16

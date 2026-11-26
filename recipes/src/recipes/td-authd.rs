@@ -3,6 +3,10 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const SOURCES: &[(&str, &str)] = &[
     (
+        "src/process_signals.rs",
+        include_str!("../../../td-authd/src/process_signals.rs"),
+    ),
+    (
         "src/website.rs",
         include_str!("../../../td-authd/src/website.rs"),
     ),

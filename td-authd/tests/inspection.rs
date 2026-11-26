@@ -4,6 +4,31 @@ use std::io::Write;
 use std::os::fd::AsFd;
 
 #[test]
+fn the_helper_receives_the_original_directory_after_a_name_is_reused() {
+    let temp = crate::test_temp::TempDir::new("signal-directory").unwrap();
+    let path = temp.path().join("target");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("result"), b"S").unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    std::fs::rename(&path, temp.path().join("original")).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("result"), b"E").unwrap();
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "inspection::tests::read_directory", "--ignored"]);
+    let mut helper = Inspection::with_process_directory(cmd, directory).unwrap();
+    // The test harness also prints a summary around the fixture.
+    helper.limit = 512;
+    let output = helper.wait().unwrap();
+    assert!(output.windows(8).any(|part| part == b"1 passed"));
+}
+
+#[test]
+#[ignore = "exec-only directory inspection fixture"]
+fn read_directory() {
+    assert_eq!(std::fs::read("/proc/self/fd/0/result").unwrap(), b"S");
+}
+
+#[test]
 #[ignore = "exec-only private inspection reply fixture"]
 fn child() {
     let mut wire = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());

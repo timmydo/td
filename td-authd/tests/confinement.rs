@@ -8,6 +8,22 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(website.contains("Command::new(\"/bin/td-pass\")"));
     assert!(website.contains("crate::application::admitted_uid(\"firefox\")"));
     assert!(website.contains("UnixDatagram::pair()"));
+    let signals = include_str!("../src/process_signals.rs");
+    assert_eq!(signals.matches("Command::new(").count(), 1);
+    let mut remaining = signals;
+    for step in [
+        "inode",
+        ".metadata()",
+        "NStgid:",
+        "in_workload(&cgroup",
+        "process_signal_summary(&summary)",
+        "Command::new(\"/bin/td-login\")",
+        "\"exec-service-as\"",
+        "\"/bin/td-taskmgr\"",
+        "\"--deliver-workload-signal\"",
+    ] {
+        remaining = remaining.split_once(step).unwrap().1;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
     assert!(manifest.contains("autotests = false"));
@@ -54,6 +70,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "notebook_token.rs",
             "portal_files.rs",
             "primary_account.rs",
+            "process_signals.rs",
             "proof.rs",
             "revocation.rs",
             "rollback.rs",
@@ -105,6 +122,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("mount_sys.rs", 4),
         ("portal_files.rs", 0),
         ("primary_account.rs", 0),
+        ("process_signals.rs", 0),
         ("proof.rs", 0),
         ("revocation.rs", 0),
         ("storage.rs", 0),
@@ -144,6 +162,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "storage.rs"
                     | "rollback.rs"
                     | "session.rs"
+                    | "process_signals.rs"
                     | "set_hostname.rs"
                     | "revocation.rs"
                     | "inspection.rs"
@@ -194,7 +213,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x095fca30ea38f81b,
+        0xb0c6069f8833028e,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -423,7 +442,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x06e8ff0061b8d895,
+        0x2a8b5829839fc1f4,
         "read-only store controller changed"
     );
     let inspection = include_str!("../src/inspection.rs")
@@ -1891,7 +1910,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
 const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
 const LAUNCH_FINGERPRINT: u64 = 0xed4453a1f1e9c2db;
-const MAIN_FINGERPRINT: u64 = 0xda7a530d5160d76e;
+const MAIN_FINGERPRINT: u64 = 0x5e8dba4df23cebfc;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0x715685005ea23b04;
 
@@ -1903,8 +1922,8 @@ const INSTALLATION_FINGERPRINT: u64 = 0xfaa09d0fcd131ee5;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0xb0d5ccf021f64f9d;
 const SHARED_MEMORY_FINGERPRINT: u64 = 0xe860c6bf21db03b0;
 const ROLLBACK_FINGERPRINT: u64 = 0xf96a32041165e345;
-const ELEVATION_FINGERPRINT: u64 = 0x8459fa58867f0cf2;
-const SET_HOSTNAME_FINGERPRINT: u64 = 0x78cff327012a7219;
+const ELEVATION_FINGERPRINT: u64 = 0xf1b6c4eceb548dea;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0x7d4b8faaf486b5ed;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0x7090a6da9e98d2e9;

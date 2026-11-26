@@ -3549,6 +3549,15 @@ by the requester, checks caller and target UIDs match and are non-root,
 and rejects itself and namespace init before sending on that descriptor.
 The kernel enforces the human account's signal permission at delivery.
 
+For a selected sandbox process or its observed subtree, the paired
+authority retains the procfs identities and binds one trusted approval
+to that exact set. td-login starts the fixed td-taskmgr delivery helper
+in the host PID namespace with the target workload's credentials.
+The third signal call accepts only a named signal. Each helper inherits
+one retained process directory as standard input. It checks the workload
+UID and nested namespace protection and delivers on that same descriptor. Kernel permission checks apply after the credential drop.
+Crash, cancellation and a stale identity never retry a signal.
+
 `action_linux` is the sole production caller. Its startup probe retains
 its own procfs directory, validates stat/status against the caller PID and
 requires one NStgid value, proving the procfs PID view is the caller's

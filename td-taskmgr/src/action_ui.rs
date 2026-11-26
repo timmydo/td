@@ -250,6 +250,17 @@ impl Controller {
     pub fn focus_lost(&mut self) {
         if self
             .request
+            .is_some_and(|(_, stage)| stage == Stage::Sending)
+            && self
+                .details
+                .as_ref()
+                .and_then(|details| details.workload_requester)
+                .is_some()
+        {
+            return;
+        }
+        if self
+            .request
             .is_some_and(|(_, stage)| stage == Stage::Results)
         {
             self.dialog = None;
@@ -337,6 +348,9 @@ impl Controller {
                     }
                     Some(Delivery::Exited) => {
                         let _ = row.write_str("Exited | ");
+                    }
+                    Some(Delivery::Unconfirmed) => {
+                        let _ = row.write_str("Outcome unconfirmed | ");
                     }
                     Some(Delivery::Permission) => {
                         let _ = row.write_str("Permission denied | ");
@@ -535,9 +549,19 @@ impl Controller {
                     if let Some((intent, Stage::Confirming)) = self.request {
                         self.request = Some((intent, Stage::Sending));
                         self.command = Some(Command::Confirm(intent.revision));
-                        self.note = Some(Text::new(
-                            "Sending the confirmed signal to captured processes...",
-                        ));
+                        self.note = Some(
+                            if let Some(requester) = self
+                                .details
+                                .as_ref()
+                                .and_then(|details| details.workload_requester)
+                            {
+                                let mut notice = Text::default();
+                                let _ = write!(notice, "Press Ctrl+Alt+Delete, then H. Check task manager PID {} and the signal before approving.", requester);
+                                notice
+                            } else {
+                                Text::new("Sending the confirmed signal to captured processes...")
+                            },
+                        );
                     }
                 }
                 confirm::Choice::Confirmed(Decision::Close) => self.clear(),
@@ -689,7 +713,11 @@ mod tests {
             write!(row, "PID {} start 99 UID 1000: owned process", index + 42).unwrap();
             rows.push(row).unwrap();
         }
-        c.update(Update::Prepared(Details { intent, rows }));
+        c.update(Update::Prepared(Details {
+            intent,
+            rows,
+            workload_requester: None,
+        }));
         assert_eq!(c.stage(), "confirmation", "{:?}", c.take_note());
         intent
     }
@@ -719,6 +747,27 @@ mod tests {
         assert!(c.take_command().is_none());
         assert_eq!(c.stage(), "sending");
     }
+    #[test]
+    fn a_confirmed_workload_request_survives_focus_passing_to_secure_attention() {
+        let mut c = fixture();
+        let intent = prepared(&mut c, 2);
+        c.details.as_mut().unwrap().workload_requester = Some(514);
+        c.key("Tab", false);
+        c.key("Return", false);
+        assert_eq!(c.take_command(), Some(Command::Confirm(intent.revision)));
+        assert!(c
+            .note
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .contains("Ctrl+Alt+Delete"));
+        c.focus_lost();
+        assert_eq!(c.stage(), "sending");
+        assert!(c.take_command().is_none());
+        c.cancel();
+        assert_eq!(c.take_command(), Some(Command::Cancel(intent.revision)));
+    }
+
     #[test]
     fn configure_without_resize_preserves_consent_and_refusal_survives_cancellation() {
         let mut c = fixture();

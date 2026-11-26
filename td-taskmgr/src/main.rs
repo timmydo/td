@@ -20,6 +20,13 @@ fn run() -> io::Result<()> {
     if command.is_none() {
         return window::open(None);
     }
+    if command.as_deref() == Some("--deliver-workload-signal") {
+        let signal = args.next().ok_or(io::ErrorKind::InvalidInput)?;
+        if args.next().is_some() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        return td_taskmgr::deliver_workload_signal(&signal, &mut io::stdout().lock());
+    }
     if command.as_deref() == Some("--force-quit-peer") {
         let pid = args.next().and_then(|arg| arg.parse().ok());
         let inode = args.next().and_then(|arg| arg.parse().ok());
@@ -70,7 +77,7 @@ fn run() -> io::Result<()> {
         if args.next().is_some() {
             return Err(io::Error::other("unexpected argument"));
         }
-        return writeln!(io::stdout().lock(), "td-taskmgr [--control-socket ABSOLUTE-PATH]\n  Open the Wayland task manager with confirmed process signal actions.\n\ntd-taskmgr --sample [COUNT] [--interval 0.5|1|2|5]\n  Print bounded resource snapshots; COUNT defaults to 2, maximum 240.\ntd-taskmgr --preview [WIDTHxHEIGHT]\n  Write a PPM preview of live observations (default 1280x960).\ntd-taskmgr --font-license\n  Print embedded font notices.\n\nTab/S-Tab: focus controls. Arrows: navigate. C-f: search.\nC-l: return to Live. C-i: interval. C-q: quit.\nSelect a process to filter its CPU/RSS plot; C-a outside search compares all.\nCPU/RSS headings rank all processes; Process restores the tree.\nGraphs: arrows inspect; C-Tab changes plot; PageUp/PageDown scroll.\nDevice list: Space toggles a member. Tree: Left/Right collapse/expand.\nDouble-click a process or press Return for CPU/RSS history and its subtree.\nIn details: Escape returns; M-Up opens the parent. CPU time is lifetime user+kernel time.\nF10/S-F10: process actions. Right-click: selected row context menu.\nF1 or the Help button: every key, over the window. F12: the next colour theme, kept.\nEvery signal requires confirmation; Cancel is initially focused.\nThe optional local socket uses the td-ui driven protocol.");
+        return writeln!(io::stdout().lock(), "td-taskmgr [--control-socket ABSOLUTE-PATH]\n  Open the Wayland task manager with confirmed process signal actions.\n\ntd-taskmgr --sample [COUNT] [--interval 0.5|1|2|5]\n  Print bounded resource snapshots; COUNT defaults to 2, maximum 240.\ntd-taskmgr --preview [WIDTHxHEIGHT]\n  Write a PPM preview of live observations (default 1280x960).\ntd-taskmgr --font-license\n  Print embedded font notices.\n\nTab/S-Tab: focus controls. Arrows: navigate. C-f: search.\nC-l: return to Live. C-i: interval. C-q: quit.\nSelect a process to filter its CPU/RSS plot; C-a outside search compares all.\nCPU/RSS headings rank all processes; Process restores the tree.\nGraphs: arrows inspect; C-Tab changes plot; PageUp/PageDown scroll.\nDevice list: Space toggles a member. Tree: Left/Right collapse/expand.\nDouble-click a process or press Return for CPU/RSS history and its subtree.\nIn details: Escape returns; M-Up opens the parent. CPU time is lifetime user+kernel time.\nF10/S-F10: process actions. Right-click: selected row context menu.\nF1 or the Help button: every key, over the window. F12: the next colour theme, kept.\nEvery signal requires confirmation; Cancel is initially focused.\nFor a sandbox target, press Ctrl+Alt+Delete, then H to review the pending signal.\nThe optional local socket uses the td-ui driven protocol.");
     }
     if command.as_deref() != Some("--sample") {
         return Err(io::Error::new(

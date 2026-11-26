@@ -28,10 +28,9 @@ pub type Outcome<T> = Option<Option<(T, bool)>>;
 
 /// The descriptor a helper writes its result to: its stdin socket, as
 /// td-secret's helpers do, or its stdout.
-#[derive(Clone, Copy)]
 enum Writes {
     Stdin,
-    Stdout,
+    Stdout(std::process::Stdio),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,7 +117,14 @@ impl Inspection {
     /// standard output, observed within `lifetime`: the revocation's
     /// render and reboot request, read with `finished`.
     pub fn printing(command: Command, limit: usize, lifetime: Duration) -> Result<Self, String> {
-        Self::spawn(command, limit, lifetime, Writes::Stdout)
+        Self::spawn(command, limit, lifetime, Writes::Stdout(Stdio::null()))
+    }
+
+    pub fn with_process_directory(
+        command: Command,
+        directory: std::fs::File,
+    ) -> Result<Self, String> {
+        Self::spawn(command, 1, LIFETIME, Writes::Stdout(Stdio::from(directory)))
     }
 
     fn spawn(
@@ -138,7 +144,7 @@ impl Inspection {
         let output = Stdio::from(OwnedFd::from(output));
         let (stdin, stdout) = match writes {
             Writes::Stdin => (output, Stdio::null()),
-            Writes::Stdout => (Stdio::null(), output),
+            Writes::Stdout(input) => (input, output),
         };
         let (stderr, stderr_end) = crate::stderr_tail::Tail::pair()?;
         let child = command

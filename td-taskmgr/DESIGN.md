@@ -451,11 +451,20 @@ Preparing a subtree containing either refuses the whole action and names
 the protected member; it never silently drops that member from delivery.
 This includes nested namespace inits: killing one implicitly kills its
 namespace, exceeding a selected-process request or its captured member set.
-Version 1 therefore cannot tear down a confined application by killing its
-namespace init. td's distinct application UIDs also retain their ordinary
-kernel permission boundary until separately authorized elevation exists.
-There is no sudo, su, setuid executable, capability grant, password dialog,
-or privileged helper.
+The host task manager runs as the primary human. For a jailed process
+in a workload account it offers the same named signals and scopes. After
+the local confirmation, the authenticated settings intake holds the captured
+targets while the user presses Ctrl+Alt+Delete and H. The trusted screen
+names the signal, workload kind and name, selected host PID, scope, count
+and requesting task-manager PID. Its fresh approval authorizes precisely
+the pinned set. Focus may pass to secure attention while this request is
+pending. Closing the window cancels a request still awaiting approval.
+After consent, td-authd passes each retained procfs directory as standard
+input to a fixed helper running as the workload account in the host PID
+namespace. The helper delivers the signal on that descriptor. The window
+reports each result, including unconfirmed delivery if a helper times out.
+An ordinary process outside these accounts uses the caller's own kernel
+signal permissions.
 
 For a physical Super+Shift+Q on a native window, the paired compositor
 captures the connector's identity. td-authd invokes the fixed
@@ -464,11 +473,6 @@ The helper verifies the live procfs identity, caller and target accounts
 and protected-process rules before sending SIGKILL on the same descriptor.
 A native client can be launched from any terminal or desktop entry point.
 
-Keep action preparation, typed intent, and execution separate. A future
-authorized executor can accept a descriptor-bound signal and exact member
-set after fresh request-bound consent. That increment must amend the
-relevant authority/threat contracts and provide the trusted input path;
-this seam neither implements elevation nor delegates ambient UI authority.
 The signal adapter is recorded in UNSAFE.md §20. One x86-64 syscall
 instruction issues pidfd_send_signal with null siginfo and zero flags;
 only the adapter resolves the closed named-signal enum to numbers. A

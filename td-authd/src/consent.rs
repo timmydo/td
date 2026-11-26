@@ -1267,6 +1267,10 @@ pub enum Operation {
         setting: String,
     },
     /// Tag 42: one extra-volume change (td-disks/DESIGN.md).
+    SignalProcesses {
+        requester: u32,
+        setting: String,
+    },
     ManageVolumes {
         requester: u32,
         setting: String,
@@ -1895,6 +1899,11 @@ impl Request {
             {
                 return Err("invalid consent time change".into());
             }
+            Operation::SignalProcesses { requester, setting }
+                if *requester != owner || !process_signal_summary(setting) =>
+            {
+                return Err("invalid process signal consent".into())
+            }
             Operation::ManageVolumes { requester, setting }
                 if *requester != owner || volume_setting::Change::decode(setting).is_err() =>
             {
@@ -2120,6 +2129,7 @@ impl Request {
             | Operation::DeployRollback { .. }
             | Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
+            | Operation::SignalProcesses { .. }
             | Operation::ManageVolumes { .. }
             | Operation::ReplacePublisher { .. }
             | Operation::EnrollAdminKey { .. }
@@ -2724,8 +2734,15 @@ impl Request {
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 put_text(&mut bytes, setting);
             }
-            Operation::ManageVolumes { requester, setting } => {
-                bytes.push(42);
+            Operation::SignalProcesses { requester, setting }
+            | Operation::ManageVolumes { requester, setting } => {
+                bytes.push(
+                    if matches!(self.operation, Operation::SignalProcesses { .. }) {
+                        47
+                    } else {
+                        42
+                    },
+                );
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 put_text(&mut bytes, setting);
             }
@@ -3036,6 +3053,10 @@ impl Request {
                 requester: input.number()?,
                 setting: input.text()?,
             },
+            47 => Operation::SignalProcesses {
+                requester: input.number()?,
+                setting: input.text()?,
+            },
             42 => Operation::ManageVolumes {
                 requester: input.number()?,
                 setting: input.text()?,
@@ -3165,17 +3186,49 @@ impl Request {
         Self::new(nonce, owner, operation)
     }
 
+    fn bounded_content<E>(
+        &self,
+        mut row: impl FnMut(std::fmt::Arguments<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match &self.operation {
+            Operation::Website(w) => w.rows(row),
+            Operation::SignalProcesses { setting, .. } => {
+                row(format_args!("SEND PROCESS SIGNAL"))?;
+                for (label, value) in [
+                    "SIGNAL",
+                    "TYPE",
+                    "WORKLOAD",
+                    "SELECTED PID",
+                    "SCOPE",
+                    "PROCESSES",
+                    "REQUESTING PID",
+                ]
+                .into_iter()
+                .zip(setting.split_ascii_whitespace())
+                {
+                    row(format_args!("{label}: {value}"))?;
+                }
+                row(format_args!("{APPROVE_ROW}"))?;
+                row(format_args!("ESC: CANCEL"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Display human-relevant operation arguments; retain the nonce without displaying it.
-    pub fn website_rows<E>(
+    pub fn bounded_rows<E>(
         &self,
         mut row: impl FnMut(std::fmt::Arguments<'_>) -> Result<(), E>,
     ) -> Result<bool, E> {
-        let Operation::Website(w) = &self.operation else {
+        if !matches!(
+            self.operation,
+            Operation::Website(_) | Operation::SignalProcesses { .. }
+        ) {
             return Ok(false);
-        };
+        }
         row(format_args!("TD SECURE ATTENTION"))?;
         row(format_args!("SESSION USER {}", self.owner))?;
-        w.rows(&mut row)?;
+        self.bounded_content(&mut row)?;
         if !self.awaits_approval() {
             row(format_args!("ESC TO CANCEL"))?;
         }
@@ -3188,8 +3241,8 @@ impl Request {
             format!("SESSION USER {}", self.owner),
         ];
         match &self.operation {
-            Operation::Website(w) => {
-                let _: Result<(), std::convert::Infallible> = w.rows(|row| {
+            Operation::Website(_) | Operation::SignalProcesses { .. } => {
+                let _: Result<(), std::convert::Infallible> = self.bounded_content(|row| {
                     lines.push(row.to_string());
                     Ok(())
                 });
@@ -3837,6 +3890,62 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(text, "{byte:02x}");
     }
     text
+}
+
+pub fn process_signal_summary(setting: &str) -> bool {
+    if setting.len() > 155 {
+        return false;
+    }
+    let mut fields = setting.split(' ');
+    let signal = fields.next().unwrap_or("");
+    let kind = fields.next().unwrap_or("");
+    let name = fields.next().unwrap_or("");
+    let pid = fields.next().and_then(|v| v.parse::<u32>().ok());
+    let scope = fields.next();
+    let count = fields.next().and_then(|v| v.parse::<u16>().ok());
+    let requester = fields.next().and_then(|v| v.parse::<u32>().ok());
+    matches!(
+        signal,
+        "SIGHUP"
+            | "SIGINT"
+            | "SIGQUIT"
+            | "SIGILL"
+            | "SIGTRAP"
+            | "SIGABRT"
+            | "SIGBUS"
+            | "SIGFPE"
+            | "SIGKILL"
+            | "SIGUSR1"
+            | "SIGSEGV"
+            | "SIGUSR2"
+            | "SIGPIPE"
+            | "SIGALRM"
+            | "SIGTERM"
+            | "SIGSTKFLT"
+            | "SIGCHLD"
+            | "SIGCONT"
+            | "SIGSTOP"
+            | "SIGTSTP"
+            | "SIGTTIN"
+            | "SIGTTOU"
+            | "SIGURG"
+            | "SIGXCPU"
+            | "SIGXFSZ"
+            | "SIGVTALRM"
+            | "SIGPROF"
+            | "SIGWINCH"
+            | "SIGIO"
+            | "SIGPWR"
+            | "SIGSYS"
+    ) && matches!(kind, "application" | "workspace" | "sandbox")
+        && application_name(name)
+        && requester.is_some_and(|v| v > 1)
+        && pid.is_some_and(|v| v > 1)
+        && matches!(
+            (scope, count),
+            (Some("selected"), Some(1)) | (Some("subtree"), Some(1..=256))
+        )
+        && fields.next().is_none()
 }
 
 fn put_text(bytes: &mut Vec<u8>, text: &str) {
@@ -4812,6 +4921,48 @@ mod tests {
 
     /// Both names are what `Hostname::parse` admits, they differ, and the
     /// requester is the owner. The widest value is 177 bytes.
+    #[test]
+    fn workload_signal_prompt_round_trips_the_request_and_names_its_scope() {
+        let request = Request::new(
+            [3; 32],
+            1000,
+            Operation::SignalProcesses {
+                requester: 1000,
+                setting: "SIGTERM sandbox demo 82 subtree 3 514".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+        assert!(request.awaits_approval());
+        let lines = request.lines();
+        for label in [
+            "SIGNAL: SIGTERM",
+            "WORKLOAD: demo",
+            "SELECTED PID: 82",
+            "SCOPE: subtree",
+            "PROCESSES: 3",
+            "REQUESTING PID: 514",
+            APPROVE_ROW,
+        ] {
+            assert!(lines.iter().any(|line| line == label));
+        }
+        let mut trusted = Vec::new();
+        assert!(request
+            .bounded_rows(|row| {
+                trusted.push(row.to_string());
+                Ok::<_, ()>(())
+            })
+            .unwrap());
+        assert_eq!(trusted, lines);
+        for bad in [
+            "SIGKILL sandbox demo 1 selected 1 514",
+            "SIGQUIT sandbox demo 82 selected 2 514",
+            "9 sandbox demo 82 selected 1 514",
+        ] {
+            assert!(!process_signal_summary(bad));
+        }
+    }
+
     #[test]
     fn a_hostname_change_names_two_canonical_names_for_its_owner() {
         let widest = Request::new(

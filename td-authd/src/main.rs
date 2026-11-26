@@ -68,6 +68,7 @@ mod notebook_token;
 mod notebook_wire;
 mod portal_files;
 mod primary_account;
+mod process_signals;
 mod proof;
 mod revocation;
 mod rollback;
