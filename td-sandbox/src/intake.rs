@@ -3,6 +3,7 @@
 //! one answer, `ok` with what it found or did, or `refused` and why. A
 //! launch's `ok` hands the connection on to the relay.
 
+use crate::workload_accounts::KVM_REQUEST_PREFIX;
 use crate::{failure, owned, refused, text};
 use std::fmt::Write as _;
 use std::io;
@@ -14,8 +15,10 @@ use std::path::Path;
 use std::time::Duration;
 
 pub use crate::workspace_intake::{lasting, shown, Answer, Intake, DELETED, EXISTS, LOG};
-pub type Root<'a> =
-    crate::workspace_intake::Root<'a, { MAX_REQUEST + crate::sandbox_layout::MAX_BYTES + 16 }>;
+pub type Root<'a> = crate::workspace_intake::Root<
+    'a,
+    { MAX_REQUEST + KVM_REQUEST_PREFIX.len() + crate::sandbox_layout::MAX_BYTES + 16 },
+>;
 const MAX_REQUEST: usize = 8192;
 #[cfg(test)]
 use crate::workspace_intake::parse;
@@ -63,12 +66,20 @@ pub fn run(
     Ok(line)
 }
 
-pub fn with_layout(line: &str, layout: &crate::sandbox_layout::Layout) -> io::Result<String> {
+pub fn launch_request(
+    line: &str,
+    layout: &crate::sandbox_layout::Layout,
+    kvm: bool,
+) -> io::Result<String> {
+    let device = if kvm { KVM_REQUEST_PREFIX } else { "" };
     let count = layout.mounts().count();
     if count == 0 {
-        return owned(line);
+        return text(format_args!("{device}{line}"));
     }
-    text(format_args!("mounts {count}\n{}{line}", layout.encode("")?))
+    text(format_args!(
+        "mounts {count}\n{}{device}{line}",
+        layout.encode("")?
+    ))
 }
 
 /// `create NAME`, `delete NAME`, `status NAME` or `grants NAME`.
@@ -251,6 +262,20 @@ mod tests {
         assert_eq!(revoke("default", "src")?, "revoke default src\n");
         assert_eq!(network("default", true)?, "network default host\n");
         assert_eq!(network("default", false)?, "network default off\n");
+        Ok(())
+    }
+
+    #[test]
+    fn kvm_launch_request_preserves_the_mount_prelude() -> io::Result<()> {
+        let line = "start tools native linux\n";
+        let mut layout = crate::sandbox_layout::Layout::default();
+        assert_eq!(launch_request(line, &layout, false)?, line);
+        assert_eq!(launch_request(line, &layout, true)?, format!("kvm {line}"));
+        layout.row("src\t/work")?;
+        assert_eq!(
+            launch_request(line, &layout, true)?,
+            format!("mounts 1\nsrc\t/work\nkvm {line}")
+        );
         Ok(())
     }
 

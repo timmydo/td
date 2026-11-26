@@ -1723,9 +1723,11 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "root workspace launch intake changed"
     );
     for (call, count) in [
-        ("Command::new(", 3),
+        ("Command::new(", 4),
         ("Command::new(\"/bin/td-login\")", 2),
         ("Command::new(\"/bin/td-jail\")", 1),
+        ("Command::new(\"/bin/mknod\")", 1),
+        (".args([\"c\", \"10\", \"232\"])", 1),
         (".spawn(", 2),
         (".exec()", 1),
         ("stderr_tail::status(&mut command)", 1),
@@ -1767,7 +1769,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "            self.release_views(prepared.uid, id);\n            if failed {\n                self.instances.forget(prepared.uid);\n            }\n"
     ));
     assert!(workspace.contains(
-        "impl<S: Serve> Drop for Launched<'_, S> {\n    fn drop(&mut self) {\n        self.serve.release(&self.prepared, self.failed);\n        let _ = fs::remove_file(&self.prepared.spec);\n"
+        "impl<S: Serve> Drop for Launched<'_, S> {\n    fn drop(&mut self) {\n        self.serve.release(&self.prepared, self.failed);\n"
+    ));
+    assert!(workspace.contains(
+        "impl Drop for Prepared {\n    fn drop(&mut self) {\n        let _ = fs::remove_file(&self.spec);\n"
     ));
     // The service runs each connection through the real preparation and
     // launch, checks what the human can mend before its answer, and never
@@ -1886,7 +1891,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
 const RAW_FINGERPRINT: u64 = 0xb64878d738ec4031;
 const GRANT_REQUESTS_FINGERPRINT: u64 = 0x5f7221258ec5d3d1;
 const GRANT_VIEWS_FINGERPRINT: u64 = 0x48b5bc7296ae3585;
-const WORKSPACE_FINGERPRINT: u64 = 0x439a667622ee93f1;
+const WORKSPACE_FINGERPRINT: u64 = 0x196bdddcd572e6fb;
 const APPLICATION_FINGERPRINT: u64 = 0x5974d63997917e06;
 
 fn fingerprint(source: &str) -> u64 {

@@ -2220,6 +2220,20 @@ workspace launch SLOT development|isolated RUNTIME WORD...
 the mount destination from the primary account. Both forms use the same
 account storage and manifest grants as `start` and `run`.
 
+The primary can prefix a sandbox launch line with `kvm `. This records
+`device=kvm` in the root-owned launch spec after `home` and any
+`home-location` line. The prefix is accepted only for sandbox launches.
+The prefix's four bytes are outside the ordinary 8192-byte request limit.
+Root requires the host's character device 10:232 at `/dev/kvm` with
+the desktop's root:1000 ownership and mode 0660. It uses the installed
+`mknod` applet to create a fresh character device 10:232 next to the
+sealed spec, with the spec's decimal filename plus `.kvm`. Its mode is
+0600 and it is owned by the sandbox's UID and GID. The spec directory
+permits traversal by that account's group and gives root sole write
+access. After the launch ends, or on a refusal after creation, root
+removes the spec and its backing node. Service startup clears stale
+specs and nodes in the same root-owned tree.
+
 A sandbox launch may prefix its request with `mounts N` and N lines
 of `SOURCE<TAB>DEST`. N is 1 to 32. Each path is at most 1024 bytes.
 The same request deadline applies throughout. Root validates the layout

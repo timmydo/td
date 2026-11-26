@@ -268,8 +268,8 @@ td-agent adopts (td-authd/DESIGN.md, "Workload account ledger").
 
 ## Grants
 
-Directory views, service sockets and network policy bound what a confined
-workload reaches outside its runtime and home:
+Directory views, service sockets, devices and network policy bound what a
+confined workload reaches outside its runtime and home:
 
 - **a directory** of the human's: a detached idmapped bind mount mapping
   filesystem uid/gid 1000 to the workload's account, read-only or
@@ -297,7 +297,13 @@ workload reaches outside its runtime and home:
 - **network**: a sandbox's `off` or `host`, with one `host` row per
   account and no row for `off`. An application's network comes from its
   reviewed declaration. A td-agent workspace's network comes from its
-  per-launch profile, `development` or `isolated`, never a grant row.
+  per-launch profile, `development` or `isolated`, never a grant row;
+- **KVM**: a sandbox profile may add the fixed KVM request to the human's
+  launch. Root provides a private device node for that session, owned by
+  the sandbox's account. A running session holds its original device view.
+  This grant is effective only inside named sandbox launches and requires
+  desktop KVM access for the primary. See `td-sandbox/DESIGN.md` and
+  `td-authd/DESIGN.md`, "Workspace launch intake".
 
 Persistent grant requests admit applications and sandboxes. A td-agent
 workspace instead carries a directory plan with each launch. Root admits

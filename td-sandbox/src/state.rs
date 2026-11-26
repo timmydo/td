@@ -261,6 +261,28 @@ impl Profile {
         ))?))
     }
 
+    pub fn kvm(&self) -> io::Result<bool> {
+        let lock = open_private(&self.layout_file("kvm.lock")?, true)?;
+        lock.lock_shared()?;
+        match td_fs::read_bounded_real_file(&self.layout_file("kvm")?, "KVM setting", 4) {
+            Ok(bytes) if bytes == b"on\n" => Ok(true),
+            Ok(bytes) if bytes == b"off\n" => Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+            Ok(_) => Err(io::Error::other("invalid sandbox KVM setting")),
+        }
+    }
+
+    pub fn set_kvm(&self, enabled: bool) -> io::Result<()> {
+        let lock = open_private(&self.layout_file("kvm.lock")?, true)?;
+        lock.lock()?;
+        td_fs::replace(
+            &self.layout_file("kvm")?,
+            if enabled { b"on\n" } else { b"off\n" },
+            0o600,
+        )
+    }
+
     fn pending_mount(&self) -> io::Result<Option<String>> {
         match td_fs::read_bounded_real_file(
             &self.layout_file("mounts.pending")?,
@@ -396,6 +418,21 @@ fn parse(record: &str) -> io::Result<(Option<String>, Option<PathBuf>, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kvm_is_opt_in_and_updates_for_the_next_session() -> io::Result<()> {
+        let base = td_fs::TempDir::new("sandbox-kvm-setting")?;
+        let profiles = profiles(&base)?;
+        let created = Profile::create(&profiles, "tools", None, None)?;
+        assert!(!created.kvm()?);
+        created.set_kvm(true)?;
+        assert!(Profile::read(&profiles, "tools")?.kvm()?);
+        created.set_kvm(false)?;
+        assert!(!Profile::read(&profiles, "tools")?.kvm()?);
+        fs::write(created.layout_file("kvm")?, b"yes\n")?;
+        assert!(created.kvm().is_err());
+        Ok(())
+    }
 
     #[test]
     fn a_record_is_private_locked_and_round_trips() -> io::Result<()> {

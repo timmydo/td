@@ -17,7 +17,8 @@ use crate::portal_files::pinned;
 use crate::primary_account;
 use crate::stderr_tail;
 use crate::workload_accounts::{
-    self as accounts, canonical_decimal, Kind, WORKSPACE_INTAKE, WORKSPACE_SPECS,
+    self as accounts, canonical_decimal, Kind, KVM_REQUEST_PREFIX, WORKSPACE_INTAKE,
+    WORKSPACE_SPECS,
 };
 use crate::workload_grants::{self, Access, Directory, Network, Role};
 use crate::{allocation, message, owned, refused, text};
@@ -29,7 +30,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -176,6 +177,7 @@ impl Mode {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Launch {
     pub(crate) mounts: crate::sandbox_layout::Layout,
+    pub(crate) kvm: bool,
     pub(crate) personal_home_path: bool,
     pub(crate) runtime: Option<&'static str>,
     pub(crate) mode: Mode,
@@ -269,6 +271,16 @@ pub(crate) struct Request {
     pub(crate) verb: Verb,
 }
 
+fn request_limit(line: &[u8]) -> usize {
+    if line.starts_with(INSTANCE) {
+        MAX_INSTANCE_REQUEST
+    } else if line.starts_with(KVM_REQUEST_PREFIX.as_bytes()) {
+        MAX_REQUEST + KVM_REQUEST_PREFIX.len()
+    } else {
+        MAX_REQUEST
+    }
+}
+
 impl Request {
     /// One line, single spaces, nothing else:
     ///
@@ -291,12 +303,7 @@ impl Request {
     /// (`workload_accounts::workspace_slot`). A launch's plan follows on
     /// lines of its own (`read_plan`).
     pub(crate) fn parse(line: &[u8]) -> Result<Self, String> {
-        let bound = if line.starts_with(INSTANCE) {
-            MAX_INSTANCE_REQUEST
-        } else {
-            MAX_REQUEST
-        };
-        if line.len() > bound {
+        if line.len() > request_limit(line) {
             return Err("the workspace request is too long".into());
         }
         let text = std::str::from_utf8(line)
@@ -305,7 +312,14 @@ impl Request {
             .filter(|text| !text.chars().any(char::is_control))
             .ok_or("the workspace request is not one line")?;
         let malformed = || message(format_args!("the workspace request is malformed"));
+        let (kvm, text) = match text.strip_prefix(KVM_REQUEST_PREFIX) {
+            Some(launch) => (true, launch),
+            None => (false, text),
+        };
         let (verb, rest) = text.split_once(' ').ok_or_else(malformed)?;
+        if kvm && !matches!(verb, "start" | "start-home" | "run" | "run-home") {
+            return Err(malformed());
+        }
         let named = |name: &str| {
             if accounts::valid_name(name) {
                 owned(name)
@@ -327,6 +341,7 @@ impl Request {
                 let [name, runtime, term] = words(rest).ok_or_else(malformed)?;
                 let launch = Launch {
                     mounts: Default::default(),
+                    kvm,
                     personal_home_path: verb.ends_with("-home"),
                     runtime: runtime_of(runtime)?,
                     mode: Mode::Pty,
@@ -344,6 +359,7 @@ impl Request {
                 };
                 let launch = Launch {
                     mounts: Default::default(),
+                    kvm,
                     personal_home_path: verb.ends_with("-home"),
                     runtime: runtime_of(runtime)?,
                     mode: Mode::parse(mode).ok_or_else(malformed)?,
@@ -617,16 +633,7 @@ fn refuse(stream: &mut UnixStream, why: &str) {
 /// `MAX_REQUEST`.
 fn read_request(stream: &mut UnixStream) -> Result<Request, String> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    // Only a workspace instance's line may pass `MAX_REQUEST`.
-    let request_line = |stream: &mut UnixStream| {
-        read_line(stream, deadline, |line| {
-            if line.len() < MAX_REQUEST || line.starts_with(INSTANCE) {
-                MAX_INSTANCE_REQUEST
-            } else {
-                MAX_REQUEST
-            }
-        })
-    };
+    let request_line = |stream: &mut UnixStream| read_line(stream, deadline, request_limit);
     let mut line = request_line(stream)?;
     let mut layout = crate::sandbox_layout::Layout::default();
     let mapped = line.starts_with(b"mounts ");
@@ -861,6 +868,7 @@ impl SpecTree<'_> {
     /// file, the tree owner's and the account's group's, mode 0640,
     /// removed again when any step after its creation fails.
     fn write(&self, uid: u32, id: u64, text: &str) -> Result<PathBuf, String> {
+        let path = self.spec(uid, id)?;
         let root = owned_directory(self.root, self.owner)?;
         let directory = grant_views::account_directory_of(&root, uid, self.owner.0)?;
         let name = crate::text(format_args!("{id}"))?;
@@ -879,7 +887,7 @@ impl SpecTree<'_> {
             let _ = fs::remove_file(pinned(&directory, &name));
             return Err(why);
         }
-        self.spec(uid, id)
+        Ok(path)
     }
 
     /// The tree, emptied: a service that starts again has no launch left,
@@ -1518,6 +1526,65 @@ struct Prepared {
     /// A workspace instance's launch id, under which its plan holds its
     /// account's views until it ends.
     held: Option<u64>,
+    _kvm: Option<KvmNode>,
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.spec);
+    }
+}
+
+/// A root-created node beside one admitted launch spec. The host node keeps
+/// its own permissions. Dropping this backing name does not unmount the jail.
+struct KvmNode(PathBuf);
+
+impl KvmNode {
+    fn create(spec: &Path, uid: u32) -> Result<Self, String> {
+        let host = fs::symlink_metadata(accounts::KVM_DEVICE)
+            .map_err(|e| message(format_args!("sandbox KVM requires /dev/kvm: {e}")))?;
+        if !host.file_type().is_char_device()
+            || host.rdev() != accounts::KVM_RDEV
+            || (host.uid(), host.gid(), host.mode() & 0o7777) != (0, primary_account::UID, 0o660)
+        {
+            return Err(message(format_args!(
+                "sandbox KVM requires the desktop KVM device and permissions"
+            )));
+        }
+        let path = PathBuf::from(text(format_args!(
+            "{}{}",
+            spec.display(),
+            accounts::KVM_SPEC_SUFFIX
+        ))?);
+        // The adjacent spec established the enclosing root-owned directory.
+        // mknod refuses an existing name, so only a successful create is ours.
+        let status = Command::new("/bin/mknod")
+            .env_clear()
+            .args(["-m", "0600"])
+            .arg(&path)
+            .args(["c", "10", "232"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|e| message(format_args!("create the sandbox KVM node: {e}")))?;
+        if !status.success() {
+            return Err(message(format_args!(
+                "create the sandbox KVM node: {status}"
+            )));
+        }
+        let node = Self(path);
+        std::os::unix::fs::lchown(&node.0, Some(uid), Some(uid))
+            .map_err(|e| message(format_args!("assign the sandbox KVM node: {e}")))?;
+        Ok(node)
+    }
+}
+
+impl Drop for KvmNode {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.0) {
+            log(format_args!("remove sandbox KVM node: {error}"));
+        }
+    }
 }
 
 /// What root does for each verb: `Root` on a running system, a stand-in
@@ -1730,13 +1797,15 @@ impl Root<'_> {
             human: &human,
         };
         let text = instance_spec(instance, &canonical(AGENT)?, &canonical(TXT)?, &places)?;
+        let command = copied(&instance.arguments)?;
         let spec = specs().write(uid, id, &text)?;
         Ok(Prepared {
             uid,
             spec,
             relay: None,
-            command: copied(&instance.arguments)?,
+            command,
             held: Some(id),
+            _kvm: None,
         })
     }
 }
@@ -1771,15 +1840,24 @@ impl Serve for Root<'_> {
             .mounts
             .encode("mount=")
             .map_err(|e| message(format_args!("{e}")))?;
+        if launch.kvm {
+            allocation::push_str(&mut text, "device=kvm\n").map_err(refused)?;
+        }
         allocation::push_str(&mut text, &mounts).map_err(refused)?;
+        let relay = Some((launch.mode, owned(&launch.term)?));
         let spec = specs().write(uid, id, &text)?;
-        Ok(Prepared {
+        let mut prepared = Prepared {
             uid,
             spec,
-            relay: Some((launch.mode, owned(&launch.term)?)),
+            relay,
             command,
             held: None,
-        })
+            _kvm: None,
+        };
+        if launch.kvm {
+            prepared._kvm = Some(KvmNode::create(&prepared.spec, uid)?);
+        }
+        Ok(prepared)
     }
 
     /// The slot must hold a workspace ledger row, which this never adds; a
@@ -2346,7 +2424,6 @@ struct Launched<'a, S: Serve> {
 impl<S: Serve> Drop for Launched<'_, S> {
     fn drop(&mut self) {
         self.serve.release(&self.prepared, self.failed);
-        let _ = fs::remove_file(&self.prepared.spec);
     }
 }
 

@@ -4,6 +4,7 @@ use crate::{
         FilesystemGrant, FilesystemSourceKind, LaunchPlan, ResolvedFile, ResolvedResourceLimits,
     },
     cgroup, firefox, seccomp, sys,
+    workload_accounts::{KVM_DEVICE, KVM_RDEV},
     workspace::{self, WorkspacePlan},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -487,6 +488,7 @@ pub struct Stage2Workspace {
     /// `native-glibc`: td's glibc ABI at `/lib` and `/lib64`, in place of
     /// the host's.
     native: bool,
+    kvm: bool,
     programs: Vec<String>,
     aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
@@ -1605,6 +1607,43 @@ fn mount_tmpfs(path: &str, flags: usize, data: &str) -> io::Result<()> {
 fn mount_bind_read_only(source: &str, target: &str) -> io::Result<()> {
     mount_bind(Path::new(source), target)?;
     remount_read_only(target, sys::MS_BIND | sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+fn require_kvm_node(node: &fs::Metadata, uid: u32) -> io::Result<()> {
+    if !node.file_type().is_char_device()
+        || node.rdev() != KVM_RDEV
+        || (node.uid(), node.gid(), node.mode() & 0o7777) != (uid, uid, 0o600)
+        || node.nlink() != 1
+    {
+        return Err(crate::error(
+            io::ErrorKind::InvalidData,
+            format_args!("sandbox KVM node has the wrong type, identity or permissions"),
+        ));
+    }
+    Ok(())
+}
+
+fn mount_sandbox_kvm(source: &Path, uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let pinned = OpenOptions::new()
+        .read(true)
+        .custom_flags(authority::O_PATH | crate::workload_accounts::O_NOFOLLOW)
+        .open(source)?;
+    let expected = pinned.metadata()?;
+    require_kvm_node(&expected, uid)?;
+    let source = source.to_str().ok_or(io::ErrorKind::InvalidInput)?;
+    let target = crate::text(format_args!("{NEW_ROOT}{KVM_DEVICE}"))?;
+    fs::File::create_new(&target)?;
+    mount_bind_read_only(source, &target)?;
+    let actual = fs::symlink_metadata(&target)?;
+    if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
+        return Err(crate::error(
+            io::ErrorKind::InvalidData,
+            format_args!("sandbox KVM bind changed identity"),
+        ));
+    }
+    Ok(())
 }
 
 fn mount_application_tree(source: &Path, target: &str) -> io::Result<()> {
@@ -3019,13 +3058,16 @@ fn device_nodes(terminal: bool) -> impl Iterator<Item = (&'static str, u64, u64)
         .chain(terminal.then_some(TERMINAL_NODE))
 }
 
-fn require_devices(terminal: bool, key_names: &[String]) -> io::Result<()> {
+fn require_devices(terminal: bool, key_names: &[String], kvm: bool) -> io::Result<()> {
     let mut names = vec![
         "fd", "full", "null", "ptmx", "pts", "random", "shm", "stderr", "stdin", "stdout",
         "urandom", "zero",
     ];
     if terminal {
         names.push(TERMINAL_NODE.0);
+    }
+    if kvm {
+        crate::allocation::push(&mut names, "kvm").map_err(|_| io::ErrorKind::OutOfMemory)?;
     }
     for name in key_names {
         crate::allocation::push(&mut names, name.as_str())
@@ -3698,6 +3740,7 @@ struct Stage2MountExpectation<'a> {
 /// PID 1, and the writable scratch trees; returns the mountinfo it read.
 fn require_base_plan(
     key_names: &[String],
+    kvm: bool,
     token: &[u8; TOKEN_LEN],
     terminal: bool,
     executable_scratch: bool,
@@ -3708,7 +3751,7 @@ fn require_base_plan(
     require_mode("/dev/shm", 0o1777)?;
     require_mode("/tmp", 0o1777)?;
     require_mode("/var/tmp", 0o1777)?;
-    require_devices(terminal, key_names)?;
+    require_devices(terminal, key_names, kvm)?;
 
     let numeric = read_dir_names("/proc")?
         .into_iter()
@@ -3852,7 +3895,7 @@ fn require_mount_plan(
         let name = crate::text(format_args!("hidraw{index}"))?;
         crate::allocation::push(&mut key_names, name).map_err(|_| io::ErrorKind::OutOfMemory)?;
     }
-    let mountinfo = require_base_plan(&key_names, token, terminal, false, false)?;
+    let mountinfo = require_base_plan(&key_names, false, token, terminal, false, false)?;
     if !key_names.is_empty() {
         require_names("/sys", &["bus", "class", "devices"])?;
         require_names("/sys/bus", &[])?;
@@ -7039,7 +7082,9 @@ fn stage2_workspace_arguments(
             .iter()
             .map(|directory| directory.as_os_str().to_os_string()),
     );
-    stage2.push(OsString::from(if plan.sandbox {
+    stage2.push(OsString::from(if plan.kvm.is_some() {
+        "--sandbox-kvm-home"
+    } else if plan.sandbox {
         "--sandbox-home"
     } else {
         STAGE2_HOME_ARG
@@ -7171,9 +7216,10 @@ where
         }
         path.push(directory);
     }
-    let sandbox_home = match args.next().as_deref().and_then(OsStr::to_str) {
-        Some(STAGE2_HOME_ARG) => false,
-        Some("--sandbox-home") if development && !persistent => true,
+    let (sandbox_home, kvm) = match args.next().as_deref().and_then(OsStr::to_str) {
+        Some(STAGE2_HOME_ARG) => (false, false),
+        Some("--sandbox-home") if development && !persistent => (true, false),
+        Some("--sandbox-kvm-home") if development && !persistent => (true, true),
         _ => return Err(usage_error()),
     };
     let home = tree(args.next())?;
@@ -7271,6 +7317,7 @@ where
         persistent,
         runtime,
         native,
+        kvm,
         programs,
         aliases,
         path,
@@ -7384,6 +7431,9 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         )?;
     }
     let dev = prepare_base_mounts(identity, plan.development, true, !plan.scratch.is_empty())?;
+    if let Some(source) = &plan.kvm {
+        mount_sandbox_kvm(source, identity.uid)?;
+    }
     for grant in &plan.scratch {
         mount_grant(grant, grant.target != Path::new("/dev/shm"))?;
     }
@@ -7855,7 +7905,23 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             "detached host root remains reachable in the fresh root",
         ));
     }
-    let mountinfo = require_base_plan(&[], token, plan.development, true, plan.persistent)?;
+    let mountinfo = require_base_plan(
+        &[],
+        plan.kvm,
+        token,
+        plan.development,
+        true,
+        plan.persistent,
+    )?;
+    if plan.kvm {
+        require_mount(
+            &mountinfo,
+            KVM_DEVICE,
+            Some("tmpfs"),
+            &["ro", "nosuid", "noexec"],
+            &["rw", "nodev"],
+        )?;
+    }
     // The root holds the fixed trees, the host's system trees and the
     // first component of each admitted directory, and nothing else.
     let mut fixed: BTreeSet<String> = ["dev", "etc", "opt", "proc", "run", "tmp", "var"]
@@ -8387,6 +8453,11 @@ fn run_stage2_workspace(
     }
     clear_and_require_empty_capabilities()?;
     install_workspace_seccomp_filter(plan.development)?;
+    if plan.kvm {
+        require_kvm_node(&fs::symlink_metadata(KVM_DEVICE)?, identity.uid)?;
+        // Device I/O works through a read-only bind, which prevents metadata writes.
+        drop(OpenOptions::new().read(true).write(true).open(KVM_DEVICE)?);
+    }
     sys::set_dumpable(false)?;
     if sys::dumpable()? {
         return Err(io::Error::other("workspace PID 1 remained dumpable"));
@@ -8582,6 +8653,7 @@ mod tests {
             persistent: false,
             runtime: false,
             native: false,
+            kvm: false,
             programs: vec!["a".into()],
             aliases: Vec::new(),
             path: Vec::new(),
@@ -8672,6 +8744,7 @@ mod tests {
             native_abi: None,
             intake: false,
             sandbox: false,
+            kvm: None,
         };
         let identity = Identity {
             uid: 1000,
@@ -8812,6 +8885,16 @@ mod tests {
             .replace("/h ", "/var/home/timmy ")
             .replace("--shared 0", "--shared 1 /var/home/timmy/src/td rw");
         assert!(parse_stage2_workspace(&mut words(&personal).into_iter()).is_ok());
+        let kvm = personal.replace("--sandbox-home", "--sandbox-kvm-home");
+        assert!(
+            parse_stage2_workspace(&mut words(&kvm).into_iter())
+                .unwrap()
+                .kvm
+        );
+        assert!(parse_stage2_workspace(
+            &mut words(&kvm.replace("development", "confined")).into_iter()
+        )
+        .is_err());
         for invalid in [
             personal.replace("development", "confined"),
             personal.replace("ephemeral", "persistent"),
@@ -8884,6 +8967,7 @@ mod tests {
             persistent: false,
             runtime,
             native,
+            kvm: false,
             programs: vec!["a".into()],
             aliases: Vec::new(),
             path: Vec::new(),

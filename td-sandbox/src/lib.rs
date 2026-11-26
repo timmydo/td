@@ -54,6 +54,7 @@ const HELP: &str = "td-sandbox COMMAND\n\
   unshare NAME PATH\n\
   home NAME PATH|private      place the private home at your home path or its account path\n\
   network NAME off|host\n\
+  device NAME kvm on|off      allow KVM in new sessions\n\
   runtime NAME RUNTIME|native-glibc|native\n\
                               bind a declared Flathub runtime at /usr, or\n\
                               td's glibc at /lib and /lib64 for programs\n\
@@ -333,6 +334,9 @@ fn inspect(
         }
         td_alloc::push_str(&mut shown, &line).map_err(refused)?;
     }
+    if profile.kvm()? {
+        td_alloc::push_str(&mut shown, "KVM: on\n").map_err(refused)?;
+    }
     if let Some(old) = &profile.old_home {
         let line = text(format_args!(
             "Old home: {} (from before sandbox accounts; left as it was)\n",
@@ -354,7 +358,7 @@ fn session(
     let session = sessions::Session::register(profile)?;
     let (guard, layout) = profile.layout()?;
     let channel = intake::Root::new()
-        .launch(&intake::with_layout(line, &layout)?)
+        .launch(&intake::launch_request(line, &layout, profile.kvm()?)?)
         .map_err(|e| failure(format_args!("sandbox {name}: {}", explain(name, e))))?;
     let banner = if shell {
         // The terminal relay disables output newline translation.
@@ -526,6 +530,19 @@ fn run() -> io::Result<u8> {
             root.ask(&intake::network(&name, host)?)?
                 .accepted()
                 .map_err(|e| explain(&name, e))?;
+        }
+        "device" => {
+            if word(args.next())? != "kvm" {
+                return Err(error(HELP));
+            }
+            let enabled = match word(args.next())?.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(error(HELP)),
+            };
+            end(&mut args)?;
+            let profile = state::Profile::open(&profiles, &name, state::Access::Session)?;
+            profile.set_kvm(enabled)?;
         }
         "home" => {
             let choice = word(args.next())?;

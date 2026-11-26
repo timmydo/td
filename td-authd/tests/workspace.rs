@@ -83,6 +83,7 @@ fn word(argument: &str) -> String {
 fn shell(runtime: Option<&'static str>, term: &str) -> Verb {
     Verb::Launch(Launch {
         mounts: Default::default(),
+        kvm: false,
         personal_home_path: false,
         runtime,
         mode: Mode::Pty,
@@ -93,6 +94,24 @@ fn shell(runtime: Option<&'static str>, term: &str) -> Verb {
 
 /// A request is one exact line: the verb, a ledger name, and exactly the
 /// verb's operands, and nothing else.
+#[test]
+fn the_kvm_prefix_preserves_the_command_budget() {
+    let base = "run x native pipes dumb x";
+    let encoded = "61".repeat((MAX_REQUEST - 1 - base.len()) / 2);
+    let line = format!("{KVM_REQUEST_PREFIX}{base}{encoded}\n");
+    assert_eq!(line.len(), MAX_REQUEST + KVM_REQUEST_PREFIX.len());
+    let (mut caller, mut root) = UnixStream::pair().unwrap();
+    caller.write_all(line.as_bytes()).unwrap();
+    assert!(matches!(
+        read_request(&mut root).unwrap().verb,
+        Verb::Launch(Launch { kvm: true, .. })
+    ));
+    let longer = format!("{KVM_REQUEST_PREFIX}{base}{encoded}61\n");
+    assert!(Request::parse(longer.as_bytes()).is_err());
+    caller.write_all(longer.as_bytes()).unwrap();
+    assert!(read_request(&mut root).is_err());
+}
+
 #[test]
 fn a_request_is_one_exact_bounded_line() {
     let request = Request::parse(b"start default native xterm-256color\n").unwrap();
@@ -122,6 +141,22 @@ fn a_request_is_one_exact_bounded_line() {
                 ..
             })
         ));
+    }
+    for line in [
+        b"kvm start tools native linux\n".as_slice(),
+        b"kvm run-home tools native pipes dumb x6c73\n",
+    ] {
+        assert!(matches!(
+            Request::parse(line).unwrap().verb,
+            Verb::Launch(Launch { kvm: true, .. })
+        ));
+    }
+    for line in [
+        b"kvm create tools\n".as_slice(),
+        b"kvm workspace launch agent-1 development native x6c73\n",
+        b"kvm kvm start tools native linux\n",
+    ] {
+        assert!(Request::parse(line).is_err());
     }
     let runtime = Request::parse(b"start tools freedesktop-sdk-25-08 linux\n").unwrap();
     assert_eq!(runtime.verb, shell(Some("freedesktop-sdk-25-08"), "linux"));
@@ -160,6 +195,7 @@ fn a_request_is_one_exact_bounded_line() {
             name: "oracle".into(),
             verb: Verb::Launch(Launch {
                 mounts: Default::default(),
+                kvm: false,
                 personal_home_path: false,
                 runtime: None,
                 mode: Mode::Pipes,
@@ -776,6 +812,7 @@ impl Serve for Fake {
                     .clone()
                     .unwrap_or_else(|| vec!["/bin/sh".into(), "-i".into()]),
                 held: None,
+                _kvm: None,
             },
         )
     }
@@ -799,6 +836,7 @@ impl Serve for Fake {
                 relay: None,
                 command: instance.arguments.clone(),
                 held: Some(id),
+                _kvm: None,
             },
         )
     }
@@ -2015,6 +2053,7 @@ fn an_account_is_prepared_once_until_created_or_deleted_again() {
         relay: None,
         command: Vec::new(),
         held,
+        _kvm: None,
     };
     instances.hold(98305, 7, &[]).unwrap();
     root.release(&instance(Some(7)), false);

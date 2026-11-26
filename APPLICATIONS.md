@@ -3849,6 +3849,15 @@ flags and writability, allowing existing files. The optional host system
 link in `/run` is created if absent and refreshed when the host generation
 changes; an existing nonsymlink is refused. Unrelated runtime files remain.
 
+A root-owned sandbox spec can add one `device=kvm` line after its home
+and optional home location. The jail derives the source from the sealed
+spec's own path plus `.kvm`. It holds and checks the source inode
+and device number, then binds the node at `/dev/kvm` with read-only,
+nosuid and noexec mount flags. Stage 2 checks the device type, number,
+owner, mode and mount flags, then opens it read/write with the sandbox's
+credentials and empty capabilities. Device I/O is usable through the
+read-only bind. The spec line is reserved for ledger sandbox accounts.
+
 The development syscall policy is a default-allow filter for x86-64 and
 i386, with unknown architectures and x32 killed. It allows process and thread
 creation (including clone3), nested user/mount/PID namespaces, old and new

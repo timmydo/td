@@ -116,7 +116,8 @@ impl Sandbox {
                 "sandbox profile changed; prepare the sandbox again",
             ));
         }
-        let mut channel = intake::Root::new().launch(&intake::with_layout(&line, &layout)?)?;
+        let mut channel =
+            intake::Root::new().launch(&intake::launch_request(&line, &layout, profile.kvm()?)?)?;
         channel.set_read_timeout(Some(crate::workspace_intake::LAUNCH_PATIENCE))?;
         let (kind, payload) = wire::read(&mut channel).map_err(|e| {
             failure(format_args!(

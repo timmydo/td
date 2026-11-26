@@ -2246,7 +2246,7 @@ fn read_view_manifest(
 
 /// Linux x86-64's `O_PATH`: a descriptor that names a file without opening
 /// it for reading, which needs only search permission on the way.
-const O_PATH: i32 = 0o10_000_000;
+pub(crate) const O_PATH: i32 = 0o10_000_000;
 
 /// `read_view_manifest` below `state`, its directories of owner and group
 /// `owners.0`, the account's directory and manifest of group `owners.1`,

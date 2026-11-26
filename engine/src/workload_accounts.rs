@@ -91,6 +91,11 @@ pub const WORKSPACE_ORACLE_MARKER: &str = "TD-AGENT-WORKSPACE-ACCOUNTS-OK";
 /// Root's directory of workspace launch specs, one root-owned directory of
 /// the account's group per account below it.
 pub const WORKSPACE_SPECS: &str = "/run/td-authd/workspaces";
+/// The sandbox device grant's sole host device and its staged spec suffix.
+pub const KVM_DEVICE: &str = "/dev/kvm";
+pub const KVM_RDEV: u64 = (10 << 8) | 232;
+pub const KVM_SPEC_SUFFIX: &str = ".kvm";
+pub const KVM_REQUEST_PREFIX: &str = "kvm ";
 /// The directory below `DIRECTORY` holding each workspace account's
 /// scratch tree, named by its uid: the persistent `/tmp`, `/var/tmp`,
 /// `/dev/shm` and `/run` of its jails, outside its home, since a jail's

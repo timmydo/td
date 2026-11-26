@@ -26,7 +26,7 @@ use crate::authority::{
     self, path_is_same_or_child, paths_overlap, FilesystemGrant, FilesystemSourceKind,
 };
 use crate::flathub_app::{self, FlathubRuntime};
-use crate::workload_accounts::canonical_decimal;
+use crate::workload_accounts::{canonical_decimal, KVM_SPEC_SUFFIX};
 use crate::workload_accounts::{Kind, WORKLOAD_UIDS, WORKSPACE_INTAKE, WORKSPACE_SPECS};
 
 /// The argument after the exact `td-jail` argv[0] that selects this kind.
@@ -221,6 +221,7 @@ pub(crate) struct WorkspacePlan {
     /// ledger caller's, rather than its launcher's unnamed socket pair.
     pub(crate) intake: bool,
     pub(crate) sandbox: bool,
+    pub(crate) kvm: Option<PathBuf>,
 }
 
 /// Who may launch the kind, which decides whose spec, home and grants an
@@ -459,6 +460,7 @@ struct Spec {
     /// `require_account_spec`; never parsed from a spec line.
     account_private: bool,
     personal_home_path: bool,
+    kvm: bool,
     mounts: Layout,
     development: bool,
     shared_network: bool,
@@ -529,6 +531,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         "path",
         "home",
         "home-location",
+        "device",
         "mount",
         "scratch",
         "worktree",
@@ -558,6 +561,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             "entry" => entry,
             "home" => home.is_some(),
             "home-location" => spec.personal_home_path,
+            "device" => spec.kvm,
             _ => false,
         };
         if rank < last || repeated {
@@ -587,6 +591,16 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         }
         if key == "mount" {
             spec.mounts.row(value)?;
+            continue;
+        }
+        if key == "device" {
+            if value != "kvm" {
+                return Err(crate::error(
+                    io::ErrorKind::InvalidInput,
+                    format_args!("unknown sandbox device"),
+                ));
+            }
+            spec.kvm = true;
             continue;
         }
         if key == "alias" {
@@ -720,6 +734,7 @@ where
         }
     }
     let personal_home_path = spec.personal_home_path;
+    let kvm = spec.kvm;
     let mounts = std::mem::take(&mut spec.mounts);
     let runtime = spec.runtime;
     let native_glibc = spec.native_glibc;
@@ -744,6 +759,12 @@ where
         }
         plan.sandbox = true;
         plan.shared = sandbox_views(plan.shared, &mounts, &human, &plan.home.target)?;
+        if kvm {
+            plan.kvm = Some(PathBuf::from(crate::text(format_args!(
+                "{}{KVM_SPEC_SUFFIX}",
+                spec_path.display()
+            ))?));
+        }
     }
     plan.intake = matches!(caller, Caller::Account(_));
     if let Some(runtime) = runtime {
@@ -914,6 +935,12 @@ fn configuration_installed(config: &Path) -> io::Result<bool> {
 /// by role, each of which must be a view its manifest lists
 /// (`select_views`).
 fn require_account_spec(spec: &Spec, kind: Kind, uid: u32) -> io::Result<()> {
+    if spec.kvm && (kind != Kind::Sandbox || !spec.development) {
+        return Err(crate::error(
+            io::ErrorKind::InvalidInput,
+            format_args!("KVM requires a sandbox launch spec"),
+        ));
+    }
     if (spec.personal_home_path || spec.mounts.mounts().next().is_some())
         && (kind != Kind::Sandbox || !spec.development)
     {
@@ -1051,6 +1078,12 @@ fn select_views(spec: &mut Spec, mut views: Vec<FilesystemGrant>, human: &Path) 
 /// sandbox's profile, and a sandbox runs as its own account through
 /// root's workspace intake (td-sandbox/DESIGN.md), never as the human.
 fn require_host_spec(spec: &Spec) -> io::Result<()> {
+    if spec.kvm {
+        return Err(crate::error(
+            io::ErrorKind::InvalidInput,
+            format_args!("KVM requires a sandbox launch spec"),
+        ));
+    }
     if spec.personal_home_path || spec.mounts.mounts().next().is_some() {
         return Err(invalid(
             "the personal home path belongs to sandbox accounts",
@@ -1470,6 +1503,7 @@ fn admit(
         native_abi: None,
         intake: false,
         sandbox: false,
+        kvm: None,
     })
 }
 
@@ -2096,6 +2130,20 @@ mod tests {
             "format=1\nentry=/a\nprofile=development\nhome=/h\n",
         ] {
             assert!(parse_spec(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn kvm_is_a_single_device_in_a_root_sandbox_spec() {
+        let base = "format=1\nprofile=development-offline\nentry=/bin/sh\nhome=/var/lib/td/workloads/98304\n";
+        let spec = parse_spec(&format!("{base}device=kvm\n")).unwrap();
+        assert!(spec.kvm);
+        assert!(require_account_spec(&spec, Kind::Sandbox, 98304).is_ok());
+        assert!(require_account_spec(&spec, Kind::Workspace, 98304).is_err());
+        assert!(require_host_spec(&spec).is_err());
+        assert!(!parse_spec(base).unwrap().kvm);
+        for bad in ["device=/dev/kvm\n", "device=kvm\ndevice=kvm\n"] {
+            assert!(parse_spec(&format!("{base}{bad}")).is_err());
         }
     }
 

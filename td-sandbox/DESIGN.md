@@ -30,6 +30,7 @@ host is stale, no longer updated, and should be removed by hand.
 td-sandbox create tools
 td-sandbox share tools ~/src/project --write
 td-sandbox network tools host
+td-sandbox device tools kvm on
 td-sandbox runtime tools freedesktop-platform-25-08
 td-sandbox shell tools
 td-sandbox run tools -- command argument
@@ -41,7 +42,7 @@ td-sandbox delete tools
 
 ## Who keeps what
 
-Root keeps each sandbox's account, grants and network: the ledger row
+Root keeps each sandbox's account, directory grants and network: the ledger row
 `sandbox NAME UID` (`/var/lib/td/accounts.tsv`), the grant table's rows
 for it (`/var/lib/td/grants.tsv`), `directory ro|rw PATH` relative to the
 human's home and `network host`, no network row being off, and the
@@ -68,6 +69,8 @@ again. Readers hold the layout lock until the jailed relay reports that
 its command has started and the mounts are in place.
 A profile without destination rows uses default mounts. Running sessions keep
 their existing views. Removing a record discards its destination overrides.
+The optional private `kvm` file holds one line, `on` or `off`. Without
+that file KVM is off. Reads and atomic replacements use `kvm.lock`.
 
 A sandbox is **held** when its account's home holds files or the grant
 table holds a row of its name; root answers `status NAME` with `absent`
@@ -107,6 +110,12 @@ sandbox, so a lost record never costs a sandbox its files or grants.
   the same private storage across launches and location changes.
   `home NAME private` restores the default account path.
 - `network NAME off|host` sets the network row.
+- `device NAME kvm on|off` selects the KVM device for new sessions.
+  The primary's launch request asks root to provision it. Root refuses the
+  launch if the desktop KVM device is unavailable. All processes in a
+  session launched with KVM can open its `/dev/kvm` read/write. Turning
+  it off takes effect at the next launch. Running sessions keep their
+  existing device until they end.
 - `runtime NAME RUNTIME|native|native-glibc` changes the record alone.
 - `delete NAME` asks root to `delete`, then removes the record. Root
   refuses while a shell or command of the sandbox runs or its grants are
@@ -116,7 +125,8 @@ sandbox, so a lost record never costs a sandbox its files or grants.
   root.
 - `list` prints each record's name, account and network; `inspect` the
   account, its home, network, runtime, each grant as `Read: ~/PATH` or
-  `Write: ~/PATH`, and an imported sandbox's old home.
+  `Write: ~/PATH`, the enabled KVM setting, and an imported sandbox's old
+  home.
 
 Grants change what the next launch publishes; a running session keeps its
 views until it ends. Root's grant verbs, `status`, launches, creation and
