@@ -30,16 +30,9 @@ use crate::types::{Recipe, Step};
 // bodies that serve them. main.rs's two `#[path]` includes reach the engine's
 // CRC and inflater, staged at the checkout's layout below.
 //
-// `free`/`ps` read /proc and `dmesg` reads /dev/kmsg O_NONBLOCK, all ordinary file
-// I/O. `less` is the one that is not: taking a keystroke without waiting for Enter,
-// and asking how many rows a screen has, are `ioctl(2)`, and nothing in safe `std`
-// reaches them. That is the SEVENTH target-side unsafe exception UNSAFE.md records —
-// ONE syscall, THREE pinned requests (TCGETS/TCSETS/TIOCGWINSZ), confined to
-// `sys.rs` with `term.rs` its only caller — so the crate root is `#![deny]` rather
-// than `#![forbid]` and `main.rs`'s `mod confinement` tests hold the surface at that.
-// The applets that would widen it further (reboot/poweroff/halt, switch_root,
-// cttyhack, init, and `sync`, which is td-init's) stay out of scope: each needs a
-// syscall this roster does not have, which is a further reviewed amendment.
+// The pager's three terminal ioctls, and flock's lock and descriptor
+// inheritance calls, are covered by UNSAFE.md section 7 and the crate's
+// confinement tests.
 //
 // system-x86-64 packs td-util into the real root AND both initramfs cpios, routes
 // /bin/{clear,which,free,ps,dmesg,hwcheck,less,tar,sha256sum} here, and calls the others as
@@ -88,6 +81,7 @@ const MODULES: &[(&str, &str)] = &[
     ("fileattr", include_str!("../../../td-util/src/fileattr.rs")),
     ("fileops", include_str!("../../../td-util/src/fileops.rs")),
     ("find", include_str!("../../../td-util/src/find.rs")),
+    ("flock", include_str!("../../../td-util/src/flock.rs")),
     ("free", include_str!("../../../td-util/src/free.rs")),
     (
         "gen_init_cpio",

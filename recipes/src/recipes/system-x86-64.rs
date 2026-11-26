@@ -1166,6 +1166,7 @@ fn td_init_probe(applet: &str, probe: &Probe) -> String {
 /// dispatches to nothing.
 const TD_UTIL_APPLETS: &[&str] = &[
     "clear",
+    "flock",
     "which",
     "free",
     "ps",
@@ -3998,6 +3999,7 @@ fn build_sandbox_kernel_probes() -> String {
 /// it a tty. An operand ties the probe to nothing but itself.
 fn td_util_probe_args(applet: &str) -> &'static str {
     match applet {
+        "flock" => " -n -s /etc/os-release /bin/true",
         "tar" => " --help",
         "which" => " sh",
         "less" => " /etc/os-release",
@@ -17266,6 +17268,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             !TD_UTIL_APPLETS.is_empty(),
             "an empty farm would make every per-applet assertion below, and shape_check's \
              own farm loop, silently vacuous"
+        );
+        assert_eq!(
+            td_util_probe_args("flock"),
+            " -n -s /etc/os-release /bin/true"
         );
         for applet in TD_UTIL_APPLETS {
             // Match the WHOLE generated segment, failure branch included. Matching the name

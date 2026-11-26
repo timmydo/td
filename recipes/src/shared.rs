@@ -2436,8 +2436,8 @@ mod tests {
             .any(|(recipe, file)| *recipe == stem && staged_body(recipe, file) == path)
     }
 
-    /// The bodies that IMPLEMENT a retired tool rather than run one, each
-    /// freed for the tools it names and no other.
+    /// Reviewed command launchers and the retired tool names each implements.
+    /// An empty list admits caller-supplied argv while exempting no names.
     ///
     /// td-util serves `find` and `xargs` as applets, so its crate root names
     /// them in the applet table and each applet's diagnostics carry its own
@@ -2454,6 +2454,7 @@ mod tests {
     /// roster's does.
     const TOOL_PROVIDER_BODIES: &[(&str, &str, &[&str])] = &[
         ("td-util", "find.rs", &["find"]),
+        ("td-util", "flock.rs", &[]),
         ("td-util", "main.rs", &["find", "xargs"]),
         ("td-util", "xargs.rs", &["xargs"]),
     ];
@@ -3322,6 +3323,12 @@ mod tests {
                 .is_some()
         );
         assert!(host_tool_invocation("td-txt", &named(&find, r#"let a = "find";"#)).is_some());
+        let flock = staged_body("td-util", "flock.rs");
+        for tool in HOST_TOOLS {
+            let named_command = named(&flock, &format!("Command::new(\"{tool}\")"));
+            assert!(provider_tripwire("td-util", &named_command).is_some());
+            assert!(host_tool_invocation("td-util", &named_command).is_some());
+        }
     }
 
     /// The `.rs` rule above is narrow in the direction that matters: a staged

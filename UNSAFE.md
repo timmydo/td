@@ -197,7 +197,7 @@ one.
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
-| 7 | `td-util` | `ioctl(2)`, three pinned requests |
+| 7 | `td-util` | terminal `ioctl(2)`, `flock(2)`, and `fcntl(F_SETFD, 0)` |
 | 8 | `td-sh` | `umask(2)`, disposition-only `rt_sigaction(2)`, job-control `kill(2)` and `rt_sigprocmask(2)`, `ioctl(2)` (five requests), `poll(2)`, and §8 descriptor inheritance (`fcntl(2)` with four pinned commands, `dup3(2)`, `close_range(2)`, `wait4(2)`, `memfd_create(2)`, and descriptor adoption) |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
@@ -1225,9 +1225,9 @@ exact request. No clock or request value changes.
 
 ## 7. `td-util` — the diagnostics multicall
 
-The `td-util` diagnostics multicall, whose one `syscall3` body in
-`td-util/src/sys.rs` carries EXACTLY ONE syscall — `ioctl(2)` — with THREE
-value-pinned requests, reached only from `term.rs`: `TCGETS`/`TCSETS`
+The `td-util` diagnostics multicall has one `syscall3` instruction in
+`src/sys.rs`. The pager issues three value-pinned ioctl requests from
+`term.rs`: `TCGETS`/`TCSETS`
 (0x5401/0x5402) to take a keystroke without waiting for Enter, and
 `TIOCGWINSZ` (0x5413) to ask how many rows a page is. td-util
 `#![forbid(unsafe_code)]`d until it grew `less`, the pager that let
@@ -1265,14 +1265,13 @@ staircases. The guard holds a `BorrowedFd`, not a bare `RawFd`: it issues
 a syscall from `Drop` on a descriptor it does not own, so the borrow
 checker is what stops the terminal being closed — or closed and RECYCLED —
 before the restore reaches it. `ISIG` is deliberately left ON, so Ctrl-C
-still ends a pager stuck on a huge file. An eighth syscall, a fourth
-request, or a second scoped `#[allow]` is an amendment here;
-`td-util/src/main.rs`'s confinement tests assert the roster and its one
-value-pinned number, the three request values and that each is named
+still ends a pager stuck on a huge file. Any additional syscall, request or scoped allowance amends this section;
+`td-util/src/main.rs`'s confinement tests assert the roster and its
+value-pinned numbers, the three request values and that each is named
 exactly twice, the whole `asm!` block including which register each
 argument lands in (and that `options(nomem)` stays absent, since two of
 the three requests have the kernel write through a pointer), that the
-crate names the unsafe lint exactly twice, that `term.rs` is the wrappers'
+crate names the unsafe lint exactly twice, that `term.rs` is the ioctl wrappers'
 only caller, and that no module names the syscall module any way but plain
 `use crate::sys;` — an alias would give the audited calls a name none of
 those scans looks for. Two of those assertions are about an ARGUMENT
@@ -1303,6 +1302,15 @@ only decoupling constructs the confinement scan admits, each pinned
 verbatim and removed exactly once before the scan refuses the rest,
 and the engine files themselves are scanned: no `unsafe` and no
 decoupling construct of their own.
+
+The flock applet uses the same instruction for x86-64 flock (73) and
+fcntl (72). flock takes an inherited nonnegative descriptor or an opened
+lock file and one of LOCK_SH, LOCK_EX or LOCK_UN, optionally LOCK_NB.
+The kernel checks the supplied descriptor. No descriptor is adopted.
+The command form clears close-on-exec with F_SETFD (2) and argument
+zero on its own live lock File, keeps it through the child wait, and
+lets descendants inherit the same open file description. Tests pin both
+call sites, their selectors and flags, and flock.rs as their only caller.
 
 ## 8. `td-sh` — the shell
 

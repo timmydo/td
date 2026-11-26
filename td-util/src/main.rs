@@ -33,18 +33,9 @@
 //! parser and creates them with its ustar writer; its `--help` states the
 //! supported flags and resource limits.
 //!
-//! Almost everything here is safe `std`: `/proc` and `/dev/kmsg` are ordinary
-//! files, and the build tools walk, read and spawn through `std`. `less` is
-//! the exception, and the reason this crate root `deny`s the
-//! unsafe lint rather than `forbid`ding it — a pager that cannot take a keystroke
-//! without waiting for Enter, or ask how many rows the screen has, is not a pager,
-//! and both are `ioctl(2)`. That surface is ONE syscall with THREE pinned requests,
-//! confined to `sys.rs` with `term.rs` its only caller; it is the SEVENTH
-//! target-side unsafe exception UNSAFE.md records, and `mod confinement` below
-//! asserts every part of it against this crate's own source. The applets that would
-//! need a syscall beyond that roster (reboot/poweroff/halt, switch_root, cttyhack,
-//! init) are deliberately absent — adding one is a further reviewed amendment, not
-//! a drive-by.
+//! Terminal ioctls for the pager and descriptor operations for flock live in
+//! sys.rs. The confinement tests pin the instructions, operations and callers
+//! recorded in UNSAFE.md section 7.
 
 mod cat;
 mod cmp;
@@ -74,6 +65,7 @@ mod dmesg;
 mod fileattr;
 mod fileops;
 mod find;
+mod flock;
 mod free;
 mod gen_init_cpio;
 mod glob;
@@ -129,43 +121,48 @@ mod xargs;
 use std::io::Write;
 use std::process::ExitCode;
 
-type Applet = fn(&[String]) -> Result<u8, String>;
+#[derive(Clone, Copy)]
+enum Applet {
+    Text(fn(&[String]) -> Result<u8, String>),
+    Native(fn(std::env::ArgsOs) -> u8),
+}
 
 /// Every applet this multicall serves, paired with the function that runs it.
 /// ONE table, so a name cannot exist without an arm or an arm without a name —
 /// `--list`, argv[0] dispatch, and the shipped /bin symlink farm all read it.
 const APPLETS: &[(&str, Applet)] = &[
-    ("cat", cat::run),
-    ("chmod", fileattr::chmod),
-    ("chown", fileattr::chown),
-    ("clear", clear),
-    ("cmp", cmp::run),
-    ("cpio", cpio::run),
-    ("diff", diff::run),
-    ("dmesg", dmesg::run),
-    ("find", find::run),
-    ("free", free::run),
-    ("gen_init_cpio", gen_init_cpio::run),
-    ("gunzip", gz::gunzip),
-    ("gzip", gz::gzip),
-    ("hwcheck", hwcheck::run),
-    ("less", less::run),
-    ("ln", fileops::ln),
-    ("mkdir", fileops::mkdir),
-    ("mv", fileops::mv),
-    ("od", od::run),
-    ("printf", printf::run),
-    ("ps", ps::run),
-    ("readlink", fileops::readlink),
-    ("rm", fileops::rm),
-    ("sha256sum", sha256sum::run),
-    ("sleep", sleep::run),
-    ("tar", tar::run),
-    ("test", test::run),
-    ("uname", uname::run),
-    ("which", which::run),
-    ("xargs", xargs::run),
-    ("zcat", gz::zcat),
+    ("cat", Applet::Text(cat::run)),
+    ("chmod", Applet::Text(fileattr::chmod)),
+    ("chown", Applet::Text(fileattr::chown)),
+    ("clear", Applet::Text(clear)),
+    ("cmp", Applet::Text(cmp::run)),
+    ("cpio", Applet::Text(cpio::run)),
+    ("diff", Applet::Text(diff::run)),
+    ("dmesg", Applet::Text(dmesg::run)),
+    ("find", Applet::Text(find::run)),
+    ("flock", Applet::Native(flock::run)),
+    ("free", Applet::Text(free::run)),
+    ("gen_init_cpio", Applet::Text(gen_init_cpio::run)),
+    ("gunzip", Applet::Text(gz::gunzip)),
+    ("gzip", Applet::Text(gz::gzip)),
+    ("hwcheck", Applet::Text(hwcheck::run)),
+    ("less", Applet::Text(less::run)),
+    ("ln", Applet::Text(fileops::ln)),
+    ("mkdir", Applet::Text(fileops::mkdir)),
+    ("mv", Applet::Text(fileops::mv)),
+    ("od", Applet::Text(od::run)),
+    ("printf", Applet::Text(printf::run)),
+    ("ps", Applet::Text(ps::run)),
+    ("readlink", Applet::Text(fileops::readlink)),
+    ("rm", Applet::Text(fileops::rm)),
+    ("sha256sum", Applet::Text(sha256sum::run)),
+    ("sleep", Applet::Text(sleep::run)),
+    ("tar", Applet::Text(tar::run)),
+    ("test", Applet::Text(test::run)),
+    ("uname", Applet::Text(uname::run)),
+    ("which", Applet::Text(which::run)),
+    ("xargs", Applet::Text(xargs::run)),
+    ("zcat", Applet::Text(gz::zcat)),
 ];
 
 /// A plain loop rather than an iterator search: this file is embedded verbatim
@@ -235,40 +232,41 @@ fn usage() -> String {
 }
 
 fn main() -> ExitCode {
-    // `args_os`, not `args`: the latter PANICS on a non-UTF-8 argument, which is
-    // an ordinary thing to hand a diagnostics tool (`which $(some-bad-path)`).
-    let argv: Vec<String> = std::env::args_os()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let prog = argv.first().map(String::as_str).unwrap_or("td-util");
-    let self_name = basename(prog);
-
-    let (name, args): (&str, &[String]) = match lookup(self_name) {
-        Some(_) => (self_name, argv.get(1..).unwrap_or(&[])),
-        None => match argv.get(1).map(String::as_str) {
-            Some("--list") => {
-                let listing = format!("{}\n", names().join("\n"));
-                return match emit(&listing) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        emit_err(&format!("td-util: {e}\n"));
-                        ExitCode::from(1)
-                    }
-                };
-            }
-            Some(a) if lookup(a).is_some() => (a, argv.get(2..).unwrap_or(&[])),
-            _ => {
-                emit_err(&format!("{}\n", usage()));
-                return ExitCode::from(2);
-            }
-        },
+    let mut args = std::env::args_os();
+    let prog = args.next().unwrap_or_default();
+    let spelled = prog.to_string_lossy();
+    let invoked = basename(&spelled);
+    let explicit;
+    let name = if lookup(invoked).is_some() {
+        invoked
+    } else {
+        explicit = args.next();
+        explicit
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("")
     };
-
-    let result = match lookup(name) {
-        Some(run) => run(args),
-        None => Err(format!("no such applet '{name}'")),
+    if name == "--list" {
+        let listing = format!("{}\n", names().join("\n"));
+        return match emit(&listing) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                emit_err(&format!("td-util: {e}\n"));
+                ExitCode::from(1)
+            }
+        };
+    }
+    let Some(applet) = lookup(name) else {
+        emit_err(&format!("{}\n", usage()));
+        return ExitCode::from(2);
     };
-
+    let result = match applet {
+        Applet::Native(run) => return ExitCode::from(run(args)),
+        Applet::Text(run) => {
+            let argv: Vec<String> = args.map(|a| a.to_string_lossy().into_owned()).collect();
+            run(&argv)
+        }
+    };
     match result {
         Ok(code) => ExitCode::from(code),
         Err(msg) => {
@@ -360,7 +358,11 @@ mod confinement {
     /// neighbour would otherwise change which kernel call this crate makes
     /// while every name-based assertion still passed. 16 is `ioctl`; 15 is
     /// `rt_sigreturn` and 17 is `pread64`, which is what a fat-finger would reach.
-    const AMENDED: &[(&str, &str)] = &[("SYS_IOCTL", "16")];
+    const AMENDED: &[(&str, &str)] = &[
+        ("SYS_FCNTL", "72"),
+        ("SYS_FLOCK", "73"),
+        ("SYS_IOCTL", "16"),
+    ];
 
     const CALL: &str = concat!("sys", "call3");
 
@@ -376,7 +378,13 @@ mod confinement {
     ];
 
     /// The typed wrappers, one per request, and `syscall3`'s only callers.
-    const WRAPPERS: &[&str] = &["termios_get", "termios_set", "window_size"];
+    const WRAPPERS: &[&str] = &[
+        "termios_get",
+        "termios_set",
+        "window_size",
+        "inherit_lock",
+        "lock_descriptor",
+    ];
 
     /// Neighbours of the three that are deliberately NOT in the surface, each
     /// one request-number digit away from something admitted. Checked against
@@ -482,8 +490,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            28,
-            "expected twenty-eight modules in src/ beside the crate root"
+            29,
+            "expected twenty-nine modules in src/ beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -521,6 +529,7 @@ mod confinement {
                 "fileattr.rs",
                 "fileops.rs",
                 "find.rs",
+                "flock.rs",
                 "free.rs",
                 "gen_init_cpio.rs",
                 "glob.rs",
@@ -653,7 +662,7 @@ mod confinement {
     /// below it. A line-oriented scan with a fixed-spacing prefix would see one
     /// and pass.
     #[test]
-    fn the_syscall_surface_is_exactly_one() {
+    fn the_syscall_surface_matches_the_roster() {
         let sys = squeeze(&source("sys.rs"));
         let mut declared: Vec<(String, String)> = Vec::new();
         for (offset, _) in sys.match_indices(DECL) {
@@ -804,9 +813,16 @@ mod confinement {
             WRAPPERS.len(),
             "expected exactly one call site per typed wrapper"
         );
-        assert!(
-            selected.iter().all(|s| s == "SYS_IOCTL"),
-            "every call site must select the one amended syscall: {selected:?}"
+        selected.sort();
+        assert_eq!(
+            selected,
+            [
+                "SYS_FCNTL",
+                "SYS_FLOCK",
+                "SYS_IOCTL",
+                "SYS_IOCTL",
+                "SYS_IOCTL"
+            ]
         );
         // ...and the definition, and NOTHING else. The loop skips any mention
         // not followed by `(`, which is the function ITEM: bind it once and
@@ -866,12 +882,21 @@ mod confinement {
     #[test]
     fn every_call_site_is_pinned_whole() {
         const ARGUMENTS: &[&str] = &[
+            "(SYS_FCNTL,file.as_raw_fd()asusize,F_SETFD,0)",
+            "(SYS_FLOCK,fdasusize,flags,0)",
             "(SYS_IOCTL,fdasusize,TCGETS,out.as_mut_ptr()asusize,)",
             "(SYS_IOCTL,fdasusize,TCSETS,termios.as_ptr()asusize,)",
             "(SYS_IOCTL,fdasusize,TIOCGWINSZ,out.as_mut_ptr()asusize,)",
         ];
         assert_eq!(ARGUMENTS.len(), WRAPPERS.len(), "one pin per typed wrapper");
         let sys = squeeze(&source("sys.rs"));
+        for pin in [
+            "constF_SETFD:usize=2;",
+            "enumLockMode{Shared=1,Exclusive=2,Unlock=8,}",
+            "letflags=modeasusize|ifnonblocking{4}else{0};",
+        ] {
+            assert_eq!(sys.matches(pin).count(), 1, "{pin}");
+        }
         for arguments in ARGUMENTS {
             assert_eq!(
                 sys.matches(&format!("{CALL}{arguments}")).count(),
@@ -932,7 +957,7 @@ mod confinement {
     /// decides what a termios byte means, which is the one thing that file
     /// exists to prevent.
     #[test]
-    fn only_the_terminal_layer_reaches_the_ioctl_wrappers() {
+    fn only_the_named_applets_reach_their_wrappers() {
         let prefix = concat!("sys", "::");
         // NOTHING may import an item OUT of the syscall module, or alias it.
         // Tokens off the un-squeezed text, because the forms differ only by
@@ -977,6 +1002,11 @@ mod confinement {
             }
         }
         for wrapper in WRAPPERS {
+            let caller = if matches!(*wrapper, "inherit_lock" | "lock_descriptor") {
+                "flock.rs"
+            } else {
+                "term.rs"
+            };
             let mention = format!("{prefix}{wrapper}");
             let call = format!("{mention}(");
             for (name, text) in sources() {
@@ -991,8 +1021,8 @@ mod confinement {
                     "{name} names {wrapper} somewhere that is not a call; it would be \
                      reachable under another name"
                 );
-                if name != "term.rs" {
-                    assert_eq!(calls, 0, "{name} calls {wrapper}; only term.rs may");
+                if name != caller {
+                    assert_eq!(calls, 0, "{name} calls {wrapper}; only {caller} may");
                 }
             }
             // Inside sys.rs the wrappers are reachable UNQUALIFIED, which no
@@ -1013,8 +1043,14 @@ mod confinement {
         }
         // ...and term.rs really does call all three, or one wrapper is dead code
         // and the assertions above are vacuous for it.
-        let term = squeeze(&source("term.rs"));
         for wrapper in WRAPPERS {
+            let term = squeeze(&source(
+                if matches!(*wrapper, "inherit_lock" | "lock_descriptor") {
+                    "flock.rs"
+                } else {
+                    "term.rs"
+                },
+            ));
             assert!(
                 term.contains(&format!("{prefix}{wrapper}(")),
                 "term.rs never calls {wrapper}; the confinement above says nothing"

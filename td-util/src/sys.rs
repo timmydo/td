@@ -1,24 +1,5 @@
-//! The confined raw-syscall layer — the whole `unsafe` surface of this crate.
-//!
-//! The crate root `#![deny(unsafe_code)]`s and exactly one item here carries a
-//! scoped `#[allow]`: `syscall3`, the `syscall`-instruction body copied from
-//! `td-init/src/sys.rs`. Everything else in the crate — and every other function
-//! in this module — is ordinary safe Rust. This is the SEVENTH target-side unsafe
-//! exception UNSAFE.md records.
-//!
-//! The surface is ONE syscall, `ioctl(2)`, with exactly THREE permitted requests,
-//! all of them about the shape and mode of a terminal this process already has
-//! open: `TCGETS` and `TCSETS` (read and set the line discipline, so `less` can
-//! take a keystroke without waiting for Enter) and `TIOCGWINSZ` (how many rows and
-//! columns, so a page is a screenful rather than a guess). A FOURTH request, or a
-//! second syscall, is a reviewed amendment; `main.rs`'s confinement tests assert
-//! the roster, the request values, the assembly body and the callers.
-//!
-//! Deliberately NOT here: `TIOCSWINSZ` (nothing should resize an operator's
-//! terminal), `TCSETSW`/`TCSETSF` (they drain or flush pending output, and a pager
-//! has no business discarding what another process wrote), `TIOCSTI` (it injects
-//! input into a terminal, which is the classic escape from a restricted session),
-//! and `isatty`, which `std::io::IsTerminal` already answers safely.
+//! x86-64 Linux descriptor operations used by the pager and flock.
+//! UNSAFE.md section 7 and the confinement tests own the syscall contract.
 //!
 //! The termios and winsize buffers are OPAQUE BYTES here. This module never
 //! decides what a field means — it hands the kernel a buffer and gives one back —
@@ -26,11 +7,13 @@
 //! read-back that checks it.
 
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-util's terminal layer is x86_64-linux only (raw syscall ABI)");
 
+const SYS_FCNTL: usize = 72;
+const SYS_FLOCK: usize = 73;
 const SYS_IOCTL: usize = 16;
 
 /// `struct termios` as the x86_64 kernel lays it out: four `u32` flag words, a
@@ -43,7 +26,7 @@ pub const WINSIZE_LEN: usize = 8;
 /// The single raw-syscall entry point (x86_64 SysV syscall ABI), copied from
 /// `td-init/src/sys.rs`. Its body is the ONLY `unsafe` in the crate. The scoped
 /// `#[allow]` covers where `unsafe` may appear, not what may be passed here — this
-/// fn is safe to CALL, so its confinement is module privacy plus the three typed
+/// fn is safe to CALL, so its confinement is module privacy plus the typed
 /// wrappers below being its only callers.
 #[inline]
 #[allow(unsafe_code)]
@@ -117,6 +100,24 @@ pub fn window_size(fd: RawFd, out: &mut [u8; WINSIZE_LEN]) -> io::Result<()> {
         TIOCGWINSZ,
         out.as_mut_ptr() as usize,
     ))
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum LockMode {
+    Shared = 1,
+    Exclusive = 2,
+    Unlock = 8,
+}
+
+pub fn lock_descriptor(fd: RawFd, mode: LockMode, nonblocking: bool) -> io::Result<()> {
+    let flags = mode as usize | if nonblocking { 4 } else { 0 };
+    check(syscall3(SYS_FLOCK, fd as usize, flags, 0))
+}
+
+pub fn inherit_lock(file: &std::fs::File) -> io::Result<()> {
+    const F_SETFD: usize = 2;
+    check(syscall3(SYS_FCNTL, file.as_raw_fd() as usize, F_SETFD, 0))
 }
 
 #[cfg(test)]
