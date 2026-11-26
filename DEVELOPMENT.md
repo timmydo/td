@@ -642,7 +642,8 @@ integration`, which `check` alone does not include. It runs on the host,
 never in the gate sandbox: it warms the system image's inputs and
 exports the declared Flathub refs into the host's feed (`warm
 --flathub`, APPLICATIONS.md §W.9), which the oracles' guests fetch
-Firefox and its runtime from, then runs
+Firefox and its runtime from, then runs the disposable td-vm QEMU lifecycle,
+workspace and enrollment cases (`qemu-vm-lifecycle`), followed by
 `qemu-boot-system`, `qemu-boot-server`, `qemu-boot-audio`,
 `qemu-boot-audio-hotplug`, `qemu-deploy-rollback`, `qemu-admin-update`,
 `qemu-boot-live` and `qemu-install-system`, each with a banner saying what it proves, its
@@ -650,7 +651,11 @@ outcome and wall time, recorded in the check history as
 `integration:STEP` (`td-recipe-eval check-history integration`). On its
 own it runs only those steps; beside gate goals (`td-builder check check
 integration`), it runs after the gates pass and says so when they do
-not. Every boot runs on KVM alone, which needs the run to open
+not. The VM manager cases require host `qemu-img`, `qemu-io` and
+`qemu-system-x86_64` and run even when every image boot answers from
+its memo. The Cargo runner gives each fixture a short private `/tmp`
+backed by the request's scratch directory. Missing manager tools or an entirely unavailable image boot
+suite gives an unprovisioned result. Each system image boot runs on KVM alone
 `/dev/kvm` (membership in the `kvm` group, from a login started after
 joining it): an oracle never falls back to TCG, several times slower,
 and without KVM it is a host gap. A q35 firmware boot splits the

@@ -25,7 +25,7 @@ fn in_trusted_root(name: &str) -> Result<bool> {
     let output = Command::new(builder)
         .arg("run-capped")
         .arg(std::env::current_exe()?)
-        .args(["--exact", name, "--nocapture"])
+        .args(["--exact", name, "--include-ignored", "--nocapture"])
         .env("TD_TEST_TRUSTED_ROOT", "1")
         .env("TD_VM_GIT_TEST_INNER", "1")
         .output()?;
@@ -684,8 +684,9 @@ fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Out
 }
 
 #[test]
-fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> Result<()> {
-    if in_trusted_root("manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion")? {
+#[ignore = "td-builder check integration supplies qemu-img"]
+fn qemu_integration_enrollment_retries_and_revokes_before_deletion() -> Result<()> {
+    if in_trusted_root("qemu_integration_enrollment_retries_and_revokes_before_deletion")? {
         return Ok(());
     }
     let (root, policy) = fixture()?;

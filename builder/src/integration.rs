@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 /// The goal word `td-builder check` takes for this tier.
 pub(crate) const GOAL: &str = "integration";
 
-/// One step: its name, its `td-recipe-eval` argv, and what it proves.
+const VM_LIFECYCLE: &str = "qemu-vm-lifecycle";
+
+/// One step: its name, command arguments, and what it proves.
 struct Step {
     name: &'static str,
     argv: &'static [&'static str],
@@ -27,6 +29,11 @@ const STEPS: &[Step] = &[
         argv: &["warm", "system-x86-64", "--flathub"],
         proves: "the system image's pinned inputs are present, and the host's feed holds the \
                  Flathub applications the guests fetch",
+    },
+    Step {
+        name: VM_LIFECYCLE,
+        argv: &["test", "--frozen", "--manifest-path", "td-vm/Cargo.toml", "qemu_integration_", "--", "--ignored"],
+        proves: "td-vm creates independent overlays, supervises the guest, and preserves workspace bindings and Git enrollment",
     },
     Step {
         name: "qemu-boot-system",
@@ -202,16 +209,16 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
     }
     let every_hit = STEPS
         .iter()
-        .filter(|step| step.name != "warm")
+        .filter(|step| !matches!(step.name, "warm" | VM_LIFECYCLE))
         .all(|step| matches!(ask_memo(root, eval, step.name), Memo::Hit(_)));
     let mut results: Vec<(&str, Outcome, Duration)> = Vec::new();
     for step in STEPS {
         let memo = match step.name {
             "warm" if every_hit => {
-                println!(">> {GOAL}: warm skipped — every oracle answers from the memo");
+                println!(">> {GOAL}: warm skipped — every image oracle answers from the memo");
                 continue;
             }
-            "warm" => Memo::Unasked,
+            "warm" | VM_LIFECYCLE => Memo::Unasked,
             name => ask_memo(root, eval, name),
         };
         match &memo {
@@ -242,20 +249,8 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
             step.name, step.proves
         );
         let started = Instant::now();
-        let mut cmd = Command::new(eval);
-        cmd.args(step.argv).current_dir(root);
-        // An oracle runs for many minutes: it must not outlive `td-builder
-        // stop` or a dead check host, holding the ladder lock.
-        crate::host_bin::arm_check_child(&mut cmd);
-        let status = cmd.status();
+        let outcome = run_step(root, eval, step);
         let took = started.elapsed();
-        let outcome = match &status {
-            Ok(st) => Outcome::of(st.code()),
-            Err(e) => {
-                eprintln!("{GOAL}: could not start {eval}: {e}");
-                Outcome::Fail
-            }
-        };
         println!(
             "================ {GOAL} {}: {} ({:.1}s) ================",
             step.name,
@@ -279,13 +274,48 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
     println!("{line}");
     if code == td_engine::exit::EXIT_UNPROVISIONED {
         println!(
-            ">> {GOAL}: UNPROVISIONED — no oracle could run on this host (qemu, /dev/kvm, or \
-             OVMF for the UEFI boots); a skip is not a pass"
+            ">> {GOAL}: UNPROVISIONED — missing VM lifecycle tools or no system boot oracle could run \
+             (qemu, /dev/kvm, or OVMF for the UEFI boots); a skip is not a pass"
         );
         // A caller reads a host gap by the code and the sentinel together.
         eprintln!("{}", td_engine::exit::UNPROVISIONED_SENTINEL);
     }
     code
+}
+
+fn run_step(root: &Path, eval: &str, step: &Step) -> Outcome {
+    let program = if step.name == VM_LIFECYCLE {
+        let path = std::env::var("PATH").unwrap_or_default();
+        if let Some(missing) = ["qemu-img", "qemu-io", "qemu-system-x86_64"]
+            .into_iter()
+            .find(|tool| crate::stage0::find_in_path(&path, tool).is_none())
+        {
+            println!(">> {GOAL} {}: unprovisioned (missing {missing})", step.name);
+            return Outcome::HostGap;
+        }
+        "cargo"
+    } else {
+        eval
+    };
+    let mut cmd = Command::new(program);
+    if step.name == VM_LIFECYCLE {
+        // Cargo runs each selected harness under a short, request-backed /tmp.
+        // The registrar harness is already inside its trusted-root runner.
+        cmd.env(crate::test_root::ENV, "1")
+            .env("TD_VM_GIT_TEST_INNER", "1");
+    }
+    cmd.args(step.argv).current_dir(root);
+    // An oracle runs for many minutes: it must not outlive `td-builder
+    // stop` or a dead check host, holding the ladder lock.
+    crate::host_bin::arm_check_child(&mut cmd);
+    let status = cmd.status();
+    match &status {
+        Ok(st) => Outcome::of(st.code()),
+        Err(e) => {
+            eprintln!("{GOAL}: could not start {program}: {e}");
+            Outcome::Fail
+        }
+    }
 }
 
 /// The summary line and exit code for `results`: the oracles counted, every
@@ -312,7 +342,14 @@ fn verdict(results: &[(&str, Outcome, Duration)]) -> (String, i32) {
     let failed = results.iter().any(|r| r.1 == Outcome::Fail);
     let code = if failed {
         1
-    } else if oracles.iter().all(|r| r.1 == Outcome::HostGap) {
+    } else if oracles
+        .iter()
+        .filter(|r| r.0 != VM_LIFECYCLE)
+        .all(|r| r.1 == Outcome::HostGap)
+        || results
+            .iter()
+            .any(|r| r.0 == VM_LIFECYCLE && r.1 == Outcome::HostGap)
+    {
         td_engine::exit::EXIT_UNPROVISIONED
     } else {
         0
@@ -351,6 +388,22 @@ mod tests {
             ("qemu-boot-live", gap, s(0)),
         ];
         assert_eq!(verdict(&all_gap).1, td_engine::exit::EXIT_UNPROVISIONED);
+        let manager_only = [
+            (VM_LIFECYCLE, Outcome::Pass, s(1)),
+            ("qemu-boot-system", gap, s(0)),
+        ];
+        assert_eq!(
+            verdict(&manager_only).1,
+            td_engine::exit::EXIT_UNPROVISIONED
+        );
+        let missing_manager_tools = [
+            (VM_LIFECYCLE, gap, s(0)),
+            ("qemu-boot-system", Outcome::Pass, s(1)),
+        ];
+        assert_eq!(
+            verdict(&missing_manager_tools).1,
+            td_engine::exit::EXIT_UNPROVISIONED
+        );
         let one_ran = [
             ("warm", Outcome::Pass, s(1)),
             ("qemu-boot-system", Outcome::Pass, s(600)),
@@ -360,7 +413,7 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             line.contains(
-                "of 8 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 6 not run"
+                "of 9 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 7 not run"
             ),
             "{line}"
         );
@@ -372,7 +425,7 @@ mod tests {
         let (line, code) = verdict(&warm_gap);
         assert_eq!(code, td_engine::exit::EXIT_UNPROVISIONED);
         assert!(
-            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 8 not run"),
+            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 9 not run"),
             "{line}"
         );
         // Every oracle from the memo, warm skipped: a pass that booted nothing,
@@ -439,6 +492,7 @@ mod tests {
     fn the_deferred_note_names_the_oracles_and_the_command() {
         let note = deferred_note();
         for name in [
+            VM_LIFECYCLE,
             "qemu-boot-system",
             "qemu-boot-audio",
             "qemu-boot-audio-hotplug",

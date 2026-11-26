@@ -1446,6 +1446,10 @@ Required evidence includes:
   private files. Guest requests cannot read arbitrary host paths, invoke host
   commands, modify another instance, or change the configured origin mapping.
 
+The three host tests that execute QEMU tools run in `td-builder check
+integration`. The branch preflight runs the remaining process, Git and
+manager tests without QEMU.
+
 Host lifecycle tests alone do not prove these guest behaviors. Keep the design
 and implementation status explicit until this evidence exists.
 

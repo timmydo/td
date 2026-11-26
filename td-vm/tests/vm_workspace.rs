@@ -3,15 +3,9 @@ use std::fs::{self, File};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use td_fs::TempDir;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const BIN: &str = env!("CARGO_BIN_EXE_td-vm");
-struct Root(PathBuf);
-impl Drop for Root {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 fn invoke(command: &mut Command, success: bool) -> Result<Output> {
     let output = command.stdin(Stdio::null()).output()?;
     assert_eq!(
@@ -33,14 +27,10 @@ fn identity(record: &str) -> Result<&str> {
 }
 
 #[test]
-fn process_workspace_snapshots_survive_defaults_retries_and_recreation() -> Result<()> {
-    let root = Root(std::env::temp_dir().join(format!(
-        "td-workspace-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    )));
-    fs::create_dir(&root.0)?;
-    let home = root.0.join("vms");
+#[ignore = "td-builder check integration supplies qemu-img"]
+fn qemu_integration_workspace_snapshots_survive_recreation() -> Result<()> {
+    let root = TempDir::new("td-workspace")?;
+    let home = root.join("vms");
     let vm = |args: &[&str], success| {
         invoke(
             Command::new(BIN).env("TD_VM_HOME", &home).args(args),
@@ -51,7 +41,7 @@ fn process_workspace_snapshots_survive_defaults_retries_and_recreation() -> Resu
     assert!(!home.exists());
     // Supply a tiny real qcow2 template. Firmware bytes are not executed here.
     vm(&["list"], true)?;
-    let input = root.0.join("profile");
+    let input = root.join("profile");
     fs::write(&input, profile("/srv/git/td.git"))?;
     fs::set_permissions(&input, fs::Permissions::from_mode(0o600))?;
     vm(

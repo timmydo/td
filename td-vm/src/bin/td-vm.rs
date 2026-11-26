@@ -2893,11 +2893,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs QEMU; only the host preflight runs ignored tests"]
-    fn real_qemu_two_overlays_lifecycle_and_supervisor_loss_exclusion() {
-        let scratch = Scratch::new();
-        let manager = Manager::new(&scratch.0.join("state")).unwrap();
-        let bundle = scratch.0.join("bundle");
+    #[ignore = "td-builder check integration supplies the QEMU tools"]
+    fn qemu_integration_two_overlays_lifecycle_and_supervisor_loss_exclusion() {
+        let scratch = td_fs::TempDir::new("vm").unwrap();
+        let manager = Manager::new(&scratch.join("state")).unwrap();
+        let bundle = scratch.join("bundle");
         private_dir(&bundle).unwrap();
         fs::write(bundle.join("bzImage"), b"fixture").unwrap();
         fs::write(bundle.join("selector-initramfs.cpio"), b"fixture").unwrap();
