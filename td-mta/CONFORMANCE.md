@@ -559,7 +559,7 @@ including after the reply moves to another folder; deleting that reply leaves
 the original thread member visible. This exercises Thread/get followed by
 Email/get through the client, not just stored thread IDs.
 
-This PostgreSQL fixture is part of the native gate. It does not qualify
+This PostgreSQL fixture is part of the required post-landing PostgreSQL integration step. It does not qualify
 cloud-provider failover or managed-database deployment.
 It also runs the query adapter fixture in a separate disposable database,
 including replica inventory continuation across deletion and date changes,

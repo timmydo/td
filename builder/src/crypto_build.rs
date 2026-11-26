@@ -74,8 +74,13 @@ pub(crate) fn release(root: &Path) -> Result<Release> {
 }
 
 fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release>> {
-    if !matches!(action, "test" | "clippy" | "build" | "perf") {
-        return Err("crypto-cargo accepts only test, clippy, build or perf".into());
+    let postgres = action == crate::integration::POSTGRES;
+    if !(matches!(action, "test" | "clippy" | "build" | "perf")
+        || postgres && manifest == "td-mta/Cargo.toml")
+    {
+        return Err(
+            "crypto-cargo accepts only test, clippy, build, perf or postgres-integration".into(),
+        );
     }
     let name = match manifest {
         "td-crypto/Cargo.toml" => "td-crypto",
@@ -116,9 +121,9 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         std::env::var("PATH").unwrap_or_default()
     );
     // Before any test runs, over the PATH the fixtures inherit.
-    if matches!(action, "test" | "perf") && name == "td-mta" {
-        let extra = if action == "test" { BACKUP_TOOLS } else { &[] };
-        if action == "test" {
+    if (postgres || action == "perf") && name == "td-mta" {
+        let extra = if postgres { BACKUP_TOOLS } else { &[] };
+        if postgres {
             // The native restore fixture clears Cargo's test library path.
             let layout = crate::install_mta::restore_layout::from_path(&path, None)?;
             path = td_engine::allocation::format(format_args!("{}:{path}", layout.bin.display()))
@@ -209,7 +214,14 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
         .stdout(Stdio::piped());
         return crate::native_tests::run_cases(cmd).map(|()| None);
     }
-    let mut cmd = command(if action == "perf" { "test" } else { action }, manifest);
+    let mut cmd = command(
+        if postgres || action == "perf" {
+            "test"
+        } else {
+            action
+        },
+        manifest,
+    );
     if action == "build" {
         std::fs::create_dir_all(&target_dir).map_err(|e| format!("release target: {e}"))?;
         let target = Path::new(&target_dir)
@@ -235,7 +247,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     let inbox_perf = action == "perf"
         && std::env::var_os("TD_MTA_PERF_INBOX_ONLY").as_deref() == Some(std::ffi::OsStr::new("1"));
     let mut live_fixture = None;
-    if name == "td-mta" && (action == "test" || inbox_perf) {
+    if name == "td-mta" && (action == "test" || postgres || inbox_perf) {
         std::fs::create_dir_all(&target_dir).map_err(|e| format!("crypto fixture target: {e}"))?;
         let target = Path::new(&target_dir)
             .canonicalize()
@@ -252,52 +264,53 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
                     &target,
                 )?,
             );
+        } else {
+            let mut build_mail = command("build", "td-mail/Cargo.toml");
+            if inbox_perf {
+                crate::check_loop::warm_mail_client_sources(root)?;
+                build_mail.arg("--release");
+            }
+            let mail = fixture_executable(
+                build_mail,
+                "td-mail",
+                crate::crypto_isolated::ArtifactKind::Installed,
+                &target,
+            )?;
+            let net_vendor = crate::host_bin::prepare_native_vendor(root)?;
+            let net_vendor = net_vendor
+                .to_str()
+                .ok_or("fetch fixture vendor path must be UTF-8")?;
+            let quoted = td_engine::json::Json::Str(net_vendor.into()).to_json_string();
+            let mut fetch = command("test", "net/Cargo.toml");
+            // Its vendor directory differs from the crypto graph's, so in the
+            // shared target directory the crates both graphs name, and rustls
+            // above them, would be rebuilt in place under another leg reading
+            // them.
+            let fetch_target = target
+                .to_str()
+                .ok_or("crypto fixture target must be UTF-8")?;
+            let fetch_target =
+                td_engine::allocation::format(format_args!("{fetch_target}/net-fixture"))
+                    .map_err(|_| String::new())?;
+            fetch.env("CARGO_TARGET_DIR", fetch_target);
+            if inbox_perf {
+                fetch.arg("--release");
+            }
+            fetch.args([
+                "--bin",
+                "td-net",
+                "--no-run",
+                "--config",
+                &format!("source.td-crypto-vendor.directory={quoted}"),
+            ]);
+            let fetch = fixture_executable(
+                fetch,
+                "td-net",
+                crate::crypto_isolated::ArtifactKind::BinaryTest,
+                &target,
+            )?;
+            live_fixture = Some((mail, fetch));
         }
-        let mut build_mail = command("build", "td-mail/Cargo.toml");
-        if inbox_perf {
-            crate::check_loop::warm_mail_client_sources(root)?;
-            build_mail.arg("--release");
-        }
-        let mail = fixture_executable(
-            build_mail,
-            "td-mail",
-            crate::crypto_isolated::ArtifactKind::Installed,
-            &target,
-        )?;
-        let net_vendor = crate::host_bin::prepare_native_vendor(root)?;
-        let net_vendor = net_vendor
-            .to_str()
-            .ok_or("fetch fixture vendor path must be UTF-8")?;
-        let quoted = td_engine::json::Json::Str(net_vendor.into()).to_json_string();
-        let mut fetch = command("test", "net/Cargo.toml");
-        // Its vendor directory differs from the crypto graph's, so in the
-        // shared target directory the crates both graphs name, and rustls
-        // above them, would be rebuilt in place under another leg reading
-        // them.
-        let fetch_target = target
-            .to_str()
-            .ok_or("crypto fixture target must be UTF-8")?;
-        let fetch_target =
-            td_engine::allocation::format(format_args!("{fetch_target}/net-fixture"))
-                .map_err(|_| String::new())?;
-        fetch.env("CARGO_TARGET_DIR", fetch_target);
-        if inbox_perf {
-            fetch.arg("--release");
-        }
-        fetch.args([
-            "--bin",
-            "td-net",
-            "--no-run",
-            "--config",
-            &format!("source.td-crypto-vendor.directory={quoted}"),
-        ]);
-        let fetch = fixture_executable(
-            fetch,
-            "td-net",
-            crate::crypto_isolated::ArtifactKind::BinaryTest,
-            &target,
-        )?;
-        live_fixture = Some((mail, fetch));
     }
     if action == "perf" {
         // On demand only: no gate selects it. Release, as td-mta M23 measures,
@@ -325,19 +338,35 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     if action == "clippy" {
         cmd.args(["--all-targets", "--", "-D", "warnings"]);
     }
-    let mut child = Child(cmd.spawn().map_err(|e| format!("crypto {action}: {e}"))?);
-    let status = child
-        .0
-        .wait()
-        .map_err(|e| format!("crypto {action} wait: {e}"))?;
-    if !status.success() {
-        return Err(format!("crypto {action} failed: {status}"));
+    if !postgres {
+        let mut child = Child(cmd.spawn().map_err(|e| format!("crypto {action}: {e}"))?);
+        let status = child
+            .0
+            .wait()
+            .map_err(|e| format!("crypto {action} wait: {e}"))?;
+        if !status.success() {
+            return Err(format!("crypto {action} failed: {status}"));
+        }
+        return Ok(None);
     }
-    if let Some((mail, fetch)) = live_fixture {
-        // One process per case: probes running concurrently in one process
-        // contend for td-mta's process-wide tickets (DEVELOPMENT.md, "Native
-        // mail fixtures").
-        for (selector, target, case) in [
+    let mut client = command("test", "td-postgres/Cargo.toml");
+    client
+        .env(crate::test_root::ENV, "private")
+        .args([
+            "--test",
+            "postgres",
+            "--",
+            "--ignored",
+            "--exact",
+            "real_postgres",
+        ])
+        .stdout(Stdio::piped());
+    crate::native_tests::run_cases(client)?;
+    let (mail, fetch) = live_fixture.ok_or("missing mail integration fixtures")?;
+    // One process per case: probes running concurrently in one process
+    // contend for td-mta's process-wide tickets (DEVELOPMENT.md, "Native
+    // mail fixtures").
+    for (selector, target, case) in [
             ("--test", "postgres_probe", "real_postgres_td_mail_reads_and_downloads"),
             ("--test", "postgres_probe", "real_postgres_td_mail_sends_plain_text"),
             ("--test", "postgres_probe", "real_postgres_executable_receives_and_serves_database_profiles"),
@@ -370,22 +399,21 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
             fixture.stdout(Stdio::piped());
             crate::native_tests::run_cases(fixture)?;
         }
-        let mut drill = command("test", "builder/Cargo.toml");
-        drill
-            .env("TD_TEST_TRUSTED_ROOT", "private")
-            .args([
-                "--release",
-                "--test",
-                "mail_restore_drill",
-                "--",
-                "--ignored",
-                "--exact",
-                "real_archive_round_trip",
-                "--nocapture",
-            ])
-            .stdout(Stdio::piped());
-        crate::native_tests::run_cases(drill)?;
-    }
+    let mut drill = command("test", "builder/Cargo.toml");
+    drill
+        .env("TD_TEST_TRUSTED_ROOT", "private")
+        .args([
+            "--release",
+            "--test",
+            "mail_restore_drill",
+            "--",
+            "--ignored",
+            "--exact",
+            "real_archive_round_trip",
+            "--nocapture",
+        ])
+        .stdout(Stdio::piped());
+    crate::native_tests::run_cases(drill)?;
     Ok(None)
 }
 
@@ -489,6 +517,17 @@ mod tests {
     #[test]
     fn on_demand_actions_take_their_manifests_and_unknown_actions_refuse() {
         let root = Path::new("/nonexistent-td-root");
+        let actions =
+            Some("crypto-cargo accepts only test, clippy, build, perf or postgres-integration");
+        assert_eq!(
+            run_inner(root, crate::integration::POSTGRES, "td-crypto/Cargo.toml")
+                .err()
+                .as_deref(),
+            actions
+        );
+        let mail = run_inner(root, crate::integration::POSTGRES, "td-mta/Cargo.toml").err();
+        assert!(mail.is_some());
+        assert_ne!(mail.as_deref(), actions);
         // td-crypto passes the perf gate and fails only at validation.
         let crypto = run_inner(root, "perf", "td-crypto/Cargo.toml").err();
         assert!(crypto.is_some());
@@ -506,7 +545,7 @@ mod tests {
             run_inner(root, "leakage", "td-crypto/Cargo.toml")
                 .err()
                 .as_deref(),
-            Some("crypto-cargo accepts only test, clippy, build or perf")
+            actions
         );
         assert_eq!(
             run_inner(root, "test", "td-primitives/Cargo.toml")
@@ -518,7 +557,7 @@ mod tests {
             run_inner(root, "bench", "td-mta/Cargo.toml")
                 .err()
                 .as_deref(),
-            Some("crypto-cargo accepts only test, clippy, build or perf")
+            actions
         );
     }
 

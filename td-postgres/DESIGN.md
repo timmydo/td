@@ -308,6 +308,6 @@ while a deferred trigger runs (unknown, and the server then commits) and
 one whose backend is terminated (unknown, FATAL `57P01`), LISTEN and
 NOTIFY, an ended idle session found by a poll, a query and a COMMIT
 written to a session the server already ended (its FATAL reported, the
-COMMIT unknown), and each result limit. The test is ignored in ordinary
-runs, since the sandbox gate has no PostgreSQL; the host preflight runs
-it through `test-args = "--include-ignored"`.
+COMMIT unknown), and each result limit. The required `postgres-integration` step of
+`td-builder check integration` runs this case. Branch `ready` runs the
+in-memory and Unix-listener tests without starting a database.

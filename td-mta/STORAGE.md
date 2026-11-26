@@ -79,7 +79,7 @@ mutex waiting, not an interruptible wait or a host-scheduler deadline guarantee.
 
 ## Qualification and operations
 
-The native gate runs real PostgreSQL fixtures with the checkout's td-mail
+Post-landing integration runs real PostgreSQL fixtures with the checkout's td-mail
 and fetch test executables, and a separate real serving-process fixture.
 Protocol-only tests use bounded memory sources or disposable response files.
 No embedded-database dependency or its allocation/backup probes remain.

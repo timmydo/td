@@ -1831,8 +1831,17 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
             ));
         }
         for index in 1..=count {
-            work.push((spec.to_string(), index));
+            if spec == crate::integration::POSTGRES_PACKAGE && index == 1 {
+                println!(
+                    ">> recipe-checks: {spec}#{index} runs in required post-landing integration"
+                );
+            } else {
+                work.push((spec.to_string(), index));
+            }
         }
+    }
+    if work.is_empty() && checks.trim() == crate::integration::POSTGRES_PACKAGE {
+        return Ok(());
     }
 
     // Longest first, by what each took when it last executed here: the gate

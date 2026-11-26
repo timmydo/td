@@ -1,8 +1,8 @@
 //! td-postgres against a real PostgreSQL 17 server, started the way
 //! td-mta's native fixtures start theirs: the first `initdb` on PATH and
 //! the `postgres` beside it, on a disposable cluster in an owned
-//! temporary directory. Ignored in ordinary runs; the host preflight
-//! runs it (`test-args = "--include-ignored"`).
+//! temporary directory. The required post-landing PostgreSQL integration step
+//! runs this case against the real server.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -219,7 +219,7 @@ fn code(error: Error) -> String {
 }
 
 #[test]
-#[ignore = "needs PostgreSQL 17 on PATH; the host preflight runs it"]
+#[ignore = "needs PostgreSQL 17 on PATH; postgres-integration runs it"]
 fn real_postgres() {
     let server = Server::start();
     authentication(&server);

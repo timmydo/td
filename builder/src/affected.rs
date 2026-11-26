@@ -3393,6 +3393,11 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 return fail(&e);
             }
             // The gates warm before calling; the on-demand harness warms itself.
+            if action == crate::integration::POSTGRES && manifest == "td-mta/Cargo.toml" {
+                if let Err(e) = crate::check_loop::warm_mail_client_sources(&root) {
+                    return fail(&e);
+                }
+            }
             if action == "perf" && manifest == "td-mta/Cargo.toml" {
                 if let Err(e) = crate::check_loop::warm_mail_sources(&root) {
                     return fail(&e);
@@ -3539,6 +3544,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
         _ => {
             eprintln!("usage: td-builder gate-crates locks|allocations|allocation-inventory");
             eprintln!("       td-builder gate-crates cargo-cmds");
+            eprintln!("       td-builder gate-crates crypto-cargo postgres-integration --manifest-path td-mta/Cargo.toml");
             eprintln!("       td-builder gate-crates fmt --all [--write]");
             eprintln!("       td-builder gate-crates names");
             eprintln!("       td-builder gate-crates crypto-cargo test|clippy|build --manifest-path CRATE/Cargo.toml");
@@ -4360,10 +4366,8 @@ fn elf_loaded_digest(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
     Some(h.finalize().to_vec())
 }
 
-/// Host tools a preflight takes from PATH: PostgreSQL's `initdb`, which the
-/// native mail leg and td-postgres's real-server test require, and `dav1d`,
-/// whose decode oracles td-photo's tests run only when one is there.
-const PREFLIGHT_PATH_TOOLS: &[&str] = &["initdb", "dav1d"];
+/// td-photo runs its decode oracles when dav1d is present on PATH.
+const PREFLIGHT_PATH_TOOLS: &[&str] = &["dav1d"];
 
 /// What selects and configures the toolchain a cargo preflight runs, which
 /// the tree does not pin: the variables cargo and rustc read for it, every
@@ -6856,15 +6860,7 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
                 .iter()
                 .any(|cmd| cmd.contains(" gate-crates crypto-cargo "))
             {
-                let native_mail = cmds.iter().any(|cmd| {
-                    cmd.contains(" gate-crates crypto-cargo test --manifest-path td-mta/Cargo.toml")
-                });
-                let prepared = if native_mail {
-                    crate::check_loop::warm_mail_client_sources(root)
-                } else {
-                    crate::check_loop::warm_mail_sources(root)
-                };
-                if let Err(e) = prepared {
+                if let Err(e) = crate::check_loop::warm_mail_sources(root) {
                     eprintln!("affected-checks: {e}");
                     return 1;
                 }

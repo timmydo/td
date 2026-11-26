@@ -1261,5 +1261,5 @@ The mail artifact includes td's own synchronous PostgreSQL client,
 `td-postgres`. Removed embedded-database allocation, RSS, worker-stack and backup
 scenarios are not qualification of PostgreSQL. Existing crypto, TLS, MIME,
 configuration and operator-CLI portable checks retain their stated scope.
-The native gate separately requires real PostgreSQL client and service
+Post-landing integration requires real PostgreSQL client and service
 fixtures; see DEVELOPMENT.md and td-mta/CONFORMANCE.md.

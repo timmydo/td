@@ -47,7 +47,7 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
         "td-json" => "31684b6cb14691bd585ec01f6711c55d34917ec6e3c26ce67126b7874f7a0cf1",
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
         "td-mime" => "3f14e32d7ee4f4b11e57845153df490fc4d0480f282477ecebf2349d5347b1d4",
-        "td-postgres" => "e3240524fbf9819bb8bedac949d890a7239839c9e813afdc6028947187d4f5db",
+        "td-postgres" => "8a328fc8505ddebeda0abca7654013cf3e40228117d91c2abd919333a0a5d0dd",
         "td-primitives" => "056b2c47072b8e101730f86e33fbe79a00917aaa91a12aa17a7a801070bd4b85",
         "td-source-scan" => "a380afb246633ec088b69078cd005c4d86fbccc442fac738bce8aa2519abd3c1",
         "td-tls-provider" => "b6c4742d6c92c053f6d1595dbb29ff11a8396775e23e30e0317bb6ee72f10298",

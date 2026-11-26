@@ -178,9 +178,8 @@ versions, every `CARGO_*` and `RUST*` variable but those that set only
 parallelism or output and those `cargo run` sets for the td-builder it
 starts, `TD_RUST_HOME`, `TD_CC_HOME` and the memory cap, every cargo
 config that exists above the repository or in `CARGO_HOME`, the test
-runner's and this td-builder's loaded segments, and which `initdb` (the
-PostgreSQL of the native mail leg and td-postgres) and `dav1d` (td-photo's
-decode oracles) are first on `PATH` with what their `--version` prints,
+runner's and this td-builder's loaded segments, and which `dav1d` (for
+td-photo's decode oracles) is first on `PATH` with its `--version` output,
 or that there is none. Two worktrees' builds of the same sources
 differ only in local symbol names, which the loader never reads, so
 they share passes; builders built from different sources do not.
@@ -637,10 +636,12 @@ as above) and that crate's reader closure. Today that crate is td-vm,
 whose boot-profile test includes evaluator checks. Recipe-checks still
 treats an evaluator path as a miss and lists every check.
 
-The system-level qemu oracles are a separate tier, `td-builder check
+The PostgreSQL and system-level QEMU oracles share the post-landing tier, `td-builder check
 integration`, which `check` alone does not include. It runs on the host,
-never in the gate sandbox: it warms the system image's inputs and
-exports the declared Flathub refs into the host's feed (`warm
+never in the gate sandbox. Each run checks the native PostgreSQL suite and
+`postgresql-x86-64-test#1`, the recipe-built server's cluster. The package
+step warms its declared closure and bypasses its recipe verdict memo. The tier then warms the system
+image's inputs and exports the declared Flathub refs into the host's feed (`warm
 --flathub`, APPLICATIONS.md §W.9), which the oracles' guests fetch
 Firefox and its runtime from, then runs the disposable td-vm QEMU lifecycle,
 workspace and enrollment cases (`qemu-vm-lifecycle`), followed by
@@ -1282,12 +1283,15 @@ directory behind.
 
 ## Native mail fixtures
 
-The td-mta native crypto-cargo test leg also builds the checkout's td-mail
-binary and td-net unit-test executable offline. Native source preparation
+Branch `ready` runs the database-independent td-postgres and td-mta
+suites, including the native TLS peer. Main's required `postgres-integration`
+step runs the td-postgres real-server test, the mail fixtures and the restore
+drill. It builds the checkout's td-mail binary and td-net unit-test executable
+offline. Native source preparation
 warms both locked external closures; each build verifies its archived inputs.
 Cargo artifact records identify the helper executables inside the selected
 target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
-them. After ordinary tests, the wrapper runs the exact ignored PostgreSQL
+them. The integration wrapper runs the exact ignored PostgreSQL
 read, plain-text send, foreground-service, schema-bounds, uploads,
 email-views, SMTP-owner, deployment WAL replay, service-login
 provisioning, socket writer fence and PostgreSQL minor-release check
@@ -1305,14 +1309,13 @@ include hashing and TLS; an unoptimized full-size body hash can exhaust a
 deadline before database work starts. Ordinary unit and documentation tests
 retain the test profile. This does not change target compiler flags or relax
 an operation deadline.
-Host preparation must put PostgreSQL 17 on `PATH`; td-postgres's
-real-server test, which its preflight runs through `--include-ignored`,
-starts its cluster from the same first `initdb`, with `postgres` and
-`pg_ctl` beside it. The native tests
+The integration host needs System V shared memory and PostgreSQL 17 on
+`PATH`. The td-postgres real-server test starts its cluster from the first
+`initdb`, with `postgres` and `pg_ctl` beside it. The native tests
 resolve the first `initdb` to its package directory, which must also hold `postgres`,
 `pg_ctl`, `psql`, `pg_dump`, `pg_restore`, `pg_receivewal`, `pg_basebackup`
 and `pg_verifybackup`, and `postgres --version` must report release 17.
-The native test preflight also checks that the first `initdb` resolves
+The integration step also checks that the first `initdb` resolves
 to a supported restore-drill package and that its companion tools can run.
 Use a Guix PostgreSQL 17 profile or store package, Debian's
 `/usr/lib/postgresql/17`, the extracted deployment's

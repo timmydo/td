@@ -1022,7 +1022,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     }
     let disabled = std::env::var("TD_CHECK_DISABLE").unwrap_or_default();
     if !listing_only && crate::gates::goals_include(&goals, "cargo-test", &disabled)? {
-        if let Err(e) = warm_mail_client_sources(&root) {
+        if let Err(e) = warm_mail_sources(&root) {
             eprintln!("td-builder check: native mail source preparation: {e}; the cargo gate enforces presence when provisioned");
         }
     }
