@@ -2179,9 +2179,8 @@ mod tests {
 
     /// A work tree on `main` with one branch published to `origin`, present
     /// locally only as a remote-tracking ref.
-    fn repo(tag: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("td-review-app-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn repo(tag: &str) -> (td_fs::TempDir, PathBuf) {
+        let root = td_fs::TempDir::new(&format!("td-review-app-{tag}")).unwrap();
         let origin = root.join("origin.git");
         let work = root.join("work");
         std::fs::create_dir_all(&work).unwrap();
@@ -2190,6 +2189,11 @@ mod tests {
             &["init", "--bare", "-b", "main", &origin.to_string_lossy()],
         );
         git_in(&root, &["init", "-b", "main", &work.to_string_lossy()]);
+        git_in(&work, &["config", "user.name", "Integrator"]);
+        git_in(
+            &work,
+            &["config", "user.email", "integrator@example.invalid"],
+        );
         std::fs::write(work.join("f"), "one\n").unwrap();
         git_in(&work, &["add", "f"]);
         git_in(&work, &["commit", "-m", "base"]);
@@ -2417,6 +2421,16 @@ mod tests {
             ),
         ] {
             let (root, work) = repo(tag);
+            // Squashing two commits changes the parent even if both identities
+            // and timestamps happen to match the original authorship.
+            git_in(&work, &["checkout", "--detach", "origin/work-0001-feature"]);
+            std::fs::write(work.join("f"), "three\n").unwrap();
+            git_in(&work, &["commit", "-am", "feature: another step"]);
+            git_in(
+                &work,
+                &["push", "origin", "HEAD:refs/heads/work-0001-feature"],
+            );
+            git_in(&work, &["checkout", "main"]);
             let tip = git_in(
                 &work,
                 &["rev-parse", "refs/remotes/origin/work-0001-feature"],
