@@ -68,7 +68,7 @@ fn test_command(
     root: &Path,
     manifest: &str,
     binary: &Path,
-    trusted: bool,
+    trusted: Option<&str>,
     fixture: Option<(&str, &Path, Option<&str>)>,
 ) -> Result<Command> {
     let tool = binary
@@ -89,8 +89,13 @@ fn test_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    if trusted {
-        cmd.args(["--config", "env.TD_TEST_TRUSTED_ROOT.value=\"1\""])
+    if let Some(mode) = trusted {
+        let value = if mode == "shell" {
+            "env.TD_TEST_TRUSTED_ROOT.value=\"shell\""
+        } else {
+            "env.TD_TEST_TRUSTED_ROOT.value=\"1\""
+        };
+        cmd.args(["--config", value])
             .args(["--config", "env.TD_TEST_TRUSTED_ROOT.force=true"]);
     }
     if let Some((feature, target, unit)) = fixture {
@@ -212,7 +217,7 @@ fn unit_target(root: &Path, manifest: &str) -> &'static str {
 pub(crate) fn run(
     root: &Path,
     manifest: &str,
-    trusted: bool,
+    trusted: Option<&str>,
     fixture_feature: Option<&str>,
 ) -> Result<()> {
     let root = root
@@ -294,7 +299,7 @@ mod tests {
                 Path::new("/repo"),
                 "td-editor/Cargo.toml",
                 Path::new("/repo/tool"),
-                true,
+                Some("shell"),
                 Some(("test-file-barrier", Path::new("/repo/private"), unit)),
             )
             .unwrap();
@@ -316,6 +321,7 @@ mod tests {
                 unit.is_none()
             );
             assert_eq!(args.contains(&"--test-threads=8"), unit.is_none());
+            assert!(args.contains(&"env.TD_TEST_TRUSTED_ROOT.value=\"shell\""));
             assert!(args.contains(&"env.TD_TEST_TRUSTED_ROOT.force=true"));
             assert!(fixture
                 .get_envs()
@@ -328,7 +334,7 @@ mod tests {
             Path::new("/repo"),
             "td-editor/Cargo.toml",
             Path::new("/repo/tool"),
-            true,
+            Some("1"),
             None,
         )
         .unwrap();
@@ -360,7 +366,7 @@ mod tests {
             Path::new("/repo"),
             "td-x/Cargo.toml",
             Path::new("/repo/tool"),
-            false,
+            None,
             None,
         )
         .unwrap();

@@ -42,7 +42,7 @@
 //! why the shells legitimately differ, so resolution keys on the shell list.
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -1204,7 +1204,7 @@ pub enum Disposition {
 /// byte-for-byte pristine — the overlay is td-sh's view, not an edit to upstream.
 #[derive(Clone, Debug, Default)]
 pub struct Expectations {
-    xfail: BTreeSet<String>,
+    xfail: BTreeMap<String, bool>,
     skip: BTreeSet<String>,
 }
 
@@ -1238,14 +1238,36 @@ pub fn case_keys(file: &str, cases: &[SpecCase]) -> Vec<String> {
     keys
 }
 
+/// Every comma-separated group needs one executable at its named location.
+pub fn missing_utilities(tools: &str) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut missing = false;
+    for group in tools.split(',') {
+        let mut found = false;
+        for path in group.split('|') {
+            let name = path
+                .strip_prefix("/bin/")
+                .or_else(|| path.strip_prefix("/usr/bin/"))?;
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                return None;
+            }
+            found |= Path::new(path)
+                .metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        }
+        missing |= !found;
+    }
+    Some(missing)
+}
+
 impl Expectations {
     /// Parse the overlay. Each non-blank, non-`#` line is
-    /// `<xfail|skip> <file>::<case description>`; the key runs to end-of-line so a
+    /// `<xfail|skip|xfail-without=TOOLS> <file>::<case description>`; the key runs to end-of-line so a
     /// description may contain spaces. Duplicate or contradictory entries, an
     /// unknown disposition, or a key without `::` are hard errors — a sloppy
     /// manifest must not silently mis-tolerate a case.
     pub fn parse(text: &str) -> Result<Self, SpecError> {
-        let mut xfail = BTreeSet::new();
+        let mut xfail = BTreeMap::new();
         let mut skip = BTreeSet::new();
         for (idx, raw) in text.lines().enumerate() {
             let line = raw.trim();
@@ -1263,21 +1285,24 @@ impl Expectations {
                     "expectation key must be `<file>::<case>`",
                 ));
             }
-            let inserted = match disp {
-                "xfail" => xfail.insert(key.to_string()),
-                "skip" => skip.insert(key.to_string()),
-                other => {
-                    return Err(SpecError::new(
-                        ln,
-                        format!("unknown disposition {other:?} (want xfail|skip)"),
-                    ));
-                }
+            let inserted = if disp == "skip" {
+                skip.insert(key.to_string())
+            } else {
+                let expected_failure = if disp == "xfail" {
+                    true
+                } else if let Some(tools) = disp.strip_prefix("xfail-without=") {
+                    missing_utilities(tools)
+                        .ok_or_else(|| SpecError::new(ln, "invalid required utility"))?
+                } else {
+                    return Err(SpecError::new(ln, format!("unknown disposition {disp:?}")));
+                };
+                xfail.insert(key.to_string(), expected_failure).is_none()
             };
             if !inserted {
                 return Err(SpecError::new(ln, format!("duplicate expectation {key:?}")));
             }
         }
-        if let Some(k) = xfail.intersection(&skip).next() {
+        if let Some(k) = skip.iter().find(|key| xfail.contains_key(*key)) {
             return Err(SpecError::new(
                 0,
                 format!("{k:?} listed as both xfail and skip"),
@@ -1287,7 +1312,7 @@ impl Expectations {
     }
 
     fn is_xfail(&self, key: &str) -> bool {
-        self.xfail.contains(key)
+        self.xfail.get(key).copied().unwrap_or(false)
     }
 
     fn is_skip(&self, key: &str) -> bool {
@@ -1296,7 +1321,7 @@ impl Expectations {
 
     /// All listed keys (xfail then skip), for stale-entry detection.
     fn keys(&self) -> impl Iterator<Item = &String> {
-        self.xfail.iter().chain(self.skip.iter())
+        self.xfail.keys().chain(self.skip.iter())
     }
 }
 
@@ -1345,6 +1370,7 @@ pub fn summarize(outcomes: &[ClassifiedOutcome]) -> Summary {
 /// Classify one already-run outcome against the overlay for a given key.
 fn classify(key: String, outcome: &CaseOutcome, exp: &Expectations) -> ClassifiedOutcome {
     let disposition = match (outcome.passed, exp.is_xfail(&key)) {
+        _ if outcome.timed_out || outcome.truncated => Disposition::Fail,
         (true, false) => Disposition::Pass,
         (false, true) => Disposition::XFail,
         (true, true) => Disposition::XPass,
@@ -2194,6 +2220,27 @@ dash-says
         assert!(exp.is_skip("loop.test.sh::reads from stdin forever"));
         assert!(!exp.is_xfail("loop.test.sh::reads from stdin forever"));
         Ok(())
+    }
+
+    #[test]
+    fn utility_expectations_remain_graded_and_detect_duplicates() {
+        let exp = Expectations::parse("xfail-without=/bin/sh case::present\nxfail-without=/bin/td-no-such-fixture case::missing").unwrap();
+        assert!(!exp.is_xfail("case::present"));
+        assert!(exp.is_xfail("case::missing"));
+        for (timed_out, truncated) in [(true, false), (false, true)] {
+            let result = CaseOutcome {
+                timed_out,
+                truncated,
+                ..outcome(false)
+            };
+            assert_eq!(
+                classify("case::missing".into(), &result, &exp).disposition,
+                Disposition::Fail
+            );
+        }
+        assert_eq!(exp.keys().count(), 2);
+        assert!(Expectations::parse("xfail-without=/bin/sh case::test\nskip case::test").is_err());
+        assert!(Expectations::parse("xfail-without= case::bad").is_err());
     }
 
     #[test]

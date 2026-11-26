@@ -3903,20 +3903,8 @@ fn a_stages_trap_reaches_its_own_children_only() -> Result<(), Box<dyn std::erro
 #[test]
 fn an_interrupt_is_not_confined_to_a_clone() -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
-    // POSIX puts a shell at this path and `kill` is one of its builtins. If the
-    // host's cannot produce a signal-killed child there is nothing to observe,
-    // and a green test would be saying otherwise.
-    let probe = std::process::Command::new("/bin/sh")
-        .args(["-c", "kill -INT $$"])
-        .output();
-    assert!(
-        matches!(&probe, Ok(o) if o.status.code().is_none()),
-        "/bin/sh -c 'kill -INT $$' did not die of a signal ({probe:?}) - this test needs \
-         a child it can have killed, and has none. On a td image that is expected rather \
-         than a broken host: `/bin/sh` is td-sh, whose interrupt guard swallows a SIGINT \
-         a child sends to the shell itself."
-    );
-    let dies = r#"/bin/sh -c 'kill -INT $$'"#;
+
+    let dies = interrupt_command()?;
     for boundary in [
         format!("{dies}; echo AFTER"),
         format!("x=$({dies}); echo AFTER"),
@@ -3983,12 +3971,12 @@ fn an_interrupt_is_not_confined_to_a_clone() -> Result<(), Box<dyn std::error::E
     let out = std::process::Command::new(&shell)
         .args([
             "-c",
-            "trap '' INT; /bin/sh -c 'trap - INT; kill -INT $$'; echo AFTER",
+            &format!("trap '' INT; env --default-signal=INT {dies}; echo status=$?; echo AFTER"),
         ])
         .output()?;
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "AFTER\n",
+        "status=130\nAFTER\n",
         "a child's death by SIGINT ended a shell that had asked to be uninterruptible"
     );
     assert_eq!(out.status.code(), Some(0));
@@ -4227,15 +4215,11 @@ fn an_unstarted_stage_is_not_negatable() -> Result<(), Box<dyn std::error::Error
     let ten = ": | : | : | : | : | : | : | : | : | :";
     let mut exercised = false;
     for program in [ten.to_string(), format!("! {ten}")] {
-        let out = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                &format!(
-                    "ulimit -u 40 2>/dev/null; exec {} -c {}",
-                    shell.display(),
-                    shell_quote(&program)
-                ),
-            ])
+        let out = std::process::Command::new("prlimit")
+            .args(["--nproc=40", "--"])
+            .arg(&shell)
+            .arg("-c")
+            .arg(&program)
             .output()?;
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
         if !err.contains("pipeline stage did not start") {
@@ -4267,7 +4251,7 @@ fn an_unstarted_stage_is_not_negatable() -> Result<(), Box<dyn std::error::Error
 /// producer. A pipe is a fixed kernel buffer, so the first is bounded and the
 /// second ends when `head` closes its end.
 ///
-/// Bounded with `ulimit -v`, so a regression is a FAILURE rather than a machine
+/// Bounded with `RLIMIT_AS`, so a regression is a FAILURE rather than a machine
 /// that stops responding — the whole point is that unbounded growth is gone, and
 /// a test that proves it by exhausting memory would be the bug it is testing for.
 #[test]
@@ -4283,23 +4267,11 @@ fn a_pipeline_streams_rather_than_buffering_its_producer() -> Result<(), Box<dyn
         // EPIPE and that has to end the stage, or the loop spins forever.
         ("while :; do echo x; done | head -n 1", "x\n"),
     ] {
-        let out = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                // 256 MiB is far under what buffering `/dev/zero` needs and far
-                // over what streaming needs.
-                // `timeout` as well as `ulimit`: the memory shapes regress into
-                // an abort, but the EPIPE one regresses into a SPIN at constant
-                // memory, which no limit catches. Without this the test wedges
-                // the gate instead of failing it — the same "a regression is a
-                // failure, not a machine that stops responding" the limit is
-                // for.
-                &format!(
-                    "ulimit -v 262144; exec timeout 20 {} -c {}",
-                    shell.display(),
-                    shell_quote(program)
-                ),
-            ])
+        let out = std::process::Command::new("prlimit")
+            .args(["--as=268435456", "--", "timeout", "20"])
+            .arg(&shell)
+            .arg("-c")
+            .arg(program)
             .output()?;
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
@@ -4750,6 +4722,29 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+fn interrupt_command() -> Result<String, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+    let path = std::env::var_os("PATH").ok_or("no host PATH")?;
+    let kill = std::env::split_paths(&path)
+        .map(|dir| dir.join("kill"))
+        .find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .ok_or("no external kill on PATH")?;
+    let kill = std::path::absolute(kill)?;
+    let body = format!(
+        "exec {} -INT $$",
+        shell_quote(kill.to_str().ok_or("non-UTF-8 kill path")?)
+    );
+    let probe = std::process::Command::new("/bin/sh")
+        .args(["-c", &body])
+        .output()?;
+    assert_eq!(probe.status.signal(), Some(2), "fixture must die of SIGINT");
+    Ok(format!("/bin/sh -c {}", shell_quote(&body)))
+}
+
 /// A profile INTERRUPTED falls where a fatal error in one falls, and by the same
 /// rule: ash's top-level handler exits a non-interactive login and recovers an
 /// interactive one. bash is the other way — it abandons the rest of the profile
@@ -4759,17 +4754,11 @@ fn shell_quote(s: &str) -> String {
 /// left `$?` untouched besides.
 #[test]
 fn an_interrupted_profile_ends_a_non_interactive_login() -> Result<(), Box<dyn std::error::Error>> {
-    let probe = std::process::Command::new("/bin/sh")
-        .args(["-c", "kill -INT $$"])
-        .output();
-    assert!(
-        matches!(&probe, Ok(o) if o.status.code().is_none()),
-        "/bin/sh -c 'kill -INT $$' did not die of a signal - this test cannot run"
-    );
-    let home = profile_home("profile-interrupt")?;
+    let dies = interrupt_command()?;
+    let home = td_fs::TempDir::new("profile-interrupt")?;
     std::fs::write(
         home.join(".profile"),
-        "/bin/sh -c 'kill -INT $$'\necho REST_OF_PROFILE\n",
+        format!("{dies}\necho REST_OF_PROFILE\n"),
     )?;
 
     // Non-interactive: the login ends at 130 and the command never runs.
@@ -4791,7 +4780,6 @@ fn an_interrupted_profile_ends_a_non_interactive_login() -> Result<(), Box<dyn s
     );
     assert_eq!(code, Some(0));
 
-    let _ = std::fs::remove_dir_all(&home);
     Ok(())
 }
 
@@ -5229,12 +5217,12 @@ fn exec_reads_large_here_documents_to_the_end() -> Result<(), Box<dyn std::error
 #[test]
 fn numbered_redirections_respect_the_descriptor_limit() -> Result<(), Box<dyn std::error::Error>> {
     let sh = env!("CARGO_BIN_EXE_td-sh");
-    let out = std::process::Command::new("/bin/sh")
+    let out = std::process::Command::new("prlimit")
         .args([
-            "-c",
-            r#"ulimit -n 12 && exec "$1" -ec "$2""#,
-            "limit",
+            "--nofile=12",
+            "--",
             sh,
+            "-ec",
             r#"exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- 10>&- 11>&-; /bin/sh -c 'echo ok'"#,
         ])
         .output()?;
@@ -5244,22 +5232,29 @@ fn numbered_redirections_respect_the_descriptor_limit() -> Result<(), Box<dyn st
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    for (setup, command) in [
-        ("ulimit -n 6", r#"exec 3>&1 4>&1; /bin/sh -c 'echo ok >&4'"#),
+    for (setup, limit, command) in [
         (
-            "exec 3>/dev/null 4>&3 5>&3 6>&3 7>&3; ulimit -n 10",
+            ":",
+            "--nofile=6",
+            r#"exec 3>&1 4>&1; /bin/sh -c 'echo ok >&4'"#,
+        ),
+        (
+            "exec 3>/dev/null 4>&3 5>&3 6>&3 7>&3",
+            "--nofile=10",
             r#"exec 9>&3; /bin/sh -c 'echo ok >&9'"#,
         ),
         (
-            "exec 9>/dev/null; ulimit -n 8",
+            "exec 9>/dev/null",
+            "--nofile=8",
             r#"/bin/sh -c 'echo ok >&9'"#,
         ),
     ] {
         let inherited = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
-                &format!(r#"{setup}; exec "$1" -c "$2""#),
+                &format!(r#"{setup}; exec prlimit "$1" -- "$2" -c "$3""#),
                 "limit",
+                limit,
                 sh,
                 command,
             ])

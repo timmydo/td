@@ -130,13 +130,18 @@ pub fn effective_limits(want_bytes: u64, ambient: (u64, u64)) -> (u64, u64) {
     (soft, hard)
 }
 
+fn shell_corpus_generator(program: &Path, package: Option<&str>) -> bool {
+    package == Some("td-sh") && program.ends_with("examples/gen_expectations")
+}
+
 pub fn main(args: &[String]) -> ExitCode {
     let Some((program, rest)) = args.split_first() else {
         eprintln!("td-builder run-capped: usage: run-capped <binary> [args...]");
         return ExitCode::FAILURE;
     };
 
-    if is_test_artifact(program) {
+    let test = is_test_artifact(program);
+    if test {
         let package = std::env::var("CARGO_PKG_NAME").ok();
         let override_value = std::env::var(OVERRIDE_ENV).ok();
         let mib = match ceiling_mib(package.as_deref(), override_value.as_deref()) {
@@ -168,7 +173,16 @@ pub fn main(args: &[String]) -> ExitCode {
         if override_value.is_some() {
             eprintln!("td-builder run-capped: {OVERRIDE_ENV} in effect — ceiling {mib} MiB");
         }
-        let trusted = crate::test_root::enabled(std::env::var_os(crate::test_root::ENV).as_deref());
+    }
+    let mode = std::env::var_os(crate::test_root::ENV);
+    // The corpus generator is a Cargo example and needs the same login environment.
+    let generator = mode.as_deref() == Some("shell".as_ref())
+        && shell_corpus_generator(
+            Path::new(program),
+            std::env::var("CARGO_PKG_NAME").ok().as_deref(),
+        );
+    if test || generator {
+        let trusted = crate::test_root::enabled(mode.as_deref());
         match trusted {
             Ok(false) => {}
             Ok(true) => {
@@ -219,6 +233,17 @@ mod tests {
         ] {
             assert!(!is_test_artifact(path), "{path} is not a test artifact");
         }
+    }
+
+    #[test]
+    fn only_the_shell_corpus_generator_gets_the_login_fixture() {
+        let path = Path::new("target/release/examples/gen_expectations");
+        assert!(shell_corpus_generator(path, Some("td-sh")));
+        assert!(!shell_corpus_generator(path, Some("td-demo")));
+        assert!(!shell_corpus_generator(
+            Path::new("target/debug/examples/demo"),
+            Some("td-sh")
+        ));
     }
 
     #[test]

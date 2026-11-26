@@ -10,11 +10,14 @@
 # gate as an XPASS so it is promoted (removed here). Regenerate (do not hand-edit)
 # on a pin bump or when passes change:
 #   cargo build --release --manifest-path td-sh/Cargo.toml
-#   cargo run --release --manifest-path td-sh/Cargo.toml --example gen_expectations \
+#   TD_TEST_TRUSTED_ROOT=shell cargo run --release --manifest-path td-sh/Cargo.toml --example gen_expectations \
 #     -- td-sh/target/release/td-sh td-sh/target/release/spec_helpers td-sh/spec \
 #     > td-sh/spec/expectations.txt
 #
-# Format, one per line:   <xfail|skip> <spec-file>::<case description>
+# Format, one per line:   <xfail|skip|xfail-without=TOOLS> <spec-file>::<case description>
+#   xfail-without = require a pass when every named executable exists, otherwise
+#                   expect failure. A comma requires each group. Within a group
+#                   a pipe separates alternative absolute paths for one utility.
 #   xfail = td-sh runs it and gets the wrong answer today. It still RUNS every
 #           gate; the failure is tolerated, a regression (an unlisted case that
 #           fails) reds the gate, and an unexpected PASS (XPASS) reds it so the
@@ -523,10 +526,10 @@ xfail builtin-kill.test.sh::kill -n 9 specifies the signal number
 xfail builtin-kill.test.sh::kill -s TERM specifies the signal name
 xfail builtin-kill.test.sh::kill multiple pids at once
 xfail builtin-kill.test.sh::kill pid and job at once
-xfail builtin-meta.test.sh::command -p (find hidden tool in default path)
-xfail builtin-meta.test.sh::command -p (override existing program)
+xfail-without=/bin/ls|/usr/bin/ls builtin-meta.test.sh::command -p (find hidden tool in default path)
+xfail-without=/bin/tr|/usr/bin/tr builtin-meta.test.sh::command -p (override existing program)
 xfail builtin-meta.test.sh::command -v executable, builtin
-xfail builtin-misc.test.sh::Print shell strings with weird chars: set and printf %q and ${x@Q}
+xfail-without=/bin/echo builtin-misc.test.sh::Print shell strings with weird chars: set and printf %q and ${x@Q}
 xfail builtin-misc.test.sh::Shifting too far
 xfail builtin-misc.test.sh::time pipeline
 xfail builtin-printf.test.sh::Invalid UTF-8
@@ -644,7 +647,7 @@ xfail command-sub.test.sh::Double Quotes in Command Sub in Double Quotes
 xfail command-sub.test.sh::Here doc with pipeline
 xfail command-sub.test.sh::More levels of double quotes in backticks
 xfail command-sub.test.sh::Nested backticks
-xfail command_.test.sh::Command block
+xfail-without=/bin/which,/bin/ls command_.test.sh::Command block
 xfail command_.test.sh::Name too long
 xfail command_.test.sh::filling $PATH cache, then deleting command
 xfail command_.test.sh::filling $PATH cache, then insert the same command earlier in cache
@@ -678,7 +681,7 @@ xfail errexit-osh.test.sh::global assignment with command sub: middle command fa
 xfail errexit-osh.test.sh::local and inherit_errexit / command_sub_errexit
 xfail errexit-osh.test.sh::local: middle command fails and keeps going
 xfail errexit-osh.test.sh::strict_errexit prevents errexit from being disabled in function
-xfail errexit.test.sh::More && ||
+xfail-without=/bin/false errexit.test.sh::More && ||
 xfail errexit.test.sh::errexit and time { }
 xfail exit-status.test.sh::Truncating 'return' status
 xfail exit-status.test.sh::func subshell OverflowError https://github.com/oilshell/oil/issues/996

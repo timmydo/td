@@ -1163,6 +1163,12 @@ those scheduling endpoints to its child editor.
 
 ## Trusted filesystem roots for permission tests
 
+The shell conformance crate selects `trusted-test-root = "shell"`.
+Its private root exposes the host entries in `/etc` except the login
+profile, so the shell under test can read its disposable user profile
+without executing the installed system greeter. Host process tests
+use util-linux `prlimit` and `flock`, `timeout`, `yes`, and an external `kill`.
+
 A standalone `td-*` roster crate may declare `trusted-test-root = true` in its
 `[package.metadata.td-gate]`. Both derived cargo-test command lists force
 `TD_TEST_TRUSTED_ROOT=1` for that invocation; Clippy, other crates and ordinary

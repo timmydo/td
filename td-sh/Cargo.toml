@@ -5,6 +5,9 @@ edition = "2021"
 description = "td's target-built POSIX /bin/sh (busybox-sh replacement): interpreter + Oils-spec conformance harness"
 license = "MIT"
 
+[package.metadata.td-gate]
+trusted-test-root = "shell"
+
 # The SHIPPED shell is the `td-sh` bin (src/main.rs), compiled directly by rustc
 # from recipes/src/recipes/td-sh.rs (never `cargo build`) into a static ET_EXEC.
 [[bin]]

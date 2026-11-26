@@ -13,9 +13,9 @@ pub const ENV: &str = "TD_TEST_TRUSTED_ROOT";
 pub fn enabled(value: Option<&std::ffi::OsStr>) -> io::Result<bool> {
     match value {
         None => Ok(false),
-        Some(value) if value == "1" || value == "private" => Ok(true),
+        Some(value) if value == "1" || value == "private" || value == "shell" => Ok(true),
         Some(_) => Err(io::Error::other(
-            "TD_TEST_TRUSTED_ROOT must be absent or 1 or private",
+            "TD_TEST_TRUSTED_ROOT must be absent or 1, private, or shell",
         )),
     }
 }
@@ -113,20 +113,32 @@ fn temporary_source_root(cwd: &Path) -> io::Result<PathBuf> {
     Ok(cwd.to_owned())
 }
 
-fn bindings(cwd: &Path, programs: &[PathBuf], temporary: &Path) -> io::Result<Vec<Bind>> {
+fn bindings(
+    cwd: &Path,
+    programs: &[PathBuf],
+    temporary: &Path,
+    shell: bool,
+) -> io::Result<Vec<Bind>> {
     if cwd == Path::new("/tmp") {
         return Err(io::Error::other(
             "trusted test root requires a working directory other than /tmp",
         ));
     }
     let mut paths = Vec::new();
-    for entry in fs::read_dir("/")? {
-        let path = entry?.path();
-        // host_shell supplies private procfs, minimal /dev and scratch /tmp.
-        if !matches!(path.to_str(), Some("/proc" | "/dev" | "/tmp" | "/oldroot"))
-            && resolvable(&path)?
-        {
-            paths.push(path);
+    // A login shell must not run the host's interactive startup during conformance.
+    let dirs: &[&str] = if shell { &["/", "/etc"] } else { &["/"] };
+    for dir in dirs {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            // host_shell supplies private procfs, minimal /dev and scratch /tmp.
+            if shell && matches!(path.to_str(), Some("/etc" | "/etc/profile")) {
+                continue;
+            }
+            if !matches!(path.to_str(), Some("/proc" | "/dev" | "/tmp" | "/oldroot"))
+                && resolvable(&path)?
+            {
+                paths.push(path);
+            }
         }
     }
     paths.sort();
@@ -168,7 +180,12 @@ pub fn run(program: &str, args: &[String]) -> io::Result<ExitStatus> {
     let temporary = backing.0.join("tmp");
     fs::create_dir(&temporary)?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o1777))?;
-    let binds = bindings(&cwd, &[program.clone(), supervisor.clone()], &temporary)?;
+    let binds = bindings(
+        &cwd,
+        &[program.clone(), supervisor.clone()],
+        &temporary,
+        std::env::var_os(ENV).as_deref() == Some("shell".as_ref()),
+    )?;
     let mut env = Vec::new();
     for (key, value) in std::env::vars_os() {
         if key == ENV || key == "TMPDIR" {
@@ -261,8 +278,20 @@ mod tests {
         assert!(!enabled(None).unwrap());
         assert!(enabled(Some("1".as_ref())).unwrap());
         assert!(enabled(Some("private".as_ref())).unwrap());
+        assert!(enabled(Some("shell".as_ref())).unwrap());
         for value in ["", "0", "true", "yes"] {
             assert!(enabled(Some(value.as_ref())).is_err());
+        }
+    }
+
+    #[test]
+    fn shell_fixture_omits_the_system_profile_but_keeps_account_data() {
+        let binds = bindings(Path::new("/"), &[], Path::new("/tmp"), true).unwrap();
+        assert!(!binds
+            .iter()
+            .any(|bind| matches!(bind.src.as_str(), "/etc" | "/etc/profile")));
+        if Path::new("/etc/passwd").exists() {
+            assert!(binds.iter().any(|bind| bind.src == "/etc/passwd"));
         }
     }
 
@@ -274,7 +303,7 @@ mod tests {
             PathBuf::from("/tmp/artifacts/test"),
             PathBuf::from("/tmp/runner"),
         ];
-        let binds = bindings(cwd, &programs, temporary).unwrap();
+        let binds = bindings(cwd, &programs, temporary, false).unwrap();
         assert_eq!(binds.first().unwrap().dest.as_deref(), Some("/tmp"));
         assert_eq!(binds.first().unwrap().src, "/tmp/fixture/tmp");
         for path in ["/tmp/project", "/tmp/artifacts/test", "/tmp/runner"] {
@@ -283,8 +312,8 @@ mod tests {
         assert!(!binds
             .iter()
             .any(|b| matches!(b.src.as_str(), "/tmp" | "/proc" | "/dev" | "/oldroot")));
-        assert!(bindings(Path::new("/tmp"), &programs, temporary).is_err());
-        assert!(bindings(Path::new("/"), &programs, temporary)
+        assert!(bindings(Path::new("/tmp"), &programs, temporary, false).is_err());
+        assert!(bindings(Path::new("/"), &programs, temporary, false)
             .unwrap()
             .iter()
             .any(|b| b.src == "/tmp/artifacts/test"));
@@ -310,7 +339,7 @@ mod tests {
         fs::write(tree.join(".git"), b"gitdir: trusted external admin\n").unwrap();
         let source = sibling.join("source.rs");
         fs::write(&source, b"shared source").unwrap();
-        let binds = bindings(&cwd, &[], &directory.path().join("tmp")).unwrap();
+        let binds = bindings(&cwd, &[], &directory.path().join("tmp"), false).unwrap();
         assert!(binds.iter().any(|bind| bind.src == tree.to_str().unwrap()));
         assert!(!binds.iter().any(|bind| bind.src == cwd.to_str().unwrap()));
         let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/release/td-builder");
@@ -355,7 +384,13 @@ mod tests {
         );
         fs::remove_file(cwd.join(".git")).unwrap();
         let executable = tree.join("target/release/td-builder");
-        let binds = bindings(&cwd, &[executable.clone()], &directory.path().join("tmp")).unwrap();
+        let binds = bindings(
+            &cwd,
+            &[executable.clone()],
+            &directory.path().join("tmp"),
+            false,
+        )
+        .unwrap();
         assert!(!binds
             .iter()
             .any(|bind| bind.src == executable.to_str().unwrap()));

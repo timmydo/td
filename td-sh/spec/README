@@ -48,7 +48,7 @@ Overlay
                      or when passes change (do not hand-edit):
 
                        cargo build --release --manifest-path td-sh/Cargo.toml
-                       cargo run --release --manifest-path td-sh/Cargo.toml \
+                       TD_TEST_TRUSTED_ROOT=shell cargo run --release --manifest-path td-sh/Cargo.toml \
                          --example gen_expectations -- \
                          td-sh/target/release/td-sh \
                          td-sh/target/release/spec_helpers \

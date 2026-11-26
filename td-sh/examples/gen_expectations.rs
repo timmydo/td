@@ -5,7 +5,7 @@
 //!
 //! Usage (build the shell first, then point the generator at it and the corpus):
 //!   cargo build --release --manifest-path td-sh/Cargo.toml
-//!   cargo run --release --manifest-path td-sh/Cargo.toml \
+//!   TD_TEST_TRUSTED_ROOT=shell cargo run --release --manifest-path td-sh/Cargo.toml \
 //!     --example gen_expectations -- \
 //!     td-sh/target/release/td-sh td-sh/target/release/spec_helpers td-sh/spec \
 //!     > td-sh/spec/expectations.txt
@@ -46,7 +46,9 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use td_sh::{case_keys, graded_identity, parse_spec, run_case, spec_paths, ASH_DASH_CHAIN};
+use td_sh::{
+    case_keys, graded_identity, missing_utilities, parse_spec, run_case, spec_paths, ASH_DASH_CHAIN,
+};
 
 // Header emitted verbatim atop the overlay. Documents the xfail/skip contract for
 // a maintainer reading `expectations.txt` directly; kept in sync with this tool.
@@ -63,11 +65,14 @@ const HEADER: &str = "\
 # gate as an XPASS so it is promoted (removed here). Regenerate (do not hand-edit)
 # on a pin bump or when passes change:
 #   cargo build --release --manifest-path td-sh/Cargo.toml
-#   cargo run --release --manifest-path td-sh/Cargo.toml --example gen_expectations \\
+#   TD_TEST_TRUSTED_ROOT=shell cargo run --release --manifest-path td-sh/Cargo.toml --example gen_expectations \\
 #     -- td-sh/target/release/td-sh td-sh/target/release/spec_helpers td-sh/spec \\
 #     > td-sh/spec/expectations.txt
 #
-# Format, one per line:   <xfail|skip> <spec-file>::<case description>
+# Format, one per line:   <xfail|skip|xfail-without=TOOLS> <spec-file>::<case description>
+#   xfail-without = require a pass when every named executable exists, otherwise
+#                   expect failure. A comma requires each group. Within a group
+#                   a pipe separates alternative absolute paths for one utility.
 #   xfail = td-sh runs it and gets the wrong answer today. It still RUNS every
 #           gate; the failure is tolerated, a regression (an unlisted case that
 #           fails) reds the gate, and an unexpected PASS (XPASS) reds it so the
@@ -458,6 +463,31 @@ fn json_string(s: &str) -> String {
 /// golden loosened under an unchanged shape defeats both and needs re-measuring.
 const HOST_SCHEDULED: &[&str] = &["background.test.sh::wait for N parallel jobs and check failure"];
 
+// These upstream cases explicitly use fixed paths or command -p.
+const SYSTEM_UTILITIES: &[(&str, &str)] = &[
+    (
+        "builtin-meta.test.sh::command -p (find hidden tool in default path)",
+        "/bin/ls|/usr/bin/ls",
+    ),
+    (
+        "builtin-meta.test.sh::command -p (override existing program)",
+        "/bin/tr|/usr/bin/tr",
+    ),
+    (
+        "builtin-misc.test.sh::Print shell strings with weird chars: set and printf %q and ${x@Q}",
+        "/bin/echo",
+    ),
+    ("command_.test.sh::Command block", "/bin/which,/bin/ls"),
+    ("errexit.test.sh::More && ||", "/bin/false"),
+];
+
+fn system_utilities(key: &str) -> Option<&'static str> {
+    SYSTEM_UTILITIES
+        .iter()
+        .find(|(case, _)| *case == key)
+        .map(|(_, tools)| *tools)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let shell = PathBuf::from(
@@ -547,6 +577,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             match run_case(&shell, &helpers, case, ASH_DASH_CHAIN) {
+                Ok(outcome) if system_utilities(&key).is_some() => {
+                    let missing = system_utilities(&key).and_then(missing_utilities);
+                    if outcome.timed_out || outcome.truncated || missing != Some(!outcome.passed) {
+                        errors.push(format!(
+                            "system utility result disagrees with the prerequisites: {key}: {:?}",
+                            outcome.detail
+                        ));
+                    } else {
+                        xfail.push(key);
+                    }
+                }
                 Ok(outcome) if outcome.passed => {}
                 Ok(outcome) => {
                     // Truncated joins timed-out rather than becoming an xfail:
@@ -592,13 +633,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    for (key, _) in SYSTEM_UTILITIES {
+        if !seen.contains(*key) {
+            return Err(format!("missing system utility case: {key}").into());
+        }
+    }
     xfail.sort();
     skip.sort();
     let mut out = String::with_capacity(HEADER.len() + (xfail.len() + skip.len()) * 48);
     out.push_str(HEADER);
     out.push_str("\n# ---- xfail: td-sh runs, wrong answer (known gaps) ----\n");
     for key in &xfail {
-        out.push_str("xfail ");
+        out.push_str("xfail");
+        if let Some(tools) = system_utilities(key) {
+            out.push_str("-without=");
+            out.push_str(tools);
+        }
+        out.push(' ');
         out.push_str(key);
         out.push('\n');
     }

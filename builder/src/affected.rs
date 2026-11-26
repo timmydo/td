@@ -4755,7 +4755,7 @@ fn toml_string(value: &str) -> Option<&str> {
 /// same reviewed act that adding a row used to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GateCrate {
-    trusted_test_root: bool,
+    trusted_test_root: Option<&'static str>,
     native_compositor_tests: bool,
     native_fixture_feature: Option<String>,
     /// The directory name, which is also the crate name and the manifest path
@@ -5290,7 +5290,7 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
         ));
     }
     let mut out = GateCrate {
-        trusted_test_root: false,
+        trusted_test_root: None,
         native_compositor_tests: false,
         native_fixture_feature: None,
         name: name.to_string(),
@@ -5378,7 +5378,10 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
                     gate_bool(name, "native-compositor-tests", value.trim())?;
             }
             "trusted-test-root" => {
-                out.trusted_test_root = gate_bool(name, "trusted-test-root", value.trim())?;
+                out.trusted_test_root = match value.split('#').next().map(str::trim) {
+                    Some("\"shell\"") => Some("shell"),
+                    _ => gate_bool(name, "trusted-test-root", value.trim())?.then_some("1"),
+                };
             }
             "clippy-all-targets" => {
                 out.clippy_all_targets = gate_bool(name, "clippy-all-targets", value.trim())?;
@@ -6761,8 +6764,12 @@ fn crate_cargo_command(krate: &GateCrate, action: &str) -> Result<String, String
 
 fn crate_test_command(krate: &GateCrate) -> Result<String, String> {
     let mut cmd = crate_cargo_command(krate, "test")?;
-    if krate.trusted_test_root {
-        cmd.push_str(" --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'");
+    if let Some(mode) = krate.trusted_test_root {
+        cmd.push_str(if mode == "shell" {
+            " --config 'env.TD_TEST_TRUSTED_ROOT.value=\"shell\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'"
+        } else {
+            " --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'"
+        });
     }
     Ok(cmd)
 }
@@ -7802,7 +7809,7 @@ mod tests {
             std::fs::write(&p, text).unwrap();
         }
         let krate = |name: &str| GateCrate {
-            trusted_test_root: false,
+            trusted_test_root: None,
             native_compositor_tests: false,
             native_fixture_feature: None,
             name: name.to_string(),
@@ -7885,7 +7892,7 @@ mod tests {
     #[test]
     fn one_pass_crate_dir_scan_matches_the_one_name_oracle() {
         let krate = |name: &str| GateCrate {
-            trusted_test_root: false,
+            trusted_test_root: None,
             native_compositor_tests: false,
             native_fixture_feature: None,
             name: name.to_string(),
@@ -12490,9 +12497,11 @@ mod tests {
                     k.name
                 ),
                 None => assert!(
-                    test.ends_with(if k.trusted_test_root {
-                        " --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'"
-                    } else { "/Cargo.toml" }),
+                    test.ends_with(if k.trusted_test_root.is_some() {
+                        " --config 'env.TD_TEST_TRUSTED_ROOT.force=true'"
+                    } else {
+                        "/Cargo.toml"
+                    }),
                     "{}: undeclared arguments appeared in `{test}`",
                     k.name
                 ),
@@ -12575,7 +12584,11 @@ mod tests {
         .unwrap();
         let root = _root_cleanup.join("fixture");
         std::fs::create_dir(&root).unwrap();
-        for (name, option) in [("td-yes", "true"), ("td-no", "false")] {
+        for (name, option) in [
+            ("td-yes", "true"),
+            ("td-no", "false"),
+            ("td-profile", "\"shell\""),
+        ] {
             let dir = root.join(name);
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(
@@ -12591,8 +12604,13 @@ mod tests {
             for command in commands {
                 assert_eq!(
                     command.contains("TD_TEST_TRUSTED_ROOT"),
-                    command.starts_with("cargo test ") && command.contains("td-yes/Cargo.toml"),
+                    command.starts_with("cargo test ")
+                        && (command.contains("td-yes/Cargo.toml")
+                            || command.contains("td-profile/Cargo.toml")),
                 );
+                if command.starts_with("cargo test ") && command.contains("td-profile/Cargo.toml") {
+                    assert!(command.contains("TD_TEST_TRUSTED_ROOT.value=\"shell\""));
+                }
                 if command.starts_with("cargo test ") && command.contains("td-yes/Cargo.toml") {
                     assert_eq!(
                         command,
@@ -12745,7 +12763,7 @@ mod tests {
         let bare = "[package]\nname = \"td-x\"\n\n[workspace]\n";
         let got = parse_gate_crate("td-x", bare).expect("defaults");
         assert!(!got.clippy_all_targets);
-        assert!(!got.trusted_test_root);
+        assert!(got.trusted_test_root.is_none());
         assert_eq!(got.test_args, None);
         assert_eq!(got.gate_test_args, None);
 
@@ -13529,7 +13547,7 @@ mod tests {
         // a crate's own dev-dependencies included and a dependency's own
         // dev-dependencies excluded, as cargo resolves them.
         let krate = |name: &str, deps: &[&str], dev: &[&str]| GateCrate {
-            trusted_test_root: false,
+            trusted_test_root: None,
             native_compositor_tests: false,
             native_fixture_feature: None,
             name: name.to_string(),

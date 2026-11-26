@@ -2938,6 +2938,16 @@ mod tests {
                     "done; echo \"[$line]\"",
                 ),
             );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while sh.procsubs.0.iter().any(|entry| !entry.ended()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "substitution did not finish"
+                );
+                std::thread::yield_now();
+            }
+            // The next ordinary command must reap every finished older body.
+            let _ = crate::exec::run_program(&mut sh, ":");
             let kept = sh.procsubs.len();
             drop(sh);
             let text = out.lock().map(|v| String::from_utf8_lossy(&v).into_owned());
@@ -2945,12 +2955,7 @@ mod tests {
         })
         .expect("could not start the shell thread");
         assert_eq!(out, "[200]\n");
-        // A handful at most. Two hundred is what is left if nothing below the
-        // mark is ever swept -- and with THIS body, which outlives the command
-        // that opened it, nearly every entry needs that sweep. The bound is
-        // loose enough for a loaded machine and far below what a per-command
-        // sweep alone leaves.
-        assert!(kept <= 20, "{kept} entries left after 200 substitutions");
+        assert_eq!(kept, 0, "completed substitutions left in the shell");
     }
 
     /// The same for a command that is not a SIMPLE one. ash bounds a
