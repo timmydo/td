@@ -196,7 +196,7 @@ one.
 | 3 | `td-init` | twelve — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has six pinned requests, `poll(2)` at most two lines, `swapon(2)` fixed flags |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED` and `SO_PEERPIDFD`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED` and `SO_PEERPIDFD`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `fstatfs(2)` on the home volume, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | terminal `ioctl(2)`, `flock(2)`, and `fcntl(F_SETFD, 0)` |
 | 8 | `td-sh` | self-only `prlimit64(2)` (§8), `umask(2)`, disposition-only `rt_sigaction(2)`, job-control `kill(2)` and `rt_sigprocmask(2)`, `ioctl(2)` (five requests), `poll(2)`, and §8 descriptor inheritance (`fcntl(2)` with four pinned commands, `dup3(2)`, `close_range(2)`, `wait4(2)`, `memfd_create(2)`, and descriptor adoption) |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -799,6 +799,11 @@ exit status, and a console that is neither skippable nor indefinitely
 delayed).
 
 ## 6. `td-compositor` — the software Wayland server
+
+The status worker issues x86-64 `fstatfs(2)` (138) through the same
+instruction on an open directory for `/var/home`. The kernel writes its
+120-byte result into fifteen initialized native words. The worker reads
+the available block count and fragment size to display free space.
 
 The `td-compositor` software Wayland server, whose one `syscall5` body in
 `td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm, clipboard and

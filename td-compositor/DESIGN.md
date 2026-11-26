@@ -221,7 +221,9 @@ On AMD the control temperature is the fallback when the die channel is
 unavailable. The bar samples these drivers under `/sys/class/hwmon` and
 shows `TEMP ?` if neither supplies a reading. Load, memory and uptime come
 from `/proc`. The clock samples `SystemTime` and reads ordinary timezone files.
-The bar adds no unsafe syscall surface. Memory is total minus
+The worker opens `/var/home`, the parent of the installed user homes, and
+reads its filesystem with `fstatfs(2)`. FREE shows space available to an
+unprivileged account, in the same binary units as memory. Memory is total minus
 MemAvailable rather than minus MemFree,
 which counts neither cache nor reclaimable slab and reads alarmingly low on
 an idle machine. A reading that could not be taken shows its label with `?`
@@ -575,9 +577,8 @@ Reporting is bounded twice over — deduplicated, and capped at four named
 failures between good paints — because a fault that ALTERNATES defeats
 deduplication on its own and is a line a second again.
 
-Deliberately not here: disk free, which needs `statfs(2)` and so an
-`UNSAFE.md` amendment; wireless and temperature fields; and a live
-timezone setter. Ethernet is already represented by the network field.
+Wireless and a live timezone setter remain outside the bar. Ethernet is
+already represented by the network field.
 
 The stock QEMU input fixture has a PS/2 keyboard and pointer plus a virtio
 tablet. The USB-enabled kernel also exposes USB HID input through evdev.

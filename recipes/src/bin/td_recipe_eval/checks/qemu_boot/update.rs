@@ -2411,7 +2411,7 @@ mod tests {
             "const TEXT_TOP: usize = (BAR_HEIGHT - CELL_HEIGHT) / 2;",
             "pub(crate) const BACKGROUND: [u8; 4] = [0x18, 0x14, 0x20, 0];",
             "pub(crate) const INK: [u8; 4] = [0xd0, 0xc8, 0xe0, 0];",
-            "{net}  {load}  TEMP {temperature}  {memory}  {uptime}  {audio}{clock}",
+            "{net}  {load}  TEMP {temperature}  {memory}  FREE {disk}  {uptime}  {audio}{clock}",
             // The band is the screen's top, and the line is drawn in it at
             // the text row, in ink on the background, after the cells.
             "let bar = (0, 0, width, BAR_HEIGHT);",

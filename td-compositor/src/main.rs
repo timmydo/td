@@ -1659,11 +1659,12 @@ unsafe impl Send for MappedRegion {}"#;
             "const SYS_RECVMSG: usize = 47;",
             "const SYS_GETSOCKOPT: usize = 55;",
             "const SYS_FCNTL: usize = 72;",
+            "const SYS_FSTATFS: usize = 138;",
             "const SYS_CLOCK_GETTIME: usize = 228;",
         ] {
             assert!(SYS.contains(syscall), "{syscall}");
         }
-        assert_eq!(occurrences(SYS, "const SYS_"), 9);
+        assert_eq!(occurrences(SYS, "const SYS_"), 10);
         for (name, source) in OTHER {
             if *name == "allocation.rs" {
                 assert!(source.starts_with("#![forbid(unsafe_code)]\n"));
@@ -2195,7 +2196,9 @@ unsafe impl Send for MappedRegion {}"#;
             MAP_SHARED,
             fd as usize,
             offset,"#;
-        assert_eq!(occurrences(SYS, "syscall5("), 10);
+        assert_eq!(occurrences(SYS, "syscall5("), 11);
+        assert_eq!(occurrences(SYS, "SYS_FSTATFS"), 2);
+        assert!(SYS.contains("let mut words = [0_u64; 15];\n    let result = syscall5(\n        SYS_FSTATFS,\n        directory.as_raw_fd() as usize,\n        words.as_mut_ptr() as usize,\n        0,\n        0,\n        0,"));
         // The definition and the ONE call. `mmap` is the only six-argument
         // syscall this crate makes, and a second caller of `syscall6` would be
         // a second mapping with no region type owning its unmap.
@@ -2473,12 +2476,16 @@ pub struct MappedRegion {
         // One queue: the backend's CRTC.
         assert_eq!(occurrences(drm, "sys::drm_page_flip("), 1);
         let production_main = production(MAIN);
+        let bar = production(include_str!("bar.rs"));
+        assert_eq!(occurrences(bar, "sys::"), 1);
+        assert!(bar.contains("crate::sys::available_kib(&directory)"));
         for (name, source) in
             std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())
         {
             if matches!(
                 name,
                 "client.rs"
+                    | "bar.rs"
                     | "conn.rs"
                     | "server.rs"
                     | "input.rs"
@@ -2655,6 +2662,7 @@ pub struct MappedRegion {
             ),
             (&["sys::input_monotonic_clock"], &["input.rs"]),
             (&["sys::monotonic_time"], &["runtime.rs"]),
+            (&["sys::available_kib"], &["bar.rs"]),
         ];
         for (name, source) in
             std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())

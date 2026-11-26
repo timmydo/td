@@ -1398,7 +1398,7 @@ td-compositor/src/authority.rs	allocation-macro	6
 td-compositor/src/authority.rs	heap-owner	1
 td-compositor/src/authority.rs	unchecked-growth-or-clone	28
 td-compositor/src/bar.rs	allocating-conversion	19
-td-compositor/src/bar.rs	allocation-macro	12
+td-compositor/src/bar.rs	allocation-macro	10
 td-compositor/src/bar.rs	unchecked-growth-or-clone	4
 td-compositor/src/buffer.rs	allocating-conversion	2
 td-compositor/src/buffer.rs	allocation-macro	3

@@ -20,6 +20,7 @@ const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
 const SYS_GETSOCKOPT: usize = 55;
 const SYS_FCNTL: usize = 72;
+const SYS_FSTATFS: usize = 138;
 const SYS_CLOCK_GETTIME: usize = 228;
 const CLOCK_MONOTONIC: i32 = 1;
 
@@ -519,6 +520,27 @@ pub fn input_monotonic_clock(device: &impl AsRawFd) -> io::Result<()> {
     )
     .map_err(io::Error::other)?;
     raw_errno(raw).map_or(Ok(()), Err)
+}
+
+/// Linux x86-64 struct statfs is fifteen native words, including its tail padding.
+pub(crate) fn available_kib(directory: &File) -> Option<u64> {
+    let mut words = [0_u64; 15];
+    let result = syscall5(
+        SYS_FSTATFS,
+        directory.as_raw_fd() as usize,
+        words.as_mut_ptr() as usize,
+        0,
+        0,
+        0,
+    );
+    let [_, block_size, _, _, available, _, _, _, _, fragment_size, ..] = words;
+    let unit = if fragment_size == 0 {
+        block_size
+    } else {
+        fragment_size
+    };
+    (result == 0 && unit != 0).then_some(())?;
+    available.checked_mul(unit).map(|bytes| bytes / 1024)
 }
 
 /// The same clock selected on each trusted evdev client, without wrapping.

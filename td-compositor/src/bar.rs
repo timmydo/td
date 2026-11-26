@@ -77,6 +77,7 @@ pub struct Readings {
     temperature: CpuTemperature,
     pub used_kb: Option<u64>,
     pub total_kb: Option<u64>,
+    available_disk_kib: Option<u64>,
     pub uptime_secs: Option<u64>,
     pub epoch_secs: Option<u64>,
     pub link: Link,
@@ -91,6 +92,7 @@ impl Readings {
         proc_root: &Path,
         sys_root: &Path,
         netd_status: &Path,
+        home_volume: &Path,
         epoch_secs: Option<u64>,
     ) -> Self {
         let loadavg = std::fs::read_to_string(proc_root.join("loadavg")).ok();
@@ -113,6 +115,9 @@ impl Readings {
                 _ => None,
             },
             total_kb,
+            available_disk_kib: std::fs::File::open(home_volume)
+                .ok()
+                .and_then(|directory| crate::sys::available_kib(&directory)),
             uptime_secs: uptime.as_deref().and_then(parse_uptime_secs),
             epoch_secs,
             link: sample_link(proc_root, sys_root, netd_status),
@@ -394,20 +399,37 @@ fn parse_uptime_secs(text: &str) -> Option<u64> {
 
 /// Round to one decimal in the largest unit that keeps the number small.
 /// Integer arithmetic throughout: a bar is not worth a float.
-fn human_bytes(kb: u64) -> String {
-    const UNITS: &[(u64, &str)] = &[(1024 * 1024 * 1024, "T"), (1024 * 1024, "G"), (1024, "M")];
-    for (divisor, suffix) in UNITS {
-        if kb >= *divisor {
-            // The multiply is done in `u128`. `kb.saturating_mul(10)` clamps
-            // above `u64::MAX / 10` and the clamp happens BEFORE the divide,
-            // so it does not bound the answer — it divides it by ten, and
-            // reports a tenth of the truth as though it were a number.
-            let tenths = u64::try_from(u128::from(kb).saturating_mul(10) / u128::from(*divisor))
-                .unwrap_or(u64::MAX);
-            return format!("{}.{}{suffix}", tenths / 10, tenths % 10);
+struct HumanBytes(u64);
+
+impl std::fmt::Display for HumanBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kb = self.0;
+        const UNITS: &[(u64, &str)] = &[(1024 * 1024 * 1024, "T"), (1024 * 1024, "G"), (1024, "M")];
+        for (divisor, suffix) in UNITS {
+            if kb >= *divisor {
+                // The multiply is done in `u128`. `kb.saturating_mul(10)` clamps
+                // above `u64::MAX / 10` and the clamp happens BEFORE the divide,
+                // so it does not bound the answer — it divides it by ten, and
+                // reports a tenth of the truth as though it were a number.
+                let tenths =
+                    u64::try_from(u128::from(kb).saturating_mul(10) / u128::from(*divisor))
+                        .unwrap_or(u64::MAX);
+                return write!(f, "{}.{}{suffix}", tenths / 10, tenths % 10);
+            }
+        }
+        write!(f, "{kb}K")
+    }
+}
+
+struct DiskFree(Option<u64>);
+
+impl std::fmt::Display for DiskFree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(kib) => HumanBytes(kib).fmt(f),
+            None => f.write_str("?"),
         }
     }
-    format!("{kb}K")
 }
 
 /// Days, hours and minutes — seconds would churn the line for nothing, and
@@ -445,7 +467,7 @@ fn line(clock: &Clock, readings: &Readings) -> Result<Status, crate::allocation:
     );
     let memory = match (readings.used_kb, readings.total_kb) {
         (Some(used), Some(total)) => {
-            format!("MEM {}/{}", human_bytes(used), human_bytes(total))
+            format!("MEM {}/{}", HumanBytes(used), HumanBytes(total))
         }
         _ => "MEM ?".to_string(),
     };
@@ -481,10 +503,11 @@ fn line(clock: &Clock, readings: &Readings) -> Result<Status, crate::allocation:
             format!("NET {name} {state}")
         }
     };
+    let disk = DiskFree(readings.available_disk_kib);
     let temperature = readings.temperature;
     let audio = AudioField(readings.audio);
     let text = crate::allocation::format(format_args!(
-        "{net}  {load}  TEMP {temperature}  {memory}  {uptime}  {audio}{clock}"
+        "{net}  {load}  TEMP {temperature}  {memory}  FREE {disk}  {uptime}  {audio}{clock}"
     ))?;
     // The field ends where the gap before the clock begins.
     let audio = readings.audio.and_then(|reading| {
@@ -873,14 +896,10 @@ enum Tick {
 /// green. `epoch_secs` is a parameter for the same reason the `/proc` root is.
 fn tick(
     runtime: &Mutex<crate::runtime::Runtime>,
-    proc_root: &Path,
-    sys_root: &Path,
-    netd_status: &Path,
-    epoch_secs: Option<u64>,
+    mut readings: Readings,
     clock: &Clock,
     reported: &mut Reported,
 ) -> Tick {
-    let mut readings = Readings::sample(proc_root, sys_root, netd_status, epoch_secs);
     readings.audio = match runtime.lock() {
         Ok(runtime) => runtime.audio_shown(),
         Err(_) => return Tick::Poisoned,
@@ -943,10 +962,13 @@ pub fn start(
                 // session down with it.
                 match tick(
                     &runtime,
-                    &proc_root,
-                    &sys_root,
-                    Path::new("/run/td-netd/status"),
-                    unix_epoch_secs(),
+                    Readings::sample(
+                        &proc_root,
+                        &sys_root,
+                        Path::new("/run/td-netd/status"),
+                        Path::new("/var/home"),
+                        unix_epoch_secs(),
+                    ),
                     &clock,
                     &mut reported,
                 ) {
@@ -1007,6 +1029,7 @@ mod tests {
                 &self.proc_root,
                 &self.sys_root,
                 &self.netd_status,
+                &self.proc_root.join("missing-home"),
                 epoch_secs,
             )
         }
@@ -1079,7 +1102,7 @@ Local:
         assert_eq!(readings.uptime_secs, Some(187_245));
         assert_eq!(
             line(&Clock::Utc, &readings),
-            "NET ?  LOAD 0.42  TEMP ?  MEM 2.6G/7.6G  UP 2D 04:00  2026-02-02 02:40:00 UTC"
+            "NET ?  LOAD 0.42  TEMP ?  MEM 2.6G/7.6G  FREE ?  UP 2D 04:00  2026-02-02 02:40:00 UTC"
         );
     }
 
@@ -1105,6 +1128,7 @@ Local:
                     root.path(),
                     root.path(),
                     &root.path().join("status"),
+                    root.path(),
                     Some(0),
                 ),
             )
@@ -1387,11 +1411,11 @@ Local:
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let readings = Readings::sample(&empty, &empty, &empty, None);
+        let readings = Readings::sample(&empty, &empty, &empty, &empty.join("missing"), None);
         assert_eq!(readings, Readings::default());
         assert_eq!(
             line(&Clock::Utc, &readings),
-            "NET ?  LOAD ?  TEMP ?  MEM ?  UP ?  CLOCK ?"
+            "NET ?  LOAD ?  TEMP ?  MEM ?  FREE ?  UP ?  CLOCK ?"
         );
 
         // Present but unparseable is the same answer, and each field fails on
@@ -1404,7 +1428,7 @@ Local:
         assert_eq!(readings.uptime_secs, None);
         assert_eq!(
             line(&Clock::Utc, &readings),
-            "NET ?  LOAD ?  TEMP ?  MEM ?  UP ?  1970-01-01 00:00:00 UTC"
+            "NET ?  LOAD ?  TEMP ?  MEM ?  FREE ?  UP ?  1970-01-01 00:00:00 UTC"
         );
     }
 
@@ -1450,6 +1474,12 @@ Local:
 
     #[test]
     fn bytes_and_uptime_render_in_the_units_a_person_reads() {
+        let dir = crate::temp_dir::TempDir::new("td-bar-disk").unwrap();
+        let root = dir.path();
+        let sample = Readings::sample(root, root, root, root, None);
+        assert!(sample.available_disk_kib.is_some());
+        let human_bytes = |kb| HumanBytes(kb).to_string();
+        assert_eq!(DiskFree(Some(0)).to_string(), "0K");
         assert_eq!(human_bytes(0), "0K");
         assert_eq!(human_bytes(512), "512K");
         assert_eq!(human_bytes(1024), "1.0M");
@@ -1795,15 +1825,7 @@ Local:
         let mut at = 1_770_000_000u64;
         let mut next = |reported: &mut Reported| {
             at = at.saturating_add(1);
-            tick(
-                &runtime,
-                &fixture.proc_root,
-                &fixture.sys_root,
-                &fixture.netd_status,
-                Some(at),
-                &Clock::Utc,
-                reported,
-            )
+            tick(&runtime, fixture.sample(Some(at)), &Clock::Utc, reported)
         };
 
         assert_eq!(
@@ -1854,10 +1876,7 @@ Local:
         assert_eq!(
             tick(
                 &runtime,
-                &fixture.proc_root,
-                &fixture.sys_root,
-                &fixture.netd_status,
-                Some(0),
+                fixture.sample(Some(0)),
                 &Clock::Utc,
                 &mut reported
             ),
@@ -1899,15 +1918,7 @@ Local:
         };
         let mut reported = Reported::default();
         assert_eq!(
-            tick(
-                &runtime,
-                &fixture.proc_root,
-                &fixture.sys_root,
-                &fixture.netd_status,
-                Some(0),
-                &clock,
-                &mut reported
-            ),
+            tick(&runtime, fixture.sample(Some(0)), &clock, &mut reported),
             Tick::Continue(None)
         );
         let expected = line(&clock, &fixture.sample(Some(0)));
@@ -1969,6 +1980,7 @@ Local:
                 load_centi: Some(1_234),
                 temperature: CpuTemperature(Some(-12)),
                 used_kb: Some(2_800_000),
+                available_disk_kib: Some(2 * 1024 * 1024),
                 total_kb: Some(8_039_384),
                 uptime_secs: Some(187_245),
                 epoch_secs: Some(1_770_000_000),
@@ -1984,6 +1996,8 @@ Local:
             },
         );
         let failed = line(&Clock::Utc, &Readings::default());
+        assert!(full.contains("  FREE 2.0G  "));
+        assert!(failed.contains("  FREE ?  "));
         // The audio field's other two forms, and the notices a volume key
         // leaves, which the bar draws in the line's place.
         let mut audio = Vec::new();
