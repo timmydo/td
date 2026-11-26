@@ -120,6 +120,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/proc_status.rs"),
     ),
     (
+        "quit_target",
+        include_str!("../../../td-compositor/src/quit_target.rs"),
+    ),
+    (
         "reportable",
         include_str!("../../../td-compositor/src/reportable.rs"),
     ),

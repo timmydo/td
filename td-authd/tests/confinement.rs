@@ -1470,7 +1470,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(launch.matches(".spawn(").count(), 1);
     assert_eq!(launch.matches(".exec()").count(), 2);
     assert_eq!(launch.matches(".process_group(0)").count(), 1);
-    assert_eq!(launch.matches("Command::new(").count(), 8);
+    assert_eq!(launch.matches("Command::new(").count(), 10);
+    assert!(launch.contains("self.registered(name) != Some(true)"));
+    assert!(launch.contains("command.args([\"stop-instance\", name, &pid, &inode]);"));
     // The root commands a peer can cause beside the credential helper:
     // its supervisor starting an application's unit or the fixed update
     // unit, and reading an application unit's status line. The name is
@@ -1498,7 +1500,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     ] {
         assert_eq!(launch.matches(bound).count(), 1, "{bound}");
     }
-    assert_eq!(launch.matches("Inspection::printing(").count(), 2);
+    assert_eq!(launch.matches("Inspection::printing(").count(), 3);
     // `0d` starts only the unit a registry name names; the retired update
     // unit, `0e`'s, is named nowhere.
     assert!(launch.contains("let Self::Start(name) = self;\n        name"));
@@ -1888,7 +1890,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
 const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
-const LAUNCH_FINGERPRINT: u64 = 0x4fde98f76ca43535;
+const LAUNCH_FINGERPRINT: u64 = 0xed4453a1f1e9c2db;
 const MAIN_FINGERPRINT: u64 = 0xda7a530d5160d76e;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0x715685005ea23b04;

@@ -37,6 +37,30 @@ pub(crate) struct Linux {
     own_pid: u32,
     generation: u64,
 }
+/// The paired compositor's physical force-quit, after td-login has entered
+/// the human account. The caller holds the original directory throughout.
+pub fn force_quit_peer(pid: u32, inode: u64) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let budget = Budget::new(crate::budget::LIMIT).map_err(io::Error::other)?;
+    let mut linux = Linux::new(&budget, 1)?;
+    let directory = linux.reader.process_directory(pid)?;
+    if directory.metadata()?.ino() != inode {
+        return Err(io::Error::other("the selected application exited"));
+    }
+    let caller = File::open("/proc/self")?;
+    let status = |linux: &mut Linux, dir: &File| {
+        action_plan::status(linux.reader.process_file(dir, "status", PROCESS_BYTES)?)
+            .map_err(io::Error::other)
+    };
+    let owner = status(&mut linux, &caller)?.uid;
+    let target = status(&mut linux, &directory)?;
+    if owner == 0 || target.uid != owner || target.pid != pid {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    action_plan::protected(target, linux.own_pid).map_err(io::Error::other)?;
+    signal_sys::send(&directory, crate::actions::Signal::Kill)
+}
+
 fn cancelled(active: &AtomicU64, revision: u64) -> io::Result<()> {
     if revision == 0 || active.load(Ordering::Acquire) != revision {
         Err(io::Error::new(
@@ -411,6 +435,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+        }
+    }
+    #[test]
+    fn physical_quit_targets_a_peer_launched_independently_of_the_desktop_launcher() {
+        use std::os::unix::fs::MetadataExt;
+        let mut peer = child();
+        let pid = peer.0.id();
+        let directory = File::open(format!("/proc/{pid}")).unwrap();
+        let inode = directory.metadata().unwrap().ino();
+        assert!(force_quit_peer(pid, inode + 1).is_err());
+        assert!(peer.0.try_wait().unwrap().is_none());
+        if File::open("/proc/self").unwrap().metadata().unwrap().uid() == 0 {
+            assert!(force_quit_peer(pid, inode).is_err());
+        } else {
+            force_quit_peer(pid, inode).unwrap();
+            assert!(!peer.0.wait().unwrap().success());
         }
     }
     fn child() -> OwnedChild {

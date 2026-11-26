@@ -196,7 +196,7 @@ one.
 | 3 | `td-init` | twelve — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has six pinned requests, `poll(2)` at most two lines, `swapon(2)` fixed flags |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED` and `SO_PEERPIDFD`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | terminal `ioctl(2)`, `flock(2)`, and `fcntl(F_SETFD, 0)` |
 | 8 | `td-sh` | `umask(2)`, disposition-only `rt_sigaction(2)`, job-control `kill(2)` and `rt_sigprocmask(2)`, `ioctl(2)` (five requests), `poll(2)`, and §8 descriptor inheritance (`fcntl(2)` with four pinned commands, `dup3(2)`, `close_range(2)`, `wait4(2)`, `memfd_create(2)`, and descriptor adoption) |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
@@ -829,7 +829,11 @@ allocating a private client slot. The dedicated compositor admits the compiled
 human UID 1000 on its public Wayland, control and readiness sockets, and on
 public Wayland also the compiled live installer UID 990 and the deployment's
 application UIDs, through one pinned `session.rs` caller of the same peer-uid
-wrapper. The private
+wrapper. For a public Wayland client that can own a force-quit target,
+`quit_target.rs` reads the peer UID and calls the fixed `SO_PEERPIDFD=77`
+wrapper. The kernel supplies a four-byte descriptor, adopted through the
+existing received-descriptor wrapper. The peer pidfd must still name the
+same live process after the compositor opens its procfs directory. The private
 portal listener uses its separate UID-991 check, not that human admission.
 These sockets use mode 0666 under compositor-owned directories; the
 credential check precedes protocol reads, writes and slot admission. Host development retains private
@@ -3521,6 +3525,15 @@ argument is null and flags are zero, giving process-directed ordinary
 signal semantics without queued payloads. Neither a PID nor an arbitrary
 number, flag, pointer or descriptor integer is an accepted caller input.
 The kernel checks descriptor kind, lifetime and caller permission.
+
+The paired desktop also accepts physical Super+Shift+Q on the focused
+public client. For a native application td-authd executes the fixed
+td-taskmgr peer-stop operation through td-login as the human. This second
+call to the existing signal adapter accepts only SIGKILL. The helper
+opens the named process directory, compares its inode to the one pinned
+by the requester, checks caller and target UIDs match and are non-root,
+and rejects itself and namespace init before sending on that descriptor.
+The kernel enforces the human account's signal permission at delivery.
 
 `action_linux` is the sole production caller. Its startup probe retains
 its own procfs directory, validates stat/status against the caller PID and

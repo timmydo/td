@@ -683,9 +683,8 @@ keymap, so the glyph names (`?`, `V`, `T`) are literals — remapping a key in
 `keys.rs` would make the sheet lie with the suite green. The card is
 sized FROM the table too, so adding a row cannot push the last one past the
 bottom edge, and every pixel is clipped to it on an output too small to
-hold it. Its rows are 23 pixels apart, which holds the paired card's
-twenty-one rows, Print's and `Super+q`'s among them, whole on an 800x600
-output (541 rows).
+hold it. Its rows are 22 pixels apart. The paired card fits all twenty-two rows
+on an 800x600 output at a height of 542 pixels.
 
 ### Screenshots
 
@@ -3217,6 +3216,14 @@ the attention screen or the lock surface (neither runs an ordinary
 binding, and `Runtime::close_focused` refuses a private screen itself),
 or while a resume withholds input.
 
+In the paired desktop, physical Super+Shift+Q asks the session authority to
+stop the focused application. The public Wayland connection supplies its kernel
+peer identity. The compositor pins the process directory at admission and sends
+the PID, directory inode and optional deployment application name. Private
+surfaces, the portal dialog, lock and attention screens have no target. Root
+routes native peers to the human account and registered applications to
+their current supervised instance.
+
 The compositor never signals a process, and a client that does not answer
 keeps its window: what a close means is the client's. td-ui hands it to its
 handler as `Input::Close` (td-ui/DESIGN.md), so each td program decides,
@@ -4416,6 +4423,8 @@ The `syscall5` body carries:
 - getsockopt(2), with fixed `SOL_SOCKET` and `SO_PEERCRED`, an exact 12-byte
   result, and one server caller, to admit only uid 991 on the private portal
   listener;
+- getsockopt(2) with fixed `SOL_SOCKET/SO_PEERPIDFD` to pin the original
+  connector of a public Wayland client alongside its peer UID;
 - fcntl(2), with only `F_GETFL` and `F_SETFL`, to add `O_NONBLOCK` while one
   clipboard source writes and restore the destination's prior status;
 - ioctl(2), for the two pinned `EVIOCGABS` requests that read an absolute

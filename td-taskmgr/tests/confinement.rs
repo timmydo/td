@@ -124,7 +124,27 @@ fn process_signal_surface_is_fixed_and_private() {
     let adapter = std::fs::read_to_string(root.join("src/action_linux.rs")).unwrap();
     let production = adapter.split("#[cfg(test)]").next().unwrap();
     assert_eq!(production.matches("signal_sys::probe(").count(), 1);
-    assert_eq!(production.matches("signal_sys::send(").count(), 1);
+    let peer = production
+        .split_once("pub fn force_quit_peer(")
+        .unwrap()
+        .1
+        .split_once("fn cancelled(")
+        .unwrap()
+        .0;
+    let mut remaining = peer;
+    for step in [
+        "linux.reader.process_directory(pid)?",
+        "directory.metadata()?.ino() != inode",
+        "owner == 0 || target.uid != owner || target.pid != pid",
+        "action_plan::protected(target, linux.own_pid)",
+        "signal_sys::send(&directory, crate::actions::Signal::Kill)",
+    ] {
+        remaining = remaining
+            .split_once(step)
+            .unwrap_or_else(|| panic!("missing ordered peer-stop check {step}"))
+            .1;
+    }
+    assert_eq!(production.matches("signal_sys::send(").count(), 2);
     assert!(production.contains("File::open(\"/proc/self\")"));
     assert!(production.contains("action_plan::caller(status, self.own_pid)"));
     assert!(production.contains("action_plan::protected(status, self.own_pid)"));

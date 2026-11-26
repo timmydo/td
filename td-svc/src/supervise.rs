@@ -181,6 +181,7 @@ pub struct Service {
     pub unit: Unit,
     pub phase: Phase,
     pub pid: Option<i32>,
+    process_directory: Option<std::fs::File>,
     /// Dropped from the table by a `reload`, but still on its way down.
     ///
     /// It is no longer declared, so it is in no plan and no start order — but
@@ -289,6 +290,7 @@ impl Service {
             unit,
             phase: Phase::Down,
             pid: None,
+            process_directory: None,
             starttime: None,
             generation: 0,
             started: None,
@@ -1501,6 +1503,7 @@ impl Runtime {
                 let starttime = procfs::stat_of(pid).ok().flatten().map(|s| s.starttime);
                 if let Some(service) = self.services.get_mut(index) {
                     service.pid = Some(pid);
+                    service.process_directory = procfs::directory(pid);
                     service.cohort = cohort;
                     service.pair_resume = None;
                     // An unexpected exit restarts in the same leaf without
@@ -1586,6 +1589,7 @@ impl Runtime {
         if let Some(service) = self.services.get_mut(index) {
             service.phase = Phase::Failed;
             service.pid = None;
+            service.process_directory = None;
             // A pair has not received its start grant when watch fails.
             service.cohort = None;
             service.pair_resume = None;
@@ -1611,6 +1615,7 @@ impl Runtime {
             return;
         };
         service.pid = None;
+        service.process_directory = None;
         service.starttime = None;
         service.started = None;
         service.deadline = None;
@@ -2028,6 +2033,7 @@ impl Runtime {
         // releases the identity for a stop, once the leader really is reaped.
         if !stopping {
             service.pid = None;
+            service.process_directory = None;
             service.starttime = None;
         }
     }
@@ -3273,6 +3279,26 @@ impl Runtime {
             return "error: empty request\n".to_string();
         };
         let target = words.next();
+        if verb == "stop-instance" {
+            let (Some(name), Some(pid), Some(inode), None) = (
+                target,
+                words.next().and_then(|p| p.parse().ok()),
+                words.next().and_then(|i| i.parse().ok()),
+                words.next(),
+            ) else {
+                return "error: stop-instance needs NAME MEMBER-PID PROC-INODE\n".into();
+            };
+            let leader = self.lookup(name).and_then(|s| s.process_directory.as_ref());
+            if !leader.is_some_and(|leader| procfs::includes(leader, pid, inode)) {
+                return "error: application instance is no longer running\n".into();
+            }
+            if let Some(service) = self.lookup_mut(name).filter(|service| service.stopping) {
+                service.start_after_stop = false;
+                service.pair_resume = None;
+                return "stop already requested\n".into();
+            }
+            return self.control_stop(name, false);
+        }
         if words.next().is_some() {
             return format!("error: {verb}: too many arguments\n");
         }
@@ -3681,6 +3707,7 @@ impl Runtime {
         let kind = service.unit.kind;
         let restart = service.unit.restart;
         service.pid = None;
+        service.process_directory = None;
         service.started = None;
         service.deadline = None;
         // A pair or a leaf stop retains the requested grace deadline for what
@@ -3891,6 +3918,7 @@ impl Runtime {
                             service.kill_at = None;
                         }
                         service.pid = None;
+                        service.process_directory = None;
                         service.starttime = None;
                     }
                 }
@@ -4213,6 +4241,53 @@ mod tests {
         controls.events("populated 1\n");
         controls.procs(&[leader.pid]);
         (rt, controls)
+    }
+
+    #[test]
+    fn descendant_identity_belongs_to_one_current_unit() {
+        use std::os::unix::fs::MetadataExt;
+        let leader = live_running("/bin/sh -c 'read x'; :", 0);
+        let bystander = live_group_leader();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            let group = procfs::members(Containment::Group(leader.pid), leader.pid).unwrap();
+            if let Some(pid) = group.pids.first().copied() {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "no child for the test unit");
+            std::thread::yield_now();
+        };
+        let directory = procfs::directory(pid).unwrap();
+        let inode = directory.metadata().unwrap().ino();
+        assert!(!procfs::includes(
+            &procfs::directory(bystander.pid).unwrap(),
+            pid,
+            inode
+        ));
+        let (mut rt, _controls) = running_leaf("always", &leader);
+        rt.lookup_mut("sshd").unwrap().process_directory = procfs::directory(leader.pid);
+        assert!(rt
+            .control(&format!("stop-instance sshd {pid} {inode}"))
+            .contains("stop requested"));
+    }
+
+    #[test]
+    fn stop_instance_requires_the_current_member_and_leaves_restart_disabled() {
+        use std::os::unix::fs::MetadataExt;
+        let leader = stubborn_group_leader();
+        let (mut rt, _controls) = running_leaf("always", &leader);
+        let directory = procfs::directory(leader.pid).unwrap();
+        let inode = directory.metadata().unwrap().ino();
+        rt.lookup_mut("sshd").unwrap().process_directory = Some(directory);
+        let request = |inode| format!("stop-instance sshd {} {inode}", leader.pid);
+        assert!(rt.control(&request(inode + 1)).starts_with("error:"));
+        assert!(!rt.lookup("sshd").unwrap().stopping);
+        assert!(rt.control(&request(inode)).contains("stop requested"));
+        let deadline = rt.lookup("sshd").unwrap().kill_at;
+        assert!(deadline.is_some());
+        assert_eq!(rt.control(&request(inode)), "stop already requested\n");
+        assert_eq!(deadline, rt.lookup("sshd").unwrap().kill_at);
+        assert!(!rt.lookup("sshd").unwrap().start_after_stop);
     }
 
     /// A `stop=leaf` leader is launched through the start-gate trampoline

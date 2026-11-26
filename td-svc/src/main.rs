@@ -69,6 +69,7 @@ fn usage() -> String {
          status    what the running supervisor is doing (all units, or NAME)\n  \
          start     start NAME, clearing any restart backoff\n  \
          stop      stop NAME and keep it stopped\n  \
+         stop-instance NAME MEMBER-PID PROC-INODE    stop the matching instance\n  \
          restart   stop NAME, then start it again\n  \
          reload    re-read FILE; on any complaint the running table is kept\n  \
          reboot    stop every service, run /etc/shutdown, then reset\n  \
@@ -121,7 +122,15 @@ enum Route {
 
 /// The verbs that address a running supervisor rather than a file.
 const CTL_VERBS: &[&str] = &[
-    "status", "start", "stop", "restart", "reload", "reboot", "poweroff", "halt",
+    "status",
+    "start",
+    "stop",
+    "stop-instance",
+    "restart",
+    "reload",
+    "reboot",
+    "poweroff",
+    "halt",
 ];
 
 fn route(args: &mut [String]) -> Route {

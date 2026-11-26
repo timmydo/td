@@ -11,6 +11,77 @@ use std::io;
 
 const PROC: &str = "/proc";
 
+/// Numeric procfs paths never need dynamically allocated storage.
+fn open_path(args: std::fmt::Arguments<'_>) -> Option<std::fs::File> {
+    use std::io::Write;
+    let mut path = [0u8; 64];
+    let mut writer = io::Cursor::new(path.as_mut_slice());
+    writer.write_fmt(args).ok()?;
+    let size = usize::try_from(writer.position()).ok()?;
+    std::fs::File::open(std::str::from_utf8(path.get(..size)?).ok()?).ok()
+}
+
+pub fn directory(pid: i32) -> Option<std::fs::File> {
+    (pid > 1).then(|| open_path(format_args!("/proc/{pid}")))?
+}
+
+fn parent(directory: &std::fs::File) -> Option<i32> {
+    use std::{io::Read, os::fd::AsRawFd};
+    let mut stat = open_path(format_args!("/proc/self/fd/{}/stat", directory.as_raw_fd()))?;
+    // Read the whole bounded stat, including a comm with spaces or ')'.
+    let mut data = [0u8; 2048];
+    let mut filled = 0;
+    loop {
+        let tail = data.get_mut(filled..).filter(|tail| !tail.is_empty())?;
+        let n = stat.read(tail).ok()?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    let stat = data.get(..filled)?;
+    let end = stat.iter().rposition(|b| *b == b')')?;
+    std::str::from_utf8(stat.get(end + 1..)?)
+        .ok()?
+        .split_ascii_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Each parent is pinned before the child's parent is checked again.
+pub fn includes(leader: &std::fs::File, pid: i32, inode: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(mut member) = directory(pid) else {
+        return false;
+    };
+    if member.metadata().ok().is_none_or(|m| m.ino() != inode) {
+        return false;
+    }
+    let Ok(expected) = leader.metadata() else {
+        return false;
+    };
+    for _ in 0..128 {
+        if member
+            .metadata()
+            .is_ok_and(|m| (m.dev(), m.ino()) == (expected.dev(), expected.ino()))
+        {
+            return true;
+        }
+        let Some(ppid) = parent(&member) else {
+            return false;
+        };
+        let Some(next) = directory(ppid) else {
+            return false;
+        };
+        if parent(&member) != Some(ppid) {
+            return false;
+        }
+        member = next;
+    }
+    false
+}
+
 /// Is `/proc` mounted at all?
 ///
 /// `stat_of` answers `Ok(None)` for "that process is gone", and an ABSENT

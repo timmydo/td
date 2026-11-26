@@ -12436,7 +12436,9 @@ path of its own and is later work. The deployment init creates
 `/run/td-applications-on-demand` on every boot that does not carry the
 autotest token, and on every live one. Firefox's unit names it in
 `unless-exists=`, so an ordinary boot skips Firefox and only a launch
-request starts it, and an oracle boot starts it. Its `restart=on-failure`
+request starts it, and an oracle boot starts it. A physical Super+Shift+Q
+on a registered application asks the supervisor to stop the instance that
+owns the focused Wayland connection. An explicit stop suppresses restart. Its `restart=on-failure`
 retries a launch that failed, as one racing the session bus does, while a
 window the human closed stays closed; a launch td-jail refuses as not
 installed fails the same way each time, and td-svc's backoff holds it.

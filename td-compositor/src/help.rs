@@ -5,7 +5,7 @@ const CARD_WIDTH: usize = 620;
 const CARD_PADDING: usize = 24;
 const TITLE_TOP: usize = 18;
 const FIRST_ROW_TOP: usize = 48;
-const ROW_STEP: usize = 23;
+const ROW_STEP: usize = 22;
 const BOTTOM_PADDING: usize = 10;
 const KEYS_LEFT: usize = 20;
 const ACTION_LEFT: usize = 280;
@@ -84,6 +84,11 @@ pub const LOCK: Row = Row {
     action: "LOCK SCREEN",
 };
 
+const FORCE_QUIT: Row = Row {
+    keys: "SUPER+SHIFT+Q",
+    action: "FORCE QUIT APP",
+};
+
 /// The pointer's rows, below the chords.
 pub const POINTING: &[Row] = &[
     // Not chords, and the only lines here the dispatch test cannot drive.
@@ -158,7 +163,11 @@ impl HelpAction {
 /// The sheet's rows in order: the chords, `Super+l`'s where `locks`, then
 /// the pointer's.
 pub fn rows(locks: bool) -> impl Iterator<Item = &'static Row> {
-    CHORDS.iter().chain(locks.then_some(&LOCK)).chain(POINTING)
+    CHORDS
+        .iter()
+        .chain(locks.then_some(&LOCK))
+        .chain(locks.then_some(&FORCE_QUIT))
+        .chain(POINTING)
 }
 
 #[derive(Clone, Default)]
@@ -323,7 +332,7 @@ mod tests {
         );
         // The paired card, `Super+l`'s row included, fits 800x600 whole
         // too, and the title clears the first row by more than a row gap.
-        assert_eq!(card_height(true), 541);
+        assert_eq!(card_height(true), 542);
         assert!(card_height(true) <= 600 - CARD_PADDING * 2);
         const _: () = assert!(TITLE_TOP + ROW_STEP < FIRST_ROW_TOP);
     }
@@ -335,10 +344,10 @@ mod tests {
         let direct: Vec<&Row> = rows(false).collect();
         let paired: Vec<&Row> = rows(true).collect();
         assert!(!direct.contains(&&LOCK));
-        assert_eq!(paired.len(), direct.len() + 1);
+        assert_eq!(paired.len(), direct.len() + 2);
         assert_eq!(paired.get(CHORDS.len()), Some(&&LOCK));
         assert_eq!(paired.iter().filter(|row| ***row == LOCK).count(), 1);
-        assert_eq!(card_height(true), card_height(false) + ROW_STEP);
+        assert_eq!(card_height(true), card_height(false) + 2 * ROW_STEP);
         let (width, height) = (900usize, 700usize);
         let stride = width * 4;
         let painted = |locks: bool| {

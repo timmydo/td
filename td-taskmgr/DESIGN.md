@@ -457,6 +457,13 @@ kernel permission boundary until separately authorized elevation exists.
 There is no sudo, su, setuid executable, capability grant, password dialog,
 or privileged helper.
 
+For a physical Super+Shift+Q on a native window, the paired compositor
+captures the connector's identity. td-authd invokes the fixed
+`--force-quit-peer PID INODE` operation through td-login as the human.
+The helper verifies the live procfs identity, caller and target accounts
+and protected-process rules before sending SIGKILL on the same descriptor.
+A native client can be launched from any terminal or desktop entry point.
+
 Keep action preparation, typed intent, and execution separate. A future
 authorized executor can accept a descriptor-bound signal and exact member
 set after fresh request-bound consent. That increment must amend the

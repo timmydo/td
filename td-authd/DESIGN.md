@@ -1316,6 +1316,7 @@ Subsequent payloads are exact byte records:
 | `23` | `88` and which of the registry's Flathub declarations are installed ("Application requests") |
 | `24` plus a verb byte and an application name | an application cache request ("Application requests"): `86` once an operation started, or for status `87` and the last record |
 | `2c` plus a verb, the kind, an application name and a start row or path | a grant request ("Grant requests"): `89` a page of the account's directory rows, `8a` what a change did, or `8b` the writer's refusal |
+| `33` plus a big-endian host PID (4 bytes), procfs inode (8 bytes), and optional registered application name | `b3` when root accepted a force quit. An empty name runs the fixed td-taskmgr peer-stop helper through td-login as the human, with the same pinned identity. For a registered application, td-svc checks the member against its current unit instance before stopping it. |
 | `30` | `81` plus a process handle for the human sound panel, td-mixer |
 
 `0d` and `0f` name an application: the rest of the frame, one to 64

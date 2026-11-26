@@ -2260,10 +2260,18 @@ impl Client {
         let outbound = Outbound::new(writer, deadline)?;
         let resources = Arc::new(ClientResourceHighWater::default());
         resources.observe_objects(objects.len());
-        runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned".to_string())?
-            .register_client_resources(id, Arc::clone(&resources))?;
+        {
+            let target = (access == ClientAccess::Public)
+                .then(|| crate::quit_target::Target::capture(&stream))
+                .flatten();
+            let mut runtime = runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?;
+            runtime.register_client_resources(id, Arc::clone(&resources))?;
+            if let Some(target) = target {
+                runtime.set_quit_target(id, target);
+            }
+        }
         Ok(Client {
             id,
             access,

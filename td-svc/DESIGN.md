@@ -6,6 +6,12 @@ not checkable by any compiler or lint — they are recorded here because the
 failure modes they prevent are silent, and because each was found the hard
 way rather than reasoned out in advance.
 
+The private supervisor control verb `stop-instance NAME MEMBER-PID PROC-INODE`
+stops the named unit only when the pinned process is the current leader or
+one of its descendants. The supervisor retains the leader directory from
+spawn and checks membership in the same dispatch that starts the stop.
+The ordinary stop path owns the grace deadline and restart suppression.
+
 ## 1. Why the split exists
 
 PID 1 (`td-init`'s `init` applet) supervises with **no signals at all**: a

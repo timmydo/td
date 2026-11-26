@@ -95,6 +95,7 @@ mod output;
 mod pointer;
 mod positioner;
 mod proc_status;
+mod quit_target;
 mod reportable;
 mod runtime;
 mod scene;
@@ -1225,7 +1226,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xda504ee46881a021;
+    const AUTHORITY_FINGERPRINT: u64 = 0xebe81ec868346078;
     const AUTH_SYS_FINGERPRINT: u64 = 0xb64878d738ec4031;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1294,6 +1295,7 @@ mod confinement {
         ("positioner.rs", include_str!("positioner.rs")),
         ("proc_status.rs", include_str!("proc_status.rs")),
         ("reportable.rs", include_str!("reportable.rs")),
+        ("quit_target.rs", include_str!("quit_target.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
         ("screenshot.rs", include_str!("screenshot.rs")),
@@ -1758,9 +1760,9 @@ unsafe impl Send for MappedRegion {}"#;
         }
         assert_eq!(occurrences(SYS, "pub fn peer_uid("), 1);
         assert_eq!(occurrences(production(SYS), "SO_PEERCRED"), 7);
-        assert_eq!(occurrences(production(SYS), "SOL_SOCKET as usize"), 1);
+        assert_eq!(occurrences(production(SYS), "SOL_SOCKET as usize"), 2);
         assert_eq!(occurrences(production(SYS), "as *mut [u32; 3]"), 1);
-        assert_eq!(occurrences(production(SYS), "as *mut u32"), 1);
+        assert_eq!(occurrences(production(SYS), "as *mut u32"), 2);
     }
 
     /// The person's account is the installed one, whatever its name: no
@@ -2173,6 +2175,17 @@ unsafe impl Send for MappedRegion {}"#;
             (&mut credentials as *mut [u32; 3]) as usize,
             (&mut length as *mut u32) as usize,
         )"#;
+        assert!(SYS.contains("const SO_PEERPIDFD: i32 = 77;"));
+        assert!(SYS.contains(
+            r#"syscall5(
+            SYS_GETSOCKOPT,
+            stream.as_raw_fd() as usize,
+            SOL_SOCKET as usize,
+            SO_PEERPIDFD as usize,
+            (&mut fd as *mut i32) as usize,
+            (&mut length as *mut u32) as usize,
+        )"#
+        ));
         let unmap =
             r#"        let _ = syscall5(SYS_MUNMAP, self.address as usize, self.length, 0, 0, 0);"#;
         let map = r#"            SYS_MMAP,
@@ -2182,7 +2195,7 @@ unsafe impl Send for MappedRegion {}"#;
             MAP_SHARED,
             fd as usize,
             offset,"#;
-        assert_eq!(occurrences(SYS, "syscall5("), 9);
+        assert_eq!(occurrences(SYS, "syscall5("), 10);
         // The definition and the ONE call. `mmap` is the only six-argument
         // syscall this crate makes, and a second caller of `syscall6` would be
         // a second mapping with no region type owning its unmap.
@@ -2229,7 +2242,7 @@ pub struct MappedRegion {
         assert_eq!(occurrences(SYS, "SYS_IOCTL"), 2);
         assert_eq!(occurrences(SYS, "SYS_SENDMSG"), 2);
         assert_eq!(occurrences(SYS, "SYS_RECVMSG"), 2);
-        assert_eq!(occurrences(SYS, "SYS_GETSOCKOPT"), 2);
+        assert_eq!(occurrences(SYS, "SYS_GETSOCKOPT"), 3);
         assert_eq!(occurrences(SYS, close), 1);
         assert_eq!(occurrences(SYS, receive), 1);
         assert_eq!(occurrences(SYS, send), 1);
@@ -2471,6 +2484,7 @@ pub struct MappedRegion {
                     | "input.rs"
                     | "drm.rs"
                     | "session.rs"
+                    | "quit_target.rs"
                     | "runtime.rs"
             ) {
                 continue;
@@ -2631,7 +2645,8 @@ pub struct MappedRegion {
         // syscall users. The union of the module roster is not confinement.
         const FAMILIES: &[(&[&str], &[&str])] = &[
             (TRANSPORT, &["client.rs", "conn.rs", "server.rs"]),
-            (PEER_AUTH, &["server.rs", "session.rs"]),
+            (PEER_AUTH, &["server.rs", "session.rs", "quit_target.rs"]),
+            (&["sys::peer_pidfd("], &["quit_target.rs"]),
             (ABSOLUTE, &["input.rs"]),
             (&["sys::drm_", "sys::parse_drm_event"], &["drm.rs"]),
             (
@@ -3485,7 +3500,7 @@ pub struct MappedRegion {
         // The runtime withholds a client's paint, focus and input while a
         // lock is owed, and nothing on a private screen; Print captures
         // nothing then either, and `Super+q` closes nothing.
-        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 9);
+        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 10);
         assert!(runtime.contains(
             "        !self.scene.private_screen() && self.resume.as_ref().is_some_and(|resume| resume.holds())\n"
         ));

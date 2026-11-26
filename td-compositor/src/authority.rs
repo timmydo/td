@@ -59,6 +59,7 @@ enum Work {
     /// `28`: root opens the password notebook's window.
     Notebook,
     Supervised(Supervised),
+    ForceQuit(crate::quit_target::Target),
     Secret(std::sync::Arc<crate::secret_client::Attempt>),
 }
 
@@ -1408,6 +1409,12 @@ impl Launcher {
         }
     }
 
+    pub(crate) fn force_quit(&self, target: crate::quit_target::Target) -> Result<(), String> {
+        self.send
+            .try_send(Work::ForceQuit(target))
+            .map_err(|_| "force quit could not reach the session authority".into())
+    }
+
     pub fn supervise(&self, request: Supervised) -> Result<(), String> {
         // Root ends the generation on a malformed name; refused here.
         if matches!(&request, Supervised::Start(name) if !consent::application_name(name)) {
@@ -1995,6 +2002,24 @@ fn worker(
         secrets.set_revocation(login.revocation());
         match work {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
+            Ok(Work::ForceQuit(target)) => {
+                if wire.exchange(&target.request()?)?.as_slice() != [0xb3] {
+                    let runtime = login
+                        .login
+                        .0
+                        .lock()
+                        .map_err(|_| "login lock poisoned")?
+                        .website_notice
+                        .upgrade();
+                    if let Some(runtime) = runtime {
+                        let mut runtime = runtime.lock().map_err(|_| "runtime lock poisoned")?;
+                        if !runtime.session_locked() {
+                            runtime
+                                .input_notice("Force quit refused or application already closed")?;
+                        }
+                    }
+                }
+            }
             Ok(Work::Supervised(request)) => {
                 if let Some(error) = supervise(&mut wire, request, &application)? {
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");

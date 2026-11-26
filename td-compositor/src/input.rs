@@ -431,6 +431,7 @@ struct KeyDecision {
     command: Option<Command>,
     /// `Super+q`: ask the focused window to close.
     close: bool,
+    force_quit: bool,
     launcher: Option<LauncherAction>,
     help: Option<HelpAction>,
     screenshot: Option<ScreenshotAction>,
@@ -480,6 +481,7 @@ impl KeyBindings {
             volume: None,
             command: None,
             close: false,
+            force_quit: false,
             launcher: None,
             help: None,
             screenshot: None,
@@ -777,7 +779,14 @@ impl KeyBindings {
         // and the client may refuse; nothing is ever killed.
         if event.code == KEY_Q {
             self.consumed.insert(physical);
-            decision.close = true;
+            if shift && self.attention_enabled {
+                let eligible = |a, b| self.attention_pressed(a) || self.attention_pressed(b);
+                decision.force_quit = !self.excluded(device)
+                    && eligible(KEY_LEFTMETA, KEY_RIGHTMETA)
+                    && eligible(KEY_LEFTSHIFT, KEY_RIGHTSHIFT);
+            } else {
+                decision.close = true;
+            }
             return decision;
         }
         if let Some(direction) = direction(event.code) {
@@ -1964,6 +1973,9 @@ trait InputTarget {
     /// `Super+q`: ask the focused window to close. Required, so a target
     /// cannot silently make the chord do nothing.
     fn close(&mut self) -> Result<(), String>;
+    fn force_quit(&mut self) -> Result<(), String> {
+        Err("force quit requires the physical session".into())
+    }
     fn launcher(&mut self, action: LauncherAction) -> Result<bool, String>;
     /// Answers whether the sheet is up afterwards, as `launcher` does: the
     /// adapter must know to route the NEXT key to it.
@@ -3050,6 +3062,29 @@ impl InputTarget for LiveInputTarget {
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .close_focused();
+        Ok(())
+    }
+
+    fn force_quit(&mut self) -> Result<(), String> {
+        let target = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned")?
+            .focused_quit_target();
+        let result = target
+            .ok_or("focused window has no force quit target".into())
+            .and_then(|target| {
+                self.launches
+                    .task_launcher()
+                    .ok_or("force quit needs the paired session")?
+                    .force_quit(target)
+            });
+        if let Err(message) = result {
+            self.runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned")?
+                .input_notice(&message)?;
+        }
         Ok(())
     }
 
@@ -4415,6 +4450,7 @@ fn apply_locked<T: InputTarget>(
         && decision.field.is_none()
         && decision.command.is_none()
         && !decision.close
+        && !decision.force_quit
         && decision.launcher.is_none()
         && decision.help.is_none()
         && decision.screenshot.is_none()
@@ -4525,6 +4561,7 @@ fn deliver_key_decision<T: InputTarget>(
     // "Session lock"); the runtime withholds keys from clients itself.
     let bindings_ordinary = decision.command.is_some()
         || decision.close
+        || decision.force_quit
         || decision.launcher.is_some()
         || decision.help.is_some()
         || decision.screenshot.is_some()
@@ -4532,6 +4569,7 @@ fn deliver_key_decision<T: InputTarget>(
     if bindings_ordinary && runtime.session_locked() {
         decision.command = None;
         decision.close = false;
+        decision.force_quit = false;
         decision.launcher = None;
         decision.help = None;
         decision.screenshot = None;
@@ -4598,6 +4636,9 @@ fn deliver_key_decision<T: InputTarget>(
     }
     if let Some(command) = decision.command {
         runtime.command(command)?;
+    }
+    if decision.force_quit {
+        runtime.force_quit()?;
     }
     if decision.close {
         runtime.close()?;
@@ -8681,6 +8722,7 @@ mod tests {
         Screenshot(ScreenshotAction),
         /// `Super+q`'s polite close.
         Close,
+        ForceQuit,
         /// The paired profile's session lock.
         Lock,
         /// Documented but not a key, so this row is exercised elsewhere. The
@@ -8765,6 +8807,7 @@ mod tests {
                 Bound::Help(_) => "THIS HELP",
                 Bound::Screenshot(_) => "SCREENSHOT",
                 Bound::Close => "CLOSE WINDOW",
+                Bound::ForceQuit => "FORCE QUIT APP",
                 Bound::Lock => "LOCK SCREEN",
             }
         }
@@ -8864,6 +8907,7 @@ mod tests {
             ),
             (&[], KEY_SYSRQ, Bound::Screenshot(ScreenshotAction::Take)),
             (&[KEY_LEFTMETA], KEY_L, Bound::Lock),
+            (&[KEY_LEFTMETA, KEY_LEFTSHIFT], KEY_Q, Bound::ForceQuit),
             (&[], 0, Bound::Pointer("HOVER", Pointing::Focus)),
             (&[], 0, Bound::Pointer("CLICK", Pointing::Focus)),
             (&[], 0, Bound::Pointer("DRAG A TITLE", Pointing::Move)),
@@ -8915,6 +8959,9 @@ mod tests {
                 (None, None, None, None, Some(action), false, false) => Bound::Screenshot(action),
                 (None, None, None, None, None, true, false) => Bound::Lock,
                 (None, None, None, None, None, false, true) => Bound::Close,
+                (None, None, None, None, None, false, false) if decision.force_quit => {
+                    Bound::ForceQuit
+                }
                 other => panic!("{} produced {other:?}", row.keys),
             };
             assert_eq!(&actual, expected, "{} / {}", row.keys, row.action);

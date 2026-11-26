@@ -20,6 +20,16 @@ fn run() -> io::Result<()> {
     if command.is_none() {
         return window::open(None);
     }
+    if command.as_deref() == Some("--force-quit-peer") {
+        let pid = args.next().and_then(|arg| arg.parse().ok());
+        let inode = args.next().and_then(|arg| arg.parse().ok());
+        let (Some(pid), Some(inode), None) = (pid, inode, args.next()) else {
+            return Err(io::Error::other(
+                "force quit requires a PID and procfs inode",
+            ));
+        };
+        return td_taskmgr::force_quit_peer(pid, inode);
+    }
     if command.as_deref() == Some("--control-socket") {
         let path = args
             .next()

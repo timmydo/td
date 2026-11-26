@@ -527,6 +527,11 @@ enum Request {
     Poll(u64),
     Heartbeat,
     Supervised(Supervised),
+    ForceQuit {
+        pid: u32,
+        inode: u64,
+        application: Option<String>,
+    },
     /// `0f` and a name: that application unit's state, as root last read
     /// it.
     UnitState(String),
@@ -928,6 +933,31 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [0x0d, name @ ..] if !name.is_empty() => {
             Ok(Request::Supervised(Supervised::Start(application(name)?)))
         }
+        [0x33, rest @ ..] => {
+            let (pid, rest) = rest.split_at_checked(4).ok_or("missing force quit PID")?;
+            let (inode, name) = rest
+                .split_at_checked(8)
+                .ok_or("missing force quit identity")?;
+            let pid = u32::from_be_bytes(pid.try_into().map_err(|_| "invalid force quit PID")?);
+            let inode = u64::from_be_bytes(
+                inode
+                    .try_into()
+                    .map_err(|_| "invalid force quit identity")?,
+            );
+            if pid < 2 || pid > i32::MAX as u32 || inode == 0 {
+                return Err("invalid force quit target".into());
+            }
+            let application = if name.is_empty() {
+                None
+            } else {
+                Some(application(name)?)
+            };
+            Ok(Request::ForceQuit {
+                pid,
+                inode,
+                application,
+            })
+        }
         // 0e started the retired Firefox update unit; it stays unassigned.
         [0x0f, name @ ..] if !name.is_empty() => Ok(Request::UnitState(application(name)?)),
         [2, rest @ ..] if rest.len() == 8 => {
@@ -965,6 +995,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
 struct Launches {
     sandbox_reader: Option<Inspection>,
     children: BTreeMap<u64, Child>,
+    stopping: Option<(Inspection, File)>,
     next: u64,
     generation: String,
     /// At most one `td-svc start` per unit in flight, and at most
@@ -1030,6 +1061,7 @@ impl Launches {
     ) -> Self {
         Self {
             children: BTreeMap::new(),
+            stopping: None,
             sandbox_reader: None,
             next: 1,
             generation,
@@ -1050,8 +1082,68 @@ impl Launches {
         }
     }
 
+    fn force_quit(
+        &mut self,
+        config: &Config,
+        pid: u32,
+        inode: u64,
+        name: Option<&str>,
+    ) -> Result<bool, String> {
+        if std::fs::symlink_metadata(LIVE_MEDIUM).is_ok() {
+            return Ok(false);
+        }
+        let path = crate::text(format_args!("/proc/{pid}"))?;
+        let Ok(directory) = File::open(&path) else {
+            return Ok(false);
+        };
+        if directory.metadata().ok().is_none_or(|m| m.ino() != inode) {
+            return Ok(false);
+        }
+        if self.stopping.is_some() {
+            return Ok(false);
+        }
+        let pid = crate::text(format_args!("{pid}"))?;
+        let inode = crate::text(format_args!("{inode}"))?;
+        let command = if let Some(name) = name {
+            if self.registered(name) != Some(true) {
+                return Ok(false);
+            }
+            let mut command = Command::new("/bin/td-svc");
+            command.args(["stop-instance", name, &pid, &inode]);
+            command
+        } else {
+            let mut command = Command::new("/bin/td-login");
+            command.args([
+                "exec-as",
+                &config.user,
+                "--",
+                "/bin/td-taskmgr",
+                "--force-quit-peer",
+                &pid,
+                &inode,
+            ]);
+            command
+        };
+        let Ok(stop) = Inspection::printing(command, 1024, CHECK_TIMEOUT) else {
+            return Ok(false);
+        };
+        self.stopping = Some((stop, directory));
+        Ok(self
+            .stopping
+            .as_mut()
+            .and_then(|(stop, _)| stop.wait())
+            .is_some())
+    }
+
     fn answer(&mut self, config: &Config, request: Request) -> Result<Vec<u8>, String> {
         self.reap_supervised();
+        if self
+            .stopping
+            .as_mut()
+            .is_some_and(|(child, _)| child.reaped())
+        {
+            self.stopping = None;
+        }
         // Every launch request and heartbeat reaps a finished status
         // client, so one the peer stopped asking about is not left a
         // zombie, and a finished application request.
@@ -1061,6 +1153,15 @@ impl Launches {
         self.unit.advance();
         self.software.advance();
         match request {
+            Request::ForceQuit {
+                pid,
+                inode,
+                application,
+            } => {
+                let stopped = self.force_quit(config, pid, inode, application.as_deref())?;
+                crate::allocation::copy(if stopped { &[0xb3] } else { &[0xff, 2] })
+                    .map_err(crate::refused)
+            }
             Request::Software(request) => Ok(self.software.answer(config.owner, request)),
             Request::Sandboxes => {
                 if self.sandbox_reader.is_some() {

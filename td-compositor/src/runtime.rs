@@ -789,7 +789,13 @@ pub struct Runtime {
     /// Per-connection monotonic counters. The dispatch thread owns the live
     /// objects; atomics let the runtime snapshot the matching client at the
     /// exact painted-content transition without taking a client-local lock.
-    client_resources: BTreeMap<u64, Arc<ClientResourceHighWater>>,
+    client_resources: BTreeMap<
+        u64,
+        (
+            Arc<ClientResourceHighWater>,
+            Option<crate::quit_target::Target>,
+        ),
+    >,
     /// The window a press picked up, held until the button is released.
     /// Nothing in the pointer model carries it: neither press a drag begins
     /// with is delivered, so no client is told any of this.
@@ -1076,12 +1082,30 @@ impl Runtime {
                 "client {client} registered resource telemetry more than once"
             ));
         }
-        self.client_resources.insert(client, resources);
+        self.client_resources.insert(client, (resources, None));
         if self.headless_output.is_some() {
             self.headless_commits
                 .insert(client, ClientCommit::default());
         }
         Ok(())
+    }
+
+    pub(crate) fn set_quit_target(&mut self, client: u64, target: crate::quit_target::Target) {
+        if let Some((_, slot)) = self.client_resources.get_mut(&client) {
+            *slot = Some(target);
+        }
+    }
+
+    pub(crate) fn focused_quit_target(&self) -> Option<crate::quit_target::Target> {
+        if self.scene.modal() || self.resume_withholds() || self.scene.portal_modal().is_some() {
+            return None;
+        }
+        let surface = self.topmost_parented(self.scene.focused()?);
+        self.client_resources
+            .get(&surface.client)?
+            .1
+            .as_ref()?
+            .duplicate()
     }
 
     pub(crate) fn unregister_client_resources(&mut self, client: u64) {
@@ -2813,6 +2837,7 @@ impl Runtime {
                     key.client
                 )
             })?
+            .0
             .snapshot();
         let evidence = ApplicationEvidence {
             app_id: ready.expected_app_id.clone(),

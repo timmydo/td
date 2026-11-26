@@ -406,6 +406,29 @@ fn drm_ioctl(fd: RawFd, request: usize, argument: usize, operation: &str) -> Res
     ))
 }
 
+/// The kernel's reference to the original socket connector, even if it
+/// handed the connection to another process before exiting.
+pub fn peer_pidfd(stream: &UnixStream) -> Result<File, String> {
+    const SO_PEERPIDFD: i32 = 77;
+    let mut fd: i32 = -1;
+    let mut length = 4u32;
+    errno_result(
+        syscall5(
+            SYS_GETSOCKOPT,
+            stream.as_raw_fd() as usize,
+            SOL_SOCKET as usize,
+            SO_PEERPIDFD as usize,
+            (&mut fd as *mut i32) as usize,
+            (&mut length as *mut u32) as usize,
+        ),
+        "getsockopt SO_PEERPIDFD",
+    )?;
+    if length != 4 {
+        return Err("unexpected peer pidfd length".into());
+    }
+    take_received(fd)
+}
+
 /// The uid sampled by the kernel when this Unix-stream peer connected.
 ///
 /// The option and level are fixed here rather than accepted from a caller.

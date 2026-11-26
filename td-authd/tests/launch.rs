@@ -1539,3 +1539,21 @@ fn sandbox_request_is_a_fixed_unprivileged_terminal_command() {
         .is_err()
     );
 }
+
+#[test]
+fn force_quit_rejects_a_stale_inode_or_an_invalid_record() {
+    let pid = std::process::id();
+    let inode = File::open("/proc/self").unwrap().metadata().unwrap().ino();
+    let mut launches = Launches::new("000102030405060708090a0b0c0d0e0f".into());
+    let record = |inode: u64| [&[0x33][..], &pid.to_be_bytes(), &inode.to_be_bytes()].concat();
+    assert_eq!(
+        launches
+            .answer(&config(), request(&record(inode + 1)).unwrap())
+            .unwrap(),
+        [0xff, 2]
+    );
+    assert!(request(&record(0)).is_err());
+    let mut named = record(inode);
+    named.extend_from_slice(b"../unknown");
+    assert!(request(&named).is_err());
+}
