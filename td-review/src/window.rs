@@ -7,7 +7,9 @@
 //! in `app.rs`); a window that ran them on its own thread could neither show
 //! that frame nor answer the compositor until they ended. So the window
 //! thread owns the Wayland connection and paints whatever frame arrived last,
-//! and the worker owns the `App`, its git, and every decision.
+//! and the worker owns the `App`, its git, and every decision. Branch checks
+//! run independently against the worker's snapshot so a list refresh does
+//! not wait for trial merges.
 //!
 //! What crosses between them is what a terminal used to carry. Inputs go to
 //! the worker in the order they were made, each stamped with a frame the
@@ -39,8 +41,8 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -302,6 +304,8 @@ enum Event {
     },
     /// The grid changed: lay the frame out again.
     Redraw,
+    /// The worker's wait expired while branch checks were running.
+    CheckBranches,
     /// The compositor asked the window to close.
     Close,
 }
@@ -373,7 +377,7 @@ impl Link {
 
     /// The next input made against a frame no older than the floor, or none
     /// once the window has gone.
-    fn next(&mut self) -> Option<Event> {
+    fn next(&mut self, checking: bool) -> Option<Event> {
         loop {
             let event = match self.events.try_recv() {
                 Ok(event) => event,
@@ -382,7 +386,15 @@ impl Link {
                     // pace of an input in flight. A window that has gone is
                     // seen by the receive.
                     let _ = self.messages.send(Message::Idle { taken: self.taken });
-                    self.events.recv().ok()?
+                    if checking {
+                        match self.events.recv_timeout(Duration::from_millis(IDLE_MS)) {
+                            Ok(event) => event,
+                            Err(RecvTimeoutError::Timeout) => return Some(Event::CheckBranches),
+                            Err(RecvTimeoutError::Disconnected) => return None,
+                        }
+                    } else {
+                        self.events.recv().ok()?
+                    }
                 }
                 Err(TryRecvError::Disconnected) => return None,
             };
@@ -424,34 +436,74 @@ impl Ui for Link {
 /// The worker: draw, settle, take the next input, act on it — the loop the
 /// terminal ran, over the window's inputs.
 fn serve(mut app: App, mut link: Link) -> io::Result<()> {
-    loop {
-        let (rows, cols) = link.size();
-        link.draw(app.render(rows, cols))?;
-        // The prompt is on screen now: drop anything made while the last
-        // command ran, before taking the answer.
-        app.settle_prompt(&mut link)?;
-        let Some(event) = link.next() else {
-            return Ok(());
+    let git = app.git().try_clone()?;
+    let current = AtomicU64::new(app.checks_revision());
+    thread::scope(|scope| {
+        let spawn = |job: app::CheckJob| {
+            let (git, current) = (&git, &current);
+            thread::Builder::new().spawn_scoped(scope, move || job.run(git, current))
         };
-        match event {
-            Event::Key { key, .. } => {
-                if matches!(app.feed(vec![key], &mut link)?, app::Flow::Quit) {
-                    return Ok(());
+        let mut check = None;
+        let mut checked_frame = 0;
+        let result = (|| loop {
+            // At most one batch runs at a time. An obsolete batch stops
+            // between branches, then the checker takes the newest snapshot.
+            current.store(app.checks_revision(), Ordering::Relaxed);
+            if let Some(done) =
+                check.take_if(|job: &mut thread::ScopedJoinHandle<'_, _>| job.is_finished())
+            {
+                if let Some(checked) = thread::ScopedJoinHandle::join(done)
+                    .map_err(|_| io::Error::other("branch checker panicked"))??
+                {
+                    if app.finish_checks(checked) {
+                        checked_frame = link.generation.saturating_add(1);
+                    }
                 }
             }
-            Event::Pick {
-                refname, double, ..
-            } => app.pick(&refname, double, link.size().0)?,
-            Event::Wheel { rows, .. } => {
-                let (height, cols) = link.size();
-                app.wheel(rows, height, cols);
+            if check.is_none() {
+                check = app.pending_checks()?.map(spawn).transpose()?;
             }
-            Event::Redraw => {}
-            // As `q` does, and from a prompt as leaving it does: a confirmation
-            // still up is answered no, an unfinished landing left as it is.
-            Event::Close => return Ok(()),
+            let (rows, cols) = link.size();
+            link.draw(app.render(rows, cols))?;
+            app.settle_prompt(&mut link)?;
+            let event = loop {
+                match link.next(check.is_some()) {
+                    Some(Event::CheckBranches)
+                        if check.as_ref().is_some_and(|job| !job.is_finished()) => {}
+                    event => break event,
+                }
+            };
+            match event {
+                Some(Event::Key { key, seen }) => {
+                    // A pending row may have become eligible for automatic
+                    // deletion. Other keys still apply to the same rows.
+                    if seen < checked_frame && app.is_delete_shortcut(key) {
+                        continue;
+                    }
+                    if matches!(app.feed(vec![key], &mut link)?, app::Flow::Quit) {
+                        return Ok(());
+                    }
+                }
+                Some(Event::Pick {
+                    refname, double, ..
+                }) => {
+                    app.pick(&refname, double, link.size().0)?;
+                }
+                Some(Event::Wheel { rows, .. }) => {
+                    let (height, cols) = link.size();
+                    app.wheel(rows, height, cols);
+                }
+                Some(Event::Redraw | Event::CheckBranches) => {}
+                // As q does, and from a prompt as leaving it does.
+                Some(Event::Close) | None => return Ok(()),
+            }
+        })();
+        current.fetch_add(1, Ordering::Relaxed);
+        if let Some(check) = check {
+            let _ = thread::ScopedJoinHandle::join(check);
         }
-    }
+        result
+    })
 }
 
 /// A frame painted whole: its generation, when, and its list rows' branches.
@@ -1337,12 +1389,12 @@ mod tests {
         ] {
             events.send(event).unwrap();
         }
-        assert_eq!(link.next(), Some(Event::Redraw));
-        assert_eq!(link.next(), Some(key('n', 2)));
-        assert_eq!(link.next(), Some(Event::Close));
+        assert_eq!(link.next(false), Some(Event::Redraw));
+        assert_eq!(link.next(false), Some(key('n', 2)));
+        assert_eq!(link.next(false), Some(Event::Close));
         assert_eq!(link.taken, 6);
         drop(events);
-        assert_eq!(link.next(), None);
+        assert_eq!(link.next(false), None);
         let generations: Vec<u64> = messages
             .try_iter()
             .filter_map(|m| match m {
@@ -1360,8 +1412,8 @@ mod tests {
         link.draw(Frame::new(1, 1)).unwrap();
         events.send(key('j', 0)).unwrap();
         events.send(key('k', 1)).unwrap();
-        assert_eq!(link.next(), Some(key('j', 0)));
-        assert_eq!(link.next(), Some(key('k', 1)));
+        assert_eq!(link.next(false), Some(key('j', 0)));
+        assert_eq!(link.next(false), Some(key('k', 1)));
     }
 
     /// The worker says it took an input when it takes one, and that it is idle
@@ -1370,7 +1422,7 @@ mod tests {
     fn the_worker_says_what_it_took_and_when_it_waits() {
         let (mut link, events, messages) = link();
         events.send(Event::Redraw).unwrap();
-        let worker = thread::spawn(move || (link.next(), link.next()));
+        let worker = thread::spawn(move || (link.next(false), link.next(false)));
         assert!(matches!(messages.recv(), Ok(Message::Taken { taken: 1 })));
         // The second `next` finds nothing queued: it says so, then waits.
         assert!(matches!(messages.recv(), Ok(Message::Idle { taken: 1 })));

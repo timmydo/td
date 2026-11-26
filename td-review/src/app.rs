@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::git::{self, now_unix, Branch, DefaultRemote, Git};
@@ -98,10 +99,58 @@ struct Reviewing {
     empty: bool,
 }
 
+struct BranchInput {
+    tip: String,
+    counts: Option<(u32, u32)>,
+}
+
+pub struct CheckJob {
+    revision: u64,
+    base_oid: Option<String>,
+    branches: Vec<BranchInput>,
+}
+
+pub struct CheckedBranches {
+    revision: u64,
+    readiness: Vec<record::Readiness>,
+    prospects: Vec<git::Prospect>,
+}
+
+impl CheckJob {
+    pub fn run(self, git: &Git, current: &AtomicU64) -> io::Result<Option<CheckedBranches>> {
+        let mut readiness =
+            td_alloc::with_capacity(self.branches.len()).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        let mut prospects =
+            td_alloc::with_capacity(self.branches.len()).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        let base_oid = self.base_oid.as_deref();
+        let base = base_oid.and_then(|oid| git.base_tree(oid).ok());
+        for branch in self.branches {
+            if current.load(Ordering::Relaxed) != self.revision {
+                return Ok(None);
+            }
+            let ready = readiness_of(git, base_oid, &branch.tip, branch.counts);
+            let prospect = git.prospect_of(
+                base.as_ref(),
+                &branch.tip,
+                matches!(branch.counts, Some((0, _))),
+            );
+            td_alloc::push(&mut readiness, ready).map_err(|_| io::ErrorKind::OutOfMemory)?;
+            td_alloc::push(&mut prospects, prospect).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        }
+        Ok(Some(CheckedBranches {
+            revision: self.revision,
+            readiness,
+            prospects,
+        }))
+    }
+}
+
 pub struct App {
     git: Git,
     base: String,
     branches: Vec<Branch>,
+    base_oid: Option<String>,
+    checks_revision: u64,
     /// Per-branch review-record status, aligned with `branches` — whether every
     /// commit a landing would replay carries the record AGENTS.md requires.
     readiness: Vec<record::Readiness>,
@@ -146,6 +195,8 @@ impl App {
             git,
             base,
             branches: Vec::new(),
+            base_oid: None,
+            checks_revision: 0,
             readiness: Vec::new(),
             prospects: Vec::new(),
             view: Vec::new(),
@@ -224,28 +275,75 @@ impl App {
     /// it. Before `D` could delete unasked, a misaimed one raised a misaimed
     /// prompt; the keystroke is what changed, so the drain has to cover every
     /// way the rows move rather than the paths that happened to delete.
-    pub fn reload(&mut self) -> io::Result<()> {
+    pub fn reload(&mut self, force_checks: bool) -> io::Result<()> {
+        let base_oid = self.git.base_oid(&self.base).ok();
+        let branches = self.git.branches(&self.base, base_oid.as_deref())?;
+        if force_checks || base_oid != self.base_oid || branches != self.branches {
+            self.base_oid = base_oid;
+            self.branches = branches;
+            self.checks_revision = self.checks_revision.wrapping_add(1);
+            self.readiness.clear();
+            self.prospects.clear();
+        }
         self.stale_typeahead = true;
-        self.branches = self.git.branches(&self.base)?;
-        self.readiness = self
-            .branches
-            .iter()
-            .map(|b| readiness_of(&self.git, &self.base, b))
-            .collect();
-        // One merge per branch that has anything ahead at all. Measured on this
-        // repo's own remotes it costs what the record scan does, both around
-        // 8ms a branch; the patch count behind a conflicted merge is a second
-        // process, on the few branches that reach it.
-        let base_tree = self.git.resolve_base(&self.base).ok();
-        self.prospects = self
-            .branches
-            .iter()
-            .map(|b| self.git.prospect_of(base_tree.as_ref(), b))
-            .collect();
         self.base_stale = self.git.base_behind_upstream(&self.base).unwrap_or(None);
         self.now = now_unix();
         self.apply_filter();
         Ok(())
+    }
+
+    pub fn git(&self) -> &Git {
+        &self.git
+    }
+
+    pub fn checks_revision(&self) -> u64 {
+        self.checks_revision
+    }
+
+    pub fn pending_checks(&self) -> io::Result<Option<CheckJob>> {
+        if self.readiness.len() == self.branches.len() {
+            return Ok(None);
+        }
+        let base_oid = self
+            .base_oid
+            .as_deref()
+            .map(td_alloc::string)
+            .transpose()
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        let mut branches =
+            td_alloc::with_capacity(self.branches.len()).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        for b in &self.branches {
+            let tip = td_alloc::string(&b.commit).map_err(|_| io::ErrorKind::OutOfMemory)?;
+            td_alloc::push(
+                &mut branches,
+                BranchInput {
+                    tip,
+                    counts: b.counts,
+                },
+            )
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        }
+        Ok(Some(CheckJob {
+            revision: self.checks_revision,
+            base_oid,
+            branches,
+        }))
+    }
+
+    pub fn finish_checks(&mut self, checked: CheckedBranches) -> bool {
+        if checked.revision != self.checks_revision {
+            return false;
+        }
+        self.readiness = checked.readiness;
+        self.prospects = checked.prospects;
+        true
+    }
+
+    pub fn is_delete_shortcut(&self, key: Key) -> bool {
+        key == Key::Char('D')
+            && matches!(self.screen, Screen::List)
+            && !self.editing_filter
+            && self.prompt.is_none()
     }
 
     fn apply_filter(&mut self) {
@@ -385,6 +483,9 @@ impl App {
             .view
             .iter()
             .map(|&i| match self.branches.get(i) {
+                Some(_) if self.readiness.get(i).is_none() => {
+                    (td_alloc::string("…").unwrap_or_default(), false)
+                }
                 Some(b) => ready_cell(
                     b,
                     self.readiness.get(i),
@@ -596,7 +697,7 @@ impl App {
                 self.apply_filter();
             }
             Key::Char('r') => {
-                self.reload()?;
+                self.reload(true)?;
                 self.note("reloaded", Style::fg(GREEN));
             }
             Key::Char('f') => self.fetch(false, term)?,
@@ -659,7 +760,7 @@ impl App {
         self.redraw(term)?;
         let fetch = self.git.run(&args)?;
         if fetch.ok {
-            self.reload()?;
+            self.reload(false)?;
             self.note(format!("fetched {what}"), Style::fg(GREEN));
         } else {
             self.note(format!("fetch failed: {}", fetch.failure()), Style::fg(RED));
@@ -1488,12 +1589,13 @@ impl App {
             let row = self
                 .view
                 .get(self.sel)
-                .and_then(|&i| self.branches.get(i).zip(self.prospects.get(i)));
+                .and_then(|&i| Some((self.branches.get(i)?, self.prospects.get(i))));
             let why = match row {
                 Some((b, _)) if b.refname != refname => {
                     "this row is not the branch that was aimed at"
                 }
-                Some((b, &p)) if !takes_nothing(b, p) => {
+                Some((_, None)) => "this row's branch checks are still running",
+                Some((b, Some(&p))) if !takes_nothing(b, p) => {
                     "this row still counts commits the base does not carry"
                 }
                 Some(_) => "this row describes a commit that is no longer the branch's tip",
@@ -1733,7 +1835,7 @@ impl App {
 
     /// Re-read the branch list, downgrading a failure to a status note.
     fn refresh_quietly(&mut self) {
-        if let Err(e) = self.reload() {
+        if let Err(e) = self.reload(false) {
             self.log.push(Line::new(
                 format!("(branch list not refreshed: {e})"),
                 Style::fg(YELLOW),
@@ -1780,17 +1882,25 @@ fn fitted<'a>(cells: impl Iterator<Item = &'a str>, floor: usize) -> usize {
 ///
 /// One log per branch. A branch whose commits cannot be read stays `Unknown`
 /// rather than `Ready`: the column may never invent a record.
-pub fn readiness_of(git: &Git, base: &str, b: &Branch) -> record::Readiness {
-    // Fully qualified, like every other range here: a TAG named after the
-    // branch would otherwise resolve first, and the count cross-check below
-    // would then compare two different ranges.
-    match git.commit_records(&format!("refs/heads/{base}..refs/remotes/{}", b.refname)) {
+pub fn readiness_of(
+    git: &Git,
+    base_oid: Option<&str>,
+    tip: &str,
+    counts: Option<(u32, u32)>,
+) -> record::Readiness {
+    let Some(base_oid) = base_oid else {
+        return record::Readiness::Unknown;
+    };
+    let Ok(range) = td_alloc::format(format_args!("{base_oid}..{tip}")) else {
+        return record::Readiness::Unknown;
+    };
+    match git.commit_records(&range) {
         // Cross-checked against the count for-each-ref reported, which is free
         // and comes from a different query: a batch that lost a commit to a
         // separator in someone's message must not read as ready. Without counts
         // (pre-2.41 git) there is nothing to compare, and the scan stands on
         // its own parse.
-        Ok(commits) => match b.counts {
+        Ok(commits) => match counts {
             Some((ahead, _)) => record::readiness_for(ahead as usize, &commits),
             None => record::readiness(&commits),
         },
@@ -2214,8 +2324,117 @@ mod tests {
     fn app_on(work: &Path) -> App {
         let git = Git::discover(work).unwrap();
         let mut app = App::new(git, "main".to_string());
-        app.reload().unwrap();
+        app.reload(false).unwrap();
+        complete_checks(&mut app);
         app
+    }
+
+    fn complete_checks(app: &mut App) {
+        if let Some(job) = app.pending_checks().unwrap() {
+            let current = AtomicU64::new(app.checks_revision());
+            app.finish_checks(job.run(app.git(), &current).unwrap().unwrap());
+        }
+    }
+
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn fetch_reuses_unchanged_branch_checks_and_defers_changed_checks() {
+        let (root, work) = repo("fetch-checks");
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        let original = app.checks_revision();
+
+        app.handle(Key::Char('f'), &mut ui).unwrap();
+        assert_eq!(app.checks_revision(), original);
+        assert!(app.pending_checks().unwrap().is_none());
+
+        git_in(
+            &root.join("origin.git"),
+            &["branch", "--force", "work-0001-feature", "main"],
+        );
+        app.handle(Key::Char('f'), &mut ui).unwrap();
+
+        assert_eq!(app.status, "fetched origin");
+        assert_ne!(app.checks_revision(), original);
+        assert!(app.pending_checks().unwrap().is_some());
+        assert!(app
+            .render(10, 100)
+            .lines()
+            .iter()
+            .any(|line| line.text.contains("origin/work-0001-feature") && line.text.contains('…')));
+        complete_checks(&mut app);
+        assert_eq!(app.readiness, [record::Readiness::Empty]);
+    }
+
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn old_checks_cannot_set_verdicts_for_a_new_base() {
+        let (root, work) = repo("old-checks");
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        app.reload(true).unwrap();
+        let current = AtomicU64::new(app.checks_revision());
+        let stale = app.pending_checks().unwrap().unwrap();
+        let old_result = app
+            .pending_checks()
+            .unwrap()
+            .unwrap()
+            .run(app.git(), &current)
+            .unwrap()
+            .unwrap();
+
+        git_in(&work, &["merge", "--ff-only", "origin/work-0001-feature"]);
+        app.reload(false).unwrap();
+        current.store(app.checks_revision(), Ordering::Relaxed);
+        assert!(stale.run(app.git(), &current).unwrap().is_none());
+        app.finish_checks(old_result);
+        assert!(app.pending_checks().unwrap().is_some());
+
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+        assert!(matches!(app.prompt, Some(Prompt::Delete { .. })));
+        assert!(git_in(&root.join("origin.git"), &["show-ref"]).contains("work-0001-feature"));
+    }
+
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn completing_branch_checks_preserves_filter_input() {
+        let (_root, work) = repo("filter-during-checks");
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        app.reload(true).unwrap();
+        app.settle_prompt(&mut ui).unwrap();
+        app.handle(Key::Char('/'), &mut ui).unwrap();
+        app.handle(Key::Char('a'), &mut ui).unwrap();
+
+        complete_checks(&mut app);
+        assert!(!app.stale_typeahead());
+        assert!(!app.is_delete_shortcut(Key::Char('D')));
+        app.handle(Key::Char('D'), &mut ui).unwrap();
+        app.handle(Key::Enter, &mut ui).unwrap();
+
+        assert_eq!(app.filter, "aD");
+        assert!(app.is_delete_shortcut(Key::Char('D')));
+    }
+
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn branch_records_can_be_read_without_the_base_tree() {
+        let (_root, work) = repo("missing-base-tree");
+        git_in(&work, &["merge", "--ff-only", "origin/work-0001-feature"]);
+        std::fs::write(
+            work.join("f"),
+            "main
+",
+        )
+        .unwrap();
+        git_in(&work, &["commit", "-am", "advance the base"]);
+        let tree = git_in(&work, &["rev-parse", "main^{tree}"]);
+        let (dir, file) = tree.trim().split_at(2);
+        std::fs::remove_file(work.join(".git/objects").join(dir).join(file)).unwrap();
+
+        let app = app_on(&work);
+        assert!(app.git.base_tree(app.base_oid.as_deref().unwrap()).is_err());
+        assert_eq!(app.readiness, [record::Readiness::Empty]);
     }
 
     /// `discard` runs right after a destructive reset, so a check it could not
@@ -5121,7 +5340,8 @@ mod tests {
         git_in(&work, &["commit", "--allow-empty", "-m", "main moves on"]);
         git_in(&work, &["cherry-pick", "origin/work-0001-feature"]);
         let git = Git::discover(&work).unwrap();
-        let base = git.resolve_base("main").unwrap();
+        let base_oid = git.base_oid("main").unwrap();
+        let base = git.base_tree(&base_oid).unwrap();
         assert_eq!(
             git.prospect(&base, "refs/remotes/origin/work-0001-feature")
                 .ok(),

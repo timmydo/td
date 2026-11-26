@@ -5,7 +5,9 @@
 //! td-pinentry beside this program, ssh's and git's prompts ask in its window
 //! instead; without it they fail loudly.
 
+use std::ffi::OsString;
 use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -163,12 +165,13 @@ pub enum DefaultRemote {
 /// comparison describing different bases. Hoisting both out of the caller's
 /// loop is what keeps the per-branch cost one merge rather than a merge and a
 /// `rev-parse`.
-pub struct BaseTree {
-    oid: String,
+pub struct BaseTree<'a> {
+    oid: &'a str,
     tree: String,
 }
 
 /// One remote-tracking branch as shown in the list.
+#[derive(PartialEq, Eq)]
 pub struct Branch {
     pub refname: String,
     pub commit: String,
@@ -345,6 +348,13 @@ impl Git {
 
     pub fn repo(&self) -> &Path {
         &self.repo
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let path = td_alloc::copy(self.repo.as_os_str().as_bytes())
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        // Both conversions move the already allocated Unix path bytes.
+        Ok(Self::new(OsString::from_vec(path).into()))
     }
 }
 
@@ -549,10 +559,15 @@ impl Git {
         self.rev_parse(&format!("{rev}^{{tree}}"))
     }
 
-    /// Resolve a base once for a run of [`Git::prospect`] questions.
-    pub fn resolve_base(&self, base: &str) -> io::Result<BaseTree> {
-        let oid = self.rev_parse(&format!("refs/heads/{base}"))?;
-        let tree = self.tree_of(&oid)?;
+    pub fn base_oid(&self, base: &str) -> io::Result<String> {
+        let base_ref = td_alloc::format(format_args!("refs/heads/{base}"))
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        self.rev_parse(&base_ref)
+    }
+
+    /// Resolve the tree once for a run of [`Git::prospect`] questions.
+    pub fn base_tree<'a>(&self, oid: &'a str) -> io::Result<BaseTree<'a>> {
+        let tree = self.tree_of(oid)?;
         Ok(BaseTree { oid, tree })
     }
 
@@ -560,15 +575,17 @@ impl Git {
     /// the two answers that need no query at all. A branch with nothing ahead
     /// already reads as empty, and a base that would not resolve leaves every
     /// row saying what its record says.
-    pub fn prospect_of(&self, base: Option<&BaseTree>, b: &Branch) -> Prospect {
-        if b.nothing_ahead() {
+    pub fn prospect_of(
+        &self,
+        base: Option<&BaseTree<'_>>,
+        tip: &str,
+        nothing_ahead: bool,
+    ) -> Prospect {
+        if nothing_ahead {
             return Prospect::Outstanding;
         }
-        base.and_then(|base| {
-            self.prospect(base, &format!("refs/remotes/{}", b.refname))
-                .ok()
-        })
-        .unwrap_or(Prospect::Outstanding)
+        base.and_then(|base| self.prospect(base, tip).ok())
+            .unwrap_or(Prospect::Outstanding)
     }
 
     /// What a landing would find on `branch`: nothing, a conflict, or work.
@@ -603,11 +620,11 @@ impl Git {
     /// no patch id changes it. Skipping the count there is also what keeps this
     /// bounded — with no merge base `A...B` is the union of BOTH histories, so
     /// asking would patch-id the whole repository, on every reload.
-    pub fn prospect(&self, base: &BaseTree, branch: &str) -> io::Result<Prospect> {
-        match self.merge_tree(&base.oid, branch)? {
+    pub fn prospect(&self, base: &BaseTree<'_>, branch: &str) -> io::Result<Prospect> {
+        match self.merge_tree(base.oid, branch)? {
             MergeResult::Clean(tree) if tree == base.tree => Ok(Prospect::Nothing),
             MergeResult::Clean(_) => Ok(Prospect::Outstanding),
-            MergeResult::Conflicted => Ok(match self.unlanded_by_patch(&base.oid, branch) {
+            MergeResult::Conflicted => Ok(match self.unlanded_by_patch(base.oid, branch) {
                 Ok(0) => Prospect::Nothing,
                 // A count git could not produce is not an answer of nothing:
                 // the merge already said this branch does not apply, and that
@@ -621,7 +638,7 @@ impl Git {
             // a branch with no merge base is one nothing can land. Only the
             // second is the branch's own problem, and the merge base is what
             // tells them apart.
-            MergeResult::Unavailable(_) => Ok(match self.merge_base(&base.oid, branch) {
+            MergeResult::Unavailable(_) => Ok(match self.merge_base(base.oid, branch) {
                 Ok(_) => Prospect::Outstanding,
                 Err(_) => Prospect::Conflicted,
             }),
@@ -1000,7 +1017,7 @@ impl Git {
     /// `%(ahead-behind:)` needs git >= 2.41; on an older git the whole query
     /// fails, so retry without it and leave the counts unknown rather than
     /// refusing to start.
-    pub fn branches(&self, base: &str) -> io::Result<Vec<Branch>> {
+    pub fn branches(&self, base: &str, base_oid: Option<&str>) -> io::Result<Vec<Branch>> {
         let fmt = |counts: &str| {
             format!(
                 // Full refname, not %(refname:short): git's shortening drops a
@@ -1009,7 +1026,7 @@ impl Git {
                  {counts}{FS}%(authorname){FS}%(contents:subject)"
             )
         };
-        let with_counts = fmt(&format!("%(ahead-behind:refs/heads/{base})"));
+        let with_counts = fmt(&format!("%(ahead-behind:{})", base_oid.unwrap_or("")));
         let run = self.run(&[
             "for-each-ref",
             "--sort=-committerdate",

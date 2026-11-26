@@ -295,10 +295,10 @@ fn run(args: Args) -> io::Result<ExitCode> {
 }
 
 fn list_branches(git: &Git, base: &str) -> io::Result<()> {
-    let branches = git.branches(base)?;
-    // Resolved once for the whole run, as the window does: a base that moved
-    // mid-listing would leave two rows describing different bases.
-    let base_tree = git.resolve_base(base).ok();
+    // Pin the counts, record scan and trial merges to the same base.
+    let base_oid = git.base_oid(base).ok();
+    let base_tree = base_oid.as_deref().and_then(|oid| git.base_tree(oid).ok());
+    let branches = git.branches(base, base_oid.as_deref())?;
     let now = now_unix();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -309,8 +309,8 @@ fn list_branches(git: &Git, base: &str) -> io::Result<()> {
         // `ok` in one of them. Per ROW rather than per run, so the listing
         // still streams: the merge behind each is a process, and a run of them
         // up front is a silent pause before the first line.
-        let ready = app::readiness_of(git, base, b);
-        let prospect = git.prospect_of(base_tree.as_ref(), b);
+        let ready = app::readiness_of(git, base_oid.as_deref(), &b.commit, b.counts);
+        let prospect = git.prospect_of(base_tree.as_ref(), &b.commit, b.nothing_ahead());
         // Refnames and subjects are untrusted; --list prints straight to a
         // terminal, so neutralise them here as the window's frame does.
         //
@@ -687,7 +687,7 @@ fn run_window(git: Git, base: String) -> io::Result<()> {
 fn prepare(git: Git, base: String) -> io::Result<Opened> {
     let repo = git.repo().to_path_buf();
     let mut app = App::new(git, base);
-    app.reload()?;
+    app.reload(false)?;
     Ok(Opened { app, repo })
 }
 

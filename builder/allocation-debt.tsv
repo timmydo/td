@@ -3488,8 +3488,8 @@ td-remote/src/link.rs	unchecked-growth-or-clone	17
 td-remote/src/ssh.rs	allocating-conversion	3
 td-remote/src/ssh.rs	allocation-macro	4
 td-review/src/app.rs	allocating-constructor	1
-td-review/src/app.rs	allocating-conversion	32
-td-review/src/app.rs	allocation-macro	91
+td-review/src/app.rs	allocating-conversion	30
+td-review/src/app.rs	allocation-macro	90
 td-review/src/app.rs	heap-owner	2
 td-review/src/app.rs	unchecked-growth-or-clone	73
 td-review/src/chooser.rs	allocating-constructor	3
@@ -3497,7 +3497,7 @@ td-review/src/chooser.rs	allocating-conversion	16
 td-review/src/chooser.rs	allocation-macro	5
 td-review/src/chooser.rs	unchecked-growth-or-clone	14
 td-review/src/git.rs	allocating-conversion	39
-td-review/src/git.rs	allocation-macro	45
+td-review/src/git.rs	allocation-macro	43
 td-review/src/git.rs	unchecked-growth-or-clone	5
 td-review/src/keys.rs	allocating-conversion	2
 td-review/src/land.rs	allocating-conversion	39
