@@ -6378,7 +6378,9 @@ mod frame_tests {
         key(&mut session, "D");
         assert_eq!(session.title, "Drafts");
         assert!(
-            text(&session).starts_with("No drafts or sent drafts in "),
+            text(&session)
+                .replace('\n', " ")
+                .starts_with("No drafts or sent drafts in "),
             "{}",
             text(&session)
         );
