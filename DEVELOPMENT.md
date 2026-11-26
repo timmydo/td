@@ -1201,8 +1201,11 @@ top-level symlinks are logged and omitted; other lookup failures refuse.
 Resolvable top-level symlink aliases become mountpoints, not symlinks, so
 this fixture is not an exact replica of host pathname identity.
 The helper requires UTF-8 paths/environment and replaces
-`TMPDIR` with `/tmp`; externally prepared temporary files and display sockets
-under the old `/tmp` are not retained unless inside the bound working tree.
+`TMPDIR` with `/tmp`. The caller's temporary directory backs this private
+mount so a disk-backed `TMPDIR` can hold large fixtures. The pivot stays
+below the outer `/tmp`, outside the retained root mounts. Temporary files
+and display sockets under the old `/tmp` are retained only inside the bound
+working tree.
 This includes contents of `HOME`, `CARGO_HOME` and `XDG_RUNTIME_DIR` beneath
 the old `/tmp`. Environment strings are retained, not silently rewritten
 to a different directory. Network and UTS namespaces are also private.

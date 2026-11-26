@@ -29,13 +29,13 @@ fn text(path: &Path) -> io::Result<String> {
 struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> io::Result<Self> {
+    fn new_in(parent: &Path) -> io::Result<Self> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         for attempt in 0..128 {
-            let path = Path::new("/tmp").join(format!(
+            let path = parent.join(format!(
                 "td-test-root-{}-{stamp:x}-{attempt}",
                 std::process::id()
             ));
@@ -54,7 +54,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         // Only our exclusive fixture; namespace mounts are already gone.
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = sandbox::remove_scratch_tree(&self.0);
     }
 }
 
@@ -158,8 +158,14 @@ pub fn run(program: &str, args: &[String]) -> io::Result<ExitStatus> {
     let cwd = std::env::current_dir()?;
     let program = fs::canonicalize(program)?;
     let supervisor = fs::canonicalize(std::env::current_exe()?)?;
-    let scratch = Scratch::new()?;
-    let temporary = scratch.0.join("tmp");
+    let scratch = Scratch::new_in(Path::new("/tmp"))?;
+    // The pivot must sit below the hidden /tmp, outside the ambient root binds.
+    // Only the private /tmp's contents use the caller's temporary filesystem.
+    let parent = std::env::var_os("TMPDIR")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    let backing = Scratch::new_in(&fs::canonicalize(parent)?)?;
+    let temporary = backing.0.join("tmp");
     fs::create_dir(&temporary)?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o1777))?;
     let binds = bindings(&cwd, &[program.clone(), supervisor.clone()], &temporary)?;
@@ -294,8 +300,9 @@ mod tests {
             );
             return;
         }
-        let directory = Scratch::new().unwrap();
-        let tree = directory.0.join("worktree");
+        let directory =
+            crate::test_temp::TempDir::new_in(Path::new("/tmp"), "td-test-root").unwrap();
+        let tree = directory.path().join("worktree");
         let cwd = tree.join("consumer");
         let sibling = tree.join("provider");
         fs::create_dir_all(&cwd).unwrap();
@@ -303,7 +310,7 @@ mod tests {
         fs::write(tree.join(".git"), b"gitdir: trusted external admin\n").unwrap();
         let source = sibling.join("source.rs");
         fs::write(&source, b"shared source").unwrap();
-        let binds = bindings(&cwd, &[], &directory.0.join("tmp")).unwrap();
+        let binds = bindings(&cwd, &[], &directory.path().join("tmp")).unwrap();
         assert!(binds.iter().any(|bind| bind.src == tree.to_str().unwrap()));
         assert!(!binds.iter().any(|bind| bind.src == cwd.to_str().unwrap()));
         let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/release/td-builder");
@@ -348,7 +355,7 @@ mod tests {
         );
         fs::remove_file(cwd.join(".git")).unwrap();
         let executable = tree.join("target/release/td-builder");
-        let binds = bindings(&cwd, &[executable.clone()], &directory.0.join("tmp")).unwrap();
+        let binds = bindings(&cwd, &[executable.clone()], &directory.path().join("tmp")).unwrap();
         assert!(!binds
             .iter()
             .any(|bind| bind.src == executable.to_str().unwrap()));
@@ -356,12 +363,12 @@ mod tests {
 
     #[test]
     fn dangling_links_are_omitted_but_missing_entries_are_errors() {
-        let dir = Scratch::new().unwrap();
-        let path = dir.0.join("link");
+        let dir = crate::test_temp::TempDir::new_in(Path::new("/tmp"), "td-test-root").unwrap();
+        let path = dir.path().join("link");
         assert!(resolvable(&path).is_err());
-        symlink(dir.0.join("missing"), &path).unwrap();
+        symlink(dir.path().join("missing"), &path).unwrap();
         assert!(!resolvable(&path).unwrap());
-        fs::write(dir.0.join("missing"), b"x").unwrap();
+        fs::write(dir.path().join("missing"), b"x").unwrap();
         assert!(resolvable(&path).unwrap());
     }
 
@@ -390,6 +397,12 @@ mod tests {
             }
             assert!(std::env::var_os(ENV).is_none());
             assert_eq!(std::env::var("TMPDIR").unwrap(), "/tmp");
+            if mode != "empty" {
+                let backing = fs::read_dir("backing").unwrap().next().unwrap().unwrap();
+                let outer = fs::metadata(backing.path().join("tmp")).unwrap();
+                let inner = fs::metadata("/tmp").unwrap();
+                assert_eq!((outer.dev(), outer.ino()), (inner.dev(), inner.ino()));
+            }
             assert_eq!(
                 std::env::current_dir().unwrap(),
                 PathBuf::from(std::env::var("TD_TEST_ROOT_CWD").unwrap())
@@ -399,9 +412,9 @@ mod tests {
                 format!("{},{}", limits.0, limits.1),
                 std::env::var("TD_TEST_ROOT_LIMITS").unwrap()
             );
-            let dir = Scratch::new().unwrap();
-            fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o700)).unwrap();
-            let path = dir.0.join("control");
+            let dir = crate::test_temp::TempDir::new_in(Path::new("/tmp"), "td-test-root").unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let path = dir.path().join("control");
             let listener = UnixListener::bind(&path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
             let metadata = fs::metadata(&path).unwrap();
@@ -428,9 +441,25 @@ mod tests {
         let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/release/td-builder");
         let ambient = crate::sys::get_rlimit(crate::sys::RLIMIT_DATA).unwrap();
         let limits = crate::run_capped::effective_limits(32 * 1024 * 1024, ambient);
-        for (mode, expected) in [("ok", 0), ("exit", 23), ("signal", 143), ("private", 0)] {
-            let dir = Scratch::new().unwrap();
+        for (mode, expected) in [
+            ("ok", 0),
+            ("exit", 23),
+            ("signal", 143),
+            ("private", 0),
+            ("empty", 0),
+        ] {
+            let dir = crate::test_temp::TempDir::new_in(Path::new("/tmp"), "td-test-root").unwrap();
+            let backing = dir.path().join("backing");
+            fs::create_dir(&backing).unwrap();
             let output = Command::new(&runner)
+                .env(
+                    "TMPDIR",
+                    if mode == "empty" {
+                        Path::new("")
+                    } else {
+                        &backing
+                    },
+                )
                 .arg("run-capped")
                 .arg(&exe)
                 .args([
@@ -438,11 +467,11 @@ mod tests {
                     "test_root::tests::private_root_preserves_cwd_caps_and_socket_permissions",
                     "--nocapture",
                 ])
-                .current_dir(&dir.0)
+                .current_dir(dir.path())
                 .env(ENV, if mode == "private" { "private" } else { "1" })
                 .env("TD_RUN_CAPPED_MIB", "32")
                 .env("TD_TEST_ROOT_PROBE", mode)
-                .env("TD_TEST_ROOT_CWD", &dir.0)
+                .env("TD_TEST_ROOT_CWD", dir.path())
                 .env("TD_TEST_ROOT_LIMITS", format!("{},{}", limits.0, limits.1))
                 .output()
                 .unwrap();
@@ -453,13 +482,14 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert!(fs::read_dir(&backing).unwrap().next().is_none());
             assert_eq!(
-                fs::read(dir.0.join("proof")).unwrap(),
+                fs::read(dir.path().join("proof")).unwrap(),
                 b"child executed",
                 "successful zero-test libtest runs are not evidence"
             );
         }
-        let dir = Scratch::new().unwrap();
+        let dir = crate::test_temp::TempDir::new_in(Path::new("/tmp"), "td-test-root").unwrap();
         let output = Command::new(&runner)
             .arg("run-capped")
             .arg(&exe)
@@ -467,13 +497,13 @@ mod tests {
                 "--exact",
                 "test_root::tests::private_root_preserves_cwd_caps_and_socket_permissions",
             ])
-            .current_dir(&dir.0)
+            .current_dir(dir.path())
             .env(ENV, "0")
             .env("TD_TEST_ROOT_PROBE", "ok")
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert!(!dir.0.join("proof").exists());
+        assert!(!dir.path().join("proof").exists());
         assert!(String::from_utf8_lossy(&output.stderr).contains("must be absent or 1"));
     }
 }
