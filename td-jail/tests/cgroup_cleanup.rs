@@ -7,8 +7,9 @@ const MEMBERSHIP: &str = "/td-user-1000/test-0123456789abcdef";
 
 struct ProcessStat {
     state: char,
-    process_group: u32,
-    session: u32,
+    parent: u32,
+    process_group: i64,
+    session: i64,
     terminal: i64,
     starttime: u64,
 }
@@ -42,22 +43,11 @@ fn a_stale_bootstrap_snapshot_cannot_kill_the_cleanup_watcher() -> io::Result<()
         return Err(io::Error::other("cleanup watcher sent invalid readiness"));
     }
 
-    let children = fs::read_to_string(format!(
-        "/proc/{stale_snapshot}/task/{stale_snapshot}/children"
-    ))?;
-    let mut child_pids = children.split_whitespace();
-    let watcher: u32 = child_pids
-        .next()
-        .ok_or_else(|| io::Error::other("cleanup bootstrap has no watcher child"))?
-        .parse()
-        .map_err(|error| io::Error::other(format!("invalid cleanup watcher pid: {error}")))?;
-    if child_pids.next().is_some() || watcher == stale_snapshot {
-        return Err(io::Error::other(
-            "cleanup watcher is not the bootstrap's one distinct child",
-        ));
-    }
-    let before = process_stat(watcher)?;
-    if before.process_group != watcher || before.session != watcher || before.terminal != 0 {
+    let (watcher, before) = only_child(stale_snapshot)?;
+    if before.process_group != i64::from(watcher)
+        || before.session != i64::from(watcher)
+        || before.terminal != 0
+    {
         return Err(io::Error::other(format!(
             "cleanup watcher is not detached: pid={watcher}, process-group={}, session={}, terminal={}",
             before.process_group, before.session, before.terminal
@@ -115,11 +105,47 @@ fn effective_user_id() -> io::Result<u32> {
         .map_err(|error| io::Error::other(format!("invalid effective uid: {error}")))
 }
 
+fn only_child(parent: u32) -> io::Result<(u32, ProcessStat)> {
+    let mut child = None;
+    for entry in fs::read_dir("/proc")? {
+        let name = entry?.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let stat = match process_stat(pid) {
+            Ok(stat) => stat,
+            // Unrelated processes can exit during the scan. A hidepid
+            // mount can also conceal processes owned by other users.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) || e.raw_os_error() == Some(3) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        if stat.parent != parent {
+            continue;
+        }
+        if child.is_some() {
+            return Err(io::Error::other("cleanup bootstrap has multiple children"));
+        }
+        child = Some((pid, stat));
+    }
+    child.ok_or_else(|| io::Error::other("cleanup bootstrap has no watcher child"))
+}
+
 fn process_stat(pid: u32) -> io::Result<ProcessStat> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let (_, fields) = stat
-        .rsplit_once(") ")
+    let stat = fs::read(format!("/proc/{pid}/stat"))?;
+    // A process may choose non-UTF-8 bytes and parentheses in its name.
+    let fields = stat
+        .rsplit(|byte| *byte == b')')
+        .next()
+        .and_then(|suffix| suffix.strip_prefix(b" "))
         .ok_or_else(|| io::Error::other("process stat has no command terminator"))?;
+    let fields = std::str::from_utf8(fields).map_err(io::Error::other)?;
     let mut fields = fields.split_whitespace();
     let state_text = next_field(&mut fields, "state")?;
     let mut state_characters = state_text.chars();
@@ -129,7 +155,7 @@ fn process_stat(pid: u32) -> io::Result<ProcessStat> {
     if state_characters.next().is_some() {
         return Err(io::Error::other("process stat state is not one character"));
     }
-    let _parent = next_field(&mut fields, "parent")?;
+    let parent = parse_field(&mut fields, "parent")?;
     let process_group = parse_field(&mut fields, "process group")?;
     let session = parse_field(&mut fields, "session")?;
     let terminal = parse_field(&mut fields, "terminal")?;
@@ -154,6 +180,7 @@ fn process_stat(pid: u32) -> io::Result<ProcessStat> {
     let starttime = parse_field(&mut fields, "start time")?;
     Ok(ProcessStat {
         state,
+        parent,
         process_group,
         session,
         terminal,
