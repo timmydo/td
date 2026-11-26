@@ -1150,18 +1150,14 @@ fn run_gate(
         // every gate the moment that thread finished, reported as an ordinary
         // body failure (exit 137) with nothing naming the cause.
         crate::sandbox::die_with_parent(&mut cmd);
-        // A NATIVE gate execs this binary, which cargo may be relinking — see
-        // `crate::spawn`. The message below says "bash" for either kind, which
-        // is wrong for a native gate and was written when every gate was a
-        // shell one, so it names what was actually spawned now.
+        // The namespace supervisor re-execs this binary while Cargo may relink it.
         let spawned = crate::spawn::past_a_busy_program(|| cmd.spawn());
-        let what = if native { "the gate body" } else { "bash" };
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 let _ = writeln!(
                     logf,
-                    "gate-run: FAIL: gate {}: cannot spawn {what}: {e}",
+                    "gate-run: FAIL: gate {}: cannot spawn namespace supervisor: {e}",
                     g.name
                 );
                 timing_event(timing, &g.name, "END");
@@ -2570,7 +2566,7 @@ mod tests {
         );
     }
 
-    /// A tiny synthetic gate set exercising the REAL scheduler + bash execution
+    /// A tiny synthetic gate set exercising the REAL scheduler + sh execution
     /// path (not a mock): cheap gates run strictly serially, a failure
     /// fail-fasts (later gates never start), and a BUILD_GATE waits for
     /// build-recipes.
@@ -2920,12 +2916,31 @@ mod tests {
         assert_eq!(unk2, vec!["pool:bogus".to_string()]);
     }
 
+    // The synthetic gates re-exec this test binary through TD_BUILDER_SELF,
+    // which the scheduler supplies to every gate.
+    #[test]
+    fn memory_gate_fixture() {
+        let Ok(mode) = std::env::var("TD_TEST_GATE_MEMORY") else {
+            return;
+        };
+        let mib = match mode.as_str() {
+            "single" => 64,
+            "worker" => 32,
+            _ => panic!("unknown memory fixture"),
+        };
+        let pages = vec![0x42u8; mib * 1024 * 1024];
+        if mode == "worker" {
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        std::hint::black_box(pages.as_slice());
+        println!("held allocation");
+    }
+
     #[test]
     fn gate_mem_backstop_contains_a_runaway_allocator() {
         // Native pre_exec setrlimit — no host prlimit needed, so no host guard.
         let d = tmpdir("rlimit");
-        // ~64 MiB heap allocation in the shell (command substitution buffers it).
-        let hog = r#"x=$(head -c 67108864 /dev/zero | tr '\0' a); echo grew ${#x}"#;
+        let hog = r#"TD_TEST_GATE_MEMORY=single exec "$TD_BUILDER_SELF" --exact gates::tests::memory_gate_fixture --nocapture"#;
         let set = synth(&d, &[("hog", Pool::Heavy, hog, &[])]);
         let sel = expand_goals(&set, &["hog".to_string()]).unwrap();
         // VERIFIED-RED half: capped at 16 MiB per process, the allocator dies
@@ -2942,16 +2957,16 @@ mod tests {
             run_selected(&set, &sel, &c).unwrap(),
             "uncapped hog must pass"
         );
+        assert!(std::fs::read_to_string(d.join("logs/hog.log"))
+            .unwrap()
+            .contains("held allocation"));
     }
 
     #[test]
     fn tree_watchdog_kills_a_collectively_oversized_process_group() {
         let d = tmpdir("tree");
-        // Four children, ~32 MiB each — every one modest, ~128 MiB together.
-        // NOTE the echo after sleep: bash EXECS a trailing command over itself,
-        // which would free the 32 MiB string before the sampler's first tick —
-        // the trailing echo keeps each subshell (and its allocation) resident.
-        let hog = r#"for i in 1 2 3 4; do ( x=$(head -c 33554432 /dev/zero | tr '\0' a); sleep 3; echo ${#x} ) & done; wait; echo tree-done"#;
+        // Four distinct processes hold 32 MiB each until the sampler runs.
+        let hog = r#"for i in 1 2 3 4; do TD_TEST_GATE_MEMORY=worker "$TD_BUILDER_SELF" --exact gates::tests::memory_gate_fixture --nocapture & done; wait"#;
         let set = synth(&d, &[("tree", Pool::Heavy, hog, &[])]);
         let sel = expand_goals(&set, &["tree".to_string()]).unwrap();
         // VERIFIED-RED half: a 64 MiB TREE budget kills the group (each child is
@@ -2968,6 +2983,8 @@ mod tests {
             run_selected(&set, &sel, &c).unwrap(),
             "unbudgeted tree must pass"
         );
+        let log = std::fs::read_to_string(d.join("logs/tree.log")).unwrap();
+        assert_eq!(log.matches("held allocation").count(), 4);
     }
 
     #[test]
@@ -3270,6 +3287,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn descendant_gate_fixture() {
+        if std::env::var_os("TD_TEST_GATE_DESCENDANTS").is_none() {
+            return;
+        }
+        // EOF releases every child together, including on a partial spawn failure.
+        let (release, writer) = std::io::pipe().unwrap();
+        for _ in 0..60 {
+            let child = std::process::Command::new("sh")
+                .args(["-c", "read -r release; sleep 1 && echo escaped >> escaped"])
+                .stdin(release.try_clone().unwrap())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            assert!(child.is_ok(), "spawn delayed marker: {child:?}");
+        }
+        std::fs::write("spawned", b"").unwrap();
+        drop(writer);
+    }
+
     /// A body that exits while many things it started keep running: every one
     /// must be dead before the gate returns. Before the PID-namespace boundary
     /// the gate passed and the sleepers spun on, reparented to init.
@@ -3279,7 +3316,7 @@ mod tests {
         // Each child would leave a delayed marker if it outlived the body. Sixty
         // makes this exercise namespace teardown under a fork burst rather than
         // merely the one-child happy path.
-        let body = r#"i=0; while [ $i -lt 60 ]; do sh -c 'sleep 1; echo escaped >> {D}/escaped' </dev/null >/dev/null 2>&1 & i=$((i+1)); done"#;
+        let body = r#"TD_TEST_GATE_DESCENDANTS=1 exec "$TD_BUILDER_SELF" --exact gates::tests::descendant_gate_fixture"#;
         let set = synth(&d, &[("leaky", Pool::Cheap, body, &[])]);
         let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
         let c = cfg(&d, 1, None);
@@ -3287,6 +3324,7 @@ mod tests {
             run_selected(&set, &sel, &c).unwrap(),
             "the body exits 0, so the gate passes"
         );
+        assert!(d.join("spawned").is_file(), "the burst finished spawning");
         std::thread::sleep(Duration::from_millis(1200));
         assert!(
             !d.join("escaped").exists(),
