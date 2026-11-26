@@ -11,8 +11,12 @@ pub(crate) const V1: &str =
 /// A table granting `uid` every v1 operation, outside the grammar's UID
 /// range when a test runs as such a UID.
 pub(crate) fn granting(uid: u32) -> Table {
+    granting_only(uid, Operation::ALL)
+}
+
+pub(crate) fn granting_only(uid: u32, operations: &[Operation]) -> Table {
     Table {
-        rows: vec![(uid, Operation::ALL.to_vec())],
+        rows: vec![(uid, operations.to_vec())],
     }
 }
 

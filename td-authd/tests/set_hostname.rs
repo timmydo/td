@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 use super::*;
+use crate::admission::PRIMARY_UID;
 use crate::backoff::tests::Scratch;
 use crate::revocation::tests::WAIT;
 use std::fs;
@@ -19,7 +20,10 @@ pub(crate) fn granted() -> Result<Table, String> {
 }
 
 fn refused() -> Result<Table, String> {
-    Table::parse("td-elevation-v1\n1000\tdeploy-rollback\n")
+    Ok(crate::elevation::tests::granting_only(
+        fs::metadata("/proc/self").unwrap().uid(),
+        &[elevation::Operation::DeployRollback],
+    ))
 }
 
 fn missing() -> Result<Table, String> {
@@ -136,6 +140,12 @@ fn queued(fixture: &Fixture, name: &str) -> (Intake, UnixStream) {
     let mut intake = fixture.intake(granted);
     let (client, answer) = fixture.submit(&mut intake, &frame(name));
     assert_eq!(answer, Some(ADMITTED));
+    (intake, client)
+}
+
+fn queued_for_consent(fixture: &Fixture, name: &str) -> (Intake, UnixStream) {
+    let mut intake = fixture.intake(granted);
+    let client = submit_as(fixture, &mut intake, name, PRIMARY_UID);
     (intake, client)
 }
 
@@ -388,10 +398,10 @@ fn an_admitted_request_counts_at_admission_however_it_ends() {
 #[test]
 fn the_description_names_both_names_and_writes_nothing() {
     let fixture = Fixture::new("td");
-    let (mut intake, _client) = queued(&fixture, "my-laptop");
+    let (mut intake, _client) = queued_for_consent(&fixture, "my-laptop");
     let admitted = fixture.backoff().read().unwrap();
     let ready = intake.select().unwrap();
-    let change = intake.describe(fixture.uid(), ready).unwrap();
+    let change = intake.describe(PRIMARY_UID, ready).unwrap();
     assert_eq!(fixture.backoff().read().unwrap(), admitted);
     assert_eq!(admitted.count(), 1);
     let Operation::SetHostname {
@@ -403,18 +413,18 @@ fn the_description_names_both_names_and_writes_nothing() {
         panic!("not a hostname change");
     };
     assert_eq!((old.as_str(), new.as_str()), ("td", "my-laptop"));
-    assert_eq!(*requester, fixture.uid());
-    assert_eq!(change.request().owner(), fixture.uid());
+    assert_eq!(*requester, PRIMARY_UID);
+    assert_eq!(change.request().owner(), PRIMARY_UID);
 }
 
 fn drawn(fixture: &Fixture) -> Change {
     let places = fixture.places(granted);
     let ready = Ready {
         name: Setting::parse("my-laptop").unwrap(),
-        requester: fixture.uid(),
+        requester: PRIMARY_UID,
     };
     Change::drawn(
-        fixture.uid(),
+        PRIMARY_UID,
         ready,
         Setting::parse("td").unwrap(),
         &places,
@@ -437,7 +447,7 @@ fn the_commit_saves_the_new_name_once_and_clears_the_backoff() {
     assert!(request.awaits_approval());
     assert!(change.commit(&request).is_err());
     assert_eq!(fixture.saved(), b"td\n");
-    let wrong = Request::new([8; 32], fixture.uid(), request.operation().clone()).unwrap();
+    let wrong = Request::new([8; 32], PRIMARY_UID, request.operation().clone()).unwrap();
     assert!(change.presented(&wrong).is_err());
     change.presented(&request).unwrap();
     assert!(change.presented(&request).is_err());
@@ -603,17 +613,17 @@ fn time_settings_bind_exact_values_and_cancellation_never_starts_the_helper() {
         "automatic off",
     ] {
         let fixture = Fixture::new("td");
-        let (mut intake, _client) = queued(&fixture, &format!("time {setting}"));
+        let (mut intake, _client) = queued_for_consent(&fixture, &format!("time {setting}"));
         let ready = intake.select().unwrap();
         assert_eq!(ready.operation(), elevation::Operation::ManageTime);
-        let mut change = intake.describe(fixture.uid(), ready).unwrap();
+        let mut change = intake.describe(PRIMARY_UID, ready).unwrap();
         let request = change.request().clone();
         assert!(request.awaits_approval());
         assert_eq!(Request::decode(&request.encode()).unwrap(), request);
         assert_eq!(
             request.operation(),
             &Operation::ManageTime {
-                requester: fixture.uid(),
+                requester: PRIMARY_UID,
                 setting: setting.into()
             }
         );
@@ -622,9 +632,9 @@ fn time_settings_bind_exact_values_and_cancellation_never_starts_the_helper() {
         change.presented(&request).unwrap();
         let wrong = Request::new(
             *request.nonce(),
-            fixture.uid(),
+            PRIMARY_UID,
             Operation::ManageTime {
-                requester: fixture.uid(),
+                requester: PRIMARY_UID,
                 setting: "automatic on".into(),
             },
         )
@@ -654,9 +664,9 @@ fn publisher_replacement_needs_its_own_grant_and_exact_presented_approval() {
         Some(4)
     );
     drop(refused_intake);
-    let (mut intake, _client) = queued(&fixture, &value);
+    let (mut intake, _client) = queued_for_consent(&fixture, &value);
     let ready = intake.select().unwrap();
-    let mut change = intake.describe(fixture.uid(), ready).unwrap();
+    let mut change = intake.describe(PRIMARY_UID, ready).unwrap();
     let request = change.request().clone();
     assert!(request.awaits_approval());
     assert_eq!(Request::decode(&request.encode()).unwrap(), request);
@@ -671,9 +681,9 @@ fn publisher_replacement_needs_its_own_grant_and_exact_presented_approval() {
     change.presented(&request).unwrap();
     let changed = Request::new(
         *request.nonce(),
-        fixture.uid(),
+        PRIMARY_UID,
         Operation::ReplacePublisher {
-            requester: fixture.uid(),
+            requester: PRIMARY_UID,
             fingerprint: "b".repeat(64),
         },
     )
@@ -711,14 +721,14 @@ fn admin_updates_need_their_own_grant_and_exact_presented_approval() {
             Some(4)
         );
         drop(refused_intake);
-        let (mut intake, _client) = queued(&fixture, &value);
+        let (mut intake, _client) = queued_for_consent(&fixture, &value);
         let ready = intake.select().unwrap();
-        let mut change = intake.describe(fixture.uid(), ready).unwrap();
+        let mut change = intake.describe(PRIMARY_UID, ready).unwrap();
         let request = change.request().clone();
         assert_eq!(
             request.operation(),
             &Operation::AdminUpdate {
-                requester: fixture.uid(),
+                requester: PRIMARY_UID,
                 source,
                 reboot,
             }
@@ -733,9 +743,9 @@ fn admin_updates_need_their_own_grant_and_exact_presented_approval() {
         change.presented(&request).unwrap();
         let changed = Request::new(
             *request.nonce(),
-            fixture.uid(),
+            PRIMARY_UID,
             Operation::AdminUpdate {
-                requester: fixture.uid(),
+                requester: PRIMARY_UID,
                 source: !source,
                 reboot,
             },
@@ -797,17 +807,17 @@ fn volume_changes_bind_exact_values_and_cancellation_never_starts_the_helper() {
         "remove backup",
     ] {
         let fixture = Fixture::new("td");
-        let (mut intake, _client) = queued(&fixture, &format!("volume {setting}"));
+        let (mut intake, _client) = queued_for_consent(&fixture, &format!("volume {setting}"));
         let ready = intake.select().unwrap();
         assert_eq!(ready.operation(), elevation::Operation::ManageVolumes);
-        let mut change = intake.describe(fixture.uid(), ready).unwrap();
+        let mut change = intake.describe(PRIMARY_UID, ready).unwrap();
         let request = change.request().clone();
         assert!(request.awaits_approval());
         assert_eq!(Request::decode(&request.encode()).unwrap(), request);
         assert_eq!(
             request.operation(),
             &Operation::ManageVolumes {
-                requester: fixture.uid(),
+                requester: PRIMARY_UID,
                 setting: setting.into()
             }
         );
@@ -819,9 +829,9 @@ fn volume_changes_bind_exact_values_and_cancellation_never_starts_the_helper() {
         change.presented(&request).unwrap();
         let wrong = Request::new(
             *request.nonce(),
-            fixture.uid(),
+            PRIMARY_UID,
             Operation::ManageVolumes {
-                requester: fixture.uid(),
+                requester: PRIMARY_UID,
                 setting: "remove other".into(),
             },
         )

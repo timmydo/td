@@ -1,25 +1,19 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 use super::*;
+use crate::test_temp::TempDir;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A private directory whose `authd` child is the backoff's directory,
 /// owned as the private directory is; removed on drop.
 pub(crate) struct Scratch {
-    pub(crate) path: PathBuf,
+    pub(crate) path: TempDir,
     pub(crate) owner: (u32, u32),
 }
 
 impl Scratch {
     pub(crate) fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "td-backoff-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = TempDir::new("td-backoff").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         let metadata = fs::metadata(&path).unwrap();
         Self {
@@ -47,12 +41,6 @@ impl Scratch {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(self.file(), text).unwrap();
         fs::set_permissions(self.file(), fs::Permissions::from_mode(0o600)).unwrap();
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
