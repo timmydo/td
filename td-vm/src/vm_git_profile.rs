@@ -541,12 +541,11 @@ pub(crate) mod tests {
                 std::io::stdout().write_all(&[b'x'; 8193]).unwrap();
             }
             "backlog" => {
-                let mut streams = Vec::new();
-                for _ in 0..10000 {
-                    streams.push(
-                        UnixStream::connect(std::env::var("TD_VM_PROFILE_SOCKET").unwrap())
-                            .unwrap(),
-                    );
+                let socket = std::env::var("TD_VM_PROFILE_SOCKET").unwrap();
+                // Unaccepted connections stay queued after the client closes.
+                // Fill the listener backlog without exhausting the child's FDs.
+                loop {
+                    drop(UnixStream::connect(&socket).unwrap());
                 }
             }
             _ => thread::sleep(Duration::from_secs(60)),
@@ -571,8 +570,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "host process fixture"]
     fn bounded_capture_covers_connection_output_exit_and_reaps_the_client() {
-        let root = std::env::temp_dir().join(format!("td-vm-capture-{}", std::process::id()));
-        fs::create_dir(&root).unwrap();
+        let root = td_fs::TempDir::new("vm-capture").unwrap();
         let listener = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
         for mode in ["ok", "large", "sleep", "backlog"] {
             // An attempt a loaded host starved proves nothing, so the mode
@@ -629,7 +627,6 @@ pub(crate) mod tests {
             assert!(!still_running(&record), "{mode}: child must be reaped");
         }
         drop(listener);
-        fs::remove_dir_all(root).unwrap();
     }
     const KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";

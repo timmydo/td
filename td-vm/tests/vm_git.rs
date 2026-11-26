@@ -1,11 +1,11 @@
 //! Host Git protocol tests; the sandbox gate runs --bins without host Git.
 use std::error::Error;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use td_fs::TempDir;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const BIN: &str = env!("CARGO_BIN_EXE_td-vm-git");
@@ -48,17 +48,17 @@ fn in_trusted_root(name: &str) -> Result<bool> {
 }
 
 struct Fixture {
-    root: PathBuf,
+    root: TempDir,
     git: PathBuf,
     oid: String,
     pack: Vec<u8>,
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
 
+fn exit_hook(path: &Path, code: u8) -> Result<()> {
+    fs::write(path, format!("#!/bin/sh\nexit {code}\n"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
 fn program(name: &str) -> Result<PathBuf> {
     for parent in std::env::split_paths(&std::env::var_os("PATH").ok_or("no PATH")?) {
         let candidate = parent.join(name);
@@ -71,12 +71,7 @@ fn program(name: &str) -> Result<PathBuf> {
 
 impl Fixture {
     fn new(format: &str) -> Result<Self> {
-        let root = std::env::temp_dir().join(format!(
-            "td-vm-git-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        DirBuilder::new().mode(0o700).create(&root)?;
+        let root = TempDir::new("td-vm-git")?;
         let mut fixture = Self {
             root,
             git: program("git")?,
@@ -266,11 +261,11 @@ fn real_receive_restricts_each_instance_and_preserves_host_hooks() -> Result<()>
             ],
             &[],
         )?;
-        symlink(program("false")?, f.repo().join("custom-hooks/pre-receive"))?;
+        exit_hook(&f.repo().join("custom-hooks/pre-receive"), 1)?;
         let result = f.push(B, &[(&zero, &f.oid, "refs/heads/vm-b")])?;
         assert!(result.contains("pre-receive hook declined"), "{result}");
         fs::remove_file(f.repo().join("custom-hooks/pre-receive"))?;
-        symlink(program("false")?, f.repo().join("custom-hooks/update"))?;
+        exit_hook(&f.repo().join("custom-hooks/update"), 1)?;
         let result = f.push(B, &[(&zero, &f.oid, "refs/heads/vm-b")])?;
         assert!(result.contains("hook declined"), "{result}");
         fs::remove_file(f.repo().join("custom-hooks/update"))?;
@@ -292,7 +287,6 @@ fn endpoint_refuses_unregistered_identity_arbitrary_commands_and_exposed_policy(
     )? {
         return Ok(());
     }
-    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new("sha1")?;
     for (id, command) in [
         (A, "sh".into()),
@@ -410,7 +404,6 @@ fn git_launches_original_hooks_with_their_adjacent_resources_and_shell_fallback(
     )? {
         return Ok(());
     }
-    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new("sha1")?;
     let hooks = f.root.join("shared-hooks");
     fs::create_dir(&hooks)?;
@@ -449,7 +442,7 @@ fn early_success_hook_accepts_a_transaction_larger_than_pipe_capacity() -> Resul
         return Ok(());
     }
     let f = Fixture::new("sha1")?;
-    symlink(program("true")?, f.repo().join("hooks/pre-receive"))?;
+    exit_hook(&f.repo().join("hooks/pre-receive"), 0)?;
     let names: Vec<_> = (0..1500)
         .map(|index| format!("refs/heads/topic-{index}"))
         .collect();
@@ -787,7 +780,6 @@ fn old_forced_command_cannot_rejoin_a_reenrolled_instance() -> Result<()> {
 
 #[test]
 fn concurrent_human_ref_creation_cannot_be_enrolled() -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     if in_trusted_root("concurrent_human_ref_creation_cannot_be_enrolled")? {
         return Ok(());
     }
@@ -827,7 +819,6 @@ fn concurrent_human_ref_creation_cannot_be_enrolled() -> Result<()> {
 
 #[test]
 fn reservation_requires_head_and_respects_reference_transaction_veto() -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     if in_trusted_root("reservation_requires_head_and_respects_reference_transaction_veto")? {
         return Ok(());
     }
@@ -860,8 +851,7 @@ fn reservation_requires_head_and_respects_reference_transaction_veto() -> Result
         &[],
     )?;
     let hook = f.repo().join("hooks/reference-transaction");
-    fs::write(&hook, format!("#!{}\nexit 1\n", program("sh")?.display()))?;
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
+    exit_hook(&hook, 1)?;
     admin(&["enroll", path, A, "new-topic", key_path], false)?;
     assert_eq!(fs::read(&registry)?, initial);
     assert!(!f.refs()?.contains("refs/heads/new-topic"));
