@@ -926,11 +926,9 @@ pub fn recipe() -> Recipe {
     //
     //    KVM HOST: VIRTUALIZATION is the prompted menu allnoconfig forces
     //    off; KVM with KVM_AMD and KVM_INTEL builds /dev/kvm, so a td
-    //    machine can host QEMU guests at native speed. The node is a
-    //    root-only devtmpfs node and stays so: until a device policy hands
-    //    it to a session, only root services can create VMs, and td's
-    //    integration oracles (DEVELOPMENT.md) still cannot run as the
-    //    session account. By default (kvm.enable_virt_at_load) the vendor
+    //    machine can host QEMU guests at native speed. Desktop sysinit gives
+    //    the primary account's group read/write access to the devtmpfs node.
+    //    By default (kvm.enable_virt_at_load) the vendor
     //    modules enable VMX or SVM on every CPU when they load, so a
     //    built-in KVM does that at boot even if no VM is created. CPU_MITIGATIONS (below) is on, and
     //    VMSCAPE, which protects the VMM's userspace from its guests,

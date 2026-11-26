@@ -657,8 +657,9 @@ not. The VM manager cases require host `qemu-img`, `qemu-io` and
 its memo. The Cargo runner gives each fixture a short private `/tmp`
 backed by the request's scratch directory. Missing manager tools or an entirely unavailable image boot
 suite gives an unprovisioned result. Each system image boot runs on KVM alone
-`/dev/kvm` (membership in the `kvm` group, from a login started after
-joining it): an oracle never falls back to TCG, several times slower,
+`/dev/kvm`. A td desktop gives its primary account read/write access at boot.
+Other hosts typically use membership in the `kvm` group, from a login started
+after joining it. An oracle never falls back to TCG, several times slower,
 and without KVM it is a host gap. A q35 firmware boot splits the
 irqchip under KVM (`checks/accel.rs`): with it in the host kernel, OVMF
 hung polling AHCI on QEMU 10.2.1.

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, FileType, Metadata, Permissions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{self as unix_fs, DirEntryExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,9 @@ const CARD_LINK: &str = "/run/td-seat-card";
 const MAX_CARDS: usize = 64;
 const INPUT_DIR: &str = "/dev/input";
 const SOUND_DIR: &str = "/dev/snd";
+const KVM_DEVICE: &str = "/dev/kvm";
+const KVM_MAJOR: u64 = 10;
+const KVM_MINOR: u64 = 232;
 const MAX_PLAYBACK_DEVICES: usize = 64;
 const RUNTIME_BASE: &str = "/run/user";
 const AUDIO_RUNTIME: &str = "/run/td-audio";
@@ -89,6 +92,7 @@ fn usage() -> String {
      td-seatd probe --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID | \
      td-seatd probe-access --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID | \
      td-seatd watch --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID | \
+     td-seatd assign-kvm GID | \
      td-seatd exec-audio --uid UID --gid GID --compositor-uid UID --audio-uid UID --audio-gid GID \
      -- PROGRAM [ARG...] | \
      td-seatd selftest"
@@ -462,6 +466,29 @@ fn device_major(device: u64) -> u64 {
 
 fn device_minor(device: u64) -> u64 {
     (device & 0xff) | ((device >> 12) & 0xffff_ff00)
+}
+
+fn assign_kvm(path: &Path, gid: u32) -> io::Result<()> {
+    // PID 1 runs this on root-owned devtmpfs before any login can start.
+    let node = match fs::symlink_metadata(path) {
+        Ok(node) => node,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !node.file_type().is_char_device()
+        || (device_major(node.rdev()), device_minor(node.rdev())) != (KVM_MAJOR, KVM_MINOR)
+    {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    unix_fs::lchown(path, Some(0), Some(gid))?;
+    fs::set_permissions(path, Permissions::from_mode(0o660))
+}
+
+fn kvm_gid(args: &[String]) -> Option<u32> {
+    let [_, gid] = args else {
+        return None;
+    };
+    gid.parse().ok().filter(|gid| (1..u32::MAX).contains(gid))
 }
 
 /// Refuses a symlink or anything but a character device of the class's
@@ -1278,6 +1305,17 @@ fn run(args: &[String]) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("assign-kvm") {
+        let Some(gid) = kvm_gid(&args) else {
+            eprintln!("usage: td-seatd assign-kvm GID (a valid non-root group ID)");
+            process::exit(2);
+        };
+        if let Err(error) = assign_kvm(Path::new(KVM_DEVICE), gid) {
+            eprintln!("td-seatd: assign-kvm {KVM_DEVICE}: {error}");
+            process::exit(1);
+        }
+        return;
+    }
     if let Err(error) = run(&args) {
         eprintln!("td-seatd: {error}");
         process::exit(1);
@@ -1288,6 +1326,37 @@ fn main() {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn kvm_assignment_accepts_absence_and_refuses_non_kvm_nodes() {
+        let root = td_fs::TempDir::new("td-seat-kvm").unwrap();
+        let path = root.path().join("kvm");
+        assign_kvm(&path, 1000).unwrap();
+        for wrong in [Path::new("/dev/null"), root.path()] {
+            assert!(assign_kvm(wrong, 1000).is_err());
+        }
+        unix_fs::symlink(root.path().join("absent"), &path).unwrap();
+        assert!(assign_kvm(&path, 1000).is_err());
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn kvm_command_refuses_missing_invalid_and_extra_group_arguments() {
+        for args in [
+            &[][..],
+            &["0"],
+            &["4294967295"],
+            &["owner"],
+            &["1000", "/dev/null"],
+        ] {
+            let argv = std::iter::once("assign-kvm")
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(kvm_gid(&argv), None, "{argv:?}");
+        }
+        assert_eq!(kvm_gid(&["assign-kvm".into(), "1000".into()]), Some(1000));
+    }
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 

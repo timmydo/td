@@ -104,11 +104,15 @@ firmware"); its DisplayPort audio is the AMD HDMI codec on AMDGPU's audio endpoi
 host KVM guests and mount ext4, FAT, exFAT and UDF, and builds in the
 common Intel IGB and Realtek wired NICs, USB Ethernet (CDC, NCM, ASIX
 and Realtek, the chips most USB-C docks' ports use), USB Attached SCSI
-and USB audio playback, for any machine. Nothing in td hands
-`/dev/kvm` to a session yet; the owner's consented extra Btrfs and ext4
-volumes mount at boot, and removable media mount for the owner while
-the session is unlocked (td-disks/DESIGN.md). None of this has been
+and USB audio playback, for any machine. The owner's consented extra Btrfs
+and ext4 volumes mount at boot, and removable media mount for the owner
+while the session is unlocked (td-disks/DESIGN.md). None of this has been
 tried on the machine.
+
+Desktop sysinit uses `td-seatd assign-kvm` after mounting devtmpfs. A present
+`/dev/kvm` must be the character device 10:232. It becomes root-owned with
+mode 0660 and the primary account's private group (GID 1000), before login.
+Systems where the kernel does not create the node can still boot.
 
 The Framework Desktop with a Ryzen AI Max 385 or Max+ 395 is a desktop
 image target. The deployment carries the firmware AMDGPU requests for

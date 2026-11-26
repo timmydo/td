@@ -1470,8 +1470,8 @@ fn build_inittab(sys: &SystemDef) -> String {
     // process; empty id => the system console. This inittab runs on the REAL root AFTER
     // stage-1 `switch_root`ed into it.
     //
-    // PID 1 now keeps only what it must OWN: the pseudo-filesystem mounts, then
-    // respawning td-svc. Every service, its ordering, and its restart policy moved to
+    // PID 1 owns the pseudo-filesystem mounts and the desktop KVM permission
+    // assignment before respawning td-svc. Service ordering and restart policy live in
     // /etc/td-svc.conf — see build_td_svc_conf for why, and td-svc/DESIGN.md §1 for the
     // three things a signal-free PID 1 cannot express.
     //
@@ -1496,12 +1496,15 @@ fn build_inittab(sys: &SystemDef) -> String {
     // compositor reads the chord and opens secure attention, so td-svc ignores it there
     // while that unit runs and reboots in order otherwise; the headless server always
     // reboots in order.
+    let kvm = format_args!("::sysinit:/bin/td-seatd assign-kvm {UI_GID}\n");
     format!(
         "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
          ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
          ::sysinit:/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup\n\
          ::sysinit:/bin/devpts\n\
+         {kvm}\
          ::respawn:/bin/td-svc run -f {TD_SVC_CONF}{press}\n",
+        kvm = if sys.desktop() { kvm } else { format_args!("") },
         press = ctrl_alt_del_option(sys)
     )
 }
@@ -7836,13 +7839,13 @@ mod tests {
             .contains(&"td-profiler".to_string()));
     }
 
-    /// PID 1 keeps ONLY what it must own. Everything else is a unit.
+    /// PID 1 handles mounts and the desktop's early KVM setup.
     ///
     /// The mounts stay because td-svc reads /proc — its own group and session, every
     /// containment query, every liveness check. A td-svc started before /proc exists
     /// comes up unable to signal a process group at all. sysinit runs to completion
-    /// before any respawn line, so the position of these three lines IS that guarantee,
-    /// and it is the one place in this file where line order still carries meaning.
+    /// before any respawn line. KVM is assigned after devtmpfs is mounted and
+    /// before td-svc can start any login.
     #[test]
     fn the_inittab_keeps_only_what_pid_one_must_own() {
         let inittab = build_inittab(&SYSTEM);
@@ -7857,12 +7860,12 @@ mod tests {
                 "::sysinit:/bin/mount -t sysfs sysfs /sys",
                 "::sysinit:/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup",
                 "::sysinit:/bin/devpts",
+                "::sysinit:/bin/td-seatd assign-kvm 1000",
                 &format!(
                     "::respawn:/bin/td-svc run -f {TD_SVC_CONF} --ctrl-alt-del attention=wayland"
                 ),
             ],
-            "PID 1's table is the pseudo-filesystem mounts plus td-svc, and nothing else \
-             — a service that reappears here is one td-svc cannot order, restart, or stop"
+            "PID 1 sets up the pseudo-filesystems and desktop KVM access before td-svc"
         );
         // The desktop's paired compositor owns the chord (secure attention) while its
         // unit runs; the headless server keeps td-svc's ordered reboot (td-svc/DESIGN.md
@@ -7881,6 +7884,7 @@ mod tests {
                 .any(|l| l == format!("::respawn:/bin/td-svc run -f {TD_SVC_CONF}")),
             "the server's td-svc must keep the default Ctrl-Alt-Del reboot"
         );
+        assert!(!build_inittab(&SERVER).contains("assign-kvm"));
 
         assert!(
             !lines.iter().any(|l| l.contains("proc /proc")),
