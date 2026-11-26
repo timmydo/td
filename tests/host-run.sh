@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # The ./install-fonts and ./install-apps entry points bootstrap the Cargo
 # runner and hand everything else to `td-builder install-fonts` and
 # `install-apps`: one build of the runner from the checkout into its own
@@ -8,9 +8,9 @@
 # process and its exit the script's. Both scripts run through the same
 # fake tools under a PATH of those alone; a bootstrap that only one of
 # them made would be invisible from the other.
-set -euo pipefail
+set -eu
 
-if [[ ${TD_HOST_RUN_TEST_FAKE:-} == 1 ]]; then
+if [ "${TD_HOST_RUN_TEST_FAKE:-}" = 1 ]; then
     case ${0##*/} in
         cargo)
             {
@@ -33,7 +33,7 @@ if [[ ${TD_HOST_RUN_TEST_FAKE:-} == 1 ]]; then
             chmod +x "$CARGO_TARGET_DIR/release/td-builder"
             ;;
         rustc)
-            [[ $* == -vV ]] || exit 1
+            [ "$*" = -vV ] || exit 1
             printf 'rustc 1.0.0\nhost: x86_64-unknown-linux-gnu\n'
             ;;
         gcc | cc) ;;
@@ -52,7 +52,7 @@ done
 ln -s "$root/tests/host-run.sh" "$work/toolchain/bin/gcc"
 # The utilities the scripts and the fakes (this script) use, and nothing
 # else of the host: no cc unless a configuration puts one there.
-for tool in bash sed tr mkdir chmod; do
+for tool in sed tr mkdir chmod; do
     ln -s "$(command -v "$tool")" "$work/bin/$tool"
 done
 cp "$root/install-fonts" "$root/install-apps" "$work/fixture/"
@@ -62,10 +62,10 @@ cp "$root/install-fonts" "$root/install-apps" "$work/fixture/"
 # CDPATH whose decoy would catch a cd that consulted it; `linker` is what
 # the runner's build must name for rustc. The log is left in
 # $work/$script-$label.log.
-run() {
-    local script=$1 label=$2 linker=$3
+run() (
+    script=$1 label=$2 linker=$3
     shift 3
-    local log=$work/$script-$label.log
+    log=$work/$script-$label.log
     : > "$log"
     set +e
     (
@@ -76,7 +76,7 @@ run() {
                 CDPATH="$work/decoy" "$@" \
                 "fixture/$script" --one "two three"
     ) >/dev/null 2>"$work/$script-$label.err"
-    local rc=$?
+    rc=$?
     set -e
     test "$rc" -eq 7 || {
         echo "FAIL: $script ($label) did not carry the runner's exit (got $rc):" >&2
@@ -87,7 +87,6 @@ run() {
     # build's parent), its argument count and arguments; then the runner's
     # own pid, which is the script's process only if the script exec'd
     # it, its argument count and its arguments.
-    local script_pid expected
     script_pid=$(sed -n 2p "$log")
     expected=$(printf '%s\n' \
         "<unset>|$work/fixture/target|$linker|$work/fixture" \
@@ -101,7 +100,7 @@ run() {
         cat "$log" >&2
         exit 1
     }
-}
+)
 
 # A host with gcc and no cc (Guix): gcc is named as the linker.
 run install-fonts guix-host gcc

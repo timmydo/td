@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Test ci/revert-suspect.sh — the optimistic-merge heal primitive (DESIGN §7.2).
 #
 # DURABLE assertion (no Guix oracle): the heal actually does its job — the revert
@@ -6,7 +6,7 @@
 # (refuses to revert a revert). git-driven, and the loop sandbox has no git
 # (like no diffutils/awk), so this runs as the `heal-revert` preflight in
 # `td-builder affected-checks` (the dev host has git) — not a gate at all.
-set -euo pipefail
+set -eu
 
 script=$(cd "$(dirname "$0")/.." && pwd)/ci/revert-suspect.sh
 test -x "$script" || { echo "FAIL: $script not executable" >&2; exit 1; }

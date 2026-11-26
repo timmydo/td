@@ -1743,6 +1743,13 @@ pub fn relocate_ld_scripts(stage: &str, store_prefix: &str) -> Step {
 
 #[cfg(test)]
 mod tests {
+    // Both utilities canonicalize missing path components with -m. The td
+    // host ships readlink; the Debian build root calls realpath.
+    fn host_map_script(script: &str) -> String {
+        script
+            .replace("/usr/bin/realpath -m", "readlink -m")
+            .replace("realpath -m", "readlink -m")
+    }
 
     /// Runs the map check's own script against fixture maps: a clean link
     /// passes; Debian files, the root's store path, a relative escape, a map
@@ -1774,7 +1781,7 @@ mod tests {
             let Step::Run { argv, .. } = step else {
                 panic!("the map check is a run step");
             };
-            argv[2]
+            host_map_script(&argv[2])
                 .replace("{root}", &root)
                 .replace("{src}", &src)
                 .replace("{in:gcc-runtime}", &format!("{store}/gcc-runtime"))
@@ -1891,21 +1898,19 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
         }
         let expand = |text: &str| {
-            text.replace("{root}", &root)
+            host_map_script(text)
+                .replace("{root}", &root)
                 .replace("{src}", &src)
                 .replace("{in:gcc-runtime}", &format!("{store}/gcc-runtime"))
         };
-        // The wrapper as the root runs it, but for where this host keeps
-        // realpath and bash, in front of a `cc` that says what it was given.
+        // Run the build-root wrapper against a cc that reports its map.
         let Step::WriteFile { content, .. } = super::build_root_link_map_cc() else {
             panic!("the wrapper is a written file");
         };
         let wrapper = format!("{root}/wb/map-cc");
         std::fs::write(
             &wrapper,
-            expand(&content)
-                .replace("/usr/bin/realpath", "realpath")
-                .replace(super::BUILD_ROOT_SH, "/bin/sh"),
+            expand(&content).replace(super::BUILD_ROOT_SH, "/bin/sh"),
         )
         .unwrap();
         std::fs::write(
@@ -1921,8 +1926,21 @@ mod tests {
             )
             .unwrap();
         }
+        // The build-root wrapper uses slash replacement. Native td-sh supports
+        // it; hosts with a POSIX-only sh exercise the wrapper with Bash.
+        let shell = if std::process::Command::new("sh")
+            .args(["-c", r#"p=a/b; test "${p//\//+}" = a+b"#])
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            "sh"
+        } else {
+            "bash"
+        };
         let cc = |args: &[&str], with_maps: bool| {
-            let mut command = std::process::Command::new("bash");
+            let mut command = std::process::Command::new(shell);
             command
                 .arg(&wrapper)
                 .args(args)
@@ -1958,7 +1976,7 @@ mod tests {
         );
         // A link the wrapper cannot name is refused, not left unmapped.
         assert_eq!(cc(&["x.o"], false), "");
-        let unnamed = std::process::Command::new("bash")
+        let unnamed = std::process::Command::new(shell)
             .arg(&wrapper)
             .arg("x.o")
             .env("TD_LINK_MAPS", &maps)

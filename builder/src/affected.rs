@@ -1059,7 +1059,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // source, plus the test that drives them. `build-qcow`, `build-iso`,
     // `build-server-image`, `test-iso`, `publish` and `host-preflight.sh` route here
     // rather than to the generic shell arm because `start-bootstrap` is what
-    // actually proves them: bash -n would accept a `build-qcow` that had
+    // actually proves them: sh -n would accept a `build-qcow` that had
     // quietly stopped running the preflight.
     if p == "start"
         || p == "build-qcow"
@@ -1835,10 +1835,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 // Rendering — byte-for-byte with the shell's stdout.
 // ---------------------------------------------------------------------------
 
-/// The shell scripts' syntax check, one `bash -n` per script: given several
-/// names at once, bash checks the first and hands the rest to it as its
+/// The shell scripts' syntax check, one `sh -n` per script: given several
+/// names at once, sh checks the first and hands the rest to it as its
 /// arguments.
-const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso build-server-image test-iso publish host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do bash -n \"$f\" || exit 1; done";
+const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso build-server-image test-iso publish host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do sh -n \"$f\" || exit 1; done";
 
 /// The repository-wide format check, as the preflights spell it: this binary's
 /// `gate-crates fmt --all` (`check_format`).
@@ -1864,9 +1864,9 @@ fn net_test_cmd() -> Result<String, String> {
 fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> {
     match name {
         "shell-syntax" => Some(format!("  {}", SHELL_SYNTAX)),
-        "start-bootstrap" => Some("  bash tests/start.sh".to_string()),
-        "host-run-entry" => Some("  bash tests/host-run.sh".to_string()),
-        "heal-revert" => Some("  bash tests/heal-revert.sh".to_string()),
+        "start-bootstrap" => Some("  sh tests/start.sh".to_string()),
+        "host-run-entry" => Some("  sh tests/host-run.sh".to_string()),
+        "heal-revert" => Some("  sh tests/heal-revert.sh".to_string()),
         // Rendered from the SAME list that runs, so a scoped run cannot print a
         // command it will not issue — the dry run is what a reader trusts.
         "cargo-test" => match cargo_test_cmds(root, changed) {
@@ -3265,10 +3265,10 @@ fn run_self_test_over(root: &Path) -> Vec<String> {
     // The heal primitive's behavioral test moved from CI into the `heal-revert`
     // preflight (GitHub is a backup remote only): editing the primitive or its
     // test selects it (the dev host has git; the loop sandbox does not).
-    assert_contains!("ci/revert-suspect.sh", "bash tests/heal-revert.sh");
-    assert_contains!("tests/heal-revert.sh", "bash tests/heal-revert.sh");
-    assert_contains!("start", "bash tests/start.sh");
-    assert_contains!("tests/start.sh", "bash tests/start.sh");
+    assert_contains!("ci/revert-suspect.sh", "sh tests/heal-revert.sh");
+    assert_contains!("tests/heal-revert.sh", "sh tests/heal-revert.sh");
+    assert_contains!("start", "sh tests/start.sh");
+    assert_contains!("tests/start.sh", "sh tests/start.sh");
 
     failures
 }
@@ -3609,7 +3609,7 @@ fn run_self_check(root: &Path, targets: &[String], changed: &[String]) -> i32 {
 }
 
 fn run_shell(root: &Path, script: &str) -> i32 {
-    Command::new("bash")
+    Command::new("sh")
         .arg("-c")
         .arg(script)
         .current_dir(root)
@@ -4534,7 +4534,7 @@ fn cargo_group_plan(groups: usize, cpus: usize, caller_jobs: Option<usize>) -> (
 /// caller already decided.
 fn run_shell_captured(root: &Path, script: &str, jobs: &str) -> (i32, Vec<u8>) {
     use std::io::IsTerminal;
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(format!("exec 2>&1\n{script}"))
         .current_dir(root)
@@ -4549,7 +4549,7 @@ fn run_shell_captured(root: &Path, script: &str, jobs: &str) -> (i32, Vec<u8>) {
     }
 }
 
-/// Single-quote a path for the bash `-c` string preflights run through. Refuses a
+/// Single-quote a path for the sh `-c` string preflights run through. Refuses a
 /// path holding a single quote rather than guessing at an escape — the caller then
 /// runs without the variable instead of running a mis-quoted command.
 fn shell_quote(p: &Path) -> Option<String> {
@@ -4868,7 +4868,7 @@ fn discover_gate_crates(root: &Path) -> Result<Vec<GateCrate>, String> {
             }
         }
         // It IS a crate. Only now must its name be one a command can spell: the
-        // name is interpolated into the same `bash -c` string as the declared
+        // name is interpolated into the same `sh -c` string as the declared
         // args, and into a `--manifest-path`. A crate-shaped directory under an
         // unusable name is refused rather than gated, because the alternative is
         // running cargo against a backup copy of a crate.
@@ -5432,7 +5432,7 @@ fn gate_string(krate: &str, key: &str, value: &str) -> Result<String, String> {
         return Err(format!("{krate}: `{key}` is empty"));
     }
     // These args are interpolated into a command string that `run_shell` hands
-    // to `bash -c`, so they are VALIDATED rather than quoted: quoting would
+    // to `sh -c`, so they are VALIDATED rather than quoted: quoting would
     // change the rendered command a reader is asked to trust, and no legitimate
     // cargo flag needs a shell metacharacter. Before this commit both halves of
     // that string were Rust consts; a manifest can now contribute to it.
@@ -5456,7 +5456,7 @@ fn gate_string(krate: &str, key: &str, value: &str) -> Result<String, String> {
     Ok(inner.to_string())
 }
 
-/// The characters a declared value may contribute to a `bash -c` string: enough
+/// The characters a declared value may contribute to a `sh -c` string: enough
 /// for any cargo flag, and nothing a shell acts on.
 fn is_shell_safe(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '=' | ',' | '.' | '/' | '+' | ':' | ' ')
@@ -6795,9 +6795,9 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
 
     match name {
         "shell-syntax" => run_shell(root, SHELL_SYNTAX),
-        "start-bootstrap" => run_shell(root, "bash tests/start.sh"),
-        "host-run-entry" => run_shell(root, "bash tests/host-run.sh"),
-        "heal-revert" => run_shell(root, "bash tests/heal-revert.sh"),
+        "start-bootstrap" => run_shell(root, "sh tests/start.sh"),
+        "host-run-entry" => run_shell(root, "sh tests/host-run.sh"),
+        "heal-revert" => run_shell(root, "sh tests/heal-revert.sh"),
         // BOTH engine crates, tests AND clippy: the AGENTS.md deny-lints only
         // fire under the clippy driver, and the in-loop cargo-test gate (325)
         // is unreachable while the loop is UNPROVISIONED (re #469) — this
@@ -8670,7 +8670,7 @@ mod tests {
             match quote {
                 Some(open) if c == open => quote = None,
                 Some(_) => word.push(c),
-                // A `#` beginning a word opens a bash COMMENT, so nothing
+                // A `#` beginning a word opens a sh COMMENT, so nothing
                 // after it is passed to anything: `git diff --name-only #
                 // --no-renames` names the flag where the shell will never
                 // read it, which is the same evasion `passes_no_renames`
@@ -9868,7 +9868,7 @@ mod tests {
         );
         // A SHELL QUOTE is not a word boundary the way whitespace is, and the
         // two directions of that are a pair. `core.pager='--no-renames'` is
-        // one word bash hands git as a config VALUE — the quotes vanish and
+        // one word sh hands git as a config VALUE — the quotes vanish and
         // the flag is never passed…
         let quoted = "run_shell(root, \"git -c core.pager='--no-renames' diff --name-only\")";
         assert!(bare_name_only(quoted).is_some(), "{quoted}");
@@ -9937,7 +9937,7 @@ mod tests {
         let nested =
             r#"g.run(&["-c", concat!("core.pager=x ", "--no-renames"), "diff", "--name-only"]);"#;
         assert!(bare_name_only(nested).is_some(), "{nested}");
-        // A `#` beginning a word opens a bash comment, so the flag after one
+        // A `#` beginning a word opens a sh comment, so the flag after one
         // is never passed. This was a silent pass.
         let hidden_flag = "run_shell(root, \"git diff --name-only # --no-renames\")";
         assert!(bare_name_only(hidden_flag).is_some(), "{hidden_flag}");
@@ -11886,14 +11886,13 @@ mod tests {
     /// reuse; an edit runs everything.
     #[test]
     fn a_cargo_command_that_passed_on_this_content_is_reused() {
-        let bash = Command::new("bash")
+        let sh = Command::new("sh")
             .args(["-c", "true"])
             .stdin(std::process::Stdio::null())
             .status();
-        if !bash.is_ok_and(|s| s.success())
-            || Command::new("git").arg("--version").output().is_err()
+        if !sh.is_ok_and(|s| s.success()) || Command::new("git").arg("--version").output().is_err()
         {
-            eprintln!("SKIP: no bash or no git (the in-sandbox gate)");
+            eprintln!("SKIP: no sh or no git (the in-sandbox gate)");
             return;
         }
         let _base_cleanup = crate::test_temp::TempDir::new("td-preflight-reuse").unwrap();
@@ -12275,17 +12274,17 @@ mod tests {
     /// the concurrency are what can break.
     #[test]
     fn cargo_groups_run_every_group_and_report_the_first_failure_in_order() {
-        // The stand-ins run through `bash -c`, as the cargo lines do. The
-        // in-sandbox cargo-test gate has no bash (its PATH holds only the
+        // The stand-ins run through `sh -c`, as the cargo lines do. The
+        // in-sandbox cargo-test gate has no sh (its PATH holds only the
         // toolchain), so there
         // every stand-in would fail to spawn and the verdict would be a 1
         // that proves nothing; the test says so and stops instead.
-        let bash = Command::new("bash")
+        let sh = Command::new("sh")
             .args(["-c", "true"])
             .stdin(std::process::Stdio::null())
             .status();
-        if !bash.is_ok_and(|s| s.success()) {
-            eprintln!("SKIP: no bash on PATH (the in-sandbox gate)");
+        if !sh.is_ok_and(|s| s.success()) {
+            eprintln!("SKIP: no sh on PATH (the in-sandbox gate)");
             return;
         }
         let _root_cleanup = crate::test_temp::TempDir::new("td-cargo-groups").unwrap();
@@ -12830,7 +12829,7 @@ mod tests {
         let docs = "[package.metadata.docs.rs]\nall-features = true\n";
         assert!(parse_gate_crate("td-x", docs).is_ok(), "{docs:?}");
 
-        // A declared value reaches a `bash -c` string, so a shell metacharacter
+        // A declared value reaches a `sh -c` string, so a shell metacharacter
         // is refused rather than quoted.
         for evil in [
             "[package.metadata.td-gate]\ntest-args = \"--x; rm -rf /\"\n",
@@ -13903,7 +13902,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  for f in start build-qcow build-iso build-server-image test-iso publish host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do bash -n \"$f\" || exit 1; done",
+                "  for f in start build-qcow build-iso build-server-image test-iso publish host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do sh -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
                 defers,

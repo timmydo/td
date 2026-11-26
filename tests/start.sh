@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # The checkout entry points must bootstrap the Cargo runner before `cargo run`
 # can ask that runner to execute td-recipe-eval.
 #
@@ -9,9 +9,9 @@
 # legs below run all of them through
 # the same fixtures: a preflight that only `start` enforces is the bug this
 # file exists to prevent, and it is invisible from any single script alone.
-set -euo pipefail
+set -eu
 
-if [[ ${TD_START_TEST_FAKE_TOOLS:-} == 1 ]]; then
+if [ "${TD_START_TEST_FAKE_TOOLS:-}" = 1 ]; then
     case ${0##*/} in
         cargo)
             printf '%s|%s|%s|%s|%s\n' \
@@ -19,7 +19,7 @@ if [[ ${TD_START_TEST_FAKE_TOOLS:-} == 1 ]]; then
                 "${CARGO_BUILD_TARGET-<unset>}" \
                 "${CARGO_HOME-<unset>}" \
                 "$PWD" "$*" >> "$TD_START_TEST_LOG"
-            if [[ ${1-} == build && ${TD_START_TEST_MATERIALIZE:-} == 1 ]]; then
+            if [ "${1-}" = build ] && [ "${TD_START_TEST_MATERIALIZE:-}" = 1 ]; then
                 mkdir -p "$CARGO_TARGET_DIR/release"
                 printf '%s\n' \
                     '#!/bin/sh' \
@@ -33,7 +33,7 @@ if [[ ${TD_START_TEST_FAKE_TOOLS:-} == 1 ]]; then
             fi
             ;;
         rustc)
-            if [[ ${1-} == --version ]]; then
+            if [ "${1-}" = --version ]; then
                 printf '%s\n' "${TD_START_TEST_RUSTC_VERSION:-rustc 1.99.0}"
             else
                 exit "${TD_START_TEST_RUST_PROBE_RC:-0}"
@@ -65,8 +65,8 @@ make_fixture() {
 
 # One green run of an entry point under the ambient-config fixture, logging the
 # Cargo calls it makes. Echoes the fixture directory it built.
-run_entry_point() {
-    local fixture=$1 log=$2 script=$3
+run_entry_point() (
+    fixture=$1 log=$2 script=$3
     shift 3
     PATH=$work/bin:$PATH \
     TMPDIR=$ambient_tmp \
@@ -80,16 +80,16 @@ run_entry_point() {
     CARGO_BUILD_TARGET=wrong-target \
     CARGO_HOME=$ambient_home \
         "$fixture/$script" "$@"
-}
+)
 
 # The first logged Cargo call must be the isolated runner build: fixed target
 # dir, no ambient build.target, a throwaway Cargo home under TMPDIR, run from
 # the filesystem root against the fixture's own builder manifest.
-assert_isolated_runner_build() {
-    local line=$1 fixture=$2 label=$3
-    local build_target_dir build_target build_home build_cwd build_args
-    IFS='|' read -r build_target_dir build_target build_home build_cwd build_args \
-        <<< "$line"
+assert_isolated_runner_build() (
+    line=$1 fixture=$2 label=$3
+    IFS='|' read -r build_target_dir build_target build_home build_cwd build_args <<EOF
+$line
+EOF
     test "$build_target_dir" = "$fixture/target" &&
     test "$build_target" = "<unset>" &&
     test "$build_cwd" = "/" &&
@@ -102,7 +102,7 @@ assert_isolated_runner_build() {
         echo "FAIL: $label left its temporary Cargo home behind: $build_home" >&2
         exit 1
     }
-}
+)
 
 # A provisioned compiler without stable try_update must be diagnosed after the
 # runner bootstrap and before Cargo starts building the system — from EITHER
@@ -288,21 +288,18 @@ test -z "$iso_third" || {
     exit 1
 }
 
-mapfile -t runner_paths < <(
-    sed -n 's/^runner = \["\([^"]*\)", "run-capped"\]$/\1/p' \
-        "$fixture/.cargo/config.toml"
-)
-test "${#runner_paths[@]}" -gt 0 || {
+sed -n 's/^runner = \["\([^"]*\)", "run-capped"\]$/\1/p' \
+    "$fixture/.cargo/config.toml" > "$work/runner-paths"
+IFS= read -r runner_path < "$work/runner-paths" || {
     echo "FAIL: .cargo/config.toml names no run-capped runner" >&2
     exit 1
 }
-runner_path=${runner_paths[0]}
-for path in "${runner_paths[@]}"; do
+while IFS= read -r path; do
     test "$path" = "$runner_path" || {
         echo "FAIL: Cargo target rows disagree on the runner path" >&2
         exit 1
     }
-done
+done < "$work/runner-paths"
 test -x "$fixture/$runner_path" || {
     echo "FAIL: configured runner $runner_path does not reach the host build" >&2
     exit 1

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # revert-suspect.sh — form the revert of the commit that broke main.
 #
 # The optimistic-merge heal primitive (DESIGN §7.2). Main is NON-strict, so two
@@ -22,7 +22,7 @@
 # Loop guard: refuses to revert a commit that is ITSELF a revert (subject starts
 # "Revert ") and exits 3 — a revert that itself reds main is a human's problem,
 # not something to revert-storm.
-set -euo pipefail
+set -eu
 
 ref=HEAD
 while [ $# -gt 0 ]; do
@@ -46,12 +46,13 @@ esac
 
 # Replayed commits are single-parent (git revert needs no -m); guard a stray
 # true merge commit anyway.
-parents=$(git rev-list --parents -n1 "$sha" | wc -w)
-mflag=()
-[ "$parents" -gt 2 ] && mflag=(-m 1)
+parents=$(git rev-list --parents -n1 "$sha")
+# rev-list emits only space-separated object IDs.
+set -- $parents
+if [ "$#" -gt 2 ]; then set -- -m 1; else set --; fi
 
 branch="heal/revert-$short"
 git switch -c "$branch"
-git revert --no-edit "${mflag[@]}" "$sha"
+git revert --no-edit "$@" "$sha"
 echo "prepared revert of $short (\"$subject\") on branch $branch"
 echo "land it: the integrator reviews and lands $branch (td-review), then pushes."
