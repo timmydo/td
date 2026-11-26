@@ -647,22 +647,3 @@ The window protocol reexports only `pass::MailBinding`, the shared bounded,
 clearing tuple value; this gives it no host, transport or vault capability.
 Confinement pins that exact type-only exception. All service access remains
 in the backend thread.
-
-### Website authenticator worker
-
-The installed td-pass executable also supplies a root-only
-`website-authenticator GID` worker. Its input is a private, connected
-socketpair from the session authority. The worker owns a virtual FIDO
-interface and the private TPM passkey vault in /var/lib/td-passkeys.
-The window receives neither hardware PINs nor signing keys. A security
-key transaction runs through td-secret's bounded hidraw child. A PIN
-for the vault can authorize one pending website request. An unlocked
-vault may answer restricted known-handle checks for up to three minutes.
-The session owner revokes the cache on lock and reaps the worker at
-teardown.
-
-On td the locked notebook window also shows Ctrl+Alt+K. This physical
-shortcut opens the device-bound website passkeys, including before the
-portable password notebook is enrolled. The trusted screen accepts the
-vault PIN, lists the site, account and credential ID, and confirms the
-exact entry before removing it. Escape closes the list and locks it.

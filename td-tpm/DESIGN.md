@@ -302,7 +302,7 @@ secret and PCR 12 cap in `td-protector/DESIGN.md`, and its tokens and
 recovery flow in `td-install/ENCRYPTION.md`.
 
 One consumer policy lives here by exception: `device_pin`, td's shared
-device-PIN admission, which three consumers must apply identically and
+device-PIN admission, which both consumers must apply identically and
 none may own alone. It holds the dictionary-attack parameters td sets
 (`DA_PARAMETERS`, 32 tries, 600 s, 86400 s) and
 `DictionaryAttack::holds_td_policy`, which refuses a TPM whose lockout
@@ -313,10 +313,9 @@ root's private, single-link, exactly 34-byte SHA-256 Name, its errors
 typed and carrying no I/O detail; and the 6–63 byte printable PIN codec
 whose authValue is HMAC-SHA256 over a caller's domain, a zero byte and
 the PIN, keyed by a 32-byte salt. td-protector applies it to the volume
-PIN in its domain `td/disk-protector/pin/v1`, td-passkeys to its vault
-in that same domain under its own salt, and td-secret to a notebook key
+PIN in its domain `td/disk-protector/pin/v1`, and td-secret to a notebook key
 of this computer's TPM in `td-secret/portable/tpm-pin/v1`
-(td-install/ENCRYPTION.md, "Passkey storage primary"); all three share
+(td-install/ENCRYPTION.md, "Passkey storage primary"); both share
 the TPM's one counter. The PIN and authValue are zeroed on drop. The
 admission's open pins O_NOFOLLOW per architecture, as td-fs does, and
 fails to compile elsewhere; it then requires a regular file by its

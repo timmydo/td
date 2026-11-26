@@ -53,63 +53,6 @@ impl Drop for Secret {
     }
 }
 
-/// A trusted caller supplies a parsed, single website operation. The PIN
-/// and token never leave this module's one-use key agreement.
-pub(super) fn website_mac<I: Operation, T>(
-    info: &[u8],
-    intent: I,
-    channel: &mut impl super::fido_transaction::Channel,
-    prompt: impl FnOnce(u8) -> Result<Pin, String>,
-    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
-    send: impl FnOnce(
-        &I,
-        Option<(u64, &[u8])>,
-        bool,
-        &mut dyn super::fido_transaction::Channel,
-    ) -> Result<T, String>,
-    need_pin: bool,
-) -> Result<T, String> {
-    let claims = Profile::claims(info, true)?;
-    let options = claims.info.get(&Value::Unsigned(4))?;
-    let builtin = options
-        .map(|v| option(v, "uv", false))
-        .transpose()?
-        .unwrap_or(false);
-    if builtin && (need_pin || claims.always_uv) {
-        return send(&intent, None, true, channel);
-    }
-    if claims.client_pin != Some(true) || (!need_pin && !claims.always_uv) {
-        return send(&intent, None, claims.always_uv, channel);
-    }
-    let profile = Profile::admit(claims)?;
-    let retries = profile.retries()?;
-    let reply = channel.exchange(retries.bytes())?;
-    let retries = retries.parse(reply.as_ref())?;
-    if retries.count == 0 || retries.power_cycle {
-        return Err("security key PIN unavailable".into());
-    }
-    let request = KeyRequest {
-        bytes: command(6, client_pin(profile.protocol, 2, 2)?, profile.max_message)?,
-        profile,
-        intent,
-    };
-    let reply = channel.exchange(request.bytes())?;
-    let (keys, public) = agree(&request.profile, reply.as_ref(), entropy)?;
-    channel.check().map_err(|_| "website request expired")?;
-    let pin = prompt(retries.count)?;
-    channel.check().map_err(|_| "website request expired")?;
-    let authorized = request.with_keys_pin(keys, public, pin, entropy)?;
-    let reply = channel.exchange(authorized.bytes())?;
-    let mac = authorized.authorize(reply.as_ref())?;
-    channel.check().map_err(|_| "website request expired")?;
-    send(
-        &authorized.intent,
-        Some((authorized.profile.protocol.number(), &mac.0)),
-        false,
-        channel,
-    )
-}
-
 /// Initial profile accepts printable ASCII (already NFC), never rewrites a PIN.
 pub struct Pin(Secret);
 impl Pin {
@@ -484,9 +427,6 @@ pub(super) struct Unbound {
 pub(super) trait Operation {
     fn challenge(&self) -> &[u8; 32];
     fn permission(&self) -> u64;
-    fn rp(&self) -> &str {
-        RP_ID
-    }
 }
 impl Operation for Intent {
     fn challenge(&self) -> &[u8; 32] {
@@ -544,15 +484,6 @@ impl<I: Operation> KeyRequest<I> {
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
     ) -> Result<PinRequest<I>, String> {
         let (keys, public) = agree(&self.profile, response, entropy)?;
-        self.with_keys_pin(keys, public, pin, entropy)
-    }
-    fn with_keys_pin(
-        self,
-        keys: Keys,
-        public: PublicKey,
-        pin: Pin,
-        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
-    ) -> Result<PinRequest<I>, String> {
         let mut hash = crypto::digest(&pin.0 .0);
         drop(pin);
         let encrypted = keys.encrypt(hash.get(..16).ok_or("PIN hash extent")?, entropy);
@@ -571,7 +502,7 @@ impl<I: Operation> KeyRequest<I> {
             out.head(0, 9)?;
             out.head(0, self.intent.permission())?; // One operation, fixed RP.
             out.head(0, 10)?;
-            out.text(self.intent.rp())?;
+            out.text(RP_ID)?;
         }
         let bytes = command(6, out, self.profile.max_message)?;
         Ok(PinRequest {

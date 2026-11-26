@@ -68,7 +68,6 @@ fn update_request() -> Result<Inspection, String> {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Request {
     Prepare,
-    Website(crate::website::Frame),
     NotebookOpen,
     NotebookLock,
     Poll,
@@ -131,7 +130,6 @@ impl Request {
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         match bytes {
             [0x10] => Ok(Self::Prepare),
-            [0x2d, rest @ ..] => Ok(Self::Website(crate::website::Frame::parse(rest)?)),
             [0x28] => Ok(Self::NotebookOpen),
             [0x2b] => Ok(Self::NotebookLock),
             [0x11] => Ok(Self::Poll),
@@ -372,7 +370,6 @@ impl Drop for Cleanup {
 }
 
 pub(crate) struct Session {
-    website: crate::website::Authority,
     owner: u32,
     notebook: Option<crate::notebook::Bridge>,
     notebook_mail: Option<crate::notebook_mail::Intake>,
@@ -416,7 +413,6 @@ impl Session {
         }
         Ok(Self {
             owner,
-            website: crate::website::Authority::default(),
             notebook: None,
             notebook_mail: None,
             intake: None,
@@ -461,8 +457,7 @@ impl Session {
                 self.admit(&crate::handoff::Paths::production());
             }
         }
-        let answer = self.answer_with(request, cleanup_command, Start::begin);
-        answer
+        self.answer_with(request, cleanup_command, Start::begin)
     }
 
     /// Amendment 9: consumes the admission record before the first `1a`,
@@ -490,9 +485,6 @@ impl Session {
         if self.suspending.is_some() && request.takes_slot() {
             return Err("a request for the slot while suspend is pending".into());
         }
-        if request.takes_slot() || request == Request::NotebookLock {
-            self.website.revoke();
-        }
         match request {
             Request::Prepare => {
                 if self.activated {
@@ -513,23 +505,6 @@ impl Session {
                     intake.revoke();
                 }
                 Ok(vec![0xab])
-            }
-            Request::Website(frame) => {
-                let allowed = self.prepared
-                    && self.setup.is_none()
-                    && self.cleanup.is_none()
-                    && self.operation.is_none()
-                    && self.inspection.is_none()
-                    && self.suspending.is_none()
-                    && !self
-                        .notebook
-                        .as_ref()
-                        .is_some_and(crate::notebook::Bridge::busy)
-                    && !self
-                        .revocation
-                        .as_ref()
-                        .is_some_and(crate::revocation::Revocation::restarting);
-                self.website.answer(frame, allowed)
             }
             Request::NotebookOpen => {
                 // A window that just closed is seen before it is counted open.
@@ -1187,24 +1162,18 @@ impl Session {
     pub fn tick(&mut self) -> Result<(), String> {
         // The notebook takes the token slot only when nothing else holds
         // it and nothing could claim it before its step ends.
-        // A website ceremony the physical seat drives outranks it too.
         let slot_free = self.prepared
             && self.cleanup.is_none()
             && self.operation.is_none()
             && self.inspection.is_none()
             && self.suspending.is_none()
-            && !self.website.busy()
             && !self
                 .revocation
                 .as_ref()
                 .is_some_and(crate::revocation::Revocation::restarting);
         let polled = self.notebook.as_mut().map(|bridge| bridge.poll(slot_free));
-        match polled {
-            // Its operation took the slot: like any local secret operation,
-            // it revokes website operations before its first token step.
-            Some(Ok(true)) => self.website.revoke(),
-            Some(Err(why)) => self.end_notebook(&why),
-            Some(Ok(false)) | None => {}
+        if let Some(Err(why)) = polled {
+            self.end_notebook(&why);
         }
         if let Some(intake) = &mut self.notebook_mail {
             if let Some(bridge) = &mut self.notebook {
@@ -1416,7 +1385,6 @@ impl Session {
     }
 
     fn close_with(&mut self, command: impl FnOnce(u32) -> Command) -> Result<(), String> {
-        self.website = crate::website::Authority::default();
         if !self.activated {
             self.abandon_revocation(true);
             return Ok(());

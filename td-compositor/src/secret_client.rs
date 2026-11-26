@@ -313,7 +313,7 @@ impl Drop for PinRequest {
 
 /// td-secret's PIN-holder check (`store::require_protected_memory`), for
 /// this process: no active swap on storage and a zero core-dump soft limit.
-pub(crate) fn protected_memory() -> Result<(), String> {
+fn protected_memory() -> Result<(), String> {
     memory_state(
         proc_text(Path::new("/proc/swaps")),
         proc_text(Path::new("/proc/self/limits")),
@@ -342,7 +342,6 @@ fn asks_pin(request: &Request) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Selection {
-    Website(Option<crate::website_prompt::Ticket>),
     Unlock(Role),
     Enroll(Recovery),
     Write,
@@ -362,8 +361,7 @@ impl From<Role> for Selection {
 impl Selection {
     fn operation(&self) -> Option<Operation> {
         Some(match self {
-            Self::Website(_)
-            | Self::Write
+            Self::Write
             | Self::Install
             | Self::Login(_)
             | Self::Elevation(_)
@@ -380,7 +378,6 @@ impl Selection {
     }
     fn request(&self) -> Result<Vec<u8>, String> {
         Ok(match self {
-            Self::Website(_) => return Err("website uses the virtual authenticator".into()),
             Self::Suspend => return Err("suspend requires a lock presentation receipt".into()),
             Self::Power(choice) => vec![0x21, choice.byte()],
             Self::Update => return Err("the update's requests are fixed slices".into()),
@@ -450,8 +447,6 @@ impl Elevation {
 /// other key, which ends the request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApprovalPress {
-    Page,
-    Next,
     Enter,
     Other,
 }
@@ -1027,8 +1022,6 @@ pub(crate) struct Attempt {
     selection: Selection,
     state: AtomicU8,
     deadline: Option<Instant>,
-    website_next: AtomicU8,
-    website_pin: Mutex<PinBuffer>,
     presentation: Mutex<Option<Presented>>,
     confirmed: AtomicBool,
     /// The PIN field, shared by the evdev adapter that types into it and
@@ -1063,18 +1056,11 @@ impl Attempt {
             deadline: Instant::now().checked_add(selection.lifetime()),
             selection,
             state: AtomicU8::new(ACTIVE),
-            website_next: AtomicU8::new(0),
-            website_pin: Mutex::default(),
             presentation: Mutex::new(None),
             confirmed: AtomicBool::new(false),
             field: Mutex::new(PinField::default()),
             seat,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expire_now(&mut self) {
-        self.deadline = Some(Instant::now());
     }
 
     #[cfg(test)]
@@ -1118,72 +1104,11 @@ impl Attempt {
     /// one of them comes first.
     pub fn cancel(&self) {
         self.state.fetch_or(CANCELLED, Ordering::SeqCst);
-        self.forget_website_pin();
         self.close_field();
     }
 
     /// Closes the PIN field, zeroing it, whatever a panicking holder left.
-    pub(crate) fn forget_website_pin(&self) {
-        self.website_pin
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-    }
-
-    pub(crate) fn enrollment_pin(&self, pin: &[u8], repeat: bool) -> Result<(), String> {
-        let mut first = self
-            .website_pin
-            .lock()
-            .map_err(|_| "website PIN lock poisoned")?;
-        if !self.sending() || !(6..=63).contains(&pin.len()) {
-            first.clear();
-            return Err("invalid new website vault PIN".into());
-        }
-        if repeat {
-            let matched = first.bytes.get(..first.length) == Some(pin);
-            first.clear();
-            if !matched {
-                return Err("website vault PIN entries differ".into());
-            }
-        } else {
-            first.clear();
-            first
-                .bytes
-                .get_mut(..pin.len())
-                .ok_or("website PIN extent")?
-                .copy_from_slice(pin);
-            first.length = pin.len();
-        }
-        Ok(())
-    }
-
-    pub(crate) fn take_website_next(&self) -> u8 {
-        self.website_next.swap(0, Ordering::SeqCst)
-    }
-    pub(crate) fn claim_website_send(&self) -> Result<(), String> {
-        if !self.is_website()
-            || self.expired()
-            || self
-                .state
-                .compare_exchange(ACTIVE, SENDING, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err("website request cancelled".into());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn is_website(&self) -> bool {
-        matches!(self.selection, Selection::Website(_))
-    }
-    pub(crate) fn close_website(&self) -> Result<(), String> {
-        self.close_field();
-        if let Some(seat) = &self.seat {
-            return seat.release(self);
-        }
-        Ok(())
-    }
-    pub(crate) fn close_field(&self) {
+    fn close_field(&self) {
         self.field
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1193,7 +1118,7 @@ impl Attempt {
     /// Opens the PIN field beneath `step`, the presented PIN step root asked
     /// a PIN for, and waits for its paint to be on glass: until then no key
     /// types, and afterwards only a press made after it.
-    pub(crate) fn open_field(&self, step: &Request) -> Result<(), String> {
+    fn open_field(&self, step: &Request) -> Result<(), String> {
         let presentation = {
             let mut field = self.field.lock().unwrap_or_else(PoisonError::into_inner);
             if !self.active() {
@@ -1293,7 +1218,7 @@ impl Attempt {
     /// one compare-exchange cancellation's mark races: a cancellation that
     /// came first leaves nothing copied, and one after it is honoured by
     /// `sending` up to the write. `finish_sending` ends the send.
-    pub(crate) fn take_pin(&self, into: &mut [u8]) -> Option<usize> {
+    fn take_pin(&self, into: &mut [u8]) -> Option<usize> {
         let mut field = self.field.lock().unwrap_or_else(PoisonError::into_inner);
         if !field.is_open() || !field.submitted {
             return None;
@@ -1316,12 +1241,12 @@ impl Attempt {
 
     /// Whether a taken PIN may still be written: no cancellation since the
     /// take, and the deadline not passed.
-    pub(crate) fn sending(&self) -> bool {
+    fn sending(&self) -> bool {
         self.state.load(Ordering::SeqCst) == SENDING && !self.expired()
     }
 
     /// Back to `ACTIVE` after a send, unless cancellation marked it.
-    pub(crate) fn finish_sending(&self) {
+    fn finish_sending(&self) {
         let _ = self
             .state
             .compare_exchange(SENDING, ACTIVE, Ordering::SeqCst, Ordering::SeqCst);
@@ -1349,7 +1274,7 @@ impl Attempt {
             .is_none_or(|deadline| Instant::now() >= deadline)
     }
 
-    pub(crate) fn active(&self) -> bool {
+    fn active(&self) -> bool {
         self.state.load(Ordering::SeqCst) == ACTIVE
             && self
                 .deadline
@@ -1365,7 +1290,7 @@ impl Attempt {
             .is_ok()
     }
 
-    pub(crate) fn present(&self, request: Request) -> Result<Request, String> {
+    fn present(&self, request: Request) -> Result<Request, String> {
         if !self.active() {
             return Err("physical attention was cancelled".into());
         }
@@ -1408,16 +1333,14 @@ impl Attempt {
         }
         let completed = receipt.completed();
         let request = receipt.into_request();
-        if self.selection.confirms()
-            || matches!(self.selection, Selection::Login(_) | Selection::Website(_))
-        {
+        if self.selection.confirms() || matches!(self.selection, Selection::Login(_)) {
             let mut presentation = self
                 .presentation
                 .lock()
                 .map_err(|_| "presentation receipt lock poisoned")?;
             // A login step replaces the one before it, whose approval is
             // spent: it goes with it, under the lock an Enter sets it.
-            if matches!(self.selection, Selection::Login(_) | Selection::Website(_)) {
+            if matches!(self.selection, Selection::Login(_)) {
                 self.confirmed.store(false, Ordering::SeqCst);
             }
             *presentation =
@@ -1433,7 +1356,7 @@ impl Attempt {
 
     /// Whether `request`, the presented login disclosure step, was approved
     /// by Enter: only then does its receipt go to root.
-    pub(crate) fn approved(&self, request: &Request) -> bool {
+    fn approved(&self, request: &Request) -> bool {
         self.confirmed.load(Ordering::SeqCst)
             && self.presentation.lock().is_ok_and(|presented| {
                 presented
@@ -1493,10 +1416,7 @@ impl Attempt {
     ) -> Result<bool, String> {
         if !matches!(
             self.selection,
-            Selection::Install
-                | Selection::Elevation(_)
-                | Selection::Login(_)
-                | Selection::Website(_)
+            Selection::Install | Selection::Elevation(_) | Selection::Login(_)
         ) || !self.active()
         {
             return Ok(false);
@@ -1512,24 +1432,8 @@ impl Attempt {
             }) else {
                 return Ok(false);
             };
-            if !presented.decided {
-                let step = match (press, presented.request.operation()) {
-                    (ApprovalPress::Next, Operation::Website(w))
-                        if matches!(w.stage, 0 | 3 | 10) =>
-                    {
-                        1
-                    }
-                    (ApprovalPress::Page, Operation::Website(w)) if w.stage == 10 => 16,
-                    _ => 0,
-                };
-                if step != 0 {
-                    presented.decided = true;
-                    self.website_next.store(step, Ordering::SeqCst);
-                    return Ok(false);
-                }
-            }
             if presented.decided {
-                let earlier = press != ApprovalPress::Enter
+                let earlier = press == ApprovalPress::Other
                     && presented.approved_at.is_some_and(|at| timestamp < at);
                 if !earlier {
                     return Ok(false);
@@ -1653,7 +1557,6 @@ impl Drop for LoginPending {
 }
 
 pub(crate) struct Client {
-    pub(crate) website: crate::website_prompt::Client,
     pending: Option<Pending>,
     login: Option<LoginPending>,
     /// A login operation ended since the authority worker last asked: its
@@ -1671,7 +1574,6 @@ pub(crate) struct Client {
 impl Default for Client {
     fn default() -> Self {
         Self {
-            website: crate::website_prompt::Client::default(),
             pending: None,
             login: None,
             login_ended: false,
@@ -1729,26 +1631,12 @@ impl Client {
         })
     }
 
-    pub(crate) fn follow_website(
-        &mut self,
-        wire: &mut impl Exchange,
-        login: &crate::authority::Login,
-    ) -> Result<(), String> {
-        self.website.poll(wire, login, self.memory)
-    }
-
     pub fn start(&mut self, wire: &mut impl Exchange, attempt: Arc<Attempt>) -> Result<(), String> {
         if !attempt.active() {
             return Ok(());
         }
         if self.pending.is_some() || self.login.is_some() || self.inspection.is_some() {
             return attempt.notice(Notice::Busy);
-        }
-        if let Selection::Website(ticket) = attempt.selection {
-            return match ticket {
-                Some(ticket) => self.website.start(ticket, attempt),
-                None => self.website.manage(wire, attempt),
-            };
         }
         if matches!(attempt.selection, Selection::Enroll(_)) {
             return self.inspect(wire, attempt, true);
@@ -2878,228 +2766,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
-    }
-
-    #[test]
-    fn website_chooser_renders_the_default_and_requires_separate_enrollment_consent() {
-        use crate::website_prompt::Ticket;
-        let ticket = Ticket {
-            epoch: [7; 32],
-            id: 12,
-        };
-        let prefix = [vec![0xad], ticket.epoch.to_vec(), vec![0]].concat();
-        let reply = [
-            prefix.clone(),
-            ticket.id.to_be_bytes().to_vec(),
-            vec![1, 1, 1, 0, 11],
-            b"www.example".to_vec(),
-            vec![0, 5],
-            b"Alice".to_vec(),
-            9u64.to_be_bytes().to_vec(),
-            vec![3],
-        ]
-        .concat();
-        for (physical, mismatch) in [(false, false), (false, true), (true, false)] {
-            let mut screen = Screen::sized(1024, 768);
-            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Website(Some(ticket));
-            let login = crate::authority::Login::default();
-            let mut client = Client::trusting_memory();
-            let mut wire = wire(Vec::new());
-            let poll = |wire: &mut Wire, client: &mut Client, action: bool| {
-                wire.replies.push_back(reply.clone());
-                if action {
-                    wire.replies.push_back(prefix.clone());
-                }
-                client.follow_website(wire, &login).unwrap();
-            };
-            poll(&mut wire, &mut client, false);
-            assert_eq!(login.website_ticket(), Some(ticket));
-            client
-                .start(&mut wire, Arc::clone(&screen.attempt))
-                .unwrap();
-            poll(&mut wire, &mut client, false);
-            let shown = || {
-                let presentation = screen.attempt.presentation.lock().unwrap();
-                let p = presentation.as_ref().unwrap();
-                let Operation::Website(w) = p.request.operation() else {
-                    panic!("wrong prompt");
-                };
-                assert_eq!((&*w.site, &*w.account), ("www.example", "Alice"));
-                (p.after + APPROVAL_SETTLE + 1, w.stage, w.key)
-            };
-            let (at, stage, key) = shown();
-            assert_eq!((stage, key), (0, None));
-            assert!(!press(
-                &screen,
-                if physical {
-                    ApprovalPress::Next
-                } else {
-                    ApprovalPress::Enter
-                },
-                at
-            ));
-            poll(&mut wire, &mut client, false);
-            poll(&mut wire, &mut client, false);
-            let (at, stage, key) = shown();
-            assert_eq!(
-                (stage, key),
-                if physical { (0, Some(3)) } else { (1, None) }
-            );
-            assert!(wire.calls.iter().all(|c| c.as_slice() == [0x2d, 1]));
-            assert!(!press(&screen, ApprovalPress::Enter, at));
-            poll(&mut wire, &mut client, true);
-            let mut expected = vec![0x2d, 2];
-            expected.extend(ticket.epoch);
-            expected.push(if physical { 4 } else { 5 });
-            expected.extend(ticket.id.to_be_bytes());
-            if physical {
-                expected.extend(9u64.to_be_bytes());
-                expected.push(3);
-            } else {
-                expected.push(1);
-            }
-            assert_eq!(wire.calls.last(), Some(&expected));
-            if !physical {
-                poll(&mut wire, &mut client, false);
-                type_pin(&screen.attempt, b"example1");
-                poll(&mut wire, &mut client, false);
-                assert_eq!(wire.calls.last().unwrap(), &[0x2d, 1]);
-                poll(&mut wire, &mut client, false);
-                type_pin(
-                    &screen.attempt,
-                    if mismatch { b"example2" } else { b"example1" },
-                );
-                poll(&mut wire, &mut client, true);
-                expected.truncate(34);
-                expected.push(if mismatch { 3 } else { 6 });
-                expected.extend(ticket.id.to_be_bytes());
-                if !mismatch {
-                    expected.extend(b"example1");
-                }
-                assert_eq!(wire.calls.last(), Some(&expected));
-            } else {
-                let needs_pin =
-                    [prefix.clone(), ticket.id.to_be_bytes().to_vec(), vec![6, 3]].concat();
-                for _ in 0..2 {
-                    wire.replies.push_back(needs_pin.clone());
-                    client.follow_website(&mut wire, &login).unwrap();
-                }
-                assert!(screen.attempt.field.lock().unwrap().is_open());
-                type_pin(&screen.attempt, b"1234");
-                wire.replies.extend([needs_pin, prefix.clone()]);
-                client.follow_website(&mut wire, &login).unwrap();
-                expected.truncate(34);
-                expected.push(6);
-                expected.extend(ticket.id.to_be_bytes());
-                expected.extend(b"1234");
-                assert_eq!(wire.calls.last(), Some(&expected));
-                screen.attempt.claim_website_send().unwrap();
-                screen.attempt.cancel();
-                assert!(!screen.attempt.sending());
-                screen.attempt.finish_sending();
-                assert!(!screen.attempt.active());
-                assert!(screen.attempt.claim_website_send().is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn passkey_management_shows_the_selected_site_before_removing_a_credential() {
-        let mut screen = Screen::sized(1024, 768);
-        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Website(None);
-        let ticket = crate::website_prompt::Ticket {
-            epoch: [4; 32],
-            id: 9,
-        };
-        let prefix = [vec![0xad], ticket.epoch.to_vec(), vec![0]].concat();
-        let state = |op| [prefix.clone(), ticket.id.to_be_bytes().to_vec(), vec![op]].concat();
-        let login = crate::authority::Login::default();
-        let mut client = Client::trusting_memory();
-        let mut wire = wire(vec![state(11)]);
-        client
-            .start(&mut wire, Arc::clone(&screen.attempt))
-            .unwrap();
-        let follow = |wire: &mut Wire, client: &mut Client, replies: Vec<Vec<u8>>| {
-            wire.replies.extend(replies);
-            client.follow_website(wire, &login).unwrap();
-        };
-        follow(&mut wire, &mut client, vec![state(11)]);
-        type_pin(&screen.attempt, b"sample PIN");
-        follow(&mut wire, &mut client, vec![state(11), prefix.clone()]);
-        let row = |id, site: &str| {
-            [
-                prefix.clone(),
-                vec![id; 32],
-                (site.len() as u16).to_be_bytes().to_vec(),
-                site.as_bytes().to_vec(),
-                vec![0, 5],
-                b"Alice".to_vec(),
-                vec![255],
-            ]
-            .concat()
-        };
-        let shown = || {
-            let receipt = screen.attempt.presentation.lock().unwrap();
-            let presented = receipt.as_ref().unwrap();
-            let Operation::Website(w) = presented.request.operation() else {
-                panic!()
-            };
-            (
-                presented.after + APPROVAL_SETTLE + 1,
-                w.stage,
-                w.site.clone(),
-                w.credential,
-            )
-        };
-        follow(
-            &mut wire,
-            &mut client,
-            vec![state(13), row(1, "one.example")],
-        );
-        let (_, stage, site, id) = shown();
-        assert_eq!(
-            (stage, site.as_str(), id),
-            (10, "one.example", Some([1; 32]))
-        );
-        for n in 1..=16u16 {
-            let index = (n * 16).min(255) as u8;
-            let at = shown().0;
-            assert!(!press(&screen, ApprovalPress::Page, at));
-            follow(
-                &mut wire,
-                &mut client,
-                vec![state(13), row(index, "two.example")],
-            );
-            assert_eq!(wire.calls.last().unwrap().last(), Some(&index));
-            assert_eq!(shown().3, Some([index; 32]));
-        }
-        let (at, stage, site, id) = shown();
-        assert_eq!(
-            (stage, site.as_str(), id),
-            (10, "two.example", Some([255; 32]))
-        );
-        assert!(!press(&screen, ApprovalPress::Enter, at));
-        follow(&mut wire, &mut client, vec![state(13)]);
-        follow(&mut wire, &mut client, vec![state(13)]);
-        let (at, stage, site, id) = shown();
-        assert_eq!(
-            (stage, site.as_str(), id),
-            (11, "two.example", Some([255; 32]))
-        );
-        assert!(wire.calls.iter().all(|q| q.get(34) != Some(&14)));
-        assert!(!press(&screen, ApprovalPress::Enter, at));
-        follow(&mut wire, &mut client, vec![state(13), prefix.clone()]);
-        let remove = [
-            vec![0x2d, 2],
-            ticket.epoch.to_vec(),
-            vec![14],
-            ticket.id.to_be_bytes().to_vec(),
-            vec![255; 32],
-        ]
-        .concat();
-        assert_eq!(wire.calls.last(), Some(&remove));
-        follow(&mut wire, &mut client, vec![state(15)]);
-        assert!(!screen.attempt.field.lock().unwrap().is_open());
     }
 
     struct Wire {
@@ -4934,8 +4600,6 @@ mod tests {
             let mut screen = Self::login(selection.clone());
             let deadline = Instant::now() + after;
             screen.attempt = Arc::new(Attempt {
-                website_next: AtomicU8::new(0),
-                website_pin: Mutex::default(),
                 origin: crate::input::test_origin(),
                 runtime: Arc::clone(&screen.attempt.runtime),
                 selection: Selection::Login(selection),

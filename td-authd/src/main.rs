@@ -25,6 +25,10 @@ mod channel;
     reason = "immutable trusted-prompt contract; authority consumer follows"
 )]
 mod consent;
+#[path = "../../td-fido/src/hid_descriptor.rs"]
+mod hid_descriptor;
+#[path = "../../td-fido/shared/security_key.rs"]
+mod security_key;
 // The cutover record's bytes and the root-only publication firstboot's
 // renders share: one reviewed copy (amendment 7).
 #[path = "../../td-firstboot/src/cutover.rs"]
@@ -101,7 +105,6 @@ mod storage;
 mod suspend;
 mod sys;
 mod unlock;
-mod website;
 #[path = "../../engine/src/workload_accounts.rs"]
 #[allow(dead_code, reason = "the application policy reads the ledger")]
 mod workload_accounts;

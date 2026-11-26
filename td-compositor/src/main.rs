@@ -101,7 +101,6 @@ mod runtime;
 mod scene;
 mod screenshot;
 mod secret_client;
-mod website_prompt;
 // td-secret's memory rules for a process holding a PIN (secret_client.rs).
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-secret/src/memory.rs")]
 mod secret_memory;
@@ -1226,7 +1225,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xebe81ec868346078;
+    const AUTHORITY_FINGERPRINT: u64 = 0x92b14254b5609c6a;
     const AUTH_SYS_FINGERPRINT: u64 = 0xb64878d738ec4031;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1300,7 +1299,6 @@ mod confinement {
         ("scene.rs", include_str!("scene.rs")),
         ("screenshot.rs", include_str!("screenshot.rs")),
         ("secret_client.rs", include_str!("secret_client.rs")),
-        ("website_prompt.rs", include_str!("website_prompt.rs")),
         (
             "secret_memory.rs",
             include_str!("../../td-secret/src/memory.rs"),
@@ -1400,7 +1398,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xb0c6069f8833028e,
+            0x9347c21c55952977,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -3637,7 +3635,7 @@ pub struct MappedRegion {
              || held(KEY_LEFTALT, KEY_RIGHTALT)\n            \
              || held(KEY_LEFTMETA, KEY_RIGHTMETA);\n        \
              Some(if code == KEY_ENTER && !modified {\n            \
-             ApprovalPress::Enter\n        } else if code == KEY_TAB && !modified {\n            ApprovalPress::Next\n        } else if code == KEY_PAGEDOWN && !modified {\n            ApprovalPress::Page\n        } else {\n            \
+             ApprovalPress::Enter\n        } else {\n            \
              ApprovalPress::Other\n        })"
         ));
         assert!(!press.contains("KEY_KP"));
@@ -3705,7 +3703,7 @@ pub struct MappedRegion {
         ));
         assert!(approve.contains(
             "            if presented.decided {\n                \
-             let earlier = press != ApprovalPress::Enter\n                    \
+             let earlier = press == ApprovalPress::Other\n                    \
              && presented.approved_at.is_some_and(|at| timestamp < at);\n                \
              if !earlier {\n                    return Ok(false);\n                }\n"
         ));
@@ -3727,7 +3725,7 @@ pub struct MappedRegion {
         assert!(approve.contains("        if ended {\n            self.cancel();\n        }\n"));
         assert!(approve.contains(
             "        if !matches!(\n            self.selection,\n            \
-             Selection::Install\n                | Selection::Elevation(_)\n                | Selection::Login(_)\n                | Selection::Website(_)\n        \
+             Selection::Install | Selection::Elevation(_) | Selection::Login(_)\n        \
              ) || !self.active()\n"
         ));
         // Root's description alone says which prompts await approval: the
@@ -3743,7 +3741,7 @@ pub struct MappedRegion {
              && login.attempt.active()\n"
         ));
         assert_eq!(occurrences(client, ".approved("), 1);
-        let approved = body(client, "    pub(crate) fn approved(");
+        let approved = body(client, "    fn approved(");
         assert!(approved.contains(
             "        self.confirmed.load(Ordering::SeqCst)\n            \
              && self.presentation.lock().is_ok_and(|presented| {\n"

@@ -51,8 +51,8 @@ const REL_WHEEL: u16 = 8;
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const KEY_ESC: u16 = 1;
+#[cfg(test)]
 const KEY_TAB: u16 = 15;
-const KEY_PAGEDOWN: u16 = 109;
 const KEY_BRIGHTNESSDOWN: u16 = 224;
 const KEY_BRIGHTNESSUP: u16 = 225;
 const KEY_MUTE: u16 = 113;
@@ -582,13 +582,8 @@ impl KeyBindings {
             }
             return decision;
         }
-        let website = match event.code {
-            KEY_K => Some(None),
-            KEY_P => self.login.website_ticket().map(Some),
-            _ => None,
-        };
         if self.attention_enabled
-            && (ATTENTION_KEYS.contains(&event.code) || website.is_some())
+            && ATTENTION_KEYS.contains(&event.code)
             && event.value == KEY_PRESS
             && (self.pressed(KEY_LEFTCTRL) || self.pressed(KEY_RIGHTCTRL))
             && (self.pressed(KEY_LEFTALT) || self.pressed(KEY_RIGHTALT))
@@ -598,17 +593,10 @@ impl KeyBindings {
                 && !attention_held
                 && held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
                 && held(KEY_LEFTALT, KEY_RIGHTALT);
-            if website.is_some() && !decision.unlock {
-                return decision;
-            }
             self.attention_late.clear();
             self.attention = AttentionState::Open;
             self.keyless_close = None;
-            self.secret_selected = website.is_some();
-            if let Some(ticket) = website {
-                decision.secret = Some(crate::secret_client::Selection::Website(ticket));
-                decision.unlock = false;
-            }
+            self.secret_selected = false;
             self.login_screen = LoginScreen::Closed;
             self.login_shown = None;
             self.forwarded.clear();
@@ -1128,10 +1116,6 @@ impl KeyBindings {
             || held(KEY_LEFTMETA, KEY_RIGHTMETA);
         Some(if code == KEY_ENTER && !modified {
             ApprovalPress::Enter
-        } else if code == KEY_TAB && !modified {
-            ApprovalPress::Next
-        } else if code == KEY_PAGEDOWN && !modified {
-            ApprovalPress::Page
         } else {
             ApprovalPress::Other
         })
@@ -2067,7 +2051,6 @@ enum KeylessClose {
     /// A committed device-bound disk installation's notice
     /// (`Seat::release`).
     Install,
-    Website,
     /// A lid close's or a resume's lock (`lock_for_suspend`).
     Suspend,
 }
@@ -2077,7 +2060,6 @@ impl KeylessClose {
         match self {
             Self::Unlock => UNLOCK_CLOSE_MARKER,
             Self::Install => SELF_CLOSE_MARKER,
-            Self::Website => "TD-ATTENTION-WEBSITE-CLOSE",
             Self::Suspend => SUSPEND_CLOSE_MARKER,
         }
     }
@@ -2203,12 +2185,7 @@ impl Seat {
     /// shows. The close settles by time. A drain that fails leaves the
     /// screen open as it was, for Escape.
     pub(crate) fn release(&self, attempt: &crate::secret_client::Attempt) -> Result<(), String> {
-        let close = if attempt.is_website() {
-            KeylessClose::Website
-        } else {
-            KeylessClose::Install
-        };
-        self.close_itself(attempt, close, |bindings, target| {
+        self.close_itself(attempt, KeylessClose::Install, |bindings, target| {
             bindings.attention = AttentionState::Draining;
             let drained = target.drain_attention();
             if drained.is_err() {
@@ -4603,7 +4580,6 @@ fn deliver_key_decision<T: InputTarget>(
                 state => decision.notice = Some(no_login_keys(state)),
             }
         } else {
-            decision.secret = None;
             // A security key's own keyboard selects nothing: its chord
             // leaves the lock surface as it was.
             bindings.attention = AttentionState::Closed;
@@ -15569,51 +15545,6 @@ mod tests {
         run(&mut client, &mut root).unwrap();
         assert!(!seat.locked() && !seat.attention_open());
         seat
-    }
-
-    #[test]
-    fn an_expired_passkey_list_withdraws_its_credential_without_a_keypress() {
-        use crate::authority::consent::{Operation, Request, Website};
-        use crate::secret_client::{Attempt, Selection};
-        let seat = LockedSeat::open(&[]);
-        seat.chord(0);
-        let owner = seat.target.lock().unwrap().seat.clone();
-        let mut attempt = Attempt::seated(
-            test_origin(),
-            Arc::clone(&seat.runtime),
-            Selection::Website(None),
-            Some(owner),
-        );
-        let prompt = Request::new(
-            [9; 32],
-            1000,
-            Operation::Website(Website {
-                ticket: 8,
-                stage: 10,
-                register: false,
-                key: None,
-                site: "login.example".into(),
-                account: "Alice".into(),
-                credential: Some([3; 32]),
-            }),
-        )
-        .unwrap();
-        attempt.present(prompt.clone()).unwrap();
-        assert!(seat
-            .runtime
-            .lock()
-            .unwrap()
-            .attention_request_visible(&prompt));
-        Arc::get_mut(&mut attempt).unwrap().expire_now();
-        seat.target.lock().unwrap().secret_attempt = Some(Arc::clone(&attempt));
-        assert!(!attempt.active());
-        attempt.close_website().unwrap();
-        assert!(!seat.attention_open());
-        assert!(!seat
-            .runtime
-            .lock()
-            .unwrap()
-            .attention_request_visible(&prompt));
     }
 
     /// `events` read from `device` by its own reader, which has seen no

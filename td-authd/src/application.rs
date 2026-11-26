@@ -322,6 +322,9 @@ pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
     let request = Request::parse(arguments)?;
     launch::require_launch_startup().map_err(|e| format!("application startup: {e}"))?;
     let uid = admit(&LAUNCH, request.owner, &request.name)?;
+    if request.name == "firefox" && uid == crate::hid_descriptor::FIREFOX_KEY_GROUP {
+        grant_security_keys().map_err(|e| message(format_args!("grant USB security keys: {e}")))?;
+    }
     // Publish only this application's explicit grants before its first process.
     crate::grant_views::publish(Kind::Application, &request.name, uid)?;
     // No root log or inherited descriptor reaches the credential helper or
@@ -335,6 +338,31 @@ pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
         .stderr(Stdio::null())
         .exec();
     Err(format!("exec application credential helper: {error}"))
+}
+
+/// Only an admitted Firefox launch gets the fixed group's device grant.
+fn grant_security_keys() -> std::io::Result<()> {
+    use crate::hid_descriptor::FIREFOX_KEY_GROUP;
+    use std::fs::Permissions;
+    use std::os::unix::fs::{fchown, MetadataExt, PermissionsExt};
+
+    for index in 0..=u8::MAX {
+        let Some((node, _, _)) = crate::security_key::open(index)? else {
+            continue;
+        };
+        let meta = node.metadata()?;
+        if MetadataExt::gid(&meta) != FIREFOX_KEY_GROUP {
+            fchown(&node, None, Some(FIREFOX_KEY_GROUP))?;
+        }
+        if meta.mode() & 0o7777 != 0o660 {
+            node.set_permissions(Permissions::from_mode(0o660))?;
+        }
+        // If unplug raced the update, restore the unlinked node's mode.
+        if node.metadata()?.nlink() == 0 {
+            node.set_permissions(Permissions::from_mode(0o000))?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn bounded(path: &str) -> Result<String, String> {

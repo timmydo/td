@@ -1681,7 +1681,13 @@ the validator. Trusted root must not change the account database, deployment
 or mount hierarchy during launch. The check creates no state and does not
 substitute for successful firstboot dependency ordering.
 
-After validation the authority execs the fixed td-login helper,
+After validation, an admitted Firefox launch grants its reserved
+workload group read and write access on each attached USB FIDO node
+that presents the shared CTAP HID descriptor profile. The grant
+changes the confirmed device inode by descriptor before credentials
+are dropped (WORKLOADS.md, "Firefox hardware security keys").
+
+The authority then execs the fixed td-login helper,
 `exec-service-as tdaUID`, which resolves the account from the workload
 account ledger and then executes the authority's
 own `application-exec` wrapper. All
@@ -5098,7 +5104,7 @@ for `manage-time`. There is no saved value to compare.
 Tag 46 carries a requester u32 equal to the owner, then a flag byte that
 is `1` for a trusted-main source build and `0` for a signed release, then
 a flag byte that is `1` when it restarts; any other flag value refuses.
-Tag 44, a retired website-key assignment, stays unassigned. H presents
+Tags 44 and 45 and paired request 2d are reserved. H presents
 which update it is, the requester, that main or the release is chosen
 when the job runs, and whether it restarts after installing. The
 ordinary fresh, presented Enter confirmation, cancellation, requester
@@ -5211,17 +5217,11 @@ starts nothing and answers `a8 00`. A start root cannot make answers
 
 The window's hardware operation (actions 1 to 6) waits for the token
 slot: no attention operation, inspection, cleanup, pending suspend,
-restarting revocation or website ceremony in flight: the website
-worker's status at the compositor's last poll names a ticket the seat
-has taken up, past an offer still waiting for it (kinds 0 to 3), which a
-page may hold open. A ceremony begun since that poll is not seen; the
-notebook's synchronous revoke then ends it. Its ten-minute ceiling runs from root's
+or restarting revocation. Its ten-minute ceiling runs from root's
 receipt of the request, the wait included; one that waits it out is
 dropped, and the window answered `01` and td-secret's words for an
-expired step, without the service seeing it. When it takes the slot,
-root revokes website operations before the service receives it, as for
-any local secret operation, and each token request the service makes
-starts root's worker. Physical attention outranks it: an attention
+expired step, without the service seeing it. When it takes the slot, each token request the service makes starts
+root's worker. Physical attention outranks it: an attention
 operation, once admitted, takes the slot from a running step, which
 fails as superseded, and a failed revocation's reboot waits for the
 operation, at most its ceiling. Each presentation the worker sends
@@ -5365,25 +5365,3 @@ deployment through `td-update trust-image DIRECTORY SHA256`. Its tag 5,
 principal grant and pinned-source checks are unchanged; neither admission nor
 approval asserts that the requester built the image. The exact manifest digest
 and root helper's payload checks establish which bytes are approved.
-
-### Website authenticator
-
-The paired compositor's request 2d polls the virtual authenticator or
-answers a transaction. Root obtains the current Firefox workload group
-from the application ledger and starts the fixed td-pass worker with an
-unnamed socketpair. The 32-byte worker generation and the individual
-ticket bind commands to that process and that ceremony. Root revokes
-website operations before local secret operations, session lock or
-suspend. A notebook operation instead waits while the worker's last
-status names a ticket the seat has taken up, since the physical seat
-drives that ceremony, and
-revokes website operations when it takes the slot. Losing the generation
-closes the worker. A worker failure is
-reported as unavailable on this channel. The worker, its private storage
-and the TPM admission record are documented in td-passkeys/DESIGN.md.
-
-On the paired channel, 2d 03 starts a separate local management ticket.
-The worker's private replies identify its lifetime and PIN, listing and
-removal states. Root accepts only the typed PIN, bounded row index,
-32-byte credential ID, or close for the corresponding private verbs.
-A website operation cannot select the management ticket through hidraw.

@@ -6439,8 +6439,9 @@ root reaps its
 child before clearing the runtime release. Runtime locks never span channel
 I/O. Root retains its independent deadlines and exact step checks.
 
-APPLICATIONS.md §W.4 requires an assertion bound to each secret request,
-with exclusive CTAP mediation; keyboard selection alone cannot approve it.
+APPLICATIONS.md §W.4 requires a token assertion bound to each secret
+request. The trusted keyboard selects the operation. A Firefox instance
+with direct access to the same key can independently solicit a touch.
 Ordinary elevation and hardware PIN policy retain their separate contracts
 in §L.1 and td-install/ENCRYPTION.md.
 
@@ -6547,10 +6548,10 @@ the compositor, since a running session must not die for one device.
 Token presence is inferred neither from keyboard events nor from a
 device's arrival or departure: the compositor's sysfs reads can only
 exclude a device from secure attention, and token workers find tokens
-through their own root-only hidraw path (`td-secret/DESIGN.md`, "USB
-token transport"). Of the compositor's nodes, only `/dev/input/event*`
-are assigned late. hidraw nodes stay root-only, framebuffer, card,
-backlight and VM-port assignment stay boot snapshots, playback nodes are
+through td-fido's hidraw transport (`td-secret/DESIGN.md`, "USB token
+transport"). Of the compositor's nodes, only `/dev/input/event*` are
+assigned late. Framebuffer, card, backlight and VM-port assignment stay
+boot snapshots. Playback nodes are
 assigned late to the audio account by the same watcher with the same
 rules ("Playback nodes" below; `APPLICATIONS.md` §K.5), and no node
 moves between accounts: section 1's absent live seat reassignment stays
@@ -6801,8 +6802,9 @@ trusted. Latency is best effort, about two poll periods. No claim is
 made that a keyboard is attached, or that the chord is reachable, at any
 moment; hotplug makes no authentication-readiness claim. The
 security-key exclusion keeps every startup residual, plus the 5 s bound
-above. Nothing here touches hidraw nodes, the token workers or their
-exclusive mediation.
+above. The input hotplug watcher handles evdev. The separate Firefox
+launch grant governs hidraw (APPLICATIONS.md, "Using a website passkey
+in Firefox").
 
 **Evidence owed.** td-seatd host tests over scratch trees: a late node
 is assigned, an assigned one is left alone, a recreated inode is
@@ -8380,22 +8382,3 @@ publisher policy. `td-update/ADMIN.md` owns both recovery operations.
 The shared td-authd channel module also contains the root workspace
 intake's fixed `POLLRDHUP` lifetime check (UNSAFE.md §16). The compositor
 never calls it; its own authority-channel operations are unchanged.
-
-### Firefox website passkeys
-
-A pending website request displays a compositor notification. Ctrl+Alt+P
-on the physical seat opens that ticket while the session is unlocked.
-Ctrl+Alt+Esc still opens the system menu. The prompt shows the exact RP,
-the account when supplied, and the selected provider. Enter confirms a
-presented choice. Tab cycles through td-pass and each attached YubiKey.
-A new registration selects td-pass first when this boot admitted its
-TPM. Creating the vault requires separate acceptance that losing or
-clearing the original TPM loses its passkeys. PINs use the protected
-field. Escape, session lock and a changed worker generation revoke the
-operation. A YubiKey remains available for td authentication.
-
-Ctrl+Alt+K from an eligible physical keyboard on the unlocked seat
-opens td-pass website passkey management. A fresh protected vault PIN
-opens the list. Tab changes the selected credential, Page Down skips up to sixteen, and each review
-and removal requires a separate presented screen and physical Enter.
-The review binds the site, account, credential ID and private ticket.

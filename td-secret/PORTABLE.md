@@ -161,8 +161,8 @@ replacement, and the service refuses a creation whose primary and
 backup are both this computer before anything is sealed.
 
 The TPM limits wrong PINs with its dictionary-attack counter, which the
-disk's TPM PIN (td-protector) and passkeys share: a wrong notebook PIN
-counts against the disk's, and a lockout refuses all three until it
+disk's TPM PIN (td-protector) shares: a wrong notebook PIN
+counts against the disk's, and a lockout refuses both until it
 recovers. Root refuses a computer step before any PIN is asked for when
 this boot proved no primary, the TPM cannot be reached, its lockout
 policy is weaker than td's (td-tpm `device_pin::DA_PARAMETERS`), the

@@ -532,9 +532,13 @@ own account.
 - Whether a workload's request for a directory grant is answered by
   td-portal's dialog alone or also recorded as a standing grant.
 
-### Firefox website authenticator
+### Firefox hardware security keys
 
-The root session's virtual FIDO hidraw device is readable and writable
-by the admitted Firefox workload group. Physical FIDO nodes stay under
-root ownership and mode 0600. td-jail verifies and pins the virtual
-node, its sysfs identity and its attachment for the Firefox instance.
+On td, the installed Firefox workload has direct read and write access
+to each admitted physical USB FIDO hidraw node present at launch. Each
+node stays owned by root. Before launching Firefox, td-authd assigns
+mode 0660 with its reserved
+workload group (65536) until unplug. td-jail verifies and pins the nodes
+and their read-only sysfs leaves before mounting them into the instance.
+Other application and workspace mounts keep their existing device view.
+See APPLICATIONS.md, "Using a website passkey in Firefox".

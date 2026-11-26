@@ -6,14 +6,6 @@ use super::{crypto, fido_hid};
 pub const RP_ID: &str = "td.invalid";
 pub const MAX_CREDENTIAL_ID: usize = 1024;
 
-pub(super) fn encode_descriptor(out: &mut Encoder, id: &[u8]) -> Result<(), String> {
-    out.head(5, 2)?;
-    out.text("id")?;
-    out.bytes(id)?;
-    out.text("type")?;
-    out.text("public-key")
-}
-
 /// What verifies an ES256 signature over a SHA-256 digest under a
 /// public-only P-256 key `(x, y)`; td-secret's is its TPM. A verifier
 /// grants nothing: the codec decides what a verified assertion means.
@@ -122,7 +114,11 @@ impl AssertionRequest {
         out.bytes(&client_data_hash)?;
         out.head(0, 3)?;
         out.head(4, 1)?;
-        encode_descriptor(&mut out, credential)?;
+        out.head(5, 2)?;
+        out.text("id")?;
+        out.bytes(credential)?;
+        out.text("type")?;
+        out.text("public-key")?;
         out.head(0, 5)?;
         out.head(5, 1)?;
         out.text("up")?;
@@ -255,7 +251,11 @@ impl IdentifyRequest {
         out.head(0, 3)?;
         out.head(4, owned.len() as u64)?;
         for id in &owned {
-            encode_descriptor(&mut out, id)?;
+            out.head(5, 2)?;
+            out.text("id")?;
+            out.bytes(id)?;
+            out.text("type")?;
+            out.text("public-key")?;
         }
         out.head(0, 5)?;
         out.head(5, 1)?;

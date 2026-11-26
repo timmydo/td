@@ -6409,7 +6409,7 @@ fn rgb_diagnostic(rgb: Option<[u8; 3]>) -> String {
 /// authority worker calls in holding no lock and takes the runtime's
 /// alone. A failed repaint stays owed, as any other.
 pub(crate) fn watch_login(runtime: &Arc<Mutex<Runtime>>, login: &crate::authority::Login) {
-    login.watch_website(runtime);
+    login.watch_runtime(runtime);
     let runtime = Arc::downgrade(runtime);
     login.watch(move |answer| {
         let Some(runtime) = runtime.upgrade() else {

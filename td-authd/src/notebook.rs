@@ -771,14 +771,6 @@ pub(crate) mod tests {
         (bridge, pids)
     }
 
-    /// A bridge whose unlock waits for the token slot.
-    pub(crate) fn waiting() -> (Bridge, [u32; 2]) {
-        let (mut bridge, pids) = bridge();
-        bridge.pending = Some(Bytes(unlock_request()));
-        bridge.pending_deadline = Some(Instant::now() + crate::consent::NOTEBOOK_CEILING);
-        (bridge, pids)
-    }
-
     #[test]
     #[ignore = "child process: a window that refuses to start"]
     fn refusing_process() {

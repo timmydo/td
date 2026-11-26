@@ -364,9 +364,10 @@ their software authenticator framing inputs prove a physical token touch.
 ## USB token transport
 
 `fido_device.rs` discovers at most 256 fixed `/dev/hidrawN` names. Root
-admission, the only mode on td, requires a root-owned, root-group,
-mode-0600 character device and the kernel's USB HID bus metadata, and its
-discovery reads metadata without opening the device. Desktop admission,
+admission, the only mode on td, requires a root-owned character device
+with the kernel's USB HID bus metadata. It accepts mode 0600 with
+root's group and mode 0600 or 0660 with Firefox's reserved group.
+Discovery reads metadata without opening the device. Desktop admission,
 below, differs in its node mode and group, its denial report, its
 process identity and its lock location. The report descriptor must
 describe one FIDO usage-page 0xf1d0/application-usage 1 collection with
@@ -386,9 +387,10 @@ The prompted parents are explicitly enabled after
 allnoconfig; derived USB_XHCI_PCI is checked after olddefconfig without
 a fictitious direct pin. Besides EHCI, built in for the ThinkPad T430s's
 USB 2.0 port, the profile adds no legacy USB host controller drivers.
-Raw token nodes stay root-only and never enter an application jail or the
-compositor's input-device delegation. Separate USB keyboard/pointer
-interfaces do enter the compositor's seat-assigned evdev roster, at
+Firefox's launch grants direct access to the attached USB FIDO interfaces
+(APPLICATIONS.md, "Using a website passkey in Firefox"). Raw token nodes
+are outside the compositor's input-device delegation. Separate USB
+keyboard/pointer interfaces enter the compositor's seat-assigned evdev roster, at
 startup and through hotplug; its trusted-device boundary is specified in
 `td-compositor/DESIGN.md` under Physical secure attention.
 
@@ -486,9 +488,9 @@ A busy transport refuses promptly; there is no queued touch, stale
 PID recovery, or retry. The independent watchdog remains the backstop for
 an orphaned worker, including while it holds the lock.
 
-This serializes all td-owned workers across tokens and sessions. Root and
-the kernel remain trusted: the advisory lock cannot constrain a different
-root program that opens hidraw directly. Trusted root must not replace
+This serializes all td-owned workers across tokens and sessions.
+Firefox and other callers with direct hidraw access can operate a
+shared key concurrently. Trusted root must not replace
 or overmount the runtime or lock while workers exist: that can split the
 lock inode just as unlinking it would. The paired authority must
 serialize complete presented operations, including any gap between worker
@@ -521,8 +523,8 @@ account's td-owned workers on that host; it cannot exclude root, other
 accounts or other programs. The same-account worker can be inspected or
 signalled by the account's other processes, so desktop mode inherits the
 host account boundary stated for standalone mode. On td, root-console
-admission remains the only mode reaching a token, and raw nodes stay
-root-only.
+admission is the mode td's own workers use. Firefox uses its own
+direct hidraw access.
 
 The trusted consumer must negotiate getInfo message limits before
 constructing requests, bind fresh challenges to presented operations,

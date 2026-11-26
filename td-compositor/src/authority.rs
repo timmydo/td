@@ -972,8 +972,7 @@ type Watcher = Arc<dyn Fn(&Answer) + Send + Sync>;
 
 #[derive(Default)]
 struct Shared {
-    website: Option<crate::website_prompt::Ticket>,
-    website_notice: std::sync::Weak<Mutex<crate::runtime::Runtime>>,
+    runtime: std::sync::Weak<Mutex<crate::runtime::Runtime>>,
     notebook_lock: bool,
     answer: Option<Answer>,
     watcher: Option<Watcher>,
@@ -986,38 +985,13 @@ struct Shared {
 pub(crate) struct Login(Arc<Mutex<Shared>>);
 
 impl Login {
-    pub(crate) fn website(&self, ticket: Option<crate::website_prompt::Ticket>) {
-        let notify = {
-            let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            if guard.website == ticket {
-                return;
-            }
-            guard.website = ticket;
-            guard.website_notice.upgrade()
-        };
-        if ticket.is_some() {
-            if let Some(runtime) = notify {
-                if let Ok(mut runtime) = runtime.lock() {
-                    if !runtime.session_locked() {
-                        let _ = runtime
-                            .input_notice("Firefox passkey request - press Ctrl+Alt+P to review");
-                    }
-                }
-            }
-        }
-    }
-    pub(crate) fn website_ticket(&self) -> Option<crate::website_prompt::Ticket> {
+    pub(crate) fn watch_runtime(&self, runtime: &Arc<Mutex<crate::runtime::Runtime>>) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .website
+            .runtime = Arc::downgrade(runtime);
     }
-    pub(crate) fn watch_website(&self, runtime: &Arc<Mutex<crate::runtime::Runtime>>) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .website_notice = Arc::downgrade(runtime);
-    }
+
     pub(crate) fn lock_notebook(&self) {
         self.0
             .lock()
@@ -2009,7 +1983,7 @@ fn worker(
                         .0
                         .lock()
                         .map_err(|_| "login lock poisoned")?
-                        .website_notice
+                        .runtime
                         .upgrade();
                     if let Some(runtime) = runtime {
                         let mut runtime = runtime.lock().map_err(|_| "runtime lock poisoned")?;
@@ -2064,7 +2038,6 @@ fn worker(
             let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
         }
         secrets.tick(&mut wire)?;
-        secrets.follow_website(&mut wire, &login.login)?;
         login.follow(&mut wire, &mut secrets)?;
         hostnames.follow(&mut wire)?;
         application.follow(&mut wire)?;
@@ -2802,7 +2775,6 @@ mod tests {
         let script = std::rc::Rc::new(std::cell::RefCell::new(wire(vec![
             vec![0x84],
             vec![0x83],
-            vec![0xad],
             vec![0x9f, 0, 0],
             vec![0xaf, 0],
             vec![0x85, 2],
@@ -2831,7 +2803,6 @@ mod tests {
             [
                 b"\x0dfirefox".to_vec(),
                 vec![3],
-                vec![0x2d, 1],
                 vec![0x1f],
                 vec![0x2f],
                 b"\x0ffirefox".to_vec()
@@ -3122,7 +3093,6 @@ mod tests {
             vec![0x84],
             vec![0x86],
             vec![0x83],
-            vec![0xad],
             vec![0x9f, 0, 0],
             vec![0xaf, 0],
             b"\x88\x00".to_vec(),
@@ -3351,7 +3321,6 @@ checked=never\nrefused=none\nprogress=none\n";
             vec![0x84],
             vec![0x86],
             vec![0x83],
-            vec![0xad],
             vec![0x9f, 0, 0],
             vec![0xaf, 0],
         ]);
@@ -3374,7 +3343,6 @@ checked=never\nrefused=none\nprogress=none\n";
                 b"\x0dmail".to_vec(),
                 b"\x24\x01firefox".to_vec(),
                 vec![3],
-                vec![0x2d, 1],
                 vec![0x1f],
                 vec![0x2f]
             ]

@@ -2,7 +2,6 @@
 //! consumers"): td's dictionary-attack parameters and the check that the TPM
 //! still holds them, the storage primary Name the boot selector proved,
 //! and the PIN codec whose authValue such an object takes. td-protector,
-//! td-passkeys and td-secret share this one statement of that policy.
 
 use super::{zero, DaParameters, DictionaryAttack};
 use std::fmt;

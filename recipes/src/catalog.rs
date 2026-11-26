@@ -707,7 +707,6 @@ mod tests {
                 "td-open",
                 "td-page",
                 "td-pass",
-                "td-passkeys",
                 "td-photo",
                 "td-picture",
                 "td-png",

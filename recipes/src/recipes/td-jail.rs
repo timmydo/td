@@ -20,6 +20,10 @@ const MODULES: &[(&str, &str)] = &[
     ("cgroup", include_str!("../../../td-jail/src/cgroup.rs")),
     ("firefox", include_str!("../../../td-jail/src/firefox.rs")),
     (
+        "hid_descriptor",
+        include_str!("../../../td-fido/src/hid_descriptor.rs"),
+    ),
+    (
         "ipc_namespace",
         include_str!("../../../engine/src/ipc_namespace.rs"),
     ),
@@ -49,6 +53,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../engine/src/sandbox_layout.rs"),
     ),
     ("seccomp", include_str!("../../../td-jail/src/seccomp.rs")),
+    (
+        "security_key",
+        include_str!("../../../td-fido/shared/security_key.rs"),
+    ),
     ("sys", include_str!("../../../td-jail/src/sys.rs")),
     (
         "transition",

@@ -603,9 +603,8 @@ that nothing in production calls until 8c, in the `pin` module, over
 td-tpm's existing commands.
 
 **PIN.** `pin::Pin` wraps td-tpm's shared device PIN codec, `device_pin`
-(td-tpm/DESIGN.md, "What belongs to consumers"), in this crate's domain,
-which td-passkeys' vault also uses through this type with a salt of its
-own; td-secret's notebook keys of this computer's TPM apply the codec in
+(td-tpm/DESIGN.md, "What belongs to consumers"), in this crate's domain.
+td-secret's notebook keys of this computer's TPM apply the codec in
 their own domain. It holds 6 to 63 bytes, each 0x20 to 0x7e, as typed;
 `parse` refuses any other entry, naming the byte offset or the length
 and never a byte, and is the only constructor. It judges the length
@@ -724,8 +723,7 @@ proof and the reset are the protected release's (below), over td-tpm's
 lockout commands (td-tpm/DESIGN.md "Lockout hierarchy") with the
 parameters `DA_MAX_TRIES` 32, `DA_RECOVERY_SECS` 600 and
 `DA_LOCKOUT_RECOVERY_SECS` 86400 (`lockout::DA_PARAMETERS`, td-tpm's
-`device_pin::DA_PARAMETERS`, pinned by test), which the passkey vault
-and notebook keys of this computer's TPM also require; none matches
+`device_pin::DA_PARAMETERS`, pinned by test), which notebook keys of this computer's TPM also require; none matches
 parameters in place of a proof. The clear,
 TPM2_Clear under `L`, is a confirmed `tpm-clear` request's ("The
 selector's `request::plan`").

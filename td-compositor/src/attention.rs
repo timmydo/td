@@ -190,11 +190,7 @@ impl Prepared {
         if !doubled
             || (request.login_proof().is_none()
                 && request.upgrade_step().is_none()
-                && request.protector_step().is_none()
-                && !matches!(
-                    request.operation(),
-                    crate::authority::consent::Operation::Website(_)
-                ))
+                && request.protector_step().is_none())
         {
             let scale = if doubled { 2 } else { 1 };
             return Self::at_scale(request, width, height, stride, remaining, scale);
@@ -324,11 +320,6 @@ impl Prepared {
                 request.protector_step() == Some(crate::authority::consent::LoginStep::Choose);
             let (pin, touch) = if recovery {
                 (RECOVERY_PROMPT, CHECKING_PROMPT)
-            } else if matches!(
-                request.operation(),
-                crate::authority::consent::Operation::Website(_)
-            ) {
-                ("PIN", "CHECKING PIN")
             } else if choose {
                 (CHOOSE_PROMPT, CHOSEN_PROMPT)
             } else {

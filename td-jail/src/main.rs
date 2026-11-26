@@ -28,6 +28,11 @@ mod flathub;
     path = "../../engine/src/flathub_app.rs"
 )]
 mod flathub_app;
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-fido/src/hid_descriptor.rs"
+)]
+mod hid_descriptor;
 #[allow(dead_code, reason = "shared PATH alias discovery and wire contract")]
 #[cfg_attr(not(feature = "target-recipe"), path = "../../engine/src/host_path.rs")]
 mod host_path;
@@ -61,6 +66,11 @@ mod primary_account;
 )]
 mod sandbox_layout;
 mod seccomp;
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-fido/shared/security_key.rs"
+)]
+mod security_key;
 mod sys;
 mod transition;
 // The workload account ledger the application policy resolves uids from.
@@ -1084,7 +1094,7 @@ mod confinement {
         assert!(TRANSITION.contains("read_exact(&mut readiness)"));
         assert!(TRANSITION.contains("close_inherited_descriptors(cleanup_descriptor.as_slice())?;"));
         assert!(TRANSITION.contains(
-            "let preserved: Vec<u32> = cleanup_descriptor\n            .into_iter()\n            .chain(generation_descriptors)\n            .chain(\n                website_key\n                    .iter()\n                    .flat_map(|key| [key.node.as_raw_fd() as u32, key.sysfs.as_raw_fd() as u32]),\n            )\n            .collect();\n        close_inherited_descriptors(&preserved)?;"
+            "let preserved: Vec<u32> = cleanup_descriptor\n            .into_iter()\n            .chain(generation_descriptors)\n            .chain(\n                security_keys\n                    .iter()\n                    .flat_map(|key| [key.node.as_raw_fd() as u32, key.sysfs.as_raw_fd() as u32]),\n            )\n            .collect();\n        close_inherited_descriptors(&preserved)?;"
         ));
         assert!(managed.contains("None if self.instance.is_none() => Ok(None)"));
         assert!(MAIN.contains("run_cgroup_cleanup_bootstrap(&membership)"));

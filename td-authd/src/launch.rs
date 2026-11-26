@@ -1325,11 +1325,6 @@ pub(crate) fn serve(mut channel: Channel, config: Config) -> Result<(), String> 
                 Request::Secret(request) => secrets.answer(request)?,
                 request => {
                     secrets.tick()?;
-                    if matches!(&request, Request::Supervised(unit) if unit.name()=="firefox") {
-                        let _ = secrets.answer(crate::session::Request::Website(
-                            crate::website::Frame::parse(&[1])?,
-                        ))?;
-                    }
                     launches.answer(&config, request)?
                 }
             };

@@ -3,7 +3,6 @@
 pub const REPORT_SIZE: usize = 64;
 pub const MAX_MESSAGE: usize = 57 + 128 * 59;
 pub const BROADCAST: u32 = u32::MAX;
-const PING: u8 = 0x81;
 const INIT: u8 = 0x86;
 const CBOR: u8 = 0x90;
 const CANCEL: u8 = 0x91;
@@ -46,10 +45,6 @@ impl Drop for Message {
     fn drop(&mut self) {
         self.0.fill(0);
     }
-}
-
-pub fn ping(channel: u32, payload: &[u8]) -> Result<Reports, String> {
-    encode(channel, Command::Ping, payload)
 }
 
 pub fn cbor(channel: u32, payload: &[u8]) -> Result<Reports, String> {
@@ -103,7 +98,6 @@ impl Initialization {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
-    Ping,
     Init,
     Cbor,
     Cancel,
@@ -112,7 +106,6 @@ enum Command {
 impl Command {
     fn wire(self) -> u8 {
         match self {
-            Self::Ping => PING,
             Self::Init => INIT,
             Self::Cbor => CBOR,
             Self::Cancel => CANCEL,
@@ -137,7 +130,6 @@ fn allocated(channel: u32) -> bool {
 
 fn encode(channel: u32, command: Command, payload: &[u8]) -> Result<Reports, String> {
     let valid = match command {
-        Command::Ping => allocated(channel),
         Command::Init => channel != 0 && payload.len() == 8,
         Command::Cbor => allocated(channel) && !payload.is_empty(),
         Command::Cancel => allocated(channel) && payload.is_empty(),
@@ -201,10 +193,6 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn ping(channel: u32) -> Result<Self, String> {
-        Self::new(channel, Command::Ping)
-    }
-
     pub fn cbor(channel: u32) -> Result<Self, String> {
         Self::new(channel, Command::Cbor)
     }
@@ -212,7 +200,7 @@ impl Decoder {
     fn new(channel: u32, command: Command) -> Result<Self, String> {
         if channel == 0
             || command == Command::Cancel
-            || (matches!(command, Command::Cbor | Command::Ping) && !allocated(channel))
+            || (command == Command::Cbor && !allocated(channel))
         {
             return Err("invalid CTAP HID response channel".into());
         }
@@ -283,10 +271,7 @@ impl Decoder {
                     _ => Err("invalid CTAP HID keepalive status".into()),
                 };
             }
-            if command != self.command.wire()
-                || (size == 0 && self.command != Command::Ping)
-                || size > MAX_MESSAGE
-            {
+            if command != self.command.wire() || size == 0 || size > MAX_MESSAGE {
                 return Err("invalid CTAP HID response command or length".into());
             }
             self.remaining = Some(size);

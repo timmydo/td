@@ -25,14 +25,6 @@ prerequisites" onward):
 - `fido_ctap`: the getAssertion and silent identify codecs, credential
   fingerprints and DER signatures; `fido_enroll`: getInfo negotiation
   and makeCredential with proof of possession.
-- `web_assertion`: a website's CTAP2 getAssertion command and reply.
-  The caller binds an authorized RP ID and client-data hash to one
-  presentation. The codec excludes td's internal RP, requires a touch,
-  checks the signed RP hash and requested UV flag, and restricts the
-  returned credential to the allow list when supplied. A discoverable
-  result carries a user handle. Multiple accounts require selection; the
-  codec releases no assertion in that case. The website verifies the
-  signature. This codec neither admits a caller nor opens a device.
 - `fido_pin`: PIN protocols one and two, the PIN and pinUvAuthToken
   flows, hmac-secret and the login profile; `fido_transaction`: one
   owned PIN transaction over a `Channel`. Since increment 8b the login
@@ -129,25 +121,6 @@ so:
   consumer serves the role from its own command line
   (td-secret/DESIGN.md names td-secret's).
 
-### Browser CTAP requests
-
-`web_request::parse` accepts getInfo, ES256 makeCredential and
-getAssertion. A CTAP 2.0 makeCredential with empty pinAuth produces
-only a presence-selection request. Typed fields borrow the checked packet. Each request names
-a canonical website RP, excludes td.invalid, bounds credential lists to
-32 entries, and carries the browser's 32-byte client-data hash. It
-rejects PIN management, reset, credential management, extension operations
-and unknown request fields. Firefox may explicitly disable hmac-secret
-on registration. The typed request discards that setting. Local policy supplies user presence and
-verification. The decoder has no authority to operate a device.
-
-### Website key attachment
-
-The website worker enumerates root-owned USB YubiKey FIDO collections.
-A selected device retains its kernel identity and participates in the
-same operation lock as login and recovery. The virtual Firefox device
-is excluded from system token discovery.
-
 ## Consumers
 
 td-secret depends on td-fido by path, `td-fido = { path = "../td-fido"
@@ -156,8 +129,7 @@ modules, and the files td-firstboot and td-portal share with it, name
 them as before. td-tpm depends on it the same way for its salted
 sessions (td-tpm/DESIGN.md). Per `td-install/ENCRYPTION.md` item 8,
 td-protector, td-boot and td-install use it for the disk protectors.
-td-passkeys depends on it for the checked browser requests, CBOR and RP
-hashes. Since increment 8b td-boot does, for its
+Since increment 8b td-boot does, for its
 selector's FIDO2 client: `fido_disk` over root-admitted devices, each
 session's worker td-boot's own `fido-worker` verb (`Program::ROOT`),
 whose desktop verb it never builds or dispatches. Since increment 8e
@@ -258,15 +230,11 @@ hmac-secret for assertions with and without UV whatever versions it
 claims, so the no-PIN probe's refusal is testable. The vectors and
 their optional host generators live under `tests/`.
 
-System FIDO discovery excludes the virtual device with physical path
-`td/firefox-passkeys`, including before its Firefox group is assigned.
-The shared 64-byte HID codec also frames and decodes diagnostic PINGs.
-
-The website hardware adapter rebuilds each command from an admitted
-website request. It shares the physical worker's operation lock with td
-login and disk operations. A fresh PIN exchange allows one verification
-attempt. Protocols with permission-bearing tokens request only the
-website RP and makeCredential or getAssertion permission. The browser
-receives a sanitized CTAP response. The hardware credential's private
-key stays on the authenticator. Silent handle probes require the fixed
-hash of empty client data and an explicit credential list.
+Root and desktop admission verify the unnumbered CTAP HID report
+profile with the descriptor parser shared with td-jail. The physical
+attachment probe in `shared/security_key.rs` is shared by td-authd and
+td-jail for Firefox launches. Root accepts
+root-owned private nodes and nodes assigned to Firefox's reserved
+group. The advisory lock coordinates td workers. Direct application
+access can operate concurrently (APPLICATIONS.md, "Using a website
+passkey in Firefox").

@@ -33,7 +33,6 @@ indexing_slicing = "deny"
 [dependencies]
 td-alloc = { path = "../td-alloc" }
 td-ui = { path = "../td-ui" }
-td-passkeys = { path = "../td-passkeys" }
 td-secret = { path = "../td-secret" }
 
 [dev-dependencies]

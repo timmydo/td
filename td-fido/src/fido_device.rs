@@ -1,6 +1,9 @@
 //! Root-owned USB hidraw transport. Public discovery hints are never token identity.
 
 use crate::fido_hid as hid;
+#[path = "hid_descriptor.rs"]
+mod hid_descriptor;
+use hid_descriptor::{descriptor, device_numbers, key_mode, MAX_DESCRIPTOR};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
@@ -21,7 +24,6 @@ const NOCTTY: i32 = 0o400;
 const LOCK_REFUSED: u8 = 1;
 const DEVICE_DENIED: u8 = 2;
 pub const MAX_LIFETIME: Duration = Duration::from_secs(120);
-const MAX_DESCRIPTOR: usize = 4096;
 const CANCEL_INTERVAL: Duration = Duration::from_millis(50);
 const WRITE: u8 = 1;
 const READ: u8 = 2;
@@ -41,7 +43,7 @@ pub use crate::root::require_root;
 /// Who may open a token, fixed when a device is discovered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Admission {
-    /// td's root console: root-owned mode-0600 nodes, lock under `/run`.
+    /// td's root console: root-owned private or Firefox-group nodes, lock under `/run`.
     Root,
     /// A supported host's ordinary desktop account: root-owned nodes with no
     /// world access whose group or ACL grants the account, as decided by the
@@ -85,7 +87,7 @@ fn node_admitted(admission: Admission, char_device: bool, uid: u32, gid: u32, mo
     char_device
         && uid == 0
         && match admission {
-            Admission::Root => gid == 0 && mode & 0o7777 == 0o600,
+            Admission::Root => key_mode(gid, mode),
             Admission::Desktop => mode & 0o7117 == 0 && mode & 0o600 == 0o600,
         }
 }
@@ -113,7 +115,6 @@ fn desktop_identity(status: &str) -> Result<(u32, u32), String> {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Device {
-    yubikey: bool,
     index: u8,
     inode: u64,
     rdev: u64,
@@ -121,18 +122,6 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn hidraw_index(self) -> u8 {
-        self.index
-    }
-
-    /// Selection is repeated for each website transaction. The root worker
-    /// subsequently pins the chosen attachment and takes the normal HID lock.
-    pub fn website_devices() -> Result<Vec<Self>, String> {
-        let mut keys = Self::discover()?;
-        keys.retain(|key| key.yubikey);
-        Ok(keys)
-    }
-
     pub fn discover() -> Result<Vec<Self>, String> {
         require_root()?;
         let mut found = Vec::new();
@@ -166,7 +155,12 @@ impl Device {
     }
 
     fn open(index: u8, admission: Admission) -> Result<(Self, File), String> {
-        let file = open_node(index).map_err(|error| open_failure(admission, error.kind()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(NOFOLLOW | NOCTTY)
+            .open(node_path(index))
+            .map_err(|error| open_failure(admission, error.kind()))?;
         let meta = file.metadata().map_err(|_| "read token device metadata")?;
         Ok((Self::inspect(index, &meta, admission)?, file))
     }
@@ -174,17 +168,15 @@ impl Device {
     fn inspect(index: u8, meta: &fs::Metadata, admission: Admission) -> Result<Self, String> {
         if !admission.node(meta) {
             return Err(match admission {
-                Admission::Root => "token device must be root-owned private character device",
+                Admission::Root => {
+                    "token device must be a root-owned character device with admitted permissions"
+                }
                 Admission::Desktop => {
                     "token device must be a root-owned character device without world access"
                 }
             }
             .into());
         }
-        Self::profile(index, meta, admission)
-    }
-
-    fn profile(index: u8, meta: &fs::Metadata, admission: Admission) -> Result<Self, String> {
         let (event_path, descriptor_path) = metadata_paths(meta.rdev());
         let event = bounded_file(&event_path, 4096)?;
         let event = std::str::from_utf8(&event).map_err(|_| "invalid token bus metadata")?;
@@ -192,31 +184,17 @@ impl Device {
             .lines()
             .filter_map(|line| line.strip_prefix("HID_ID="));
         let id = ids.next().ok_or("missing token bus metadata")?;
-        if ids.next().is_some()
-            || !id.starts_with("0003:")
-            || event
-                .lines()
-                .any(|line| line == "HID_PHYS=td/firefox-passkeys")
-        {
+        if ids.next().is_some() || !id.starts_with("0003:") {
             return Err("token is not a USB HID device".into());
         }
         descriptor(&bounded_file(&descriptor_path, MAX_DESCRIPTOR)?)?;
         Ok(Self {
-            yubikey: id.starts_with("0003:00001050:"),
             index,
             inode: meta.ino(),
             rdev: meta.rdev(),
             admission,
         })
     }
-}
-
-fn open_node(index: u8) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(NOFOLLOW | NOCTTY)
-        .open(node_path(index))
 }
 
 fn node_path(index: u8) -> String {
@@ -284,74 +262,6 @@ fn metadata_paths(rdev: u64) -> (String, String) {
         format!("{sysfs}/uevent"),
         format!("{sysfs}/report_descriptor"),
     )
-}
-
-fn device_numbers(value: u64) -> (u64, u64) {
-    (
-        ((value >> 8) & 0xfff) | ((value >> 32) & 0xfffff000),
-        (value & 0xff) | ((value >> 12) & 0xffffff00),
-    )
-}
-
-/// Admit the unnumbered 64-byte FIDO application collection only.
-fn descriptor(mut bytes: &[u8]) -> Result<(), String> {
-    if bytes.is_empty() || bytes.len() > MAX_DESCRIPTOR {
-        return Err("invalid HID descriptor size".into());
-    }
-    let (mut page, mut usage, mut size, mut count, mut min, mut max) =
-        (None, None, None, None, None, None);
-    let (mut opened, mut closed, mut input, mut output) = (false, false, false, false);
-    while let Some(&prefix) = bytes.first() {
-        if closed || prefix == 0xfe {
-            return Err("unsupported HID descriptor item".into());
-        }
-        let len = match prefix & 3 {
-            3 => 4,
-            n => usize::from(n),
-        };
-        let raw = bytes.get(1..1 + len).ok_or("truncated HID descriptor")?;
-        let mut value = 0u32;
-        for (i, byte) in raw.iter().enumerate() {
-            value |= u32::from(*byte) << (i * 8);
-        }
-        bytes = bytes.get(1 + len..).ok_or("truncated HID descriptor")?;
-        match (prefix >> 2 & 3, prefix >> 4) {
-            (1, 0) => page = Some(value),
-            (1, 1) => min = Some(value),
-            (1, 2) => max = Some(value),
-            (1, 7) => size = Some(value),
-            (1, 9) => count = Some(value),
-            (2, 0) if usage.is_none() => usage = Some(value),
-            (0, 10) if !opened && value == 1 && page == Some(0xf1d0) && usage == Some(1) => {
-                opened = true;
-                usage = None;
-            }
-            (0, kind @ (8 | 9))
-                if opened
-                    && value == 2
-                    && page == Some(0xf1d0)
-                    && size == Some(8)
-                    && count == Some(64)
-                    && min == Some(0)
-                    && max == Some(255) =>
-            {
-                if kind == 8 && usage == Some(0x20) && !input {
-                    input = true;
-                } else if kind == 9 && usage == Some(0x21) && !output {
-                    output = true;
-                } else {
-                    return Err("invalid FIDO report usage".into());
-                }
-                usage = None;
-            }
-            (0, 12) if opened && input && output && len == 0 && usage.is_none() => closed = true,
-            _ => return Err("unsupported FIDO HID report profile".into()),
-        }
-    }
-    if !closed {
-        return Err("incomplete FIDO HID collection".into());
-    }
-    Ok(())
 }
 
 struct Worker {
@@ -1162,7 +1072,6 @@ pub(crate) mod tests {
         cancellation.cancel();
         cancellation.cancel();
         let device = Device {
-            yubikey: false,
             index: 0,
             inode: 0,
             rdev: 0,
@@ -1398,12 +1307,16 @@ pub(crate) mod tests {
 
     #[test]
     fn admission_modes_accept_only_their_node_policy() {
+        use hid_descriptor::FIREFOX_KEY_GROUP;
         use Admission::{Desktop, Root};
         const CHAR: u32 = 0o020000;
         for (admission, char_device, uid, gid, mode, admitted) in [
             (Root, true, 0, 0, CHAR | 0o600, true),
             (Root, true, 0, 46, CHAR | 0o600, false),
             (Root, true, 0, 0, CHAR | 0o660, false),
+            (Root, true, 0, FIREFOX_KEY_GROUP, CHAR | 0o600, true),
+            (Root, true, 0, FIREFOX_KEY_GROUP, CHAR | 0o660, true),
+            (Root, true, 0, FIREFOX_KEY_GROUP, CHAR | 0o666, false),
             (Root, false, 0, 0, 0o600, false),
             // Guix-style plugdev group access, and a root-group node the kernel
             // may still deny at open.
@@ -1447,7 +1360,6 @@ pub(crate) mod tests {
     #[test]
     fn desktop_workers_receive_the_runtime_directory_and_root_workers_do_not() {
         let device = |admission| Device {
-            yubikey: false,
             index: 3,
             inode: 7,
             rdev: 9,
@@ -1563,7 +1475,8 @@ pub(crate) mod tests {
         assert!(worker.starts_with("\n    admission: Admission,"));
         assert!(worker.contains(") -> Result<(), String> {\n    admission.require()?;"));
         assert_eq!(source.matches(".open(node_path(index))").count(), 1);
-        assert_eq!(source.matches("open_node(index)").count(), 1);
+        assert_eq!(source.matches("\"/dev/hidraw").count(), 1);
+        assert_eq!(source.matches("open(index,").count(), 1);
         assert_eq!(
             source
                 .matches("match Device::open(index, admission)")

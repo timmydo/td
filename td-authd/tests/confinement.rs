@@ -3,11 +3,6 @@ use std::path::Path;
 
 #[test]
 fn the_production_source_and_raw_boundary_are_closed() {
-    let website = include_str!("../src/website.rs");
-    assert_eq!(website.matches("Command::new(").count(), 1);
-    assert!(website.contains("Command::new(\"/bin/td-pass\")"));
-    assert!(website.contains("crate::application::admitted_uid(\"firefox\")"));
-    assert!(website.contains("UnixDatagram::pair()"));
     let signals = include_str!("../src/process_signals.rs");
     assert_eq!(signals.matches("Command::new(").count(), 1);
     let mut remaining = signals;
@@ -85,7 +80,6 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "suspend.rs",
             "sys.rs",
             "unlock.rs",
-            "website.rs",
             "workspace.rs"
         ]
     );
@@ -127,7 +121,6 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("revocation.rs", 0),
         ("storage.rs", 0),
         ("suspend.rs", 0),
-        ("website.rs", 0),
         ("workspace.rs", 0),
     ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
@@ -168,7 +161,6 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "inspection.rs"
                     | "notebook.rs"
                     | "notebook_token.rs"
-                    | "website.rs"
                     | "stderr_tail.rs"
                     | "workspace.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
@@ -213,7 +205,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xb0c6069f8833028e,
+        0x9347c21c55952977,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -415,7 +407,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .split_once("            if crate::disk_install::live_boot()? {\n")
         .unwrap()
         .1
-        .split_once("        }\n        let answer = self.answer_with(")
+        .split_once("        }\n        self.answer_with(")
         .unwrap()
         .0
         .split_once("            } else {\n")
@@ -1895,7 +1887,7 @@ const RAW_FINGERPRINT: u64 = 0xb64878d738ec4031;
 const GRANT_REQUESTS_FINGERPRINT: u64 = 0x5f7221258ec5d3d1;
 const GRANT_VIEWS_FINGERPRINT: u64 = 0x48b5bc7296ae3585;
 const WORKSPACE_FINGERPRINT: u64 = 0x439a667622ee93f1;
-const APPLICATION_FINGERPRINT: u64 = 0xd216cde5d8075fd7;
+const APPLICATION_FINGERPRINT: u64 = 0x5974d63997917e06;
 
 fn fingerprint(source: &str) -> u64 {
     source.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
@@ -1909,10 +1901,10 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
 const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
-const LAUNCH_FINGERPRINT: u64 = 0xed4453a1f1e9c2db;
-const MAIN_FINGERPRINT: u64 = 0x5e8dba4df23cebfc;
+const LAUNCH_FINGERPRINT: u64 = 0x373df1eed335eea2;
+const MAIN_FINGERPRINT: u64 = 0x33990d6b29df26af;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
-const SESSION_FINGERPRINT: u64 = 0x715685005ea23b04;
+const SESSION_FINGERPRINT: u64 = 0x0065a818b7d44dd0;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xca50da9225e5e54e;

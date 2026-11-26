@@ -4339,9 +4339,12 @@ socket's peer UID to the fixed portal UID 991 before reading a frame. It
 adds no raw syscall or unsafe block. AppId authentication remains in the
 portal's broker query; peer UID is not treated as the mail application ID.
 
-The Firefox instance can bind the verified virtual FIDO hidraw node and
-its sysfs leaf using the existing td-jail mount boundary. Its root
-selector, identity, inode, group and access mode are verified before
-publication. Only the selected bind and restricted sysfs scaffold are
-admitted in the second stage. Physical YubiKeys are opened by the
-existing td-fido worker under the system operation lock.
+Firefox's jail binds each admitted physical FIDO hidraw node and its
+sysfs leaf using td-jail's existing mount boundary. Stage 1 checks the
+report descriptor against td-fido's shared CTAP HID profile, verifies
+both bind identities, and holds the opened nodes until the instance
+ends. The kernel retains each minor while its open file is held, even
+after unplug. td-authd uses the standard library's descriptor-based
+ownership and permissions operations for the reserved Firefox group.
+Stage 2 checks the exact device and sysfs name sets and the mount
+restrictions. Stage 1's device descriptors do not cross exec.

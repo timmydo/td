@@ -45,18 +45,6 @@ pub fn replace_with(
     mode: u32,
     prepare: impl FnOnce(&File) -> io::Result<()>,
 ) -> io::Result<()> {
-    replace_if(path, bytes, mode, prepare, || Ok(()))
-}
-
-/// Run the final authorization check after syncing the temporary and just
-/// before committing the rename. Refusal discards the temporary.
-pub fn replace_if(
-    path: &Path,
-    bytes: &[u8],
-    mode: u32,
-    prepare: impl FnOnce(&File) -> io::Result<()>,
-    commit: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
     use std::io::Write;
     let directory = File::open(parent_of(path)).map_err(|e| named(path, "", e))?;
     stream_with_sync(
@@ -67,10 +55,7 @@ pub fn replace_if(
             prepare(file)?;
             file.write_all(bytes)
         },
-        |temporary| {
-            commit()?;
-            std::fs::rename(temporary, path)
-        },
+        |temporary| std::fs::rename(temporary, path),
         File::sync_all,
     )
 }

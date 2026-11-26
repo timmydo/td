@@ -95,15 +95,16 @@ like the existing unlock worker. Its requests, deadlines, step admission
 and revocation are specified, and implemented, in `td-authd/DESIGN.md`,
 "Login keys and session lock".
 
-**td-secret**'s worker owns all CTAP2 traffic. It reuses `PORTABLE.md`'s
-PIN-authorized hmac-secret flow, transaction runner and P-256 verification
-over the root-only USB transport, each token session serialized by
+**td-secret**'s root worker owns the login operation's CTAP2 traffic.
+It reuses `PORTABLE.md`'s PIN-authorized hmac-secret flow, transaction
+runner and P-256 verification over USB. td workers serialize through
 `/run/td-fido/operation.lock` (`td-secret/DESIGN.md`, "USB token
 transport"); td-authd's single operation slot, not that lock, covers the
-gaps between one operation's sessions ("The login record", below). That
-is the exclusive mediation §L.1 requires: raw token nodes
-stay root-only, td-owned workers serialize, and every assertion is bound to
-one presented operation. The worker verifies assertions and publishes the
+gaps between one operation's sessions ("The login record", below).
+Every assertion is bound to one presented operation. Firefox's direct
+hidraw grant allows it to issue commands and solicit touches on a shared
+key independently (THREAT-MODEL.md, "Direct access to website security
+keys"). The worker verifies assertions and publishes the
 record; td-authd trusts its success frame only together with its observed
 successful exit. Before any presentation or token I/O the worker reports
 the state it read: unenrolled, or the enrolled record's slot count and

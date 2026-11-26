@@ -9,7 +9,7 @@ pub use entry::{has_attributes, rename_entry};
 
 #[path = "replace.rs"]
 pub(crate) mod staging;
-pub use staging::{replace, replace_if, replace_with};
+pub use staging::{replace, replace_with};
 
 /// Stage a streamed Linux output beside a literal basename in a pinned
 /// directory. Both paths delivered to the publication operation resolve

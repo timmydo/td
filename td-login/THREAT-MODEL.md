@@ -1154,18 +1154,14 @@ while the notebook is unlocked. The adapter exposes neither notes nor vault
 keys and cannot unlock the service. Closing or locking the notebook cancels
 outstanding requests, but cannot revoke plaintext already released to mail.
 
-### Website passkeys
+### Direct access to website security keys
 
-Confined Firefox can submit website CTAP requests to a td-owned virtual
-authenticator. Its trusted confirmation and protected PIN entry use the
-physical seat. Site and account labels come from the request; a
-compromised browser can misstate the intended website. The worker
-admits website RP identifiers on its HID interface and reserves the
-selected root-owned YubiKey through the same
-operation lock used by td login. A hardware passkey stays on that key.
-Device-bound software passkeys use the independently established TPM
-primary and their vault PIN, with explicit enrollment consent.
-Only the trusted physical seat can request local vault management on
-the private worker channel. A fresh vault PIN opens its list. Removal
-binds a separate confirmation to the selected credential. Session lock,
-expiry or closing the trusted screen ends that authority.
+Confined Firefox has raw CTAP access to the physical USB FIDO interfaces
+admitted at launch (APPLICATIONS.md, "Using a website passkey in Firefox").
+It can open a key concurrently with td's workers, ignore their advisory
+lock, solicit touches and issue any command the authenticator accepts.
+Any PIN entered in Firefox is available to Firefox and applies to the
+whole key. The compositor's secure attention path protects the input
+and prompts for td operations. It cannot arbitrate which raw command a
+touch serves. This is a trust boundary for a plugged-in key shared with
+login, storage, recovery or the notebook.

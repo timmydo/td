@@ -9731,15 +9731,13 @@ on-authenticator biometric additionally verifies the user. Hardware-backed
 PINs are permitted by principle 7; disk unlock and protector changes require
 the PIN policy in `td-install/ENCRYPTION.md`. A PIN-less key means *whoever
 holds the key may elevate*, consistent with physical access being out of
-scope. If a token is used, **CTAP access must be exclusively mediated**:
-a key is `/dev/hidraw`, not evdev, so the compositor's input path does
-not cover it, and a rogue process holding hidraw can solicit an assertion
-timed with the prompt and consume the operator's touch. Only Firefox binds td's virtual hidraw interface. The physical USB
-transport requires root-owned mode-0600 token nodes.
-This blocks unprivileged direct access. The td-owned HID workers serialize
-through one root-private runtime lock held until the worker actually exits.
-Hidraw itself permits concurrent opens, and a different trusted root program
-can ignore that advisory lock. Firefox website requests use the mediated virtual device described below.
+scope. The compositor's input path
+covers evdev, while security keys accept commands over hidraw. Firefox's
+direct USB FIDO access permits concurrent opens and commands on keys
+visible to it, including keys used for td authentication. td-owned
+workers serialize with one another through a root-private advisory lock.
+Use a separate key for td authentication and connect it only when needed
+if browser access to that key is undesirable ("Using a website passkey in Firefox").
 
 **Current credential consent is specified in §W.4.** Physical selection,
 immutable presentation and a token assertion now mediate credential writes,
@@ -11119,9 +11117,10 @@ unlock operations. Secret operations require a complete,
 immutable prompt confirmed presented before token acquisition; a queued
 frame is not a presentation receipt. Bind the FIDO2 challenge to a fresh
 nonce and a domain-separated, versioned, length-prefixed encoding of the
-requester, operation and descriptor-pinned arguments. Exclusive CTAP
-mediation prevents another process from consuming that touch for its own
-challenge. Possession plus user presence is the requested secret-store
+requester, operation and descriptor-pinned arguments. td-owned workers
+serialize their requests. Firefox can independently solicit a touch from
+a shared key as described in "Using a website passkey in Firefox".
+Possession plus user presence is the requested secret-store
 policy: a token left available to a walk-up attacker remains usable by
 that attacker. This is distinct from the hardware PIN disk/session policy
 in `td-install/ENCRYPTION.md`.
@@ -13119,20 +13118,20 @@ shell command, vault directory, or direct connection to the vault service.
 
 ### Using a website passkey in Firefox
 
-When a site asks to create or use a passkey, td displays a notification.
-Press Ctrl+Alt+P to review the site on the trusted screen. For a new
-passkey, Enter selects td-pass when available. Tab selects a plugged-in
-YubiKey instead. The first td-pass enrollment asks you to accept that
-losing or clearing this TPM permanently loses its passkeys. Enter the
-new vault PIN twice on the trusted screen. For a YubiKey, follow its PIN and
-touch prompts. Plugging in a key requires no assignment or restart.
+Plug in the USB security keys before opening Firefox. When a website asks
+to create or use a passkey, choose the browser's security key option and
+follow its PIN and touch prompts. Completely quit and reopen Firefox to
+admit a key plugged in after launch. A hardware passkey stays on its key. To replace a site credential
+previously stored in td-pass, sign in with another method and register
+a new passkey on a hardware key.
 
-Only Firefox receives the kernel's virtual authentication device and
-its pinned hidraw sysfs leaf. The browser speaks standard WebAuthn.
-td-pass owns the CTAP operation, permission checks and storage. The
-third-party Firefox and runtime continue to execute inside its jail.
+For the installed Firefox application, td-jail binds every attached
+physical USB FIDO hidraw interface that presents the unnumbered 64-byte
+CTAP HID report profile. There is no vendor filter or single-key
+selection. The jail exposes each device and its read-only hidraw sysfs
+leaf for discovery. Keyboard, OTP, smart card and other HID interfaces
+are outside this grant. See WORKLOADS.md, "Firefox hardware security keys".
 
-To manage saved td-pass passkeys, press Ctrl+Alt+K on the unlocked
-desktop and enter the vault PIN. Tab moves one entry and Page Down advances up to sixteen. Enter
-reviews the selected site's passkey and a second Enter removes it.
-Escape closes the vault.
+Firefox can send raw commands to those keys and receives any PIN entered
+in its own UI. A key's firmware enforces its PIN, touch and credential
+rules. td's secure attention path still governs td's own system operations.

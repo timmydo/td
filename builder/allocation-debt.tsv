@@ -1132,7 +1132,7 @@ td-authd/src/consent.rs	allocating-constructor	5
 td-authd/src/consent.rs	allocating-conversion	13
 td-authd/src/consent.rs	allocation-macro	52
 td-authd/src/consent.rs	heap-owner	2
-td-authd/src/consent.rs	unchecked-growth-or-clone	234
+td-authd/src/consent.rs	unchecked-growth-or-clone	231
 td-authd/src/deployment.rs	allocating-constructor	2
 td-authd/src/deployment.rs	allocating-conversion	21
 td-authd/src/deployment.rs	allocation-macro	7
@@ -2038,10 +2038,10 @@ td-jail/src/seccomp.rs	allocation-macro	13
 td-jail/src/seccomp.rs	unchecked-growth-or-clone	5
 td-jail/src/sys.rs	allocation-macro	4
 td-jail/src/transition.rs	allocating-constructor	10
-td-jail/src/transition.rs	allocating-conversion	115
+td-jail/src/transition.rs	allocating-conversion	114
 td-jail/src/transition.rs	allocation-macro	374
 td-jail/src/transition.rs	heap-owner	3
-td-jail/src/transition.rs	unchecked-growth-or-clone	125
+td-jail/src/transition.rs	unchecked-growth-or-clone	124
 td-jail/src/workspace.rs	allocating-conversion	18
 td-jail/src/workspace.rs	allocation-macro	42
 td-jail/src/workspace.rs	unchecked-growth-or-clone	36
@@ -3203,8 +3203,6 @@ td-pass/src/store.rs	allocation-macro	9
 td-pass/src/store.rs	unchecked-growth-or-clone	14
 td-pass/src/window.rs	allocating-conversion	2
 td-pass/src/window.rs	allocation-macro	2
-td-passkeys/src/worker.rs	allocating-conversion	2
-td-passkeys/src/worker.rs	unchecked-growth-or-clone	3
 td-photo/src/auto.rs	allocating-conversion	2
 td-photo/src/avif.rs	allocating-constructor	1
 td-photo/src/avif.rs	unchecked-growth-or-clone	4

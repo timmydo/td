@@ -29,9 +29,6 @@ pub mod fido_hid;
 pub mod fido_p256;
 pub mod fido_pin;
 pub mod fido_transaction;
-pub mod web_assertion;
-pub mod web_key;
-pub mod web_request;
 
 /// The test build's P-256, whose signing the virtual authenticator uses:
 /// td-secret's tests compile `fido_p256.rs` by path under this name, as

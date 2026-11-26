@@ -2088,7 +2088,7 @@ valid, which lets that genuine chain boot once more.
 ### Passkey storage primary
 
 A measured TPM-PIN release may also hand the deployment the 34-byte
-storage primary Name for a device-bound passkey vault. The selector
+storage primary Name for a password notebook key bound to this TPM. The selector
 obtains it only after proving or taking the lockout hierarchy and setting
 its dictionary-attack policy on this boot. The proven Name must match
 the object whose PIN unsealed the key that opened the volume. Any attempt to clear the TPM
@@ -2098,15 +2098,12 @@ Name. td-kexec carries it in a separate mode-0400 archive member,
 deployments. During `admit`, a matching primary TPM admission allows the
 deployment to publish the Name in root's private /run/td-admit directory.
 The optional member carries no key, PIN or lockout authorization. Its
-absence affects only the availability of the TPM passkey vault and of
-notebook keys of this computer's TPM (td-secret/PORTABLE.md, "This
-computer's TPM as a key"), which seal under the same Name: without it
-td-secret refuses their sealing and unsealing before asking for a PIN.
-td-tpm's `device_pin` module owns the Name's admission, the device PIN
-codec and the lockout policy both consumers require. The passkey vault
-derives its authValue in the volume PIN's domain under its own salt, a
-notebook key in td-secret's domain; both share this TPM's
-dictionary-attack counter with the volume's TPM PIN, and a notebook step
+absence makes td-secret refuse to seal or unseal notebook keys of this
+computer's TPM before asking for a PIN (td-secret/PORTABLE.md, "This
+computer's TPM as a key"). td-tpm's `device_pin` module owns the Name's
+admission, the device PIN codec and the lockout policy. A notebook key
+derives its authValue in td-secret's domain and shares the TPM's
+dictionary-attack counter with the volume's TPM PIN. A notebook step
 leaves the last eight tries to the volume.
 
 ### Verified account handoff

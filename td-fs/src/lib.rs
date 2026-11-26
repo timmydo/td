@@ -17,7 +17,7 @@ mod publication;
 pub use publication::replace_stream;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use publication::{has_attributes, rename_entry};
-pub use publication::{replace, replace_if, replace_with};
+pub use publication::{replace, replace_with};
 
 mod bounded;
 mod on_path;
@@ -153,23 +153,5 @@ mod write_tests {
         for squatter in &squatters {
             assert_eq!(std::fs::read(squatter).unwrap(), b"left");
         }
-    }
-
-    #[test]
-    fn revoking_a_prepared_write_preserves_the_old_file() {
-        let dir = TempDir::new("replace-revoked").unwrap();
-        let path = dir.path().join("vault");
-        replace(&path, b"previous", 0o600).unwrap();
-        let error = replace_if(
-            &path,
-            b"new",
-            0o600,
-            |_| Ok(()),
-            || Err(io::ErrorKind::Interrupted.into()),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

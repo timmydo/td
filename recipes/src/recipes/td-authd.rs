@@ -7,10 +7,6 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/process_signals.rs"),
     ),
     (
-        "src/website.rs",
-        include_str!("../../../td-authd/src/website.rs"),
-    ),
-    (
         "src/notebook_mail.rs",
         include_str!("../../../td-authd/src/notebook_mail.rs"),
     ),
@@ -311,12 +307,22 @@ pub fn recipe() -> Recipe {
         "{src}/td-civil/src",
         "{src}/td-busd/src",
         "{src}/td-alloc/src",
+        "{src}/td-fido/src",
+        "{src}/td-fido/shared",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
         });
     }
     for (path, source) in [
+        (
+            "{src}/td-fido/src/hid_descriptor.rs",
+            include_str!("../../../td-fido/src/hid_descriptor.rs"),
+        ),
+        (
+            "{src}/td-fido/shared/security_key.rs",
+            include_str!("../../../td-fido/shared/security_key.rs"),
+        ),
         // td-alloc's fallible growth, mounted by path.
         (
             "{src}/td-alloc/src/lib.rs",

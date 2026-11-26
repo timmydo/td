@@ -416,7 +416,7 @@ pub enum Mode {
 /// indirection costs a pointer hop on a path that runs a single time.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stage2Launch {
-    website_key: Option<u8>,
+    security_keys: Vec<u8>,
     entry: String,
     resolv_conf: bool,
     machine_id: String,
@@ -539,7 +539,7 @@ struct EtcBinding<'a> {
 
 #[derive(Clone, Copy)]
 struct Stage2MountBinding<'a> {
-    website_key: Option<u8>,
+    security_keys: &'a [SecurityKey],
     filesystems: &'a [FilesystemGrant],
     resolv_conf: bool,
     machine_id: &'a str,
@@ -1041,8 +1041,9 @@ where
         if cgroup_membership != NO_CGROUP_MEMBERSHIP {
             cgroup::validate_expected_membership(&cgroup_membership)?;
         }
-        let next = args.next();
-        let (website_key, delimiter) = if next.as_deref() == Some(OsStr::new("--website-key")) {
+        let mut security_keys = Vec::new();
+        let mut delimiter = args.next();
+        while delimiter.as_deref() == Some(OsStr::new("--security-key")) {
             if entry != "/app/bin/firefox" || cgroup_membership == NO_CGROUP_MEMBERSHIP {
                 return Err(usage_error());
             }
@@ -1057,16 +1058,17 @@ where
                     }
                     word.parse::<u8>().ok()
                 })
+                .filter(|index| security_keys.last().is_none_or(|last| last < index))
                 .ok_or_else(usage_error)?;
-            (Some(index), args.next())
-        } else {
-            (None, next)
-        };
+            crate::allocation::push(&mut security_keys, index)
+                .map_err(|_| io::ErrorKind::OutOfMemory)?;
+            delimiter = args.next();
+        }
         if delimiter.as_deref() != Some(STAGE2_ARGUMENTS_ARG.as_ref()) {
             return Err(usage_error());
         }
         return Ok(Stage2Action::Launch(Box::new(Stage2Launch {
-            website_key,
+            security_keys,
             entry,
             resolv_conf,
             machine_id,
@@ -1142,11 +1144,12 @@ fn stage2_launch_arguments(
     mounts: Stage2MountBinding<'_>,
     resources: Stage2ResourceBinding<'_>,
     arguments: &[OsString],
-) -> Vec<OsString> {
+) -> io::Result<Vec<OsString>> {
     let mut stage2 = Vec::with_capacity(
         26usize
             .saturating_add(environment.len().saturating_mul(2))
             .saturating_add(mounts.filesystems.len().saturating_mul(2))
+            .saturating_add(mounts.security_keys.len().saturating_mul(2))
             .saturating_add(arguments.len()),
     );
     stage2.extend([
@@ -1247,15 +1250,15 @@ fn stage2_launch_arguments(
         OsString::from(resources.limits.cpu_period_usec.to_string()),
         OsString::from(resources.membership),
     ]);
-    if let Some(index) = mounts.website_key {
+    for key in mounts.security_keys {
         stage2.extend([
-            OsString::from("--website-key"),
-            OsString::from(index.to_string()),
+            OsString::from("--security-key"),
+            OsString::from(crate::text(format_args!("{}", key.index))?),
         ]);
     }
     stage2.push(OsString::from(STAGE2_ARGUMENTS_ARG));
     stage2.extend(arguments.iter().cloned());
-    stage2
+    Ok(stage2)
 }
 
 fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
@@ -2398,135 +2401,38 @@ fn prepare_base_mounts(
     Ok(dev)
 }
 
-// Only root can publish this selector symlink in devtmpfs. Hold the actual
-// hidraw file and its sysfs leaf while the instance lives.
-struct WebsiteKey {
+// Stage 1 holds the actual hidraw files for the lifetime of the instance.
+struct SecurityKey {
     index: u8,
     node: fs::File,
     sysfs: fs::File,
     syspath: PathBuf,
 }
 
-impl WebsiteKey {
-    fn acquire(plan: &LaunchPlan) -> io::Result<Option<Self>> {
-        if plan.host_mode || plan.name != "firefox" || plan.entry != "/app/bin/firefox" {
-            return Ok(None);
-        }
-        // First launch can race the kernel publishing the session's UHID
-        // device. Wait here rather than blocking the paired authority.
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(key) = Self::published(plan)? {
-                return Ok(Some(key));
-            }
-            if start.elapsed() >= std::time::Duration::from_secs(6) {
-                return Ok(None);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(40));
-        }
-    }
-    fn published(plan: &LaunchPlan) -> io::Result<Option<Self>> {
-        const SELECTOR: &str = "/dev/td-firefox-passkeys";
-        let published = match fs::symlink_metadata(SELECTOR) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if !published.file_type().is_symlink() || published.uid() != 0 {
-            return Ok(None);
-        }
-        let published = match fs::metadata(SELECTOR) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if !published.file_type().is_char_device()
-            || published.uid() != 0
-            || published.gid() != plan.outside_gid
-            || published.mode() & 0o7777 != 0o660
-            || published.nlink() != 1
+impl SecurityKey {
+    fn acquire(plan: &LaunchPlan) -> io::Result<Vec<Self>> {
+        let mut keys = Vec::new();
+        if plan.host_mode
+            || plan.name != "firefox"
+            || plan.entry != "/app/bin/firefox"
+            || plan.outside_gid != crate::hid_descriptor::FIREFOX_KEY_GROUP
         {
-            return Ok(None);
+            return Ok(keys);
         }
-        let (major, minor) = device_numbers(published.rdev());
-        let Ok(index) = u8::try_from(minor) else {
-            return Ok(None);
-        };
-        let name = crate::text(format_args!("hidraw{index}"))?;
-        if fs::read_link(SELECTOR).ok().as_deref() != Some(Path::new(&name)) {
-            return Ok(None);
+        for index in 0..=u8::MAX {
+            if let Some(key) = Self::open(index)? {
+                crate::allocation::push(&mut keys, key).map_err(|_| io::ErrorKind::OutOfMemory)?;
+            }
         }
-        Self::open(index, major, &name, &published)
+        Ok(keys)
     }
 
-    fn open(
-        index: u8,
-        major: u64,
-        name: &str,
-        published: &fs::Metadata,
-    ) -> io::Result<Option<Self>> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let node = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(0o400000 | 0o400 | 0o4000)
-            .open(crate::text(format_args!("/dev/{name}"))?)
-        {
-            Ok(node) => node,
-            Err(_) => return Ok(None),
+    fn open(index: u8) -> io::Result<Option<Self>> {
+        let Some((node, sysfs, syspath)) = crate::security_key::open(index)? else {
+            return Ok(None);
         };
         let meta = node.metadata()?;
-        if meta.dev() != published.dev()
-            || meta.ino() != published.ino()
-            || meta.rdev() != published.rdev()
-            || meta.nlink() != 1
-            || meta.gid() != published.gid()
-            || meta.mode() & 0o7777 != 0o660
-        {
-            return Ok(None);
-        }
-        let path = crate::text(format_args!("/sys/dev/char/{major}:{index}"))?;
-        let Ok(syspath) = fs::canonicalize(path) else {
-            return Ok(None);
-        };
-        if !syspath.starts_with("/sys/devices/virtual")
-            || syspath.file_name() != Some(OsStr::new(name))
-            || syspath.parent().and_then(Path::file_name) != Some(OsStr::new("hidraw"))
-        {
-            return Ok(None);
-        }
-        let sysfs = match fs::File::open(&syspath) {
-            Ok(leaf) => leaf,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        let event = crate::text(format_args!(
-            "/proc/self/fd/{}/device/uevent",
-            std::os::fd::AsRawFd::as_raw_fd(&sysfs)
-        ))?;
-        let mut bytes = [0; 4097];
-        let mut input = fs::File::open(event)?;
-        let mut used = 0;
-        while let Some(space) = bytes.get_mut(used..).filter(|left| !left.is_empty()) {
-            let n = input.read(space)?;
-            if n == 0 {
-                break;
-            }
-            used += n;
-        }
-        let event = bytes
-            .get(..used)
-            .filter(|s| s.len() < 4097)
-            .and_then(|s| std::str::from_utf8(s).ok());
-        if !event.is_some_and(|s| {
-            s.lines().any(|l| l == "HID_ID=0003:00001209:00007464")
-                && s.lines().any(|l| l == "HID_PHYS=td/firefox-passkeys")
-                && s.lines().any(|l| {
-                    l.strip_prefix("HID_UNIQ=td-").is_some_and(|id| {
-                        id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit())
-                    })
-                })
-        }) {
+        if meta.gid() != crate::hid_descriptor::FIREFOX_KEY_GROUP || meta.mode() & 0o7777 != 0o660 {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -2553,7 +2459,7 @@ impl WebsiteKey {
         fs::create_dir_all(&leaf)?;
         let class = crate::text(format_args!("{NEW_ROOT}/sys/class/hidraw"))?;
         fs::create_dir_all(&class)?;
-        fs::create_dir(crate::text(format_args!("{NEW_ROOT}/sys/bus"))?)?;
+        fs::create_dir_all(crate::text(format_args!("{NEW_ROOT}/sys/bus"))?)?;
         symlink(syspath, crate::text(format_args!("{class}/{name}"))?)?;
         mount_private_bind(&self.syspath, &leaf, true)?;
         Self::require_pinned_bind(&self.sysfs, &leaf)
@@ -2563,7 +2469,7 @@ impl WebsiteKey {
         let expected = pinned.metadata()?;
         let actual = fs::symlink_metadata(target)?;
         if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
-            return Err(io::Error::other("website key bind changed identity"));
+            return Err(io::Error::other("security key bind changed identity"));
         }
         Ok(())
     }
@@ -2573,7 +2479,7 @@ fn prepare_mount_plan(
     identity: Identity,
     executable: &Path,
     application: Option<&LaunchPlan>,
-    website_key: Option<&WebsiteKey>,
+    security_keys: &[SecurityKey],
 ) -> io::Result<()> {
     let root = cstring("/")?;
     sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None)
@@ -2612,7 +2518,7 @@ fn prepare_mount_plan(
 
     let terminal = application.is_some_and(|plan| plan.terminal);
     let dev = prepare_base_mounts(identity, terminal, false, false)?;
-    if let Some(key) = website_key {
+    for key in security_keys {
         key.mount()?;
     }
     if let Some(application) = application {
@@ -3113,7 +3019,7 @@ fn device_nodes(terminal: bool) -> impl Iterator<Item = (&'static str, u64, u64)
         .chain(terminal.then_some(TERMINAL_NODE))
 }
 
-fn require_devices(terminal: bool, website_key: Option<u8>) -> io::Result<()> {
+fn require_devices(terminal: bool, key_names: &[String]) -> io::Result<()> {
     let mut names = vec![
         "fd", "full", "null", "ptmx", "pts", "random", "shm", "stderr", "stdin", "stdout",
         "urandom", "zero",
@@ -3121,11 +3027,9 @@ fn require_devices(terminal: bool, website_key: Option<u8>) -> io::Result<()> {
     if terminal {
         names.push(TERMINAL_NODE.0);
     }
-    let key_name = website_key
-        .map(|index| crate::text(format_args!("hidraw{index}")))
-        .transpose()?;
-    if let Some(name) = &key_name {
-        names.push(name);
+    for name in key_names {
+        crate::allocation::push(&mut names, name.as_str())
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
     }
     require_names("/dev", &names)?;
     for (name, expected_major, expected_minor) in device_nodes(terminal) {
@@ -3778,7 +3682,7 @@ fn require_runtime_etc_binds(mountinfo: &str, runtime_etc: &[RuntimeEtcEntry]) -
 }
 
 struct Stage2MountExpectation<'a> {
-    website_key: Option<u8>,
+    security_keys: &'a [u8],
     filesystems: Option<&'a [Stage2Filesystem]>,
     etc: EtcBinding<'a>,
     runtime_aliases: bool,
@@ -3793,7 +3697,7 @@ struct Stage2MountExpectation<'a> {
 /// the read-only root, `/dev` and its nodes, the fresh procfs holding only
 /// PID 1, and the writable scratch trees; returns the mountinfo it read.
 fn require_base_plan(
-    website_key: Option<u8>,
+    key_names: &[String],
     token: &[u8; TOKEN_LEN],
     terminal: bool,
     executable_scratch: bool,
@@ -3804,7 +3708,7 @@ fn require_base_plan(
     require_mode("/dev/shm", 0o1777)?;
     require_mode("/tmp", 0o1777)?;
     require_mode("/var/tmp", 0o1777)?;
-    require_devices(terminal, website_key)?;
+    require_devices(terminal, key_names)?;
 
     let numeric = read_dir_names("/proc")?
         .into_iter()
@@ -3905,7 +3809,7 @@ fn require_mount_plan(
     identity: Identity,
 ) -> io::Result<()> {
     let Stage2MountExpectation {
-        website_key,
+        security_keys,
         filesystems,
         etc,
         runtime_aliases,
@@ -3929,7 +3833,7 @@ fn require_mount_plan(
         firefox_seccomp_probe,
         filesystems.unwrap_or_default(),
     )? {
-        if website_key.is_some() && path == Path::new("/") {
+        if !security_keys.is_empty() && path == Path::new("/") {
             expected.insert(crate::text(format_args!("sys"))?);
         }
         let path_text = path
@@ -3942,17 +3846,29 @@ fn require_mount_plan(
             )));
         }
     }
-    let mountinfo = require_base_plan(website_key, token, terminal, false, false)?;
-    if let Some(index) = website_key {
+    let mut key_names = Vec::new();
+    let mut class_names = Vec::new();
+    for index in security_keys {
         let name = crate::text(format_args!("hidraw{index}"))?;
+        crate::allocation::push(&mut key_names, name).map_err(|_| io::ErrorKind::OutOfMemory)?;
+    }
+    let mountinfo = require_base_plan(&key_names, token, terminal, false, false)?;
+    if !key_names.is_empty() {
         require_names("/sys", &["bus", "class", "devices"])?;
         require_names("/sys/bus", &[])?;
         require_names("/sys/class", &["hidraw"])?;
-        require_names("/sys/class/hidraw", &[&name])?;
+        for name in &key_names {
+            crate::allocation::push(&mut class_names, name.as_str())
+                .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        }
+        require_names("/sys/class/hidraw", &class_names)?;
+    }
+    for (index, name) in security_keys.iter().zip(&key_names) {
         let path = crate::text(format_args!("/dev/{name}"))?;
         let meta = fs::symlink_metadata(&path)?;
-        if !meta.file_type().is_char_device() || device_numbers(meta.rdev()).1 != u64::from(index) {
-            return Err(io::Error::other("website key device mismatch"));
+        if !meta.file_type().is_char_device() || device_numbers(meta.rdev()).1 != u64::from(*index)
+        {
+            return Err(io::Error::other("security key device mismatch"));
         }
         require_mount(
             &mountinfo,
@@ -3962,8 +3878,8 @@ fn require_mount_plan(
             &["rw", "nodev"],
         )?;
         let leaf = fs::read_link(crate::text(format_args!("/sys/class/hidraw/{name}"))?)?;
-        if !leaf.starts_with("/sys/devices/virtual") {
-            return Err(io::Error::other("invalid website key sysfs leaf"));
+        if !crate::security_key::physical_leaf(&leaf, name) {
+            return Err(io::Error::other("invalid security key sysfs leaf"));
         }
         require_mount(
             &mountinfo,
@@ -4589,7 +4505,7 @@ fn start_probe_instance(
     if let Some(descriptor) = test_leak {
         require_descriptor_closed(descriptor)?;
     }
-    prepare_mount_plan(identity, &executable, None, None)?;
+    prepare_mount_plan(identity, &executable, None, &[])?;
     prepare_capability_bridge()?;
 
     let (proof_reader, mut proof_writer) = io::pipe()?;
@@ -5772,9 +5688,9 @@ pub fn run_stage2(
         };
     require_mount_plan(
         Stage2MountExpectation {
-            website_key: match &action {
-                Stage2Action::Launch(launch) => launch.website_key,
-                _ => None,
+            security_keys: match &action {
+                Stage2Action::Launch(launch) => &launch.security_keys,
+                _ => &[],
             },
             filesystems,
             etc,
@@ -5818,7 +5734,7 @@ pub fn run_stage2(
             // mistake this very commit had to be threaded through twice to
             // avoid making.
             let Stage2Launch {
-                website_key: _,
+                security_keys: _,
                 entry,
                 resolv_conf: _,
                 machine_id: _,
@@ -6564,7 +6480,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
         };
         crate::bus::require_accepting_endpoint(socket, FETCH_CONNECT_TIMEOUT, what)?;
     }
-    let website_key = WebsiteKey::acquire(&application)?;
+    let security_keys = SecurityKey::acquire(&application)?;
     let inside_identity = Identity {
         uid: application.inside_uid,
         gid: application.inside_gid,
@@ -6669,7 +6585,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             .into_iter()
             .chain(generation_descriptors)
             .chain(
-                website_key
+                security_keys
                     .iter()
                     .flat_map(|key| [key.node.as_raw_fd() as u32, key.sysfs.as_raw_fd() as u32]),
             )
@@ -6679,7 +6595,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             inside_identity,
             &executable,
             Some(&application),
-            website_key.as_ref(),
+            &security_keys,
         )?;
         prepare_capability_bridge()?;
 
@@ -6694,7 +6610,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             &application.entry,
             &application.environment,
             Stage2MountBinding {
-                website_key: website_key.as_ref().map(|key| key.index),
+                security_keys: &security_keys,
                 filesystems: &application.filesystems,
                 resolv_conf: application.resolv_conf.is_some(),
                 machine_id: &application.state.machine_id,
@@ -6713,7 +6629,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 membership: application_cgroup.membership()?,
             },
             &application.arguments,
-        );
+        )?;
         // The acquired terminal travels as stage 2's stdout, cloned only
         // now, after the descriptor sweep, so the sweep has nothing to
         // exempt and stage 2 still sees exactly three descriptors.
@@ -7939,7 +7855,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             "detached host root remains reachable in the fresh root",
         ));
     }
-    let mountinfo = require_base_plan(None, token, plan.development, true, plan.persistent)?;
+    let mountinfo = require_base_plan(&[], token, plan.development, true, plan.persistent)?;
     // The root holds the fixed trees, the host's system trees and the
     // first component of each admitted directory, and nothing else.
     let mut fixed: BTreeSet<String> = ["dev", "etc", "opt", "proc", "run", "tmp", "var"]
@@ -8625,15 +8541,15 @@ mod tests {
     }
 
     #[test]
-    fn website_key_bind_refuses_a_replacement_at_the_same_name() {
-        let dir = td_fs::TempDir::new("website-key-bind").unwrap();
+    fn security_key_bind_refuses_a_replacement_at_the_same_name() {
+        let dir = td_fs::TempDir::new("security-key-bind").unwrap();
         let target = dir.path().join("hidraw0");
         let pinned = fs::File::create_new(&target).unwrap();
         let name = target.to_str().unwrap();
-        WebsiteKey::require_pinned_bind(&pinned, name).unwrap();
+        SecurityKey::require_pinned_bind(&pinned, name).unwrap();
         fs::remove_file(&target).unwrap();
         fs::File::create_new(&target).unwrap();
-        assert!(WebsiteKey::require_pinned_bind(&pinned, name).is_err());
+        assert!(SecurityKey::require_pinned_bind(&pinned, name).is_err());
     }
 
     #[test]
@@ -9783,7 +9699,7 @@ mod tests {
                 action: Stage2Action::Launch(launch),
                 ..
             } if *launch == Stage2Launch {
-                website_key: None,
+                security_keys: Vec::new(),
                 entry: "/app/bin/app".into(),
                 resolv_conf: true,
                 machine_id: machine_id.into(),
@@ -10116,7 +10032,7 @@ mod tests {
                 "/app/bin/app",
                 &environment,
                 Stage2MountBinding {
-                    website_key: None,
+                    security_keys: &[],
                     filesystems: &filesystems,
                     resolv_conf: false,
                     machine_id,
@@ -10136,6 +10052,7 @@ mod tests {
                 },
                 &arguments,
             )
+            .unwrap()
         };
         // A constant in the emitter would leave mail on the wider program, and
         // only this could tell.
@@ -10153,7 +10070,7 @@ mod tests {
             ));
         }
         let emitted = emit(true, authority::ApplicationFilter::Standard);
-        let with_key = |entry: &str, index: &str| {
+        let with_keys = |entry: &str, indices: &[&str]| {
             let mut wire = emitted.clone();
             let app = wire.iter().position(|arg| arg == "/app/bin/app").unwrap();
             wire[app] = entry.into();
@@ -10163,18 +10080,28 @@ mod tests {
                 .unwrap();
             wire.splice(
                 delimiter..delimiter,
-                [OsString::from("--website-key"), index.into()],
+                indices
+                    .iter()
+                    .flat_map(|index| [OsString::from("--security-key"), (*index).into()]),
             );
             parse_mode(wire.into_iter())
         };
         assert!(
-            matches!(with_key("/app/bin/firefox", "0"), Ok(Mode::Stage2 {
+            matches!(with_keys("/app/bin/firefox", &["0", "17", "255"]), Ok(Mode::Stage2 {
             action: Stage2Action::Launch(launch), ..
-        }) if launch.website_key == Some(0))
+        }) if launch.security_keys == [0, 17, 255])
         );
-        assert!(with_key("/app/bin/app", "0").is_err());
-        for invalid in ["01", "+1", "-1", "256", "../1"] {
-            assert!(with_key("/app/bin/firefox", invalid).is_err());
+        assert!(with_keys("/app/bin/app", &["0"]).is_err());
+        for invalid in [
+            &["01"][..],
+            &["+1"],
+            &["-1"],
+            &["256"],
+            &["../1"],
+            &["3", "3"],
+            &["5", "3"],
+        ] {
+            assert!(with_keys("/app/bin/firefox", invalid).is_err());
         }
         // The sentinel is the value EVERY launch emits until a writer for
         // `/etc/timezone` exists, so it needs a POSITIVE assertion: every
@@ -10239,7 +10166,7 @@ mod tests {
             "/app/bin/app",
             &environment,
             Stage2MountBinding {
-                website_key: None,
+                security_keys: &[],
                 filesystems: &filesystems,
                 resolv_conf: false,
                 machine_id,
@@ -10258,7 +10185,8 @@ mod tests {
                 membership,
             },
             &arguments,
-        );
+        )
+        .unwrap();
         assert_eq!(fetched_emission[fetch_index], STAGE2_FETCH_SOCKET_ARG);
         assert_eq!(fetched_emission[fetch_index + 1], "present");
         assert!(matches!(
@@ -10382,7 +10310,7 @@ mod tests {
             "/app/bin/app",
             &environment,
             Stage2MountBinding {
-                website_key: None,
+                security_keys: &[],
                 filesystems: &filesystems,
                 resolv_conf: false,
                 machine_id,
@@ -10401,7 +10329,8 @@ mod tests {
                 membership,
             },
             &arguments,
-        );
+        )
+        .unwrap();
         assert_eq!(granted_emission[terminal_index], STAGE2_TERMINAL_ARG);
         assert_eq!(granted_emission[terminal_index + 1], "present");
         assert_eq!(
@@ -10411,7 +10340,7 @@ mod tests {
                 identity,
                 outside_identity,
                 action: Stage2Action::Launch(Box::new(Stage2Launch {
-                    website_key: None,
+                    security_keys: Vec::new(),
                     entry: "/app/bin/app".into(),
                     resolv_conf: false,
                     machine_id: machine_id.into(),

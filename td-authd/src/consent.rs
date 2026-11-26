@@ -1080,106 +1080,8 @@ impl Notebook {
     }
 }
 
-/// Immutable website prompt painted by the physical seat. Browser-provided
-/// strings occupy their own rows and never contain control characters.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Website {
-    pub ticket: u64,
-    pub stage: u8,
-    pub register: bool,
-    pub key: Option<u8>,
-    pub site: String,
-    pub account: String,
-    pub credential: Option<[u8; 32]>,
-}
-impl Website {
-    fn valid(&self) -> bool {
-        self.ticket != 0
-            && matches!(self.stage, 0..=4 | 7..=13)
-            && matches!(self.stage, 3 | 10 | 11) == self.credential.is_some()
-            && (self.stage < 9 || (!self.register && self.key.is_none()))
-            && self.site.is_empty() == matches!(self.stage, 9 | 12 | 13)
-            && (!self.site.is_empty() || self.account.is_empty())
-            && self.site.len() <= 253
-            && self
-                .site
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
-            && self.account.len() <= 255
-            && self.account.bytes().all(|b| (0x20..=0x7e).contains(&b))
-    }
-    fn rows<E>(
-        &self,
-        mut row: impl FnMut(std::fmt::Arguments<'_>) -> Result<(), E>,
-    ) -> Result<(), E> {
-        row(format_args!(
-            "{}",
-            if self.stage >= 9 {
-                "MANAGE TD-PASS WEBSITE PASSKEYS"
-            } else if self.register {
-                "CREATE A WEBSITE PASSKEY"
-            } else {
-                "SIGN IN TO WEBSITE"
-            }
-        ))?;
-        if !self.site.is_empty() {
-            row(format_args!("SITE: {}", self.site))?;
-        }
-        if !self.account.is_empty() {
-            row(format_args!("ACCOUNT: {}", self.account))?;
-        }
-        if let Some(id) = &self.credential {
-            let (chunks, _) = id.as_chunks::<16>();
-            if let [a, b] = chunks {
-                row(format_args!(
-                    "CREDENTIAL: {:032X}{:032X}",
-                    u128::from_be_bytes(*a),
-                    u128::from_be_bytes(*b)
-                ))?;
-            }
-        }
-        match self.key {
-            Some(i) => row(format_args!("YUBIKEY (HIDRAW {i})"))?,
-            None => row(format_args!("TD-PASS ON THIS TPM"))?,
-        }
-        let instructions: &[&str] = match self.stage {
-            0 => &["TAB: CHANGE PROVIDER   ENTER: CONTINUE"],
-            1 => &[
-                "ENROLL A DEVICE-BOUND PASSKEY VAULT?",
-                "LOSING OR CLEARING THIS TPM PERMANENTLY LOSES THESE PASSKEYS.",
-                "ENTER: ACCEPT LOSS   ESC: CANCEL",
-            ],
-            2 if self.key.is_some() => &["ENTER YOUR YUBIKEY PIN"],
-            2 | 9 => &["ENTER YOUR TD-PASS VAULT PIN"],
-            10 => &[
-                "TAB: NEXT PASSKEY   PAGE DOWN: SKIP 16",
-                "ENTER: REVIEW REMOVAL   ESC: CLOSE",
-            ],
-            11 => &[
-                "REMOVE THIS PASSKEY FROM TD-PASS?",
-                "THIS WEBSITE SIGN-IN WILL BE LOST.",
-                "ENTER: REMOVE   ESC: CANCEL",
-            ],
-            12 => &[
-                "NO WEBSITE PASSKEYS SAVED.",
-                "CREATE A PASSKEY FROM FIREFOX TO SAVE IT HERE.",
-            ],
-            13 => &["PASSKEY REMOVED FROM TD-PASS."],
-            3 => &["TAB: NEXT ACCOUNT   ENTER: SIGN IN"],
-            7 => &["CHOOSE A TD-PASS VAULT PIN (6 TO 63 CHARACTERS)"],
-            8 => &["RE-ENTER YOUR NEW VAULT PIN"],
-            _ => &["TOUCH YOUR YUBIKEY"],
-        };
-        for text in instructions {
-            row(format_args!("{text}"))?;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
-    Website(Website),
     Notebook(Notebook),
     /// `deploy-publish`: install a locally built deployment as current.
     Install {
@@ -1801,7 +1703,6 @@ impl Request {
             return Err("invalid consent protector operation".into());
         }
         match &operation {
-            Operation::Website(w) if !w.valid() => return Err("invalid website prompt".into()),
             Operation::Notebook(notebook) if !notebook.valid() => {
                 return Err("invalid consent notebook operation".into());
             }
@@ -1958,47 +1859,9 @@ impl Request {
             .or(self.protector_step())
     }
 
-    pub fn website_successor(&self, next: &Self) -> bool {
-        let (Operation::Website(a), Operation::Website(b)) = (&self.operation, &next.operation)
-        else {
-            return false;
-        };
-        if self.owner != next.owner
-            || self.nonce != next.nonce
-            || a.ticket != b.ticket
-            || a.register != b.register
-        {
-            return false;
-        }
-        if a.stage >= 9 || b.stage >= 9 {
-            return match (a.stage, b.stage) {
-                (9, 10 | 12) | (10, 10) | (11, 13) => true,
-                (10, 11) => {
-                    a.credential == b.credential && a.site == b.site && a.account == b.account
-                }
-                _ => false,
-            };
-        }
-        if a.site != b.site {
-            return false;
-        }
-        if (a.stage, b.stage) == (0, 0) {
-            return a.account == b.account;
-        }
-        a.key == b.key
-            && match (a.stage, b.stage) {
-                (0, 1) | (1, 7) | (7, 8) => a.key.is_none() && a.register && a.account == b.account,
-                (0, 2) => a.key.is_none() && a.account == b.account,
-                (2, 3) | (3, 3) => a.key.is_none() && !a.register,
-                (0, 4) | (4, 2) | (2, 4) => a.key.is_some() && a.account == b.account,
-                _ => false,
-            }
-    }
-
     pub fn asks_pin(&self) -> bool {
         self.ceremony_step().is_some_and(LoginStep::asks_pin)
             || matches!(&self.operation, Operation::Notebook(n) if n.step != 0)
-            || matches!(&self.operation, Operation::Website(w) if matches!(w.stage, 2 | 7 | 8 | 9))
     }
 
     pub fn asks_recovery_key(&self) -> bool {
@@ -2123,7 +1986,6 @@ impl Request {
     /// identify step. Every other description and step does not.
     pub fn awaits_approval(&self) -> bool {
         match &self.operation {
-            Operation::Website(w) => matches!(w.stage, 0 | 1 | 3 | 10 | 11),
             Operation::Notebook(n) => n.step == 0,
             Operation::Install { .. }
             | Operation::DeployRollback { .. }
@@ -2567,21 +2429,6 @@ impl Request {
         bytes.extend_from_slice(&self.nonce);
         bytes.extend_from_slice(&self.owner.to_be_bytes());
         match &self.operation {
-            Operation::Website(w) => {
-                bytes.extend_from_slice(&[
-                    45,
-                    w.stage,
-                    u8::from(w.register),
-                    u8::from(w.key.is_some()),
-                    w.key.unwrap_or(0),
-                ]);
-                bytes.extend_from_slice(&w.ticket.to_be_bytes());
-                put_text(&mut bytes, &w.site);
-                put_text(&mut bytes, &w.account);
-                if let Some(id) = w.credential {
-                    bytes.extend_from_slice(&id);
-                }
-            }
             Operation::Notebook(n) => {
                 bytes.extend_from_slice(&[41, n.method, n.action, n.purpose, n.role, n.step]);
                 bytes.extend_from_slice(&n.operation);
@@ -2839,7 +2686,7 @@ impl Request {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_BYTES && (bytes.get(44) != Some(&45) || bytes.len() > 600) {
+        if bytes.len() > MAX_BYTES {
             return Err("oversized consent request".into());
         }
         let mut input = Input(bytes);
@@ -3007,33 +2854,6 @@ impl Request {
                 source: input.flag()?,
                 reboot: input.flag()?,
             },
-            45 => {
-                let stage = input.byte()?;
-                let register = input.flag()?;
-                let physical = input.flag()?;
-                let index = input.byte()?;
-                if !physical && index != 0 {
-                    return Err("invalid website key choice".into());
-                }
-                Operation::Website(Website {
-                    ticket: input.wide()?,
-                    stage,
-                    register,
-                    key: physical.then_some(index),
-                    site: input.text()?,
-                    account: input.text()?,
-                    credential: if matches!(stage, 3 | 10 | 11) {
-                        Some(
-                            input
-                                .take(32)?
-                                .try_into()
-                                .map_err(|_| "invalid website credential")?,
-                        )
-                    } else {
-                        None
-                    },
-                })
-            }
             41 => Operation::Notebook(Notebook {
                 method: input.byte()?,
                 action: input.byte()?,
@@ -3191,7 +3011,6 @@ impl Request {
         mut row: impl FnMut(std::fmt::Arguments<'_>) -> Result<(), E>,
     ) -> Result<(), E> {
         match &self.operation {
-            Operation::Website(w) => w.rows(row),
             Operation::SignalProcesses { setting, .. } => {
                 row(format_args!("SEND PROCESS SIGNAL"))?;
                 for (label, value) in [
@@ -3220,10 +3039,7 @@ impl Request {
         &self,
         mut row: impl FnMut(std::fmt::Arguments<'_>) -> Result<(), E>,
     ) -> Result<bool, E> {
-        if !matches!(
-            self.operation,
-            Operation::Website(_) | Operation::SignalProcesses { .. }
-        ) {
+        if !matches!(self.operation, Operation::SignalProcesses { .. }) {
             return Ok(false);
         }
         row(format_args!("TD SECURE ATTENTION"))?;
@@ -3241,7 +3057,7 @@ impl Request {
             format!("SESSION USER {}", self.owner),
         ];
         match &self.operation {
-            Operation::Website(_) | Operation::SignalProcesses { .. } => {
+            Operation::SignalProcesses { .. } => {
                 let _: Result<(), std::convert::Infallible> = self.bounded_content(|row| {
                     lines.push(row.to_string());
                     Ok(())

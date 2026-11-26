@@ -2771,28 +2771,6 @@ fn notebook_lock_stops_an_active_operation_and_both_private_processes() {
     }
 }
 
-/// A website ceremony the physical seat drives holds a waiting notebook
-/// operation back; once it ends, the notebook takes the slot and revokes
-/// website operations before its first token step.
-#[test]
-fn a_website_ceremony_holds_a_notebook_operation_back() {
-    let mut session = quiet();
-    prepare(&mut session);
-    let (bridge, _) = crate::notebook::tests::waiting();
-    session.notebook = Some(bridge);
-    session.website.held = true;
-    for _ in 0..5 {
-        session.tick().unwrap();
-        assert!(!session.notebook.as_ref().unwrap().busy());
-    }
-    session.website.held = false;
-    let revocations = session.website.revocations;
-    session.tick().unwrap();
-    assert!(session.notebook.as_ref().unwrap().busy());
-    assert_eq!(session.website.revocations, revocations + 1);
-    session.close_with(|_| fixture("cleanup_child")).unwrap();
-}
-
 /// An operation the attention screen selects takes the slot from the
 /// notebook's: the notebook stops holding it, whatever then answers.
 #[test]
