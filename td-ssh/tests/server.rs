@@ -566,6 +566,10 @@ fn field<'a>(status: &'a str, name: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
+fn filter_count(status: &str) -> Option<u32> {
+    field(status, "Seccomp_filters")?.parse().ok()
+}
+
 fn children_of(parent: u32) -> Vec<String> {
     let mut found = Vec::new();
     for entry in fs::read_dir("/proc").unwrap().flatten() {
@@ -594,7 +598,9 @@ fn the_pre_auth_worker_runs_under_seccomp_and_no_new_privs() {
     let worker = children_of(monitor[0].parse().unwrap());
     assert_eq!(worker.len(), 1, "{worker:?}");
     let status = status_of(&worker[0]).unwrap();
+    let inherited = filter_count(&status_of("self").unwrap()).unwrap();
     assert_eq!(field(&status, "Seccomp"), Some("2"), "{status}");
+    assert_eq!(filter_count(&status), Some(inherited + 1), "{status}");
     assert_eq!(field(&status, "NoNewPrivs"), Some("1"), "{status}");
     assert_eq!(field(&status, "Threads"), Some("1"), "{status}");
     // Standard three, the socket's two clones, the monitor's clone, /dev/random.
@@ -620,12 +626,16 @@ fn after_authentication_the_signer_is_jailed_and_no_worker_remains() {
         .spawn()
         .unwrap();
     let start = Instant::now();
+    let baseline = status_of("self").unwrap();
+    let inherited = filter_count(&baseline).unwrap();
     let signer = loop {
         let log = server.log();
         let stage = children_of(server.child.id());
         if log.contains("Accepted publickey") && stage.len() == 1 {
             let status = status_of(&stage[0]).unwrap_or_default();
-            if field(&status, "Seccomp") == Some("2") {
+            if field(&status, "Seccomp") == Some("2")
+                && filter_count(&status) == Some(inherited + 1)
+            {
                 break stage[0].clone();
             }
         }
@@ -637,7 +647,11 @@ fn after_authentication_the_signer_is_jailed_and_no_worker_remains() {
     let session = children_of(signer.parse().unwrap());
     assert_eq!(session.len(), 1, "{session:?}");
     let session_status = status_of(&session[0]).unwrap();
-    assert_eq!(field(&session_status, "Seccomp"), Some("0"));
+    assert_eq!(
+        field(&session_status, "Seccomp"),
+        field(&baseline, "Seccomp")
+    );
+    assert_eq!(filter_count(&session_status), Some(inherited));
     child.stdin.take().unwrap().write_all(b"bye\n").unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(stdout(&output), "bye\n");
@@ -1375,10 +1389,18 @@ fn a_peers_orderly_goodbye_before_authentication_is_no_error_line() {
 #[test]
 fn a_client_whose_stdout_closes_ends_the_program_writing_to_it() {
     let server = start("");
+    let cat = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("cat"))
+        .find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .unwrap();
+    std::os::unix::fs::symlink(std::path::absolute(cat).unwrap(), server.home.join("cat")).unwrap();
     let mut child = server
         .ssh("client")
         .arg(format!("{USER}@127.0.0.1"))
-        .arg("while :; do echo a line of output; done")
+        .arg("exec ./cat /dev/zero")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1412,7 +1434,7 @@ fn stderr_written_after_eow_arrives_and_then_the_status() {
     let channel = client.open_session(1 << 20);
     client.exec(
         channel,
-        "trap '' PIPE; while echo a line of output; do :; done; echo said late >&2; exit 3",
+        "while (echo a line of output); do :; done; echo said late >&2; exit 3",
         false,
     );
     while client.receive_skipping_window()[0] != msg::CHANNEL_DATA {}
