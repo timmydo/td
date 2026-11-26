@@ -769,8 +769,9 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         assert!(!is_mount_point(Path::new("/mnt/root/subdir"), Some(MOUNTS)));
         // Unstattable or unresolvable answers "no" rather than switching.
         assert!(!is_mount_point(Path::new("/nonexistent-xyz"), Some(MOUNTS)));
-        // Fallback with no mount table: a directory of / is not a mount point.
-        assert!(!is_mount_point(Path::new("/etc"), None));
+        // A new directory shares its parent's filesystem in the fallback.
+        let plain = td_fs::TempDir::new("td-init-mount").unwrap();
+        assert!(!is_mount_point(plain.path(), None));
     }
 
     /// The property that matters on td: `/sbin/init` in a real new root is a

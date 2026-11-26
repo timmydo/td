@@ -19,6 +19,7 @@ path = "src/main.rs"
 # Dev-only: the recipe compiles src/main.rs with a direct rustc and no
 # `--test`, so the shipped binary never sees it.
 [dev-dependencies]
+td-fs = { path = "../td-fs" }
 td-pty = { path = "../td-pty" }
 td-source-scan = { path = "../td-source-scan" }
 
