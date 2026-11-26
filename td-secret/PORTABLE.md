@@ -1555,7 +1555,9 @@ hardware slot; knowing these bytes is not admission to that slot.
 
 The worker shares the notebook u32 framing, bounded additionally by a
 130-second absolute lifetime, longer than root's 120-second step deadline
-so that root decides a step's end and relays it. Its initial frame holds a length-prefixed
+so that root decides a step's end and relays it. A security key session
+has its own 120-second deadline measured from the worker's start, so time
+spent waiting for approval counts toward it. The initial frame holds a length-prefixed
 consent description and length-prefixed service token request. Presentation
 `40` holds the description; acknowledgement `41` must repeat it exactly.
 PIN `42` holds that same description and a bounded 4–63 byte printable

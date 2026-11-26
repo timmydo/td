@@ -8,7 +8,7 @@ use super::{
     PRIMARY_NAME,
 };
 use crate::consent::{Notebook, Operation, Request};
-use crate::fido_device::{Device, Session};
+use crate::fido_device::{Device, Session, MAX_LIFETIME};
 use crate::fido_pin::Pin;
 use crate::fido_transaction::{Error as Transaction, PinPurpose, Status};
 use crate::notebook_wire::{field, Bytes, Reader, Wire};
@@ -23,6 +23,24 @@ const COMPUTER_PIN: &[u8] = b"td-secret/portable/tpm-pin/v1";
 /// The worker's absolute lifetime: longer than root's 120-second step
 /// deadline, so root decides a step's end and relays it.
 const LIFETIME: Duration = Duration::from_secs(130);
+
+struct Deadlines {
+    worker: Instant,
+    fido: Instant,
+}
+
+impl Deadlines {
+    fn from_start(start: Instant) -> Result<Self, &'static str> {
+        Ok(Self {
+            worker: start
+                .checked_add(LIFETIME)
+                .ok_or("notebook deadline overflow")?,
+            fido: start
+                .checked_add(MAX_LIFETIME)
+                .ok_or("FIDO deadline overflow")?,
+        })
+    }
+}
 
 /// The wrong PINs a computer step leaves to the disk: it is refused when
 /// fewer than this many tries remain before the TPM's lockout, which the
@@ -526,12 +544,10 @@ fn pin_bytes(wire: &mut Wire, request: &mut Request, purpose: PinPurpose) -> Res
 
 pub(crate) fn run(owner: u32) -> Result<(), String> {
     let endpoint = crate::operation::startup()?;
-    let deadline = Instant::now()
-        .checked_add(LIFETIME)
-        .ok_or("notebook deadline overflow")?;
+    let deadlines = Deadlines::from_start(Instant::now())?;
     let protected = host::protect_service()?;
     let mut wire = Wire::new(endpoint)?;
-    wire.bound(deadline);
+    wire.bound(deadlines.worker);
     let initial = wire.receive(Duration::from_secs(5))?;
     let mut input = Reader::new(&initial.0);
     let mut request = Request::decode(input.field(256)?)?;
@@ -578,7 +594,7 @@ pub(crate) fn run(owner: u32) -> Result<(), String> {
     let mut entropy = host::Entropy::open()?;
     let mut tokens = Hardware {
         open: |_: Presented<'_>| {
-            Session::open(device, deadline).map_err(|_| super::lifecycle::TokenError::Unavailable)
+            Session::open(device, deadlines.fido).map_err(|_| TokenError::Unavailable)
         },
         prompt: |_: Presented<'_>, purpose| prompt(&mut wire, &mut request, purpose),
         entropy: |bytes: &mut [u8]| entropy.fill(bytes),
@@ -606,6 +622,14 @@ fn refuse(wire: &mut Wire, error: &TokenError) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn immediate_approval_fits_the_fido_session_lifetime() {
+        let start = Instant::now();
+        let deadlines = Deadlines::from_start(start).unwrap();
+        assert_eq!(deadlines.fido - start, crate::fido_device::MAX_LIFETIME);
+        assert!(deadlines.worker > deadlines.fido);
+    }
 
     fn enrollment() -> (Bytes, Notebook) {
         let mut bytes = Bytes(vec![0x30, 1, 1]);
