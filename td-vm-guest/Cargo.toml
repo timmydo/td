@@ -8,7 +8,7 @@ license = "MIT"
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 [package.metadata.td-gate]
 clippy-all-targets = true
-# Real key/clone fixtures require host OpenSSH, Git, rustc and its linker.
+# Real key/clone fixtures require host SSH tools (td or OpenSSH), Git, rustc and its linker.
 # The compiler-only sandbox does not supply these runtime fixture tools.
 test-args = "--include-ignored"
 gate-test-args = "--bins"

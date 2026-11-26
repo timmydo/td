@@ -548,16 +548,20 @@ mod tests {
             }
         }
     }
-    fn program(name: &str) -> PathBuf {
+    fn find_program(name: &str) -> Option<PathBuf> {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .chain(std::iter::once(PathBuf::from(
+                "/run/current-system/profile/sbin",
+            )))
             .map(|p| p.join(name))
-            .find(|p| p.is_file())
-            .or_else(|| {
-                let p = PathBuf::from("/run/current-system/profile/sbin").join(name);
-                p.is_file().then_some(p)
+            .find(|p| {
+                p.metadata()
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
             })
             .map(|p| std::path::absolute(p).unwrap())
-            .unwrap_or_else(|| panic!("host fixture needs {name}"))
+    }
+    fn program(name: &str) -> PathBuf {
+        find_program(name).unwrap_or_else(|| panic!("host fixture needs {name}"))
     }
     fn invoke(command: &mut Command) -> String {
         let out = command.stdin(Stdio::null()).output().unwrap();
@@ -572,7 +576,7 @@ mod tests {
             .into()
     }
     #[test]
-    #[ignore = "requires host Git, OpenSSH daemon/client, rustc and its linker"]
+    #[ignore = "requires host Git, SSH server and client, rustc and its linker"]
     fn ssh_clone_keeps_retained_base_private_worktree_and_user_edits() {
         if let Some(root) = std::env::var_os("TD_VM_CLONE_CRASH_CHILD") {
             let root = PathBuf::from(root);
@@ -766,16 +770,31 @@ fn main() {{
                 .arg(&dispatcher),
         );
         std::os::unix::fs::symlink(&dispatcher, &launcher).unwrap();
-        let auth = f.root.join("authorized");
+        let auth = f.root.join(".ssh/authorized_keys");
+        create_directory(&f.root.join(".ssh")).unwrap();
         fs::write(&auth, format!("restrict {}\n", plan.guest_key)).unwrap();
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
         let daemon = f.root.join("sshd_config");
-        fs::write(&daemon, format!("ListenAddress 127.0.0.1\nPort {port}\nHostKey {}\nPidFile {}/sshd.pid\nAuthorizedKeysFile {}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nStrictModes yes\nAllowUsers {user}\nPermitUserEnvironment no\nDisableForwarding yes\nPermitTTY no\nForceCommand {}\n", host_key.display(), f.root.display(), auth.display(), dispatcher.display())).unwrap();
+        let mut server = if let Some(sshd) = find_program("td-sshd").filter(|_| uid != 0) {
+            fs::write(&daemon, format!("ListenAddress 127.0.0.1\nPort {port}\nHostKey {}\nAuthorizedKeysFile .ssh/authorized_keys\nAllowUsers {user}\nMatch User {user}\n    PermitTTY no\n    ForceCommand {}\n", host_key.display(), dispatcher.display())).unwrap();
+            let mut command = Command::new(sshd);
+            command
+                .arg("-f")
+                .arg(&daemon)
+                .arg("--single-user")
+                .arg(&user)
+                .env("HOME", f.root.path())
+                .env("SHELL", "/bin/sh");
+            command
+        } else {
+            fs::write(&daemon, format!("ListenAddress 127.0.0.1\nPort {port}\nHostKey {}\nPidFile {}/sshd.pid\nAuthorizedKeysFile {}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nStrictModes yes\nAllowUsers {user}\nPermitUserEnvironment no\nDisableForwarding yes\nPermitTTY no\nForceCommand {}\n", host_key.display(), f.root.display(), auth.display(), dispatcher.display())).unwrap();
+            let mut command = Command::new(program("sshd"));
+            command.args(["-D", "-e", "-f"]).arg(&daemon);
+            command
+        };
         let log = File::create(f.root.join("sshd.log")).unwrap();
         f.server = Some(
-            Command::new(program("sshd"))
-                .args(["-D", "-e", "-f"])
-                .arg(&daemon)
+            server
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(log))

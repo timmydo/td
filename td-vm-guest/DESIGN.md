@@ -175,8 +175,10 @@ cause an unrequested retry. Status echoes the full plan and is only a record
 of that completed attempt. The service clears status on startup and before a
 new attempt; the compositor refuses a mismatched plan or malformed status.
 
-The host preflight includes a real disposable SSH server, the host's OpenSSH,
-under the test user's private home, preserving its StrictModes. It proves a moved origin main,
+The host preflight starts a disposable loopback SSH server under the test
+user's private home. It uses `td-sshd --single-user` when available to an
+unprivileged caller, or the host's OpenSSH with strict modes. Both use a
+restricted fixture key and a forced Git dispatcher. The test proves a moved origin main,
 explicit retained-ref fetch, atomic relative worktree publication, same-plan
 retry preserving edits and new commits, and an ordinary SSH push. Killing the
 owned provisioning helper while Git's server is held verifies that surviving
