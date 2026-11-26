@@ -2218,6 +2218,11 @@ architecture dispatch and jumps validated before installation. Reviews and
 maintenance retain the workspace filter. Development allows ordinary code,
 nested namespaces and mounts, with the exact denial roster and inherited-mount
 boundary in APPLICATIONS.md §C. The raw installation wrapper is unchanged.
+The workspace launch test reads the optional kernel fallback interface
+`sit0` through §2's existing `sys::ioctl` on a test-owned AF_INET
+datagram socket. Its two requests are SIOCGIFHWADDR and SIOCGIFFLAGS,
+each with a 40-byte x86-64 ifreq for that name. It requires hardware
+type ARPHRD_SIT and IFF_UP clear.
 The test-only C development probe calls unshare, uid/gid-map writes, mount,
 umount2, keyctl, open_tree and move_mount to exercise this policy; its i386
 assembly companion only gets its PID and exits. Neither is a shipped wrapper. No syscall, operation

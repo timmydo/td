@@ -5,11 +5,19 @@
 use std::error::Error;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::net::{Ipv4Addr, UdpSocket};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+#[path = "../../td-netd/src/sys.rs"]
+#[allow(
+    dead_code,
+    reason = "the test reads two interface properties through td-netd's ioctl"
+)]
+mod net_sys;
 
 const PROBE: &str = r#"#!/bin/sh
 read -r request
@@ -359,13 +367,19 @@ fn a_datagram_channel_is_refused() -> Result<(), Box<dyn Error>> {
 /// The workspace program as the kernel applies it, seen from a Rust
 /// program inside: no Unix socket of its own, a stream pair but no
 /// datagram one, a child spawned on std's fork path (which makes a
-/// sequenced-packet pair), and loopback alone. The entry is this
-/// test binary, running `rust_probe_inside`.
+/// sequenced-packet pair), and a private network without an external link.
+/// The entry is this test binary, running `rust_probe_inside`.
 #[test]
 #[ignore = "needs unprivileged user namespaces and a host /bin/sh"]
 fn the_workspace_filter_holds_for_a_rust_program() -> Result<(), Box<dyn Error>> {
     let me = fs::canonicalize(std::env::current_exe()?)?;
-    let (_base, spec) = prepare_with("workspace-rust", Some(&me))?;
+    let (base, spec) = prepare_with("workspace-rust", Some(&me))?;
+    fs::write(
+        base.join("tree/host-netns"),
+        fs::read_link("/proc/self/ns/net")?
+            .as_os_str()
+            .as_encoded_bytes(),
+    )?;
     let (mut ours, theirs) = UnixStream::pair()?;
     let child = Command::new(env!("CARGO_BIN_EXE_td-jail"))
         .arg("--workspace")
@@ -392,9 +406,8 @@ fn the_workspace_filter_holds_for_a_rust_program() -> Result<(), Box<dyn Error>>
         "stream-pair=made",
         "datagram-pair=refused",
         "fork-path-spawn=ran",
-        "interfaces=lo",
+        "network=isolated",
     ] {
-        // Whole lines: `interfaces=lo,eth0` is no isolated network.
         assert!(
             reply.lines().any(|got| got == line),
             "{line} absent from:\n{reply}"
@@ -432,12 +445,47 @@ fn rust_probe_inside() -> Result<(), Box<dyn Error>> {
         .status()
         .is_ok_and(|status| status.success());
     println!("fork-path-spawn={}", if ran { "ran" } else { "failed" });
-    let interfaces: Vec<String> = fs::read_to_string("/proc/net/dev")?
-        .lines()
-        .skip(2)
-        .filter_map(|line| line.split(':').next().map(|name| name.trim().to_string()))
-        .collect();
-    println!("interfaces={}", interfaces.join(","));
+    assert_ne!(
+        fs::read_link("/proc/self/ns/net")?
+            .as_os_str()
+            .as_encoded_bytes(),
+        fs::read("host-netns")?
+    );
+    let devices = fs::read_to_string("/proc/net/dev")?;
+    let mut names = Vec::new();
+    for line in devices.lines().skip(2) {
+        let (name, _) = line.split_once(':').ok_or("invalid /proc/net/dev row")?;
+        names.push(name.trim());
+    }
+    names.sort_unstable();
+    assert!(names == ["lo"] || names == ["lo", "sit0"], "{names:?}");
+    // Linux can create an unconfigured IPv6 tunnel in every new netns.
+    if names.contains(&"sit0") {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let mut ifreq = [0u8; 40];
+        ifreq[..4].copy_from_slice(b"sit0");
+        // Linux x86-64 ifreq: the union starts after the 16-byte name.
+        const SIOCGIFHWADDR: usize = 0x8927;
+        const ARPHRD_SIT: u16 = 776;
+        net_sys::ioctl(socket.as_raw_fd(), SIOCGIFHWADDR, ifreq.as_mut_ptr())?;
+        assert_eq!(u16::from_ne_bytes([ifreq[16], ifreq[17]]), ARPHRD_SIT);
+        const SIOCGIFFLAGS: usize = 0x8913;
+        const IFF_UP: u16 = 1;
+        net_sys::ioctl(socket.as_raw_fd(), SIOCGIFFLAGS, ifreq.as_mut_ptr())?;
+        assert_eq!(u16::from_ne_bytes([ifreq[16], ifreq[17]]) & IFF_UP, 0);
+        for table in [
+            "/proc/net/route",
+            "/proc/net/ipv6_route",
+            "/proc/net/if_inet6",
+        ] {
+            let rows = fs::read_to_string(table)?;
+            assert!(
+                !rows.split_whitespace().any(|word| word == "sit0"),
+                "{table}: {rows}"
+            );
+        }
+    }
+    println!("network=isolated");
     Ok(())
 }
 
