@@ -14,6 +14,7 @@ use crate::{ast, exec};
 pub enum Builtin {
     Colon,
     True,
+    Ulimit,
     Umask,
     False,
     Echo,
@@ -55,7 +56,7 @@ pub const NAMES: &[&str] = &[
     ":", "[", ".", "alias", "bg", "break", "cd", "command", "continue", "echo", "eval", "exec",
     "exit", "export", "false", "fg", "getopts", "jobs", "local", "printf", "pwd", "read",
     "readonly", "return", "set", "shift", "source", "test", "times", "trap", "true", "type",
-    "umask", "unalias", "unset", "wait",
+    "ulimit", "umask", "unalias", "unset", "wait",
 ];
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -74,6 +75,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "unset" => Builtin::Unset,
         "export" => Builtin::Export,
         "readonly" => Builtin::Readonly,
+        "ulimit" => Builtin::Ulimit,
         "umask" => Builtin::Umask,
         "read" => Builtin::Read,
         "getopts" => Builtin::Getopts,
@@ -187,6 +189,7 @@ fn run_named(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Unset => unset(sh, argv),
         Builtin::Export => export(sh, argv, false),
         Builtin::Readonly => export(sh, argv, true),
+        Builtin::Ulimit => ulimit(sh, argv),
         Builtin::Umask => umask_builtin(sh, argv),
         Builtin::Local => local(sh, argv),
         Builtin::Read => read(sh, argv),
@@ -3513,6 +3516,110 @@ fn symbolic_mode(mask: u32) -> String {
         }
     }
     out
+}
+
+fn ulimit(sh: &mut Shell, argv: &[String]) -> R<()> {
+    use crate::limits::{Limit, Resource, RESOURCES};
+    use std::io::{Cursor, Write};
+
+    let mut args = argv.iter().skip(1).peekable();
+    let mut resource = None;
+    let mut all = false;
+    let mut soft = false;
+    let mut hard = false;
+    let usage = |sh: &mut Shell| {
+        err_line(
+            sh,
+            "usage: ulimit [-SH] [-a | -cdfnstuv] [value | unlimited]",
+        );
+        status(sh, 2)
+    };
+    while let Some(arg) = args.next_if(|arg| arg.starts_with('-')) {
+        if arg == "--" {
+            break;
+        }
+        if arg == "-" {
+            return usage(sh);
+        }
+        if arg == "--all" {
+            all = true;
+            continue;
+        }
+        for flag in arg.chars().skip(1) {
+            match flag {
+                'S' => soft = true,
+                'H' => hard = true,
+                'a' => all = true,
+                _ => match RESOURCES.iter().find(|entry| entry.0 == flag) {
+                    Some(entry) if resource.is_none() => resource = Some(entry.1),
+                    _ => return usage(sh),
+                },
+            }
+        }
+    }
+    let operand = args.next();
+    if args.next().is_some() || (all && (operand.is_some() || resource.is_some())) {
+        return usage(sh);
+    }
+    for &(_, kind, label, scale) in RESOURCES {
+        if !all && kind != resource.unwrap_or(Resource::File) {
+            continue;
+        }
+        let Ok(current) = crate::sys::get_limit(kind) else {
+            err_line(sh, "cannot read resource limit");
+            return status(sh, 1);
+        };
+        if let Some(arg) = operand {
+            let value = if arg == "unlimited" {
+                u64::MAX
+            } else {
+                let Some(n) = arg.parse::<u64>().ok().and_then(|n| n.checked_mul(scale)) else {
+                    return usage(sh);
+                };
+                if n == u64::MAX {
+                    return usage(sh);
+                }
+                n
+            };
+            let value = Limit {
+                soft: if soft || !hard { value } else { current.soft },
+                hard: if hard || !soft { value } else { current.hard },
+            };
+            if let Err(message) = crate::limits::set(kind, value, sh.owns_limits) {
+                err_line(sh, message);
+                return status(sh, 1);
+            }
+            return ok(sh);
+        }
+        let value = if hard && !soft {
+            current.hard
+        } else {
+            current.soft
+        };
+        let mut bytes = [0u8; 96];
+        let mut line = Cursor::new(&mut bytes[..]);
+        let write_line = |line: &mut Cursor<&mut [u8]>| -> std::io::Result<()> {
+            if all {
+                write!(line, "{label:<30} ")?;
+            }
+            if value == u64::MAX {
+                writeln!(line, "unlimited")
+            } else {
+                writeln!(line, "{}", value / scale)
+            }
+        };
+        if write_line(&mut line).is_err() {
+            return status(sh, 1);
+        }
+        let length = line.position() as usize;
+        if let Some(text) = bytes.get(..length) {
+            out(sh, text)?;
+            if sh.status != 0 {
+                return Ok(());
+            }
+        }
+    }
+    ok(sh)
 }
 
 /// ash's `umask`. Reading the mask needs no argument and setting it takes one;

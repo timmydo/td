@@ -397,7 +397,6 @@ xfail brace-expansion.test.sh::triple nested brace expansion
 xfail brace-expansion.test.sh::} in expansion
 xfail bugs.test.sh::#2640 Hanging when reading from character devices
 xfail bugs.test.sh::Turn an array into an integer.
-xfail bugs.test.sh::other builtins fail on writing to full disk
 xfail bugs.test.sh::unset doesn't allow command execution
 xfail builtin-bash.test.sh::bad help topic
 xfail builtin-bash.test.sh::help
@@ -541,12 +540,7 @@ xfail builtin-process.test.sh::exec -- 2>&1
 xfail builtin-process.test.sh::exec builtin
 xfail builtin-process.test.sh::ulimit -f 1 prevents files larger 512 bytes
 xfail builtin-process.test.sh::ulimit -n limits file descriptors
-xfail builtin-process.test.sh::ulimit accepts 'unlimited'
 xfail builtin-process.test.sh::ulimit doesn't accept multiple flags - reduce confusion between shells
-xfail builtin-process.test.sh::ulimit negative arg
-xfail builtin-process.test.sh::ulimit negative flag
-xfail builtin-process.test.sh::ulimit of 2**32, 2**31 (int overflow)
-xfail builtin-process.test.sh::ulimit that is 64 bits
 xfail builtin-process.test.sh::ulimit with no flags is like -f
 xfail builtin-process.test.sh::write big file with ulimit
 xfail builtin-read.test.sh::read -a reads into array

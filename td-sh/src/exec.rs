@@ -347,6 +347,8 @@ pub struct Shell {
     /// moment it happens to exit. Not inherited: a clone starts having changed
     /// nothing, whatever its parent did.
     pub umask_changed: bool,
+    /// Granted only to the interpreter running the shell binary.
+    pub owns_limits: bool,
 }
 
 /// Bound on nested command execution — enforced once, at the `run_command` choke
@@ -506,6 +508,7 @@ impl Shell {
             sig_installed: Vec::new(),
             stderr_epipe: AtomicBool::new(false),
             umask_changed: false,
+            owns_limits: false,
             sig_undo: Vec::new(),
             trap_status: None,
         };
@@ -634,6 +637,7 @@ impl Shell {
             sig_installed: Vec::new(),
             stderr_epipe: AtomicBool::new(false),
             umask_changed: false,
+            owns_limits: false,
             sig_undo: Vec::new(),
             trap_status: None,
         };

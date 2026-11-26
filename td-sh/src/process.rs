@@ -414,9 +414,8 @@ const BAD_FD_NUMBER: i32 = 2;
 /// is a bound on native recursion, sized against the main thread's 8 MiB. Rust's
 /// default 2 MiB left those bounds above where a stage's stack actually ended.
 ///
-/// 8 MiB is `ulimit -s`'s usual value rather than a reading of it: asking would
-/// need `getrlimit(2)`, a syscall this crate's surface deliberately does not
-/// have. Nothing evaluates on the stack the process was LAUNCHED with -- bar
+/// The thread stack is fixed at 8 MiB. Nothing evaluates on the stack the
+/// process was launched with -- bar
 /// `main`'s fallback for an OS that refuses a thread at all -- so the size is
 /// this crate's choice everywhere rather than the environment's.
 pub const SHELL_THREAD_STACK: usize = 8 * 1024 * 1024;
@@ -1587,6 +1586,7 @@ impl Drop for UmaskScope {
 pub struct Subshell {
     shell: Shell,
     mask: UmaskScope,
+    _limits_guard: crate::limits::CloneGuard,
 }
 
 /// Put back every signal disposition this subshell changed.
@@ -1739,9 +1739,14 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         sig_installed: sh.sig_installed.clone(),
         stderr_epipe: std::sync::atomic::AtomicBool::new(false),
         umask_changed: false,
+        owns_limits: false,
         sig_undo: Vec::new(),
     };
-    Subshell { shell, mask }
+    Subshell {
+        shell,
+        mask,
+        _limits_guard: crate::limits::CloneGuard::new(),
+    }
 }
 
 /// `$(code)`: run `code` in a subshell with stdout captured to a buffer, and

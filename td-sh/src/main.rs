@@ -40,6 +40,7 @@ mod fd_exec;
 mod funcs;
 mod jobs;
 mod lexer;
+mod limits;
 mod line;
 mod parser;
 mod pattern;
@@ -104,6 +105,7 @@ fn main() -> ExitCode {
 /// Parse the command line and dispatch to the right execution mode.
 fn run(args: &[String], fds: &mut process::Fds) -> Result<i32, String> {
     let mut sh = Shell::new();
+    sh.owns_limits = true;
     std::mem::swap(&mut sh.fds, fds);
     // Settle "was this signal ignored when we started?" while this is still the
     // only thread — a stage asking for the first time during a SIBLING's guard,
@@ -635,6 +637,7 @@ mod confinement {
         ("funcs.rs", include_str!("funcs.rs")),
         ("jobs.rs", include_str!("jobs.rs")),
         ("lexer.rs", include_str!("lexer.rs")),
+        ("limits.rs", include_str!("limits.rs")),
         ("line.rs", include_str!("line.rs")),
         ("parser.rs", include_str!("parser.rs")),
         ("pattern.rs", include_str!("pattern.rs")),
@@ -1025,6 +1028,17 @@ mod confinement {
         );
     }
 
+    #[test]
+    fn resource_limits_pin_the_linux_abi_and_sole_writer() {
+        let limits = squeeze(&code_only(source("limits.rs")));
+        assert!(limits.contains("pubenumResource{Cpu=0,File=1,Data=2,Stack=3,Core=4,Processes=6,Descriptors=7,AddressSpace=9,}"));
+        assert!(limits.contains("#[repr(C)]pubstructLimit{pubsoft:u64,pubhard:u64,}"));
+        assert!(limits.contains("if!owner||LIVE_CLONES.load(Ordering::SeqCst)!=0{returnErr("));
+        assert_eq!(count_code(concat!("sys", "::set_limit(")), 1);
+        assert_eq!(count_code(concat!("sys", "::get_limit(")), 1);
+        assert_eq!(count_code(concat!("owns_limits", " = true")), 1);
+    }
+
     /// The ioctl requests are pinned by VALUE, since a name alone would let the number
     /// change under it.
     #[test]
@@ -1110,6 +1124,7 @@ mod confinement {
         assert_eq!(
             seen,
             vec![
+                concat!("SYS", "_PRLIMIT64:usize=302").to_string(),
                 concat!("SYS", "_KILL:usize=62").to_string(),
                 concat!("SYS", "_RT_SIGPROCMASK:usize=14").to_string(),
                 concat!("SYS", "_WAIT4:usize=61").to_string(),
@@ -1307,7 +1322,7 @@ mod confinement {
         for (name, text) in SOURCES {
             let uses = code_only(text).matches(call).count();
             match *name {
-                "builtin.rs" | "process.rs" | "term.rs" | "fd_exec.rs" => {
+                "builtin.rs" | "process.rs" | "term.rs" | "fd_exec.rs" | "limits.rs" => {
                     assert!(uses > 0, "{name} stopped calling")
                 }
                 _ => assert_eq!(uses, 0, "{name} reaches the syscall module"),
@@ -1358,7 +1373,7 @@ mod confinement {
         let name = concat!("syscall", "4");
         assert_eq!(
             code.matches(name).count(),
-            18,
+            20,
             "unexpected raw syscall site"
         );
         assert_eq!(
@@ -1371,6 +1386,8 @@ mod confinement {
         // names no constant and would satisfy the roster test above.
         let squeezed = squeeze(&code);
         for number in [
+            "SYS_PRLIMIT64,0,resourceasusize,0,(&mutlimitas*mutLimit)asusize,",
+            "SYS_PRLIMIT64,0,resourceasusize,(&limitas*constLimit)asusize,0,",
             "SYS_UMASK,",
             "SYS_RT_SIGACTION,",
             "SYS_IOCTL,",

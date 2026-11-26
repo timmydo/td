@@ -85,7 +85,13 @@ pub fn recipe() -> Recipe {
             &[
                 bin,
                 "-ec",
-                r#"exec 9>/dev/null; "$1" -c 'echo inherited >&9'"#,
+                r#"exec 9>/dev/null
+                   "$1" -c 'echo inherited >&9'
+                   before=$(ulimit -Hn)
+                   if (ulimit -n 32); then exit 1; fi
+                   limit=$("$1" -ec 'ulimit -n 32; exec "$1" -c "ulimit -Hn"' sh "$1")
+                   test "$limit" = 32
+                   test "$(ulimit -Hn)" = "$before""#,
                 "sh",
                 bin,
             ],

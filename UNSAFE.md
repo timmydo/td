@@ -198,7 +198,7 @@ one.
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED` and `SO_PEERPIDFD`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
 | 7 | `td-util` | terminal `ioctl(2)`, `flock(2)`, and `fcntl(F_SETFD, 0)` |
-| 8 | `td-sh` | `umask(2)`, disposition-only `rt_sigaction(2)`, job-control `kill(2)` and `rt_sigprocmask(2)`, `ioctl(2)` (five requests), `poll(2)`, and §8 descriptor inheritance (`fcntl(2)` with four pinned commands, `dup3(2)`, `close_range(2)`, `wait4(2)`, `memfd_create(2)`, and descriptor adoption) |
+| 8 | `td-sh` | self-only `prlimit64(2)` (§8), `umask(2)`, disposition-only `rt_sigaction(2)`, job-control `kill(2)` and `rt_sigprocmask(2)`, `ioctl(2)` (five requests), `poll(2)`, and §8 descriptor inheritance (`fcntl(2)` with four pinned commands, `dup3(2)`, `close_range(2)`, `wait4(2)`, `memfd_create(2)`, and descriptor adoption) |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
@@ -1318,11 +1318,22 @@ call sites, their selectors and flags, and flock.rs as their only caller.
 
 ## 8. `td-sh` — the shell
 
-The shell confines eleven Linux syscalls to one instruction in
+The shell confines twelve Linux syscalls to one instruction in
 `td-sh/src/sys.rs`. The `umask` and `trap` builtins and process
 guards use `umask(2)` and disposition-only `rt_sigaction(2)`. The
 line editor uses three value-pinned `ioctl(2)` requests, and
 `read -t` uses `poll(2)` on one descriptor.
+
+`ulimit` uses x86-64 `prlimit64(302)` with PID zero and a typed
+resource (CPU, file, data, stack, core, processes, descriptors or address
+space). Exactly one pointer is present per call, to the two-u64 C layout
+for the soft and hard limits. The main interpreter can set its own limits
+while it is the sole shell environment. The kernel enforces the new
+limits immediately and child processes inherit them on fork and exec.
+A guard counts each live thread-backed shell environment through its
+teardown. These environments and any main shell sharing the process with
+one can query limits. A change in either context returns an error and
+directs the caller to launch a separate shell process with `sh -c`.
 
 For a foreground external command, an interactive shell that owns stdin's
 terminal (`TIOCGPGRP`, 0x540f, returns its PID) and retains child exit

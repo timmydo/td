@@ -5273,3 +5273,71 @@ fn numbered_redirections_respect_the_descriptor_limit() -> Result<(), Box<dyn st
     assert!(String::from_utf8_lossy(&out.stderr).contains("bad file descriptor"));
     Ok(())
 }
+
+#[test]
+fn resource_limits_reach_a_separate_shell_and_its_commands() -> std::io::Result<()> {
+    let sh = env!("CARGO_BIN_EXE_td-sh");
+    for (flag, proposed) in [("-n", "48"), ("-u", "65536"), ("-v", "524288")] {
+        let out = std::process::Command::new(sh)
+            .env("TD_SH", sh)
+            .env("CHECK_LIMITS", r#"test "$(ulimit -H "$1")" = "$2" && test "$(ulimit -S "$1")" = "$2""#)
+            .args(["-ec", r#"
+                before=$(ulimit -H "$1")
+                soft=$(ulimit -S "$1")
+                value=$2
+                if test "$before" != unlimited && test "$before" -lt "$value"; then value=$before; fi
+                "$TD_SH" -ec 'ulimit "$1" "$2"; exec "$TD_SH" -ec "$CHECK_LIMITS" sh "$1" "$2"' sh "$1" "$value"
+                test "$(ulimit -H "$1")" = "$before"
+                test "$(ulimit -S "$1")" = "$soft"
+            "#, "sh", flag, proposed])
+            .output()?;
+        assert!(out.status.success(), "{flag}: {out:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn descriptor_limit_is_enforced_by_the_kernel_for_shell_redirections() -> std::io::Result<()> {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_td-sh"))
+        .args(["-c", "ulimit -n 0 || exit 42; echo opened </dev/null"])
+        .output()?;
+    assert!(!out.status.success(), "{out:?}");
+    assert_ne!(out.status.code(), Some(42), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    Ok(())
+}
+
+#[test]
+fn resource_limit_changes_require_an_unshared_shell_process() -> std::io::Result<()> {
+    let dir = td_fs::TempDir::new("td-sh-limit-owner")?;
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_td-sh"))
+        .current_dir(dir.path())
+        .args([
+            "-ec",
+            r#"
+            before=$(ulimit -Hn)
+            if (ulimit -n 0); then exit 1; fi
+            test "$(ulimit -Hn)" = "$before"
+            { while test ! -f go; do :; done; ulimit -Hn >child-limit; } &
+            rc=0
+            ulimit -n 32 || rc=$?
+            : >go
+            wait
+            test "$rc" = 1
+            read child <child-limit
+            test "$child" = "$before"
+            test "$(ulimit -Hn)" = "$before"
+            ulimit -n 32
+            test "$(ulimit -Hn)" = 32
+        "#,
+        ])
+        .output()?;
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("requires a separate shell process").count(),
+        2,
+        "{out:?}"
+    );
+    Ok(())
+}

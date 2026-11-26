@@ -57,6 +57,7 @@ const MODULES: &[(&str, &str)] = &[
     ("funcs", include_str!("../../../td-sh/src/funcs.rs")),
     ("jobs", include_str!("../../../td-sh/src/jobs.rs")),
     ("lexer", include_str!("../../../td-sh/src/lexer.rs")),
+    ("limits", include_str!("../../../td-sh/src/limits.rs")),
     ("line", include_str!("../../../td-sh/src/line.rs")),
     ("parser", include_str!("../../../td-sh/src/parser.rs")),
     ("pattern", include_str!("../../../td-sh/src/pattern.rs")),

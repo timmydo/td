@@ -3,13 +3,14 @@
 //! The crate denies unsafe code except for the syscall instruction and
 //! adoption of inherited and freshly created descriptors (UNSAFE.md §8).
 //!
-//! Nine syscalls are reached from four modules:
-//! `builtin.rs`, for the `umask` and `trap` builtins; `process.rs`, for the
+//! Twelve syscalls are reached from five modules:
+//! `builtin.rs`, for `ulimit` queries and the `umask` and `trap` builtins; `process.rs`, for the
 //! guards that hand a subshell back the process state a real fork would have
 //! kept for it, for the one that stops the shell listening to the terminal
 //! while a foreground child runs, AND for the descriptor question `read -t`
 //! asks; `term.rs`, for terminal mode and width; and `fd_exec.rs`, for
-//! transferring explicit numbered descriptors to an external command.
+//! transferring explicit numbered descriptors to an external command; and
+//! `limits.rs`, for changes to the sole interpreter’s resource limits.
 //! None is reachable through safe `std`, which exposes no umask API, no
 //! signal-disposition API, no terminal-mode API and no readiness API at all —
 //! `IsTerminal` answers whether a descriptor is a terminal, never how wide, in
@@ -65,6 +66,9 @@ compile_error!("td-sh's syscall layer is x86_64-linux only (raw syscall ABI)");
 
 use std::sync::Mutex;
 
+use crate::limits::{Limit, Resource};
+
+const SYS_PRLIMIT64: usize = 302;
 const SYS_KILL: usize = 62;
 const SYS_RT_SIGPROCMASK: usize = 14;
 const SYS_WAIT4: usize = 61;
@@ -126,8 +130,7 @@ const UNCHANGEABLE: &[u8] = &[9, 19];
 /// The single raw-syscall entry point (x86_64 SysV syscall ABI), copied from
 /// `td-util/src/sys.rs`. Its body owns the only assembly instruction. The scoped
 /// `#[allow]` covers where `unsafe` may appear, not what may be passed here — this
-/// fn is safe to CALL, so its confinement is module privacy plus the two typed
-/// wrappers below being its only callers.
+/// fn is safe to call, so module privacy and the source guard pin its typed callers.
 #[inline]
 #[allow(unsafe_code)]
 fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
@@ -171,6 +174,29 @@ const F_GETFD: usize = 1;
 const F_SETFD: usize = 2;
 const FD_CLOEXEC: usize = 1;
 const CLOSE_RANGE_UNSHARE: usize = 2;
+
+pub fn get_limit(resource: Resource) -> std::io::Result<Limit> {
+    let mut limit = Limit::default();
+    fd_result(syscall4(
+        SYS_PRLIMIT64,
+        0,
+        resource as usize,
+        0,
+        (&mut limit as *mut Limit) as usize,
+    ))?;
+    Ok(limit)
+}
+
+pub fn set_limit(resource: Resource, limit: Limit) -> std::io::Result<()> {
+    fd_result(syscall4(
+        SYS_PRLIMIT64,
+        0,
+        resource as usize,
+        (&limit as *const Limit) as usize,
+        0,
+    ))
+    .map(drop)
+}
 
 /// Only a successful dup of a borrowed fd enters this owner.
 pub(super) struct Transfer(std::fs::File);
