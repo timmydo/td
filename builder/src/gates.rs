@@ -3012,21 +3012,65 @@ mod tests {
     }
 
     #[test]
+    fn detached_gate_fixture() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        const MODE: &str = "TD_TEST_DETACHED_GATE";
+        match std::env::var(MODE).as_deref() {
+            Ok("worker") => {
+                let held = std::fs::File::create("lease").unwrap();
+                held.lock().unwrap();
+                std::fs::write("started", []).unwrap();
+                std::fs::File::open("release").unwrap().lock().unwrap();
+            }
+            Ok("parent") => {
+                let exe = std::env::current_exe().unwrap();
+                let path = std::env::var("PATH").unwrap_or_default();
+                // Always leave the gate's process group. Exercise a separate session
+                // as well on hosts that supply setsid.
+                let mut cmd = if let Some(setsid) = crate::stage0::find_in_path(&path, "setsid") {
+                    let mut cmd = Command::new(setsid);
+                    cmd.arg(&exe);
+                    cmd
+                } else {
+                    let mut cmd = Command::new(&exe);
+                    cmd.process_group(0);
+                    cmd
+                };
+                let mut worker = cmd
+                    .args(["--exact", "gates::tests::detached_gate_fixture"])
+                    .env(MODE, "worker")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                while !std::path::Path::new("started").exists() {
+                    assert!(
+                        worker.try_wait().unwrap().is_none(),
+                        "worker exited before taking the lease"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
     fn gate_pid_namespace_reaps_a_detached_background_process() {
         let d = tmpdir("pidns-reap");
-        let escaped = d.join("escaped");
-        let body = format!(
-            "setsid sh -c 'sleep 1; touch {}' >/dev/null 2>&1 &",
-            escaped.display()
-        );
-        let set = synth(&d, &[("detach", Pool::Heavy, &body, &[])]);
+        let release = std::fs::File::create(d.join("release")).unwrap();
+        release.lock().unwrap();
+        let body = r#"TD_TEST_DETACHED_GATE=parent exec "$TD_BUILDER_SELF" --exact gates::tests::detached_gate_fixture"#;
+        let set = synth(&d, &[("detach", Pool::Heavy, body, &[])]);
         let sel = expand_goals(&set, &["detach".to_string()]).unwrap();
-        assert!(run_selected(&set, &sel, &cfg(&d, 1, None)).unwrap());
-        std::thread::sleep(Duration::from_millis(1200));
-        assert!(
-            !escaped.exists(),
-            "a setsid descendant survived after its gate released the permit"
-        );
+        let mut limits = cfg(&d, 1, None);
+        limits.gate_timeout_secs = 10;
+        assert!(run_selected(&set, &sel, &limits).unwrap());
+        let lease = std::fs::File::open(d.join("lease")).unwrap();
+        lease
+            .try_lock()
+            .expect("a detached descendant still holds the gate lease");
     }
 
     /// Namespace PID 1 is an init, not the program: an orphan the program
