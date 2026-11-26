@@ -666,10 +666,20 @@ fn messages_typed_into_the_window_land_in_each_conversations_log() {
     // end raises a conversation in the list, so one that ended after the
     // next conversation's message would list this first and leave
     // Control-PageDown nothing below.
-    wait(&agent, "hi's turn ends in the open window", || {
+    let turn_ended = || {
         let shown = agent.text();
         (shown.contains("no model") || shown.contains("not answered")).then_some(())
-    });
+    };
+    wait(&agent, "hi's turn ends in the open window", turn_ended);
+    let active = || {
+        let state = agent.state();
+        state
+            .split('\t')
+            .find_map(|field| field.strip_prefix("active="))
+            .filter(|id| *id != "none")
+            .map(str::to_owned)
+    };
+    let first_id = active().expect("the first conversation is open");
 
     compositor.chord(&[KEY_LEFTCTRL], KEY_N);
     compositor.chord(&[], KEY_Y);
@@ -688,8 +698,16 @@ fn messages_typed_into_the_window_land_in_each_conversations_log() {
         (agent.conversations() == [first(&["hi"]), conversation.clone()]).then_some(())
     });
 
-    // The newer is listed first, so the first is below it.
+    // Persistence precedes the window's delivery and activity updates.
+    // Page down once the second turn has finished in the open window.
+    wait(&agent, "yo's turn ends in the second conversation", || {
+        active().filter(|id| id != &first_id)?;
+        turn_ended()
+    });
     compositor.chord(&[KEY_LEFTCTRL], KEY_PAGEDOWN);
+    wait(&agent, "PageDown reopens the first conversation", || {
+        (active().as_deref() == Some(first_id.as_str())).then_some(())
+    });
     compositor.chord(&[], KEY_X);
     compositor.chord(&[KEY_LEFTCTRL], KEY_ENTER);
     wait(
