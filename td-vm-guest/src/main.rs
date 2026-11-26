@@ -579,25 +579,19 @@ fn main() -> ExitCode {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use ::td_fs::TempDir;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     const ID: &str = "0123456789abcdef0123456789abcdef";
     const OTHER: &str = "1123456789abcdef0123456789abcdef";
 
     struct Fixture {
-        root: PathBuf,
+        root: TempDir,
         uid: u32,
         keygen: PathBuf,
     }
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "td-vm-key-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            DirBuilder::new().mode(0o700).create(&root).unwrap();
+            let root = TempDir::new("td-vm-key").unwrap();
             let uid = fs::metadata(&root).unwrap().uid();
             let keygen = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                 .map(|p| p.join("ssh-keygen"))
@@ -631,12 +625,6 @@ mod tests {
             )
         }
     }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
     #[test]
     #[ignore = "requires host ssh-keygen; run by the host preflight"]
     fn structurally_valid_secret_corruption_clears_success_without_repair() {
@@ -656,13 +644,15 @@ FnRkLXFlbXUtYWRtaW4tc2VsZnRlc3QBAgMEBQYH
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO20U7fqwCjDTgS8k43HhAtyw1K9o7h+iqRCeYa9DVem\n";
         fs::write(f.state().join("git/id_ed25519"), damaged).unwrap();
         fs::write(f.state().join("git/id_ed25519.pub"), public).unwrap();
-        let extracted = keygen_run(
+        // OpenSSH can extract the embedded public key; td-ssh rejects the
+        // damaged seed during extraction. Neither may authenticate with it.
+        if let Ok(extracted) = keygen_run(
             &f.keygen,
             &["-y", "-P", "", "-f"],
             &f.state().join("git/id_ed25519"),
-        )
-        .unwrap();
-        assert_eq!(normalize_public(&extracted).unwrap(), public.trim());
+        ) {
+            assert_eq!(normalize_public(&extracted).unwrap(), public.trim());
+        }
         assert!(f.exchange().is_err());
         assert!(!f.response().exists());
         assert_eq!(
@@ -700,7 +690,7 @@ FnRkLXFlbXUtYWRtaW4tc2VsZnRlc3QBAgMEBQYH
         let mut worker = workspace::Worker::default();
         let mut failed = None;
         let mut attempts = (0, 0);
-        for _ in 0..4 {
+        for poll in 0..4 {
             if worker
                 .poll_at(&f.state(), &f.root, &lock, f.uid, &tools, &endpoints)
                 .is_err()
@@ -717,6 +707,15 @@ FnRkLXFlbXUtYWRtaW4tc2VsZnRlc3QBAgMEBQYH
                     &f.response(),
                     &f.keygen,
                 ));
+            }
+            if poll == 0 {
+                assert_eq!(attempts, (1, 1));
+                // A strict extractor refuses before either worker needs proof
+                // staging. Exercise that directory churn with both caches warm.
+                assert!(
+                    verify_secret(&f.state().join("git"), f.uid, &f.keygen, public.trim()).is_err()
+                );
+                assert!(!f.state().join("git.proof").exists());
             }
         }
         assert_eq!(
