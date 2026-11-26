@@ -254,6 +254,10 @@ fn prove_td_shell_userland(
          test \"$uu_out\" = TD:UUTILS || exit 95\n\
          test \"$(\"$uutils\" cat /tmp/td-shell-userland/sub/known-needle.txt)\" = TD-414-NEEDLE || exit 96\n\
          test \"$(\"$uutils\" uname -s)\" = Linux || exit 97\n\
+         rc=0; \"$uutils\" timeout 0.1 \"$uutils\" sleep 5 || rc=$?\n\
+         test \"$rc\" = 124 || exit 98\n\
+         lines=$(\"$uutils\" yes striped | \"$uutils\" head -n 2)\n\
+         test \"$lines\" = \"$(printf '%s\\n' striped striped)\" || exit 98\n\
          uu_id=$(\"$uutils\" id -u)\n\
          case \"$uu_id\" in ''|*[!0-9]*) exit 98 ;; esac\n\
          \"$uutils\" --list >/tmp/td-shell-userland/uutils-list || exit 99\n\

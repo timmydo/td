@@ -1188,7 +1188,7 @@ const UUTILS_APPLETS: &[&str] = &[
     "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head", "tail", "sort", "date",
     "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink", "basename",
     "dirname", "true", "false", "printenv", "link", "unlink", "cut", "tr", "expr", "tee", "uniq",
-    "install", "mkfifo",
+    "install", "mkfifo", "timeout", "yes",
 ];
 
 enum UutilsProbe {
