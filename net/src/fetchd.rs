@@ -1874,20 +1874,32 @@ fn swollen(memory: u64) -> Fault {
     ))
 }
 
-/// Write `bytes` to a client that may have stopped reading, within the
-/// writer's budget, in slices between which the relay looks at it: a
-/// client that hangs up while a write waits ends the stream as one that
-/// hangs up while the origin is silent does.
-fn send(writer: &mut Bounded, watch: &mut Watch, bytes: &[u8]) -> io::Result<()> {
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        let left = writer.remaining()?;
+/// Give the head or a whole chunk one write budget. An expired total before
+/// the first attempt leaves the wire at a boundary where the relay can report it.
+/// Once a write is in progress, its timeout closes the connection.
+fn send_frame(
+    writer: &mut Bounded,
+    watch: &mut Watch,
+    mut frame: &mut [io::IoSlice<'_>],
+    ends: Instant,
+    client_budget: Duration,
+) -> io::Result<bool> {
+    writer.renew(client_budget);
+    writer.deadline = writer.deadline.min(ends);
+    let mut attempted = false;
+    io::IoSlice::advance_slices(&mut frame, 0);
+    while !frame.is_empty() {
+        let left = match writer.remaining() {
+            Err(_) if !attempted && writer.deadline == ends => return Ok(false),
+            remaining => remaining?,
+        };
         writer
             .stream
             .set_write_timeout(Some(left.min(STREAM_PACE)))?;
-        match (&writer.stream).write(rest) {
+        attempted = true;
+        match (&writer.stream).write_vectored(frame) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(written) => rest = rest.get(written..).unwrap_or_default(),
+            Ok(written) => io::IoSlice::advance_slices(&mut frame, written),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1903,7 +1915,7 @@ fn send(writer: &mut Bounded, watch: &mut Watch, bytes: &[u8]) -> io::Result<()>
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn relay(
@@ -1919,43 +1931,44 @@ fn relay(
     // well as to the client's budget, so a client that stops reading
     // cannot keep the process past the total; once the process is ended,
     // the last line has the client's budget to itself.
-    let budget = || {
-        ends.saturating_duration_since(Instant::now())
-            .min(limits.client)
-    };
-    // A head heard as the total runs out could not be written; the client
-    // is told of the total instead.
-    let heard = match hear(head, ends, watch) {
-        Heard::Said(Ok(_)) if budget().is_zero() => Heard::Spent,
-        heard => heard,
-    };
-    // Before the head, a refusal or failure is the same `error` head a
-    // counted request would get.
-    let text = match heard {
-        Heard::Said(Ok(text)) => text,
-        Heard::HungUp => return Ok(()),
-        ended => {
-            let line = match ended {
-                Heard::Said(Err(line)) => line,
-                Heard::Spent => bounded_line(&spent(limits.total).line()),
-                _ => bounded_line(&process.ended(limits.memory).line()),
-            };
-            process.end();
-            writer.renew(limits.client);
-            writer.write_all(format!("{PROTOCOL}\n{line}\n\n").as_bytes())?;
-            return writer.flush();
+    let head_error = match hear(head, ends, watch) {
+        Heard::Said(Ok(text)) => {
+            let sent = send_frame(
+                writer,
+                watch,
+                &mut [io::IoSlice::new(text.as_bytes())],
+                ends,
+                limits.client,
+            )?;
+            (!sent).then(|| bounded_line(&spent(limits.total).line()))
         }
+        Heard::Said(Err(line)) => Some(line),
+        Heard::HungUp => return Ok(()),
+        Heard::Spent => Some(bounded_line(&spent(limits.total).line())),
+        Heard::Ended => Some(bounded_line(&process.ended(limits.memory).line())),
     };
-    // The client's budget for the head starts once there is one to write,
-    // as a counted reply's starts once the origin is done.
-    writer.renew(budget());
-    send(writer, watch, text.as_bytes())?;
+    if let Some(line) = head_error {
+        process.end();
+        writer.renew(limits.client);
+        writer.write_all(format!("{PROTOCOL}\n{line}\n\n").as_bytes())?;
+        return writer.flush();
+    }
     let ending = loop {
         match hear(body, ends, watch) {
             Heard::Said(Ok(Some(chunk))) => {
-                writer.renew(budget());
-                send(writer, watch, format!("chunk {}\n", chunk.len()).as_bytes())?;
-                send(writer, watch, &chunk)?;
+                let header = format!("chunk {}\n", chunk.len());
+                if !send_frame(
+                    writer,
+                    watch,
+                    &mut [
+                        io::IoSlice::new(header.as_bytes()),
+                        io::IoSlice::new(&chunk),
+                    ],
+                    ends,
+                    limits.client,
+                )? {
+                    break bounded_line(&spent(limits.total).line());
+                }
             }
             Heard::Said(Ok(None)) => break "end".to_string(),
             Heard::Said(Err(line)) => break line,
@@ -2228,6 +2241,31 @@ pub(crate) fn probe_within(socket: &Path, budget: Duration) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_origin_leaves_the_next_frame_unstarted() {
+        let (client, peer) = UnixStream::pair().unwrap();
+        let mut writer = Bounded::new(client, Duration::from_secs(1));
+        let ends = Instant::now();
+        let mut watch = Watch {
+            client: None,
+            looked: ends,
+        };
+        assert!(!send_frame(
+            &mut writer,
+            &mut watch,
+            &mut [io::IoSlice::new(b"chunk 1\n"), io::IoSlice::new(b"x")],
+            ends,
+            Duration::from_secs(1)
+        )
+        .unwrap());
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            (&peer).read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
     use std::net::{TcpListener, TcpStream};
 
     /// What build_agent hands ureq: ureq 3 counts redirects followed, where
