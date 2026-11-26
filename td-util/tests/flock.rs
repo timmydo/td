@@ -41,15 +41,18 @@ fn inherited_descriptor_holds_the_lock_until_unlock_or_last_close() {
 fn command_receives_its_arguments_verbatim_and_returns_its_status() {
     let dir = TempDir::new("flock-command").unwrap();
     let path = dir.path().join(OsStr::from_bytes(b"lock\xff"));
-    let arg = OsStr::from_bytes(b"a b\xfe");
+    let arg = dir.path().join(OsStr::from_bytes(b"a b\xfe"));
     let out = flock()
         .arg(&path)
-        .args(["sh", "-c", "printf '%s' \"$1\"; exit 23", "sh"])
-        .arg(arg)
+        .arg(env!("CARGO_BIN_EXE_td-util"))
+        .arg("flock")
+        .arg(&arg)
+        .args(["sh", "-c", "printf locked; exit 23"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(23));
-    assert_eq!(out.stdout, arg.as_bytes());
+    assert_eq!(out.stdout, b"locked");
+    assert!(arg.is_file());
     assert!(path.is_file());
 }
 
