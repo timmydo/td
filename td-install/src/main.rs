@@ -5387,9 +5387,8 @@ mod tests {
                 .to_string(),
             "serve requires the installation authority"
         );
-        let directory = scratch::path("serve-admission");
-        std::fs::create_dir(&directory).unwrap();
-        let _cleanup = ScratchDirectory(directory.clone());
+        // This listener needs a bounded pathname independent of the image scratch.
+        let directory = ::td_fs::TempDir::new_in(Path::new("/tmp"), "td-admit").unwrap();
         let regular = directory.join("stdin");
         std::fs::write(&regular, b"").unwrap();
         let unconnected =

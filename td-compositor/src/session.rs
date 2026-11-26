@@ -403,25 +403,27 @@ mod tests {
     #[test]
     fn readiness_waits_for_publication_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let root =
-            std::env::temp_dir().join(format!("td-authority-publication-{}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
+        // The readiness filename is fixed and AF_UNIX bounds the whole path.
+        let root = crate::temp_dir::TempDir::new_in(Path::new("/tmp"), "td-ready").unwrap();
         let path = root.join("td-auth-terminal-0123456789abcdef0123456789abcdef-1.ready");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let owner = std::fs::symlink_metadata(&path).unwrap().uid();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(authority_sockets_owned(&root, owner).unwrap().is_empty());
+        assert!(authority_sockets_owned(root.path(), owner)
+            .unwrap()
+            .is_empty());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            authority_sockets_owned(&root, owner).unwrap(),
+            authority_sockets_owned(root.path(), owner).unwrap(),
             vec![path.clone()]
         );
         std::fs::remove_file(&path).unwrap();
-        assert!(authority_sockets_owned(&root, owner).unwrap().is_empty());
+        assert!(authority_sockets_owned(root.path(), owner)
+            .unwrap()
+            .is_empty());
         std::fs::write(&path, b"not a socket").unwrap();
-        assert!(authority_sockets_owned(&root, owner).is_err());
+        assert!(authority_sockets_owned(root.path(), owner).is_err());
         drop(listener);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
