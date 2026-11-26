@@ -1120,12 +1120,9 @@ mod tests {
 
     #[test]
     fn the_end_is_known_while_ssh_s_last_words_are_awaited() {
-        // Something else holds its standard error open, so the wait runs out.
+        // The peer closes its protocol output but keeps stderr until stdin closes.
         let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            &format!("{SAY_HELLO}; (while read -r line; do :; done) <&0 >&- & exit 0"),
-        ]);
+        command.args(["-c", &format!("{SAY_HELLO}; exec cat >/dev/null")]);
         let mut link = Link::spawn(command, OPTIONS).unwrap();
         let inbox = link.take_inbox(1).unwrap();
         finishes(move || {
