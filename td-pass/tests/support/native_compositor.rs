@@ -145,12 +145,12 @@ fn the_window_maps_takes_the_keyboard_and_closes_on_ctrl_q() {
             break place;
         }
         if let Some(status) = pass.exited() {
-            // On td the window refuses before it maps, until td mode is
-            // built; nothing else may end it.
+            // A direct invocation on td lacks the launcher's trusted grant;
+            // it must refuse before mapping the window.
             assert!(!status.success());
             assert_eq!(
                 std::fs::read_to_string(&pass.log).unwrap(),
-                "td-pass: td-pass needs td's vault service on td, which this build does not reach\n"
+                "td-pass: open td-pass from td’s launcher\n"
             );
             drop(pass);
             compositor.stop();
