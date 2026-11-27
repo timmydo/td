@@ -7,11 +7,11 @@ description = "Host VM manager and Git enrollment services for td development"
 license = "MIT"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
-# The host preflight covers Git and trusted-root fixtures. The QEMU cases
+# The host preflight covers Git and trusted-root fixtures. The native VM cases
 # run together under `td-builder check integration`.
 [package.metadata.td-gate]
 clippy-all-targets = true
-test-args = "--include-ignored --skip qemu_integration_"
+test-args = "--include-ignored --skip vm_integration_ --skip graphical_integration_"
 # ... but the in-sandbox gate runs only the binary targets: the ignored tests
 # the host preflight opts into need an environment the guix-free loop has not.
 gate-test-args = "--bins"
@@ -28,6 +28,7 @@ path = "src/bin/td-vm.rs"
 # admits (AGENTS.md 'Rust code'): the clipboard's base64 and the hex of
 # workspace ids, staging nonces and the origin reply.
 [dependencies]
+td-alloc = { path = "../td-alloc" }
 td-encoding = { path = "../td-encoding" }
 td-fs = { path = "../td-fs" }
 

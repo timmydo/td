@@ -13,9 +13,11 @@ pub const ENV: &str = "TD_TEST_TRUSTED_ROOT";
 pub fn enabled(value: Option<&std::ffi::OsStr>) -> io::Result<bool> {
     match value {
         None => Ok(false),
-        Some(value) if value == "1" || value == "private" || value == "shell" => Ok(true),
+        Some(value) if value == "1" || value == "private" || value == "shell" || value == "kvm" => {
+            Ok(true)
+        }
         Some(_) => Err(io::Error::other(
-            "TD_TEST_TRUSTED_ROOT must be absent or 1, private, or shell",
+            "TD_TEST_TRUSTED_ROOT must be absent or 1, private, shell, or kvm",
         )),
     }
 }
@@ -216,6 +218,7 @@ pub fn run(program: &str, args: &[String]) -> io::Result<ExitStatus> {
         &env,
         &[],
         &scratch.0,
+        std::env::var_os(ENV).as_deref() == Some("kvm".as_ref()),
     )
 }
 
@@ -279,6 +282,7 @@ mod tests {
         assert!(enabled(Some("1".as_ref())).unwrap());
         assert!(enabled(Some("private".as_ref())).unwrap());
         assert!(enabled(Some("shell".as_ref())).unwrap());
+        assert!(enabled(Some("kvm".as_ref())).unwrap());
         for value in ["", "0", "true", "yes"] {
             assert!(enabled(Some(value.as_ref())).is_err());
         }
@@ -432,6 +436,7 @@ mod tests {
             }
             assert!(std::env::var_os(ENV).is_none());
             assert_eq!(std::env::var("TMPDIR").unwrap(), "/tmp");
+            assert!(!Path::new("/dev/kvm").exists());
             if mode != "empty" {
                 let backing = fs::read_dir("backing").unwrap().next().unwrap().unwrap();
                 let outer = fs::metadata(backing.path().join("tmp")).unwrap();

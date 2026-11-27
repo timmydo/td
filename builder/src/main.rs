@@ -11951,7 +11951,7 @@ fn main() -> ExitCode {
                 }
                 let result = sandbox::host_shell(
                     &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, &workdir, &extra_env,
-                    &ro_dirs, &scratch,
+                    &ro_dirs, &scratch, false,
                 )
                 .map_err(|e| e.to_string());
                 // Remove the scratch tree (the sandbox's mounts lived in the
@@ -12015,6 +12015,7 @@ fn main() -> ExitCode {
                     &[],
                     &[],
                     &scratch,
+                    false,
                 )
                 .map_err(|e| e.to_string());
                 let _ = std::fs::remove_dir_all(&scratch);

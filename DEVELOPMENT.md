@@ -642,11 +642,15 @@ never in the gate sandbox. Each run checks the native PostgreSQL suite and
 `postgresql-x86-64-test#1`, the recipe-built server's cluster. The package
 step warms its declared closure and bypasses its recipe verdict memo. The
 `vm-workspace` step runs the VM workspace and Git enrollment assertions
-with native qcow2 creation and disk locking. The tier then warms the system
+with native qcow2 creation and disk locking. `vm-lifecycle` builds td-vmm
+and boots two small x86 guests on KVM. Each reports execution on its serial
+port. The case kills one supervisor, verifies the guest retains both locks
+and stops the two instances independently. Both VM steps run before image
+warming and even when every image oracle answers from its memo.
+The tier then warms the system
 image's inputs and exports the declared Flathub refs into the host's feed (`warm
 --flathub`, APPLICATIONS.md §W.9), which the oracles' guests fetch
-Firefox and its runtime from, then runs the disposable guest lifecycle and supervisor-loss case
-(`qemu-vm-lifecycle`), followed by
+Firefox and its runtime from, then runs
 `qemu-boot-system`, `qemu-boot-server`, `qemu-boot-audio`,
 `qemu-boot-audio-hotplug`, `qemu-deploy-rollback`, `qemu-admin-update`,
 `qemu-boot-live` and `qemu-install-system`, each with a banner saying what it proves, its
@@ -654,12 +658,13 @@ outcome and wall time, recorded in the check history as
 `integration:STEP` (`td-recipe-eval check-history integration`). On its
 own it runs only those steps; beside gate goals (`td-builder check check
 integration`), it runs after the gates pass and says so when they do
-not. The guest lifecycle case requires host `qemu-img`, `qemu-io` and
-`qemu-system-x86_64` and runs even when every image boot answers from
-its memo. The Cargo runner gives each fixture a short private `/tmp`
-backed by the request's scratch directory. Missing manager tools or an entirely unavailable image boot
-suite gives an unprovisioned result. Each system image boot runs on KVM alone
-`/dev/kvm`. A td desktop gives its primary account read/write access at boot.
+not. The native lifecycle case needs read/write access to `/dev/kvm`.
+Both fixtures use the capped runner's private test root. In
+`TD_TEST_TRUSTED_ROOT=kvm` mode it also binds the caller's accessible
+KVM character device (10:232), pinned before entering the namespace.
+Missing KVM access for the lifecycle case or an entirely unavailable image
+boot suite gives an unprovisioned result. Each system image boot also
+requires KVM. A td desktop gives its primary account read/write access at boot.
 Other hosts typically use membership in the `kvm` group, from a login started
 after joining it. An oracle never falls back to TCG, several times slower,
 and without KVM it is a host gap. A q35 firmware boot splits the

@@ -52,6 +52,8 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm import TEMPLATE BUNDLE        verify and copy an existing clean bundle
   td-vm templates
   td-vm remove-template TEMPLATE
+  td-vm create-native NAME RAW_IMAGE     create a private copy for a headless KVM guest
+  td-vm run-native NAME KERNEL INITRAMFS CMDLINE   run in foreground with serial on stdout
   td-vm create NAME TEMPLATE [CPUS MEMORY_MIB]
   td-vm create NAME TEMPLATE --branch BRANCH [CPUS MEMORY_MIB]
   td-vm list
@@ -78,7 +80,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm workspace clone NAME          provision its private guest clone and worktree
   td-vm workspace terminal NAME       open a terminal in its prepared task worktree
 
-TD_VM_HOME defaults to ~/.local/share/td-vm. Guest launch requires host QEMU. Bundle import requires qemu-img.
+TD_VM_HOME defaults to ~/.local/share/td-vm. Graphical launch requires host QEMU. Native launch uses td-vmm on PATH. Bundle import requires qemu-img.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
 Clipboard and feed actions require a bridge-capable system image. Workspace
 automatic provisioning on Open uses the updated image. Shut down from inside td;
@@ -143,6 +145,20 @@ fn run(args: Vec<String>) -> Result<()> {
             let origin = profile.check()?;
             println!("Git profile {}: registrar authenticated; origin {} at main {}. Guest SSH and workspace readiness remain unverified.", profile.fingerprint(), origin.repository, origin.head);
             Ok(())
+        }
+        ["create-native", value, raw] => manager.publish_instance(
+            value,
+            |dir| {
+                io(
+                    td_vm::disk::copy_raw(Path::new(raw), &member(dir, "disk.raw")?),
+                    "copy native disk",
+                )?;
+                write_new(&member(dir, "config")?, b"td-vm-native-v1\n")
+            },
+            |_| Ok(()),
+        ),
+        ["run-native", value, kernel, initrd, line] => {
+            manager.run_native(value, kernel, initrd, line)
         }
         ["import", name, bundle] => manager.import(name, Path::new(bundle)),
         ["workspace", "prepare", name, branch] => {
@@ -264,6 +280,20 @@ fn number(value: &str, low: u32, high: u32, label: &str) -> Result<u32> {
         return Err(format!("{label} must be {low}–{high}"));
     }
     Ok(value)
+}
+
+fn render(args: std::fmt::Arguments<'_>) -> Result<String> {
+    td_alloc::format(args).map_err(|_| String::new())
+}
+
+// Manager directories are canonical UTF-8 paths. Reserve the full pathname
+// fallibly before passing the owned string to PathBuf.
+fn member(dir: &Path, file: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(render(format_args!(
+        "{}/{}",
+        dir.display(),
+        file
+    ))?))
 }
 
 fn io<T>(result: std::io::Result<T>, action: &str) -> Result<T> {
@@ -589,7 +619,7 @@ impl Manager {
 
     fn enroll_workspace(&self, value: &str) -> Result<String> {
         name(value)?;
-        let lock = self.lock(&format!("instance-{value}"))?;
+        let lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         self.enroll_locked(&self.instance(value)?, &lock)?.summary()
     }
 
@@ -644,7 +674,7 @@ impl Manager {
 
     fn clone_workspace(&self, value: &str) -> Result<String> {
         name(value)?;
-        let lock = self.lock(&format!("instance-{value}"))?;
+        let lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         let dir = self.instance(value)?;
         let workspace = vm_workspace::load(&dir)?.ok_or("instance has no workspace plan")?;
         let enrollment = workspace
@@ -707,7 +737,7 @@ impl Manager {
 
     fn workspace_key(&self, value: &str) -> Result<String> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         let dir = self.instance(value)?;
         let workspace = vm_workspace::load(&dir)?.ok_or("instance has no workspace plan")?;
         let reply = vm_bridge::ask(&dir, vm_wire::KEY, workspace.id.as_bytes().to_vec())?;
@@ -716,19 +746,19 @@ impl Manager {
 
     fn bridge(&self, value: &str, verb: &str, data: Vec<u8>) -> Result<Vec<u8>> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         vm_bridge::ask(&self.instance(value)?, verb, data)
     }
 
     fn sharing(&self, value: &str, mode: &str) -> Result<()> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         vm_bridge::sharing(&self.instance(value)?, mode)
     }
 
     fn feed(&self, value: &str, port: &str) -> Result<()> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         vm_bridge::configure_feed(&self.instance(value)?, port)
     }
 
@@ -802,7 +832,7 @@ impl Manager {
         let dir = self.template(value)?;
         for instance in entries(&self.root.join("instances"))? {
             let config = Config::read(&self.instance(&instance)?)?;
-            if config.template == value {
+            if config.template.as_deref() == Some(value) {
                 return Err(format!("template is still used by {instance}"));
             }
         }
@@ -838,50 +868,69 @@ impl Manager {
             None => None,
         };
         let config = Config {
-            template: name(template)?.into(),
+            template: Some(name(template)?.into()),
             cpus: number(cpus, 1, 256, "vCPUs")?,
             memory: number(memory, 512, 1048576, "memory MiB")?,
         };
-        let (scratch, _staging) = self.staging("create")?;
-        let _catalog = self.lock("catalog")?;
-        self.clear_staging()?;
-        let _instance = self.lock(&format!("instance-{value}"))?;
-        let base = self.template(template)?;
-        let dest = self.root.join("instances").join(value);
-        if dest.exists() {
-            return Err("instance already exists".into());
-        }
-        let result = (|| {
-            if let Some(workspace) = &workspace {
-                self.check_workspace(value, workspace)?;
-            }
-            let disk = scratch.join("disk.qcow2");
-            let backing = base.join("disk.qcow2");
-            match td_vm::disk::create_overlay(&disk, &backing) {
-                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    command(
-                        Command::new("qemu-img")
-                            .args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
-                            .arg(backing)
-                            .arg(disk),
-                    )?;
+        self.publish_instance(
+            value,
+            |_| Ok(()),
+            |scratch| {
+                let base = self.template(template)?;
+                if let Some(workspace) = &workspace {
+                    self.check_workspace(value, workspace)?;
                 }
-                result => io(result, "create qcow2 overlay")?,
+                let disk = scratch.join("disk.qcow2");
+                let backing = base.join("disk.qcow2");
+                match td_vm::disk::create_overlay(&disk, &backing) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                        command(
+                            Command::new("qemu-img")
+                                .args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
+                                .arg(backing)
+                                .arg(disk),
+                        )?;
+                    }
+                    result => io(result, "create qcow2 overlay")?,
+                }
+                config.write(scratch)?;
+                if let Some(workspace) = &workspace {
+                    workspace.publish(scratch)?;
+                }
+                Ok(())
+            },
+        )?;
+        println!("created {value}: {cpus} vCPUs, {memory} MiB");
+        if let Some(workspace) = &workspace {
+            println!("{}", term::scrub_lines(&workspace.summary()?));
+        }
+        Ok(())
+    }
+
+    fn publish_instance(
+        &self,
+        value: &str,
+        prepare: impl FnOnce(&Path) -> Result<()>,
+        finalize: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        name(value)?;
+        let (scratch, _staging) = self.staging("create")?;
+        let result = (|| {
+            // The staging lease protects long raw copies from concurrent pruning.
+            prepare(&scratch)?;
+            let _catalog = self.lock("catalog")?;
+            self.clear_staging()?;
+            let _instance = self.lock(&render(format_args!("instance-{value}"))?)?;
+            let dest = self.root.join("instances").join(value);
+            if io(dest.try_exists(), "inspect instance destination")? {
+                return Err("instance already exists".into());
             }
-            config.write(&scratch)?;
-            if let Some(workspace) = &workspace {
-                workspace.publish(&scratch)?;
-            }
+            finalize(&scratch)?;
             io(
                 fs::remove_file(scratch.join("lease")),
                 "remove published staging lease",
             )?;
-            io(fs::rename(&scratch, dest), "publish instance")?;
-            println!("created {value}: {cpus} vCPUs, {memory} MiB");
-            if let Some(workspace) = &workspace {
-                println!("{}", term::scrub_lines(&workspace.summary()?));
-            }
-            Ok(())
+            io(fs::rename(&scratch, dest), "publish instance")
         })();
         if scratch.exists() {
             let _ = fs::remove_dir_all(&scratch);
@@ -889,7 +938,6 @@ impl Manager {
         result
     }
 
-    // Catalog lock serializes workspace publication across instance names.
     fn check_workspace(&self, value: &str, workspace: &vm_workspace::Workspace) -> Result<()> {
         for other in entries(&self.root.join("instances"))? {
             if other == value {
@@ -913,9 +961,9 @@ impl Manager {
     fn prepare_workspace(&self, value: &str, branch: &str) -> Result<String> {
         name(value)?;
         let _catalog = self.lock("catalog")?;
-        let _instance = self.lock(&format!("instance-{value}"))?;
+        let _instance = self.lock(&render(format_args!("instance-{value}"))?)?;
         let dir = self.instance(value)?;
-        Config::read(&dir)?;
+        Config::read(&dir)?.graphical_template()?;
         if let Some(workspace) = vm_workspace::load(&dir)? {
             if workspace.branch != branch {
                 return Err(
@@ -962,20 +1010,30 @@ impl Manager {
                 let row = (|| {
                     let dir = self.instance(&value)?;
                     let config = Config::read(&dir)?;
-                    let (host_mib, capacity_mib) = disk_usage(&dir.join("disk.qcow2"))?;
-                    let state = if running(&dir)? {
+                    let (host_mib, capacity_mib) = if config.template.is_some() {
+                        disk_usage(&dir.join("disk.qcow2"))?
+                    } else {
+                        let meta = io(fs::metadata(member(&dir, "disk.raw")?), "inspect native disk")?;
+                        (meta.blocks() / 2048, meta.len() >> 20)
+                    };
+                    let state = if running(&dir)? || (config.template.is_none() && native_control(&dir)?.is_some()) {
                         "live"
                     } else if self.active(&value)? {
                         "starting"
                     } else {
                         "stopped"
                     };
-                    let accel =
-                        fs::read_to_string(dir.join("accel")).unwrap_or_else(|_| "unknown".into());
+                    let recorded;
+                    let accel = if config.template.is_none() {
+                        "KVM"
+                    } else {
+                        recorded = fs::read_to_string(dir.join("accel")).unwrap_or_else(|_| "unknown".into());
+                        recorded.trim()
+                    };
                     Ok::<_, String>(format!(
                         "{value:<32} {state:<8} {:<8} {:<16} {:>3} {:>7} {host_mib:>8} {capacity_mib:>8}",
                         accel.trim(),
-                        config.template,
+                        config.template.as_deref().unwrap_or("raw"),
                         config.cpus,
                         config.memory
                     ))
@@ -1089,7 +1147,7 @@ impl Manager {
 
     fn start(&self, value: &str, launch: Launch) -> Result<()> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         let dir = self.instance(value)?;
         if running(&dir)? {
             println!(
@@ -1099,6 +1157,7 @@ impl Manager {
             println!("{value} already has a QEMU process; select its existing td-vm window");
             return Ok(());
         }
+        Config::read(&dir)?.graphical_template()?;
         // A supervisor may still be starting or reaping a guest without QMP.
         if self.active(value)? {
             println!("{value} is already starting or finishing shutdown; inspect its logs");
@@ -1159,37 +1218,63 @@ impl Manager {
 
     fn supervise(&self, value: &str, launch: Launch) -> Result<()> {
         let config = Config::read(&self.instance(value)?)?;
-        let base = self.template(&config.template)?;
+        let base = self.template(config.graphical_template()?)?;
         self.run_qemu(
             value,
             qemu_command(&self.instance(value)?, &base, &config, launch)?,
         )
     }
 
+    fn run_native(&self, value: &str, kernel: &str, initrd: &str, line: &str) -> Result<()> {
+        name(value)?;
+        let operation = self.lock(&render(format_args!("instance-{value}"))?)?;
+        let dir = self.instance(value)?;
+        if Config::read(&dir)?.template.is_some() {
+            return Err("run-native requires a native raw instance".into());
+        }
+        let lifetime = self.lock(&render(format_args!("run-{value}"))?)?;
+        let disk = member(&dir, "disk.raw")?;
+        drop(io(td_vm::disk::lock_idle(&disk), "lock native disk")?);
+        let control = member(&dir, "ctl")?;
+        match fs::remove_file(&control) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return io(Err(e), "remove stopped control socket"),
+        }
+        let mut command = Command::new("td-vmm");
+        command
+            .args([kernel, initrd, line, "--disk-rw"])
+            .arg(disk)
+            .arg("--control")
+            .arg(control);
+        let mut child = spawn_locked(&mut command, &lifetime)?;
+        drop(operation);
+        if io(child.wait(), "wait for native guest")?.success() {
+            Ok(())
+        } else {
+            Err("native guest failed".into())
+        }
+    }
+
     fn run_qemu(&self, value: &str, mut command: Command) -> Result<()> {
-        let lifetime = self.lock(&format!("run-{value}"))?;
+        let lifetime = self.lock(&render(format_args!("run-{value}"))?)?;
         let dir = self.instance(value)?;
         if running(&dir)? {
             return Err("instance already has a live QEMU".into());
         }
         let config = Config::read(&dir)?;
-        println!("verifying template {} before launch...", config.template);
-        verify_template(&self.template(&config.template)?)?;
+        println!(
+            "verifying template {} before launch...",
+            config.graphical_template()?
+        );
+        verify_template(&self.template(config.graphical_template()?)?)?;
         drop(disk_available(&dir)?);
         cleanup_runtime(&dir)?;
         let bridge = vm_bridge::Supervisor::start(&dir)?;
         // QEMU never reads stdin (serial goes to a file). Keeping the same
         // locked open-file description on fd 0 preserves exclusion even if
         // the supervisor dies before QEMU publishes its monitor or pidfile.
-        let mut child = io(
-            command
-                .stdin(Stdio::from(io(
-                    lifetime.try_clone(),
-                    "inherit lifetime lock",
-                )?))
-                .spawn(),
-            "launch QEMU",
-        )?;
+        let mut child = spawn_locked(&mut command, &lifetime)?;
         // QEMU owns its pidfile and disk lock. Never unlink them on a timed-out
         // startup: that child may still be coming up after its supervisor dies.
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -1241,6 +1326,9 @@ impl Manager {
     fn status(&self, value: &str) -> Result<String> {
         let dir = self.instance(value)?;
         if !running(&dir)? {
+            if self.active(value)? && native_control(&dir)?.is_some() {
+                return render(format_args!("{value}: live (KVM)"));
+            }
             return Ok(format!(
                 "{value}: {}",
                 if self.active(value)? {
@@ -1259,7 +1347,7 @@ impl Manager {
 
     fn resume(&self, value: &str) -> Result<String> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         let dir = self.instance(value)?;
         if !running(&dir)? {
             return Err("instance has no live QEMU to resume; use open to boot it".into());
@@ -1273,7 +1361,7 @@ impl Manager {
 
     fn poweroff(&self, value: &str) -> Result<String> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         let dir = self.instance(value)?;
         if !running(&dir)? {
             return Err("instance has no reachable running QEMU; inspect its logs".into());
@@ -1287,10 +1375,36 @@ impl Manager {
 
     fn stop(&self, value: &str) -> Result<()> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         let dir = self.instance(value)?;
         if !running(&dir)? {
-            return Err("instance has no reachable running QEMU; inspect its logs".into());
+            if !self.active(value)? {
+                return Err("instance is stopped".into());
+            }
+            if Config::read(&dir)?.template.is_some() {
+                return Err("instance has no reachable running QEMU; inspect its logs".into());
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(socket) = native_control(&dir)? {
+                    io(socket.send(b"stop"), "stop native guest")?;
+                    break;
+                }
+                if !self.active(value)? {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err("native control endpoint unavailable; retain the disk".into());
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            while self.active(value)? {
+                if Instant::now() >= deadline {
+                    return Err("native guest still holds its lifetime lock".into());
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            return Ok(());
         }
         let request = Qmp::connect(&dir.join("qmp"))?.execute("quit");
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1309,19 +1423,22 @@ impl Manager {
     fn delete(&self, value: &str) -> Result<()> {
         name(value)?;
         let _catalog = self.lock("catalog")?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
+        let _lock = self.lock(&render(format_args!("instance-{value}"))?)?;
         let dir = self.instance(value)?;
-        let _lifetime = self.lock(&format!("run-{value}")).map_err(|e| {
-            format!(
+        let _lifetime = self
+            .lock(&render(format_args!("run-{value}"))?)
+            .map_err(|e| {
+                format!(
                 "{value} is active or finishing shutdown; stop it and wait before deleting: {e}"
             )
-        })?;
+            })?;
         if running(&dir)? {
             return Err("refusing to delete a running instance; stop it first".into());
         }
         // Open raw read/write without writing: require QEMU's write lock while
         // permitting a damaged header. Read-only raw opens do NOT test this lock.
         let _disk = disk_available(&dir)?;
+        let _raw_disk = lock_disk_if_present(&member(&dir, "disk.raw")?)?;
         // Future enrollment formats need their own revocation path. An older
         // manager must refuse unknown/corrupt state rather than erase its disk.
         if let Some(mut workspace) = vm_workspace::load(&dir)? {
@@ -1344,6 +1461,42 @@ impl Manager {
     }
 }
 
+fn spawn_locked(command: &mut Command, lifetime: &File) -> Result<std::process::Child> {
+    io(
+        command
+            .stdin(Stdio::from(io(
+                lifetime.try_clone(),
+                "inherit lifetime lock",
+            )?))
+            .spawn(),
+        "launch VM",
+    )
+}
+
+fn native_control(dir: &Path) -> Result<Option<std::os::unix::net::UnixDatagram>> {
+    let path = member(dir, "ctl")?;
+    let result = (|| {
+        fs::symlink_metadata(&path)?;
+        td_fs::check_private_socket(&path)?;
+        let socket = std::os::unix::net::UnixDatagram::unbound()?;
+        socket.connect(path)?;
+        socket.set_nonblocking(true)?;
+        Ok(socket)
+    })();
+    match result {
+        Ok(socket) => Ok(Some(socket)),
+        Err(e)
+            if matches!(
+                std::io::Error::kind(&e),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => io(Err(e), "inspect native control socket"),
+    }
+}
+
 fn reap_command(
     mut command: Command,
 ) -> Result<std::sync::mpsc::Receiver<std::io::Result<std::process::ExitStatus>>> {
@@ -1363,12 +1516,14 @@ fn reap_command(
 }
 
 fn disk_available(dir: &Path) -> Result<Option<File>> {
-    match fs::symlink_metadata(dir.join("disk.qcow2")) {
-        Ok(meta) if meta.is_file() => io(
-            td_vm::disk::lock_idle(&dir.join("disk.qcow2")),
-            "lock stopped disk",
-        )
-        .map(Some),
+    lock_disk_if_present(&dir.join("disk.qcow2"))
+}
+
+fn lock_disk_if_present(path: &Path) -> Result<Option<File>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => {
+            io(td_vm::disk::lock_idle(path), "lock stopped disk").map(Some)
+        }
         Ok(_) => Err("instance disk is not a regular file".into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("inspect disk: {e}")),
@@ -1376,18 +1531,29 @@ fn disk_available(dir: &Path) -> Result<Option<File>> {
 }
 
 struct Config {
-    template: String,
+    template: Option<String>,
     cpus: u32,
     memory: u32,
 }
 
 impl Config {
+    fn graphical_template(&self) -> Result<&str> {
+        self.template
+            .as_deref()
+            .ok_or_else(|| "native instance requires run-native".into())
+    }
+
     fn read(dir: &Path) -> Result<Self> {
         let data = text(&dir.join("config"))?;
         let fields: Vec<&str> = data.lines().collect();
         match fields.as_slice() {
+            ["td-vm-native-v1"] => Ok(Self {
+                template: None,
+                cpus: 1,
+                memory: 256,
+            }),
             ["td-vm-graphical-v1", template, cpus, memory] => Ok(Self {
-                template: name(template)?.into(),
+                template: Some(name(template)?.into()),
                 cpus: number(cpus, 1, 256, "CPUs")?,
                 memory: number(memory, 512, 1048576, "memory")?,
             }),
@@ -1399,7 +1565,9 @@ impl Config {
             &dir.join("config"),
             format!(
                 "td-vm-graphical-v1\n{}\n{}\n{}\n",
-                self.template, self.cpus, self.memory
+                self.graphical_template()?,
+                self.cpus,
+                self.memory
             )
             .as_bytes(),
         )
@@ -2287,7 +2455,7 @@ mod tests {
     }
     fn config() -> Config {
         Config {
-            template: "base".into(),
+            template: Some("base".into()),
             cpus: 4,
             memory: 8192,
         }
@@ -2354,7 +2522,10 @@ mod tests {
         }
         let scratch = Scratch::new();
         config().write(&scratch.0).unwrap();
-        assert_eq!(Config::read(&scratch.0).unwrap().template, "base");
+        assert_eq!(
+            Config::read(&scratch.0).unwrap().template.as_deref(),
+            Some("base")
+        );
         fs::write(
             scratch.0.join("config"),
             "td-vm-graphical-v1\n../base\n4\n8192\n",
@@ -2834,19 +3005,18 @@ mod tests {
         assert!(disk_usage(&link).is_err());
         assert!(disk_usage(&scratch.0).is_err());
     }
-
-    fn firmware_command(dir: &Path, accel: &str) -> Command {
+    fn firmware_command(dir: &Path) -> Command {
         // Exercise the production devices/acceleration/disk command with only
         // boot payloads removed and display disabled: no td image in host gates.
         let command = qemu_command(
             dir,
             Path::new("/unused"),
             &Config {
-                template: "base".into(),
+                template: Some("base".into()),
                 cpus: 1,
                 memory: 64,
             },
-            Launch::parse(&["--accel", accel]).unwrap(),
+            Launch::parse(&["--accel", "kvm"]).unwrap(),
         )
         .unwrap();
         let mut child = Command::new(command.get_program());
@@ -2862,9 +3032,6 @@ mod tests {
                 "-kernel" | "-initrd" | "-append" => {}
                 "-display" => {
                     child.args(["-display", "none"]);
-                }
-                "-accel" if value == "tcg" => {
-                    child.args(["-accel", "tcg,tb-size=16"]);
                 }
                 _ => {
                     child.args([flag, value]);
@@ -2900,9 +3067,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "td-builder check integration supplies the QEMU tools"]
-    fn qemu_integration_two_overlays_lifecycle_and_supervisor_loss_exclusion() {
-        let scratch = td_fs::TempDir::new("vm").unwrap();
+    #[ignore = "graphical compatibility check requires QEMU tools and hardware KVM"]
+    fn graphical_integration_overlay_pause_resume_and_duplicate_open() {
+        let scratch = td_fs::TempDir::new_in(Path::new("/tmp"), "vm").unwrap();
         let manager = Manager::new(&scratch.join("state")).unwrap();
         let bundle = scratch.join("bundle");
         private_dir(&bundle).unwrap();
@@ -2949,7 +3116,7 @@ mod tests {
         assert!(manager.remove_template("base").is_err());
         let _cleanup = StopGuests(vec![one.clone(), two.clone()]);
         let root = manager.root.clone();
-        let cmd = firmware_command(&one, "auto");
+        let cmd = firmware_command(&one);
         let supervisor =
             thread::spawn(move || Manager::existing(&root).unwrap().run_qemu("one", cmd));
         wait_running(&one);
@@ -2992,39 +3159,10 @@ mod tests {
         );
         assert!(manager.delete("one").is_err());
         assert!(disk_available(&one).is_err());
-        // Simulate the supervisor disappearing: QEMU alone inherits the locked
-        // file description. It must keep its guest protected without a parent.
-        let lifetime = manager.lock("run-two").unwrap();
-        let mut orphan = firmware_command(&two, "tcg")
-            .stdin(Stdio::from(lifetime.try_clone().unwrap()))
-            .spawn()
-            .unwrap();
-        drop(lifetime);
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !running(&two).unwrap_or(false) {
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            manager.lock("run-two").is_err(),
-            "QEMU must retain its inherited lifetime lock"
-        );
-        assert!(manager.delete("two").is_err());
-        assert!(!Qmp::connect(&two.join("qmp"))
-            .unwrap()
-            .execute("query-kvm")
-            .unwrap()
-            .get("enabled")
-            .unwrap()
-            .is_true());
         manager.stop("one").unwrap();
         supervisor.join().unwrap().unwrap();
-        assert!(running(&two).unwrap(), "stopping one preserves its sibling");
         manager.delete("one").unwrap();
-        manager.stop("two").unwrap();
-        assert!(orphan.wait().unwrap().success());
         manager.delete("two").unwrap();
         manager.remove_template("base").unwrap();
-        assert!(entries(&manager.root.join("instances")).unwrap().is_empty());
     }
 }

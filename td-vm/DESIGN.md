@@ -16,7 +16,7 @@ an ordinary running desktop.
 ### Implemented lifecycle increment
 
 `td-vm` is a standalone, dependency-free host crate: `std` and, by path,
-td's own `td-encoding` for its hex and base64 and `td-fs` for the atomic
+td's own `td-alloc` for fallible formatting, `td-encoding` for its hex and base64 and `td-fs` for the atomic
 replace its bridge publishes settings through. It owns the VM manager,
 Git dispatcher and account-authenticated registrar binaries. `td-review` is
 a separate review tool; their integration is ordinary Git branches. The VM
@@ -128,6 +128,24 @@ there are not implied by the lifecycle increment's successful launch.
 The host is Linux x86-64 with a graphical session. KVM is preferred; QEMU TCG
 software emulation is a supported fallback. The fallback changes performance,
 not which td image boots or which development features are available.
+
+## Headless KVM instances
+
+`td-vm create-native NAME RAW_IMAGE` copies a sector-aligned regular file
+into a private instance. The native configuration records one vCPU and
+256 MiB. Each instance owns its raw disk and shares the manager's name,
+operation and lifetime lock namespace. A graphical template is unnecessary.
+
+With td-vmm on PATH, `td-vm run-native NAME KERNEL INITRAMFS CMDLINE`
+runs in the foreground and sends guest serial output to stdout. The VMM
+inherits its instance lifetime lock on stdin and holds the raw disk lock
+itself. Both survive losing the supervisor. `td-vm status NAME` uses
+the live VMM's private control endpoint. `td-vm stop NAME --force`
+cuts power to that instance and waits for release of its lifetime lock.
+`td-vm delete NAME --yes` requires both lifetime and disk exclusion.
+Guest-initiated reset exits the runner. The native profile has serial
+output and a raw block device. The graphical open, resume and workspace
+bridge commands require the desktop backend.
 
 ## The daily flow
 
@@ -1459,9 +1477,12 @@ Required evidence includes:
   private files. Guest requests cannot read arbitrary host paths, invoke host
   commands, modify another instance, or change the configured origin mapping.
 
-The three host tests that execute QEMU tools run in `td-builder check
-integration`. The branch preflight runs the remaining process, Git and
-manager tests without QEMU.
+The integration tier runs the native lifecycle on hardware KVM and runs
+the workspace and enrollment cases using td's own disk tools. The
+graphical backend also has an opt-in KVM compatibility test for qcow2
+overlay isolation, paused-guest status, resume and duplicate opens.
+On a host with QEMU, run it with
+`cargo test --manifest-path td-vm/Cargo.toml --bin td-vm -- --ignored graphical_integration_`.
 
 Host lifecycle tests alone do not prove these guest behaviors. Keep the design
 and implementation status explicit until this evidence exists.

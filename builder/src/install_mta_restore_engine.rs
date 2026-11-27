@@ -414,6 +414,7 @@ fn jailed() -> Result<()> {
         &env,
         &[],
         &job,
+        false,
     )?
     .success()
     {

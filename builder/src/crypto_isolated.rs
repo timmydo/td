@@ -1991,6 +1991,7 @@ fn enter(
         &[],
         &[],
         scratch,
+        false,
     )
     .map_err(|e| format!("portable namespace: {e}"))?;
     if !status.success() {

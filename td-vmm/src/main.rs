@@ -7,39 +7,58 @@ mod boot;
 mod kvm;
 mod serial;
 
-use std::{env, fs::File, io, os::unix::ffi::OsStrExt, process::ExitCode};
+use std::{
+    env, fs::File, io, os::unix::ffi::OsStrExt, os::unix::net::UnixDatagram, path::Path,
+    process::ExitCode,
+};
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// A process owning the instance directory may explicitly cut power. A blocked
+/// vCPU still has to be stoppable after its supervisor exits.
+fn listen_control(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    td_fs::check_private_socket_parent(path)?;
+    let socket = UnixDatagram::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    std::thread::Builder::new().spawn(move || {
+        let mut buf = [0; 5];
+        loop {
+            match socket.recv(&mut buf) {
+                Ok(4) if buf.get(..4) == Some(b"stop") => std::process::exit(0),
+                Ok(_) => (),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
+                Err(_) => break,
+            }
+        }
+    })?;
+    Ok(())
 }
 
 fn run() -> io::Result<()> {
     let mut args = env::args_os().skip(1);
     let usage = || {
         invalid(
-            "usage: td-vmm KERNEL INITRAMFS 'kernel command line' [--disk-ro RAW | --disk-rw RAW]",
+            "usage: td-vmm KERNEL INITRAMFS 'kernel command line' [--disk-ro RAW | --disk-rw RAW] [--control SOCKET]",
         )
     };
     let kernel = args.next().ok_or_else(usage)?;
     let initrd = args.next().ok_or_else(usage)?;
     let append = args.next().ok_or_else(usage)?;
-    let disk = match args.next() {
-        None => None,
-        Some(mode) => {
-            let write = if mode == "--disk-ro" {
-                false
-            } else if mode == "--disk-rw" {
-                true
-            } else {
-                return Err(usage());
-            };
-            let path = args.next().ok_or_else(usage)?;
-            if args.next().is_some() {
-                return Err(usage());
-            }
-            Some(block::Block::open(path.as_ref(), write)?)
+    let mut disk = None;
+    let mut control = None;
+    while let Some(flag) = args.next() {
+        let path = args.next().ok_or_else(usage)?;
+        if (flag == "--disk-rw" || flag == "--disk-ro") && disk.is_none() {
+            disk = Some(block::Block::open(path.as_ref(), flag == "--disk-rw")?);
+        } else if flag == "--control" && control.is_none() {
+            control = Some(path);
+        } else {
+            return Err(usage());
         }
-    };
+    }
     let mut memory = kvm::Ram::new()?;
     let entry = boot::load(
         memory.bytes(),
@@ -47,7 +66,7 @@ fn run() -> io::Result<()> {
         File::open(initrd)?,
         append.as_bytes(),
     )?;
-    kvm::execute(memory, entry, disk)
+    kvm::execute(memory, entry, disk, control.as_deref().map(Path::new))
 }
 
 fn main() -> ExitCode {

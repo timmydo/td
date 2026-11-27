@@ -8,17 +8,14 @@ type Result<T> = std::result::Result<T, String>;
 const LINE_LIMIT: u64 = 64 * 1024;
 const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
     fn create(root: &Path) -> Result<Self> {
         let parent = root.join("target");
         std::fs::create_dir_all(&parent).map_err(|e| format!("native tool parent: {e}"))?;
         for attempt in 0..100 {
-            let path = parent.join(format!(
-                "native-compositor-{}-{attempt}",
-                std::process::id()
-            ));
+            let path = parent.join(format!("native-test-tool-{}-{attempt}", std::process::id()));
             match std::fs::create_dir(&path) {
                 Ok(()) => return Ok(Self(path)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -214,6 +211,39 @@ fn unit_target(root: &Path, manifest: &str) -> &'static str {
     }
 }
 
+/// Build in a fresh directory so a cross-target layout cannot leave a stale
+/// host executable looking like the result of this invocation.
+pub(crate) fn build_tool(root: &Path, manifest: &str, name: &str) -> Result<(Scratch, PathBuf)> {
+    let scratch = Scratch::create(root)?;
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(root)
+        .args([
+            "build",
+            "--frozen",
+            "--manifest-path",
+            manifest,
+            "--bin",
+            name,
+            "--target-dir",
+        ])
+        .arg(&scratch.0)
+        .stdin(Stdio::null());
+    crate::host_bin::arm_check_child(&mut cmd);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("native {name} build: {e}"))?;
+    if !status.success() {
+        return Err(format!("native {name} build failed: {status}"));
+    }
+    let relative =
+        td_engine::allocation::format(format_args!("debug/{name}")).map_err(|_| String::new())?;
+    let binary = scratch.0.join(relative);
+    if !binary.is_file() {
+        return Err("native build did not produce its host binary".into());
+    }
+    Ok((scratch, binary))
+}
+
 pub(crate) fn run(
     root: &Path,
     manifest: &str,
@@ -223,29 +253,7 @@ pub(crate) fn run(
     let root = root
         .canonicalize()
         .map_err(|e| format!("native test root: {e}"))?;
-    let scratch = Scratch::create(&root)?;
-    let status = Command::new("cargo")
-        .current_dir(&root)
-        .args([
-            "build",
-            "--frozen",
-            "--manifest-path",
-            "td-compositor/Cargo.toml",
-        ])
-        .args(["--bin", "td-compositor", "--target-dir"])
-        .arg(&scratch.0)
-        .stdin(Stdio::null())
-        .status()
-        .map_err(|e| format!("native compositor build: {e}"))?;
-    if !status.success() {
-        return Err(format!("native compositor build failed: {status}"));
-    }
-    // A fresh directory cannot supply an old binary if an ambient cross-target
-    // setting changes Cargo's layout. Cross compilation is not a native test.
-    let binary = scratch.0.join("debug/td-compositor");
-    if !binary.is_file() {
-        return Err("native compositor build did not produce its host binary".into());
-    }
+    let (scratch, binary) = build_tool(&root, "td-compositor/Cargo.toml", "td-compositor")?;
     run_cases(test_command(&root, manifest, &binary, trusted, None)?)?;
     if let Some(feature) = fixture_feature {
         // Never replace or reuse the ordinary editor's build directory.

@@ -15,7 +15,7 @@ pub(crate) const GOAL: &str = "integration";
 pub(crate) const POSTGRES: &str = "postgres-integration";
 pub(crate) const POSTGRES_PACKAGE: &str = "postgresql-x86-64-test";
 const VM_WORKSPACE: &str = "vm-workspace";
-const VM_LIFECYCLE: &str = "qemu-vm-lifecycle";
+const VM_LIFECYCLE: &str = "vm-lifecycle";
 
 /// One step: its name, command arguments, and what it proves.
 struct Step {
@@ -43,15 +43,15 @@ const STEPS: &[Step] = &[
         proves: "the native disk manager preserves workspace bindings and Git enrollment and revokes access before deletion",
     },
     Step {
+        name: VM_LIFECYCLE,
+        argv: &[],
+        proves: "td-vm protects two hardware guests and their private disks through supervisor loss and independent force-stop",
+    },
+    Step {
         name: "warm",
         argv: &["warm", "system-x86-64", "--flathub"],
         proves: "the system image's pinned inputs are present, and the host's feed holds the \
                  Flathub applications the guests fetch",
-    },
-    Step {
-        name: VM_LIFECYCLE,
-        argv: &[],
-        proves: "td-vm creates independent overlays, supervises the guest, and maintains exclusion after supervisor loss",
     },
     Step {
         name: "qemu-boot-system",
@@ -297,7 +297,7 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
     println!("{line}");
     if code == td_engine::exit::EXIT_UNPROVISIONED {
         println!(
-            ">> {GOAL}: UNPROVISIONED — missing VM lifecycle tools or no system boot oracle could run \
+            ">> {GOAL}: UNPROVISIONED — KVM unavailable for the VM lifecycle or no system boot oracle could run \
              (qemu, /dev/kvm, or OVMF for the UEFI boots); a skip is not a pass"
         );
         // A caller reads a host gap by the code and the sentinel together.
@@ -336,31 +336,41 @@ fn run_step(root: &Path, eval: &str, step: &Step) -> Outcome {
 }
 
 fn run_vm_cases(root: &Path, step: &str) -> Outcome {
+    let tool;
     let cases: &[(&str, &str, &str)] = if step == VM_LIFECYCLE {
-        let path = std::env::var("PATH").unwrap_or_default();
-        if let Some(missing) = ["qemu-img", "qemu-io", "qemu-system-x86_64"]
-            .into_iter()
-            .find(|tool| crate::stage0::find_in_path(&path, tool).is_none())
-        {
-            println!(">> {GOAL} {step}: unprovisioned (missing {missing})");
-            return Outcome::HostGap;
+        if let Err(error) = crate::sandbox::test_kvm_device() {
+            println!(">> {GOAL} {step}: open /dev/kvm: {error}");
+            return match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                    Outcome::HostGap
+                }
+                _ => Outcome::Fail,
+            };
         }
+        tool = match crate::native_tests::build_tool(root, "td-vmm/Cargo.toml", "td-vmm") {
+            Ok(tool) => Some(tool),
+            Err(error) => {
+                eprintln!("{GOAL}: {error}");
+                return Outcome::Fail;
+            }
+        };
         &[(
-            "--bin",
-            "td-vm",
-            "tests::qemu_integration_two_overlays_lifecycle_and_supervisor_loss_exclusion",
+            "--test",
+            "native_lifecycle",
+            "vm_integration_supervisor_loss_and_independent_stop",
         )]
     } else {
+        tool = None;
         &[
             (
                 "--test",
                 "vm_workspace",
-                "qemu_integration_workspace_snapshots_survive_recreation",
+                "vm_integration_workspace_snapshots_survive_recreation",
             ),
             (
                 "--test",
                 "vm_registrar",
-                "qemu_integration_enrollment_retries_and_revokes_before_deletion",
+                "vm_integration_enrollment_retries_and_revokes_before_deletion",
             ),
         ]
     };
@@ -380,9 +390,14 @@ fn run_vm_cases(root: &Path, step: &str) -> Outcome {
                 case,
                 "--ignored",
             ])
-            .env(crate::test_root::ENV, "1")
-            .env("TD_VM_GIT_TEST_INNER", "1")
             .stdout(std::process::Stdio::piped());
+        if let Some((_, binary)) = &tool {
+            cmd.env(crate::test_root::ENV, "kvm")
+                .env("TD_TEST_VMM", binary);
+        } else {
+            cmd.env(crate::test_root::ENV, "1")
+                .env("TD_VM_GIT_TEST_INNER", "1");
+        }
         crate::host_bin::arm_check_child(&mut cmd);
         if let Err(error) = crate::native_tests::run_cases(cmd) {
             eprintln!("{GOAL}: {case}: {error}");

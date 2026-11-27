@@ -685,8 +685,8 @@ fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Out
 
 #[test]
 #[ignore = "td-builder check integration runs the VM lifecycle workloads"]
-fn qemu_integration_enrollment_retries_and_revokes_before_deletion() -> Result<()> {
-    if in_trusted_root("qemu_integration_enrollment_retries_and_revokes_before_deletion")? {
+fn vm_integration_enrollment_retries_and_revokes_before_deletion() -> Result<()> {
+    if in_trusted_root("vm_integration_enrollment_retries_and_revokes_before_deletion")? {
         return Ok(());
     }
     let (root, policy) = fixture()?;

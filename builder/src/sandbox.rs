@@ -1985,6 +1985,26 @@ pub struct Bind {
     pub ro_optional: bool,
 }
 
+/// Pin the exact device before checking access or handing its inode to a mount.
+pub(crate) fn test_kvm_device() -> io::Result<fs::File> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+    };
+    // Linux O_PATH | O_NOFOLLOW: inspect the inode without opening a driver.
+    let pin = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o10000000 | 0o400000)
+        .open("/dev/kvm")?;
+    let meta = pin.metadata()?;
+    if !meta.file_type().is_char_device() || meta.rdev() != 0xae8 {
+        return Err(io::Error::other("expected KVM character device 10:232"));
+    }
+    let path = td_engine::allocation::format(format_args!("/proc/self/fd/{}", pin.as_raw_fd()))
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    fs::OpenOptions::new().read(true).write(true).open(path)
+}
+
 /// The loop-sandbox DEV-SHELL (vs. the build jail above): pivot into a fresh
 /// tmpfs root that exposes ONLY `binds` (rbind, the same path inside), a
 /// writable tmpfs at each of `tmpfs_dirs`, and a minimal synthetic `/dev` (the
@@ -2024,6 +2044,7 @@ pub fn host_shell(
     extra_env: &[(String, String)],
     ro_dirs: &[String],
     scratch: &Path,
+    test_kvm: bool,
 ) -> io::Result<std::process::ExitStatus> {
     let newroot = scratch.join("root");
     fs::create_dir_all(&newroot)?;
@@ -2131,9 +2152,13 @@ pub fn host_shell(
     let dev_dir_c = cstr(&dev_dir)?;
     let dev_data = c_string(format!("uid={host_uid},gid={host_gid},mode=0755"))?;
     let mut dev_node_specs: Vec<(CString, PathBuf, CString)> = Vec::new();
-    for n in ["null", "zero", "full", "random", "urandom", "tty"] {
+    let kvm = test_kvm.then(test_kvm_device).transpose()?;
+    for n in ["null", "zero", "full", "random", "urandom", "tty"]
+        .into_iter()
+        .chain(kvm.as_ref().map(|_| "kvm"))
+    {
         let src = format!("/dev/{n}");
-        if Path::new(&src).exists() {
+        if n == "kvm" || Path::new(&src).exists() {
             let target = dev_dir.join(n);
             dev_node_specs.push((c_string(src)?, target.clone(), cstr(&target)?));
         }
@@ -2356,6 +2381,16 @@ pub fn host_shell(
                 fs::File::create(target)?;
                 sys::mount(Some(src_c), target_c, None, sys::MS_BIND, None)
                     .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED binding a /dev node\n"); e })?;
+                if src_c.as_bytes() == b"/dev/kvm" {
+                    // An fd opened before CLONE_NEWNS names the old mount.
+                    // Verify the completed bind against that still-live inode.
+                    use std::os::unix::fs::MetadataExt;
+                    let pinned = kvm.as_ref().ok_or(io::ErrorKind::InvalidData)?.metadata()?;
+                    let bound = fs::symlink_metadata(target)?;
+                    if (bound.dev(), bound.ino()) != (pinned.dev(), pinned.ino()) {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                }
             }
             fs::create_dir_all(&dev_shm_dir)?;
             sys::mount(Some(&tmpfs_c), &dev_shm_c, Some(&tmpfs_c), 0, Some(&dev_shm_data))

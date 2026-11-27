@@ -10,8 +10,6 @@ clippy-all-targets = true
 
 [dependencies]
 td-civil = { path = "../td-civil" }
-
-[dev-dependencies]
 td-fs = { path = "../td-fs" }
 
 [workspace]

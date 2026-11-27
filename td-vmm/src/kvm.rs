@@ -241,6 +241,7 @@ pub(super) fn execute(
     ram: Ram,
     entry: usize,
     mut disk: Option<crate::block::Block>,
+    control: Option<&std::path::Path>,
 ) -> io::Result<()> {
     let kvm = OpenOptions::new()
         .read(true)
@@ -278,6 +279,9 @@ pub(super) fn execute(
     let cpu = fresh(ioctl(&vm, KVM_CREATE_VCPU, 0)?)?;
     set_cpu(&kvm, &cpu, entry)?;
     let mut run = Mapping::map(len, &cpu)?;
+    if let Some(path) = control {
+        crate::listen_control(path)?;
+    }
     let mut uart = Uart::default();
     let mut console = io::stdout().lock();
     let mut clock_select = 0u8;

@@ -28,7 +28,7 @@ fn identity(record: &str) -> Result<&str> {
 
 #[test]
 #[ignore = "td-builder check integration runs the VM lifecycle workloads"]
-fn qemu_integration_workspace_snapshots_survive_recreation() -> Result<()> {
+fn vm_integration_workspace_snapshots_survive_recreation() -> Result<()> {
     let root = TempDir::new("td-workspace")?;
     let home = root.join("vms");
     let vm = |args: &[&str], success| {

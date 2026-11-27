@@ -4306,8 +4306,8 @@ td-vm/src/bin/td-vm-registrar.rs	allocating-constructor	1
 td-vm/src/bin/td-vm-registrar.rs	allocating-conversion	9
 td-vm/src/bin/td-vm-registrar.rs	allocation-macro	8
 td-vm/src/bin/td-vm-registrar.rs	unchecked-growth-or-clone	2
-td-vm/src/bin/td-vm.rs	allocating-conversion	102
-td-vm/src/bin/td-vm.rs	allocation-macro	99
+td-vm/src/bin/td-vm.rs	allocating-conversion	101
+td-vm/src/bin/td-vm.rs	allocation-macro	84
 td-vm/src/bin/td-vm.rs	heap-owner	1
 td-vm/src/bin/td-vm.rs	unchecked-growth-or-clone	15
 td-vm/src/term.rs	allocating-constructor	1

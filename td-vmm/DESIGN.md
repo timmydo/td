@@ -53,11 +53,11 @@ sentinel. Its device interface is specified by
 The runner interface is a machine description owned by td. Each integration
 oracle retains ownership of its fixtures, timeouts, power-cut points and
 verdict. These are the requirements for selecting the runner for each
-existing step. Direct kernel boot alone qualifies none of these steps.
+existing step. Each step checks its own guest or management evidence.
 
 | Integration workloads | Machine and evidence required |
 | --- | --- |
-| VM lifecycle, workspace and enrollment | Independent writable overlays, lock exclusion across supervisor loss, pause/resume and live run state for two simultaneous machines. |
+| VM lifecycle, workspace and enrollment | Independent instance disks, exclusive ownership across supervisor loss, live run state and isolated force-stop for two simultaneous machines. |
 | Headless server and admin update | Persistent block storage, guest-initiated reboot, cloud seed media and metadata, a network with the test feed and loopback SSH forwards, and real guest health/rollback evidence. |
 | System and deployment rollback | Selector and kexec handoffs, writable Btrfs media, physical input, captured display and serial channels, and evidence from the unmodified services and desktop. |
 | Audio routing and hotplug | HDA and USB audio devices with separately captured PCM streams, timed device insertion and removal, and the existing waveform checks. |
@@ -65,11 +65,20 @@ existing step. Direct kernel boot alone qualifies none of these steps.
 
 Each backend needs its own oracle memo identity, including the monitor
 and device implementation that produced the result. The integration
-runner may count a step as passed only after its original assertions
-succeed. The PostgreSQL steps retain their existing native runners. The
+runner counts a step as passed only after it observes the td behavior
+that step specifies. The PostgreSQL steps retain their existing native runners. The
 `vm-workspace` step runs the workspace and enrollment cases using
-td-vm's own disk operations. The supervised guest lifecycle remains a
-separate step.
+td-vm's own disk operations. The independent `vm-lifecycle` step runs
+two real KVM guests on
+private raw disks, kills one supervisor, proves lock retention and
+duplicate-launch and deletion refusal, then force-stops each guest
+through its own endpoint.
+
+With `--control SOCKET`, the initialized machine binds a mode-0600 Unix
+datagram socket in a private directory. The four bytes `stop` request a
+power cut, including while the vCPU is halted. The manager holds the
+instance lock when replacing a stale endpoint or requesting a stop.
+The guest has no access to this host endpoint.
 
 ## Host boundary
 

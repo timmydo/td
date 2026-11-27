@@ -35,6 +35,26 @@ pub fn lock_idle(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Copy one sector-aligned raw fixture into an unpublished instance.
+pub fn copy_raw(source: &Path, dest: &Path) -> io::Result<()> {
+    let mut file = open(source, false)?;
+    file.try_lock_shared()?;
+    disk_lock::template(&file)?;
+    let size = file.metadata()?.len();
+    if size == 0 || !size.is_multiple_of(512) {
+        return Err(invalid("raw disk must contain whole sectors"));
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dest)?;
+    if io::copy(&mut file, &mut output)? != size {
+        return Err(invalid("raw image size changed during copy"));
+    }
+    output.sync_all()
+}
+
 /// A private staging directory owns this new image until creation succeeds.
 pub fn create_blank(path: &Path, size: u64) -> io::Result<()> {
     create(path, size, None)
@@ -137,4 +157,27 @@ fn create(path: &Path, size: u64, base: Option<&Path>) -> io::Result<()> {
         out.write_all_at(&1u16.to_be_bytes(), 2 * CLUSTER + 2 * i)?;
     }
     out.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_copy_refuses_an_ofd_writer_without_flock() -> io::Result<()> {
+        let dir = td_fs::TempDir::new("vm-raw-lock")?;
+        let source = dir.join("source");
+        let dest = dir.join("copy");
+        std::fs::write(&source, [7; 512])?;
+        let writer = open(&source, true)?;
+        disk_lock::idle(&writer)?;
+        assert!(
+            matches!(copy_raw(&source, &dest), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert!(!dest.exists());
+        drop(writer);
+        copy_raw(&source, &dest)?;
+        assert_eq!(std::fs::read(dest)?, [7; 512]);
+        Ok(())
+    }
 }

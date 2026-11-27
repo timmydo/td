@@ -4373,7 +4373,7 @@ in `td-vmm/DESIGN.md`.
 Only `td-vm/src/disk_lock.rs` calls libc fcntl with x86-64 Linux
 F_OFD_SETLK (37) or F_OFD_GETLK (36) on a borrowed regular file.
 The idle check holds an exclusive lock from zero through EOF. The
-template reader holds read locks at 100 and 201–203 and tests for
+template and raw-copy readers hold read locks at 100 and 201–203 and test for
 conflicts at 200 and 101–103, matching QEMU's permission-byte
 protocol. All ranges use SEEK_SET. A 32-byte initialized C flock
 outlives the synchronous call. Closing the file releases any locks.
