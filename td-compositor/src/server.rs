@@ -1,4 +1,4 @@
-use crate::buffer::{BufferCeiling, BufferCharge, ShmSnapshot, Surface};
+use crate::buffer::{BufferCeiling, BufferCharge, ShmSnapshot, Surface, SHM_BYTES_PER_PIXEL};
 use crate::client_resources::{ClientResourceHighWater, ClientResourceSnapshot};
 use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
 use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
@@ -170,6 +170,7 @@ const DECORATION_CONFIGURE: u16 = 0;
 const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIENT_SHM_POOLS: usize = 16;
 const MAX_CLIENT_SHM_BYTES: usize = 256 * 1024 * 1024;
+const MAX_CLIENT_SURFACE_BYTES: usize = 2 * MAX_UI_FRAME_BYTES;
 const MAX_CLIENT_BUFFER: usize = 256 * 1024;
 const MAX_PENDING_FDS: usize = 64;
 const MAX_OBJECTS: usize = 512;
@@ -284,7 +285,7 @@ impl Buffer {
         let bytes = self
             .width
             .checked_mul(self.height)
-            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|pixels| pixels.checked_mul(SHM_BYTES_PER_PIXEL))
             .ok_or_else(|| "client surface byte count overflow".to_string())?;
         Ok(BufferCharge::shm(bytes))
     }
@@ -2076,6 +2077,16 @@ fn supervise_seat_worker(
     result
 }
 
+/// Leave room for an output-sized surface alongside the client's other pixels.
+fn client_surface_limit(output: OutputDimensions) -> usize {
+    let frame_bytes = output
+        .width
+        .saturating_mul(output.height)
+        .saturating_mul(SHM_BYTES_PER_PIXEL)
+        .min(MAX_UI_FRAME_BYTES);
+    MAX_UI_FRAME_BYTES + frame_bytes
+}
+
 /// This client's copied-buffer total after replacing one surface's charge,
 /// refused if it would exceed the ceiling.
 ///
@@ -2087,6 +2098,7 @@ fn client_surface_total(
     current: BufferCharge,
     prior: BufferCharge,
     proposed: BufferCharge,
+    byte_limit: usize,
 ) -> Result<BufferCharge, String> {
     let retained = current
         .checked_sub(prior)
@@ -2095,10 +2107,10 @@ fn client_surface_total(
         .checked_add(proposed)
         .ok_or_else(|| "client surface charge accounting overflow".to_string())?;
     if !next.fits(BufferCeiling {
-        host_bytes: MAX_UI_FRAME_BYTES,
+        host_bytes: byte_limit,
     }) {
         return Err(format!(
-            "client surfaces need {} bytes, exceeding {MAX_UI_FRAME_BYTES}",
+            "client surfaces need {} bytes, exceeding {byte_limit}",
             next.host_bytes()
         ));
     }
@@ -4220,7 +4232,7 @@ impl Client {
             return Err(format!("unsupported wl_shm format {format}"));
         }
         let row = width
-            .checked_mul(4)
+            .checked_mul(SHM_BYTES_PER_PIXEL)
             .ok_or_else(|| "wl_shm row size overflow".to_string())?;
         if stride < row {
             return Err(format!(
@@ -4265,7 +4277,7 @@ impl Client {
     fn copy_buffer(buffer: &Buffer) -> Result<Surface, String> {
         let row = buffer
             .width
-            .checked_mul(4)
+            .checked_mul(SHM_BYTES_PER_PIXEL)
             .ok_or_else(|| "surface row overflow".to_string())?;
         let total = row
             .checked_mul(buffer.height)
@@ -5305,6 +5317,7 @@ impl Client {
             }
         }
         if let Some(pending) = state.pending_buffer {
+            let byte_limit = client_surface_limit(runtime.output().dimensions);
             let key = SurfaceKey {
                 client: self.id,
                 object: id,
@@ -5332,7 +5345,8 @@ impl Client {
                             .get(&id)
                             .copied()
                             .unwrap_or_else(BufferCharge::none);
-                        let next = client_surface_total(self.mapped_total, prior, charge)?;
+                        let next =
+                            client_surface_total(self.mapped_total, prior, charge, byte_limit)?;
                         let surface = Self::copy_buffer(&buffer)?;
                         runtime.replace_inactive_surface(key, charge)?;
                         self.resources.observe_copied(next);
@@ -5391,7 +5405,8 @@ impl Client {
                             .get(&id)
                             .copied()
                             .unwrap_or_else(BufferCharge::none);
-                        let next = client_surface_total(self.mapped_total, prior, charge)?;
+                        let next =
+                            client_surface_total(self.mapped_total, prior, charge, byte_limit)?;
                         let surface = Self::copy_buffer(&buffer)?;
                         self.resources.observe_copied(next);
                         runtime.commit_subsurface(
@@ -5456,7 +5471,8 @@ impl Client {
                             .get(&id)
                             .copied()
                             .unwrap_or_else(BufferCharge::none);
-                        let next = client_surface_total(self.mapped_total, prior, charge)?;
+                        let next =
+                            client_surface_total(self.mapped_total, prior, charge, byte_limit)?;
                         let surface = Self::copy_buffer(&buffer)?;
                         self.resources.observe_copied(next);
                         runtime.commit_popup(
@@ -5512,7 +5528,8 @@ impl Client {
                             .get(&id)
                             .copied()
                             .unwrap_or_else(BufferCharge::none);
-                        let next = client_surface_total(self.mapped_total, prior, charge)?;
+                        let next =
+                            client_surface_total(self.mapped_total, prior, charge, byte_limit)?;
                         let surface = Self::copy_buffer(&buffer)?;
                         self.resources.observe_copied(next);
                         runtime.apply_commit(
@@ -7664,7 +7681,7 @@ fn parse_application_evidence(
         || resources.deferred_events > MAX_DEFERRED_EVENTS
         || resources.deferred_bytes > MAX_DEFERRED_EVENT_BYTES
         || resources.copied_shm_bytes == 0
-        || resources.copied_shm_bytes > MAX_UI_FRAME_BYTES
+        || resources.copied_shm_bytes > MAX_CLIENT_SURFACE_BYTES
         || resources.copied_buffers == 0
         || resources.copied_buffers > MAX_OBJECTS
     {
@@ -8570,7 +8587,7 @@ mod tests {
                 ..evidence.resources
             },
             ClientResourceSnapshot {
-                copied_shm_bytes: MAX_UI_FRAME_BYTES + 1,
+                copied_shm_bytes: MAX_CLIENT_SURFACE_BYTES + 1,
                 ..evidence.resources
             },
             ClientResourceSnapshot {
@@ -14185,11 +14202,73 @@ mod tests {
     }
 
     #[test]
+    fn resizing_a_large_toplevel_keeps_its_subsurface_within_the_client_budget() {
+        let dir = crate::temp_dir::TempDir::new("td-wayland-surface-budget").unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&dir.path().join("fb"), 3840, 2160, 3840 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        install_foreign_toplevel(&mut client, 5, 9, 10, 50);
+        client
+            .insert(6, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        client.insert(20, Object::Subcompositor).unwrap();
+        get_subsurface(&mut client, 30, 6, 5).unwrap();
+
+        let size = 3836 * 2112 * 4;
+        let file = File::create(dir.path().join("pool")).unwrap();
+        file.set_len(size as u64).unwrap();
+        let pool = Pool {
+            file: Arc::new(File::open(dir.path().join("pool")).unwrap()),
+            charge: Arc::new(AtomicUsize::new(size)),
+            size,
+        };
+        for (id, width, height) in [(40, 1918, 2112), (41, 3158, 544), (42, 3836, 2112)] {
+            client
+                .create_buffer(pool.clone(), id, 0, width, height, width * 4, SHM_XRGB8888)
+                .unwrap();
+        }
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let (_, serial, _) = receive_configure(&mut peer, &mut Vec::new(), 9, 10);
+        let mut ack = wire::Builder::new();
+        ack.u32(serial);
+        client
+            .dispatch(request(9, 4, ack).unwrap(), &mut VecDeque::new())
+            .unwrap();
+
+        for (surface, buffer) in [(6, 41), (5, 40), (5, 42)] {
+            attach_surface(&mut client, surface, buffer).unwrap();
+            client
+                .dispatch(
+                    request(surface, 6, wire::Builder::new()).unwrap(),
+                    &mut VecDeque::new(),
+                )
+                .unwrap();
+        }
+        assert_eq!(client.mapped_total.host_bytes(), 39_278_336);
+        assert_eq!(
+            runtime.lock().unwrap().surface_size(SurfaceKey {
+                client: 88,
+                object: 5
+            }),
+            Some((3836, 2112))
+        );
+    }
+
+    #[test]
     fn unroled_content_enforces_client_and_dimension_bounds_before_copying() {
-        let (mut client, _peer, _runtime, framebuffer_path, pool_path) =
+        let (mut client, _peer, runtime, framebuffer_path, pool_path) =
             subsurface_fixture("unroled-bounds");
         fs::write(&pool_path, []).unwrap(); // Any attempted copy would fail.
-        client.mapped_total = BufferCharge::shm(MAX_UI_FRAME_BYTES);
+        let byte_limit = client_surface_limit(runtime.lock().unwrap().output().dimensions);
+        client.mapped_total = BufferCharge::shm(byte_limit);
         attach_surface(&mut client, 6, 40).unwrap();
         let error = client
             .dispatch(
@@ -21545,19 +21624,31 @@ mod tests {
 
     #[test]
     fn client_memory_and_connection_limits_fail_closed() {
+        let hd_limit = client_surface_limit(OutputDimensions {
+            width: 1920,
+            height: 1080,
+        });
+        let uhd_limit = client_surface_limit(OutputDimensions {
+            width: 3840,
+            height: 2160,
+        });
+        assert_eq!(hd_limit, 41_848_832);
+        assert_eq!(uhd_limit, 66_732_032);
         assert_eq!(
             client_surface_total(
-                BufferCharge::shm(MAX_UI_FRAME_BYTES),
+                BufferCharge::shm(uhd_limit),
                 BufferCharge::shm(4096),
                 BufferCharge::shm(4096),
+                uhd_limit,
             )
             .unwrap(),
-            BufferCharge::shm(MAX_UI_FRAME_BYTES)
+            BufferCharge::shm(uhd_limit)
         );
         assert!(client_surface_total(
-            BufferCharge::shm(MAX_UI_FRAME_BYTES),
+            BufferCharge::shm(uhd_limit),
             BufferCharge::none(),
             BufferCharge::shm(1),
+            uhd_limit,
         )
         .is_err());
         // Replacing a surface's buffer leaves ONE holding, not two. The four
@@ -21568,6 +21659,7 @@ mod tests {
                 BufferCharge::shm(4_096),
                 BufferCharge::shm(4_096),
                 BufferCharge::shm(8_192),
+                hd_limit,
             )
             .unwrap(),
             BufferCharge::shm(8_192)

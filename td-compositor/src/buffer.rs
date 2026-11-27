@@ -27,6 +27,7 @@
 pub const SHM_ARGB8888: u32 = 0;
 /// wl_shm's `XRGB8888`, whose fourth byte is ignored.
 pub const SHM_XRGB8888: u32 = 1;
+pub(crate) const SHM_BYTES_PER_PIXEL: usize = 4;
 
 /// Client pixels copied into td's own memory: tightly packed 4-byte rows,
 /// `width` of them per row and `height` rows, in the format the client's
@@ -88,7 +89,7 @@ impl ShmSnapshot {
             return Err(format!("shm snapshot format {format} is not XRGB or ARGB"));
         }
         let row = width
-            .checked_mul(4)
+            .checked_mul(SHM_BYTES_PER_PIXEL)
             .ok_or_else(|| "shm snapshot row overflow".to_string())?;
         let total = row
             .checked_mul(height)

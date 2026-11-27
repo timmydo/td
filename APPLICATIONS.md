@@ -7302,9 +7302,10 @@ may retain at most sixteen shm pool resources and
 objects, pending attaches and synchronized subsurface caches after the pool
 object is destroyed. A resize raises one monotonic declared charge shared by
 the pool and every buffer created from it; an older buffer cannot partially
-refund that charge, which leaves only with the last reference. This is
-deliberately separate from the 32 MiB aggregate copied-surface byte ceiling
-across the client's mapped toplevel, popup and subsurface images.
+refund that charge, which leaves only with the last reference. The compositor
+also enforces a budget tied to the output size for the pixels it retains from
+the client's toplevel, popup and subsurface images (td-compositor/DESIGN.md,
+"Wayland surface").
 
 Every non-cursor buffer commit is checked before copying against twice the
 scale-1 output's width and height; synchronized child commits receive the same

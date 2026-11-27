@@ -97,7 +97,7 @@ pub(crate) fn validate_geometry(
         .ok_or_else(|| "framebuffer pixel size overflow".to_string())?;
     if pixels > MAX_UI_FRAME_BYTES {
         return Err(format!(
-            "framebuffer pixels need {pixels} bytes, above the {MAX_UI_FRAME_BYTES}-byte client limit"
+            "framebuffer pixels need {pixels} bytes, above the {MAX_UI_FRAME_BYTES}-byte output limit"
         ));
     }
     let size = stride

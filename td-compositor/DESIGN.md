@@ -3064,10 +3064,11 @@ and copied surface bytes AND buffers, which are separate high-waters because a
 charge is two quantities and a pair taken together would report neither.
 `probe-application` requires the expected app id and colors, exact field
 order, no trailing data, the minimum and maximum sentinel-pixel counts, at
-least one object/pool/shm byte/copied byte/copied buffer, and every compiled
-resource ceiling before it reproduces the line. Matching surface keys remain
-after the one-shot publication so launcher activation can reuse the
-service-owned window; role, surface and client teardown remove them and their
+least one object/pool/shm byte/copied byte/copied buffer, and each resource's
+absolute ceiling before it reproduces the line. For copied pixels that is
+64 MiB. Commit admission applies the output-specific budget. Matching surface
+keys remain after the one-shot publication so launcher activation can reuse
+the service-owned window; role, surface and client teardown remove them and their
 telemetry registration. `probe-application SOCKET ID RGB-A RGB-B` connects and
 reads against one five-second absolute deadline, then reproduces the structured
 line; its `--quiet` form
@@ -4237,7 +4238,8 @@ Resource ceilings are part of the protocol boundary: at most 32 clients run
 at once, each has at most 512 objects, sixteen retained shm pool resources,
 256 MiB of aggregate declared shm, 64 queued descriptors, one pending layout
 wakeup, 64 pending seat deliveries, 128 unapplied synchronized-subsurface
-commits, 256 pending frame callbacks, and 32 MiB of retained surface pixels.
+commits, and 256 pending frame callbacks. The retained surface-pixel budget
+is set from the active output as described below.
 The pool-resource identity stays charged through live buffer objects, pending
 attaches and synchronized caches after its pool object is destroyed; its
 declared charge rises monotonically with a resize across the pool and all
@@ -4249,7 +4251,7 @@ sixteen. A pool alone remains capped at 64 MiB.
 The offline-document boot oracle snapshots the matching connection's
 monotonic high-water counters at the first successfully painted frame with
 the bounded exact content-pixel region and validates every field against
-these same ceilings. This makes the production accounting paths and their
+its absolute ceiling. This makes the production accounting paths and their
 admission constants part of the QEMU
 answer, while the saturation regressions separately pin every instrumentation
 site at its exact limit. The snapshot is intentionally an early fixed-page
@@ -4267,10 +4269,12 @@ released before disconnection.
 Each XDG surface has at most 32 current-generation configures. During remap it
 may additionally retain the previous generation's bounded set while the one
 new initial serial is pending, for at most 33 serials total; the tracker
-enforces the retained-generation bound itself. Output pixels, the bundled
-demo's generated buffer, and one client's aggregate retained surface pixels
-share the same 32 MiB ceiling, so every accepted output has a representable
-single-client tile. Cursor-role pixels are outside that total and carry their
+enforces the retained-generation bound itself. Output pixels and the bundled
+demo's generated buffer each have a 32 MiB ceiling. Each Wayland connection
+gets a retained-surface budget of 32 MiB plus one tightly packed output frame
+at four bytes per pixel, up to 64 MiB. The extra frame lets an output-sized
+window coexist with a client's other surfaces and any shadow pixels beyond
+the window geometry. Cursor-role pixels are outside that total and carry their
 own PER-CLIENT ceiling of 1 MiB, which is four cursors at the maximum
 dimension below or an ordinary animated set hundreds of frames deep. Per
 client rather than one shared ledger, for the reason the tile path is: a
@@ -4281,15 +4285,15 @@ render and device-shadow allocations each have a separate 64 MiB
 stride-padded ceiling. The application oracle may lazily allocate one
 same-sized comparison frame; it fails rather than publishing if that bounded
 allocation cannot be made, and reuses it across later attempts. Framebuffer and
-buffer dimensions share a
-16,384-pixel ceiling. At four bytes per pixel the area ceiling is 8,388,608
-pixels: tight 3840x2160 is accepted, while 4096x2160 is rejected. A non-cursor
-buffer is additionally refused before copying when either committed
-dimension exceeds twice the current scale-1 output. Exact output dimensions
+client buffer dimensions share a 16,384-pixel ceiling. The separate output
+area limit is 8,388,608 pixels at four bytes per pixel. It admits a tight
+3840x2160 output and rejects a 4096x2160 output. A non-cursor client buffer is
+refused before copying when either committed dimension exceeds twice the
+current scale-1 output. Exact output dimensions
 are too tight: XDG window geometry may crop client-side shadows and decoration
 extents outside the window, and the pinned Firefox startup frame is 1256x824
-on a 1280x800 output. The factor remains output-derived while the independent
-32 MiB pixel ledger bounds area. A synchronized child is checked both when its
+on a 1280x800 output. The independent copied-pixel budget bounds the total
+area retained for the connection. A synchronized child is checked both when its
 commit enters the cache and when the parent applies it. A CURSOR is bounded
 separately and far more tightly, at 256 pixels on a side: themes stop
 there, so nothing an operator would see is refused, and what it bounds is a
