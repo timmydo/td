@@ -656,8 +656,10 @@ While locked:
 - The output shows only the lock surface: hostname, username and the
   state's rows below. No client pixel, cursor, title or workspace bar is
   shown.
-- Applications keep running. They receive no focus and no input from any
-  source; new windows map behind the lock. Frame callbacks are not
+- Applications keep running and new windows map behind the lock. Physical
+  input stays on the lock interface. An attached primary-account SSH viewer
+  may focus and operate ordinary applications after the lock frame is on
+  glass. The viewer leaves the lock in place. Frame callbacks are not
   throttled. Audio and network continue.
 - Ordinary bindings (terminal, launcher, help, workspaces, screenshot,
   close) are suppressed.
@@ -732,7 +734,8 @@ authority pair starts and the first frame is the lock surface. The human
 session units (the terminal and the applications) start behind the lock as
 they do today, and their windows map behind it. Running the account's
 processes before authentication discloses nothing on an unencrypted disk
-and grants no interactive access, and it keeps boot health, which requires
+and keeps physical input locked. A primary-account SSH viewer can reach
+those applications. Starting them also keeps boot health, which requires
 the terminal, unchanged. The follow-up that releases the secret store at
 login, and the protected tier's "one fresh session" rule, must revisit
 this and may hold session start until the first unlock. The one

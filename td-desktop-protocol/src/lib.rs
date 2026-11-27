@@ -4,11 +4,11 @@
 use std::io::{self, Write};
 
 pub const PROGRAM: &str = "td-desktop";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_TEXT: usize = 64 * 1024;
 pub const MAX_PIXELS: usize = 4096 * 2160;
 pub const MAX_REPLY: usize = 1 + 8 + 4 + MAX_PIXELS * 4;
-pub const MAX_REQUEST: usize = 1 + MAX_TEXT;
+pub const MAX_REQUEST: usize = 9 + MAX_TEXT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Invalid;
@@ -55,7 +55,11 @@ pub enum Request<'a> {
     },
     ReleaseAll,
     ReadText,
-    WriteText(&'a str),
+    PrepareText,
+    WriteText {
+        revision: u64,
+        text: &'a str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +69,7 @@ pub enum Reply<'a> {
     Unavailable,
     /// The viewer must fetch the new geometry before its next pointer event.
     StaleOutput,
+    Revision(u64),
     Text(&'a str),
     /// Tightly packed pixels, one blue, green, red and unused byte per pixel.
     Frame {
@@ -150,7 +155,14 @@ impl<'a> Request<'a> {
             },
             [5] => Self::ReleaseAll,
             [6] => Self::ReadText,
-            [7] => return Ok(Self::WriteText(text(bytes)?)),
+            [7] => Self::PrepareText,
+            [8] => {
+                let revision = u64::from_be_bytes(take(&mut bytes)?);
+                return Ok(Self::WriteText {
+                    revision,
+                    text: text(bytes)?,
+                });
+            }
             _ => return Err(Invalid),
         };
         end(bytes)?;
@@ -177,9 +189,11 @@ impl<'a> Request<'a> {
             }
             Self::ReleaseAll => writer.write_all(&[5]),
             Self::ReadText => writer.write_all(&[6]),
-            Self::WriteText(s) if s.len() <= MAX_TEXT => {
-                writer.write_all(&[7])?;
-                writer.write_all(s.as_bytes())
+            Self::PrepareText => writer.write_all(&[7]),
+            Self::WriteText { revision, text } if text.len() <= MAX_TEXT => {
+                writer.write_all(&[8])?;
+                writer.write_all(&revision.to_be_bytes())?;
+                writer.write_all(text.as_bytes())
             }
             _ => Err(invalid_input()),
         }
@@ -203,6 +217,7 @@ impl<'a> Reply<'a> {
             [2] => Self::Unavailable,
             [3] => Self::StaleOutput,
             [4] => return Ok(Self::Text(text(bytes)?)),
+            [6] => Self::Revision(u64::from_be_bytes(take(&mut bytes)?)),
             [5] => {
                 let output = output(&mut bytes)?;
                 let width = u16::from_be_bytes(take(&mut bytes)?);
@@ -225,6 +240,10 @@ impl<'a> Reply<'a> {
 
     pub fn write(self, writer: &mut impl Write) -> io::Result<()> {
         match self {
+            Self::Revision(id) => {
+                writer.write_all(&[6])?;
+                writer.write_all(&id.to_be_bytes())
+            }
             Self::Applied => writer.write_all(&[1]),
             Self::Unavailable => writer.write_all(&[2]),
             Self::StaleOutput => writer.write_all(&[3]),

@@ -694,7 +694,9 @@ fn the_notebook_helper_adds_only_the_display_and_the_runtime_directory() {
         vec![
             (
                 std::ffi::OsStr::new("WAYLAND_DISPLAY"),
-                Some(std::ffi::OsStr::new("/run/td-compositor/1000/wayland-0"))
+                Some(std::ffi::OsStr::new(
+                    "/run/td-compositor/1000/wayland-protected"
+                ))
             ),
             (
                 std::ffi::OsStr::new("XDG_RUNTIME_DIR"),

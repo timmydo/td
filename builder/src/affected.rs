@@ -1588,7 +1588,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 
     // The disk usage analyzer the same way: td-dua-test runs the static
     // binary's headless modes, a scanned preview frame among them.
-    if p.starts_with("td-dua/") && !p.contains("..") {
+    if (p.starts_with("td-dua/") || p.starts_with("td-desktop/")) && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -1660,6 +1660,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     const SHARED_LIBRARIES: &[&str] = &[
         "td-charset/",
         "td-civil/",
+        "td-desktop-protocol/",
         "td-encoding/",
         "td-fetch-client/",
         "td-html/",
@@ -7433,6 +7434,7 @@ mod tests {
             [
                 "td-agent",
                 "td-authd",
+                "td-desktop",
                 "td-editor",
                 "td-jail",
                 "td-mail",
@@ -10495,6 +10497,7 @@ mod tests {
                 "td-agent",
                 "td-authd",
                 "td-compositor",
+                "td-desktop",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
@@ -10546,8 +10549,8 @@ mod tests {
         // read td-init's console identity, are readers here.
         // The format check rides with the workspace.
         // td-picture reads td-ui for its pictures: its test and Clippy legs,
-        // as does td-mixer for its panel.
-        assert_eq!(comp.len(), 83, "{comp:?}");
+        // as do td-mixer for its panel and td-desktop for its viewer.
+        assert_eq!(comp.len(), 85, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -10558,6 +10561,7 @@ mod tests {
                 "td-authd",
                 "td-busd",
                 "td-compositor",
+                "td-desktop",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
@@ -10602,6 +10606,7 @@ mod tests {
                 "td-authd",
                 "td-boot",
                 "td-compositor",
+                "td-desktop",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",

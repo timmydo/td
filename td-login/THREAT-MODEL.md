@@ -26,6 +26,14 @@ existing `!td-service` path and cannot log in. Neither account belongs to
 another account's supplementary groups. The existing credential-switching
 implementation is unchanged.
 
+
+The native desktop connection extends primary-account SSH authority to
+ordinary application pixels, input and text selections while the session
+runs. Full-credential processes of that account can reach the same local
+compositor socket. Confined workloads use other UIDs. The physical lock,
+credential prompts and the td-admin forced command keep their respective
+input and authorization paths (`REMOTE-DESKTOP.md`).
+
 ## How far principle 7 holds
 
 `AGENTS.md` principle 7 is a target, not a current claim. The stock VM

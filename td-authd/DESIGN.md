@@ -5320,6 +5320,9 @@ A separate admitted mail capability is required for tag 12; the browsing
 channel is never its substitute. Root sends idle heartbeats, ends the
 window on an expired vault, and destroys the GUI and service on session
 teardown or before suspend. No descriptor survives to the next generation.
+Root gives the trusted notebook the compositor's dedicated
+`wayland-protected` display. Its lifetime withholds remote desktop
+frames, input and selection transfers before its first surface can map.
 
 
 The paired session also owns `/run/td-authd/1000/notebook-mail`, a mode-0600

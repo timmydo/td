@@ -12911,7 +12911,9 @@ session does not run: they go in `~/.local/lib/td` beside a host build
 of td-net, and their names in `~/.local/bin` are links to it. td-jail
 and td-txt, the companions `td-net launch --companions` prints, go
 there too, linked nowhere; td-net is built first so the verb can ask
-it both lists.
+it both lists. The native desktop viewer installs in `~/.local/bin`.
+Run `td-desktop [user@]host` to connect over SSH from the host Wayland
+session (REMOTE-DESKTOP.md).
 
 Run by one of those names, td-net is `td-net launch` of the program of
 that name beside the binary the link resolves to, refusing one that is

@@ -645,6 +645,7 @@ impl PresentedRequest {
 }
 
 pub struct Runtime {
+    desktop: crate::desktop::Seat,
     scene: Scene,
     attention_enabled: bool,
     /// Where frames go. Held through the trait alone, so a second backend is
@@ -955,6 +956,7 @@ impl Runtime {
     pub fn new(backend: impl OutputBackend + Send + 'static) -> Runtime {
         Runtime {
             scene: Scene::new(),
+            desktop: Default::default(),
             attention_enabled: false,
             backend: Box::new(backend),
             comparison: Vec::new(),
@@ -3307,6 +3309,7 @@ impl Runtime {
         let locks = connected.is_some_and(|answer| answer.locks() && !answer.admitted());
         if self.attention_enabled && locks {
             self.scene.lock();
+            self.desktop.lock_epoch = self.paints.saturating_add(1);
         }
         self.repaint()
     }
@@ -3354,6 +3357,9 @@ impl Runtime {
         // tried whatever failed before it: an error leaves the session
         // locked with no client focused, never the desktop.
         self.scene.lock();
+        self.desktop.lock_epoch = self.paints.saturating_add(1);
+        let released = self.release_desktop_input();
+        self.clear_desktop_seat();
         self.owed_damage = Damage::Whole;
         self.cancel_drag_under_overlay();
         let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted");
@@ -3363,6 +3369,7 @@ impl Runtime {
         };
         let focused = self.refresh_focus();
         let painted = self.repaint();
+        released?;
         suspended?;
         focused?;
         painted?;
@@ -3419,6 +3426,10 @@ impl Runtime {
             return Err("secure attention requires the paired compositor profile".to_string());
         }
         let was_draining = self.scene.attention_draining();
+        if visible && self.desktop.attached {
+            self.release_desktop_input()?;
+            self.clear_desktop_seat();
+        }
         self.scene.set_attention(visible);
         self.owed_damage = Damage::Whole;
         self.cancel_drag_under_overlay();
@@ -4127,6 +4138,7 @@ impl Runtime {
         // that changed no coordinate owes no paint, re-answers no focus and
         // re-derives no drop.
         let size = self.backend.dimensions();
+        self.physical_pointer(buttons)?;
         let moved = self.scene.move_pointer(dx, dy, size.width, size.height);
         self.pointer_report(time, moved, buttons, scroll)
     }
@@ -4153,6 +4165,7 @@ impl Runtime {
             self.forget_pointer_asks();
             return Ok(());
         }
+        self.physical_pointer(buttons)?;
         let moved = self.scene.place_pointer(x, y, size.width, size.height);
         self.pointer_report(time, moved, buttons, scroll)
     }
@@ -4799,6 +4812,11 @@ impl Runtime {
         if self.scene.private_screen() || self.resume_withholds() {
             return Ok(());
         }
+        let down = input.state == crate::keyboard::KeyState::Pressed;
+        crate::desktop::Seat::set(&mut self.desktop.physical_keys, input.key, down);
+        if crate::desktop::Seat::held(&self.desktop.remote_keys, input.key) {
+            return Ok(());
+        }
         if let Some(event) = self.keyboard.key(input)? {
             self.publish_keyboard_event(event);
         }
@@ -4809,7 +4827,8 @@ impl Runtime {
         if self.scene.private_screen() || self.resume_withholds() {
             return Ok(());
         }
-        if let Some(event) = self.keyboard.modifiers(modifiers)? {
+        self.desktop.physical_modifiers = modifiers;
+        if let Some(event) = self.keyboard.modifiers(self.desktop.modifiers())? {
             self.publish_keyboard_event(event);
         }
         // The modifier is half of what holds an Alt gesture open, so letting
@@ -4823,6 +4842,304 @@ impl Runtime {
             self.cancel_drag()?;
         }
         Ok(())
+    }
+
+    // The renderer and device dispatcher keep their existing physical lock.
+    // Only the authenticated desktop connection can select this input route.
+    fn desktop_available(&self) -> bool {
+        self.desktop.attached
+            && self.desktop.protected == 0
+            && !self.scene.attention_visible()
+            && self.scene.portal_modal().is_none()
+            && !self.scene.launcher_visible()
+            && !self.scene.chooser_visible()
+            && !self.scene.help_visible()
+            && !self.resume_withholds()
+            && (!self.scene.locked()
+                || self.presented.presented.lock().is_ok_and(|s| {
+                    self.desktop.lock_epoch != 0
+                        && s.epoch >= self.desktop.lock_epoch
+                        && s.completed.is_some()
+                }))
+    }
+
+    pub(crate) fn protect_desktop(&mut self) -> Result<(), String> {
+        self.desktop.protected = self
+            .desktop
+            .protected
+            .checked_add(1)
+            .ok_or("protected client limit")?;
+        self.bump_vm_revision()?;
+        self.release_desktop_input()?;
+        self.refresh_focus()
+    }
+
+    pub(crate) fn unprotect_desktop(&mut self) {
+        self.desktop.protected = self.desktop.protected.saturating_sub(1);
+    }
+
+    pub(crate) fn attach_desktop(&mut self) -> bool {
+        if self.desktop.attached {
+            return false;
+        }
+        self.desktop.paused = false;
+        self.desktop.attached = true;
+        true
+    }
+
+    pub(crate) fn detach_desktop(&mut self) -> Result<(), String> {
+        self.desktop.attached = false;
+        let released = self.release_desktop_input();
+        let focused = self.refresh_focus();
+        released.and(focused)
+    }
+
+    fn clear_desktop_seat(&mut self) {
+        self.desktop.remote_keys = [0; 4];
+        self.desktop.physical_keys = [0; 4];
+        self.desktop.locks = 0;
+        self.desktop.buttons = 0;
+        self.desktop.physical_buttons = 0;
+        self.desktop.physical_modifiers = ModifierState::default();
+    }
+
+    pub(crate) fn desktop_image(&mut self) -> Result<Option<crate::desktop::Image>, String> {
+        if !self.desktop_available() {
+            return Ok(None);
+        }
+        let width = self.width();
+        let height = self.height();
+        let Some((w, h, output)) = crate::desktop::geometry(width, height) else {
+            return Ok(None);
+        };
+        let mut pixels =
+            crate::allocation::filled(width * height * 4, 0u8).map_err(crate::desktop::error)?;
+        self.scene
+            .render_screenshot(&mut pixels, width, height, width * 4);
+        Ok(Some(crate::desktop::Image {
+            width: w,
+            height: h,
+            output,
+            pixels,
+        }))
+    }
+
+    pub(crate) fn desktop_snapshot(&self) -> Result<u64, String> {
+        if !self.desktop_available() || self.keyboard_target().is_none() {
+            return Err(crate::desktop::error("no ordinary desktop focus"));
+        }
+        Ok(self.vm_revision)
+    }
+
+    fn desktop_key(&mut self, code: u16, down: bool) -> Result<(), String> {
+        use crate::keyboard::{KeyState, MOD_CAPS, MOD_NUM};
+        let key = u32::from(code);
+        let old = crate::desktop::Seat::held(&self.desktop.remote_keys, key);
+        if code == 0 || code >= 256 || down == old {
+            return Ok(());
+        }
+        crate::desktop::Seat::set(&mut self.desktop.remote_keys, key, down);
+        let state = if down {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        };
+        if !crate::desktop::Seat::held(&self.desktop.physical_keys, key) {
+            let input = KeyInput {
+                time: self.desktop.time(),
+                key,
+                state,
+            };
+            if let Some(event) = self.keyboard.key(input)? {
+                self.publish_keyboard_event(event);
+            }
+        }
+        if down {
+            self.desktop.locks ^= match code {
+                58 => MOD_CAPS,
+                69 => MOD_NUM,
+                _ => 0,
+            };
+        }
+        if let Some(event) = self.keyboard.modifiers(self.desktop.modifiers())? {
+            self.publish_keyboard_event(event);
+        }
+        Ok(())
+    }
+
+    fn physical_pointer(&mut self, buttons: &[PointerButtonInput]) -> Result<(), String> {
+        if self.desktop.buttons != 0 {
+            self.desktop_pointer_buttons(0, PointerScroll::default())?;
+        }
+        for b in buttons {
+            if let Some(i) = b.button.checked_sub(272).filter(|i| *i < 3) {
+                let bit = 1 << i;
+                if b.state == PointerButtonState::Pressed {
+                    self.desktop.physical_buttons |= bit;
+                } else {
+                    self.desktop.physical_buttons &= !bit;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn desktop_pointer_buttons(
+        &mut self,
+        buttons: u8,
+        scroll: PointerScroll,
+    ) -> Result<(), String> {
+        let time = self.desktop.time();
+        let mut transitions = [PointerButtonInput {
+            time,
+            button: 0,
+            state: PointerButtonState::Released,
+        }; 3];
+        let mut count = 0;
+        for bit in 0..3u32 {
+            if (self.desktop.buttons ^ buttons) & (1 << bit) == 0 {
+                continue;
+            }
+            let transition = transitions.get_mut(count).ok_or("desktop buttons")?;
+            transition.button = 272 + bit;
+            transition.state = if buttons & (1 << bit) == 0 {
+                PointerButtonState::Released
+            } else {
+                PointerButtonState::Pressed
+            };
+            count += 1;
+        }
+        let (hover, grab) =
+            if buttons == 0 && self.desktop.buttons != 0 && !self.desktop_available() {
+                let focus = self.pointer.snapshot().focus;
+                (
+                    None,
+                    focus.filter(|t| Some(t.surface) == self.pointer.grab_surface()),
+                )
+            } else {
+                self.pointer_targets()
+            };
+        let frames = self.pointer.frame(
+            time,
+            hover,
+            grab,
+            transitions.get(..count).ok_or("desktop buttons")?,
+            scroll,
+            |_| false,
+        )?;
+        self.desktop.buttons = buttons;
+        self.publish_pointer(frames.frames);
+        Ok(())
+    }
+
+    fn release_desktop_input(&mut self) -> Result<(), String> {
+        for code in 1..256u16 {
+            if crate::desktop::Seat::held(&self.desktop.remote_keys, u32::from(code)) {
+                self.desktop_key(code, false)?;
+            }
+        }
+        if self.desktop.locks != 0 {
+            self.desktop.locks = 0;
+            if let Some(event) = self.keyboard.modifiers(self.desktop.modifiers())? {
+                self.publish_keyboard_event(event);
+            }
+        }
+        if self.desktop.buttons != 0 {
+            self.desktop_pointer_buttons(0, PointerScroll::default())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn desktop_input(
+        &mut self,
+        req: crate::desktop_wire::Request<'_>,
+    ) -> Result<crate::desktop_wire::Reply<'static>, String> {
+        use crate::desktop_wire::{Reply, Request};
+        if req == Request::ReleaseAll {
+            self.release_desktop_input()?;
+            return Ok(Reply::Applied);
+        }
+        if !self.desktop_available() {
+            return Ok(Reply::Unavailable);
+        }
+        self.refresh_focus()?;
+        match req {
+            Request::Key { code, down }
+                if (1..256).contains(&code)
+                    && (self.keyboard_target().is_some()
+                        || (!down
+                            && crate::desktop::Seat::held(
+                                &self.desktop.remote_keys,
+                                u32::from(code),
+                            ))) =>
+            {
+                self.desktop_key(code, down)?
+            }
+            Request::Pointer { at, .. } | Request::Scroll { at, .. } => {
+                let (w, h) = (self.width(), self.height());
+                if !crate::desktop::geometry(w, h).is_some_and(|(width, height, id)| {
+                    id == at.output && at.x < width && at.y < height
+                }) {
+                    return Ok(Reply::StaleOutput);
+                }
+                if self.desktop.physical_buttons != 0 || self.dragging.is_some() {
+                    return Ok(Reply::Unavailable);
+                }
+                let x = Fraction {
+                    numerator: u32::from(at.x),
+                    denominator: w as u32,
+                };
+                let y = Fraction {
+                    numerator: u32::from(at.y),
+                    denominator: h as u32,
+                };
+                self.scene.place_pointer(x, y, w, h);
+                if self.pointer.grab_surface().is_none() {
+                    if let Some(key) = self.scene.hover_focus_at_pointer(w, h) {
+                        self.focus_surface(key)?;
+                    }
+                }
+                let (buttons, scroll) = match req {
+                    Request::Pointer { buttons, .. } => (buttons, PointerScroll::default()),
+                    Request::Scroll { x, y, .. } => (
+                        self.desktop.buttons,
+                        PointerScroll {
+                            horizontal: i32::from(x),
+                            vertical: -i32::from(y),
+                        },
+                    ),
+                    _ => return Ok(Reply::Unavailable),
+                };
+                self.desktop_pointer_buttons(buttons, scroll)?;
+                self.settle_cursor();
+                if !self.scene.locked() {
+                    self.repaint()?;
+                }
+            }
+            Request::PrepareText => {
+                return Ok(self
+                    .desktop_snapshot()
+                    .map_or(Reply::Unavailable, Reply::Revision))
+            }
+            Request::WriteText { revision, text } => {
+                if self.desktop_snapshot() != Ok(revision) {
+                    return Ok(Reply::Unavailable);
+                }
+                let Some(focus) = self.keyboard_target() else {
+                    return Ok(Reply::Unavailable);
+                };
+                let bytes =
+                    crate::allocation::copy(text.as_bytes()).map_err(crate::desktop::error)?;
+                self.own_selection(
+                    bytes,
+                    OwnedKind::Text,
+                    &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"],
+                    Some(focus.client),
+                )?;
+            }
+            _ => return Ok(Reply::Unavailable),
+        }
+        Ok(Reply::Applied)
     }
 
     pub fn keyboard_snapshot(&self) -> KeyboardSnapshot {
@@ -5788,12 +6105,33 @@ impl Runtime {
         self.own_selection(png, OwnedKind::Picture, &["image/png"], focused)
     }
 
+    #[cfg(test)]
     pub(crate) fn vm_get(
         &mut self,
         revision: u64,
         file: TransferEndpoint,
     ) -> Result<Option<Arc<Vec<u8>>>, String> {
-        self.vm_check(revision)?;
+        self.clipboard_get(revision, file, false)
+    }
+
+    pub(crate) fn clipboard_check(&self, revision: u64, desktop: bool) -> Result<(), String> {
+        if !desktop {
+            return self.vm_check(revision);
+        }
+        if self.desktop_snapshot()? == revision {
+            Ok(())
+        } else {
+            Err(crate::desktop::error("desktop selection changed"))
+        }
+    }
+
+    pub(crate) fn clipboard_get(
+        &mut self,
+        revision: u64,
+        file: TransferEndpoint,
+        desktop: bool,
+    ) -> Result<Option<Arc<Vec<u8>>>, String> {
+        self.clipboard_check(revision, desktop)?;
         let source = self.selection.clone().ok_or("guest clipboard is empty")?;
         if let Some(owned) = &self.owned_selection {
             if owned.identity == source.identity {
@@ -6257,6 +6595,14 @@ impl Runtime {
         // failures either half can report — a keyboard or pointer revision
         // exhausted — are exactly the moments a stale cursor would be least
         // explicable.
+        if self.desktop.attached {
+            let paused = !self.desktop_available();
+            if paused && !self.desktop.paused {
+                self.bump_vm_revision()?;
+                self.release_desktop_input()?;
+            }
+            self.desktop.paused = paused;
+        }
         let mut failures = Vec::new();
         match self.keyboard.set_focus(self.keyboard_target()) {
             Ok(keyboard) => {
@@ -6307,7 +6653,7 @@ impl Runtime {
     /// than moving this target. The portal dialog differs because it is a
     /// client surface owed keyboard enter/leave while it enforces modality.
     fn keyboard_target(&self) -> Option<SurfaceKey> {
-        if self.scene.private_screen() {
+        if self.scene.private_screen() && !self.desktop_available() {
             return None;
         }
         let size = self.backend.dimensions();
@@ -6339,6 +6685,9 @@ impl Runtime {
     }
 
     fn routed_pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
+        if self.scene.locked() && self.desktop_available() {
+            return self.pointer_targets();
+        }
         if self.scene.private_screen() {
             return (None, None);
         }
@@ -17844,6 +18193,275 @@ mod tests {
     /// Every generation relocks on the same rule: a restarted compositor
     /// keeps nothing of the last one's unlock, so on an answer that is
     /// still enrolled or unavailable it starts on the lock surface again.
+    #[test]
+    fn attached_viewer_uses_the_running_desktop_across_a_physical_lock() {
+        use crate::desktop_wire::{Position, Reply, Request};
+        use crate::keyboard::KeyState;
+        let (mut rt, frames) = recorded(true);
+        let enrolled = login(&[1, 1, 7, 7, 7, 7]).current().unwrap();
+        rt.first_paint(Some(&enrolled), None).unwrap();
+        let key = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        rt.commit(key, surface([9, 8, 7, 0])).unwrap();
+        assert_eq!(
+            frames.lock().unwrap().last(),
+            Some(&lock_surface(Some(&enrolled)))
+        );
+        assert!(rt.attach_desktop());
+        assert!(!rt.attach_desktop());
+        let image = rt.desktop_image().unwrap().unwrap();
+        assert!(image.pixels.as_chunks::<4>().0.contains(&[9, 8, 7, 0]));
+        assert_ne!(image.pixels, lock_surface(Some(&enrolled)));
+        assert_eq!(
+            rt.desktop_input(Request::Key {
+                code: 29,
+                down: true
+            })
+            .unwrap(),
+            Reply::Applied
+        );
+        assert_eq!(rt.keyboard_snapshot().focus, Some(key));
+        assert_eq!(rt.keyboard_snapshot().keys, vec![29]);
+        rt.key(KeyInput {
+            time: 1,
+            key: 30,
+            state: KeyState::Pressed,
+        })
+        .unwrap();
+        assert_eq!(rt.keyboard_snapshot().keys, vec![29]);
+        rt.desktop_input(Request::Pointer {
+            at: Position {
+                output: image.output,
+                x: 40,
+                y: 60,
+            },
+            buttons: 1,
+        })
+        .unwrap();
+        rt.desktop_input(Request::ReleaseAll).unwrap();
+        assert!(rt.keyboard_snapshot().keys.is_empty());
+        assert_eq!(
+            frames.lock().unwrap().last(),
+            Some(&lock_surface(Some(&enrolled)))
+        );
+        let origin = crate::input::test_origin();
+        rt.attention(&origin, true).unwrap();
+        assert!(rt.desktop_image().unwrap().is_none());
+        assert_eq!(
+            rt.desktop_input(Request::Key {
+                code: 28,
+                down: true
+            })
+            .unwrap(),
+            Reply::Unavailable
+        );
+        assert!(rt.desktop_snapshot().is_err());
+        rt.attention(&origin, false).unwrap();
+        rt.detach_desktop().unwrap();
+        assert!(rt.session_locked());
+        assert_eq!(rt.keyboard_snapshot().focus, None);
+        assert_eq!(
+            frames.lock().unwrap().last(),
+            Some(&lock_surface(Some(&enrolled)))
+        );
+    }
+
+    #[test]
+    fn attaching_to_an_unlocked_console_preserves_local_input_and_protected_windows() {
+        use crate::desktop_wire::{Reply, Request};
+        use crate::keyboard::KeyState;
+        let (mut rt, _frames) = recorded(true);
+        rt.first_paint(None, None).unwrap();
+        rt.commit(
+            SurfaceKey {
+                client: 1,
+                object: 10,
+            },
+            surface([9, 8, 7, 0]),
+        )
+        .unwrap();
+        let physical = KeyInput {
+            time: 1,
+            key: 42,
+            state: KeyState::Pressed,
+        };
+        rt.key(physical).unwrap();
+        assert!(rt.attach_desktop());
+        rt.desktop_input(Request::Key {
+            code: 42,
+            down: true,
+        })
+        .unwrap();
+        rt.desktop_input(Request::ReleaseAll).unwrap();
+        assert_eq!(rt.keyboard_snapshot().keys, vec![42]);
+        rt.desktop_input(Request::Key {
+            code: 29,
+            down: true,
+        })
+        .unwrap();
+        let revision = rt.desktop_snapshot().unwrap();
+        rt.launcher(LauncherAction::Open).unwrap();
+        assert_eq!(rt.keyboard_snapshot().keys, vec![42]);
+        rt.launcher(LauncherAction::Close).unwrap();
+        assert_eq!(
+            rt.desktop_input(Request::WriteText {
+                revision,
+                text: "old focus"
+            })
+            .unwrap(),
+            Reply::Unavailable
+        );
+        rt.protect_desktop().unwrap();
+        assert!(rt.desktop_image().unwrap().is_none());
+        assert_eq!(
+            rt.desktop_input(Request::WriteText {
+                revision: 0,
+                text: "sample"
+            })
+            .unwrap(),
+            Reply::Unavailable
+        );
+        rt.unprotect_desktop();
+        assert!(rt.desktop_image().unwrap().is_some());
+        rt.desktop_input(Request::Key {
+            code: 29,
+            down: true,
+        })
+        .unwrap();
+        rt.remove_client(1).unwrap();
+        assert!(rt.keyboard_snapshot().focus.is_none());
+        assert_eq!(
+            rt.desktop_input(Request::Key {
+                code: 29,
+                down: false
+            })
+            .unwrap(),
+            Reply::Applied
+        );
+        assert_eq!(
+            rt.desktop_input(Request::Key {
+                code: 29,
+                down: true
+            })
+            .unwrap(),
+            Reply::Unavailable
+        );
+        rt.commit(
+            SurfaceKey {
+                client: 2,
+                object: 10,
+            },
+            surface([5, 6, 7, 0]),
+        )
+        .unwrap();
+        assert_eq!(rt.keyboard_snapshot().keys, vec![42]);
+        rt.detach_desktop().unwrap();
+        assert!(!rt.session_locked());
+        assert_eq!(rt.keyboard_snapshot().keys, vec![42]);
+    }
+
+    #[test]
+    fn desktop_socket_round_trips_frames_keys_and_text_under_the_physical_lock() {
+        use crate::desktop_wire::{Reply, Request};
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (mut rt, scanout) = recorded(true);
+        let enrolled = login(&[1, 1, 7, 7, 7, 7]).current().unwrap();
+        rt.first_paint(Some(&enrolled), None).unwrap();
+        rt.commit(
+            SurfaceKey {
+                client: 4,
+                object: 5,
+            },
+            surface([8, 9, 10, 0]),
+        )
+        .unwrap();
+        rt.clipboard_writer(Some(crate::vm_bridge::start_clipboard_writer().unwrap()));
+        assert!(rt.attach_desktop());
+        let rt = Mutex::new(rt);
+        std::thread::scope(|threads| {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            threads.spawn(|| {
+                let _ = crate::desktop::session(server, &rt);
+            });
+            let mut exchange = |request: Request<'_>| {
+                let mut encoded = Vec::new();
+                request.write(&mut encoded).unwrap();
+                client
+                    .write_all(&(encoded.len() as u32).to_be_bytes())
+                    .unwrap();
+                client.write_all(&encoded).unwrap();
+                let mut size = [0; 4];
+                client.read_exact(&mut size).unwrap();
+                let size = u32::from_be_bytes(size) as usize;
+                assert!(size <= crate::desktop_wire::MAX_REPLY);
+                let mut reply = vec![0; size];
+                client.read_exact(&mut reply).unwrap();
+                reply
+            };
+            assert!(matches!(
+                Reply::decode(&exchange(Request::Frame)),
+                Ok(Reply::Frame {
+                    width: 800,
+                    height: 600,
+                    ..
+                })
+            ));
+            assert_eq!(Reply::decode(&exchange(Request::Frame)), Ok(Reply::Applied));
+            assert_eq!(
+                Reply::decode(&exchange(Request::Key {
+                    code: 42,
+                    down: true
+                })),
+                Ok(Reply::Applied)
+            );
+            assert_eq!(rt.lock().unwrap().keyboard_snapshot().keys, vec![42]);
+            let Ok(Reply::Revision(revision)) = Reply::decode(&exchange(Request::PrepareText))
+            else {
+                panic!("expected clipboard focus revision");
+            };
+            assert_eq!(
+                Reply::decode(&exchange(Request::WriteText {
+                    revision: revision.wrapping_add(1),
+                    text: "stale"
+                })),
+                Ok(Reply::Unavailable)
+            );
+            assert_eq!(
+                Reply::decode(&exchange(Request::WriteText {
+                    revision,
+                    text: "remote\nselection"
+                })),
+                Ok(Reply::Applied)
+            );
+            assert_eq!(
+                Reply::decode(&exchange(Request::ReadText)),
+                Ok(Reply::Text("remote\nselection"))
+            );
+            rt.lock().unwrap().protect_desktop().unwrap();
+            assert_eq!(
+                Reply::decode(&exchange(Request::ReadText)),
+                Ok(Reply::Unavailable)
+            );
+            assert_eq!(
+                Reply::decode(&exchange(Request::Frame)),
+                Ok(Reply::Unavailable)
+            );
+        });
+        let mut rt = rt.into_inner().unwrap();
+        rt.detach_desktop().unwrap();
+        assert!(rt.keyboard_snapshot().keys.is_empty());
+        assert_eq!(
+            scanout.lock().unwrap().last(),
+            Some(&lock_surface(Some(&enrolled)))
+        );
+    }
+
     #[test]
     fn every_generation_starts_locked_again() {
         let origin = crate::input::test_origin();

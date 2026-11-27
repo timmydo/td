@@ -1544,6 +1544,12 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(gate < launch.find("command.args([\"--select\", name]);").unwrap());
     // A PIN request lives on only in its clearing owner.
     assert_eq!(launch.matches("bytes.fill(0);").count(), 1);
+    assert_eq!(
+        launch
+            .matches("/run/td-compositor/{uid}/wayland-protected")
+            .count(),
+        1
+    );
     assert_eq!(fingerprint(launch), LAUNCH_FINGERPRINT);
     let main = include_str!("../src/main.rs");
     assert!(main.starts_with("#![deny(unsafe_code)]"));
@@ -1906,7 +1912,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0x1277edf9e370582f;
 const SOFTWARE_FINGERPRINT: u64 = 0x725c5011756b1eac;
-const LAUNCH_FINGERPRINT: u64 = 0x373df1eed335eea2;
+const LAUNCH_FINGERPRINT: u64 = 0xea0d45741a1c6f5c;
 const MAIN_FINGERPRINT: u64 = 0x33990d6b29df26af;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0x0065a818b7d44dd0;

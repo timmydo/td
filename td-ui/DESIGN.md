@@ -116,7 +116,9 @@ the selection's text whole; and the widget window's clipboard, a
 `Clipboard` handed to the handler with every input, through which it
 offers text as the selection at the press it is answering and asks the
 selection for its text, which the window delivers as `Input::Paste`. The
-editor's window keeps its own clipboard half over the moved writer.
+editor's window keeps its own clipboard half over the moved writer. A
+consumer can request a smaller text limit with `Incoming::begin_bounded`.
+The receiver enforces it as bytes arrive.
 
 Newly built (increments 17 and 18): the outline reader `sfnt` and its
 coverage rasterizer `coverage`, and the atlas executor over them: the

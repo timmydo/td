@@ -5682,6 +5682,22 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             target: "{in:td-pass}/bin/td-pass".into(),
             link: "{root}/real-root/bin/td-pass".into(),
         });
+        td_engine::allocation::push(
+            &mut steps,
+            Step::CopyTree {
+                from: "{in:td-desktop}".into(),
+                dest: "{root}/real-root{in:td-desktop}".into(),
+            },
+        )
+        .map_err(|_| String::new())?;
+        td_engine::allocation::push(
+            &mut steps,
+            Step::Symlink {
+                target: "{in:td-desktop}/bin/td-desktop".into(),
+                link: "{root}/real-root/bin/td-desktop".into(),
+            },
+        )
+        .map_err(|_| String::new())?;
         // td-dua, the disk usage analyzer, a static system-tree program run from
         // the terminal (td-dua/DESIGN.md).
         steps.push(Step::CopyTree {
@@ -6866,6 +6882,7 @@ const DESKTOP_INPUTS: &[&str] = &[
     "td-photo",
     "td-editor",
     "td-pass",
+    "td-desktop",
     "td-dua",
     "td-software",
     "td-mixer",
@@ -7191,6 +7208,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "td-photo",
                 "td-editor",
                 "td-pass",
+                "td-desktop",
                 "td-dua",
                 "td-software",
                 "td-mixer",
@@ -9379,6 +9397,7 @@ mod tests {
             ("td-photo", "td-photo"),
             ("td-editor", "td-editor"),
             ("td-pass", "td-pass"),
+            ("td-desktop", "td-desktop"),
             ("td-dua", "td-dua"),
             ("td-software", "td-software"),
             ("td-mixer", "td-mixer"),
@@ -18341,6 +18360,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             "td-photo",
             "td-editor",
             "td-pass",
+            "td-desktop",
             "td-dua",
             "td-software",
             "td-mixer",
@@ -18866,6 +18886,7 @@ mod server_tests {
             "td-sandbox",
             "td-photo",
             "td-pass",
+            "td-desktop",
             "td-dua",
             "td-software",
             "td-mixer",

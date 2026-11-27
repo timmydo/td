@@ -681,6 +681,7 @@ recipes/src/recipes/td-busd.rs	unchecked-growth-or-clone	6
 recipes/src/recipes/td-charset-notice.rs	allocation-macro	1
 recipes/src/recipes/td-compositor.rs	allocation-macro	4
 recipes/src/recipes/td-compositor.rs	unchecked-growth-or-clone	5
+recipes/src/recipes/td-desktop-test.rs	allocation-macro	4
 recipes/src/recipes/td-dua-test.rs	allocation-macro	4
 recipes/src/recipes/td-editor-test.rs	allocation-macro	4
 recipes/src/recipes/td-firstboot-test.rs	allocation-macro	12
@@ -1160,7 +1161,7 @@ td-authd/src/inspection.rs	allocation-macro	3
 td-authd/src/inspection.rs	unchecked-growth-or-clone	1
 td-authd/src/launch.rs	allocating-constructor	1
 td-authd/src/launch.rs	allocating-conversion	32
-td-authd/src/launch.rs	allocation-macro	39
+td-authd/src/launch.rs	allocation-macro	38
 td-authd/src/launch.rs	unchecked-growth-or-clone	6
 td-authd/src/login.rs	allocating-constructor	1
 td-authd/src/login.rs	allocating-conversion	4
@@ -1494,7 +1495,7 @@ td-compositor/src/server.rs	allocating-constructor	4
 td-compositor/src/server.rs	allocating-conversion	223
 td-compositor/src/server.rs	allocation-macro	269
 td-compositor/src/server.rs	heap-owner	27
-td-compositor/src/server.rs	unchecked-growth-or-clone	107
+td-compositor/src/server.rs	unchecked-growth-or-clone	105
 td-compositor/src/session.rs	allocating-conversion	7
 td-compositor/src/session.rs	allocation-macro	16
 td-compositor/src/session.rs	unchecked-growth-or-clone	3

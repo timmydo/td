@@ -376,7 +376,7 @@ fn notebook_command(uid: u32) -> Result<Command, String> {
         .arg("--trusted")
         .env(
             "WAYLAND_DISPLAY",
-            format!("/run/td-compositor/{uid}/wayland-0"),
+            crate::text(format_args!("/run/td-compositor/{uid}/wayland-protected"))?,
         )
         .env(
             "XDG_RUNTIME_DIR",

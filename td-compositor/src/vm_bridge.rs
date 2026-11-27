@@ -301,13 +301,22 @@ fn read_selection(
     revision: u64,
     deadline: Instant,
 ) -> Result<Vec<u8>, String> {
+    read_text(runtime, revision, deadline, false)
+}
+
+pub(crate) fn read_text(
+    runtime: &Mutex<Runtime>,
+    revision: u64,
+    deadline: Instant,
+    desktop: bool,
+) -> Result<Vec<u8>, String> {
     let (mut reader, writer) = UnixStream::pair().map_err(|e| e.to_string())?;
     reader.set_nonblocking(true).map_err(|e| e.to_string())?;
     let file = File::from(OwnedFd::from(writer));
     let cached = runtime
         .lock()
         .map_err(|_| "runtime lock poisoned")?
-        .vm_get(revision, TransferEndpoint::from_file(file))?;
+        .clipboard_get(revision, TransferEndpoint::from_file(file), desktop)?;
     let mut data = Vec::new();
     if let Some(bytes) = cached {
         data.extend_from_slice(&bytes);
@@ -317,7 +326,7 @@ fn read_selection(
             runtime
                 .lock()
                 .map_err(|_| "runtime lock poisoned")?
-                .vm_check(revision)?;
+                .clipboard_check(revision, desktop)?;
             if Instant::now() >= deadline {
                 return Err("guest clipboard source timed out".into());
             }
@@ -340,7 +349,11 @@ fn read_selection(
     runtime
         .lock()
         .map_err(|_| "runtime lock poisoned")?
-        .vm_check(revision)?;
+        .clipboard_check(revision, desktop)?;
+    if desktop {
+        std::str::from_utf8(&data).map_err(|_| "desktop selection is not text")?;
+        return Ok(data);
+    }
     wire::text(&data)?;
     if data.is_empty() {
         return Err("guest clipboard source returned no text".into());

@@ -1,12 +1,12 @@
-# Native remote desktop proposal
+# Native remote desktop
 
 The viewer attaches to the primary account's running graphical session.
 A terminal open before the connection is the same terminal during it.
 Connecting, using the desktop and disconnecting must preserve an existing
 physical lock. An unlocked monitor stays visible for shared use. A physical
-lock or unlock during the connection changes local presentation and local
-input admission while the viewer stays attached. This document specifies the proposed viewer and its acceptance
-tests. The installed compositor currently withdraws application input on lock.
+lock or unlock during the connection changes only local presentation and
+local input admission. The viewer uses application focus while physical
+input stays with the local console.
 
 ## Connection and authority
 
@@ -23,7 +23,8 @@ human. Confined workload UIDs and the administrator UID receive no desktop
 connection. A local process running with the human's full credentials has
 the same ordinary desktop authority as their SSH helper. The socket belongs
 to one compositor generation. A viewer needs a new connection after a
-restart. The first implementation admits one viewer at a time.
+restart. The compositor admits one viewer at a time. The live installer has
+no remote desktop endpoint. Only an installed boot can publish it.
 
 The remote protocol carries ordinary desktop operations only. Privileged
 remote actions continue through the fixed commands of the separately
@@ -48,7 +49,8 @@ applications on the visible workspace. They must never be dispatched as
 physical device reports. Trusted prompts and the trusted notebook's
 credential window require exclusion from both remote pixels and input.
 Resolve protected surfaces by trusted compositor or launch authority.
-A client-supplied title or application ID cannot confer trust.
+Root gives the notebook the protected Wayland socket. The server withholds
+the remote seat while a client on that socket can own a surface.
 
 Coordinates refer to the remote output. The viewer scales the image to fit
 and maps pointer coordinates back through the same transform. Input aimed
@@ -58,8 +60,9 @@ grabs. A replacement connection starts with all keys and buttons up.
 
 ## Clipboard and flow control
 
-The first clipboard format is UTF-8 text. Provide explicit copy-from-remote
-and paste-to-remote actions, each tied to a viewer gesture. Ordinary copy
+The first clipboard format is UTF-8 text. F9 copies the remote selection into the viewer machine’s clipboard.
+F10 sends the viewer machine’s clipboard to the remote selection. Paste
+in the destination application to insert the transferred text. Ordinary copy
 and paste inside a remote application continue to use its own Wayland
 selection. Request clipboard data only for the chosen transfer and bind it
 to the connection, selection revision and eligible source. Recheck these
@@ -69,10 +72,12 @@ transfer cannot disclose its selection.
 Bound output dimensions, frame bytes and clipboard bytes before allocation.
 Limit frames in flight and coalesce stale pictures. Preserve input ordering
 and give releases and disconnect a bounded path even on a slow display
-link. Connection loss invalidates transfer state. The viewer reports SSH
+link. The compositor waits for the SSH helper between requests without
+a frame-rate deadline. Partial requests and socket writes have deadlines.
+Connection loss invalidates transfer state. The viewer reports SSH
 and host-key errors through the existing td-remote error path.
 
-## Acceptance
+## Acceptance criteria
 
 - Boot an enrolled guest to its lock screen. Open the viewer over real SSH
   without local interaction. Type a fresh marker into an ordinary terminal

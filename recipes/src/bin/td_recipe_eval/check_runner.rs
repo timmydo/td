@@ -8552,6 +8552,7 @@ mod tests {
                 "td-btrfs",
                 "td-busd",
                 "td-compositor",
+                "td-desktop",
                 "td-disks",
                 "td-dua",
                 "td-editor",

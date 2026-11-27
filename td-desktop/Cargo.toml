@@ -1,0 +1,30 @@
+[package]
+name = "td-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Native viewer for the primary desktop over SSH"
+license = "MIT"
+
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[dependencies]
+td-alloc = { path = "../td-alloc" }
+td-desktop-protocol = { path = "../td-desktop-protocol" }
+td-fs = { path = "../td-fs" }
+td-remote = { path = "../td-remote" }
+td-ui = { path = "../td-ui" }

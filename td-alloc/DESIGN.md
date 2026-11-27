@@ -164,6 +164,12 @@ UNSAFE.md. The stable std allocator API does not
 currently provide a safe fallible replacement for every collection.
 
 
+The host recipe definition for `td-desktop-test` uses four fixed
+`vec!` literals for its build steps, executable and result paths, and
+check descriptor. Their lengths are set in source. The recipe registry
+constructs these descriptors infallibly. The viewer, SSH relay and server
+do not consume this allowance.
+
 ## Owned byte budgets
 
 `Budget` is an explicitly passed, movable shared identity. Creating it and

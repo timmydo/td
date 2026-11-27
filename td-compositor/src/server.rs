@@ -678,10 +678,18 @@ type DeleteReservation = Arc<Mutex<()>>;
 type PendingDeletes = Arc<Mutex<BTreeMap<u32, DeleteReservation>>>;
 type PointerAuthority = Arc<Mutex<Option<PointerEnterAuthority>>>;
 
-#[derive(Clone)]
 struct KeymapFile {
     file: Arc<File>,
     size: u32,
+}
+
+impl KeymapFile {
+    fn shared(&self) -> Self {
+        Self {
+            file: Arc::clone(&self.file),
+            size: self.size,
+        }
+    }
 }
 
 /// Per-connection write policy: how long one event may stall, how often a
@@ -7849,7 +7857,11 @@ pub fn watch_application(
     })
 }
 
-fn bind_listener(path: &Path, label: &str, policy: SocketPolicy) -> Result<UnixListener, String> {
+pub(crate) fn bind_listener(
+    path: &Path,
+    label: &str,
+    policy: SocketPolicy,
+) -> Result<UnixListener, String> {
     socket::remove_stale(path, label)?;
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("bind {label} socket {}: {e}", path.display()))?;
@@ -7938,6 +7950,7 @@ fn accept_clients(
     runtime: Arc<Mutex<Runtime>>,
     keymap: KeymapFile,
     policy: SocketPolicy,
+    protected: bool,
 ) -> Result<(), String> {
     let mut rejections = RejectionBudget::default();
     for connection in listener.incoming() {
@@ -7960,15 +7973,40 @@ fn accept_clients(
         };
         let id = allocate_client_id(&NEXT_CLIENT)?;
         let runtime = Arc::clone(&runtime);
-        let keymap = keymap.clone();
+        let keymap = keymap.shared();
         thread::Builder::new()
             .name(format!("wayland-client-{id}"))
             .spawn(move || {
                 let _permit = permit;
                 let deadline = WriteDeadline::for_access(access);
-                if let Err(error) =
-                    serve_client_with_access(stream, id, runtime, keymap, access, deadline)
-                {
+                if protected {
+                    let admitted = runtime
+                        .lock()
+                        .ok()
+                        .and_then(|mut rt| rt.protect_desktop().ok());
+                    if admitted.is_none() {
+                        return;
+                    }
+                }
+                let result = serve_client_with_access(
+                    stream,
+                    id,
+                    Arc::clone(&runtime),
+                    keymap,
+                    access,
+                    deadline,
+                );
+                if protected {
+                    if let Ok(mut rt) = runtime.lock() {
+                        if result.is_ok()
+                            || (rt.clear_client_selection(id).is_ok()
+                                && rt.remove_client(id).is_ok())
+                        {
+                            rt.unprotect_desktop();
+                        }
+                    }
+                }
+                if let Err(error) = result {
                     eprintln!("td-compositor: {channel} client {id}: {error}");
                 }
             })
@@ -7985,8 +8023,35 @@ pub fn serve(
 ) -> Result<(), String> {
     let keymap_dir = keymap_directory(path)?.to_path_buf();
     let keymap = keymap_file(&keymap_dir)?;
+    if policy == SocketPolicy::ApplicationSession {
+        let protected = bind_listener(
+            &path.with_file_name("wayland-protected"),
+            "protected Wayland",
+            SocketPolicy::HumanSession,
+        )?;
+        let secure_runtime = Arc::clone(&runtime);
+        let secure_keymap = keymap.shared();
+        thread::Builder::new()
+            .spawn(move || {
+                if let Err(error) = accept_clients(
+                    protected,
+                    "protected Wayland",
+                    ClientAccess::Public,
+                    secure_runtime,
+                    secure_keymap,
+                    SocketPolicy::HumanSession,
+                    true,
+                ) {
+                    eprintln!("td-compositor: {error}");
+                }
+            })
+            .map_err(|_| "could not start protected display listener")?;
+        if std::fs::File::open("/proc/cmdline").is_ok_and(crate::desktop::installed_boot) {
+            crate::desktop::start(&path.with_file_name("desktop"), Arc::clone(&runtime))?;
+        }
+    }
     let portal_runtime = Arc::clone(&runtime);
-    let portal_keymap = keymap.clone();
+    let portal_keymap = keymap.shared();
     let listener = start_wayland_channels(
         path,
         portal_path,
@@ -8003,6 +8068,7 @@ pub fn serve(
                         portal_runtime,
                         portal_keymap,
                         policy,
+                        false,
                     ) {
                         eprintln!("td-compositor: {error}");
                         std::process::exit(1);
@@ -8019,6 +8085,7 @@ pub fn serve(
         runtime,
         keymap,
         policy,
+        false,
     )
 }
 
@@ -8042,6 +8109,7 @@ pub(crate) fn serve_headless(
                 runtime,
                 keymap,
                 SocketPolicy::Private,
+                false,
             )
             .and_then(|()| Err("headless Wayland listener retired".into()));
             completion.report(result);
@@ -9507,7 +9575,7 @@ mod tests {
         );
         assert!(keymap.file.write_all_at(b"x", 0).is_err());
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
-        let second = keymap.clone();
+        let second = keymap.shared();
         assert!(Arc::ptr_eq(&keymap.file, &second.file));
         drop(keymap);
         drop(second);

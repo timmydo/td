@@ -31,13 +31,20 @@ fn input_transitions_and_clipboard_round_trip() {
         },
         Request::ReleaseAll,
         Request::ReadText,
-        Request::WriteText("two\n行"),
-        Request::WriteText(""),
+        Request::PrepareText,
+        Request::WriteText {
+            revision: 123,
+            text: "two\n行",
+        },
+        Request::WriteText {
+            revision: 9,
+            text: "",
+        },
     ] {
         let mut message = Vec::new();
         request.write(&mut message).unwrap();
         assert_eq!(Request::decode(&message).unwrap(), request);
-        if !matches!(request, Request::WriteText(_)) {
+        if !matches!(request, Request::WriteText { .. }) {
             for length in 0..message.len() {
                 assert!(Request::decode(message.get(..length).unwrap()).is_err());
             }
@@ -82,17 +89,30 @@ fn frame_extent_and_payload_must_agree_exactly() {
 fn text_limit_is_in_bytes_and_invalid_utf8_is_refused() {
     let mut text = "é".repeat(MAX_TEXT / 2);
     let mut message = Vec::new();
-    Request::WriteText(&text).write(&mut message).unwrap();
+    (Request::WriteText {
+        revision: 77,
+        text: &text,
+    })
+    .write(&mut message)
+    .unwrap();
     assert_eq!(message.len(), MAX_REQUEST);
     assert_eq!(
         Request::decode(&message).unwrap(),
-        Request::WriteText(&text)
+        (Request::WriteText {
+            revision: 77,
+            text: &text
+        })
     );
     text.push('x');
     message.push(b'x');
     assert!(Request::decode(&message).is_err());
     message.clear();
-    assert!(Request::WriteText(&text).write(&mut message).is_err());
+    assert!((Request::WriteText {
+        revision: 77,
+        text: &text
+    })
+    .write(&mut message)
+    .is_err());
     assert!(Reply::Text(&text).write(&mut message).is_err());
     assert!(message.is_empty());
     assert!(Request::decode(&[7, 0xff]).is_err());
@@ -102,6 +122,7 @@ fn text_limit_is_in_bytes_and_invalid_utf8_is_refused() {
 #[test]
 fn reply_status_text_and_unknown_discriminants() {
     for reply in [
+        Reply::Revision(123),
         Reply::Applied,
         Reply::Unavailable,
         Reply::StaleOutput,

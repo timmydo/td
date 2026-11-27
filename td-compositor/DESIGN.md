@@ -7788,12 +7788,13 @@ holding no lock, hands each later answer to the runtime
 they change; an answer never locks or unlocks. No client pixel,
 cursor, title or workspace bar is drawn, and a client's commit changes
 nothing on glass.
-The runtime's key, modifier and pointer routing, keyboard and pointer
-targets, the VM bridge's focus snapshot and the application
-pixel-evidence oracle treat the lock surface as they treat the
-attention screen, so no client is focused or given input from any
-source, and the evidence reads zero. The evdev adapter runs no ordinary
-binding on it (terminal, launcher, sheet, workspaces and tiling).
+
+Physical key, modifier and pointer routing stays on the lock surface. The
+VM bridge refuses its snapshot and the application pixel-evidence oracle
+reads zero. The native SSH viewer can obtain ordinary application focus
+after the lock frame has reached the physical output. Its connection,
+input and render contract is in `REMOTE-DESKTOP.md`. The evdev adapter runs no
+ordinary binding on the lock surface (terminal, launcher, sheet, workspaces and tiling).
 Input automation, public capture and observation, and clipboard
 control already refuse the paired profile, the only one that locks. The
 control socket's tiling and report requests do not: while locked it

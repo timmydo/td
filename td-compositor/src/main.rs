@@ -50,6 +50,13 @@ mod png_encode;
 #[allow(dead_code)]
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-alloc/src/lib.rs")]
 mod allocation;
+mod desktop;
+#[allow(dead_code)]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-desktop-protocol/src/lib.rs"
+)]
+mod desktop_wire;
 #[cfg(test)]
 #[allow(dead_code)]
 #[cfg_attr(
@@ -1234,6 +1241,7 @@ mod confinement {
 
     /// Sources another crate owns, mounted by path rather than kept in src.
     const MOUNTED: &[&str] = &[
+        "desktop_wire.rs",
         "allocation.rs",
         "app_policy.rs",
         "atlas.rs",
@@ -1272,6 +1280,11 @@ mod confinement {
         ("coverage.rs", include_str!("../../td-ui/src/coverage.rs")),
         ("crc32.rs", include_str!("../../engine/src/crc32.rs")),
         ("deflate.rs", include_str!("../../td-util/src/deflate.rs")),
+        ("desktop.rs", include_str!("desktop.rs")),
+        (
+            "desktop_wire.rs",
+            include_str!("../../td-desktop-protocol/src/lib.rs"),
+        ),
         ("drm.rs", include_str!("drm.rs")),
         ("face.rs", include_str!("../../td-ui/src/face.rs")),
         ("face_file.rs", include_str!("../../td-ui/src/face_file.rs")),
@@ -3286,7 +3299,7 @@ pub struct MappedRegion {
         assert!(first_paint.contains(
             "        let locks = connected.is_some_and(|answer| answer.locks() && !answer.admitted());\n        \
              if self.attention_enabled && locks {\n            \
-             self.scene.lock();\n        }\n        self.repaint()"
+             self.scene.lock();\n            self.desktop.lock_epoch = self.paints.saturating_add(1);\n        }\n        self.repaint()"
         ));
         assert_eq!(occurrences(first_paint, "locks()"), 1);
         assert_eq!(occurrences(first_paint, "admitted()"), 1);
@@ -3506,7 +3519,7 @@ pub struct MappedRegion {
         // The runtime withholds a client's paint, focus and input while a
         // lock is owed, and nothing on a private screen; Print captures
         // nothing then either, and `Super+q` closes nothing.
-        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 10);
+        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 11);
         assert!(runtime.contains(
             "        !self.scene.private_screen() && self.resume.as_ref().is_some_and(|resume| resume.holds())\n"
         ));

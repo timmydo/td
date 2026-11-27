@@ -473,7 +473,9 @@ secure attention screen is used. The review must have been painted for at
 least 500 ms, with the same plan nonce, before keyboard or pointer confirmation.
 Return does not repeat. This prevents accidental early input, but does not
 claim a secure-input boundary: the trusted wizard and its ordinary input are
-part of the installer authority. Installed-system elevation is unchanged.
+part of the installer authority. The live compositor omits the remote desktop
+listener so SSH access cannot operate the wizard. Installed-system
+elevation is unchanged.
 
 The `td-setup` front end has a source-built static target recipe and
 `td-setup-test` realized-output check. The recipe stages its own tree with

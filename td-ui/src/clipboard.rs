@@ -281,7 +281,12 @@ impl Incoming {
     /// offer; the caller drops its own copy of that endpoint after the
     /// hand-off, so EOF can arrive.
     pub fn begin(now: u64) -> io::Result<(Self, File)> {
-        Self::open(now, MAX_BYTES, CHUNK)
+        Self::begin_bounded(now, MAX_BYTES)
+    }
+
+    /// Receive UTF-8 text with a smaller application-specific byte limit.
+    pub fn begin_bounded(now: u64, limit: usize) -> io::Result<(Self, File)> {
+        Self::open(now, limit.min(MAX_BYTES), CHUNK)
     }
 
     /// The same for a picture, under `MAX_IMAGE_BYTES`.

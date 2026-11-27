@@ -58,6 +58,14 @@ const MODULES: &[(&str, &str)] = &[
     ("coverage", include_str!("../../../td-ui/src/coverage.rs")),
     ("crc32", include_str!("../../../engine/src/crc32.rs")),
     ("deflate", include_str!("../../../td-util/src/deflate.rs")),
+    (
+        "desktop",
+        include_str!("../../../td-compositor/src/desktop.rs"),
+    ),
+    (
+        "desktop_wire",
+        include_str!("../../../td-desktop-protocol/src/lib.rs"),
+    ),
     ("drm", include_str!("../../../td-compositor/src/drm.rs")),
     ("face", include_str!("../../../td-ui/src/face.rs")),
     ("face_file", include_str!("../../../td-ui/src/face_file.rs")),

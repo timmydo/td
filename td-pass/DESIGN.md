@@ -544,7 +544,9 @@ as the image's does.
 
 The launcher's PASSWORD NOTEBOOK entry opens the notebook through
 td-authd (td-compositor/DESIGN.md, the launcher). The GUI runs as the
-primary human; the vault service runs as that owner's reserved notebook
+primary human on the protected Wayland socket. Its connection suspends
+remote desktop access to pixels, application input and the clipboard.
+The vault service runs as that owner's reserved notebook
 identity. Root creates both private socketpairs and validates the
 account registry before dropping credentials. The GUI and vault have no
 pathname listener, caller-selected program, or UID-only vault admission.
