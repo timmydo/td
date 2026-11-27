@@ -1904,24 +1904,13 @@ destructive authorization.
 `td-firstboot render-primary-sshd ROOT` is an early boot operation using
 the same complete root-owned account admission as home preparation, which
 writes only under ROOT's volatile `/run`. It publishes the full fixed SSH
-server policy with one Match block for that primary account, in the form
-the login state under the same ROOT selects
-(td-login/TOKEN-LOGIN.md, "SSH"): the ordinary policy only where that
-state is unenrolled, and otherwise the enforced form, which admits only
-that account. Neither admits root (td-login/TOKEN-LOGIN.md, "SSH"). A
-state it cannot read is unavailable, so it renders the
-enforced form; an account failure still fails the render. The caller
-owns deployment verification and serializes account publication before
-rendering. No name or policy fragment comes from argv, the environment
-or mutable home content. Both forms keep the per-machine persistent
-authorization file, which admits no account on a td image
-(td-login/TOKEN-LOGIN.md, "SSH"), and the distinct volatile,
-loopback-restricted human self-test key. Only the ordinary form additionally
-consults the primary account's `.ssh/authorized_keys`; its contents authorize
-remote Ed25519 keys but never configure the server. A deployment older than L7
-reads that file as root's, so a rollback to one re-admits any root key
-it holds, among the root paths such a rollback restores (APPLICATIONS.md
-§L.1, "The rollback window"). It runs after
+server policy for the validated primary account and its machine profile.
+On a desktop the primary's Match block admits its owner-managed Ed25519
+keys at every login state. The separate `td-admin` block forces the
+administrator command and trusts only its root-owned key file. All
+profiles refuse root. The server profile's provisioned key sources and
+its treatment of unavailable login state are specified in
+`td-login/TOKEN-LOGIN.md`, "SSH". The boot render runs after
 profile publication, right after `td-firstboot ensure-login-directory
 /sysroot`, whose refusal never stops boot (td-login/TOKEN-LOGIN.md,
 "The login record").
@@ -1938,9 +1927,8 @@ stock name and root under each form: that each form's file parses, what its
 `Match` blocks select for each name, and that form's `allowusers` lines. `-T`
 prints compiled constants, `permitrootlogin` among them, and runs no
 admission, so it says nothing of who would be refused. The check's logins,
-under the enforced and ordinary forms with the file's root-owned paths
-redirected to test files, hold that only the ordinary form reads the
-account's own keys. Refusing other accounts is `qemu-login-system`'s
+with the desktop policy's root-owned paths redirected to test files,
+check that the owner's key authenticates before and after enrollment. Refusing other accounts is `qemu-login-system`'s
 (td-login/TOKEN-LOGIN.md, C11) and, for root, the autotest boot health's
 `TD-ROOT-SSH-REFUSED` (td-login/THREAT-MODEL.md §8). The
 generated policy contains no secrets
@@ -2506,7 +2494,7 @@ strongest access point of the network it then chooses. The passphrase is
 never stored; a stored PMK joins its network for whoever reads it, which
 only root can.
 
-For SSH, while no hardware login key is enrolled, put the other computer's
+For SSH, put the other computer's
 Ed25519 **public** key in `~/.ssh/authorized_keys` on td:
 
 ```text
@@ -2519,8 +2507,7 @@ whoami
 ```
 
 Then run `ssh ACCOUNT@ADDRESS` from the other computer using the displayed
-account and address. The SSH server already starts at boot. Login-key
-enrollment disables this remote path and revokes existing SSH sessions;
+account and address. The SSH server already starts at boot. Desktop enrollment and screen lock preserve SSH access;
 `td-login/TOKEN-LOGIN.md` owns that policy. Root and password login are disabled.
 
 An installed machine can receive this through its source checkout without

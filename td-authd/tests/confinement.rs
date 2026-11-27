@@ -205,7 +205,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x9347c21c55952977,
+        0x0fa54ab146d99049,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -917,7 +917,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(fingerprint(revocation), REVOCATION_FINGERPRINT);
     assert_eq!(revocation.matches("Command::new(").count(), 3);
     for pin in [
-        "let mut command = Command::new(\"/bin/td-firstboot\");\n                command.arg(\"render-ssh-policy\");\n                Inspection::printing(command, RENDER_OUTPUT, RENDER_TIME)\n",
+        "let mut command = Command::new(\"/bin/td-firstboot\");\n                command.arg(\"console-login-state\");\n                Inspection::printing(command, RENDER_OUTPUT, RENDER_TIME)\n",
         "let mut command = Command::new(\"/bin/td-svc\");\n                command.arg(\"reboot\");\n                Inspection::printing(command, REPLY_OUTPUT, EXCHANGE_TIME)\n",
         // Each control exchange: a td-svc client child naming a fixed verb
         // and one of the fixed units.
@@ -930,7 +930,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "const RENDER_OUTPUT: usize = 16;",
         "const LINE: &str = \"/dev/ttyS0\";",
         "const GUARD: &str = \"/var/lib/td/login/cutover-reboot\";",
-        "const UNITS: &[&str] = &[\"sshd\", \"greeter\"];",
+        "const UNITS: &[&str] = &[\"greeter\"];",
         "const RENDER_TIME: Duration = Duration::from_secs(10);",
         "const EXCHANGE_TIME: Duration = Duration::from_secs(12);",
         "const UNIT_TIME: Duration = Duration::from_secs(30);",
@@ -1923,7 +1923,7 @@ const ELEVATION_FINGERPRINT: u64 = 0xf1b6c4eceb548dea;
 const SET_HOSTNAME_FINGERPRINT: u64 = 0x7d4b8faaf486b5ed;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
-const REVOCATION_FINGERPRINT: u64 = 0x7090a6da9e98d2e9;
-const SHARED_CUTOVER_FINGERPRINT: u64 = 0x358939aac41ef40a;
+const REVOCATION_FINGERPRINT: u64 = 0x65addeaec2b8d9eb;
+const SHARED_CUTOVER_FINGERPRINT: u64 = 0xe6f67d09736859f4;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x45e5e48767f17d03;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x855c6ad96aa12772;

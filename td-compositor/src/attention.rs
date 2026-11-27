@@ -463,8 +463,7 @@ fn ink(font: &crate::font::Font, text: &str, scale: usize) -> Result<Vec<(usize,
 
 /// `9a`'s `02` and `03` (td-authd/DESIGN.md, amendment 7), on the lock
 /// surface and the attention screen.
-pub(crate) const RESTARTING_NOTICE: &str =
-    "A CONSOLE OR SSH SESSION COULD NOT BE CLOSED: RESTARTING";
+pub(crate) const RESTARTING_NOTICE: &str = "A CONSOLE SESSION COULD NOT BE CLOSED: RESTARTING";
 pub(crate) const HELD_NOTICE: &str = "SESSION REVOCATION FAILED AFTER A RESTART";
 
 /// What a committed device-bound disk installation shows before attention

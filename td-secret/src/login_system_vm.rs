@@ -79,8 +79,8 @@ const BACKOFF: &str = "/var/lib/td/authd/backoff";
 /// reboot guard (td-authd/DESIGN.md, amendment 7).
 const CUTOVER: &str = "/run/td-login-cutover";
 const REBOOT_GUARD: &str = "/var/lib/td/login/cutover-reboot";
-/// The open SSH session's remote command's operand, which names it.
-const SESSION_SLEEP: &str = "4321";
+/// Echoes from the same SSH connection before and after enrollment.
+const SSH_ECHO: &str = "/run/td-login-system/ssh-echo";
 /// While this exists the account's profile holds a serial login: its
 /// login shell runs `sleep HOLD_SLEEP` in the foreground with TERM
 /// ignored, so the session reads nothing the host answers on ttyS0 and
@@ -200,24 +200,6 @@ fn serial_members() -> Vec<Member> {
     processes()
         .iter()
         .filter(|process| process.tty == tty)
-        .map(|process| (process.pid, process.start))
-        .collect()
-}
-
-/// The members of the cgroup leaf `pid` runs in: for `sshd`'s leader its
-/// unit's whole service leaf, every td-sshd session in it.
-fn leaf_members(pid: u32) -> Vec<Member> {
-    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
-    let path = cgroup
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .unwrap();
-    let procs = fs::read_to_string(format!("/sys/fs/cgroup{path}/cgroup.procs")).unwrap();
-    let all = processes();
-    procs
-        .lines()
-        .filter_map(|line| line.parse::<u32>().ok())
-        .filter_map(|pid| all.iter().find(|process| process.pid == pid))
         .map(|process| (process.pid, process.start))
         .collect()
 }
@@ -603,21 +585,14 @@ fn ssh_refused(user: &str, identity: &str) -> bool {
         && matches!((offered, denied), (Some(o), Some(d)) if o < d)
 }
 
-/// The boot's sshd form: both refuse a loopback root key in the persistent
-/// file (APPLICATIONS.md §L.1, L7) and admit the primary account's, which
-/// boot health made; only the enforced one names `AllowUsers`.
-fn sshd(enforced: bool) {
+/// Every desktop login state admits the primary and the forced admin command.
+fn sshd() {
     let config = fs::read_to_string("/run/td-sshd.conf").unwrap();
-    assert!(!config.contains("prohibit-password"), "{config}");
-    if enforced {
-        assert!(
-            config.contains("PermitRootLogin no\nAllowUsers tester td-admin\n"),
-            "{config}"
-        );
-    } else {
-        assert!(config.contains("PermitRootLogin no\n"), "{config}");
-        assert!(!config.contains("AllowUsers"), "{config}");
-    }
+    assert!(
+        config.contains("PermitRootLogin no\nAllowUsers tester td-admin\n"),
+        "{config}"
+    );
+    assert!(config.ends_with(" .ssh/authorized_keys\n"), "{config}");
     let identity = Path::new(WORK).join("root-key");
     let _ = fs::remove_file(&identity);
     let _ = fs::remove_file(identity.with_extension("pub"));
@@ -636,7 +611,8 @@ fn sshd(enforced: bool) {
         .status()
         .unwrap()
         .success());
-    let public = fs::read_to_string(identity.with_extension("pub")).unwrap();
+    let public_path = identity.with_extension("pub");
+    let public = fs::read_to_string(&public_path).unwrap();
     let mut authorized = OpenOptions::new()
         .append(true)
         .create(true)
@@ -647,6 +623,24 @@ fn sshd(enforced: bool) {
     authorized.sync_all().unwrap();
     let identity = identity.to_str().unwrap();
     assert!(ssh_refused("root", identity), "root over SSH");
+    assert!(
+        ssh_refused("tester", identity),
+        "global key admitted for owner"
+    );
+    let installed = ssh_command(true, "tester", "/run/td-ssh-selftest", false)
+        .arg(
+            "/bin/mkdir -p .ssh && /bin/td-util chmod 0700 .ssh && \
+              /bin/cat >> .ssh/authorized_keys && /bin/td-util chmod 0600 .ssh/authorized_keys",
+        )
+        .stdin(fs::File::open(&public_path).unwrap())
+        .status()
+        .unwrap();
+    assert!(installed.success(), "install the owner's public key");
+    assert!(ssh(false, "tester", identity), "owner key over SSH");
+    assert!(
+        ssh_refused("td-admin", identity),
+        "owner key used for td-admin"
+    );
     assert!(
         ssh(true, "tester", "/run/td-ssh-selftest"),
         "the primary over SSH"
@@ -767,28 +761,26 @@ fn cutover_record(form: &str) -> String {
     format!("td-login-cutover-v1\n{boot}{form}\n")
 }
 
-/// The open SSH session's remote command, while it runs.
-fn remote_session() -> Option<u32> {
-    processes()
-        .iter()
-        .find(|process| runs(process, "sleep", SESSION_SLEEP))
-        .map(|process| process.pid)
-}
-
-/// An SSH session as the primary account, its remote command running.
+/// Establish a bidirectional stream before the physical login transition.
 fn open_ssh() -> Child {
     let mut session = ssh_command(true, "tester", "/run/td-ssh-selftest", false)
-        .args(["/bin/sleep", SESSION_SLEEP])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .arg("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(fs::File::create(SSH_ECHO).unwrap())
         .spawn()
         .unwrap();
-    system_wait("the open SSH session", || {
+    session
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"before\n")
+        .unwrap();
+    system_wait("the initial SSH echo", || {
         assert!(
             session.try_wait().unwrap().is_none(),
             "the SSH session ended"
         );
-        remote_session().is_some()
+        fs::read(SSH_ECHO).unwrap() == b"before\n"
     });
     session
 }
@@ -1075,24 +1067,28 @@ fn remove(
 
 /// After an enrollment's last touch with a serial session and an SSH
 /// session open: the record published, then the cutover (TOKEN-LOGIN.md,
-/// "Cutover"): every process of both containments gone, the SSH client
-/// ended, the boot's record naming the enforced form, no reboot guard,
+/// "Cutover"): the serial containment gone, the SSH client
+/// still running, the boot's record naming the enforced form, no reboot guard,
 /// ttyS0 root's and a parked greeter refusing, with no shell.
-fn revoked(serial: &[Member], ssh: &[Member], client: &mut Child) {
+fn revoked(serial: &[Member], client: &mut Child) {
     system_wait("the published record", || {
         matches!(state(), State::Enrolled(_))
     });
     system_wait("the serial session's containment emptied", || gone(serial));
-    system_wait("the SSH session's containment emptied", || {
-        gone(ssh) && client.try_wait().unwrap().is_some()
-    });
-    assert!(remote_session().is_none(), "the SSH session's command");
     system_wait("the enforced record", || {
         fs::read_to_string(CUTOVER).ok() == Some(cutover_record("enforced"))
     });
     assert!(!Path::new(REBOOT_GUARD).exists(), "a failed revocation");
     let line = fs::metadata("/dev/ttyS0").unwrap();
     assert_eq!((line.uid(), line.gid()), (0, 0), "ttyS0 handed back");
+    client.stdin.take().unwrap().write_all(b"after\n").unwrap();
+    system_wait("SSH echo and orderly EOF after the cutover", || {
+        client.try_wait().unwrap().is_some_and(|status| {
+            assert!(status.success(), "SSH exited with {status}");
+            true
+        })
+    });
+    assert_eq!(fs::read(SSH_ECHO).unwrap(), b"before\nafter\n");
     parked_greeter();
     assert_eq!(login_shell(), None, "a serial shell after the cutover");
     assert_eq!(held_session(), None, "the held login after the cutover");
@@ -1118,7 +1114,7 @@ fn unenrolled_again(host: &mut Host, keyboard: &mut Keyboard, by: Plugged) {
     keyboard.key(ESCAPE);
     host.screen("desktop", &[]);
     by.remove();
-    sshd(false);
+    sshd();
 }
 
 /// With `previous` naming a deployment whose initramfs carries no tier
@@ -1196,7 +1192,7 @@ fn unmarked_previous(host: &mut Host, keyboard: &mut Keyboard, key: &Virtual) {
     }
 }
 
-/// While mounted over `/bin/td-firstboot`, a `render-ssh-policy` run,
+/// While mounted over `/bin/td-firstboot`, a `console-login-state` run,
 /// which is how td-authd's cutover renders, marks that it began and waits
 /// for the release before running the real binary from a copy, so the
 /// cutover holds between its record's removal and its restarts. td-authd
@@ -1213,7 +1209,7 @@ impl HeldRender {
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = render-ssh-policy ]; then\n    : > {began} || exit 1\n    while [ ! -e {release} ]; do /bin/sleep 0.05; done\nfi\nexec {copy} \"$@\"\n",
+                "#!/bin/sh\nif [ \"$1\" = console-login-state ]; then\n    : > {began} || exit 1\n    while [ ! -e {release} ]; do /bin/sleep 0.05; done\nfi\nexec {copy} \"$@\"\n",
                 began = Self::began_path().display(),
                 release = Self::release_path().display(),
                 copy = copy.display(),
@@ -1273,7 +1269,7 @@ fn unenrolled_start() -> (Host, Keyboard) {
     ready(&["wayland", "terminal"]);
     host.screen("desktop", &[]);
     boot_healthy();
-    sshd(false);
+    sshd();
     (host, keyboard)
 }
 
@@ -1283,8 +1279,8 @@ fn unenrolled_start() -> (Host, Keyboard) {
 /// An enrollment is refused while `previous` lacks the tier marker; then,
 /// with the serial greeter logged in again and held by a process that
 /// ignores TERM and an SSH session open as the primary account, both keys
-/// are enrolled through the attention screen and the cutover ends both
-/// sessions. Root's SSH key is refused before and after.
+/// are enrolled through the attention screen and the cutover ends the
+/// serial session and preserves the SSH session. Root's SSH key is refused before and after.
 fn seed() -> Vec<Virtual> {
     assert!(matches!(state(), State::Unenrolled));
     assert_eq!(
@@ -1308,7 +1304,6 @@ fn seed() -> Vec<Virtual> {
     service(&["start", "greeter"]);
     let serial = held_login();
     let mut client = open_ssh();
-    let ssh = leaf_members(leader("sshd"));
     // The greeter's start may have hung up the host's descriptor.
     host = Host::open();
     let render = HeldRender::mount();
@@ -1318,11 +1313,11 @@ fn seed() -> Vec<Virtual> {
     system_wait("the cutover's render", || render.began());
     assert!(!Path::new(CUTOVER).exists(), "the cutover kept its record");
     assert!(
-        alive(&serial) && alive(&ssh),
+        alive(&serial) && client.try_wait().unwrap().is_none(),
         "a session ended before the cutover"
     );
     render.release();
-    revoked(&serial, &ssh, &mut client);
+    revoked(&serial, &mut client);
     render.unmount();
     // The serial session's leader exiting hung up every descriptor open on
     // its controlling terminal, the host's among them.
@@ -1347,7 +1342,7 @@ fn seed() -> Vec<Virtual> {
         .unwrap();
     copy.write_all(&fs::read(record_path()).unwrap()).unwrap();
     copy.sync_all().unwrap();
-    sshd(true);
+    sshd();
     keys
 }
 
@@ -1370,7 +1365,6 @@ fn unlocked() -> Vec<Virtual> {
     let serial = held_login();
     let mut client = open_ssh();
     let (sshd_leader, greeter_leader) = (leader("sshd"), leader("greeter"));
-    let ssh = leaf_members(sshd_leader);
     // The greeter's start may have hung up the host's descriptor.
     let mut host = Host::open();
     let render = HeldRender::mount();
@@ -1385,7 +1379,7 @@ fn unlocked() -> Vec<Virtual> {
         (sshd_leader, greeter_leader)
     );
     assert!(
-        alive(&serial) && alive(&ssh),
+        alive(&serial) && client.try_wait().unwrap().is_none(),
         "a session ended before the kill"
     );
     assert!(Command::new("/bin/kill")
@@ -1398,13 +1392,13 @@ fn unlocked() -> Vec<Virtual> {
         "the next authority",
         || matches!(authorities()[..], [new] if new != old),
     );
-    revoked(&serial, &ssh, &mut client);
+    revoked(&serial, &mut client);
     render.unmount();
     host = Host::open();
     host.screen("locked", &[]);
     plugged.remove();
     assert_eq!(stored(), Some(vec![credential(&key)]));
-    sshd(true);
+    sshd();
     vec![key]
 }
 
@@ -1415,7 +1409,7 @@ fn locked_start(host: &mut Host) {
     host.screen("locked", &[]);
     ready(&["wayland", "terminal"]);
     boot_healthy();
-    sshd(true);
+    sshd();
 }
 
 /// `added`: from the two keys, an addition of each of six more,
@@ -1953,7 +1947,7 @@ fn locked(host: &mut Host, keyboard: &mut Keyboard) -> Vec<Virtual> {
     ready(&["wayland", "terminal"]);
     host.screen("locked", &[]);
     boot_healthy();
-    sshd(true);
+    sshd();
     unlock(host, keyboard, &keys[0]);
     // The unlock's close cut off the keyboard's first fresh report, which
     // Caps Lock spends as the chord does.
@@ -1984,13 +1978,13 @@ fn damaged_or_repaired(phase: &str, host: &mut Host, keyboard: &mut Keyboard) ->
         Some(("damaged", damage)) => {
             damaged_boot(host, keyboard, &keys, damage.starts_with("record-"));
             boot_healthy();
-            sshd(true);
+            sshd();
             repair(damage);
         }
         Some(("repaired", _)) => {
             host.screen("locked", &[]);
             boot_healthy();
-            sshd(true);
+            sshd();
         }
         _ => panic!("no phase {phase}"),
     }

@@ -1860,7 +1860,7 @@ td-firstboot/src/saved.rs	allocation-macro	11
 td-firstboot/src/saved.rs	unchecked-growth-or-clone	1
 td-firstboot/src/ssh_policy.rs	allocation-macro	5
 td-firstboot/src/ssh_render.rs	allocating-conversion	5
-td-firstboot/src/ssh_render.rs	allocation-macro	6
+td-firstboot/src/ssh_render.rs	allocation-macro	5
 td-firstboot/src/ssh_render.rs	unchecked-growth-or-clone	1
 td-fs/src/bounded.rs	allocation-macro	3
 td-fs/src/on_path.rs	allocating-conversion	1
@@ -3577,8 +3577,8 @@ td-secret/src/login_store.rs	allocating-constructor	3
 td-secret/src/login_store.rs	allocating-conversion	2
 td-secret/src/login_store.rs	allocation-macro	8
 td-secret/src/login_store.rs	unchecked-growth-or-clone	4
-td-secret/src/login_system_vm.rs	allocating-conversion	66
-td-secret/src/login_system_vm.rs	allocation-macro	32
+td-secret/src/login_system_vm.rs	allocating-conversion	65
+td-secret/src/login_system_vm.rs	allocation-macro	30
 td-secret/src/login_system_vm.rs	unchecked-growth-or-clone	6
 td-secret/src/login_tier.rs	allocating-constructor	1
 td-secret/src/login_tier.rs	allocating-conversion	4

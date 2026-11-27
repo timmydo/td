@@ -3988,11 +3988,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 7. **Revocation (5).** Root performs TOKEN-LOGIN.md's "Cutover" whenever
    the reduced login state is not the one the volatile record
    `/run/td-login-cutover` names for this boot. That record names the
-   state the console and SSH were last brought to.
+   state the console was last brought to.
 
    **The reduced state** is `unenrolled` or `enforced`, decided by the
    shared predicate's directory-and-name check alone, the one firstboot,
-   td-login and `render-ssh-policy` apply (TOKEN-LOGIN.md, "SSH"). It is
+   td-login and `console-login-state` apply (TOKEN-LOGIN.md, "SSH"). It is
    not the `1a` answer, whose helper may also report the record
    unreadable. So root and the verb always reduce alike: a valid
    directory without the record name is unenrolled, and anything else is
@@ -4018,16 +4018,16 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    publication, `td-firstboot/src/cutover.rs`, which td-authd compiles
    by its reviewed path.
    - Firstboot writes it in stage 1, under `/sysroot`, right after
-     publishing its boot-time render, naming the form it rendered. A
+     publishing its boot-time render, naming the reduced console state. A
      failure to write it fails that step, which stops boot as a failed
      render does.
    - Root removes it, under the same lock, as every cutover's first
      step, and writes it only after a cutover is observed complete,
-     naming the form `render-ssh-policy` reported publishing. So a
+     naming the state `console-login-state` reported. So a
      cutover interrupted at any point, or whose record cannot be
      written, leaves no record: a stale one could otherwise name the
-     very state the login state returned to while the console and SSH
-     were brought to another, and the next check would skip the
+     very state the login state returned to while the console
+     was brought to another, and the next check would skip the
      revocation. A record that cannot be removed fails the revocation.
    - Root reads it with `O_NOFOLLOW|O_NONBLOCK` and requires a regular
      file, one link, root:root, mode 0600, at most 128 bytes and that
@@ -4066,16 +4066,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
    **The cutover:**
    - It removes the record (**The record**), before anything else.
-   - It renders the SSH policy through the fixed root subcommand
-     `td-firstboot render-ssh-policy` (TOKEN-LOGIN.md increment 5's
-     A2). That verb applies firstboot's account validation, publishes
-     the policy by rename, and prints the one word of the form it
-     published, which is the form root records. The account tables are
-     read-only binds from `prepare-primary-profile` to shutdown, so
-     within a boot it validates the set stage 1 validated. The rename is
-     what serializes publication against `sshd`'s readers, and an
-     exclusive lock serializes overlapping renders
-     (`td-login/THREAT-MODEL.md` §1). Root
+   - It reads the effective console state through the root subcommand
+     `td-firstboot console-login-state`. The command inspects the same
+     UID-1000 login record as the boot check. Root
      launches it as it launches its helpers, with an empty environment
      and `/` as its working directory, and reaps it without blocking.
      Its output must be exactly `unenrolled` or `enforced` and a newline,
@@ -4094,9 +4087,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
      - An absent node is skipped, since no session can hold it.
      - A node of any other type, or a failed change or read-back, is a
        failed revocation.
-   - It asks td-svc to restart `sshd` and `greeter`, issuing both
-     requests before polling either so their TERM waits overlap. It
-     names no other unit.
+   - It asks td-svc to restart the serial `greeter`.
    - Each control exchange, `restart NAME` or `status NAME`, is a
      `/bin/td-svc` client child launched as the render is: empty
      environment, `/` as its working directory, its reply read through a
@@ -4110,11 +4101,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
      seconds for its start and its reply.
    - It polls `status` for each unit every 250 milliseconds until the
      unit has left `stopping` and runs a new leader. Leaving `stopping`
-     means, for `greeter`, that its `tty=` containment is empty; for
-     `sshd`, that its whole service leaf is (`td-svc/DESIGN.md`,
-     `stop=leaf`). A new leader is a pid different from the leader
+     means that the greeter’s controlling terminal containment is empty. A new leader is a pid different from the leader
      recorded before the request, whose `/proc` start time is later than
-     the request. Both units are `restart=always`, so after the request
+     the request. The greeter is `restart=always`, so after the request
      `failed` with a retry pending and `held` are td-svc's restart
      backoff, and `down` a start still to come: each is polled until a
      new leader runs or the deadline passes. Only `stopped`, an
@@ -4140,14 +4129,14 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
    On a failed revocation:
    - The `1a` revocation status reads failed (`02`).
-   - The compositor shows `A CONSOLE OR SSH SESSION COULD NOT BE CLOSED:
+   - The compositor shows `A CONSOLE SESSION COULD NOT BE CLOSED:
      RESTARTING` on its lock surface and attention screen.
    - Root asks td-svc for an orderly `reboot` through `/bin/td-svc
      reboot`, as td-install requests one: a client child bounded and
      retried once after a transient failure exactly as a control
      exchange is.
      The reboot's boot ordering then enforces the boundary: firstboot
-     renders the enforced form before `sshd` and the greeter start.
+     records the local login state before the greeter starts.
    - Root makes that request only once no operation holds the slot, so a
      reboot never interrupts an update, an elevation or a login commit.
      The slot operation's own deadline bounds the wait. While `02`
@@ -4261,7 +4250,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    The system recipe writes the marker into every deployment from
    TOKEN-LOGIN.md increment 4's C10b, which landed after C10, since the
    marker claims that a deployment honours the record at every entry
-   point (console, SSH, locked start and session lock), which no build
+   local entry point (console, locked start and session lock), which no build
    before C10 does. Between C4 and C10b, request 19 on an enrolled or
    unavailable machine refused every td-built queued deployment with
    `99 01`.
@@ -5158,7 +5147,7 @@ ASCII, a quotation mark as `?`: the session-reservation validator, the
 application admission check, both `lock-session` cleanups (the
 generation's and a cancelled unlock's), the three fixed `umount` runs,
 and, through the bounded inspection launcher, the power request, the
-revocation's `render-ssh-policy` and its `td-svc` clients. td-app's
+revocation's `console-login-state` and its `td-svc` clients. td-app's
 cache operations and td-software's requests give their last line
 unquoted, as the refusal's reason, a quotation mark kept. A last line
 that is Rust's panic note says only that it panicked, since the message

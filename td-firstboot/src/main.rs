@@ -355,8 +355,8 @@ fn usage() -> String {
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
          td-firstboot ensure-login-directory ROOT creates an absent ROOT/var/lib/td/login, refuses an invalid one, and removes its tmp- entries\n  \
          td-firstboot check-login-directory ROOT checks ROOT/var/lib/td/login without writing\n  \
-         td-firstboot render-primary-sshd [--provisioned-keys] ROOT publishes ROOT/{policy} for the validated primary account in the form ROOT's login state selects, then ROOT/{record} naming that form for this boot; --provisioned-keys, a server's, also admits the primary's root-owned provisioned keys\n  \
-         td-firstboot render-ssh-policy publishes /{policy} the same way for the running boot and prints the form it published\n  \
+         td-firstboot render-primary-sshd [--provisioned-keys] ROOT publishes ROOT/{policy} for the validated primary account in the form the machine profile selects, then ROOT/{record} naming the console login state for this boot; --provisioned-keys, a server's, also admits the primary's root-owned provisioned keys\n  \
+         td-firstboot console-login-state prints the current console login state for the greeter cutover\n  \
          td-firstboot prepare-primary-profile ROOT publishes the selected primary account and prepares its home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n  \
@@ -398,12 +398,11 @@ fn run_with_primary(
             .map_err(Failure::Failed)?;
             return Ok(());
         }
-        Invocation::RenderSshPolicy => {
+        Invocation::ConsoleLoginState => {
             let root = Path::new("/");
-            let primary = principals::primary_in_root(root).map_err(Failure::Failed)?;
-            let form = ssh_render::running_render(root, primary.name(), login_state::Owner::ROOT)
-                .map_err(Failure::Failed)?;
-            return emit(&form).map_err(Failure::Failed);
+            let state = ssh_render::selected(root, login_state::Owner::ROOT);
+            return emit_args(format_args!("{}\n", ssh_render::reduced(state).word()))
+                .map_err(Failure::Failed);
         }
         Invocation::PreparePrimaryProfile(root) => {
             let home = primary_profile::prepare(&root).map_err(Failure::Failed)?;
@@ -655,7 +654,7 @@ enum Invocation {
     EnsureLoginDirectory(PathBuf),
     CheckLoginDirectory(PathBuf),
     RenderPrimarySshd(PathBuf, ssh_policy::Provisioned),
-    RenderSshPolicy,
+    ConsoleLoginState,
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
     AllocateApplication(u32, String),
@@ -824,11 +823,16 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
             ))),
         };
     }
-    if args.first().is_some_and(|verb| verb == "render-ssh-policy") {
+    if args
+        .first()
+        .is_some_and(|verb| verb == "console-login-state")
+    {
         return if args.len() == 1 {
-            Ok(Invocation::RenderSshPolicy)
+            Ok(Invocation::ConsoleLoginState)
         } else {
-            Err(Failure::Usage("render-ssh-policy takes no operands".into()))
+            Err(Failure::Usage(
+                "console-login-state takes no operands".into(),
+            ))
         };
     }
     if args
@@ -2077,7 +2081,7 @@ mod tests {
             | Invocation::EnsureLoginDirectory(_)
             | Invocation::CheckLoginDirectory(_)
             | Invocation::RenderPrimarySshd(..)
-            | Invocation::RenderSshPolicy
+            | Invocation::ConsoleLoginState
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
             | Invocation::AllocateApplication(..)
@@ -2897,6 +2901,7 @@ mod ssh_forms {
 
     fn ordinary(name: &str) -> String {
         BEFORE
+            .replace(ROOT_REFUSED, &format!("{ROOT_REFUSED}AllowUsers {name} td-admin\n"))
             .replace("Match User alice\n", &format!("Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\nMatch User {name}\n"))
             .replace(
                 "/run/td-ssh-selftest-authorized_keys\n",
@@ -2904,18 +2909,8 @@ mod ssh_forms {
             )
     }
 
-    /// The enforced form excludes owner-managed remote keys.
-    fn enforced(name: &str) -> String {
-        BEFORE
-            .replace(
-                ROOT_REFUSED,
-                &format!("PermitRootLogin no\nAllowUsers {name} td-admin\n"),
-            )
-            .replace("Match User alice\n", &format!("Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\nMatch User {name}\n"))
-    }
-
     #[test]
-    fn remote_keys_are_consulted_only_for_an_unenrolled_primary() {
+    fn desktop_primary_keys_and_admin_restrictions_are_independent_of_enrollment() {
         for name in NAMES {
             let ordinary = ssh_policy::config(
                 name,
@@ -2930,10 +2925,7 @@ mod ssh_forms {
                 ssh_policy::Form::Enforced,
                 ssh_policy::Provisioned::No,
             );
-            assert!(!enforced.contains(".ssh/authorized_keys"));
-            assert!(enforced.ends_with(&format!(
-                "Match User {name}\n\tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys\n"
-            )));
+            assert_eq!(enforced, ordinary);
         }
     }
 
@@ -2949,13 +2941,10 @@ mod ssh_forms {
                 assert!(!desktop.contains(ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS));
                 assert!(!desktop.contains(ssh_policy::SSHD_METADATA_AUTHORIZED_KEYS));
                 let server = ssh_policy::config(name, form, Provisioned::Server);
+                assert!(!server.contains("td-admin"));
                 assert_eq!(
-                    server,
-                    desktop.replace("Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\n", "").replace(" td-admin\n", "\n").replace(
-                        "/run/td-ssh-selftest-authorized_keys",
-                        "/run/td-ssh-selftest-authorized_keys /var/lib/td/authorized-keys \
-                         /run/td-metadata-authorized-keys"
-                    )
+                    server.contains(".ssh/authorized_keys"),
+                    form == Form::Ordinary
                 );
                 assert_eq!(server.matches("/var/lib/td/authorized-keys").count(), 1);
                 assert_eq!(
@@ -3014,7 +3003,7 @@ mod ssh_forms {
         let ordinary_alice = ordinary("alice");
         assert_eq!(ordinary_alice.matches(ROOT_REFUSED).count(), 1);
         assert!(!ordinary_alice.contains("prohibit-password"));
-        assert!(!ordinary_alice.contains("AllowUsers"));
+        assert!(ordinary_alice.contains("AllowUsers alice td-admin\n"));
         for name in NAMES {
             assert_eq!(
                 ssh_policy::config(
@@ -3047,7 +3036,7 @@ mod ssh_forms {
                 ssh_policy::Form::Enforced,
                 ssh_policy::Provisioned::No,
             );
-            assert_eq!(policy, enforced(name));
+            assert_eq!(policy, ordinary(name));
             let lines: Vec<&str> = policy.lines().collect();
             let rule = |prefix: &str| {
                 let found: Vec<usize> = lines
@@ -3076,7 +3065,7 @@ mod ssh_forms {
                 ssh_policy::Form::Enforced,
                 ssh_policy::Provisioned::No
             ),
-            enforced("alice")
+            ordinary("alice")
         );
     }
 
@@ -3097,25 +3086,25 @@ mod ssh_forms {
 
     /// The record's name in any shape is enrolled; its bytes are never read.
     #[test]
-    fn an_enrolled_root_renders_the_enforced_form() {
+    fn enrolling_a_desktop_preserves_its_ssh_policy() {
         let root = Root::new();
         let record = root.login().join("1000");
         std::fs::write(&record, b"not a record").unwrap();
-        assert_eq!(root.policy("alice"), enforced("alice"));
+        assert_eq!(root.policy("alice"), ordinary("alice"));
         std::fs::remove_file(&record).unwrap();
         std::os::unix::fs::symlink("missing", &record).unwrap();
-        assert_eq!(root.policy("alice"), enforced("alice"));
+        assert_eq!(root.policy("alice"), ordinary("alice"));
         std::fs::remove_file(&record).unwrap();
         std::fs::create_dir(&record).unwrap();
-        assert_eq!(root.policy("tester"), enforced("tester"));
+        assert_eq!(root.policy("tester"), ordinary("tester"));
         std::fs::remove_dir(&record).unwrap();
         assert_eq!(root.policy("alice"), ordinary("alice"));
     }
 
     /// Each way the directory is damaged, including one that only the
-    /// production owner sees, renders the enforced form.
+    /// production owner sees, keeps desktop SSH reachable.
     #[test]
-    fn a_damaged_directory_renders_the_enforced_form() {
+    fn a_damaged_login_directory_preserves_desktop_ssh() {
         let root = Root::new();
         let login = root.login();
         let damaged = Some(login_state::State::Unavailable(
@@ -3126,7 +3115,7 @@ mod ssh_forms {
                 Some(login_state::state_as(&root.root, root.owner, 1000)),
                 damaged
             );
-            assert_eq!(root.policy("alice"), enforced("alice"));
+            assert_eq!(root.policy("alice"), ordinary("alice"));
         };
         for mode in [0o750, 0o755, 0o701, 0o500, 0o1700] {
             std::fs::set_permissions(&login, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -3155,20 +3144,20 @@ mod ssh_forms {
             uid: root.owner.uid ^ 1,
             ..root.owner
         };
-        assert_eq!(sshd_policy("alice", &root.root, foreign), enforced("alice"));
+        assert_eq!(sshd_policy("alice", &root.root, foreign), ordinary("alice"));
         // Production reads root's directory; the test's is root's only as root.
         if root.owner != login_state::Owner::ROOT {
             assert_eq!(
                 sshd_policy("alice", &root.root, login_state::Owner::ROOT),
-                enforced("alice")
+                ordinary("alice")
             );
         }
         for odd in [Path::new("relative"), &root.root.join("var/..")] {
-            assert_eq!(sshd_policy("alice", odd, root.owner), enforced("alice"));
+            assert_eq!(sshd_policy("alice", odd, root.owner), ordinary("alice"));
         }
         assert_eq!(
             sshd_policy("alice", &root.root.join("absent"), root.owner),
-            enforced("alice")
+            ordinary("alice")
         );
         assert_eq!(root.policy("alice"), ordinary("alice"));
     }
@@ -3187,7 +3176,7 @@ mod ssh_forms {
                 state,
                 login_state::State::Unavailable(login_state::Cause::Unreadable)
             );
-            assert_eq!(root.policy("alice"), enforced("alice"));
+            assert_eq!(root.policy("alice"), ordinary("alice"));
         }
         std::fs::set_permissions(&td, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(root.policy("alice"), ordinary("alice"));
@@ -3258,11 +3247,11 @@ mod principal_arguments {
     #[test]
     fn the_running_render_takes_no_operand() {
         assert!(matches!(
-            parse(&["render-ssh-policy".to_owned()]),
-            Ok(Invocation::RenderSshPolicy)
+            parse(&["console-login-state".to_owned()]),
+            Ok(Invocation::ConsoleLoginState)
         ));
         for extra in ["/", "/sysroot", "--state-dir"] {
-            let args = ["render-ssh-policy", extra].map(str::to_owned);
+            let args = ["console-login-state", extra].map(str::to_owned);
             assert!(matches!(parse(&args), Err(Failure::Usage(_))));
         }
     }

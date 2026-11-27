@@ -7987,7 +7987,7 @@ excluded from every selection, confirmation and field below.
    - **The revocation.** Implemented (TOKEN-LOGIN.md increment 5's
      A3; `td-authd/DESIGN.md` amendment 7). The answer keeps its
      revocation byte, `00` settled, `01` pending, `02` failed and
-     restarting, `03` held. `02` shows `A CONSOLE OR SSH SESSION COULD
+     restarting, `03` held. `02` shows `A CONSOLE SESSION COULD
      NOT BE CLOSED: RESTARTING` and `03` `SESSION REVOCATION FAILED AFTER
      A RESTART`: on the lock surface as its last row, below the state's,
      and on the attention screen below its padded rows and above its

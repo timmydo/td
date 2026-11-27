@@ -18,7 +18,7 @@ in the same landing.
 
 The release/source administrator (`td-update/ADMIN.md`) is a separate SSH
 principal, UID/GID 986, with a forced fixed-command interface and root-owned
-keys enrolled through one physical settings approval. It remains admitted in both SSH policy forms. Its password-field marker is
+keys enrolled through one physical settings approval. It remains admitted across desktop enrollment and lock changes. Its password-field marker is
 `td-admin-key-only`, an unsupported hash to td-login, not an empty password
 or service marker. td-sshd uses public-key authentication alone; td-login
 cannot authenticate that marker. The build/download account UID/GID 985 uses the
@@ -45,9 +45,9 @@ unencrypted storage, releases storage to TPM possession alone; it is
 device binding under principle 7 and advances no authentication or
 protector-authorization claim. The TPM-free login-key tier
 (`TOKEN-LOGIN.md`) lets the installed account's owner enroll FIDO2 keys
-on the attention screen, trading auto-login and the ordinary SSH form
+on the attention screen, trading automatic console login
 for a key plus PIN at boot and session lock. Until a key is enrolled,
-login, SSH, updates and the lock change only where the login directory
+local login, updates and the lock change only where the login directory
 is invalid, though every paired session consumes `Super+l` and shows
 `L`. That document says when the tier may be called usable and what it
 does not protect.
@@ -137,45 +137,23 @@ Before entering the verified deployment, firstboot validates its complete
 root-owned account tables and publishes the server policy itself as root:root
 mode-0600 `/run/td-sshd.conf`, renaming into place a temporary it created
 exclusively without following a link, then writes the volatile cutover
-record naming the form it rendered (`td-authd/DESIGN.md` amendment 7).
+record naming the effective console state (`td-authd/DESIGN.md` amendment 7).
 Only the admitted UID/GID-1000 account name selects its SSH Match
-block and, in the enforced form below, the one `AllowUsers` entry. The
+block and the desktop allowlist also admits the forced-command administrator. The
 policy's remaining bytes are compiled from the shared source used by the
 realized `td-ssh-test`. The daemon requires this configuration file
 explicitly; there is no optional include or fallback configuration. A
 failed validation, boot ID read, or either write stops boot before user
-processes. Within a boot, `td-firstboot render-ssh-policy`, which td-authd
-runs as a cutover's first step, publishes the same way and writes no
-record; td-authd writes the record through the same publication once the
-cutover is complete. The render's failure is td-authd's failed
-revocation (amendment 7), not a boot stop. Publication is serialized by the account
-tables' read-only binds, from `prepare-primary-profile` to shutdown; by an
-exclusive lock on a persistent root-only mode-0600 file beside the target
-(`/run/td-sshd.conf.lock`, `/run/td-login-cutover.lock`), held from
-clearing a stale temporary through the rename and the directory's fsync,
-so overlapping renders cannot interleave and no account can stall one;
-and by the rename, which no `sshd` reader sees half done. This changes no
-credential transition or authentication method. Neither form admits root
-(`TOKEN-LOGIN.md`, "SSH", states the rule). Since
-`TOKEN-LOGIN.md`'s increment 4 (C6) the render reads the login state
-through the shared predicate (§3) under the root it renders, and
-renders the ordinary policy only where that state is unenrolled.
-Enrolled, and every unavailable cause including a failed
-read, renders the enforced form, which excludes owner-managed remote keys
-and adds `AllowUsers` naming only
-that admitted account after the root line (`TOKEN-LOGIN.md`, "SSH",
-pins the bytes). The stock image never contains a record and firstboot
-ensures the directory at every boot, so it renders the ordinary policy;
-the enforced form acts only where a record or an invalid directory
-exists.
-The ordinary form also consults `.ssh/authorized_keys` in that account's
-passwd home. The owner may authorize remote Ed25519 keys there; private-key
-possession grants that account's session authority, including access to its
-files, but grants no elevation or hardware-backed credential release.
-td-sshd's strict modes (`td-ssh/DESIGN.md` §5) apply to the home and authorization
-file. A process already running as that owner may add keys; same-UID
-isolation is not claimed. Enforced and unavailable login states never consult
-this file, and enrollment's SSH leaf teardown revokes existing sessions.
+processes. The desktop's SSH policy is fixed at boot. Its primary
+account accepts Ed25519 keys from `.ssh/authorized_keys` in the validated
+account home. An authorized peer can use that account and read its files
+while the display is locked. Processes running as that account can add
+keys. Screen lock and hardware enrollment protect the local console and
+trusted input. Neither confers an SSH administrator grant: the dedicated
+`td-admin` account requires its separately provisioned key and forces the
+command interface specified in `td-update/ADMIN.md`. Enrollment restarts
+the serial greeter alone. Root SSH is refused in all profiles.
+
 A server image's policy also names root-owned keys its volume's builder
 provisioned (`TOKEN-LOGIN.md`, "SSH"), in both forms. Possessing one grants
 the same session authority and nothing more. The account cannot change them,
@@ -716,7 +694,7 @@ requires the autologin account to be the primary one. A console session
 started before enrollment does not survive it: td-authd's cutover
 (`td-authd/DESIGN.md` amendment 7) hands this line back to root and
 restarts the greeter, whose stop ends every process holding the line as
-its controlling terminal, and `sshd`, whose stop ends its whole leaf,
+its controlling terminal,
 before it records the enforced form; a revocation that fails reboots
 once, guarded, or holds. TOKEN-LOGIN.md's "Cutover" owns how. The stock
 image ships no record and firstboot ensures the directory at every boot,
@@ -725,8 +703,7 @@ above stand; the refusal acts only where a record or an invalid
 directory exists, and removing the last key cuts back over to that
 behaviour (TOKEN-LOGIN.md, "Cutover"). Since TOKEN-LOGIN.md's increment
 4 (C7) the compositor starts every generation locked on exactly those
-states, so this refusal and the enforced SSH form are what keep the
-serial line and SSH from passing a lock screen there.
+states, so this refusal prevents a serial login from bypassing the lock.
 
 The future hardware-backed disk and session unlock contract lives in
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). It binds primary

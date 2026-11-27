@@ -1,6 +1,6 @@
 //! The volatile cutover record's bytes (td-authd/DESIGN.md amendment 7)
 //! and the root-only publication by rename that both its writers use:
-//! firstboot's two SSH renders, and td-authd once a cutover is observed
+//! firstboot's boot render, and td-authd once a cutover is observed
 //! complete; and the removal under the same lock with which td-authd
 //! begins every cutover. td-authd compiles this one file by its reviewed
 //! path.
@@ -19,14 +19,14 @@ const O_NOFOLLOW: i32 = 0x20000;
 const O_NONBLOCK: i32 = 0x800;
 const O_DIRECTORY: i32 = 0x10000;
 
-/// The record naming the state the console and SSH were last brought to,
+/// The record naming the state the console was last brought to,
 /// relative to the root.
 pub(crate) const RECORD: &str = "run/td-login-cutover";
 /// The running kernel's boot ID, whatever root is rendered under.
 pub(crate) const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 const RECORD_VERSION: &str = "td-login-cutover-v1";
 
-/// The reduced login state: the record's and `render-ssh-policy`'s word.
+/// The reduced login state: the record's and `console-login-state`'s word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reduced {
     Unenrolled,
@@ -193,7 +193,7 @@ pub(crate) fn publish(path: &Path, bytes: &[u8], uid: u32, gid: u32) -> Result<(
 /// Removes the record at `path` under the same lock `publish` holds, then
 /// syncs its directory: a cutover's first step, so one interrupted, or
 /// whose record cannot be written, leaves no record that could name a
-/// state the console and SSH were not brought to. An absent record is
+/// state the console was not brought to. An absent record is
 /// already removed.
 #[allow(dead_code, reason = "td-authd's alone: firstboot only publishes")]
 pub(crate) fn remove(path: &Path, uid: u32, gid: u32) -> Result<(), String> {

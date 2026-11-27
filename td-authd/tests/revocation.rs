@@ -10,7 +10,7 @@ use std::thread;
 pub(crate) const ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
 pub(crate) const OTHER: &str = "11111111-2222-3333-4444-555555555555";
 /// Each unit's first leader; each restart's leader is the next pid.
-const LEADERS: &[(&str, u32)] = &[("sshd", 100), ("greeter", 200)];
+const LEADERS: &[(&str, u32)] = &[("greeter", 200)];
 /// `uptime`'s ticks, and a start time before and after it.
 const UPTIME: &str = "500.00 12.34\n";
 const BEFORE: u64 = 40_000;
@@ -115,8 +115,6 @@ impl Script {
                     .map(|(state, _)| state);
                 Some(if let Some(state) = settled.filter(|_| !stopping) {
                     format!("greeter {state} pid=- failures=1\n")
-                } else if stopping && unit == "sshd" {
-                    "sshd stopping pid=- failures=0 leaf=unproven\n".into()
                 } else if stopping {
                     format!("greeter stopping pid={} failures=0\n", leader - 1)
                 } else {
@@ -532,7 +530,7 @@ fn production_reads_the_fixed_paths_and_deadlines() {
     ] {
         assert!(reply.len() <= REPLY_OUTPUT, "{}", reply.len());
     }
-    assert_eq!(UNITS, ["sshd", "greeter"]);
+    assert_eq!(UNITS, ["greeter"]);
     assert_eq!(
         [
             Status::Settled,
@@ -572,7 +570,7 @@ fn a_record_naming_the_state_for_this_boot_changes_nothing() {
 }
 
 /// The whole cutover: the render, the line handed back, both leaders read,
-/// both restarts asked before either is polled, each polled until it has
+/// the greeter restart is requested and polled until it has
 /// left `stopping` and runs a new leader, then the record naming the form
 /// the render printed.
 #[test]
@@ -606,22 +604,15 @@ fn a_cutover_renders_hands_back_restarts_both_and_records_the_form() {
         assert_eq!((meta.uid(), meta.gid()), (machine.uid, machine.gid));
         let requests = svc.requests();
         assert_eq!(
-            requests[..4],
+            requests,
             [
-                "status sshd",
                 "status greeter",
-                "restart sshd",
-                "restart greeter"
+                "restart greeter",
+                "status greeter",
+                "status greeter",
+                "status greeter"
             ]
         );
-        // Each was polled through its two `stopping` answers.
-        for unit in ["sshd", "greeter"] {
-            let polls = requests[4..]
-                .iter()
-                .filter(|request| **request == format!("status {unit}"))
-                .count();
-            assert_eq!(polls, 3, "{unit}: {requests:?}");
-        }
         assert_eq!(machine.reboots(), 0);
         // A second check now finds the record and changes nothing.
         revocation.check(state);
@@ -737,7 +728,7 @@ fn one_transient_td_svc_failure_is_asked_once_more() {
             Status::Settled
         );
         let requests = svc.requests();
-        assert_eq!(requests[..2], ["status sshd", "status sshd"]);
+        assert_eq!(requests[..2], ["status greeter", "status greeter"]);
         assert_eq!(machine.recorded().unwrap(), record_bytes(ID, "enforced"));
         assert!(!machine.guard().exists());
     }
@@ -759,7 +750,7 @@ fn one_transient_td_svc_failure_is_asked_once_more() {
             settle(&mut revocation, true, Reduced::Enforced),
             Status::Restarting
         );
-        assert_eq!(svc.requests(), ["status sshd", "status sshd"]);
+        assert_eq!(svc.requests(), ["status greeter", "status greeter"]);
         assert_eq!(machine.recorded(), None);
     }
     // A client the exchange's bound killed is not asked again.
@@ -779,7 +770,7 @@ fn one_transient_td_svc_failure_is_asked_once_more() {
         Status::Restarting
     );
     assert!(started.elapsed() >= EXCHANGE);
-    assert_eq!(svc.requests(), ["status sshd"]);
+    assert_eq!(svc.requests(), ["status greeter"]);
 }
 
 /// A unit `stopped` after its restart fails the revocation at once, long
@@ -1269,7 +1260,7 @@ fn a_check_due_during_a_cutover_is_taken_when_it_settles() {
             .iter()
             .filter(|r| r.starts_with("restart"))
             .count(),
-        4
+        2
     );
 }
 

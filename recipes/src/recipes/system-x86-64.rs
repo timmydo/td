@@ -7373,12 +7373,9 @@ mod tests {
             })
     }
 
-    /// td-authd's revocation (td-authd/DESIGN.md, amendment 7) hands back
-    /// the greeter's line and restarts exactly the units serving console
-    /// and SSH logins: the line is the greeter unit's `tty=`, and each
-    /// unit it restarts exists here.
+    /// The console transition restarts only the unit owning the serial line.
     #[test]
-    fn the_revocation_hands_back_the_greeters_line_and_restarts_real_units() {
+    fn the_revocation_hands_back_the_greeters_line_and_restarts_only_the_greeter() {
         const REVOCATION: &str = include_str!("../../../td-authd/src/revocation.rs");
         let tty = unit_key("greeter", "tty").expect("the greeter unit has a tty");
         assert_eq!(
@@ -7390,17 +7387,10 @@ mod tests {
         );
         assert_eq!(
             REVOCATION
-                .matches("\nconst UNITS: &[&str] = &[\"sshd\", \"greeter\"];\n")
+                .matches("\nconst UNITS: &[&str] = &[\"greeter\"];\n")
                 .count(),
             1
         );
-        let names: Vec<String> = parse_td_svc_conf()
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        for unit in ["sshd", "greeter"] {
-            assert!(names.iter().any(|name| name == unit), "no {unit} unit");
-        }
         // The guard lives in the login directory firstboot creates.
         assert!(
             REVOCATION.contains("\nconst GUARD: &str = \"/var/lib/td/login/cutover-reboot\";\n")
@@ -13438,6 +13428,7 @@ mod tests {
                 ssh_policy::Form::Ordinary,
                 &[
                     "PermitRootLogin no",
+                    "AllowUsers alice td-admin",
                     "Match User td-admin",
                     "Match User alice",
                 ][..],
@@ -13479,14 +13470,10 @@ mod tests {
                 !config.lines().any(|line| line.starts_with("Subsystem ")),
                 "td-sshd has no subsystem, and would refuse the whole file"
             );
-            let remote = match form {
-                ssh_policy::Form::Ordinary => " .ssh/authorized_keys",
-                ssh_policy::Form::Enforced => "",
-            };
             assert!(
                 config.ends_with(&format!(
                     "\nMatch User alice\n\
-                     \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}{remote}\n"
+                     \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS} .ssh/authorized_keys\n"
                 )),
                 "the volatile boot key must authorize only the admitted primary account"
             );

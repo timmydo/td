@@ -3661,8 +3661,8 @@ const UPGRADE_CANCEL: &[&str] = &[
 /// addition and removal"). Every disclosure row fits `PROMPT_COLUMNS`.
 const ENROLLMENT_DISCLOSURE: &[&str] = &[
     "BOOT AND LOCK NEED A KEY AND PIN",
-    "CONSOLE AND SSH SESSIONS END NOW",
-    "SSH ONLY FOR THE PRIMARY ACCOUNT",
+    "CONSOLE SESSION ENDS NOW",
+    "SSH KEYS STILL GRANT REMOTE LOGIN",
     "ADMINISTRATION NEEDS A LOGIN",
     "PIN SET ON ANOTHER LAYOUT MAY FAIL",
 ];
@@ -3670,7 +3670,7 @@ const ENROLLMENT_DISCLOSURE: &[&str] = &[
 /// What one enrolled key risks: a one-key enrollment's addition to the
 /// enrollment disclosure, and a removal that leaves one key.
 const ONE_KEY_DISCLOSURE: &[&str] = &[
-    "LOST KEY OR BLOCKED PIN: NO LOGIN",
+    "LOST KEY OR BLOCKED PIN: NO UNLOCK",
     "RECOVERY NEEDS BOOTING OTHER CODE",
     "HERE, WHICH ALSO BYPASSES THE LOCK",
     "A BACKUP KEY CAN BE ADDED LATER",
@@ -3679,13 +3679,8 @@ const ONE_KEY_DISCLOSURE: &[&str] = &[
 const NO_KEY: &str = "LOGIN WILL NOT NEED A KEY";
 
 /// A removal of every key: login returns to needing none, and the cutover
-/// back restarts `sshd`, ending its open sessions.
-const NO_KEY_DISCLOSURE: &[&str] = &[
-    NO_KEY,
-    "CONSOLE LOGIN AND THE ORDINARY",
-    "SSH POLICY RETURN",
-    "OPEN SSH SESSIONS END NOW",
-];
+/// back restarts the console greeter.
+const NO_KEY_DISCLOSURE: &[&str] = &[NO_KEY, "AUTOMATIC CONSOLE LOGIN RETURNS"];
 
 /// The approval rows, last on a prompt that awaits approval, which carry
 /// its Escape. Each fits `PROMPT_COLUMNS`.
@@ -5675,13 +5670,13 @@ mod tests {
     fn disclosure_vectors() -> Vec<Vector> {
         let enrollment = [
             "BOOT AND LOCK NEED A KEY AND PIN",
-            "CONSOLE AND SSH SESSIONS END NOW",
-            "SSH ONLY FOR THE PRIMARY ACCOUNT",
+            "CONSOLE SESSION ENDS NOW",
+            "SSH KEYS STILL GRANT REMOTE LOGIN",
             "ADMINISTRATION NEEDS A LOGIN",
             "PIN SET ON ANOTHER LAYOUT MAY FAIL",
         ];
         let one_key = [
-            "LOST KEY OR BLOCKED PIN: NO LOGIN",
+            "LOST KEY OR BLOCKED PIN: NO UNLOCK",
             "RECOVERY NEEDS BOOTING OTHER CODE",
             "HERE, WHICH ALSO BYPASSES THE LOCK",
             "A BACKUP KEY CAN BE ADDED LATER",
@@ -5771,9 +5766,7 @@ mod tests {
                     ],
                     &[&[
                         "LOGIN WILL NOT NEED A KEY",
-                        "CONSOLE LOGIN AND THE ORDINARY",
-                        "SSH POLICY RETURN",
-                        "OPEN SSH SESSIONS END NOW",
+                        "AUTOMATIC CONSOLE LOGIN RETURNS",
                     ]],
                 ),
             ),
@@ -7317,8 +7310,8 @@ mod tests {
                     "AUTHORIZED BY DISK RECOVERY KEY",
                     "TYPE THE DISK RECOVERY KEY",
                     "BOOT AND LOCK NEED A KEY AND PIN",
-                    "CONSOLE AND SSH SESSIONS END NOW",
-                    "SSH ONLY FOR THE PRIMARY ACCOUNT",
+                    "CONSOLE SESSION ENDS NOW",
+                    "SSH KEYS STILL GRANT REMOTE LOGIN",
                     "ADMINISTRATION NEEDS A LOGIN",
                     "PIN SET ON ANOTHER LAYOUT MAY FAIL",
                     "ENTER: APPROVE",
@@ -7396,7 +7389,7 @@ mod tests {
                     "REMOVE: 1:01020304 3:3fa2c1d0",
                     "AUTHORIZED BY A DISK SECURITY KEY",
                     "CONNECT ONE DISK SECURITY KEY ONLY",
-                    "LOST KEY OR BLOCKED PIN: NO LOGIN",
+                    "LOST KEY OR BLOCKED PIN: NO UNLOCK",
                     "RECOVERY NEEDS BOOTING OTHER CODE",
                     "HERE, WHICH ALSO BYPASSES THE LOCK",
                     "A BACKUP KEY CAN BE ADDED LATER",

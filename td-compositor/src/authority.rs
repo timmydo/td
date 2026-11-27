@@ -2473,7 +2473,7 @@ mod tests {
             (
                 2,
                 Revocation::Restarting,
-                Some("A CONSOLE OR SSH SESSION COULD NOT BE CLOSED: RESTARTING"),
+                Some("A CONSOLE SESSION COULD NOT BE CLOSED: RESTARTING"),
             ),
             (
                 3,

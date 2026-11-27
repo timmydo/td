@@ -840,10 +840,9 @@ reach the jail.
   `ssh_policy.rs`, which the driver mounts) goes to the real `td-sshd`: `-T` over the
   file as it is, for the primary, another account, root and `td-admin`, and `-t` with
   the test's host key standing for the machine's. `-T` runs no admission, so it says
-  only what the file selects for each name. The enforced and ordinary forms then run
-  real logins, with the self-test key file redirected to one the test holds: a key only
-  in the account's own file is refused under the enforced form, and the file's own key
-  logs in under it, and the first key logs in under the ordinary form. The check's
+  only what the file selects for each name. With the desktop configuration the
+  account's own key logs in before and after enrollment. The loopback
+  self-test key also logs in. The check's
   runner holds the driver's count of checks to the number it has, so a leg cannot quietly
   stop running.
 - Boot: `TD-SSHD-OK`, `TD-ROOT-SSH-REFUSED` and the Git clone, push and reclone legs;

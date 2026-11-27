@@ -619,9 +619,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         "PASS: a full TPM-free system refused a first enrollment while previous lacked the tier \
          marker, enrolled two keys through the attention screen, its disclosure approved by \
          Enter once seen, and the cutover ended a held serial session with a process \
-         ignoring TERM and an open SSH session, every process of both containments, the \
+         ignoring TERM while the existing SSH command survived, the \
          greeter refusing; root SSH refused before and after; booted locked behind its client \
-         with the serial greeter refused, the enforced SSH form and boot health complete, \
+         with the serial greeter refused, owner SSH working, admin access refused for that key and boot health complete, \
          unlocked with each key, relocked by Super+l, L and a killed compositor, refused \
          unmarked and wrong-version updates and admitted its own, showed each unavailable \
          cause and recovered; added keys to eight and refused a ninth; removed seven and then \

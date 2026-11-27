@@ -1,11 +1,10 @@
-//! td-authd/DESIGN.md amendment 7: the revocation that brings the console
-//! and SSH to the reduced login state whenever the volatile record does
+//! td-authd/DESIGN.md amendment 7: the revocation that brings the console to the reduced login state whenever the volatile record does
 //! not name that state for this boot (td-login/TOKEN-LOGIN.md, "Cutover").
 //!
 //! A nonblocking state machine beside the operation slot, which `tick`
-//! advances: the record's removal, `render-ssh-policy`, the line's
-//! hand-back, td-svc's restart of `sshd` and `greeter` and the observation
-//! of each new leader, then the record. Every td-svc exchange is a bounded
+//! advances: the record's removal, `console-login-state`, the line's
+//! hand-back, td-svc's restart of `greeter` and the observation
+//! of its new leader, then the record. Every td-svc exchange is a bounded
 //! `/bin/td-svc` client child. A failure requests one guarded reboot once
 //! the slot is free.
 
@@ -25,7 +24,7 @@ const O_NONBLOCK: i32 = 0x800;
 const LINE: &str = "/dev/ttyS0";
 const GUARD: &str = "/var/lib/td/login/cutover-reboot";
 /// The units a cutover restarts, in request order, and no other.
-const UNITS: &[&str] = &["sshd", "greeter"];
+const UNITS: &[&str] = &["greeter"];
 const RENDER_TIME: Duration = Duration::from_secs(10);
 /// One `/bin/td-svc` client's bound, a control exchange's or the reboot
 /// request's: td-authd/DESIGN.md amendment 7 says why it is 12 seconds.
@@ -41,7 +40,7 @@ const POLL_STEP: Duration = Duration::from_millis(250);
 const TEARDOWN_REAP: Duration = Duration::from_secs(1);
 /// How often teardown looks at its reboot request again.
 const TEARDOWN_STEP: Duration = Duration::from_millis(2);
-/// `render-ssh-policy`'s output bound.
+/// `console-login-state`'s output bound.
 const RENDER_OUTPUT: usize = 16;
 /// td-svc's two acceptances of `reboot`.
 const REBOOT_REPLIES: &[&str] = &[
@@ -96,7 +95,7 @@ pub(crate) struct Host {
     /// The owner the record, the guard and the line must have.
     uid: u32,
     gid: u32,
-    /// Starts `render-ssh-policy`, bounded by its output and deadline.
+    /// Starts `console-login-state`, bounded by its output and deadline.
     render: Box<dyn Fn() -> Result<Inspection, String>>,
     /// Starts the reboot request, bounded likewise.
     reboot: Box<dyn Fn() -> Result<Inspection, String>>,
@@ -119,7 +118,7 @@ impl Host {
             gid: 0,
             render: Box::new(|| {
                 let mut command = Command::new("/bin/td-firstboot");
-                command.arg("render-ssh-policy");
+                command.arg("console-login-state");
                 Inspection::printing(command, RENDER_OUTPUT, RENDER_TIME)
             }),
             reboot: Box::new(|| {
@@ -310,7 +309,7 @@ fn hand_back(line: &Path, uid: u32, gid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// The form `render-ssh-policy` printed: exactly one word and a newline.
+/// The form `console-login-state` printed: exactly one word and a newline.
 fn rendered(output: &[u8]) -> Option<Reduced> {
     [Reduced::Unenrolled, Reduced::Enforced]
         .into_iter()
@@ -490,7 +489,7 @@ enum Progress {
     Failed(String),
 }
 
-/// The restarts of a cutover whose render published `form`.
+/// The restarts of a cutover for the observed console state `form`.
 struct Restart {
     form: Reduced,
     units: Vec<Unit>,
@@ -517,7 +516,7 @@ impl Restart {
     }
 
     /// Advances as far as it can without blocking: every leader is read,
-    /// then both restarts are requested, then each unit is polled until it
+    /// then the greeter is restarted and polled until it
     /// has left `stopping` and runs a new leader, within its deadline. A
     /// unit past its deadline fails before any reply is accepted.
     fn advance(&mut self, host: &Host) -> Progress {
@@ -624,7 +623,7 @@ impl Restart {
             Step::Await => {
                 let line = Line::parse(name, text).ok_or_else(refused)?;
                 // A unit stopped after its restart was asked fails at once.
-                // Both units restart always, so `failed` and `held` are
+                // The greeter restarts always, so `failed` and `held` are
                 // td-svc's restart backoff and `down` a start to come: each
                 // is polled until a new leader or the deadline.
                 if line.state == "stopped" {
@@ -731,7 +730,7 @@ impl Revocation {
         }
         match (self.host.render)() {
             Ok(render) => self.phase = Phase::Render(Box::new(render)),
-            Err(why) => self.fail(&format!("render-ssh-policy: {why}")),
+            Err(why) => self.fail(&format!("console-login-state: {why}")),
         }
     }
 
@@ -752,16 +751,16 @@ impl Revocation {
                     Ok(()) => self.phase = Phase::Restart(Box::new(Restart::new(form))),
                     Err(why) => self.fail(&format!("hand-back: {why}")),
                 },
-                None => self.fail("render-ssh-policy printed no form"),
+                None => self.fail("console-login-state printed no form"),
             },
             Some(Ok(Some(None))) => {
                 let said = match &mut self.phase {
                     Phase::Render(render) => render.said(),
                     _ => String::new(),
                 };
-                self.fail(&format!("render-ssh-policy failed{said}"))
+                self.fail(&format!("console-login-state failed{said}"))
             }
-            Some(Err(why)) => self.fail(&format!("render-ssh-policy: {why}")),
+            Some(Err(why)) => self.fail(&format!("console-login-state: {why}")),
         }
         let progress = match &mut self.phase {
             Phase::Restart(restart) => restart.advance(&self.host),

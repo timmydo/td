@@ -15,7 +15,7 @@ increment 4's C10b ("Deployments"), `sshd`'s `stop=leaf`, and the
 compositor's `K` screen, disclosures, PIN field and lock surface. Since
 A5, production admits a first enrollment, an addition and a removal:
 the session owner selects each on the attention screen's `K`, and the
-first enrollment ends automatic login, the ordinary SSH form and the
+first enrollment ends automatic console login and the
 unlocked start for that account until its last key is removed. A
 machine with neither a record nor an invalid directory, as every stock
 machine is until its owner enrolls, behaves as `THREAT-MODEL.md` §3
@@ -30,8 +30,8 @@ T430s ("Evidence"), which follows this increment: no document, UI or
 release note may describe the tier as usable before that record exists.
 Other documents point here rather than restate it.
 
-**Enrollment requires §L.1 elevation.** Enrolling a key refuses every
-interactive login, and there is no `su` and root has no login at all,
+**Enrollment requires §L.1 elevation.** Enrolling a key disables automatic physical
+login, and there is no `su` and root has no login at all,
 so an enrolled machine would otherwise have no administrative path. The
 activation increment therefore landed only after the `APPLICATIONS.md`
 §L.1 consent-only elevation workstream, whose "Elevation increments" L1
@@ -62,10 +62,11 @@ can enroll; root and service accounts have no login keys.
 The tier defends against a person at a booted td machine whose session is
 locked, who lacks an enrolled key and its PIN, and who uses the
 interactive surfaces td offers: the lock screen, the secure-attention
-screen, td-login's interactive console paths and SSH. On an enrolled
-machine none of these opens a session for that person without a key (the
-SSH self-test key is readable only by the session's own account), and
-administration is §L.1 elevation from an unlocked session.
+screen and td-login's interactive console paths. An authorized SSH key
+independently grants access to the primary account and its files while
+the screen is locked. Local administrative consent requires the physical
+trusted-input path. The dedicated remote administrative grant is specified
+in `td-update/ADMIN.md`.
 
 It does **not** protect:
 
@@ -196,7 +197,7 @@ needs no helper; the predicate reports it as its own state, which every
 consumer treats as enforced.
 
 Unavailable keeps every refusal of the enrolled state in force (td-login's,
-SSH's enforced form, the update-consent rule) and the compositor stays
+the update-consent rule) and the compositor stays
 locked with no unlock. It is not boot-fatal and does not fail boot health:
 firstboot reports a damaged directory on the console and continues.
 Rolling back cannot repair it, because both deployments share `@var`;
@@ -744,22 +745,23 @@ path, is refused as `THREAT-MODEL.md` §3 specifies.
 
 ## SSH
 
-The separately enrolled remote administrator (`td-update/ADMIN.md`) is an
-explicit exception to the primary-only account rule in this section.
-`AllowUsers` in the enforced form also names `td-admin`, whose root-owned
-key file and forced fixed-command interface authorize configured signed-release and explicit trusted-main updates,
-rollback and reboot. This key does not unlock the primary session or access
-its credential store. Stopping `sshd` during a login-key cutover closes its
-connections too; admitted admin jobs belong to their separate supervised
-service and continue. A login-key change does not revoke the independent
-administrator grant. Root SSH remains refused in both forms.
+The desktop admits the validated primary account and `td-admin` in a
+fixed `AllowUsers` list. The primary account's SSH keys grant ordinary
+account access on every boot, including while its screen is locked.
+Enrollment, removal and locking leave SSH connections running.
+
+The dedicated `td-admin` account trusts the root-owned administrator key
+file and forces the fixed command interface in `td-update/ADMIN.md`.
+The primary's keys cannot authorize that interface. Physical secure
+attention, hardware approval and session unlock retain their local input
+requirements.
 
 td-sshd has no subsystem, so no SFTP and no modern `scp`. A file moves
 through a command's stdin or stdout (`td-ssh/DESIGN.md` §6), as the
 authenticated account with its ordinary filesystem permissions, under the
-same key admission and enrollment cutover as a shell session.
+same key admission as a shell session.
 
-On a verifiably unenrolled machine, the primary account can authorize
+On a desktop, the primary account can authorize
 remote Ed25519 keys in its own `~/.ssh/authorized_keys`. td-sshd resolves
 that relative path against the account database home, not an environment
 variable. The home and key file must not be writable by other users; use
@@ -773,14 +775,14 @@ and its private key is readable by UID 1000 itself, so it grants nothing
 the session lacks and nothing off the machine. `/etc/bootsuccess`
 generates both on every boot (`build_bootsuccess` in
 `recipes/src/recipes/system-x86-64.rs`), and the policy's `Match` block
-names that file and, only in the ordinary form, `.ssh/authorized_keys`
+names that file and the owner’s `.ssh/authorized_keys`
 (`td-firstboot/src/ssh_policy.rs`). Root has no SSH
 login in either form: both carry `PermitRootLogin no` (`APPLICATIONS.md`
 §L.1, L7), and root's password field is `!`. This is that rule's one
 statement; other documents point here.
 
 A server image (`server-x86-64`, td-svc/DESIGN.md §10, "Profiles")
-renders the same two forms with one addition. The primary's `Match`
+retains separate ordinary and enforced forms. The primary's `Match`
 block also names `/var/lib/td/authorized-keys` and then
 `/run/td-metadata-authorized-keys`, between the self-test file and
 `.ssh/authorized_keys`, and keeps both in the enforced form too. The
@@ -814,67 +816,21 @@ over it. A deployment older than L7 reads it as root's
 (`APPLICATIONS.md` §L.1, "The rollback window"), which is why firstboot
 warns while it holds a key.
 
-In the enrolled and unavailable states the rendered policy takes its
-**enforced form**, which admits no account but the primary. SSH then
-opens no session without a login key except that self-test and, on a
-server, its provisioned keys. Only a
-verifiably unenrolled state renders the ordinary policy. At every boot
-stage-1 init's `td-firstboot render-primary-sshd /sysroot`, right after
-the directory step ("The login record") and before `sshd` starts,
-renders the form that matches the login state, decided by the
-directory-and-name check alone, with no helper: a valid directory
-without the record name or the protected marker, on a boot without
-`/run/td-admit`, renders the ordinary policy, and anything else the
-enforced form. The cutover renders it within a boot, removing access
-to owner-managed remote keys on enrollment and terminating existing SSH
-sessions. Removing the last login key restores the ordinary form, including
-access through remote keys retained in the account's home. The QEMU root-refusal fixture (`APPLICATIONS.md` §L.1, "Retiring
-the escape hatch") runs on unenrolled images, and root is refused in
-both forms.
-
-The enforced form omits `.ssh/authorized_keys` and adds the line
-`AllowUsers NAME td-admin` (`AllowUsers NAME` alone on a provisioned
-server, which has no `td-admin`) right after `PermitRootLogin no`, still
-in the global section before the primary's `Match User NAME` block, NAME
-being the admitted primary account. Those two changes are all that separates
-the forms of one profile: every other byte is the same, and a server's policy
-has no `td-admin` `Match` block in either form. Both hold only
-`td-ssh/DESIGN.md` §5's keywords, the file td-sshd refuses whole otherwise;
-what the policy once spelled out (publickey only, no forwarding, the one
-algorithm suite) is compiled in. The shared account validation admits only a
-lowercase letter followed by lowercase letters, digits, `_` and `-`, so NAME
-carries no pattern character and `AllowUsers` names only those accounts.
-Firstboot reads the accounts first, whose failure still stops boot, then
-the state under the same root it renders under, for UID 1000's record
-with root:root as the owner. The predicate answers every failure to read
-as unavailable, never as unenrolled, so a read that fails renders the
-enforced form and nothing falls back to the ordinary one. The realized
-`td-ssh-test` checks both forms with the built `td-sshd -T` and `-t`, and the
-stock image's boot health proves root's seeded key refused
-(`TD-ROOT-SSH-REFUSED`, `THREAT-MODEL.md` §8).
+On the server profile alone, the enforced form restricts `AllowUsers`
+to the primary and omits its home key file. Stage 1 publishes the
+validated profile's SSH configuration atomically before starting sshd.
+The console cutover record written alongside it identifies local login
+state and is independent of the desktop SSH configuration.
 
 ## Cutover
 
 Whenever the login state moves between unenrolled and enforced (enrolled
-or unavailable), by an operation or otherwise, td revokes every
-interactive session that the other state allowed: a serial session the
-greeter started before enrollment would otherwise keep a UID-1000 shell on
-`ttyS0`, and an SSH session the other policy admitted would outlive
-it. td-authd renders the SSH policy for the new
-state, restarts `sshd` and `greeter` through td-svc, and reports
-completion only after observing that each old containment is empty and a
-new instance runs; its exact mechanism, deadline, reconciliation, notice
-and failure handling are `td-authd/DESIGN.md`'s revocation amendment.
-
-Revocation is reconciled from durable state, not from the operation that
-changed it. Firstboot renders the policy for the login state at every boot
-before `sshd` and the greeter start, and td-authd repeats the check after
-every login operation, including a failed or uncertain one, at every
-Prepare, and when it starts. A worker or authority death between
-publication and restart therefore still converges. A revocation that
-cannot be observed complete is a failure that ends in one orderly reboot,
-whose boot ordering enforces the boundary; td-authd's guard keeps a
-persistent failure from looping.
+or unavailable), td-authd reads the effective console state, takes back
+the serial line and restarts the greeter. A serial shell from before
+enrollment must end before revocation succeeds. The boot record and
+reconciliation after uncertain operations or authority restarts are
+specified in `td-authd/DESIGN.md` amendment 7. Its failure path permits
+one guarded reboot.
 
 The restarted greeter re-enters `login-primary`, which refuses and
 returns the terminal to root (`THREAT-MODEL.md` §3). The greeter's
@@ -891,13 +847,9 @@ until the restarted greeter's refusal takes it for root. Revocation
 therefore returns the line to root:root with the pinned mode before it
 restarts the greeter (`td-authd/DESIGN.md`, amendment 7), which narrows
 that window to the time between the state change and the revocation;
-the refusal's hand-back alone does not close it. `sshd`'s unit, which runs
-`/bin/td-sshd`, stops its whole service leaf (`stop=leaf`,
-`td-svc/DESIGN.md`), so td-sshd's sessions in their own process groups end
-too: they stay in that leaf (`td-ssh/DESIGN.md` §4).
+the refusal's hand-back alone does not close it.
 
-Removing the last key reverses the cutover, so console login and the
-ordinary SSH policy return at once. The graphical session that performed
+Removing the last key restores automatic console login. The graphical session that performed
 the change stays unlocked; td-authd's next login-state answer makes the
 lock available or unavailable at once.
 
@@ -914,8 +866,7 @@ deployment ID covers it, being the SHA-256 of the manifest, which holds
 the initramfs's SHA-256.
 
 The marker claims that the deployment honours the record at every entry
-point: the console refusal (increment 4's C5), the enforced SSH form
-(C6), the locked start (C7), and the session lock on `Super+l`, `L`, lid
+point: the console refusal (increment 4's C5), the locked start (C7), and the session lock on `Super+l`, `L`, lid
 close and resume (C9, C10). Enrollment trusts `current` and `previous`
 on that claim, so a deployment that carried the marker but not that
 enforcement would be a rollback target that boots open on an enrolled
@@ -1061,12 +1012,11 @@ scope. The person chooses:
 Either choice first shows an enrollment disclosure, confirmed by Enter
 under `td-compositor/DESIGN.md`, "Elevation consent". It states that from then on the
 machine boots and locks to a screen only an enrolled key and its PIN
-open; that open console and SSH sessions end now, and SSH for any
-account but the primary is refused from then on (root SSH already is,
-since §L.1's L7); that administration then needs a login; and that a PIN
+open; that the serial session ends, SSH keys still grant remote login,
+and local administration needs a login; and that a PIN
 set on another keyboard layout may not be typable here. The one-key
 choice adds that losing this key, or blocking its PIN, leaves no way to
-log in, locally or over SSH; that recovery then needs someone who can
+unlock locally; that recovery then needs someone who can
 start other code on this machine (a firmware boot menu or UEFI shell
 suffices on an unencrypted disk), the same access that bypasses the
 lock; and that a backup key can be added later.
@@ -1091,9 +1041,8 @@ that key may be in the set. Leaving exactly one key requires the one-key
 disclosure. Removing every key is refused on a protected volume, where
 the machine never logs in without a key;
 elsewhere it requires a disclosure that the machine will log in without
-a key and that open SSH sessions end now, confirmed the same way; the
-record is then unlinked and the cutover restores console login and the
-ordinary SSH policy.
+a key, confirmed the same way; the record is then unlinked and the
+cutover restores automatic console login.
 
 **On a protected volume** (`td-install/ENCRYPTION.md` increment 8,
 inert until its item 9; td-authd's `/var/lib/td/login/protected` marker
@@ -1191,8 +1140,9 @@ can rewrite the record regardless.
 With one key lost and another enrolled, unlock with the other, remove the
 lost key and add a replacement.
 
-With every key lost or every PIN blocked, no td path logs in, locally or
-over SSH, and §L.1 elevation needs an unlocked session. There is no
+With every key lost or every PIN blocked, local unlock is unavailable.
+An authorized SSH key still opens the primary account, while §L.1 local
+elevation requires an unlocked session. There is no
 password, recovery code or fallback; recovery is physical only, and that
 is deliberate. td ships no privileged recovery environment, and its live
 medium is none: the live session is unprivileged (`APPLICATIONS.md`
@@ -1387,17 +1337,16 @@ lines, including each disclosure's approval rows, before the guest
 presses Enter. Its `seed` boot is refused a first enrollment
 while `previous` names a deployment without the tier marker, then
 enrolls two keys with a serial login held by a process that ignores
-TERM and a primary SSH session open; the cutover ends every process of
-both containments, the greeter then refuses, and root's SSH key is
+TERM and a primary SSH session open; the cutover ends the serial containment and preserves the SSH session, the greeter then refuses, and root's SSH key is
 refused before and after. Each later enrolled boot starts locked with
-the enforced SSH form. `added` adds six keys to eight and is refused a
+the desktop SSH policy. `added` adds six keys to eight and is refused a
 ninth before any token; `removed` removes seven behind the one-key
 disclosure and then the last behind the remove-all disclosure, after
 which the held serial login starts at once, and `unlocked` boots
 unlocked with the ordinary form. There one key is enrolled while the
 cutover's render is held and the authority is killed after the
-publication, before either restart; the next generation's check ends
-both sessions. `cut` removes that key, enrolls another and is killed
+publication, before the greeter restart; the next generation's check ends
+the serial session while the SSH session continues. `cut` removes that key, enrolls another and is killed
 by the host right after its publication, and `after-cut` finds the
 whole record and the enforced form that firstboot rendered before
 `sshd` and the greeter started, neither restarted, and unlocks.
@@ -1410,7 +1359,7 @@ both forms, changed them on its own account.
 
 QEMU proves protocol composition, td's state machine, the refusal paths,
 the trusted input and display path, relock on crash and resume, console
-and SSH revocation and publication. It does not prove a USB controller,
+revocation, SSH continuity and publication. It does not prove a USB controller,
 YubiKey firmware interoperability (PIN protocol, credential-ID length,
 list limit, silent assertion, UV-protected hmac-secret), real touch
 timing within the deadlines, a real retry counter, a real lid switch,
@@ -1558,7 +1507,7 @@ and the oracle that shows it.
 4. **Locked boot and session lock:** request `1a` with the login state,
    the enrolled key list, the primary username and the hostname;
    firstboot's directory and temporaries; the unavailable state;
-   firstboot's boot-time render of the enforced SSH form for the enrolled
+   firstboot's boot-time render of the desktop SSH policy for the enrolled
    and unavailable states; td-login's console refusal; removal of
    `build_autologin`'s `login -f` fallback; the tier marker and
    td-authd's update-consent refusal; the locked start; `Super+l`,
@@ -1629,22 +1578,7 @@ and the oracle that shows it.
      writes and the recipe's staging; the refusal on a full system is
      `qemu-login-system`'s (C11). It changes every boot's greeter path,
      so its landing runs `check integration` by hand.
-   - C6, landed: `render-primary-sshd`'s enforced form ("SSH"), its
-     unenrolled output byte-identical to the one before it. The
-     predicate was already td-firstboot's reviewed `#[path]` since C1, and
-     its recipe already staged it. Host tests hold the ordinary form to a
-     literal copy of the policy before it for several names, the enforced
-     form's exact bytes, the ordinary form chosen only by an unenrolled
-     state, and the enforced form over temporary roots that are enrolled
-     (the record name in any shape), damaged in each way the predicate
-     names (a wrong mode or owner, missing, a file, a link at or above
-     it, a relative root) and unreadable (an unsearchable parent); the
-     admitted name is the one the shared account validation admits; and
-     the recipe tests keep the single render right after the directory
-     step and check both forms with the built `td-sshd -T`. The enforced
-     form on a full system is `qemu-login-system`'s (C11). It changes
-     the boot path's td-firstboot, so its landing runs `check
-     integration` by hand.
+   - Firstboot publishes the desktop SSH policy specified in "SSH".
    - C7, landed, the activating commit: the compositor's locked start
      (`td-compositor/DESIGN.md`, "The lock surface"). In the paired
      profile, the `1a` answer at connect locks an enrolled or
@@ -1763,8 +1697,8 @@ and the oracle that shows it.
      chipset QEMU resets at the wake no longer powers down.
 
    C7 lands only after the update-consent refusal (C4), the console
-   refusal (C5) and the enforced SSH render (C6), so no build locks the
-   screen while an update, the console or SSH could pass it. C10b landed
+   refusal (C5) and the desktop SSH policy, so no build locks the
+   screen while an update or the console could pass it. C10b landed
    only after C10, so no deployment carries the marker before it
    honours the record at every entry point. Each commit
    before C7 changes behaviour only where a record or an invalid
@@ -1805,12 +1739,12 @@ and the oracle that shows it.
      freeze and the wake reset QEMU's virtio-vga, and Linux 7.3.1's
      virtio-gpu recreates its objects only after hibernation, not S3,
      so the lock surface itself is not seen; the unavailable state, with
-     its screen text and the enforced SSH form, for a wrong-mode,
+     its screen text and the desktop SSH policy, for a wrong-mode,
      wrong-owner and non-directory `/var/lib/td/login` and for a record
      with the wrong mode, two links, truncated bytes or an unknown version,
      each repaired by the documented recovery and followed by a normal
      boot; with the `inspect-login` helper made to fail, an unenrolled
-     image that boots unlocked with the ordinary SSH policy, and a seeded
+     image that boots unlocked with the desktop SSH policy, and a seeded
      record that shows `STATE COULD NOT BE READ` and resolves to enrolled
      once the helper answers; refusal to install a marker-less deployment
      and a marked deployment that does not read the record's version,
@@ -1849,7 +1783,7 @@ and the oracle that shows it.
 "Enrollment requires §L.1 elevation" above requires.
 
 5. **Activation:** enrollment UI and automatic-login cutover, the
-   in-boot SSH render (`td-firstboot render-ssh-policy`), the `stop=leaf`
+   in-boot console state check (`td-firstboot console-login-state`), the `stop=leaf`
    key and `sshd`'s use of it (`td-svc/DESIGN.md`), the `K` screens, the
    disclosures with their approval, addition and removal, the
    deployment-marker check on enrollment, and revocation with its reboot
@@ -1860,10 +1794,10 @@ and the oracle that shows it.
    - Full-system QEMU: both enrollment choices through the attention
      screen; enrollment in a boot whose serial session was logged in and
      runs a process that ignores TERM, and in which a primary SSH
-     session is open, followed by observation that both sessions and
-     every process in their containments are gone and the greeter
+     session is open, followed by observation that the SSH session survives, the serial containment
+     empties and the greeter
      refuses; a root SSH attempt, refused before enrollment (§L.1's L7)
-     and after; a cold reboot that is locked with the enforced SSH form;
+     and after; a cold reboot that is locked with the desktop SSH policy;
      additions to eight; removal disclosures; removal of every key
      followed by immediate serial login and an unlocked next boot;
      enrollment refused while `previous` lacks the marker.
@@ -1883,9 +1817,8 @@ and the oracle that shows it.
    Increment 5 is specified as five commits, A1 to A5, in landing
    order. Only A5 admits a write. Before it, a cutover arises only when
    the login state changes within a boot, which in production only
-   damage to the directory or the record does. A1's `sshd` stop and A2's
-   atomic publication and record are live on every machine and change
-   no admitted login. A1 and A2 each add their live piece to AGENTS.md
+   damage to the directory or the record does. The SSH service uses whole-leaf stopping when explicitly stopped.
+   The login cutover requests a restart of the greeter alone. A1 and A2 each add their live piece to AGENTS.md
    principle 7's list and to this document's opening when they land.
    - A1, landed: td-svc `stop=leaf` (`td-svc/DESIGN.md`):
      - the key, and its validation: `cgroup=service`, no `tty=`, not
@@ -1907,18 +1840,16 @@ and the oracle that shows it.
      trampoline's grant, and a guest whose leader forks a session child
      in its own session before anything else and holds it through a
      crash and ends it at a restart.
-   - A2, landed: firstboot's two renders:
+   - A2, landed: firstboot’s boot publication and console-state query:
      - Stage-1's `td-firstboot render-primary-sshd /sysroot` publishes
        `/sysroot/run/td-sshd.conf` itself, a root:root mode-0600
        temporary renamed into place, in place of the shell's truncating
        redirect. It then writes the volatile record
-       `/sysroot/run/td-login-cutover` for the form it rendered.
+       `/sysroot/run/td-login-cutover` for the console state it observed.
        `td-authd/DESIGN.md`'s amendment 7 gives the record's bytes,
        writers and reader once.
-     - The new fixed verb `td-firstboot render-ssh-policy` takes no
-       operand. It renders under `/` for a running boot, publishes the
-       policy the same way, and prints the form it published. It writes
-       no record; A3's cutover runs it.
+     - The fixed `td-firstboot console-login-state` verb reads the reduced
+       console state for a running cutover.
 
      A2 amends `THREAT-MODEL.md` §1's render and serialization
      statements to match.
@@ -1939,8 +1870,8 @@ and the oracle that shows it.
      greeter`: the greeter is stopped only while the unenrolled screens
      need the line the host answers on, then started again, and after
      seeding a restarted pair finds the record and the state different.
-     The cutover ends the logged-in serial session and an open SSH
-     session, and leaves the enforced form, the record naming it and a
+     The cutover ends the logged-in serial session, preserves the SSH
+     session, and leaves the record naming the enforced state and a
      greeter that refuses.
    - A4, landed: the disclosures' approval, which production reaches
      since A5 admits a write:

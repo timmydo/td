@@ -3268,8 +3268,8 @@ guard is a std create-new file with `O_NOFOLLOW` through that held
 directory, `fchown`, permissions and syncs of it and its directory, and
 std's removal. The line's hand-back is std's `symlink_metadata`,
 `lchown` and path-based `set_permissions`. Its fixed children,
-`/bin/td-firstboot render-ssh-policy`, `/bin/td-svc reboot` and each
-control exchange's `/bin/td-svc status|restart sshd|greeter`, start
+`/bin/td-firstboot console-login-state`, `/bin/td-svc reboot` and each
+control exchange's `/bin/td-svc status|restart greeter`, start
 through `inspection.rs`'s bounded launch with an empty environment, cwd
 `/` and a socketpair end as stdout, where the existing helpers have it
 as stdin; that choice, a failed exit's output reported to its caller,

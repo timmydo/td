@@ -639,8 +639,8 @@ its stop. `status` appends ` leaf=unproven` to its line while either kind
 holds, and a revocation waiting on the unit fails closed. Shutdown stays
 bounded: at the shutdown deadline it proceeds past such a unit as it does
 for any other. A oneshot's `timeout=` still stops its group alone. The
-shipped `sshd` unit sets `stop=leaf`, which the login-key tier's
-revocation relies on (`td-login/TOKEN-LOGIN.md`, "Cutover").
+shipped `sshd` unit sets `stop=leaf` so an explicit service stop or
+restart terminates its SSH sessions.
 
 Paired commands and their descendants must remain in their service leaf.
 They must not use the uid-1000 login/session handoff that moves work out of

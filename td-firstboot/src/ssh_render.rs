@@ -2,7 +2,7 @@
 //! (td-login/TOKEN-LOGIN.md, "SSH" and increment 5's A2). The record's
 //! bytes, writers and reader are td-authd/DESIGN.md amendment 7's.
 //!
-//! Both verbs publish through `cutover::publish`, which td-authd shares
+//! Stage 1 publishes through `cutover::publish`, which td-authd shares
 //! for its own record write: a fixed-name temporary beside the target,
 //! created exclusively without following a link, written, synced and
 //! renamed into place, so td-sshd never reads a partial policy and td-authd
@@ -16,7 +16,7 @@ use std::path::Path;
 pub(crate) const POLICY: &str = "run/td-sshd.conf";
 
 /// The reduced login state a form serves, which the record and
-/// `render-ssh-policy`'s output name.
+/// `console-login-state`'s output name.
 pub(crate) fn reduced(form: ssh_policy::Form) -> Reduced {
     match form {
         ssh_policy::Form::Ordinary => Reduced::Unenrolled,
@@ -24,7 +24,7 @@ pub(crate) fn reduced(form: ssh_policy::Form) -> Reduced {
     }
 }
 
-/// Only a verifiably unenrolled machine gets the ordinary form; the
+/// Only a verifiably unenrolled machine permits local automatic login. The
 /// predicate reports every failure to read as unavailable, never unenrolled.
 pub(crate) fn ssh_form(state: login_state::State) -> ssh_policy::Form {
     match state {
@@ -44,9 +44,8 @@ pub(crate) fn selected(root: &Path, owner: login_state::Owner) -> ssh_policy::Fo
     ))
 }
 
-/// Stage 1's render: the policy for `primary` in the form `root`'s login
-/// state selects, published under `root`, then the record naming that
-/// form for the boot `boot_id` names. The ID is read and checked first,
+/// Stage 1 publishes the SSH policy for the machine profile, then the
+/// console cutover record for the boot named by `boot_id`. The ID is read and checked first,
 /// so a malformed one publishes nothing.
 pub(crate) fn boot_render(
     root: &Path,
@@ -131,19 +130,6 @@ fn check_provisioned_keys(root: &Path, owner: login_state::Owner) -> Result<(), 
     Ok(())
 }
 
-/// The running boot's render: the policy alone, and the line
-/// `render-ssh-policy` prints for the form it published. Only td-authd
-/// asks for it, and only the desktop ships td-authd, so it renders the
-/// desktop's keys.
-pub(crate) fn running_render(
-    root: &Path,
-    primary: &str,
-    owner: login_state::Owner,
-) -> Result<String, String> {
-    publish_policy(root, primary, owner, ssh_policy::Provisioned::No)
-        .map(|form| format!("{}\n", reduced(form).word()))
-}
-
 fn publish_policy(
     root: &Path,
     primary: &str,
@@ -177,19 +163,15 @@ mod tests {
     /// A root holding `run` and a valid `var/lib/td/login`, owned by the
     /// test's IDs, and a boot ID file beside them.
     struct Root {
+        _scratch: td_fs::TempDir,
         root: PathBuf,
         owner: login_state::Owner,
     }
 
     impl Root {
         fn new() -> Self {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "td-firstboot-ssh-render-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let scratch = td_fs::TempDir::new("td-firstboot-ssh-render").unwrap();
+            let root = scratch.path().to_path_buf();
             for directory in ["var/lib/td", "run"] {
                 std::fs::DirBuilder::new()
                     .mode(0o755)
@@ -203,6 +185,7 @@ mod tests {
                 .unwrap();
             let meta = std::fs::metadata(&root).unwrap();
             let root = Self {
+                _scratch: scratch,
                 root,
                 owner: login_state::Owner {
                     uid: meta.uid(),
@@ -225,10 +208,6 @@ mod tests {
                 self.owner,
                 ssh_policy::Provisioned::No,
             )
-        }
-
-        fn running(&self) -> Result<String, String> {
-            running_render(&self.root, "alice", self.owner)
         }
 
         fn server_boot(&self) -> Result<ssh_policy::Form, String> {
@@ -261,12 +240,6 @@ mod tests {
             assert_eq!((meta.uid(), meta.gid()), (self.owner.uid, self.owner.gid));
             assert_eq!(meta.nlink(), 1);
             assert!(std::fs::symlink_metadata(temporary(&self.root.join(name))).is_err());
-        }
-    }
-
-    impl Drop for Root {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -401,44 +374,6 @@ mod tests {
         assert_eq!(RECORD, "run/td-login-cutover");
         assert_eq!(POLICY, "run/td-sshd.conf");
         assert_eq!(BOOT_ID, "/proc/sys/kernel/random/boot_id");
-    }
-
-    /// The in-boot verb prints exactly the word of the form it published
-    /// and writes no record; for one state both verbs publish one policy.
-    #[test]
-    fn the_running_render_reports_its_form_and_matches_the_boot_render() {
-        let root = Root::new();
-        assert_eq!(root.running().as_deref(), Ok("unenrolled\n"));
-        assert!(std::fs::symlink_metadata(root.root.join(RECORD)).is_err());
-        root.published(POLICY);
-        let running = root.read(POLICY);
-        root.boot().unwrap();
-        assert_eq!(root.read(POLICY), running);
-        root.enroll();
-        assert_eq!(root.running().as_deref(), Ok("enforced\n"));
-        let running = root.read(POLICY);
-        assert_eq!(
-            running,
-            ssh_policy::config(
-                "alice",
-                ssh_policy::Form::Enforced,
-                ssh_policy::Provisioned::No
-            )
-            .as_bytes()
-        );
-        // The record still names what stage 1 rendered.
-        assert!(String::from_utf8(root.read(RECORD))
-            .unwrap()
-            .ends_with("\nunenrolled\n"));
-        root.boot().unwrap();
-        assert_eq!(root.read(POLICY), running);
-        // A damaged directory reads as unavailable: enforced, both ways.
-        let login = login_state::directory(&root.root);
-        std::fs::remove_file(login.join("1000")).unwrap();
-        std::fs::set_permissions(&login, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(root.running().as_deref(), Ok("enforced\n"));
-        assert_eq!(root.boot(), Ok(ssh_policy::Form::Enforced));
-        assert_eq!(root.read(POLICY), running);
     }
 
     #[test]
@@ -611,7 +546,6 @@ mod tests {
         let bare = Root::new();
         std::fs::remove_dir(bare.root.join("run")).unwrap();
         assert!(bare.boot().is_err());
-        assert!(bare.running().is_err());
     }
 
     /// The live kernel's ID, where the host has one, is the shape the record

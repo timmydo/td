@@ -1237,7 +1237,7 @@ fn wanted_policy_lines(
                 ssh_policy::SSHD_METADATA_AUTHORIZED_KEYS
             ));
         }
-        if form == Form::Ordinary {
+        if desktop || form == Form::Ordinary {
             keys.push_str(&format!(" {}", ssh_policy::SSHD_USER_AUTHORIZED_KEYS));
         }
         keys
@@ -1252,8 +1252,8 @@ fn wanted_policy_lines(
         format!("authorizedkeysfile {keys}"),
     ];
     match (form, desktop) {
-        (Form::Ordinary, _) => lines.push("allowusers none".to_string()),
-        (Form::Enforced, true) => {
+        (Form::Ordinary, false) => lines.push("allowusers none".to_string()),
+        (_, true) => {
             lines.push(format!("allowusers {POLICY_PRIMARY}"));
             lines.push("allowusers td-admin".to_string());
         }
@@ -1334,10 +1334,8 @@ fn image_policy_in_td_sshd(
     Ok(())
 }
 
-/// The enforced form's whole point, by real logins: it withdraws the account's own
-/// `~/.ssh/authorized_keys`, which the ordinary form reads. The root-owned self-test
-/// file both forms name is the test's, for the login that shows this daemon is up.
-fn enforced_form_logins(
+/// Authenticate with a primary-owned key under each desktop login state.
+fn desktop_policy_logins(
     tools: &Tools,
     work: &Path,
     user: &str,
@@ -1404,8 +1402,8 @@ fn enforced_form_logins(
         "known_hosts_enforced",
     )?;
     report.check(
-        "the enforced form: a key only in the account's own file is refused",
-        output.status.code() == Some(255) && saying(&output, "Permission denied (publickey)"),
+        "enrolled desktop: the account's own key logs in",
+        output.status.success() && output.stdout == b"in\n",
         || describe(&output),
     );
     let output = login(
@@ -1520,7 +1518,7 @@ fn exercise(tools: &Tools, work: &Path, report: &mut Report) -> Result<(), Strin
     let stranger = work.join(STRANGER_KEY);
     stock_client_against_td_sshd(tools, work, &home, &stock_client, &stranger, report)?;
     drop(td_sshd);
-    enforced_form_logins(tools, work, &user, &stock_key, &td_key, report)?;
+    desktop_policy_logins(tools, work, &user, &stock_key, &td_key, report)?;
 
     let authorized = format!(
         "{}{}",

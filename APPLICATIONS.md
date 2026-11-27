@@ -10006,9 +10006,8 @@ build is left without an administrative path.
    model, a nested shell among them unless it is handed exactly `-c`
    and a literal script that expands nothing and passes the same scan.
 2. **L7 locks root**; it has landed. Root's password field is `!`, which
-   every td-login path refuses, and neither SSH form admits root
-   (`td-login/TOKEN-LOGIN.md`, "SSH"), so the forms differ only by
-   `AllowUsers`. td-init's two console shells, the rescue shell PID 1
+   every td-login path refuses, and the SSH server denies root
+   (`td-login/TOKEN-LOGIN.md`, "SSH"). td-init's two console shells, the rescue shell PID 1
    started when an applet returned and the built-in inittab's respawned
    console shell, are gone: each failure now fails the boot (above).
    Boot-health probes run as root under td-svc and need no root login.
