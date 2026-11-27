@@ -4348,3 +4348,18 @@ after unplug. td-authd uses the standard library's descriptor-based
 ownership and permissions operations for the reserved Firefox group.
 Stage 2 checks the exact device and sysfs name sets and the mount
 restrictions. Stage 1's device descriptors do not cross exec.
+
+## H2. td-vmm host KVM machine
+
+The host tool's three function-scoped allowances in `td-vmm/src/kvm.rs`
+cover one x86-64 syscall instruction, one adoption of the fresh VM or vCPU
+descriptor and one bounded mutable slice over a live read/write mapping.
+The raw calls are mmap, munmap and ioctl. mmap takes either private zeroed
+anonymous guest RAM or the shared vCPU run mapping at offset zero.
+The ioctl requests are GET_API_VERSION, GET_VCPU_MMAP_SIZE,
+GET_SUPPORTED_CPUID, CREATE_VM, SET_TSS_ADDR, SET_IDENTITY_MAP_ADDR,
+SET_USER_MEMORY_REGION, CREATE_IRQCHIP, CREATE_PIT2, CREATE_VCPU,
+SET_CPUID2, GET_SREGS, SET_SREGS, SET_REGS, RUN and IRQ_LINE in the KVM
+namespace. The only interrupt line driven by the monitor is COM1 IRQ 4.
+The mapping and descriptor lifetimes and the guest interface are specified
+in `td-vmm/DESIGN.md`.

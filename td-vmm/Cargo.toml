@@ -1,0 +1,29 @@
+[package]
+name = "td-vmm"
+version = "0.1.0"
+edition = "2021"
+description = "KVM machine for td's host integration tests"
+license = "MIT"
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[dependencies]
+td-civil = { path = "../td-civil" }
+
+[dev-dependencies]
+td-fs = { path = "../td-fs" }
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
