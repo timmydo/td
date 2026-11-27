@@ -3,7 +3,9 @@
 The viewer attaches to the primary account's running graphical session.
 A terminal open before the connection is the same terminal during it.
 Connecting, using the desktop and disconnecting must preserve an existing
-physical lock. This document specifies the proposed viewer and its acceptance
+physical lock. An unlocked monitor stays visible for shared use. A physical
+lock or unlock during the connection changes local presentation and local
+input admission while the viewer stays attached. This document specifies the proposed viewer and its acceptance
 tests. The installed compositor currently withdraws application input on lock.
 
 ## Connection and authority
