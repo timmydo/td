@@ -4352,14 +4352,16 @@ restrictions. Stage 1's device descriptors do not cross exec.
 ## H2. td-vmm host KVM machine
 
 The host tool's three function-scoped allowances in `td-vmm/src/kvm.rs`
-cover one x86-64 syscall instruction, one adoption of the fresh VM or vCPU
+cover one x86-64 syscall instruction, one adoption of the fresh RAM file, VM or vCPU
 descriptor and one bounded mutable slice over a live read/write mapping.
-The raw calls are mmap, munmap and ioctl. mmap takes either private zeroed
-anonymous guest RAM or the shared vCPU run mapping at offset zero.
+The raw calls are memfd_create, mmap, munmap and ioctl. memfd_create
+takes one fixed name and MFD_CLOEXEC. mmap maps the private memory file
+or vCPU descriptor shared read/write at offset zero. Only the memory file
+has positioned I/O, which checks every guest range.
 The ioctl requests are GET_API_VERSION, GET_VCPU_MMAP_SIZE,
 GET_SUPPORTED_CPUID, CREATE_VM, SET_TSS_ADDR, SET_IDENTITY_MAP_ADDR,
 SET_USER_MEMORY_REGION, CREATE_IRQCHIP, CREATE_PIT2, CREATE_VCPU,
 SET_CPUID2, GET_SREGS, SET_SREGS, SET_REGS, RUN and IRQ_LINE in the KVM
-namespace. The only interrupt line driven by the monitor is COM1 IRQ 4.
+namespace. The monitor drives COM1 IRQ 4 and the block device on IRQ 11.
 The mapping and descriptor lifetimes and the guest interface are specified
 in `td-vmm/DESIGN.md`.

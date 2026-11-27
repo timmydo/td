@@ -75,7 +75,7 @@ fn only_the_kvm_module_owns_raw_resources() {
                 (
                     "IRQ_LINE",
                     "0x4008ae61",
-                    "&vm",
+                    "vm",
                     "input::<KVM_IRQ_LINE,_>(&irq)",
                 ),
             ];
@@ -86,16 +86,16 @@ fn only_the_kvm_module_owns_raw_resources() {
                 assert!(compact.contains(&format!("constKVM_{name}:usize={value};")));
                 assert!(compact.contains(&format!("ioctl({fd},KVM_{name},{argument})")));
             }
-            assert_eq!(compact.matches("syscall(").count(), 4);
-            assert_eq!(compact.matches("fresh(").count(), 3);
+            assert_eq!(compact.matches("syscall(").count(), 5);
+            assert_eq!(compact.matches("fresh(").count(), 4);
             assert_eq!(compact.matches("Mapping::map(").count(), 2);
             for shape in [
                 "syscall(16,[file.as_raw_fd()asusize,request,value,0,0,0])",
-                "syscall(9,[0,len,3,flags,fdasusize,0])",
+                "syscall(9,[0,len,3,1,file.as_raw_fd()asusize,0])",
+                "fresh(syscall(319,[name.as_ptr()asusize,1,0,0,0,0])?)",
                 "syscall(11,[self.address.as_ptr()asusize,self.len,0,0,0,0])",
-                "Some(f)=>(1,f.as_raw_fd()),None=>(0x22,-1)",
-                "Mapping::map(boot::RAM,None)",
-                "Mapping::map(len,Some(&cpu))",
+                "Mapping::map(boot::RAM,&file)",
+                "Mapping::map(len,&cpu)",
                 "fresh(ioctl(&kvm,KVM_CREATE_VM,0)?)",
                 "fresh(ioctl(&vm,KVM_CREATE_VCPU,0)?)",
                 "std::slice::from_raw_parts_mut(self.address.as_ptr(),self.len)",
@@ -111,7 +111,7 @@ fn only_the_kvm_module_owns_raw_resources() {
     }
     assert_eq!(
         sources,
-        ["boot.rs", "kvm.rs", "main.rs", "serial.rs"]
+        ["block.rs", "boot.rs", "kvm.rs", "main.rs", "serial.rs"]
             .map(String::from)
             .into()
     );

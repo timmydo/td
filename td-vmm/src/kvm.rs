@@ -54,7 +54,7 @@ fn ioctl(file: &File, request: usize, value: usize) -> io::Result<usize> {
 #[allow(unsafe_code)]
 fn fresh(fd: usize) -> io::Result<File> {
     let fd = i32::try_from(fd).map_err(|_| invalid("invalid KVM descriptor"))?;
-    // SAFETY: called only with a new owned descriptor returned by a create ioctl.
+    // SAFETY: called only with a new owned descriptor from a KVM create ioctl or memfd_create.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -63,12 +63,8 @@ struct Mapping {
     len: usize,
 }
 impl Mapping {
-    fn map(len: usize, file: Option<&File>) -> io::Result<Self> {
-        let (flags, fd) = match file {
-            Some(f) => (1, f.as_raw_fd()),
-            None => (0x22, -1),
-        };
-        let ptr = syscall(9, [0, len, 3, flags, fd as usize, 0])? as *mut u8;
+    fn map(len: usize, file: &File) -> io::Result<Self> {
+        let ptr = syscall(9, [0, len, 3, 1, file.as_raw_fd() as usize, 0])? as *mut u8;
         Ok(Self {
             address: NonNull::new(ptr).ok_or_else(|| invalid("null mapping"))?,
             len,
@@ -88,10 +84,13 @@ impl Drop for Mapping {
         let _ = syscall(11, [self.address.as_ptr() as usize, self.len, 0, 0, 0, 0]);
     }
 }
-pub(super) struct Ram(Mapping);
+pub(super) struct Ram(Mapping, File);
 impl Ram {
     pub(super) fn new() -> io::Result<Self> {
-        Ok(Self(Mapping::map(boot::RAM, None)?))
+        let name = c"td-vmm-ram";
+        let file = fresh(syscall(319, [name.as_ptr() as usize, 1, 0, 0, 0, 0])?)?;
+        file.set_len(boot::RAM as u64)?;
+        Ok(Self(Mapping::map(boot::RAM, &file)?, file))
     }
     pub(super) fn bytes(&mut self) -> &mut [u8] {
         self.0.bytes()
@@ -172,6 +171,11 @@ fn input<const REQUEST: usize, T>(value: &T) -> usize {
     std::ptr::from_ref(value) as usize
 }
 
+fn set_irq(vm: &File, irq: [u32; 2]) -> io::Result<()> {
+    ioctl(vm, KVM_IRQ_LINE, input::<KVM_IRQ_LINE, _>(&irq))?;
+    Ok(())
+}
+
 fn set_cpu(kvm: &File, cpu: &File, entry: usize) -> io::Result<()> {
     #[repr(C)]
     struct CpuId {
@@ -233,7 +237,11 @@ fn set_cpu(kvm: &File, cpu: &File, entry: usize) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn execute(ram: Ram, entry: usize) -> io::Result<()> {
+pub(super) fn execute(
+    ram: Ram,
+    entry: usize,
+    mut disk: Option<crate::block::Block>,
+) -> io::Result<()> {
     let kvm = OpenOptions::new()
         .read(true)
         .write(true)
@@ -269,7 +277,7 @@ pub(super) fn execute(ram: Ram, entry: usize) -> io::Result<()> {
     ioctl(&vm, KVM_CREATE_PIT2, input::<KVM_CREATE_PIT2, _>(&pit))?;
     let cpu = fresh(ioctl(&vm, KVM_CREATE_VCPU, 0)?)?;
     set_cpu(&kvm, &cpu, entry)?;
-    let mut run = Mapping::map(len, Some(&cpu))?;
+    let mut run = Mapping::map(len, &cpu)?;
     let mut uart = Uart::default();
     let mut console = io::stdout().lock();
     let mut clock_select = 0u8;
@@ -300,6 +308,14 @@ pub(super) fn execute(ram: Ram, entry: usize) -> io::Result<()> {
                     if direction == 0 {
                         word.fill(0xff);
                     }
+                    if let Some(device) = disk.as_mut() {
+                        let before = device.irq();
+                        device.port(port, word, direction == 0, &ram.1)?;
+                        let irq = device.irq();
+                        if irq != before {
+                            set_irq(&vm, irq)?;
+                        }
+                    }
                     if let [value] = word {
                         match port {
                             0x3f8..=0x3ff => {
@@ -309,7 +325,7 @@ pub(super) fn execute(ram: Ram, entry: usize) -> io::Result<()> {
                                     uart.write(port, *value, &mut console)?;
                                 }
                                 let irq = [4u32, u32::from(uart.irq())];
-                                ioctl(&vm, KVM_IRQ_LINE, input::<KVM_IRQ_LINE, _>(&irq))?;
+                                set_irq(&vm, irq)?;
                             }
                             0x70 if direction == 1 => clock_select = *value & 0x7f,
                             0x71 if direction == 0 => {

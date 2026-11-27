@@ -30,6 +30,24 @@ shutdown exit, including a triple fault, is an error.
 The ABI follows the [Linux x86 boot protocol](https://docs.kernel.org/arch/x86/boot.html)
 and the [Linux KVM API](https://docs.kernel.org/virt/kvm/api.html).
 
+## Raw block device
+
+Append `--disk-ro IMAGE` to present one raw disk as `/dev/vda`.
+`--disk-rw IMAGE` gives the guest write access to the existing image
+and takes an exclusive file lock. Use a disposable copy for installation
+and recovery tests. Read-only sessions use a shared lock and open the
+image read-only. Images have a nonzero size in whole 512-byte sectors.
+
+The guest kernel's legacy virtio PCI driver discovers one block function,
+one 128-entry split queue, an I/O BAR and INTx on IRQ 11. Device requests
+use checked guest physical offsets and sector ranges. A malformed ring
+fails the run. The disk supports scatter/gather reads and writes, flush
+and device identity. Every request is served while the vCPU is stopped.
+The read-only EROFS fixture's initramfs prints `TD-EROFS-RO-OK` only
+after the kernel mounts the attached image and td-util reads its expected
+sentinel. Its device interface is specified by
+[Virtio 1.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).
+
 ## Integration tier design
 
 The runner interface is a machine description owned by td. Each integration
@@ -59,6 +77,7 @@ device 10:232 and API 12, and passes only value-pinned requests. The VM
 and vCPU are private to one thread. The registered RAM mapping outlives
 both descriptors. Userspace borrows RAM before registration and the
 vCPU run page between synchronous runs. All exit-data ranges are checked
-against the mapping. The fixed input files and serial output are the
-guest's only data channels. The syscall inventory is recorded in
+against the mapping. The optional disk is an explicitly named regular file. Device I/O uses
+positioned reads and writes on the memory file after the vCPU exits. No
+Rust slice aliases memory registered with KVM. The syscall inventory is recorded in
 `UNSAFE.md`.
