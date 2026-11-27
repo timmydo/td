@@ -79,6 +79,21 @@ inherits the supervisor's lifetime lock on its unused stdin descriptor, so a
 supervisor exit cannot release that exclusion while QEMU lives. Operation
 locks serialize changes to one instance, QEMU's own disk lock remains in
 force, and a stopped disk must pass a writable lock probe before deletion.
+The manager writes sparse qcow2 v3 overlays for the ordinary standalone
+templates produced by import. Its 64 KiB clusters carry a refcount table,
+a refcount block and an empty L1 table sized for the template's exact
+capacity. The backing format and absolute path are explicit. Legacy
+formats use the existing qemu-img writer. Import still uses qemu-img
+to inspect and convert foreign bundle disks. Workspace creation and Git
+enrollment tests create native empty qcow2 bases.
+
+Before preparing a stopped workspace or deleting an instance, the
+manager holds both a Linux flock and a nonblocking open-file-description
+write lock covering the whole disk through the operation. The latter
+conflicts with QEMU's permission-byte locks. A template reader announces consistent-read permission, denies write
+and resize permissions and checks for conflicts using QEMU's permission
+bytes. Multiple read-only guests can share the base. The host-only disk library's
+fixed fcntl call and ABI are recorded in `UNSAFE.md` H3.
 Imports prepare under individual staging leases outside the short catalog
 publication lock. Those leases are removed with their transient staging;
 reusable instance/template lock inodes remain stable. Referenced templates cannot be removed. Read-only CLI

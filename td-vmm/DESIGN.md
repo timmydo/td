@@ -66,7 +66,10 @@ existing step. Direct kernel boot alone qualifies none of these steps.
 Each backend needs its own oracle memo identity, including the monitor
 and device implementation that produced the result. The integration
 runner may count a step as passed only after its original assertions
-succeed. The PostgreSQL steps retain their existing native runners.
+succeed. The PostgreSQL steps retain their existing native runners. The
+`vm-workspace` step runs the workspace and enrollment cases using
+td-vm's own disk operations. The supervised guest lifecycle remains a
+separate step.
 
 ## Host boundary
 

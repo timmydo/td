@@ -82,7 +82,8 @@ recorded account-authentication surface, H1 below. The existing `td-review`,
 `td-vm` and `td-vm-git` binary roots retain `forbid(unsafe_code)`; only the
 registrar root uses `deny` with its one function-scoped allowance. The
 separate `td-review` package forbids unsafe code package-wide and contains
-no VM binaries or services.
+no VM binaries or services. The manager links the disk library whose
+fixed open-file-description lock operation is recorded in H3.
 
 The test-only allocation probe in `td-mta` has the separately recorded T1
 surface below (T2 is retired); T3 sends termination signals to retained test
@@ -4365,3 +4366,15 @@ SET_CPUID2, GET_SREGS, SET_SREGS, SET_REGS, RUN and IRQ_LINE in the KVM
 namespace. The monitor drives COM1 IRQ 4 and the block device on IRQ 11.
 The mapping and descriptor lifetimes and the guest interface are specified
 in `td-vmm/DESIGN.md`.
+
+
+## H3. td-vm host disk exclusion
+
+Only `td-vm/src/disk_lock.rs` calls libc fcntl with x86-64 Linux
+F_OFD_SETLK (37) or F_OFD_GETLK (36) on a borrowed regular file.
+The idle check holds an exclusive lock from zero through EOF. The
+template reader holds read locks at 100 and 201–203 and tests for
+conflicts at 200 and 101–103, matching QEMU's permission-byte
+protocol. All ranges use SEEK_SET. A 32-byte initialized C flock
+outlives the synchronous call. Closing the file releases any locks.
+Confinement tests pin the raw source and its callers. Image I/O uses std.

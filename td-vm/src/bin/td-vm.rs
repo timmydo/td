@@ -78,7 +78,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm workspace clone NAME          provision its private guest clone and worktree
   td-vm workspace terminal NAME       open a terminal in its prepared task worktree
 
-TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
+TD_VM_HOME defaults to ~/.local/share/td-vm. Guest launch requires host QEMU. Bundle import requires qemu-img.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
 Clipboard and feed actions require a bridge-capable system image. Workspace
 automatic provisioning on Open uses the updated image. Shut down from inside td;
@@ -855,12 +855,19 @@ impl Manager {
             if let Some(workspace) = &workspace {
                 self.check_workspace(value, workspace)?;
             }
-            command(
-                Command::new("qemu-img")
-                    .args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
-                    .arg(base.join("disk.qcow2"))
-                    .arg(scratch.join("disk.qcow2")),
-            )?;
+            let disk = scratch.join("disk.qcow2");
+            let backing = base.join("disk.qcow2");
+            match td_vm::disk::create_overlay(&disk, &backing) {
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                    command(
+                        Command::new("qemu-img")
+                            .args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
+                            .arg(backing)
+                            .arg(disk),
+                    )?;
+                }
+                result => io(result, "create qcow2 overlay")?,
+            }
             config.write(&scratch)?;
             if let Some(workspace) = &workspace {
                 workspace.publish(&scratch)?;
@@ -927,7 +934,7 @@ impl Manager {
         if running(&dir)? {
             return Err("stop the instance before preparing its workspace".into());
         }
-        disk_available(&dir)?;
+        let _disk = disk_available(&dir)?;
         let workspace = vm_workspace::Workspace::new(branch, vm_git_profile::load(&self.root)?)?;
         self.check_workspace(value, &workspace)?;
         workspace.publish(&dir)?;
@@ -1168,7 +1175,7 @@ impl Manager {
         let config = Config::read(&dir)?;
         println!("verifying template {} before launch...", config.template);
         verify_template(&self.template(&config.template)?)?;
-        disk_available(&dir)?;
+        drop(disk_available(&dir)?);
         cleanup_runtime(&dir)?;
         let bridge = vm_bridge::Supervisor::start(&dir)?;
         // QEMU never reads stdin (serial goes to a file). Keeping the same
@@ -1314,7 +1321,7 @@ impl Manager {
         }
         // Open raw read/write without writing: require QEMU's write lock while
         // permitting a damaged header. Read-only raw opens do NOT test this lock.
-        disk_available(&dir)?;
+        let _disk = disk_available(&dir)?;
         // Future enrollment formats need their own revocation path. An older
         // manager must refuse unknown/corrupt state rather than erase its disk.
         if let Some(mut workspace) = vm_workspace::load(&dir)? {
@@ -1355,15 +1362,15 @@ fn reap_command(
     Ok(receiver)
 }
 
-fn disk_available(dir: &Path) -> Result<()> {
+fn disk_available(dir: &Path) -> Result<Option<File>> {
     match fs::symlink_metadata(dir.join("disk.qcow2")) {
-        Ok(meta) if meta.is_file() => command(
-            Command::new("qemu-io")
-                .args(["-f", "raw", "-c", "quit"])
-                .arg(dir.join("disk.qcow2")),
-        ),
+        Ok(meta) if meta.is_file() => io(
+            td_vm::disk::lock_idle(&dir.join("disk.qcow2")),
+            "lock stopped disk",
+        )
+        .map(Some),
         Ok(_) => Err("instance disk is not a regular file".into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("inspect disk: {e}")),
     }
 }

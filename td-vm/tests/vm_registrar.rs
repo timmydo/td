@@ -684,7 +684,7 @@ fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Out
 }
 
 #[test]
-#[ignore = "td-builder check integration supplies qemu-img"]
+#[ignore = "td-builder check integration runs the VM lifecycle workloads"]
 fn qemu_integration_enrollment_retries_and_revokes_before_deletion() -> Result<()> {
     if in_trusted_root("qemu_integration_enrollment_retries_and_revokes_before_deletion")? {
         return Ok(());
@@ -718,13 +718,7 @@ fn qemu_integration_enrollment_retries_and_revokes_before_deletion() -> Result<(
     )?;
     let template = home.join("templates/base");
     DirBuilder::new().mode(0o700).create(&template)?;
-    invoke(
-        Command::new("qemu-img")
-            .args(["create", "-f", "qcow2"])
-            .arg(template.join("disk.qcow2"))
-            .arg("4M"),
-        true,
-    )?;
+    td_vm::disk::create_blank(&template.join("disk.qcow2"), 4 << 20)?;
     for name in ["one", "two"] {
         manager(&["create", name, "base"], true)?;
     }

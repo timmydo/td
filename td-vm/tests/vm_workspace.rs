@@ -27,7 +27,7 @@ fn identity(record: &str) -> Result<&str> {
 }
 
 #[test]
-#[ignore = "td-builder check integration supplies qemu-img"]
+#[ignore = "td-builder check integration runs the VM lifecycle workloads"]
 fn qemu_integration_workspace_snapshots_survive_recreation() -> Result<()> {
     let root = TempDir::new("td-workspace")?;
     let home = root.join("vms");
@@ -52,13 +52,7 @@ fn qemu_integration_workspace_snapshots_survive_recreation() -> Result<()> {
     let template = home.join("templates/base");
     fs::create_dir(&template)?;
     fs::set_permissions(&template, fs::Permissions::from_mode(0o700))?;
-    invoke(
-        Command::new("qemu-img")
-            .args(["create", "-f", "qcow2"])
-            .arg(template.join("disk.qcow2"))
-            .arg("4M"),
-        true,
-    )?;
+    td_vm::disk::create_blank(&template.join("disk.qcow2"), 4 << 20)?;
     vm(&["create", "one", "base", "--branch", "topic/a"], true)?;
     vm(
         &["create", "two", "base", "--branch", "topic/b", "2", "1024"],

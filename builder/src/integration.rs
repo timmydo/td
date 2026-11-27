@@ -14,6 +14,7 @@ pub(crate) const GOAL: &str = "integration";
 
 pub(crate) const POSTGRES: &str = "postgres-integration";
 pub(crate) const POSTGRES_PACKAGE: &str = "postgresql-x86-64-test";
+const VM_WORKSPACE: &str = "vm-workspace";
 const VM_LIFECYCLE: &str = "qemu-vm-lifecycle";
 
 /// One step: its name, command arguments, and what it proves.
@@ -37,6 +38,11 @@ const STEPS: &[Step] = &[
         proves: "the recipe-built PostgreSQL package starts a SCRAM cluster, uses pg_trgm and restores its dump",
     },
     Step {
+        name: VM_WORKSPACE,
+        argv: &[],
+        proves: "the native disk manager preserves workspace bindings and Git enrollment and revokes access before deletion",
+    },
+    Step {
         name: "warm",
         argv: &["warm", "system-x86-64", "--flathub"],
         proves: "the system image's pinned inputs are present, and the host's feed holds the \
@@ -44,8 +50,8 @@ const STEPS: &[Step] = &[
     },
     Step {
         name: VM_LIFECYCLE,
-        argv: &["test", "--frozen", "--manifest-path", "td-vm/Cargo.toml", "qemu_integration_", "--", "--ignored"],
-        proves: "td-vm creates independent overlays, supervises the guest, and preserves workspace bindings and Git enrollment",
+        argv: &[],
+        proves: "td-vm creates independent overlays, supervises the guest, and maintains exclusion after supervisor loss",
     },
     Step {
         name: "qemu-boot-system",
@@ -224,7 +230,7 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
         .filter(|step| {
             !matches!(
                 step.name,
-                "warm" | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE
+                "warm" | VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE
             )
         })
         .all(|step| matches!(ask_memo(root, eval, step.name), Memo::Hit(_)));
@@ -235,7 +241,7 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
                 println!(">> {GOAL}: warm skipped — every image oracle answers from the memo");
                 continue;
             }
-            "warm" | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE => Memo::Unasked,
+            "warm" | VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE => Memo::Unasked,
             name => ask_memo(root, eval, name),
         };
         match &memo {
@@ -309,25 +315,11 @@ fn run_step(root: &Path, eval: &str, step: &Step) -> Outcome {
                 return Outcome::Fail;
             }
         }
-    } else if step.name == VM_LIFECYCLE {
-        let path = std::env::var("PATH").unwrap_or_default();
-        if let Some(missing) = ["qemu-img", "qemu-io", "qemu-system-x86_64"]
-            .into_iter()
-            .find(|tool| crate::stage0::find_in_path(&path, tool).is_none())
-        {
-            println!(">> {GOAL} {}: unprovisioned (missing {missing})", step.name);
-            return Outcome::HostGap;
-        }
-        Command::new("cargo")
+    } else if matches!(step.name, VM_WORKSPACE | VM_LIFECYCLE) {
+        return run_vm_cases(root, step.name);
     } else {
         Command::new(eval)
     };
-    if step.name == VM_LIFECYCLE {
-        // Cargo runs each selected harness under a short, request-backed /tmp.
-        // The registrar harness is already inside its trusted-root runner.
-        cmd.env(crate::test_root::ENV, "1")
-            .env("TD_VM_GIT_TEST_INNER", "1");
-    }
     if step.name == POSTGRES_PACKAGE {
         let mut warm = Command::new(eval);
         warm.args(["warm", POSTGRES_PACKAGE]);
@@ -341,6 +333,63 @@ fn run_step(root: &Path, eval: &str, step: &Step) -> Outcome {
     }
     cmd.args(step.argv);
     run_command(root, step.name, cmd)
+}
+
+fn run_vm_cases(root: &Path, step: &str) -> Outcome {
+    let cases: &[(&str, &str, &str)] = if step == VM_LIFECYCLE {
+        let path = std::env::var("PATH").unwrap_or_default();
+        if let Some(missing) = ["qemu-img", "qemu-io", "qemu-system-x86_64"]
+            .into_iter()
+            .find(|tool| crate::stage0::find_in_path(&path, tool).is_none())
+        {
+            println!(">> {GOAL} {step}: unprovisioned (missing {missing})");
+            return Outcome::HostGap;
+        }
+        &[(
+            "--bin",
+            "td-vm",
+            "tests::qemu_integration_two_overlays_lifecycle_and_supervisor_loss_exclusion",
+        )]
+    } else {
+        &[
+            (
+                "--test",
+                "vm_workspace",
+                "qemu_integration_workspace_snapshots_survive_recreation",
+            ),
+            (
+                "--test",
+                "vm_registrar",
+                "qemu_integration_enrollment_retries_and_revokes_before_deletion",
+            ),
+        ]
+    };
+    // Each exact selector must produce its own nonzero libtest summary.
+    for &(kind, target, case) in cases {
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(root)
+            .args([
+                "test",
+                "--frozen",
+                "--manifest-path",
+                "td-vm/Cargo.toml",
+                kind,
+                target,
+                "--",
+                "--exact",
+                case,
+                "--ignored",
+            ])
+            .env(crate::test_root::ENV, "1")
+            .env("TD_VM_GIT_TEST_INNER", "1")
+            .stdout(std::process::Stdio::piped());
+        crate::host_bin::arm_check_child(&mut cmd);
+        if let Err(error) = crate::native_tests::run_cases(cmd) {
+            eprintln!("{GOAL}: {case}: {error}");
+            return Outcome::Fail;
+        }
+    }
+    Outcome::Pass
 }
 
 fn run_command(root: &Path, name: &str, mut cmd: Command) -> Outcome {
@@ -384,14 +433,19 @@ fn verdict(results: &[(&str, Outcome, Duration)]) -> (String, i32) {
         1
     } else if oracles
         .iter()
-        .filter(|r| !matches!(r.0, VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE))
+        .filter(|r| {
+            !matches!(
+                r.0,
+                VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE
+            )
+        })
         .all(|r| r.1 == Outcome::HostGap)
         || results
             .iter()
             .any(|r| r.0 == VM_LIFECYCLE && r.1 == Outcome::HostGap)
     {
         td_engine::exit::EXIT_UNPROVISIONED
-    } else if [POSTGRES, POSTGRES_PACKAGE]
+    } else if [POSTGRES, POSTGRES_PACKAGE, VM_WORKSPACE]
         .iter()
         .all(|name| results.iter().any(|r| r.0 == *name && r.1 == Outcome::Pass))
     {
@@ -452,6 +506,7 @@ mod tests {
         let one_ran = [
             (POSTGRES, Outcome::Pass, s(3)),
             (POSTGRES_PACKAGE, Outcome::Pass, s(2)),
+            (VM_WORKSPACE, Outcome::Pass, s(1)),
             ("warm", Outcome::Pass, s(1)),
             ("qemu-boot-system", Outcome::Pass, s(600)),
             ("qemu-boot-live", gap, s(0)),
@@ -460,14 +515,14 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             line.contains(
-                "of 11 oracle(s), 3 passed (0 from the memo), 1 unprovisioned, 0 failed, 7 not run"
+                "of 12 oracle(s), 4 passed (0 from the memo), 1 unprovisioned, 0 failed, 7 not run"
             ),
             "{line}"
         );
         assert!(line.contains("qemu-boot-system pass 600.0s"), "{line}");
         assert_ne!(verdict(&[(POSTGRES, Outcome::Pass, s(1))]).1, 0);
         assert_ne!(verdict(&[("qemu-boot-system", Outcome::Pass, s(1))]).1, 0);
-        for missing in [POSTGRES, POSTGRES_PACKAGE] {
+        for missing in [POSTGRES, POSTGRES_PACKAGE, VM_WORKSPACE] {
             let available: Vec<_> = one_ran.iter().copied().filter(|r| r.0 != missing).collect();
             assert_ne!(verdict(&available).1, 0);
         }
@@ -478,7 +533,7 @@ mod tests {
         let (line, code) = verdict(&warm_gap);
         assert_eq!(code, td_engine::exit::EXIT_UNPROVISIONED);
         assert!(
-            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 11 not run"),
+            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 12 not run"),
             "{line}"
         );
         // Every oracle from the memo, warm skipped: a pass that booted nothing,
@@ -486,6 +541,7 @@ mod tests {
         let all_memo = [
             (POSTGRES, Outcome::Pass, s(3)),
             (POSTGRES_PACKAGE, Outcome::Pass, s(2)),
+            (VM_WORKSPACE, Outcome::Pass, s(1)),
             ("qemu-boot-system", Outcome::Memo, s(0)),
             ("qemu-boot-server", Outcome::Memo, s(0)),
             ("qemu-boot-audio", Outcome::Memo, s(0)),
@@ -498,7 +554,7 @@ mod tests {
         let (line, code) = verdict(&all_memo);
         assert_eq!(code, 0);
         assert!(
-            line.contains("10 passed (8 from the memo), 0 unprovisioned"),
+            line.contains("11 passed (8 from the memo), 0 unprovisioned"),
             "{line}"
         );
         assert_eq!(Outcome::Memo.word(), "memo");
@@ -550,6 +606,7 @@ mod tests {
             POSTGRES,
             POSTGRES_PACKAGE,
             VM_LIFECYCLE,
+            VM_WORKSPACE,
             "qemu-boot-system",
             "qemu-boot-audio",
             "qemu-boot-audio-hotplug",
