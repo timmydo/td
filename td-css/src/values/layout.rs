@@ -881,9 +881,9 @@ fn word(style: &ComputedStyle, p: Property) -> Option<&'static str> {
 }
 /// What computing a style ends with: border widths of invisible styles,
 /// overflow pairs, and blockification of the root, a float and a flex
-/// or grid item, a child of a `flex`, `inline-flex` or `grid` box
-/// (`parent` its computed style), whose `float` computes to `none`
-/// (Flexbox 1 §4, Grid 2 §6.1).
+/// or grid item, a child of a `flex`, `inline-flex`, `grid` or
+/// `inline-grid` box (`parent` its computed style), whose `float`
+/// computes to `none` (Flexbox 1 §4, Grid 2 §6.1).
 pub(super) fn finish(
     style: &mut ComputedStyle,
     parent: Option<&ComputedStyle>,
@@ -908,8 +908,12 @@ pub(super) fn finish(
         }
     }
     let floated = matches!(word(style, Float), Some("left" | "right"));
-    let item =
-        parent.is_some_and(|p| matches!(word(p, Display), Some("flex" | "inline-flex" | "grid")));
+    let item = parent.is_some_and(|p| {
+        matches!(
+            word(p, Display),
+            Some("flex" | "inline-flex" | "grid" | "inline-grid")
+        )
+    });
     if item && floated {
         style.set(Float, ComputedValue::Keyword("none"))?;
     }
@@ -917,6 +921,7 @@ pub(super) fn finish(
         let next = match word(style, Display) {
             Some("inline-table") => Some("table"),
             Some("inline-flex") => Some("flex"),
+            Some("inline-grid") => Some("grid"),
             Some(
                 "inline" | "inline-block" | "table-row-group" | "table-header-group"
                 | "table-footer-group" | "table-row" | "table-cell" | "table-column-group"

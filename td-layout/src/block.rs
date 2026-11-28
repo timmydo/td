@@ -5,8 +5,8 @@ use crate::inline::{
 };
 use crate::list::{MarkerFragment, MarkerKind};
 use crate::{
-    float_side, inline_block, keyword, BoxId, BoxKind, BoxNode, Error, StyleId, StyledDocument,
-    TableRole, MAX_PAGE_BYTES,
+    float_side, inline_block, inline_picture, keyword, BoxId, BoxKind, BoxNode, Error, StyleId,
+    StyledDocument, TableRole, MAX_PAGE_BYTES,
 };
 use float::{units, Clear, Floats, Item, Kind, View};
 use std::ops::Range;
@@ -31,6 +31,8 @@ mod grid_tests;
 mod inline_block_tests;
 #[cfg(test)]
 mod inline_flex_tests;
+#[cfg(test)]
+mod inline_grid_tests;
 #[cfg(test)]
 mod inline_table_tests;
 mod intrinsic;
@@ -366,8 +368,8 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// baseline its row is aligned by.
     first_line: bool,
     /// The line that took `first_line`, which a float's lines laid before
-    /// it may precede.
-    first_index: Option<usize>,
+    /// it may precede, or the box a grid's first item of no line gave.
+    first_index: Option<First>,
     /// The lines and markers before these the outermost table has filtered.
     filtered: (usize, usize),
     /// Tables' grids, a stack: a nested table's after its ancestors'.
@@ -394,13 +396,13 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// height, a flex container's its lines' or items' and a picture's
     /// its own: a flex column item's automatic minimum (§5, "Flex").
     natural: f64,
-    /// The next flex container laid is an inline-flex, whose baseline its
-    /// line takes: it watches `flex_watch`, its first item, for its first
-    /// line, `flex_lead`, and leaves its first baseline in `flex_first`
-    /// (§5, "Flex").
+    /// The next flex or grid container laid is an inline-flex or an
+    /// inline-grid, whose baseline its line takes: it watches
+    /// `flex_watch`, its first item, for its first line, `flex_lead`, and
+    /// leaves its first baseline in `flex_first` (§5, "Flex", "Grid").
     flex_wanted: bool,
     flex_watch: Option<usize>,
-    flex_lead: Option<usize>,
+    flex_lead: Option<First>,
     flex_first: Option<f64>,
     /// On a page with flex containers: whether the content of the box
     /// being laid would lay otherwise at another definite height of it,
@@ -613,10 +615,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
                 let block = b.kind == BoxKind::Block
                     || (b.kind == BoxKind::Image
-                        && !matches!(
-                            keyword(style, Property::Display),
-                            "inline" | "inline-block" | "inline-table" | "inline-flex"
-                        ));
+                        && !inline_picture(keyword(style, Property::Display)));
                 let floats = self.styled.has_floats()
                     && b.parent.is_some()
                     && float_side(style, b.kind).is_some();
@@ -1152,7 +1151,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             f64::NEG_INFINITY,
             f64::NEG_INFINITY,
         );
-        let flex = matches!(kind, Kind::Inline { .. }) && !table && self.flex_container(&b)?;
+        let flex = matches!(kind, Kind::Inline { .. })
+            && !table
+            && (self.flex_container(&b)? || self.grid_container(&b)?);
         self.flex_wanted = flex;
         let laid = if table {
             self.inline_table(id, dims, place, y + dims.margin.top, depth + 1)
@@ -1174,8 +1175,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let last = std::mem::replace(&mut self.last_baseline, last_baseline);
         let (laid, mut first_row) = laid?;
         if flex {
-            // An inline-flex's is its first baseline, as a table's is its
-            // first row's.
+            // An inline-flex's or inline-grid's is its first baseline, as
+            // a table's is its first row's.
             first_row = self.flex_first.take();
         }
         let height = laid + dims.margin.vertical();
@@ -1448,8 +1449,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 None => Ok(line),
             }
         };
-        if let Some(line) = self.first_index {
-            self.first_index = Some(moved(line)?);
+        if let Some(First::Line(line)) = self.first_index {
+            self.first_index = Some(First::Line(moved(line)?));
         }
         for marker in self.markers.get_mut(markers..).ok_or(Error::Invalid)? {
             if let Some(line) = marker.line {
@@ -1716,13 +1717,42 @@ fn fragment_count(counters: &mut Counters) -> Result<(), Error> {
     counters.fragments += 1;
     Ok(())
 }
+/// Where a first baseline was taken: a line's, or, for a grid whose
+/// first item in grid order has no line, that item's border box's bottom
+/// (§5, "Grid", "Inline grid and baselines"). Read once the boxes and
+/// lines holding it are where they end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum First {
+    Line(usize),
+    Border(usize),
+}
+impl First {
+    /// As a mark keeps it: a box's index with the top bit.
+    pub(crate) fn pack(first: Option<Self>) -> Option<Option<u32>> {
+        let small = |n: usize| u32::try_from(n).ok().filter(|n| *n < 1 << 31);
+        match first {
+            None => Some(None),
+            Some(Self::Line(n)) => small(n).map(Some),
+            Some(Self::Border(n)) => small(n).map(|n| Some(n | 1 << 31)),
+        }
+    }
+    pub(crate) fn unpack(packed: Option<u32>) -> Option<Self> {
+        packed.map(|n| {
+            if n & 1 << 31 == 0 {
+                Self::Line(n as usize)
+            } else {
+                Self::Border((n & !(1 << 31)) as usize)
+            }
+        })
+    }
+}
 struct Positioned<'a> {
     lines: &'a mut BudgetVec<Line>,
     markers: &'a mut BudgetVec<MarkerFragment>,
     waiting: &'a mut BudgetVec<Waiting>,
     window: Keep<'a>,
     first: &'a mut bool,
-    first_index: &'a mut Option<usize>,
+    first_index: &'a mut Option<First>,
     /// Where its lines start, with the relative offset, and without it,
     /// in flow, where items laid apart are placed.
     x: f64,
@@ -1782,7 +1812,7 @@ impl LineSink for Positioned<'_> {
             self.markers.try_push(marker)?;
         }
         if *self.first {
-            *self.first_index = Some(self.lines.len());
+            *self.first_index = Some(First::Line(self.lines.len()));
         }
         *self.first = false;
         let local_y = line.y;
@@ -2036,11 +2066,7 @@ fn sized(
         ..
     } = bounds;
     let block = b.kind == BoxKind::Block
-        || (b.kind == BoxKind::Image
-            && !matches!(
-                keyword(style, Display),
-                "inline" | "inline-block" | "inline-table" | "inline-flex"
-            ));
+        || (b.kind == BoxKind::Image && !inline_picture(keyword(style, Display)));
     if block {
         let free = width - used_width - decor.horizontal() - margin.horizontal();
         let auto_left = length(style, MarginLeft, Some(width)).is_none();

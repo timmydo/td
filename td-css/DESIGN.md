@@ -302,7 +302,7 @@ as bare values; calc() clamps its result to the property range.
 
 | Property | Accepted values | Initial; inherited |
 |---|---|---|
-| display | none, inline, block, inline-block, list-item, table, inline-table, table-row-group, table-header-group, table-footer-group, table-row, table-cell, table-column-group, table-column, table-caption, flex, inline-flex, grid | inline; no |
+| display | none, inline, block, inline-block, list-item, table, inline-table, table-row-group, table-header-group, table-footer-group, table-row, table-cell, table-column-group, table-column, table-caption, flex, inline-flex, grid, inline-grid | inline; no |
 | color, background-color | CSS Color 4's 148 named colours, transparent, currentcolor, #rgb/#rgba/#rrggbb/#rrggbbaa, rgb()/rgba(), hsl()/hsla() (below) | black / transparent; color only |
 | font-family | comma-separated quoted strings or identifier sequences, including generic families | serif; yes |
 | font-size | lengths, percentages, xx-small through xx-large, smaller, larger | 16px; yes |
@@ -336,10 +336,10 @@ compute to zero for none/hidden styles. Border colors default to the
 computed color and resolve currentcolor after color. Display blockifies
 for the root (absent parent style), floats, and flex and grid items,
 the children of a box whose computed display is flex, inline-flex
-(Flexbox 1 §4) or grid (Grid 2 §6.1): inline/inline-block and
-table-internal displays become block, inline-table becomes table and
-inline-flex becomes flex. None, list-item, table, block, flex and grid
-remain. A flex or grid item's `float` computes to none, so no item
+(Flexbox 1 §4), grid or inline-grid (Grid 2 §6.1): inline/inline-block
+and table-internal displays become block, inline-table becomes table,
+inline-flex becomes flex and inline-grid becomes grid. None, list-item,
+table, block, flex and grid remain. A flex or grid item's `float` computes to none, so no item
 floats, and `clear` is left as it is, which td-layout does not read for
 one (td-layout/DESIGN.md §5, "Flex", "Grid"); the root's `float` is its
 own. Unsupported positioning modes are deferred.
@@ -618,15 +618,15 @@ sheet has no rule the index tests against every element.
 
 The twelve grid longhands (the table above) are parsed and computed for
 td-layout's grid layout (td-layout/DESIGN.md §5, "Grid"). `display:
-grid` is valid and its children are blockified as grid items (above),
-so `@supports (display: grid)` is true, as is `@supports` of every
+grid` and `display: inline-grid` are valid and their children are
+blockified as grid items (above), so `@supports (display: grid)` and
+`@supports (display: inline-grid)` are true, as is `@supports` of every
 `grid*` property (the `grid-*gap` aliases among them), `justify-items`,
 `justify-self`, `place-items` and `place-self`, which the layout reads.
-`display: inline-grid` stays invalid until td-layout lays it (its
-increment d): a page's fallback for it, an `inline-block` or `inline`
-`display` declared before, keeps winning, and `@supports (display:
-inline-grid)` is false. `grid-template-*: subgrid` and the masonry
-values are not parsed, so `@supports` of them is false too.
+td-layout lays an `inline-grid` whole in its line, as an inline-block
+holding a grid (td-layout/DESIGN.md §5, "Grid", "Inline grid and
+baselines"). `grid-template-*: subgrid` and the masonry values are not
+parsed, so `@supports` of them is false.
 
 A track list is line-name lists, track sizes and `repeat()`. A name is
 a custom-ident other than `span` and `auto`, kept as written. A size is

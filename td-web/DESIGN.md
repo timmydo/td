@@ -2240,10 +2240,10 @@ and `sticky` stay in flow); flex layout's reversed lines and columns
 column's wrapping and shrinking, `order` in a row wrapping onto
 lines or a column
 and `last baseline` (td-layout/DESIGN.md §5, "Flex"); grid's `dense`
-packing (laid sparse), baseline alignment (laid at the start), `order`,
-subgrid and masonry, and `inline-grid`, which td-css does not parse yet
-(td-layout/DESIGN.md §5, "Grid", "Departures"); floats and inline-blocks, inline tables and inline
-flex containers among them, are
+packing (laid sparse), baseline self-alignment (laid at the start), a
+grid's last baseline, `order`, subgrid and masonry (td-layout/DESIGN.md
+§5, "Grid", "Departures"); floats and inline-blocks, inline tables,
+inline flex and inline grid containers among them, are
 td-layout's
 (td-layout/DESIGN.md §5, "Floats", "Inline-blocks"), their boxes
 painted after the in-flow boxes around them ("Painting") but their
@@ -2579,7 +2579,7 @@ order; each is its own design amendment when it starts:
   and shrinking, `order` in rows wrapping onto lines and columns,
   laying a grown or stretched item's content again past two nested
   re-lays and at the line `align-content` grows) and the rest of grid
-  (`inline-grid`, `dense`, baselines, `order`, subgrid);
+  (`dense`, baseline self-alignment, `order`, subgrid);
   pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.

@@ -1,7 +1,7 @@
 //! A generated oracle for copying (td-web/DESIGN.md §10, "Copying"):
 //! seeded pages of floats, inline-blocks, tables, inline tables, lists,
 //! flex rows, wrapping rows, columns and inline flex containers, and grids
-//! of items placed out of their source order, and
+//! and inline grids of items placed out of their source order, and
 //! what a copy of them holds, worked from the lines and the
 //! boxes they lie in rather than from what `copy` keeps as it walks; the
 //! marker checks alone read the walk, for the order lines begin in. A
@@ -766,7 +766,9 @@ mod cases {
         for _ in 0..1 + r.below(3) {
             match r.below(11) {
                 0..=3 => flex(&mut r, 0, &mut out),
-                10 => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                // A div's line: block items in a paragraph would close it
+                // and the inline container in it.
+                10 => wrapped(&mut out, "<div style=margin:0>", "</div>", |out| {
                     words(&mut r, out);
                     flex_as(&mut r, 1, out, "span", "inline-flex");
                     words(&mut r, out);
@@ -774,9 +776,10 @@ mod cases {
                 4 => wrapped(&mut out, "<div style=float:left>", "</div>", |out| {
                     flex(&mut r, 1, out);
                 }),
-                5 => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                5 => wrapped(&mut out, "<div style=margin:0>", "</div>", |out| {
                     words(&mut r, out);
-                    wrapped(out, "<span style=display:inline-block>", "</span>", |out| {
+                    let open = "<span style=display:inline-block;margin:0>";
+                    wrapped(out, open, "</span>", |out| {
                         flex(&mut r, 1, out);
                     });
                     words(&mut r, out);
@@ -819,7 +822,9 @@ mod cases {
             "align-self:center;",
             "justify-self:start;",
             "align-self:end;",
-        ][r.below(5) as usize];
+            "justify-self:center;",
+            "justify-self:end;margin-left:auto;",
+        ][r.below(7) as usize];
         let _ = write!(out, "<div style='{place}{own}'>");
         for _ in 0..1 + r.below(2) {
             if depth < 2 && r.below(8) == 0 {
@@ -832,6 +837,10 @@ mod cases {
     }
 
     fn grid(r: &mut Rng, depth: usize, out: &mut String) {
+        grid_as(r, depth, out, "div", "grid");
+    }
+
+    fn grid_as(r: &mut Rng, depth: usize, out: &mut String, tag: &str, display: &str) {
         let cols = 1 + r.below(4);
         let sizes: Vec<&str> = (0..cols)
             .map(|_| {
@@ -858,10 +867,17 @@ mod cases {
             "row-gap:4px;column-gap:6px;",
             "grid-template-columns:repeat(auto-fill,minmax(50px,1fr));",
         ][r.below(7) as usize];
+        let content = [
+            "",
+            "",
+            "justify-content:space-between;",
+            "justify-content:space-evenly;",
+            "justify-content:center;",
+        ][r.below(5) as usize];
         let _ = write!(
             out,
-            "<div style='display:grid;grid-template-columns:{};grid-auto-rows:{rows};\
-             align-items:{align};justify-items:{justify};{extra}'>",
+            "<{tag} style='display:{display};grid-template-columns:{};grid-auto-rows:{rows};\
+             align-items:{align};justify-items:{justify};{content}{extra}'>",
             sizes.join(" ")
         );
         let n = 1 + r.below(6);
@@ -888,21 +904,28 @@ mod cases {
                 grid_item(r, depth, out, place);
             }
         }
-        out.push_str("</div>");
+        let _ = write!(out, "</{tag}>");
     }
 
     fn grid_page(seed: u64) -> String {
         let mut r = Rng::new(seed, 0x6e1d_9a6e);
         let mut out = body(&mut r, 60, 400);
         for _ in 0..1 + r.below(3) {
-            match r.below(10) {
+            match r.below(11) {
                 0..=3 => grid(&mut r, 0, &mut out),
+                // A div's line, as the flex pages' inline containers'.
+                10 => wrapped(&mut out, "<div style=margin:0>", "</div>", |out| {
+                    words(&mut r, out);
+                    grid_as(&mut r, 1, out, "span", "inline-grid");
+                    words(&mut r, out);
+                }),
                 4 => wrapped(&mut out, "<div style=float:left>", "</div>", |out| {
                     grid(&mut r, 1, out);
                 }),
-                5 => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                5 => wrapped(&mut out, "<div style=margin:0>", "</div>", |out| {
                     words(&mut r, out);
-                    wrapped(out, "<span style=display:inline-block>", "</span>", |out| {
+                    let open = "<span style=display:inline-block;margin:0>";
+                    wrapped(out, open, "</span>", |out| {
                         grid(&mut r, 1, out);
                     });
                     words(&mut r, out);
@@ -1109,7 +1132,7 @@ mod cases {
         } else if matches!(
             style.get(Property::Display),
             Some(ComputedValue::Keyword(
-                "inline-block" | "inline-table" | "inline-flex"
+                "inline-block" | "inline-table" | "inline-flex" | "inline-grid"
             ))
         ) {
             Some(false)
@@ -1832,6 +1855,64 @@ mod cases {
     #[test]
     fn flex_pages_copy_as_they_are_painted() {
         run("flex", 4_000_000, flex_page);
+    }
+
+    /// The inline containers the flex and grid pages write keep their
+    /// items once parsed: an item written as a block inside a paragraph
+    /// would close the paragraph and the container with it, leaving the
+    /// variant laying an empty container.
+    #[test]
+    fn inline_containers_keep_their_items() {
+        type Generator = fn(u64) -> String;
+        let pages: &[(&str, Generator, u64, &str)] = &[
+            ("flex", flex_page, 4_000_000, "display:inline-flex"),
+            (
+                "flex",
+                flex_page,
+                4_000_000,
+                "display:inline-block;margin:0",
+            ),
+            ("grid", grid_page, 5_000_000, "display:inline-grid"),
+            (
+                "grid",
+                grid_page,
+                5_000_000,
+                "display:inline-block;margin:0",
+            ),
+        ];
+        let mut counts = Vec::new();
+        for &(name, generate, base, display) in pages {
+            let (mut written, mut kept) = (0usize, 0usize);
+            for seed in base..base + 3_000 {
+                let html = generate(seed);
+                let doc = td_html::document::parse(&html).unwrap();
+                for (id, node) in doc.nodes() {
+                    let Some(element) = node.element() else {
+                        continue;
+                    };
+                    if !element
+                        .attribute("style")
+                        .is_some_and(|s| s.starts_with(display))
+                    {
+                        continue;
+                    }
+                    written += 1;
+                    let held = doc.children(id).any(|(_, n)| {
+                        n.element().is_some() || n.text().is_some_and(|t| !t.trim().is_empty())
+                    });
+                    kept += usize::from(held);
+                }
+            }
+            eprintln!("{name} {display}: {kept} of {written} keep an item");
+            counts.push((name, display, kept, written));
+        }
+        for (name, display, kept, written) in counts {
+            assert!(written >= 200, "{name} {display}: {written}");
+            assert!(
+                kept * 100 >= written * 95,
+                "{name} {display}: {kept} of {written}"
+            );
+        }
     }
 
     #[test]

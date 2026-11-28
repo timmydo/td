@@ -984,25 +984,45 @@ mod cases {
             "(display: flex)",
             "(gap: 1px)",
             "(place-content: center)",
+            "(display: inline-grid)",
         ] {
             assert_eq!(supports_matches(query), Ok(true), "{query}");
         }
-        // `inline-grid` waits for inline grid layout; `subgrid` is invalid.
-        for query in [
-            "(display: inline-grid)",
-            "(grid-template-columns: subgrid)",
-            "not (grid-area: a)",
-        ] {
+        // `subgrid` is invalid.
+        for query in ["(grid-template-columns: subgrid)", "not (grid-area: a)"] {
             assert_eq!(supports_matches(query), Ok(false), "{query}");
         }
     }
 
+    /// `grid` and `inline-grid` parse; an `inline-grid`'s children are
+    /// items, blockified as a `grid`'s; a floated one, the root and an
+    /// item are blockified to `grid`.
     #[test]
-    fn display_grid_parses_and_inline_grid_waits() {
-        let grid = child("display:grid");
-        assert_eq!(grid.get(Display), Some(&ComputedValue::Keyword("grid")));
+    fn display_grid_and_inline_grid_parse_and_blockify() {
+        let word = |s: &ComputedStyle| match s.get(Display) {
+            Some(ComputedValue::Keyword(k)) => *k,
+            _ => "",
+        };
+        assert_eq!(word(&child("display:grid")), "grid");
         let inline = child("display:inline-grid");
-        assert_eq!(inline.get(Display), Some(&ComputedValue::Keyword("inline")));
+        assert_eq!(word(&inline), "inline-grid");
+        for (own, display) in [
+            ("display:inline", "block"),
+            ("display:inline-block;float:left", "block"),
+            ("display:inline-grid", "grid"),
+            ("display:inline-flex", "flex"),
+            ("display:table-cell", "block"),
+        ] {
+            let item = style(own, Some(&inline));
+            assert_eq!(word(&item), display, "{own}");
+            assert_eq!(
+                item.get(Float),
+                Some(&ComputedValue::Keyword("none")),
+                "{own}"
+            );
+        }
+        assert_eq!(word(&child("display:inline-grid;float:right")), "grid");
+        assert_eq!(word(&style("display:inline-grid", None)), "grid");
     }
 
     #[test]

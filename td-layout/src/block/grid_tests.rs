@@ -849,15 +849,22 @@ mod cases {
                 "grid-template-columns:1fr 1fr;grid-template-areas:'a b' 'c c'",
                 "grid-template-columns:40px 1fr 40px;align-items:center",
                 "grid-template-columns:1fr 1fr;min-height:150px;align-content:end",
-            ][n % 8];
+                "grid-template-columns:repeat(4,30px);justify-content:space-between",
+                "grid-template-columns:20px 20px 20px;justify-content:space-evenly;\
+                 height:180px;align-content:space-around",
+                "grid-template-columns:repeat(3,auto);justify-items:end;\
+                 justify-content:space-around",
+            ][n % 11];
             html.push_str(&format!("<div class=g style='{shape}'>"));
             for k in 0..(3 + n % 5) {
                 let place = match (n + k) % 7 {
                     0 if n % 3 == 0 => format!("grid-row:{};grid-column:1", 4 - k % 3),
                     1 => "grid-column:span 2".to_string(),
                     2 => "grid-row:span 2".to_string(),
-                    3 if n % 8 == 5 => "grid-area:c".to_string(),
+                    3 if n % 11 == 5 => "grid-area:c".to_string(),
                     4 => "align-self:end".to_string(),
+                    5 if n % 2 == 0 => "justify-self:center".to_string(),
+                    5 => "justify-self:end;margin-left:auto".to_string(),
                     _ => String::new(),
                 };
                 let inner = match (n + k) % 6 {
@@ -881,14 +888,22 @@ mod cases {
                      <b>p</b><b>q<br>r</b></div><td>cell</table>\
                      <div class=fl><div class=g><b>x</b><b>y<br>z</b></div></div>\
                      <p>a para <span class=ib><span class=g style='grid-template-columns:1fr 1fr'>\
-                     <b>a</b><b>b<br>c</b></span></span> after<p>clear",
+                     <b>a</b><b>b<br>c</b></span></span> after<p>clear\
+                     <p>inline <span class=ig><b style=grid-row:2>low<br>er</b>\
+                     <b style=grid-row:1;padding-top:4px>high</b><b>x</b></span> grid \
+                     <span class=ig style=justify-items:center><b>one two</b><b>y</b></span> end\
+                     <table><tr><td class=bl>x<td class=bl><div class=g>\
+                     <b style=grid-row:2>q<br>q</b><b style=grid-row:1;padding-top:4px>r</b>\
+                     </div></table>",
                 );
             }
         }
         let doc = td_html::document::parse(&html).unwrap();
         let css = sheets(
             ".g{display:grid;column-gap:4px;padding:2px}.f{display:flex;align-items:center}\
-             .fl{float:left;width:60px}.ib{display:inline-block}li{list-style-position:outside}",
+             .fl{float:left;width:60px}.ib{display:inline-block}li{list-style-position:outside}\
+             .ig{display:inline-grid;grid-template-columns:auto auto;column-gap:3px}\
+             .bl{vertical-align:baseline}",
         );
         let styled = StyledDocument::new(&doc, &css, html.len(), Limits::default()).unwrap();
         assert!(styled.has_grid() && styled.has_flex() && styled.has_floats());
@@ -1688,5 +1703,193 @@ mod cases {
             800.0,
         );
         assert_eq!(laid.border("i").1 - laid.border("t").1, 20.0);
+    }
+
+    /// `justify-self` places an item across its area by hand-worked
+    /// positions: a non-stretched one shrink-to-fit there, `left` and
+    /// `self-start` at the start, `right` and `self-end` at the end, auto
+    /// margins taking the free space first; `justify-items` is the
+    /// default, `normal` a picture's start.
+    #[test]
+    fn justify_self_places_items_across_their_areas() {
+        let at = |own: &str, items: &str| {
+            let laid = Laid::new(
+                &format!("<div id=g><p id=a style='{own}'>ab</div>"),
+                &format!("#g{{display:grid;grid-template-columns:20px 100px;{items}}}#a{{grid-column:2}}"),
+                400.0,
+            );
+            let (x, _, w, _) = laid.border("a");
+            (x, w)
+        };
+        for (own, items, place) in [
+            ("", "", (20.0, 100.0)),
+            ("justify-self:stretch", "", (20.0, 100.0)),
+            ("justify-self:normal", "justify-items:end", (20.0, 100.0)),
+            ("justify-self:start", "", (20.0, 16.0)),
+            ("justify-self:left", "", (20.0, 16.0)),
+            ("justify-self:self-start", "", (20.0, 16.0)),
+            ("justify-self:flex-start", "", (20.0, 16.0)),
+            ("justify-self:center", "", (62.0, 16.0)),
+            ("justify-self:end", "", (104.0, 16.0)),
+            ("justify-self:right", "", (104.0, 16.0)),
+            ("justify-self:self-end", "", (104.0, 16.0)),
+            ("justify-self:flex-end", "", (104.0, 16.0)),
+            ("justify-self:safe end", "", (104.0, 16.0)),
+            ("", "justify-items:center", (62.0, 16.0)),
+            ("justify-self:auto", "justify-items:end", (104.0, 16.0)),
+            ("", "justify-items:legacy right", (104.0, 16.0)),
+            ("justify-self:start", "justify-items:end", (20.0, 16.0)),
+            ("margin-left:auto", "", (104.0, 16.0)),
+            ("margin-right:auto", "justify-items:end", (20.0, 16.0)),
+            ("margin:0 auto", "", (62.0, 16.0)),
+            ("margin-left:auto;justify-self:start", "", (104.0, 16.0)),
+            ("width:30px;justify-self:end", "", (90.0, 30.0)),
+            ("width:30px", "", (20.0, 30.0)),
+            (
+                "justify-self:end;padding:0 2px;border:1px solid",
+                "",
+                (98.0, 22.0),
+            ),
+            ("justify-self:center;margin:0 4px", "", (62.0, 16.0)),
+            ("justify-self:end;margin-right:6px", "", (98.0, 16.0)),
+            ("justify-self:end;min-width:40px", "", (80.0, 40.0)),
+            ("justify-self:start;max-width:8px", "", (20.0, 8.0)),
+        ] {
+            assert_eq!(at(own, items), place, "{own} / {items}");
+        }
+        // Wider than its area at its max-content: as wide as the area,
+        // its lines wrapped; its min-content wider still: aligned past
+        // the area's start, unsafely, as browsers have it.
+        let laid = Laid::new(
+            "<div id=g><p id=a>aaaa bbbb cccc<p id=b>aaaaaaaaaaaaaa\
+             <p id=c style=justify-self:center>aaaaaaaaaaaaaa\
+             <p id=d style=justify-self:start>aaaaaaaaaaaaaa</div>",
+            "#g{display:grid;grid-template-columns:60px;justify-items:end}",
+            400.0,
+        );
+        assert_eq!(laid.border("a"), (0.0, 0.0, 60.0, 60.0));
+        assert_eq!(laid.border("b"), (-52.0, 60.0, 112.0, 20.0));
+        assert_eq!(laid.border("c"), (-26.0, 80.0, 112.0, 20.0));
+        assert_eq!(laid.border("d"), (0.0, 100.0, 112.0, 20.0));
+        // Its auto margins take no negative space: at its start.
+        let laid = Laid::new(
+            "<div id=g><p id=a style='margin:0 auto'>aaaaaaaaaaaaaa</div>",
+            "#g{display:grid;grid-template-columns:60px}",
+            400.0,
+        );
+        assert_eq!(laid.border("a").0, 0.0);
+        // A picture's `normal` is `start`. Its `width` attribute is a
+        // presentational hint, a width not auto, which `stretch` keeps
+        // (Box Alignment 3 §6.1); one of auto width is not stretched
+        // either (DESIGN.md §5, "Grid", "Departures").
+        let laid = Laid::new(
+            "<div id=g><img id=i width=10 height=12><img id=j width=10 height=12 \
+             style=justify-self:stretch></div>",
+            "#g{display:grid;grid-template-columns:50px 50px}",
+            400.0,
+        );
+        assert_eq!(laid.border("i"), (0.0, 0.0, 10.0, 12.0));
+        assert_eq!(laid.border("j"), (50.0, 0.0, 10.0, 12.0));
+    }
+
+    /// A non-stretched item's width is shrink-to-fit in its area, as an
+    /// inline-block of the same content in a block of the area's width
+    /// is: min(max-content, max(min-content, the area)).
+    #[test]
+    fn a_shrunk_item_is_as_wide_as_an_inline_block() {
+        let contents = [
+            "one two three",
+            "one two three four five six seven eight",
+            "<p>words in</p><p>two paragraphs here and more</p>",
+            "a<span style=display:inline-block;width:70px>box</span>b",
+            "<ul><li>a list item<li>another one here</ul>",
+            "<table><tr><td>cell one<td>cell two</table>",
+            "pre<br>longer line after it",
+            "",
+        ];
+        for content in contents {
+            for width in [40.0, 100.0, 300.0] {
+                let grid = Laid::new(
+                    &format!("<div id=g><div id=a style=justify-self:start>{content}</div></div>"),
+                    &format!("#g{{display:grid;grid-template-columns:{width}px}}"),
+                    800.0,
+                );
+                let block = Laid::new(
+                    &format!(
+                        "<div style=width:{width}px><span id=a style=display:inline-block>\
+                         {content}</span></div>"
+                    ),
+                    "",
+                    800.0,
+                );
+                assert_eq!(
+                    grid.border("a").2,
+                    block.border("a").2,
+                    "{content} in {width}"
+                );
+            }
+        }
+    }
+
+    /// `justify-content` and `align-content` distribute what the tracks
+    /// leave: each share a floor of the cumulative one, in 1/64 px, so
+    /// the shares sum exactly to the free space (Box Alignment 3 §5.3).
+    #[test]
+    fn content_distribution_sums_exactly() {
+        // Four 10 px columns in 101 px: 61 px free, 3,904 units.
+        let free = 61 * 64;
+        type Share = fn(i64, i64) -> i64;
+        let cases: &[(&str, Share)] = &[
+            ("start", |_, _| 0),
+            ("end", |free, _| free),
+            ("center", |free, _| free / 2),
+            ("space-between", |free, k| free * k / 3),
+            ("space-around", |free, k| free * (2 * k + 1) / 8),
+            ("space-evenly", |free, k| free * (k + 1) / 5),
+        ];
+        for &(value, share) in cases {
+            let html = "<div id=g><p id=c0>a<p id=c1>b<p id=c2>c<p id=c3>d</div>";
+            let columns = Laid::new(
+                html,
+                &format!(
+                    "#g{{display:grid;width:101px;grid-template-columns:repeat(4,10px);\
+                     justify-content:{value}}}"
+                ),
+                400.0,
+            );
+            let rows = Laid::new(
+                html,
+                &format!(
+                    "#g{{display:grid;height:101px;grid-template-rows:repeat(4,10px);\
+                     align-content:{value}}}"
+                ),
+                400.0,
+            );
+            for k in 0..4 {
+                let at = (k as f64) * 10.0 + (share(free, k) as f64) / 64.0;
+                let id = format!("c{k}");
+                assert_eq!(columns.border(&id).0, at, "{value} column {k}");
+                assert_eq!(rows.border(&id).1, at, "{value} row {k}");
+            }
+        }
+        // Between them, the last ends at the container's end exactly.
+        let laid = Laid::new(
+            "<div id=g><p>a<p>b<p>c<p>d<p>e<p>f<p id=z>g</div>",
+            "#g{display:grid;width:101px;grid-template-columns:repeat(7,3px);\
+             justify-content:space-between}",
+            400.0,
+        );
+        let (x, _, w, _) = laid.border("z");
+        assert_eq!(x + w, 101.0);
+        // Columns overflow unsafely, centred past both edges; rows never
+        // above the content box.
+        let laid = Laid::new(
+            "<div id=g><p id=a>a<p id=b>b</div>",
+            "#g{display:grid;width:20px;height:20px;grid-template-columns:30px;\
+             grid-template-rows:30px 10px;justify-content:center;align-content:center}",
+            400.0,
+        );
+        assert_eq!(laid.border("a").0, -5.0);
+        assert_eq!(laid.border("a").1, 0.0);
     }
 }

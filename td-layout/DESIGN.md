@@ -895,12 +895,13 @@ context, as CSS does (td-web/DESIGN.md §10, "Painting").
 
 A box is an **inline-block** when it is a block, not the root, whose
 computed display is `inline-block`, an **inline table** when it is
-`inline-table`, or an **inline flex container** when it is
-`inline-flex`; what follows says inline-block of all three but where it
-names the others. td-css blockifies a floated one, and the root (an
-inline table into a block-level table, which keeps its place in flow,
-above, "Floats"), so none floats; an image whose display is
-`inline-block`, `inline-table` or `inline-flex` is an inline image.
+`inline-table`, an **inline flex container** when it is `inline-flex`,
+or an **inline grid container** when it is `inline-grid`; what follows
+says inline-block of all four but where it names the others. td-css
+blockifies a floated one, and the root (an inline table into a
+block-level table, which keeps its place in flow, above, "Floats"), so
+none floats; an image whose display is `inline-block`, `inline-table`,
+`inline-flex` or `inline-grid` is an inline image.
 `StyledDocument::has_inline_blocks` says whether any box is one, set
 while boxes are generated, so a page without one takes none of what
 follows: its geometry, lines and work are those of a layout without
@@ -967,8 +968,10 @@ cells"), else the bottom content edge of its lowest such cell, the row's
 bottom less that cell's bottom padding and border; where it has no row,
 or its first row no such cell, its bottom margin edge. An inline flex
 container's is its first baseline (below, "Flex", "Baselines"), else its
-bottom margin edge. A cell spanning rows is left out, where §17.5.3 lets
-a baseline-aligned one set its first row's baseline, as td-layout lays
+bottom margin edge; an inline grid container's is its first item's in
+grid order (below, "Grid", "Inline grid and baselines"), else its bottom
+margin edge. A cell spanning rows is left out, where §17.5.3 lets a
+baseline-aligned one set its first row's baseline, as td-layout lays
 such a cell at its top (below). Its captions are not its rows, and its
 `overflow` is not read. A line's height takes its margin box above and
 below that baseline, either part negative where its margins make it so,
@@ -1849,10 +1852,12 @@ did, boxes, lines, markers and work, charging within 240 bytes of it.
 
 ### Grid
 
-A block box whose computed display is `grid` is a **grid container**,
-laid by [CSS Grid 2][grid2] without subgrid or masonry, and Box
-Alignment 3's values; `inline-grid` is not yet parsed (td-css/DESIGN.md
-§4, "Grid"). `StyledDocument::has_grid` says whether any box is one,
+A block box whose computed display is `grid` or `inline-grid` is a
+**grid container**, an `inline-grid` one laid whole in its line as an
+inline-block (above, "Inline-blocks"; below, "Inline grid and
+baselines"), laid by [CSS Grid 2][grid2] without subgrid or masonry,
+and Box Alignment 3's values. `StyledDocument::has_grid` says whether
+any box is one,
 set while boxes are generated as `has_flex` is, so a page without one
 takes none of what follows: its geometry, lines, work and charges are
 those of a layout without grid. The code is `block/grid.rs`.
@@ -1954,8 +1959,16 @@ its edges alone. So `repeat(auto-fill, minmax(200px, 1fr))` and
 `minmax(0, 1fr)` columns measure nothing, `1fr` measures every item it
 holds, and an item spanning `1fr` columns has no automatic minimum.
 Columns come first: the container's width is definite. Then
-`justify-content` places them in what they leave (Box Alignment 3 §5.3,
-unsafe, as flex's main axis), each gap the column gap.
+`justify-content` places them in what they leave (Box Alignment 3 §5.3),
+each gap the column gap: `start`, `end`, `center`, `left` and `right`,
+and `space-between`, `space-around` and `space-evenly`, each share a
+floor of the cumulative one in 1/64 px, as flex's are, so the shares
+sum exactly to the free space; `normal` and `stretch` stretch the
+`auto` columns (§12.8), else start. Columns overflow unsafely, centred
+or ended past the content box's start as browsers lay a grid, as flex's
+main axis does; rows safely (below, "Alignment"). td-css drops a
+`safe` or `unsafe` keyword (td-css/DESIGN.md §4), so neither is
+chosen per value.
 
 **Rows and bands.** Items are laid once each in tree order, so their
 lines stay in tree order, each at its columns' x and width and the
@@ -1994,23 +2007,29 @@ items laid at their final tops, and an out-of-order grid, or one of
 `align-self` (`auto` its container's `justify-items` and `align-items`,
 `legacy` its position) are `normal` and `stretch`, `start` (and
 `self-start`, `flex-start`, `left`, the baselines), `center` and `end`
-(`self-end`, `flex-end`, `right`); `normal` is `start` for a picture
-and stretches anything else. Across, a stretched block of auto width
-and no auto horizontal margin takes its area's width less its margins,
-as block flow gives it; any other its own width or its shrink-to-fit one
-(above, "Floats"), placed by its auto margins, which take the free space
-first, else at its area's start, centre or end, never left of it; a
-table sizes itself and is placed so, as a flex column's table item.
-Down, a block of auto height and no auto vertical margin is stretched to
-its area's height less its margins, within its own min and max heights:
-its content and border heights are rewritten as a flex line's stretched
-item's are, or it is laid at that height where its rows are fixed;
-auto vertical margins share positive free space; `center` and `end` move
-it down; an item taller than its area stays at its top, as `safe`
-alignment has it. A table and a picture are not stretched. A stretched
-item overflows with its stretched box and what it holds, not the box it
-first laid: block flow notes what a box's content reached before its
-own border box, on a page with grid containers.
+(`self-end`, `flex-end`, `right`); `normal` is `start` for a picture and
+stretches anything else. Across, a stretched block of auto width and no
+auto horizontal margin takes its area's width less its margins, as block
+flow gives it; any other its own width or its shrink-to-fit one (above,
+"Floats"): min(max-content, max(min-content, the area)) within its min
+and max widths, measured as an inline-block's in a block of the area's
+width is, not taken from its contributions, which are measured with its
+percentages auto, and so a measure more for an item whose tracks
+measured it. It is placed by its auto margins, which take the free space
+first and none that is negative, else at its area's start, centre or
+end, unsafely, as browsers place it: one wider than its area is centred
+or ended past its start (Box Alignment 3 §4.4); a table sizes itself and
+is placed so, as a flex column's table item, but never past its area's
+start. Down, a block of auto height and no auto vertical margin is
+stretched to its area's height less its margins, within its own min and
+max heights: its content and border heights are rewritten as a flex
+line's stretched item's are, or it is laid at that height where its rows
+are fixed; auto vertical margins share positive free space; `center` and
+`end` move it down; an item taller than its area stays at its top, as
+`safe` alignment has it. A table and a picture are not stretched. A
+stretched item overflows with its stretched box and what it holds, not
+the box it first laid: block flow notes what a box's content reached
+before its own border box, on a page with grid containers.
 `align-content` places rows in what a definite or least height leaves,
 safely: never up.
 
@@ -2054,6 +2073,33 @@ a box whose nearest ancestor with geometry is a grid container as laid
 apart (`StyledDocument::is_grid_container`), on a page with any.
 Items among themselves paint in tree order, not by placement.
 
+**Inline grid and baselines** (§10.8). A grid's first baseline is its
+first item's in grid order: the first in row-major order of its areas'
+first cells, tree order among items sharing one, whatever their source
+order; that item's first line's baseline, else its border box's bottom
+(its synthesized baseline), less its own relative offset; with no item
+it has none. The offset is taken off only for an `inline-grid`: a
+baseline cell or baseline flex item holding a block grid reads its
+lead's line or box where the offset put it, so a lead of `top: 10px`
+puts the baseline 10 px lower than browsers do. Its lines are no
+inline-block's last in flow (below, "Output and lines"), so it has no
+last baseline. An `inline-grid` is an
+inline-block whose content is laid as a grid's, shrink-to-fit by
+`grid_intrinsic`, its baseline its first: `lay_item` asks for it as for
+an inline-flex's, and with no item it is its bottom margin edge. A cell
+aligned on its baseline, or a flex item sharing its line's, whose first
+line a grid lays takes the grid's first baseline the same way, so no
+other item's line takes it. Where it is wanted the grid finds that item
+once placed, a unit of work an item, and lays it watched, its first line
+kept whatever the window as a cell's first is; what it found, the line
+or, for an item of no line, that item's box, whose bottom is read once
+it is placed, is kept where a first line is (`First`, which marks save
+and restore as a re-laid flex line's, a box's index with the top bit),
+so a grid whose first item is such a grid gives that item's synthesized
+baseline too. Every table cell asks for its first line, so a grid that
+is a cell's first content pays that unit an item whatever the cell's
+`vertical-align`.
+
 **Output and lines.** Geometry is in postorder: each item's, then the
 container's. Lines are in tree order, item by item, as a flex
 container's are, so line order is not y order where items are placed
@@ -2061,8 +2107,8 @@ out of source order or moved by their alignment: an item placed in the
 first row after one in the second has its lines after the second's,
 above them. An anonymous item has no geometry, its lines naming the
 container. A grid's lines are no inline-block's last in flow, as a
-flex container's (`last_baseline` restored around it); a grid has no
-baseline of its own (below, "Departures").
+flex container's (`last_baseline` restored around it); its first
+baseline is above's, "Inline grid and baselines".
 
 **Windows.** Lines laid in a grid may move down until their band
 closes, so where any may (rows not all fixed, or an item centred, at
@@ -2126,67 +2172,88 @@ it; a grid's items are laid one level below it, and `MAX_DEPTH` bounds
 the nesting. Every size is clamped to `MAX_COORDINATE` and every factor
 to 2^40 units of 2^-20, so shares and fr sizes are exact in i128.
 
-**Measured.** Release, the host of §6, a harness's deterministic
-metrics (advances of 5 to 9 px by scalar, 1.25 em lines), 2026-11-28
-under a load average of about 1.3, pinned to one CPU, medians of nine
-layouts, the build before built from `git archive` of its tree. Eleven
-2 MiB shapes without grid (prose, blocks, table rows, nested tables,
-floats, inline-blocks, nested lists, inline tables, navbars, flex cards,
-a wrapping row of `height: 100%` cards) and 300 generated pages of
-blocks, tables, floats, inline-blocks, lists, pictures and flex give
-identical boxes, lines, markers, height, overflow, cuts, work, page and
-output bytes and charges, whole and in three windows, at 1280, 832 and
-200 px (4,043 layouts), against the build before; three rounds
-interleaved with it lay them in the same time, -4.9% to +2.4%. Pages
-whose grids laid as blocks before now lay them (work against the
-blocks', at 1280 px): 2.0 MiB of `repeat(auto-fill, minmax(200px,
-1fr))` cards, a heading and a paragraph each with padding and a border,
-each row a band, in 61 to 73 ms, 4,751,034 work (1.14 times, 49 ms
-before); the same cards in `repeat(4, 1fr)`, whose `1fr` columns
-measure every card, 81 ms and 121 ms at 200 px, 6,590,118 work (1.6
-times); page shells of `grid-template-areas` (a header and a footer
-spanning a 150 px nav and a `1fr` main), 85 ms, 7,021,786 work (1.6
-times); 2.0 MiB of paragraphs in `1fr 1fr` columns of `grid-auto-rows:
-1fr` with the first item placed in row 20,000, one band of every item,
-moved once, 104 ms and 131 to 152 ms at 200 px, 9,449,618 work (1.9
-times), every line held until the grid ends. The worst found are grids
-whose items lay again: cards that are each a grid of `auto 1fr auto`
-rows, each laid at its auto height and again at its row's, 181 ms,
-11,994,303 work (3.1 times, 47 ms before), and cards holding a child of
-`height: 100%`, laid again so, 97 ms, 8,230,361 work (2.2 times). Line
-names cost their index and two searches an item: 150,000 items placing
-by four absent names each in 1,000-name lists of 28-byte names, in two
-styles in turn, lay in 137 ms, 2,404,401 work (4.3 s and 4,800,047 work
-before the index and kept placements); in nine, each searching again,
-197 ms, 28,804,049 work, 6.8 ns a unit.
+**Measured.** Release, the host of §6, a harness's deterministic metrics
+(advances of 5 to 9 px by scalar, 1.25 em lines), 2026-11-28 under a
+load average of about 1.3, pinned to one CPU, medians of nine layouts,
+the build before built from `git archive` of its tree. Eleven 2 MiB
+shapes without grid (prose, blocks, table rows, nested tables, floats,
+inline-blocks, nested lists, inline tables, navbars, flex cards, a
+wrapping row of `height: 100%` cards) and 300 generated pages of blocks,
+tables, floats, inline-blocks, lists, pictures and flex give identical
+boxes, lines, markers, height, overflow, cuts, work, page and output
+bytes and charges, whole and in three windows, at 1280, 832 and 200 px
+(4,043 layouts), against the build before; three rounds interleaved with
+it lay them in the same time, -4.9% to +2.4%. Pages whose grids laid as
+blocks before now lay them (work against the blocks', at 1280 px): 2.0
+MiB of `repeat(auto-fill, minmax(200px, 1fr))` cards, a heading and a
+paragraph each with padding and a border, each row a band, in 61 to 73
+ms, 4,751,034 work (1.14 times, 49 ms before); the same cards in
+`repeat(4, 1fr)`, whose `1fr` columns measure every card, 81 ms and 121
+ms at 200 px, 6,590,118 work (1.6 times); page shells of
+`grid-template-areas` (a header and a footer spanning a 150 px nav and a
+`1fr` main), 85 ms, 7,021,786 work (1.6 times); 2.0 MiB of paragraphs in
+`1fr 1fr` columns of `grid-auto-rows: 1fr` with the first item placed in
+row 20,000, one band of every item, moved once, 104 ms and 131 to 152 ms
+at 200 px, 9,449,618 work (1.9 times), every line held until the grid
+ends. The worst found are grids whose items lay again: cards that are
+each a grid of `auto 1fr auto` rows, each laid at its auto height and
+again at its row's, 181 ms, 11,994,303 work (3.1 times, 47 ms before),
+and cards holding a child of `height: 100%`, laid again so, 97 ms,
+8,230,361 work (2.2 times). Line names cost their index and two searches
+an item: 150,000 items placing by four absent names each in 1,000-name
+lists of 28-byte names, in two styles in turn, lay in 137 ms, 2,404,401
+work (4.3 s and 4,800,047 work before the index and kept placements); in
+nine, each searching again, 197 ms, 28,804,049 work, 6.8 ns a unit.
+Increment d, 2026-11-28 against 4acfac5cb, the same 4,043 layouts
+without grid identical; timing them interleaved three rounds, the build
+is 1.4% to 2.3% slower in total, the most 5% on a shape, as much as a
+function never called added to the build before moves it (1.5%, 4.3% on
+a shape): code placement: of what those pages run, only the picture
+display check moved apart (`inline_picture`) and `lay_item`'s
+inline-flex test, now one for grids too, changed. 2.0 MiB of paragraphs
+each holding an `inline-grid` of two items, its second placed first in
+its row, lay in 95 to 101 ms, 5,471,286 work at 1280 px, 512 a
+paragraph, as an inline-block holding the same grid does (523 a
+paragraph; 9.4 us a paragraph against its 9.1), an `inline-flex` 431.
+The card grid above with `justify-items: center` or `end` measures each
+card shrink-to-fit, 91 ms, 6,867,231 work (1.36 times stretched cards'
+5,060,405); in `repeat(auto-fill, 200px)` columns of `justify-content:
+space-between`, 62 ms, 4,944,429 work.
 
 **Departures and later increments.** `dense` packing is laid as sparse.
 Baseline self-alignment is start alignment (§11.6's shim and `last
-baseline` with it), and a grid has no baseline: an inline-block holding
-one takes its bottom margin edge or a line after it. `order` does not
-reorder items for placement or painting (§8.5's order-modified document
-order is tree order). `inline-grid` (td-css parses it not yet), subgrid,
-masonry and writing modes other than horizontal left-to-right are not
-laid. §12.1 step 3, sizing the columns again once the rows' sizes are
-known for items whose min-content width depends on their height, is not
-run. Percentage rows of a grid of auto height are auto, not resolved
-again against the height that gives (§7.2.1): sizing its rows again
-would move items up. A row's `auto-fit` repeat is laid as `auto-fill`.
-Tracks an area adds past the template, beside implicit tracks, take the
-auto sizes from the first, not the cycle after the explicit grid. A
-spanning item's limited contribution under a constraint is not limited
-by its tracks' fixed maxima. Rows are aligned safely (never above the
-content box); columns are not. An item taller than its area moves
-nothing up for `center` or `end`. A table item is not stretched and is
-never narrower than its columns' minimum. A stretched item laid again
-keeps the row sizes the first lay measured, so content that grows when
-laid at its area's height overflows it. An item whose first line an
-outside list marker waits for is not laid again, as a flex item's is not
-(above, "Flex"): `<li>` holding a grid whose first item is `height: 50%`
-lays it at its auto height. A cell aligned on its baseline, or a flex
-item of a row of `align-items: baseline`, that holds a grid aligns to
-the first line of the grid's first item in tree order, not of its first
-row.
+baseline` with it), so no item shares a row's baseline and a grid's
+first baseline is always its first item's in grid order (§10.8's first
+rule never applies); a grid has no last baseline: an inline-block
+holding one takes its bottom margin edge or a line after it. `order`
+does not reorder items for placement, painting or grid order (§8.5's
+order-modified document order is tree order). Subgrid, masonry and
+writing modes other than horizontal left-to-right are not laid. §12.1
+step 3, sizing the columns again once the rows' sizes are known for
+items whose min-content width depends on their height, is not run.
+Percentage rows of a grid of auto height are auto, not resolved again
+against the height that gives (§7.2.1): sizing its rows again would move
+items up. A row's `auto-fit` repeat is laid as `auto-fill`. Tracks an
+area adds past the template, beside implicit tracks, take the auto sizes
+from the first, not the cycle after the explicit grid. A spanning item's
+limited contribution under a constraint is not limited by its tracks'
+fixed maxima. Rows are aligned safely (never above the content box);
+columns are not. An item taller than its area moves nothing up for
+`center` or `end`. A table item is not stretched and is never narrower
+than its columns' minimum. A stretched item laid again keeps the row
+sizes the first lay measured, so content that grows when laid at its
+area's height overflows it. An item whose first line an outside list
+marker waits for is not laid again, as a flex item's is not (above,
+"Flex"): `<li>` holding a grid whose first item is `height: 50%` lays it
+at its auto height. `safe` and `unsafe` overflow positions are not told
+apart (above, "Tracks"). A relative offset on a box within the first
+item in grid order moves its grid's first baseline with the line it
+moves, as it does a flex container's (above, "Flex"): a first item
+holding a paragraph of `position: relative; top: 8px` gives 23 px where
+browsers give 15. A picture of auto width is not stretched across its
+area (one of a `width` attribute has a width not auto, which browsers do
+not stretch either). A table item is placed across never past its area's
+start.
 
 ## 6. Work bounds, resize and validation
 
@@ -2955,8 +3022,9 @@ item's content, `wrap-reverse`, `column-reverse` and a column's
 wrapping and shrinking after. Grid lands in increments too: td-css's
 properties (a), then `display: grid` with placement, track sizing,
 bands of rows, alignment and grid items' paint order (b, §5, "Grid"),
-then `inline-grid` (d); `dense`, baselines, `order` and §12.1's rerun
-after. Open for
+then `inline-grid`, a grid's first baseline in cells and flex lines,
+and `justify-self` and content alignment pinned (d); `dense`, baseline
+self-alignment, `order` and §12.1's rerun after. Open for
 tables: a windowed layout
 holds the lines above its window in the row being laid and in rows a
 rowspan holds open (§5, "Tables", "Windows"). A window past 524,288

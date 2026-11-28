@@ -585,17 +585,32 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     fn item_baseline(
         &self,
         item: &FlexItem,
-        line: Option<usize>,
+        first: Option<First>,
         definite: Option<f64>,
     ) -> Result<Option<f64>, Error> {
-        let laid = match line.and_then(|at| self.lines.get(at)) {
-            Some(line) => line.y + line.baseline,
-            None => match item.border_box().and_then(|at| self.boxes.get(at)) {
-                Some(geometry) => geometry.border.y + geometry.border.height,
-                None => return Ok(None),
-            },
+        self.laid_baseline((item.source, item.border_box()), first, definite)
+    }
+    /// The baseline an item of `source` gives, its border box `geometry`,
+    /// as `item_baseline` has it, `first` its first line or the box a
+    /// grid in it gave; a grid item's too (§5, "Grid").
+    pub(super) fn laid_baseline(
+        &self,
+        (source, geometry): (Source, Option<usize>),
+        first: Option<First>,
+        definite: Option<f64>,
+    ) -> Result<Option<f64>, Error> {
+        let bottom = |at: usize| self.boxes.get(at).map(|g| g.border.y + g.border.height);
+        let laid = match first {
+            Some(First::Line(at)) if at < self.lines.len() => {
+                self.lines.get(at).map(|line| line.y + line.baseline)
+            }
+            Some(First::Border(at)) if at < self.boxes.len() => bottom(at),
+            _ => geometry.and_then(bottom),
         };
-        let Source::Element(child) = item.source else {
+        let Some(laid) = laid else {
+            return Ok(None);
+        };
+        let Source::Element(child) = source else {
             return Ok(Some(laid));
         };
         let c = self.styled.box_node(child).ok_or(Error::Invalid)?;
@@ -1507,9 +1522,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             list_cursor: small(self.list_cursor)?,
             last_baseline: self.last_baseline,
             first_line: self.first_line,
-            first_index: some(self.first_index)?,
+            first_index: First::pack(self.first_index)?,
             flex_watch: some(self.flex_watch)?,
-            flex_lead: some(self.flex_lead)?,
+            flex_lead: First::pack(self.flex_lead)?,
             nested: small(self.nested.len())?,
         })
     }
@@ -1540,9 +1555,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         self.list_cursor = n(mark.list_cursor);
         self.last_baseline = mark.last_baseline;
         self.first_line = mark.first_line;
-        self.first_index = mark.first_index.map(n);
+        self.first_index = First::unpack(mark.first_index);
         self.flex_watch = mark.flex_watch.map(n);
-        self.flex_lead = mark.flex_lead.map(n);
+        self.flex_lead = First::unpack(mark.flex_lead);
         // What an outermost container keeps from here is laid again.
         self.filtered = (self.filtered.0.min(lines), self.filtered.1.min(markers));
         Ok(())

@@ -1205,6 +1205,7 @@ fn parse_value(
                 "flex",
                 "inline-flex",
                 "grid",
+                "inline-grid",
             ],
         ),
         Color | BackgroundColor | BorderTopColor | BorderRightColor | BorderBottomColor

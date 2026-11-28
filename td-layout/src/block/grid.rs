@@ -2576,15 +2576,36 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             self.flex_marks.len(),
         );
         let (last_baseline, retain) = (self.last_baseline, self.retain);
-        let laid = self.lay_grid(id, b, dims, &place, depth);
+        // Its first baseline, its first item's in grid order (§10.8), is
+        // wanted by an inline-grid's line, or as its first line by a cell
+        // or a flex item sharing its line's baseline: that item's first
+        // line is watched for and kept whatever the window, and no other
+        // takes the first line.
+        let wanted = std::mem::replace(&mut self.flex_wanted, false);
+        let inherited = std::mem::replace(&mut self.first_line, false);
+        let watch = self.flex_watch.take();
+        let lead = self.flex_lead.take();
+        let laid = self.lay_grid(id, b, dims, &place, wanted || inherited, depth);
         // A grid's lines, as a table's, are no inline-block's last.
         self.last_baseline = last_baseline;
         self.retain = retain;
+        self.flex_watch = watch;
+        self.flex_lead = lead;
         self.grid.truncate(saved.0);
         self.grid_tracks.truncate(saved.1);
         self.grid_tree.truncate(saved.2);
         self.flex_marks.truncate(saved.3);
-        laid
+        let (used, own, first, baseline) = laid?;
+        // Its first item's first line, else its border box: a grid with
+        // no item takes none, and the first line is what follows.
+        match first {
+            Some(first) if inherited => self.first_index = Some(first),
+            _ => self.first_line = inherited,
+        }
+        if wanted {
+            self.flex_first = baseline.map(|y| y - offset.1);
+        }
+        Ok((used, own))
     }
     fn lay_grid(
         &mut self,
@@ -2592,8 +2613,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         b: &BoxNode,
         dims: &Dimensions,
         place: &Place,
+        watching: bool,
         depth: usize,
-    ) -> Result<(f64, f64), Error> {
+    ) -> Result<(f64, f64, Option<First>, Option<f64>), Error> {
         let styled = self.styled;
         let style = styled.style(b.style).ok_or(Error::Invalid)?;
         let width = place.container.width;
@@ -2683,8 +2705,40 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         } else {
             self.floors(grid, free)?
         };
+        let lead = if watching {
+            self.grid_lead(grid)?
+        } else {
+            None
+        };
+        self.flex_watch = lead;
         let content_height = self.lay_bands(id, place, grid, rows, (tree, depth))?;
-        Ok((content_height, content_height))
+        let (first, baseline) = match lead.and_then(|k| self.grid.get(k)) {
+            Some(item) => {
+                let item = *item;
+                let (_, area) = self.area_rows(grid, &item)?;
+                let source = (item.source, item.geometry());
+                let first = self.flex_lead.or(item.geometry().map(First::Border));
+                (first, self.laid_baseline(source, first, Some(px(area)))?)
+            }
+            None => (None, None),
+        };
+        Ok((content_height, content_height, first, baseline))
+    }
+    /// The grid's first item in grid order, whose baseline is its own
+    /// (§10.8): the first in row-major order of its areas' first cells,
+    /// tree order among those sharing one; a unit of work an item.
+    fn grid_lead(&mut self, grid: Grid) -> Result<Option<usize>, Error> {
+        let (start, end) = grid.items;
+        self.counters.step(end - start)?;
+        let items = self.grid.get(start..end).ok_or(Error::Invalid)?;
+        let mut best: Option<((usize, usize), usize)> = None;
+        for (at, item) in items.iter().enumerate() {
+            let cell = (item.span(true).0, item.span(false).0);
+            if best.is_none_or(|(first, _)| cell < first) {
+                best = Some((cell, start + at));
+            }
+        }
+        Ok(best.map(|(_, k)| k))
     }
     /// Each row's floor as no item is laid yet, and a tree of their
     /// prefix sums, where it starts in the tree stack.
@@ -3169,7 +3223,21 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             return Err(Error::Limit("MAX_COORDINATE"));
         }
         item.top = top;
+        // The item whose baseline is its grid's keeps its first line
+        // whatever the window, as a cell's first is kept.
+        let watched = self.flex_watch == Some(k);
+        let watch = watched.then(|| {
+            self.flex_watch = None;
+            (
+                std::mem::replace(&mut self.first_line, true),
+                self.first_index.take(),
+            )
+        });
         let laid = self.lay_in_area(&mut item, id, &area, depth);
+        if let Some((first_line, first_index)) = watch {
+            self.flex_lead = std::mem::replace(&mut self.first_index, first_index);
+            self.first_line = first_line;
+        }
         let own = if item.stretch && !item.at_height && item.geometry().is_some() {
             // Its box is stretched once its rows are sized: what it holds.
             self.inner
@@ -3207,9 +3275,11 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let styled = self.styled;
         let width = area.container.width;
         let top = area.container.y;
+        // Unsafe, as browsers align an item across (Box Alignment 3 §4.4):
+        // one wider than its area is centred or ended past its start.
         let across = |align: Align, free: f64| match align {
-            Align::Center => (free / 2.0).max(0.0),
-            Align::End => free.max(0.0),
+            Align::Center => free / 2.0,
+            Align::End => free,
             _ => 0.0,
         };
         match item.source {

@@ -314,6 +314,7 @@ fn overflow_pair_computation_and_display_blockification() {
     for (input, display) in [
         ("float:left", "block"),
         ("float:right;display:inline-flex", "flex"),
+        ("float:right;display:inline-grid", "grid"),
         ("float:left;display:inline-table", "table"),
         ("float:left;display:none", "none"),
         ("position:relative;display:inline", "inline"),

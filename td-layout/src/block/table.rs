@@ -2060,8 +2060,13 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         let inner = laid.max(set.unwrap_or(0.0));
         let height = inner + decoration.vertical();
         let baseline = decoration.top
-            + match taken.and_then(|at| self.lines.get(at)) {
-                Some(line) => line.y + line.baseline - (content.y + ctx.offset.1),
+            + match taken {
+                Some(First::Line(at)) => self.lines.get(at).map_or(laid, |line| {
+                    line.y + line.baseline - (content.y + ctx.offset.1)
+                }),
+                Some(First::Border(at)) => self.boxes.get(at).map_or(laid, |g| {
+                    g.border.y + g.border.height - (content.y + ctx.offset.1)
+                }),
                 None => laid,
             };
         let geometry = match node {

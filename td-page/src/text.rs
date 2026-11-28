@@ -2680,6 +2680,42 @@ mod tests {
         }
     }
 
+    /// An inline grid container copies as a grid container in an
+    /// inline-block does, its items in tree order wherever they are
+    /// placed; each piece starts on its own line.
+    #[test]
+    fn an_inline_grid_copies_as_its_items() {
+        for content in [
+            "<b>a</b><b>bb<br>cc</b>",
+            "<b style=grid-row:2>a</b><b style=grid-row:1;padding-top:4px>bb</b>tail",
+            "<b style=grid-column:2>a</b><b style=justify-self:end>b</b>",
+            "",
+        ] {
+            let css = "grid-template-columns:auto auto";
+            let inline =
+                format!("<p>one <span style='display:inline-grid;{css}'>{content}</span> two");
+            let boxed = format!(
+                "<p>one <span style=display:inline-block><span style='display:grid;{css}'>\
+                 {content}</span></span> two"
+            );
+            let laid = laid(&inline);
+            assert_eq!(
+                all(&laid),
+                all(&crate::page::tests::laid(&boxed)),
+                "{inline}"
+            );
+            for (at, line) in laid.lines().iter().enumerate() {
+                for item in items(&laid, line) {
+                    assert_eq!(line_of(&laid, item.start), at, "{inline} {item:?}");
+                }
+            }
+        }
+        let laid = laid(
+            "<p>one <span style=display:inline-grid><b style=grid-row:2>a</b><b>b</b></span> two",
+        );
+        assert_eq!(all(&laid), "one a\nb two");
+    }
+
     /// An inline flex container copies as a flex container in an
     /// inline-block does, its items in tree order whatever their `order`;
     /// each piece starts on its own line.
