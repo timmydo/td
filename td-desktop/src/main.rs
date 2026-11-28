@@ -19,7 +19,7 @@ fn run() -> Result<(), String> {
     }
     match arg.as_deref().and_then(std::ffi::OsStr::to_str) {
         Some("--help") => {
-            println!("usage: td-desktop [user@]host\nF9 copies text from the desktop. F10 sends local clipboard text.");
+            println!("usage: td-desktop [user@]host\nF8 opens remote apps and workspaces. F9 copies text from the desktop. F10 sends local clipboard text.");
             Ok(())
         }
         Some("--serve") => transport::serve().map_err(diagnostic),

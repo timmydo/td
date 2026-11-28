@@ -797,6 +797,16 @@ pub(crate) struct Launcher {
     connected: Option<Answer>,
 }
 
+/// The remote seat needs only the existing program queue. Sharing its
+/// sender increments its channel reference count; it copies no login state.
+pub(crate) struct DesktopPrograms(SyncSender<Work>);
+
+impl DesktopPrograms {
+    pub(crate) fn start(&self, program: Program) -> bool {
+        self.0.try_send(Work::Program(program)).is_ok()
+    }
+}
+
 /// TOKEN-LOGIN.md's login state, as root's `1a` answer gives it
 /// (td-authd/DESIGN.md, login-state amendment 1), with an enrolled
 /// record's key list.
@@ -1399,6 +1409,10 @@ impl Launcher {
             Err(TrySendError::Full(_)) => Err("authority request already pending".into()),
             Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
         }
+    }
+
+    pub(crate) fn desktop_programs(&self) -> DesktopPrograms {
+        DesktopPrograms(SyncSender::clone(&self.send))
     }
 
     pub fn launch_selected(&self, terminal: Program) -> Result<(), String> {

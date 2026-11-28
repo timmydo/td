@@ -52,6 +52,14 @@ Resolve protected surfaces by trusted compositor or launch authority.
 Root gives the notebook the protected Wayland socket. The server withholds
 the remote seat while a client on that socket can own a surface.
 
+F8 opens the viewer’s application launcher, including on an empty workspace.
+Type to filter, then press Enter or click a row to launch a terminal,
+text editor, photo viewer or disk usage window. These use the same fixed
+launch requests as the physical launcher. With the launcher open, 1–9 select
+a workspace and Left or Right focuses a neighboring window. Escape closes
+the launcher. The launcher appears only in the viewer. The workspace and
+application focus are shared with an unlocked console.
+
 Coordinates refer to the remote output. The viewer scales the image to fit
 and maps pointer coordinates back through the same transform. Input aimed
 at a superseded output geometry is discarded. Losing viewer focus, ending

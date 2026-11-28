@@ -3624,6 +3624,16 @@ impl Scene {
         self.render_omitting(frame, width, height, stride, None);
     }
 
+    pub(crate) fn paint_desktop_launcher(
+        &self,
+        launcher: &Launcher,
+        frame: &mut [u8],
+        width: usize,
+        height: usize,
+    ) {
+        launcher.paint(frame, width, height, width * 4, &self.text);
+    }
+
     /// What a screenshot shows: the ordinary render without the cursor or
     /// any compositor overlay, which are the moment's furniture rather
     /// than the screen's content. Never the private screens, whose pixels

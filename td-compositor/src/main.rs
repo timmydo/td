@@ -562,6 +562,11 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         options.terminal_authority,
     ));
     runtime.set_launcher_authority(options.terminal_authority);
+    runtime.set_desktop_launcher(
+        task_launcher
+            .as_ref()
+            .map(authority::Launcher::desktop_programs),
+    );
     if let launcher::LaunchBackend::Authority(authority) = &launches {
         runtime.set_launcher_table(launcher_rows);
         runtime.set_hostnames(authority.hostnames());
@@ -1232,7 +1237,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x262639e0cf496779;
+    const AUTHORITY_FINGERPRINT: u64 = 0x1d56438736d35d3e;
     const AUTH_SYS_FINGERPRINT: u64 = 0xb64878d738ec4031;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");

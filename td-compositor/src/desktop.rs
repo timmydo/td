@@ -16,6 +16,10 @@ pub(crate) fn error(e: impl std::fmt::Display) -> String {
 #[derive(Default)]
 pub(crate) struct Seat {
     clock: std::sync::OnceLock<Instant>,
+    pub launcher: Option<crate::launcher::Launcher>,
+    pub authority: Option<crate::authority::DesktopPrograms>,
+    pub menu_keys: [u64; 4],
+    pub menu_buttons: u8,
     pub attached: bool,
     pub paused: bool,
     pub protected: usize,

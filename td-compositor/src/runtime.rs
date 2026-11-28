@@ -4878,11 +4878,20 @@ impl Runtime {
         self.desktop.protected = self.desktop.protected.saturating_sub(1);
     }
 
+    pub(crate) fn set_desktop_launcher(
+        &mut self,
+        launcher: Option<crate::authority::DesktopPrograms>,
+    ) {
+        self.desktop.authority = launcher;
+    }
+
     pub(crate) fn attach_desktop(&mut self) -> bool {
         if self.desktop.attached {
             return false;
         }
         self.desktop.paused = false;
+        self.desktop.menu_keys = [0; 4];
+        self.desktop.menu_buttons = 0;
         self.desktop.attached = true;
         true
     }
@@ -4916,6 +4925,10 @@ impl Runtime {
             crate::allocation::filled(width * height * 4, 0u8).map_err(crate::desktop::error)?;
         self.scene
             .render_screenshot(&mut pixels, width, height, width * 4);
+        if let Some(launcher) = &self.desktop.launcher {
+            self.scene
+                .paint_desktop_launcher(launcher, &mut pixels, width, height);
+        }
         Ok(Some(crate::desktop::Image {
             width: w,
             height: h,
@@ -4925,10 +4938,94 @@ impl Runtime {
     }
 
     pub(crate) fn desktop_snapshot(&self) -> Result<u64, String> {
-        if !self.desktop_available() || self.keyboard_target().is_none() {
+        if !self.desktop_available()
+            || self.desktop.launcher.is_some()
+            || self.keyboard_target().is_none()
+        {
             return Err(crate::desktop::error("no ordinary desktop focus"));
         }
         Ok(self.vm_revision)
+    }
+
+    fn desktop_menu_action(
+        &mut self,
+        action: LauncherAction,
+    ) -> crate::desktop_wire::Reply<'static> {
+        use crate::desktop_wire::Reply;
+        let Some(menu) = &mut self.desktop.launcher else {
+            return Reply::Unavailable;
+        };
+        let program = menu.apply(action).and_then(LaunchRequest::desktop_program);
+        if !menu.visible() {
+            self.desktop.launcher = None;
+        }
+        if let Some(program) = program {
+            if !self
+                .desktop
+                .authority
+                .as_ref()
+                .is_some_and(|authority| authority.start(program))
+            {
+                return Reply::Unavailable;
+            }
+        }
+        Reply::Applied
+    }
+
+    fn desktop_menu_key(
+        &mut self,
+        code: u16,
+        down: bool,
+    ) -> Result<Option<crate::desktop_wire::Reply<'static>>, String> {
+        use crate::desktop::Seat;
+        use crate::desktop_wire::Reply;
+        let key = u32::from(code);
+        if Seat::held(&self.desktop.menu_keys, key) {
+            Seat::set(&mut self.desktop.menu_keys, key, down);
+            return Ok(Some(Reply::Applied));
+        }
+        if !down || code >= 256 || (self.desktop.launcher.is_none() && code != 66) {
+            return Ok(None);
+        }
+        if self.desktop.launcher.is_none() {
+            let buttons = self.desktop.buttons | self.desktop.menu_buttons;
+            self.release_desktop_input()?;
+            self.desktop.menu_buttons = buttons;
+            self.bump_vm_revision()?;
+            self.desktop.launcher =
+                Some(crate::launcher::Launcher::remote().map_err(|_| String::new())?);
+        } else {
+            Seat::set(&mut self.desktop.menu_keys, key, true);
+            match code {
+                2..=10 => {
+                    self.desktop.launcher = None;
+                    self.switch_workspace((code - 1) as u8)?;
+                }
+                105 | 106 => {
+                    self.desktop.launcher = None;
+                    self.command(Command::Focus(if code == 105 {
+                        Direction::Left
+                    } else {
+                        Direction::Right
+                    }))?;
+                }
+                _ => {
+                    let action = match code {
+                        1 | 66 => Some(LauncherAction::Close),
+                        28 | 96 => Some(LauncherAction::Activate),
+                        108 => Some(LauncherAction::Next),
+                        103 => Some(LauncherAction::Previous),
+                        14 => Some(LauncherAction::Backspace),
+                        _ => crate::input::launcher_character(code).map(LauncherAction::Insert),
+                    };
+                    if let Some(action) = action {
+                        return Ok(Some(self.desktop_menu_action(action)));
+                    }
+                }
+            }
+        }
+        Seat::set(&mut self.desktop.menu_keys, key, true);
+        Ok(Some(Reply::Applied))
     }
 
     fn desktop_key(&mut self, code: u16, down: bool) -> Result<(), String> {
@@ -5033,6 +5130,9 @@ impl Runtime {
     }
 
     fn release_desktop_input(&mut self) -> Result<(), String> {
+        self.desktop.launcher = None;
+        self.desktop.menu_keys = [0; 4];
+        self.desktop.menu_buttons = 0;
         for code in 1..256u16 {
             if crate::desktop::Seat::held(&self.desktop.remote_keys, u32::from(code)) {
                 self.desktop_key(code, false)?;
@@ -5063,6 +5163,11 @@ impl Runtime {
             return Ok(Reply::Unavailable);
         }
         self.refresh_focus()?;
+        if let Request::Key { code, down } = req {
+            if let Some(reply) = self.desktop_menu_key(code, down)? {
+                return Ok(reply);
+            }
+        }
         match req {
             Request::Key { code, down }
                 if (1..256).contains(&code)
@@ -5084,6 +5189,21 @@ impl Runtime {
                 }
                 if self.desktop.physical_buttons != 0 || self.dragging.is_some() {
                     return Ok(Reply::Unavailable);
+                }
+                if self.desktop.launcher.is_some() || self.desktop.menu_buttons != 0 {
+                    if let Request::Pointer { buttons, .. } = req {
+                        let pressed = buttons & !self.desktop.menu_buttons & 1 != 0;
+                        self.desktop.menu_buttons = buttons;
+                        if pressed {
+                            let action = self.desktop.launcher.as_ref().and_then(|menu| {
+                                menu.press_at(usize::from(at.x), usize::from(at.y), w, h)
+                            });
+                            if let Some(action) = action {
+                                return Ok(self.desktop_menu_action(action));
+                            }
+                        }
+                    }
+                    return Ok(Reply::Applied);
                 }
                 let x = Fraction {
                     numerator: u32::from(at.x),
@@ -18188,6 +18308,43 @@ mod tests {
             assert!(!runtime.session_locked(), "{state:02x?}");
             assert!(*frames.lock().unwrap() == [ordinary()], "{state:02x?}");
         }
+    }
+
+    #[test]
+    fn viewer_navigates_an_empty_workspace_behind_the_lock() {
+        use crate::desktop_wire::{Reply, Request};
+        let (mut rt, frames) = recorded(true);
+        let enrolled = login(&[1, 1, 7, 7, 7, 7]).current().unwrap();
+        rt.first_paint(Some(&enrolled), None).unwrap();
+        assert!(rt.attach_desktop());
+        let empty = rt.desktop_image().unwrap().unwrap().pixels;
+        let tap = |rt: &mut Runtime, code| {
+            for down in [true, false] {
+                assert_eq!(
+                    rt.desktop_input(Request::Key { code, down }).unwrap(),
+                    Reply::Applied
+                );
+            }
+        };
+        tap(&mut rt, 66);
+        assert_ne!(rt.desktop_image().unwrap().unwrap().pixels, empty);
+        tap(&mut rt, 3);
+        assert_eq!(rt.control_snapshot().active_workspace, 2);
+        assert!(rt.desktop.launcher.is_none());
+        tap(&mut rt, 66);
+        rt.protect_desktop().unwrap();
+        assert!(rt.desktop.launcher.is_none());
+        assert_eq!(
+            rt.desktop_input(Request::Key {
+                code: 66,
+                down: true
+            })
+            .unwrap(),
+            Reply::Unavailable
+        );
+        rt.detach_desktop().unwrap();
+        let lock = lock_surface(Some(&enrolled));
+        assert!(frames.lock().unwrap().iter().all(|frame| frame == &lock));
     }
 
     /// Every generation relocks on the same rule: a restarted compositor

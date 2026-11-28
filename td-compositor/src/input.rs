@@ -3388,7 +3388,7 @@ fn pin_byte(code: u16, shift: bool) -> Option<u8> {
         .map(|(_, plain, shifted)| if shift { *shifted } else { *plain })
 }
 
-fn launcher_character(code: u16) -> Option<char> {
+pub(crate) fn launcher_character(code: u16) -> Option<char> {
     match code {
         KEY_A => Some('a'),
         KEY_B => Some('b'),

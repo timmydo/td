@@ -8387,3 +8387,10 @@ publisher policy. `td-update/ADMIN.md` owns both recovery operations.
 The shared td-authd channel module also contains the root workspace
 intake's fixed `POLLRDHUP` lifetime check (UNSAFE.md §16). The compositor
 never calls it; its own authority-channel operations are unchanged.
+
+## Remote application navigation
+
+`REMOTE-DESKTOP.md` specifies the viewer’s F8 launcher, ordinary program
+allowlist and workspace controls. Its card belongs to the remote input
+seat and is drawn into remote frames. Physical scanout and secure attention
+continue through the local presentation path.

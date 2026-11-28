@@ -66,6 +66,14 @@ pub enum LaunchRequest {
 }
 
 impl LaunchRequest {
+    pub(crate) fn desktop_program(self) -> Option<crate::authority::Program> {
+        match self {
+            Self::Terminal => Some(crate::authority::Program::Home),
+            Self::Editor | Self::Photo | Self::Dua => self.authority_program(),
+            _ => None,
+        }
+    }
+
     /// The fixed authority program a request names, when it names one the
     /// authority starts as the human: the desktop programs the image ships.
     fn authority_program(self) -> Option<crate::authority::Program> {
@@ -288,6 +296,7 @@ pub struct Launcher {
     applications: Vec<Application>,
     sandbox_listing: Option<crate::authority::SandboxListing>,
     listing_seen: bool,
+    remote: bool,
     authority: bool,
 }
 
@@ -412,19 +421,36 @@ impl LaunchOptions {
 
 impl Launcher {
     pub fn new() -> Launcher {
-        let mut launcher = Launcher {
+        let mut launcher =
+            Self::with_storage(String::with_capacity(filter::MAX_QUERY_BYTES), Vec::new());
+        launcher.refresh_matches();
+        launcher
+    }
+
+    fn with_storage(query: String, matches: Vec<Item>) -> Self {
+        Self {
             visible: false,
             selected: 0,
             scroll: 0,
-            query: String::with_capacity(filter::MAX_QUERY_BYTES),
-            matches: Vec::new(),
+            query,
+            matches,
             applications: Vec::new(),
             sandbox_listing: None,
             listing_seen: false,
+            remote: false,
             authority: false,
-        };
-        launcher.refresh_matches();
-        launcher
+        }
+    }
+
+    pub(crate) fn remote() -> Result<Self, crate::allocation::Error> {
+        let mut query = String::new();
+        crate::allocation::reserve_string(&mut query, filter::MAX_QUERY_BYTES)?;
+        let matches = crate::allocation::with_capacity(fixed_count(true))?;
+        let mut launcher = Self::with_storage(query, matches);
+        launcher.remote = true;
+        launcher.authority = true;
+        launcher.apply(LauncherAction::Open);
+        Ok(launcher)
     }
 
     /// Whether the desktop programs can be started: the paired authority
@@ -622,8 +648,15 @@ impl Launcher {
             return;
         }
         for index in 0..fixed_count(self.authority) {
-            if fixed_entry(self.authority, index).is_some_and(|e| filter::matches(e.search, query))
-            {
+            if fixed_entry(self.authority, index).is_some_and(|entry| {
+                (!self.remote
+                    || entry.request.is_none()
+                    || entry
+                        .request
+                        .and_then(LaunchRequest::desktop_program)
+                        .is_some())
+                    && filter::matches(entry.search, query)
+            }) {
                 self.matches.push(Item::Fixed(index));
             }
         }
@@ -721,6 +754,8 @@ impl Launcher {
             (left.saturating_add(20), top.saturating_add(18)),
             if self.sandbox_listing.is_some() {
                 "SELECT SANDBOX"
+            } else if self.remote {
+                "REMOTE APPS   1-9: WORKSPACE"
             } else {
                 "TD LAUNCHER"
             },
@@ -1817,6 +1852,29 @@ mod authority_entry_tests {
         launcher.set_table(&image());
         launcher.set_installed(|name| Some(installed.contains(&name)));
         launcher
+    }
+
+    #[test]
+    fn remote_card_lists_only_ordinary_programs() {
+        let mut card = Launcher::remote().unwrap();
+        assert_eq!(
+            card.matched_labels(),
+            [
+                "NEW TERMINAL",
+                "TEXT EDITOR",
+                "PHOTOS",
+                "DISK USAGE",
+                "CLOSE LAUNCHER"
+            ]
+        );
+        for c in "editor".chars() {
+            card.apply(LauncherAction::Insert(c));
+        }
+        assert_eq!(
+            card.apply(LauncherAction::Activate),
+            Some(LaunchRequest::Editor)
+        );
+        assert!(LaunchRequest::Notebook.desktop_program().is_none());
     }
 
     const FIXED: &[&str] = &[
