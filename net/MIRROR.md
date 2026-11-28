@@ -98,9 +98,10 @@ own one-hour deadline. `s3 put` refuses keys under `sources/`.
 
 ## Retention
 
-Each publish records the digests it mirrored and then deletes every
-`sources/` object that none of the releases it still lists pins
-(`OPERATIONS.md`, "Storage retention"). A branch's pin that no listed
+Each publish records the digests it mirrored in the bucket's ISO catalog
+and then deletes every `sources/` object that none of the releases the
+catalog still lists pins (`release retire-s3`; `OPERATIONS.md`, "Storage
+retention"). A branch's pin that no listed
 release names is fetched upstream:
 
 ```text

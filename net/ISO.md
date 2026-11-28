@@ -52,11 +52,11 @@ matches the record's length and SHA-256, with `If-Match` on the observed
 ETag. Without both flags it only reports `would-delete` or `absent`. An
 absent file counts as retired, so a rerun after a lost reply succeeds.
 Roots are never deleted. A record that no longer verifies (an expired
-legacy root) cannot be retired this way. Remove the entry from the
-listing first: the page must not link to deleted files. The image key
+legacy root) cannot be retired this way. Unlist the entry first
+(`unlist-iso-s3`, below): the page must not link to deleted files. The image key
 is the ISO's digest and basename, so the same image signed under two
 roots or profiles shares it: retiring one record deletes the image the
-other still lists. `./publish` never retires a row whose basename a
+other still lists. `retire-s3` never deletes for a row whose image key a
 listed row still names.
 
 Private keys must be owned regular files with no group/other permissions.
@@ -96,44 +96,101 @@ issue times and expiry before and after hashing.
 
 ## Download listing
 
-`iso-index` generates a standalone `index.html`, styled like `www/`, from an
-explicit UTF-8 catalog. It does not scan a bucket or infer releases from file
-names. The catalog begins with `td-iso-catalog-v1`; every following line has
-four tab-separated fields: public root path, profile, signature path, ISO
-path. Paths are relative to the catalog's directory unless absolute. No blank
-rows, comments or control characters are allowed. The maximum is 128 entries
-and one MiB of catalog text. A header-only catalog produces an empty listing.
+The bucket holds the listing's source: an explicit catalog at
+`publisher/iso-catalog`, which every publisher continues, so no host keeps
+its own. It is UTF-8 text beginning with `td-iso-catalog-v2`; every
+following line has five tab-separated fields: `listed` or `retired`, root
+epoch, profile, the signature record's SHA-256 (its key is
+`iso/signatures/SHA256.sig`), and the SHA-256 of the release's
+source-digest record at `publisher/source-digests/SHA256`, or `-` for a
+release published before records existed. Listed rows keep publication
+order, which retention counts by; a signature appears at most once; no
+blank rows, comments or other fields are allowed; and the text is at most
+one MiB and 1024 rows. The catalog is public, like every other key, and is
+written with `no-store`, only on the ETag it was read at (`If-None-Match:
+*` when absent), so a concurrent publisher's change refuses rather than
+being overwritten.
 
 ```text
-td-net release iso-index CATALOG index.html
-td-net release upload-iso-index-s3 CATALOG index.html ENDPOINT auto td-releases CREDENTIALS PROFILE --dry-run
+td-net release list-iso-s3 ROOT PROFILE SIGNATURE ISO DIGESTS RETAIN OUTPUT ENDPOINT auto td-releases CREDENTIALS PROFILE [--check]
+td-net release retire-s3 ROOT OUTPUT ENDPOINT auto td-releases CREDENTIALS PROFILE [--delete --exclusive-publisher]
+td-net release import-iso-catalog-s3 ROOT CATALOG RETIRED OUTPUT ENDPOINT auto td-releases CREDENTIALS PROFILE
+td-net release unlist-iso-s3 ROOT OUTPUT ENDPOINT auto td-releases CREDENTIALS PROFILE SIGNATURE_SHA256...
 ```
 
-Both commands verify the complete local ISO bytes, signatures and root policy.
-Invalid or missing entries, and expired legacy entries, refuse the entire
-operation. Non-expiring entries display "No expiry". Retire obsolete entries
-explicitly in the catalog (`./publish` keeps its newest `retain`); no
-recurring signature renewal is needed.
-For one ISO/profile select one signature; duplicate entries and conflicting
-roots for one epoch refuse. Multiple root epochs and profiles are supported.
-Keep the complete catalog: uploading it replaces the listing, it does not
-merge it with the previous page. Entries sort by profile, then descending signed
-issue time, with filename and digest breaking ties deterministically. The first
-entry per profile is featured as the latest listed release; remaining entries
-appear under a collapsed, keyboard-accessible Previous versions disclosure.
-Each entry shows its signed publication time. This ordering describes the
-catalog, not freshness beyond it or source ancestry.
+`list-iso-s3` verifies the local ISO against its signature under ROOT and
+the digest record's header, count and digests, then reads the catalog. It
+lists the signature after the listed rows unless it is listed already (a
+retry), moving a retired copy back to the end, and then keeps the newest
+RETAIN (1 to 128) listed rows of each profile, marking older ones
+`retired`; the release being listed must be among those kept. Each other
+listed row's signature record is fetched and verified under its epoch's
+root, whose chain from epoch one ends at ROOT (`pull-s3`'s chain, so the
+bucket must not hold a newer epoch), and its image must be present with
+the record's length and SHA-256 upload metadata. The page is then
+rendered from those entries and this release's: legacy entries that have
+expired, a missing record or image, one image listed twice for a profile
+(the same image signed again while its earlier row is kept: unlist one)
+and a page over its bounds refuse the whole operation. With `--check` it
+stops there and writes nothing, so a refusal comes before promotion.
+Otherwise it uploads the ISO, root, signature and digest record
+(immutable, as `upload-iso-s3` does), reads the page's ETag, writes the
+catalog and then `index.html` on that ETag, with `Content-Type:
+text/html; charset=utf-8` and `Cache-Control: no-store`. A page another
+host wrote since the catalog was read therefore refuses this one, rather
+than being replaced by a page of an older catalog; rerun. The page is a
+function of the catalog, so a lost page write is rebuilt by rerunning.
+OUTPUT, a protected directory, receives the catalog and page as written.
+No signing key is needed.
 
-The upload command writes the local preview even in dry-run but makes no
-network requests in that mode. Without dry-run it uploads/reuses every listed
-ISO, root and signature before publishing `index.html` last, with
-`Content-Type: text/html; charset=utf-8` and `Cache-Control: no-store`.
-Publication uses the original page's ETag (or absence) as a write condition;
-a concurrent change refuses unless exact readback equals the intended page.
-A failed operation may leave reusable immutable files, but does not publish
-an incomplete listing. This command deletes no remote files. No signing key
-is needed.
-Local inputs and output directories must remain stable during the command.
+`unlist-iso-s3` marks the rows named by their signature records' SHA-256
+`retired` in one write and republishes the page without them, whether or
+not their records still verify; name every broken row at once, since the
+rest must verify. It withdraws a bad installer, resolves a listed row that
+no longer verifies (an expired legacy record, an image removed by hand)
+and so blocks every listing, and makes room for an image signed again.
+`retire-s3` then deletes its files.
+
+`retire-s3` reads the catalog and, for each retired row, deletes the image
+and then the signature record (`retire-iso-s3`'s rule, with the same
+metadata and `If-Match` checks), or only drops the row when a listed row
+names the same image key (one image signed twice; its signature record
+stays, unreferenced). A row whose record is already gone is finished,
+since the image goes first. Before each deletion it rereads the catalog
+and stops if another host changed it. It then writes the catalog without
+the finished rows and, only once the bucket holds exactly that catalog,
+deletes every `sources/` digest no listed row's digest record pins (`s3
+sources-gc`, `MIRROR.md`); until every listed row has a record, that
+waits and says so. Without `--delete --exclusive-publisher` it only
+reports what it would delete. A failure leaves its row retired for the
+next run and exits non-zero.
+
+`import-iso-catalog-s3` seeds a bucket that holds no catalog from a host's
+pre-bucket `td-iso-catalog-v1` file: four tab-separated fields per row
+(public root path, profile, signature path, ISO path, relative to the
+file's directory unless absolute), with the pending rows of RETIRED
+(`td-iso-retired-v1`, the same fields; a missing file is none) as retired
+rows and the `source-digests` record beside each listed ISO uploaded as its
+digest record. Each listed row's root must be the bucket chain's root for
+its epoch and its record must verify. The last listed row, if the bucket
+lacks it (a publish interrupted before its upload), is uploaded from its
+local ISO; an earlier one the bucket lacks refuses, as a stale file. A pending
+row that cannot be read or verified is skipped with a message, leaving its
+files to delete by hand. After the catalog is written, both files are set
+aside as `NAME.imported`, so they are never read again. A header-only file
+seeds an empty catalog, which is how a new publisher starts. Where the
+bucket already holds a catalog, a local file whose listed signatures it
+holds is set aside, and one it does not cover refuses: another host
+imported first ([OPERATIONS.md](OPERATIONS.md#per-user-setup) says how to
+recover). With no bucket catalog and no local file it refuses.
+
+Entries sort by profile, then descending signed issue time, with filename
+and digest breaking ties deterministically. The first entry per profile is
+featured as the latest listed release; remaining entries appear under a
+collapsed, keyboard-accessible Previous versions disclosure. Each entry
+shows its signed publication time and "No expiry" for non-expiring
+records; no recurring signature renewal is needed. This ordering describes
+the catalog, not freshness beyond it or source ancestry.
 
 Configure the public serving layer to rewrite `/` to `/index.html`, preserve
 all other paths, and honor the cache header. Links are root-relative. The
@@ -143,6 +200,6 @@ colors, typography and layout follow `www/style.css`; its assets live under
 
 The page is unsigned navigation, not a release trust anchor or latest-release
 proof. It displays signature expiry in UTC, but cannot remove entries as time
-passes. Regenerate and publish after catalog changes; clients still verify
-against an independently trusted root and current time. This command does
-not publish system-update heads or change their trust rules.
+passes. Clients still verify against an independently trusted root and
+current time. These commands do not publish system-update heads or change
+their trust rules.

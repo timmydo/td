@@ -10,7 +10,7 @@
 )]
 
 pub(crate) mod inventory;
-mod sources;
+pub(crate) mod sources;
 #[cfg(test)]
 pub(crate) mod tests;
 mod website;
@@ -443,7 +443,9 @@ impl Client {
         }
         Ok(Some(Remote { bytes, etag }))
     }
-    fn matches(&self, key: &str, digest: &str, size: u64, cache: &str) -> Result<bool> {
+    /// Whether `key` holds an object with this length, SHA-256 metadata and
+    /// cache policy; another object there refuses.
+    pub(crate) fn matches(&self, key: &str, digest: &str, size: u64, cache: &str) -> Result<bool> {
         let response = self.request("HEAD", key, &hash(b""), &[], None)?;
         match response.status().as_u16() {
             404 => Ok(false),
@@ -528,6 +530,24 @@ impl Client {
             previous,
             "text/html; charset=utf-8",
             1024 * 1024,
+        )
+    }
+    /// A small publisher record replaced only on its observed ETag.
+    pub(crate) fn state(
+        &self,
+        key: &str,
+        file: &mut File,
+        bytes: &[u8],
+        previous: Option<&Remote>,
+        limit: u64,
+    ) -> Result<()> {
+        self.mutable(
+            key,
+            file,
+            bytes,
+            previous,
+            "text/plain; charset=utf-8",
+            limit,
         )
     }
     fn mutable(
@@ -675,6 +695,9 @@ fn command(args: &[String]) -> Result<()> {
         Some("heads" | "roots" | "releases" | "objects")
     ) {
         return Err("use release upload-s3 for reserved release keys".into());
+    }
+    if key.split('/').next() == Some("publisher") {
+        return Err("use release list-iso-s3 for the publisher's keys".into());
     }
     if key.split('/').next() == Some("sources") {
         return Err("use s3 sources for the source mirror's keys".into());

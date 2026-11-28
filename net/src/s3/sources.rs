@@ -85,6 +85,19 @@ pub(super) fn collect(keep: &Path, bucket: &Bucket<'_>, delete: bool) -> Result<
         bucket.credentials,
         bucket.profile,
     )?;
+    collect_keep(&keep, &client, delete)
+}
+
+/// Delete every mirrored digest `keep` does not name (or, without
+/// `delete`, only plan it), refusing a keep set naming nothing mirrored.
+pub(crate) fn collect_keep(
+    keep: &std::collections::BTreeSet<&str>,
+    client: &Client,
+    delete: bool,
+) -> Result<()> {
+    if keep.is_empty() {
+        return Err("an empty keep list would delete the whole source mirror".into());
+    }
     // Plan the whole pass first: a keep list naming none of what is mirrored
     // belongs to some other bucket or roster, and deletes nothing.
     let remote = client.digest_keys("sources")?;
