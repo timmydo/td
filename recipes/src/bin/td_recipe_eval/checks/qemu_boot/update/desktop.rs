@@ -1,5 +1,7 @@
 //! The installed viewer and helper share an enrolled guest's ordinary session.
 //! QMP observes the physical output independently of either desktop stream.
+mod clipboard;
+
 use super::super as boot;
 use super::{Guest, Options, Result};
 use crate::check_runner::RecipeCheckRunner;
@@ -202,7 +204,7 @@ impl<'a> Login<'a> {
 
 struct Viewer {
     process: Process,
-    _compositor: Process,
+    compositor: Process,
     control: PathBuf,
     session: String,
     serial: u64,
@@ -242,8 +244,19 @@ impl Viewer {
                 .transpose()
                 .map_err(no_storage)?)
         })?;
+        Ok(Self {
+            process: Self::connect(login, viewer)?,
+            compositor: comp,
+            control: child(work, "v/td-control")?,
+            session,
+            serial: 0,
+        })
+    }
+
+    fn connect(login: &Login, viewer: &Path) -> Result<Process> {
+        let work = login.work;
         let path = child(work, "bin")?;
-        let process = Process::start(
+        Process::start(
             Command::new(viewer)
                 .current_dir(work)
                 .arg("desktop-oracle")
@@ -254,18 +267,11 @@ impl Viewer {
                 .env("WAYLAND_DISPLAY", "/proc/self/cwd/v/wayland-0")
                 .env("XDG_RUNTIME_DIR", work)
                 .stdin(Stdio::null()),
-        )?;
-        Ok(Self {
-            process,
-            _compositor: comp,
-            control: child(work, "v/td-control")?,
-            session,
-            serial: 0,
-        })
+        )
     }
 
     fn request(&mut self, command: &str) -> Result<Vec<u8>> {
-        self.process.alive()?;
+        self.compositor.alive()?;
         let mut socket = UnixStream::connect(&self.control).map_err(error)?;
         socket.set_read_timeout(Some(WAIT)).map_err(error)?;
         socket.set_write_timeout(Some(WAIT)).map_err(error)?;
@@ -288,6 +294,41 @@ impl Viewer {
         )
         .map(|_| ())
     }
+    fn pointer(&mut self, x: usize, y: usize, held: bool) -> Result<()> {
+        self.serial += 1;
+        self.request(
+            &allocation::format(format_args!(
+                "pointer {} {} {x} {y} {} 0 0",
+                self.session,
+                self.serial,
+                u8::from(held)
+            ))
+            .map_err(no_storage)?,
+        )
+        .map(|_| ())
+    }
+
+    fn ctrl(&mut self, code: u16) -> Result<()> {
+        self.key(29, true)?;
+        self.tap(code)?;
+        self.key(29, false)
+    }
+
+    fn focused(&mut self, app: &str) -> Result<()> {
+        wait(app, || {
+            self.process.alive()?;
+            let layout = String::from_utf8(self.request("layout")?).map_err(error)?;
+            Ok(layout
+                .lines()
+                .any(|line| {
+                    line.split_ascii_whitespace()
+                        .any(|s| s.strip_prefix("app_id=") == Some(app))
+                        && line.contains("focused=true")
+                })
+                .then_some(()))
+        })
+    }
+
     fn tap(&mut self, code: u16) -> Result<()> {
         self.key(code, true)?;
         self.key(code, false)
@@ -383,7 +424,8 @@ echo TD-DESKTOP-HOME-READY
         0,
         deadline,
         overlay,
-        "rdinit=/desktop-provision panic=1",
+        // Filesystem info messages can split the serial success marker.
+        "rdinit=/desktop-provision panic=1 quiet",
         "user,id=net0,restrict=on",
     )?;
     options.selector = original;
@@ -396,7 +438,7 @@ echo TD-DESKTOP-HOME-READY
     Ok(())
 }
 
-pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<()> {
+pub(crate) fn run(runner: &RecipeCheckRunner, installed_viewer: Option<&Path>) -> Result<()> {
     let accel = match crate::checks::accel::headless_from_env()?.names {
         ["kvm"] => "kvm",
         ["tcg"] => "tcg",
@@ -405,7 +447,15 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<()> {
     let (kernel, template, deployment) = boot::build_system(runner)?;
     let (mkfs, btrfs) = boot::build_btrfs_tools(runner)?;
     let compositor = binary(runner, "td-compositor")?;
-    let viewer = binary(runner, "td-desktop")?;
+    let built_viewer;
+    let viewer = match installed_viewer {
+        Some(path) => path,
+        None => {
+            built_viewer = binary(runner, "td-desktop")?;
+            &built_viewer
+        }
+    };
+    let host_editor = binary(runner, "td-editor")?;
     let owned =
         boot::release_delivery::fixture_temp::TempDir::new("td-desktop-oracle").map_err(error)?;
     let work = owned.path();
@@ -470,7 +520,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<()> {
         deadline,
     )?);
     lock(&mut guest, work)?;
-    let mut view = Viewer::start(&login, &compositor, &viewer)?;
+    let mut view = Viewer::start(&login, &compositor, viewer)?;
     // The empty ordinary scene has a BGRX ground of 30 25 20; sample
     // the viewer's RGB capture before sending the first shortcut.
     wait(
@@ -518,12 +568,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<()> {
     wait("typed word rendered in viewer", || {
         Ok((changed_columns(&editor, &view.capture()?) >= 12).then_some(()))
     })?;
-    view.key(29, true)?;
-    view.tap(31)?;
-    view.key(29, false)?; // Save As
-    view.key(29, true)?;
-    view.tap(22)?;
-    view.key(29, false)?; // Clear the path field.
+    view.ctrl(31)?; // Save As
+    view.ctrl(22)?; // Clear the path field.
     view.text("/var/home/tester/viewer")?;
     view.tap(28)?;
     wait("remote-only text saved by the editor", || {
@@ -532,6 +578,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<()> {
             .filter(|s| s == "tdedit"))
     })?;
     lock(&mut guest, work)?;
+    clipboard::exercise(&mut view, &login, viewer, &host_editor, &mut guest)?;
     guest.key(&["ctrl", "alt", "esc"])?;
     wait("viewer paused for physical secure attention", || {
         Ok(String::from_utf8(view.request("layout")?)

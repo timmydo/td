@@ -18416,7 +18416,21 @@ mod tests {
         );
         assert!(rt.desktop_snapshot().is_err());
         rt.attention(&origin, false).unwrap();
+        // Detach while the client owns a drag. Inspect the seat before a new
+        // viewer can send a buttonless pointer report and clear the grab.
+        rt.desktop_input(Request::Pointer {
+            at: Position {
+                output: image.output,
+                x: 40,
+                y: 60,
+            },
+            buttons: 1,
+        })
+        .unwrap();
+        assert_eq!(rt.pointer.grab_surface(), Some(key));
         rt.detach_desktop().unwrap();
+        assert_eq!(rt.desktop.buttons, 0);
+        assert_eq!(rt.pointer.grab_surface(), None);
         assert!(rt.session_locked());
         assert_eq!(rt.keyboard_snapshot().focus, None);
         assert_eq!(

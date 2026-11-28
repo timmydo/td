@@ -789,7 +789,13 @@ const ORACLES: &[(&str, &[&str])] = &[
     ),
     (
         "qemu-remote-desktop",
-        &["system-x86-64", "td-btrfs", "td-desktop", "td-compositor"],
+        &[
+            "system-x86-64",
+            "td-btrfs",
+            "td-desktop",
+            "td-compositor",
+            "td-editor",
+        ],
     ),
     ("qemu-deploy-rollback", &["system-x86-64", "td-btrfs"]),
     (
@@ -969,7 +975,7 @@ pub fn qemu_deploy_rollback_cli(args: &[String]) -> Result<(), String> {
 /// lock, then `run`.
 fn system_oracle(
     name: &str,
-    run: fn(&RecipeCheckRunner) -> Result<(), String>,
+    run: impl FnOnce(&RecipeCheckRunner) -> Result<(), String>,
 ) -> Result<(), String> {
     let targets = oracle_targets(name)?;
     ensure_targets_provenance(targets)?;
@@ -984,14 +990,15 @@ fn system_oracle(
 }
 
 pub fn qemu_remote_desktop_cli(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err("usage: qemu-remote-desktop".into());
-    }
+    let viewer = match args {
+        [] => None,
+        [path] if Path::new(path).is_absolute() => Some(Path::new(path)),
+        _ => return Err("usage: qemu-remote-desktop [/absolute/path/to/td-desktop]".into()),
+    };
     oracle_host(false)?;
-    system_oracle(
-        "qemu-remote-desktop",
-        crate::checks::qemu_boot::update::desktop::run,
-    )
+    system_oracle("qemu-remote-desktop", |runner| {
+        crate::checks::qemu_boot::update::desktop::run(runner, viewer)
+    })
 }
 
 pub fn qemu_admin_update_cli(args: &[String]) -> Result<(), String> {

@@ -90,7 +90,17 @@ and host-key errors through the existing td-remote error path.
 The integration tier runs `td-recipe-eval qemu-remote-desktop` against the
 installed system. It provisions a disposable enrolled guest and SSH keys,
 drives the native viewer on a separate headless compositor, and inspects
-guest scanout through QMP.
+guest scanout through QMP. A second editor on the viewer machine supplies
+and receives multiline text through its Wayland clipboard. The test checks
+the saved files on both machines, disconnects with the pointer button held,
+and checks the selection after reconnecting.
+
+To exercise the foreign-distro build, run `./install-apps` on the Wayland
+host and pass the installed viewer to the same test.
+
+```sh
+td-recipe-eval qemu-remote-desktop "$HOME/.local/bin/td-desktop"
+```
 
 - Boot an enrolled guest to its lock screen. Open the viewer over real SSH
   without local interaction. Type a fresh marker into an ordinary terminal
