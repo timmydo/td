@@ -16,8 +16,10 @@ A page made, laid out and painted, and the places over it:
 - `pipeline`, `page`, `fonts`: parsed, cascaded and laid out by
   td-layout over td-ui's faces, stepping down the cuts' ladder on a
   refusal, and laid out again for a new viewport, scale, face or styles;
-- `inline`, `memory`: the pictures a layout lays, and the terms a page is
-  made in;
+- `inline`, `memory`: the pictures a layout lays, each at its density,
+  and the terms a page is made in;
+- `sources`: an `img`'s `srcset` parsed and one candidate chosen for an
+  environment, parsing and choosing only;
 - `paint`: a layout painted into a td-ui raster, bounded;
 - `text`, `search`, `view`: places, text, find, selection, links and
   scrolling over a layout.
@@ -72,6 +74,11 @@ jail, with td-mail's head as a text page above it, its links taken in
 the pane and opened outside it. The pictures its `cid:` URLs name
 among the message's own parts are decoded through td-picture at
 td-mail's limits and laid by `pipeline::again` with an `inline::Set`,
-as td-web lays a page's. Each further use is its own amendment, and
-the one that makes a rule here caller-neutral moves that rule from
-td-web/DESIGN.md to this file.
+as td-web lays a page's. td-mail reads an `img`'s `src` alone
+(`tree::Tree::src`), never calling `sources`: an `img` with only a
+`srcset` is in `Tree::pictures` but lays no picture there. It still
+takes one of the tree's `MAX_PICTURES` (128) places, so that many
+`srcset`-only `img`s before a `cid:` one leave it unlaid, as that many
+`src`s would: only a sender degrading their own message meets it. Each
+further use is its own amendment, and the one that makes a rule here
+caller-neutral moves that rule from td-web/DESIGN.md to this file.

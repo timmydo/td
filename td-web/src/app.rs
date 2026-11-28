@@ -1084,7 +1084,9 @@ impl App {
     }
 
     /// The pictures of the page just shown, to be fetched as slots free:
-    /// a markup page's, laid with its own sheets or the user agent's.
+    /// a markup page's, laid with its own sheets or the user agent's, each
+    /// `srcset` candidate chosen here, once, for the environment the page
+    /// is laid for now (DESIGN.md §10, "Subresources").
     fn start_pictures(&mut self) {
         let Some(url) = self.current.doc.url.as_ref() else {
             return;
@@ -1095,6 +1097,9 @@ impl App {
         if page.tree.source() != Source::Markup || page.rung == Rung::Text {
             return;
         }
+        let want = self.want();
+        let environment =
+            td_page::sheets::environment(want.width, want.height, u32::from(want.scale));
         // Refused for memory, the pictures keep their placeholders.
         if let Ok(pictures) = Pictures::new(
             &page.tree,
@@ -1102,6 +1107,7 @@ impl App {
             &page.budget,
             self.pictures_term,
             self.fit_work,
+            &environment,
         ) {
             self.current.pictures = pictures;
         }
@@ -1771,16 +1777,28 @@ impl App {
         Some(td_url::resolve(&base, href.trim()))
     }
 
-    /// Opens an image's `src`, as a click on an image with no link does.
+    /// An image's address as written: the candidate its pictures chose,
+    /// else its `src`.
+    fn image_address(&self, image: NodeId) -> Option<&str> {
+        let laid = self.current.laid()?;
+        let pictures = self.current.pictures.as_ref();
+        let chosen = pictures.and_then(|pictures| pictures.chosen_for(image));
+        chosen
+            .and_then(|chosen| laid.tree().candidate(chosen))
+            .or_else(|| {
+                laid.tree()
+                    .document()
+                    .node(image)?
+                    .element()?
+                    .attribute("src")
+            })
+    }
+
+    /// Opens an image's address, its chosen candidate or its `src`, as a
+    /// click on an image with no link does.
     fn follow_src(&mut self, image: td_html::document::NodeId) {
         let target = (|| {
-            let laid = self.current.laid()?;
-            let src = laid
-                .tree()
-                .document()
-                .node(image)?
-                .element()?
-                .attribute("src")?;
+            let src = self.image_address(image)?;
             let base = self.base()?;
             Some(td_url::resolve(&base, src.trim()))
         })();
@@ -1852,16 +1870,11 @@ impl App {
         unlinked_image(&laid, item)
     }
 
-    /// Where an image in no link opens: its `src`, joined against the
-    /// page's base, or as written when it does not resolve.
+    /// Where an image in no link opens: its chosen candidate or its
+    /// `src`, joined against the page's base, or as written when it does
+    /// not resolve.
     fn src_shown(&self, image: NodeId) -> Option<String> {
-        let laid = self.current.laid()?;
-        let src = laid
-            .tree()
-            .document()
-            .node(image)?
-            .element()?
-            .attribute("src")?;
+        let src = self.image_address(image)?;
         match td_url::resolve(&self.base()?, src.trim()) {
             Ok(Reference::Fetch { url, .. }) => Some(url.text()),
             _ => Some(document::visible(src.trim())),
@@ -7276,6 +7289,202 @@ mod tests {
         slots_free(&app);
     }
 
+    /// An app at `scale` over `table`, its sheets waited for.
+    fn app_at(table: Arc<Table>, scale: u8) -> App {
+        let surface = Surface::new(800, 600, Scale::new(scale).unwrap()).unwrap();
+        let mut app = App::new(table, surface, None).unwrap();
+        app.style_wait = std::time::Duration::from_secs(60);
+        app
+    }
+
+    /// A `srcset` names a picture for each density: only the one chosen
+    /// for the window's scale is asked for, and it is laid at its
+    /// density, the same CSS size at each.
+    #[test]
+    fn a_srcset_picture_asks_only_its_chosen_candidate() {
+        for (scale, want, size) in [
+            (1, "https://example.org/one.png", (4, 2)),
+            (2, "https://example.org/two.png", (8, 4)),
+            (3, "https://example.org/three.png", (12, 6)),
+            // None at 4x: the densest.
+            (4, "https://example.org/three.png", (16, 8)),
+        ] {
+            let table = Arc::new(
+                Table::default()
+                    .page(
+                        "https://example.org/s",
+                        "text/html",
+                        "<body style=margin:0><img src=/one.png alt=q \
+                         srcset='/two.png 2x, /three.png 3x'>",
+                    )
+                    .picture("https://example.org/one.png", &png(4, 2, [255, 0, 0]))
+                    .picture("https://example.org/two.png", &png(8, 4, [0, 255, 0]))
+                    .picture("https://example.org/three.png", &png(12, 6, [0, 0, 255])),
+            );
+            let mut app = app_at(table.clone(), scale);
+            typed(&mut app, "example.org/s");
+            pictured(&mut app);
+            let nodes = picture_nodes(&app);
+            let urls: Vec<_> = asks(&table, ".png")
+                .into_iter()
+                .map(|(url, _)| url)
+                .collect();
+            assert_eq!(urls, [want], "at {scale}");
+            assert_eq!(fits(&app), vec![(nodes[0], size.0, size.1)], "at {scale}");
+            // Opened, or shown in the status row, at its candidate.
+            let img = laid(&app).tree().pictures()[0];
+            assert_eq!(app.src_shown(img).as_deref(), Some(want));
+            assert_eq!(notes(&mut app), "");
+            slots_free(&app);
+        }
+    }
+
+    /// An `img` with a `srcset` and no `src` is a picture, shown in place
+    /// of its alt text.
+    #[test]
+    fn a_srcset_without_src_shows_a_picture() {
+        let table = Arc::new(
+            Table::default()
+                .page(
+                    "https://example.org/n",
+                    "text/html",
+                    "<body style=margin:0><p>top<p><img srcset='/a.png' alt=qqq>",
+                )
+                .picture("https://example.org/a.png", &png(30, 20, [255, 0, 0])),
+        );
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org/n");
+        assert!(glyph_text(&mut app).contains("qqq"));
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app), vec![(nodes[0], 30, 20)]);
+        assert_eq!(glyph_text(&mut app), "top");
+        assert_eq!(images(&mut app).len(), 1);
+        let pixels = window_pixels(&mut app);
+        assert_eq!(
+            pixel(&app, &pixels, picture_point(&app, nodes[0])),
+            [0, 0, 255, 255]
+        );
+        assert_eq!(asks(&table, ".png").len(), 1);
+        let img = laid(&app).tree().pictures()[0];
+        assert_eq!(
+            app.src_shown(img).as_deref(),
+            Some("https://example.org/a.png")
+        );
+        slots_free(&app);
+    }
+
+    /// At scale two a 2x candidate is laid at half its pixels each way,
+    /// so its box is its own size in device pixels: drawn with no copy.
+    #[test]
+    fn a_2x_candidate_at_scale_two_draws_with_no_copy() {
+        let table = Arc::new(
+            Table::default()
+                .page(
+                    "https://example.org/d",
+                    "text/html",
+                    "<body style=margin:0><img src=/a.png srcset='/b.png 2x'>",
+                )
+                .picture("https://example.org/a.png", &png(3, 2, [255, 0, 0]))
+                .picture("https://example.org/b.png", &png(6, 4, [0, 255, 0])),
+        );
+        let mut app = app_at(table, 2);
+        typed(&mut app, "example.org/d");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app), vec![(nodes[0], 6, 4)]);
+        assert_eq!(laid(&app).factor(nodes[0]), Some(1));
+        let pixels = window_pixels(&mut app);
+        let (x, y) = picture_point(&app, nodes[0]);
+        let (left, top) = (x - 3, y - 2);
+        for (x, y) in [(0, 0), (5, 3), (2, 1)] {
+            assert_eq!(
+                pixel(&app, &pixels, (left + x, top + y)),
+                [0, 255, 0, 255],
+                "at {x}, {y}"
+            );
+        }
+        assert_ne!(pixel(&app, &pixels, (left + 6, top)), [0, 255, 0, 255]);
+        let img = laid(&app).tree().pictures()[0];
+        assert_eq!(
+            app.src_shown(img).as_deref(),
+            Some("https://example.org/b.png")
+        );
+        slots_free(&app);
+        // With no pictures kept, its `src`.
+        app.current.pictures = None;
+        assert_eq!(
+            app.src_shown(img).as_deref(),
+            Some("https://example.org/a.png")
+        );
+    }
+
+    /// A `w` candidate is laid at its width over its density, its width
+    /// over `sizes`: 60 pixels at 30px is 2x, laid 30 CSS px wide.
+    #[test]
+    fn a_w_candidate_lays_at_its_density_corrected_size() {
+        let table = Arc::new(
+            Table::default()
+                .page(
+                    "https://example.org/w",
+                    "text/html",
+                    "<body style=margin:0><img sizes='(min-width: 1px) 30px, 100vw' \
+                     srcset='/small.png 60w, /large.png 600w' src=/src.png>",
+                )
+                .picture("https://example.org/small.png", &png(60, 40, [255, 0, 0]))
+                .picture("https://example.org/large.png", &png(600, 400, [0, 255, 0]))
+                .picture("https://example.org/src.png", &png(5, 5, [0, 0, 255])),
+        );
+        let mut app = app_over(table.clone());
+        typed(&mut app, "example.org/w");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        let urls: Vec<_> = asks(&table, ".png")
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect();
+        assert_eq!(urls, ["https://example.org/small.png"]);
+        assert_eq!(fits(&app), vec![(nodes[0], 30, 20)]);
+        // Half its pixels each way: a copy fitted to its box.
+        assert_eq!(laid(&app).factor(nodes[0]), None);
+        // Laid in its line 30 by 20 CSS px.
+        let replaced = laid(&app)
+            .lines()
+            .iter()
+            .flat_map(|line| line.replaced.iter())
+            .find(|r| r.node.index() == nodes[0])
+            .map(|r| (r.width, r.height));
+        assert_eq!(replaced, Some((30.0, 20.0)));
+        slots_free(&app);
+    }
+
+    /// A `w` candidate of `sizes=0` is infinitely dense: its natural size
+    /// 0x0 with no ratio, so a width the page gives it keeps no height.
+    #[test]
+    fn an_infinitely_dense_candidate_has_no_ratio() {
+        let table = Arc::new(
+            Table::default()
+                .page(
+                    "https://example.org/z",
+                    "text/html",
+                    "<body style=margin:0><img sizes=0 srcset='/b.png 60w' style=width:30px>\
+                     <img sizes=0 srcset='/b.png 60w'>",
+                )
+                .picture("https://example.org/b.png", &png(60, 40, [255, 0, 0])),
+        );
+        let mut app = app_over(table);
+        typed(&mut app, "example.org/z");
+        pictured(&mut app);
+        let replaced: Vec<_> = laid(&app)
+            .lines()
+            .iter()
+            .flat_map(|line| line.replaced.iter())
+            .map(|r| (r.width, r.height))
+            .collect();
+        assert_eq!(replaced, [(30.0, 0.0), (0.0, 0.0)]);
+        slots_free(&app);
+    }
+
     #[test]
     fn a_refused_picture_keeps_its_placeholder_and_is_noted() {
         let good = png(4, 4, [0, 255, 0]);
@@ -7766,6 +7975,31 @@ mod tests {
         let nodes = picture_nodes(&app);
         assert_eq!(fits(&app), vec![(nodes[0], 6, 2)]);
         assert_eq!(refused(&app, 1), Some(pictures::Why::Failed));
+        assert_eq!(table.urls(), ["https://example.org/d"]);
+    }
+
+    /// A `data:` candidate chosen from a `srcset` is decoded from it, at
+    /// its density, with no request.
+    #[test]
+    fn a_data_candidate_is_decoded_from_its_srcset() {
+        let one = base64(&png(3, 2, [255, 0, 0]));
+        let two = base64(&png(6, 4, [0, 255, 0]));
+        let markup = format!(
+            "<body style=margin:0><img src=\"data:image/png;base64,{one}\" \
+             srcset=\"data:image/png;base64,{two} 2x\">"
+        );
+        let table = Arc::new(Table::default().page("https://example.org/d", "text/html", &markup));
+        let mut app = app_at(table.clone(), 2);
+        typed(&mut app, "example.org/d");
+        pictured(&mut app);
+        let nodes = picture_nodes(&app);
+        assert_eq!(fits(&app), vec![(nodes[0], 6, 4)]);
+        assert_eq!(laid(&app).factor(nodes[0]), Some(1));
+        let pixels = window_pixels(&mut app);
+        assert_eq!(
+            pixel(&app, &pixels, picture_point(&app, nodes[0])),
+            [0, 255, 0, 255]
+        );
         assert_eq!(table.urls(), ["https://example.org/d"]);
     }
 

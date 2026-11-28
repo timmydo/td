@@ -578,6 +578,8 @@ pub(crate) mod tests {
         );
         assert!(pictures.of_email("e1") && !pictures.of_email("e2"));
         assert!(Pictures::of(&email, "<img src='https://e.example/a'>").is_none());
+        // A `srcset` elsewhere asks for nothing.
+        assert!(Pictures::of(&email, "<img srcset='https://e.example/a 2x'>").is_none());
         let many: Vec<BodyPart> = (0..MAX_PICTURES + 4)
             .map(|n| part(&format!("b{n}"), "image/gif", Some(&format!("p{n}")), None))
             .collect();

@@ -1,5 +1,7 @@
 //! A page's inline pictures (DESIGN.md §10, "Subresources" and "Slots"):
-//! each `img` with a `src`, in tree order, at most `MAX_PICTURES`, fetched
+//! each `img` with a `src` or a `srcset`, in tree order, at most
+//! `MAX_PICTURES`, its candidate chosen once for the page's environment,
+//! fetched
 //! once the page is shown within the window's subresource slots, each on
 //! a thread of its own that hands its body to the render thread; decoded
 //! there under the page's pictures term; and taken by the window, which
@@ -18,6 +20,7 @@ use crate::subresource::{Slot, Slots};
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetString, BudgetVec};
 use td_html::document::NodeId;
 use td_page::inline::{Inline, Set, Witness, MAX_PICTURES};
+use td_page::sources::{self, Chosen, Environment};
 use td_page::tree::Tree;
 use td_url::{Reference, Url};
 /// How often, at most, pictures that came lay the page out again, in ms.
@@ -194,6 +197,10 @@ struct Entry {
 /// The window's pictures of the page it shows.
 pub struct Pictures {
     entries: BudgetVec<Entry>,
+    /// Each entry's candidate, chosen once as the pictures are made; empty
+    /// when no `img` has a `srcset`, each then its `src`, so such a page's
+    /// pictures hold what they held before `srcset` was read.
+    chosen: BudgetVec<Option<Chosen>>,
     inbox: BudgetShared<Inbox>,
     /// The pictures term: pixels, fitted copies, decoding's peak, and
     /// this bookkeeping.
@@ -210,7 +217,7 @@ pub struct Pictures {
     came: u32,
     settled: u32,
     laid_at: Option<u64>,
-    /// `img`s with a `src` past `MAX_PICTURES`.
+    /// `img`s with a `src` or a `srcset` past `MAX_PICTURES`.
     past: usize,
     /// The `data:` picture last handed to the render thread.
     data_at: Option<usize>,
@@ -245,13 +252,15 @@ pub struct Count {
 
 impl Pictures {
     /// The pictures `tree` names, a page from `url` made in `page`, its
-    /// term a child of it of `term` bytes; none when it names none.
+    /// term a child of it of `term` bytes, each candidate chosen for
+    /// `environment`; none when it names none.
     pub fn new(
         tree: &Tree,
         url: &Url,
         page: &Budget,
         term: usize,
         work: u64,
+        environment: &Environment,
     ) -> Result<Option<Self>, BudgetError> {
         let nodes = tree.pictures();
         if nodes.is_empty() {
@@ -265,6 +274,14 @@ impl Pictures {
                 state: State::Wanted,
             })?;
         }
+        let any = nodes.iter().any(|&node| tree.srcset(node).is_some());
+        let mut chosen =
+            td_alloc::BudgetVec::with_capacity(&term, if any { nodes.len() } else { 0 })?;
+        if any {
+            for &node in nodes {
+                chosen.try_push(sources::select(tree, node, environment, &term, fetchable))?;
+            }
+        }
         let inbox = Inbox {
             places: Mutex::new(std::array::from_fn(|_| Place::Empty)),
             gone: AtomicBool::new(false),
@@ -275,6 +292,7 @@ impl Pictures {
         };
         Ok(Some(Self {
             entries,
+            chosen,
             inbox: BudgetShared::new(&term, inbox)?,
             term,
             https: url.https,
@@ -286,6 +304,20 @@ impl Pictures {
             past: tree.past(),
             data_at: None,
         }))
+    }
+
+    /// Picture `at`'s candidate: its `src` when none has a `srcset`.
+    fn chosen(&self, at: usize) -> Option<Chosen> {
+        if self.chosen.as_slice().is_empty() {
+            return self.entries.get(at).map(|entry| Chosen::src(entry.node));
+        }
+        self.chosen.get(at).copied().flatten()
+    }
+
+    /// The candidate chosen for `img`, if it is one of the pictures.
+    pub fn chosen_for(&self, img: NodeId) -> Option<Chosen> {
+        let at = self.entries.iter().position(|entry| entry.node == img)?;
+        self.chosen(at)
     }
 
     /// Takes what has come into the inbox; whether anything had.
@@ -306,15 +338,17 @@ impl Pictures {
                 continue;
             }
             let at = self.next;
-            let node = entry.node;
-            let Some(src) = asker.tree.src(node) else {
+            let chosen = self.chosen(at);
+            let Some((chosen, src)) =
+                chosen.and_then(|chosen| Some((chosen, asker.tree.candidate(chosen)?)))
+            else {
                 self.refuse(at, Why::Skipped);
                 continue;
             };
             // A `data:` picture before it is joined, whatever its length;
             // one on the lane at a time.
             if is_data(src) {
-                if self.data_out() || !self.data(asker, at, node) {
+                if self.data_out() || !self.data(asker, at, chosen) {
                     return;
                 }
                 continue;
@@ -351,6 +385,7 @@ impl Pictures {
                         armed: true,
                     },
                     url: BudgetString::copy(&self.term, &text)?,
+                    density: chosen.density,
                     https: self.https,
                     deadline,
                     term: self.term.try_clone()?,
@@ -386,7 +421,7 @@ impl Pictures {
 
     /// A `data:` picture handed to the render thread to decode, taking no
     /// slot; false when the lane is full, to be handed again.
-    fn data(&mut self, asker: &Asker<'_>, at: usize, node: NodeId) -> bool {
+    fn data(&mut self, asker: &Asker<'_>, at: usize, chosen: Chosen) -> bool {
         let data = (|| {
             Ok::<_, BudgetError>(Data {
                 owed: Owed {
@@ -395,7 +430,7 @@ impl Pictures {
                     armed: true,
                 },
                 tree: asker.tree.try_clone()?,
-                node,
+                chosen,
                 term: self.term.try_clone()?,
             })
         })();
@@ -567,6 +602,12 @@ impl Drop for Pictures {
     }
 }
 
+/// Whether a `srcset` candidate is one td-web may fetch: not one whose
+/// path names an SVG file, as it is written.
+fn fetchable(url: &str) -> bool {
+    !svg(url)
+}
+
 /// Whether a URL's path names an SVG file, which td-web does not fetch.
 fn svg(text: &str) -> bool {
     let path = text.split(['?', '#']).next().unwrap_or(text);
@@ -583,6 +624,8 @@ fn svg(text: &str) -> bool {
 struct Asked {
     owed: Owed,
     url: BudgetString,
+    /// The chosen candidate's density, which it is laid at.
+    density: f64,
     https: bool,
     deadline: Instant,
     term: Budget,
@@ -636,6 +679,7 @@ fn spawn(fetcher: &fetch::Shared, asked: Asked, slot: Slot) -> Result<(), ()> {
             let Asked {
                 owed,
                 url,
+                density,
                 https,
                 deadline,
                 term,
@@ -654,7 +698,12 @@ fn spawn(fetcher: &fetch::Shared, asked: Asked, slot: Slot) -> Result<(), ()> {
             // as `owed` drops.
             if let Ok(loaded) = fetched {
                 if (200..300).contains(&loaded.reply.status) {
-                    renderer.picture(Decode { owed, loaded, term });
+                    renderer.picture(Decode {
+                        owed,
+                        loaded,
+                        density,
+                        term,
+                    });
                 }
             }
             drop(slot);
@@ -667,15 +716,16 @@ fn spawn(fetcher: &fetch::Shared, asked: Asked, slot: Slot) -> Result<(), ()> {
 pub struct Decode {
     owed: Owed,
     loaded: Loaded,
+    density: f64,
     term: Budget,
 }
 
 /// A `data:` picture for the render thread to decode, from its page's
-/// tree.
+/// tree: the candidate chosen, its `src` or one of its `srcset`'s.
 pub struct Data {
     owed: Owed,
     tree: BudgetShared<Tree>,
-    node: NodeId,
+    chosen: Chosen,
     term: Budget,
 }
 
@@ -707,14 +757,21 @@ fn format(content_type: Option<&str>, body: &[u8]) -> Option<Format> {
     Format::sniff(body)
 }
 
-/// `body` decoded under `term` into what picture `at` comes to.
-fn decoded(body: &[u8], content_type: Option<&str>, term: &Budget, told: &Inbox) -> Outcome {
+/// `body` decoded under `term` into what picture `at` comes to, laid at
+/// `density` pixels to a CSS px.
+fn decoded(
+    body: &[u8],
+    content_type: Option<&str>,
+    density: f64,
+    term: &Budget,
+    told: &Inbox,
+) -> Outcome {
     let Some(format) = format(content_type, body) else {
         return Outcome::Refused(Why::Failed);
     };
     match picture::decode_inline(format, body, term) {
         Ok((picture, natural)) => {
-            let inline = Inline::new(picture, natural, told.witness());
+            let inline = Inline::new(picture, natural, told.witness()).with_density(density);
             match BudgetShared::new(term, inline) {
                 Ok(inline) => Outcome::Shown(inline),
                 Err(_) => Outcome::Refused(Why::Room),
@@ -728,7 +785,12 @@ fn decoded(body: &[u8], content_type: Option<&str>, term: &Budget, told: &Inbox)
 /// On the render thread: a fetched picture decoded, its body let go,
 /// and put in its page's inbox, or let go here when the page has gone.
 pub(crate) fn decode(job: Decode) {
-    let Decode { owed, loaded, term } = job;
+    let Decode {
+        owed,
+        loaded,
+        density,
+        term,
+    } = job;
     if owed.gone() {
         return;
     }
@@ -736,6 +798,7 @@ pub(crate) fn decode(job: Decode) {
     let outcome = decoded(
         &reply.body,
         reply.header("content-type"),
+        density,
         &term,
         &owed.inbox,
     );
@@ -743,24 +806,25 @@ pub(crate) fn decode(job: Decode) {
     owed.answer(outcome);
 }
 
-/// On the render thread: a `data:` picture decoded from its `src`, with
-/// no request, its decoding's scratch and bytes in the pictures term.
+/// On the render thread: a `data:` picture decoded from its chosen
+/// candidate, with no request, its decoding's scratch and bytes in the
+/// pictures term.
 pub(crate) fn decode_data(job: Data) {
     let Data {
         owed,
         tree,
-        node,
+        chosen,
         term,
     } = job;
     if owed.gone() {
         return;
     }
     let outcome = match tree
-        .src(node)
+        .candidate(chosen)
         .and_then(|src| td_page::gather::data(src, &term))
     {
         Some(Ok(Some(bytes))) if bytes.len() as u64 <= MAX_PICTURE_BODY => {
-            decoded(&bytes, None, &term, &owed.inbox)
+            decoded(&bytes, None, chosen.density, &term, &owed.inbox)
         }
         Some(Ok(Some(_))) => Outcome::Refused(Why::Failed),
         Some(Err(_)) => Outcome::Refused(Why::Room),
@@ -903,17 +967,23 @@ pub(crate) mod tests {
             Outcome::Refused(why) => Some(why),
         };
         let body = png(3, 3);
-        assert_eq!(why(decoded(&body, Some("image/gif"), &term, &inbox)), None);
         assert_eq!(
-            why(decoded(&body, Some("image/svg+xml"), &term, &inbox)),
+            why(decoded(&body, Some("image/gif"), 1.0, &term, &inbox)),
+            None
+        );
+        assert_eq!(
+            why(decoded(&body, Some("image/svg+xml"), 1.0, &term, &inbox)),
             Some(Why::Failed)
         );
         assert_eq!(
-            why(decoded(&body[..body.len() - 8], None, &term, &inbox)),
+            why(decoded(&body[..body.len() - 8], None, 1.0, &term, &inbox)),
             Some(Why::Failed)
         );
         let small = Budget::new(1 << 20).unwrap();
-        assert_eq!(why(decoded(&body, None, &small, &inbox)), Some(Why::Room));
+        assert_eq!(
+            why(decoded(&body, None, 1.0, &small, &inbox)),
+            Some(Why::Room)
+        );
     }
 
     /// Increment 9's host measurement (DESIGN.md §10, "Memory"): each
@@ -1013,7 +1083,7 @@ pub(crate) mod tests {
         };
         let term = Budget::new(64 << 20).unwrap();
         for (body, opaque) in [(png(3, 2), true), (picture::tests::GIF.to_vec(), false)] {
-            let Outcome::Shown(inline) = decoded(&body, None, &term, &inbox) else {
+            let Outcome::Shown(inline) = decoded(&body, None, 1.0, &term, &inbox) else {
                 panic!("not shown");
             };
             assert_eq!(inline.opaque(), opaque);
@@ -1034,11 +1104,18 @@ pub(crate) mod tests {
         let url = Url::parse("https://inbox.example/").unwrap();
         let told = watch("https://inbox.example/");
         let page = Budget::new(64 << 20).unwrap();
-        let mut pictures = Pictures::new(laid.tree(), &url, &page, 16 << 20, FIT_WORK)
-            .unwrap()
-            .unwrap();
+        let mut pictures = Pictures::new(
+            laid.tree(),
+            &url,
+            &page,
+            16 << 20,
+            FIT_WORK,
+            &Environment::default(),
+        )
+        .unwrap()
+        .unwrap();
         let held = inbox(&pictures);
-        let outcome = decoded(&png(2, 2), None, &pictures.term, &held);
+        let outcome = decoded(&png(2, 2), None, 1.0, &pictures.term, &held);
         assert!(matches!(outcome, Outcome::Shown(_)));
         assert!(held.put(0, outcome).is_none());
         // Owed and dropped: failed. Handed back: owed no more.
@@ -1051,11 +1128,18 @@ pub(crate) mod tests {
         assert_eq!(pictures.refused(1), Some(Why::Failed));
         assert_eq!(pictures.refused(0), None);
         drop(pictures);
-        let pictures = Pictures::new(laid.tree(), &url, &page, 16 << 20, FIT_WORK)
-            .unwrap()
-            .unwrap();
+        let pictures = Pictures::new(
+            laid.tree(),
+            &url,
+            &page,
+            16 << 20,
+            FIT_WORK,
+            &Environment::default(),
+        )
+        .unwrap()
+        .unwrap();
         let held = inbox(&pictures);
-        let outcome = decoded(&png(2, 2), None, &pictures.term, &held);
+        let outcome = decoded(&png(2, 2), None, 1.0, &pictures.term, &held);
         assert!(held.put(0, outcome).is_none());
         Owed {
             at: 1,
@@ -1071,5 +1155,37 @@ pub(crate) mod tests {
         assert!(gone(&held));
         assert!(held.put(1, Outcome::Refused(Why::Failed)).is_some());
         drop(held);
+    }
+
+    /// A page with no `srcset` keeps no chosen candidates, so its
+    /// pictures hold what they held before `srcset` was read, each its
+    /// `src`; one `srcset` among them keeps a choice for each.
+    #[test]
+    fn candidates_are_kept_only_for_a_page_with_a_srcset() {
+        let url = Url::parse("https://chosen.example/").unwrap();
+        let page = Budget::new(64 << 20).unwrap();
+        let env = Environment {
+            resolution_dppx: 2.0,
+            ..Environment::default()
+        };
+        let made = |markup: &str| {
+            let laid = crate::made::laid(markup);
+            let pictures = Pictures::new(laid.tree(), &url, &page, 16 << 20, FIT_WORK, &env)
+                .unwrap()
+                .unwrap();
+            (laid, pictures)
+        };
+        let (laid, bare) = made("<img src=/a.png><img src=/b.svg srcset=' '>");
+        assert_eq!(bare.chosen.capacity(), 0);
+        let nodes = laid.tree().pictures();
+        assert_eq!(bare.chosen(0), Some(Chosen::src(nodes[0])));
+        assert_eq!(bare.chosen_for(nodes[1]), Some(Chosen::src(nodes[1])));
+        let (laid, some) = made("<img src=/a.png><img src=/b.png srcset='/c.png 2x, /d.svg 3x'>");
+        assert_eq!(some.chosen.as_slice().len(), 2);
+        let nodes = laid.tree().pictures();
+        assert_eq!(some.chosen(0), Some(Chosen::src(nodes[0])));
+        let chosen = some.chosen(1).unwrap();
+        assert_eq!(laid.tree().candidate(chosen), Some("/c.png"));
+        assert_eq!(chosen.density, 2.0);
     }
 }

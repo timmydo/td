@@ -1564,6 +1564,64 @@ mod tests {
         );
     }
 
+    /// td-mail takes an `img`'s `src` alone: one with only a `srcset` is
+    /// laid with no picture, though its `srcset` names one come, and
+    /// names none of them.
+    #[test]
+    fn a_srcset_alone_lays_no_picture() {
+        use crate::ui::pictures::tests::{come, png};
+        let one = Scale::default();
+        let html = "<p>above</p><img srcset='cid:a%40x 1x, https://e.example/a.png 2x' alt=x>\
+                    <p>below</p>";
+        let make = |pictures| {
+            Paged::make("m", "Subject: Hi", html, BODY, one, None, BUDGET, pictures).expect("made")
+        };
+        let bare = make(None);
+        let tall = come("a@x", &png(40, 3000));
+        let laid = make(Some(&tall));
+        assert_eq!(laid.most(), bare.most());
+        let come = tall.come().expect("come");
+        assert!(!names_any(&laid.page.tree, &come));
+        assert!(set_of(&laid.page.tree, &laid.page.budget, &come).is_none());
+    }
+
+    /// td-page's `MAX_PICTURES` counts an `img` with only a `srcset`, so
+    /// that many of them before a `cid:` picture leave it unlaid, as that
+    /// many `src`s would; one fewer, and it is laid.
+    #[test]
+    fn srcset_images_take_the_picture_slots() {
+        use crate::ui::pictures::tests::{come, png};
+        let one = Scale::default();
+        let most = td_page::inline::MAX_PICTURES;
+        let page = |before: usize| {
+            format!(
+                "{}<img src='cid:a%40x'>",
+                "<img srcset='https://e.example/x 2x'>".repeat(before)
+            )
+        };
+        let tall = come("a@x", &png(40, 3000));
+        let laid = |before: usize| {
+            let html = page(before);
+            let bare = Paged::make("m", "Subject: Hi", &html, BODY, one, None, BUDGET, None)
+                .expect("made");
+            let with = Paged::make(
+                "m",
+                "Subject: Hi",
+                &html,
+                BODY,
+                one,
+                None,
+                BUDGET,
+                Some(&tall),
+            )
+            .expect("made");
+            // A 3000 px tall picture laid makes the page scroll.
+            with.most() > bare.most()
+        };
+        assert!(laid(most - 1));
+        assert!(!laid(most));
+    }
+
     /// Pictures come that no `img` of the shown page names, as a table's
     /// background's, ask the page thread for nothing: the page stays as it
     /// is, where it is read.

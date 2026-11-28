@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::memory::Resident;
 use td_alloc::{Budget, BudgetError, BudgetShared, BudgetVec};
 use td_html::document::NodeId;
+use td_layout::block::IntrinsicSize;
 use td_ui::picture::Fitted;
 
 /// The most `img` elements a page lays a picture for.
@@ -68,6 +69,9 @@ pub struct Inline {
     natural: (usize, usize),
     /// Every pixel opaque: drawn by copying, not blending.
     opaque: bool,
+    /// Its pixels to a CSS px: a `srcset` candidate's, else 1. An `f32`
+    /// so an `Inline` is no larger than it was without it.
+    density: f32,
     witness: Witnessed,
 }
 
@@ -84,10 +88,41 @@ impl Inline {
             picture,
             natural,
             opaque,
+            density: 1.0,
             witness: Witnessed {
                 witness,
                 what: "inline",
             },
+        }
+    }
+
+    /// At `density` pixels to a CSS px, a `srcset` candidate's: one not
+    /// positive and finite (a `0x`, an infinite `w` density) is laid as
+    /// `intrinsic` says.
+    pub fn with_density(self, density: f64) -> Self {
+        Self {
+            density: density as f32,
+            ..self
+        }
+    }
+
+    /// Its intrinsic size for a layout, in 1/64 CSS px: its pixels over
+    /// its density, rounded and saturating, its ratio its pixels'. An
+    /// infinite density is 0x0 CSS px with no ratio, as HTML's natural
+    /// size is; a density of 0 or not a number is laid at 1.
+    pub fn intrinsic(&self) -> IntrinsicSize {
+        let (width, height) = self.natural;
+        let width = u32::try_from(width).unwrap_or(u32::MAX);
+        let height = u32::try_from(height).unwrap_or(u32::MAX);
+        let density = f64::from(self.density);
+        if density == 1.0 || density.is_nan() || density <= 0.0 {
+            return IntrinsicSize::picture_px(width, height);
+        }
+        // `as` saturates: an f64 past u32 is u32::MAX, NaN none.
+        let sixty_fourths = |n: u32| (f64::from(n) * 64.0 / density).round() as u32;
+        IntrinsicSize {
+            ratio: density.is_finite().then_some((width, height)),
+            ..IntrinsicSize::picture(sixty_fourths(width), sixty_fourths(height))
         }
     }
 
@@ -305,5 +340,54 @@ pub(crate) mod tests {
         assert_eq!(told.try_recv(), Ok("fit"));
         assert!(told.try_recv().is_err());
         drop(Witnessed::none("page"));
+    }
+
+    /// A picture's intrinsic size is its pixels over its density, in
+    /// 1/64 CSS px, its ratio its pixels'; at 1, `picture_px`'s.
+    #[test]
+    fn a_pictures_intrinsic_size_is_its_pixels_over_its_density() {
+        let term = Budget::new(1 << 20).unwrap();
+        let inline = |natural: (usize, usize), density: f64| {
+            let fitted = Fitted {
+                width: 1,
+                height: 1,
+                bgra: [9, 9, 9, 255].to_vec(),
+            };
+            let charge = term.charge(4).unwrap();
+            Inline::new(Resident::new(fitted, charge, 4).unwrap(), natural, None)
+                .with_density(density)
+        };
+        let picture = |w, h, ratio| IntrinsicSize {
+            ratio: Some(ratio),
+            ..IntrinsicSize::picture(w, h)
+        };
+        for (natural, density, want) in [
+            ((400, 300), 1.0, IntrinsicSize::picture_px(400, 300)),
+            ((400, 300), 2.0, picture(200 * 64, 150 * 64, (400, 300))),
+            ((400, 300), 1.25, picture(320 * 64, 240 * 64, (400, 300))),
+            ((400, 300), 400.0 / 322.4, picture(20634, 15475, (400, 300))),
+            (
+                (400, 300),
+                f64::INFINITY,
+                IntrinsicSize {
+                    ratio: None,
+                    ..IntrinsicSize::picture(0, 0)
+                },
+            ),
+            ((400, 300), 0.0, IntrinsicSize::picture_px(400, 300)),
+            ((400, 300), f64::NAN, IntrinsicSize::picture_px(400, 300)),
+            ((usize::MAX, 1), 0.5, picture(u32::MAX, 128, (u32::MAX, 1))),
+        ] {
+            let got = inline(natural, density).intrinsic();
+            assert_eq!(
+                (got.width, got.height, got.ratio),
+                (want.width, want.height, want.ratio),
+                "{natural:?} at {density}"
+            );
+        }
+        // Its own size, as stored, whatever its density: what is fitted.
+        assert_eq!(inline((400, 300), 2.0).natural(), (400, 300));
+        // No larger than it was without a density.
+        assert_eq!(std::mem::size_of::<Inline>(), 112);
     }
 }

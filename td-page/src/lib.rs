@@ -17,6 +17,7 @@ pub mod paint;
 pub mod pipeline;
 pub mod search;
 pub mod sheets;
+pub mod sources;
 pub mod text;
 pub mod tree;
 pub mod view;

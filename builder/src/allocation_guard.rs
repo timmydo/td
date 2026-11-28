@@ -289,6 +289,7 @@ const UI_STORAGE_SOURCES: &[&str] = &[
     "td-page/src/pipeline.rs",
     "td-page/src/search.rs",
     "td-page/src/sheets.rs",
+    "td-page/src/sources.rs",
     "td-page/src/text.rs",
     "td-page/src/tree.rs",
     "td-page/src/view.rs",

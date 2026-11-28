@@ -491,9 +491,10 @@ fn fit(
     Ok((fits, short))
 }
 
-/// Each image's intrinsic size: its picture's, in CSS px a pixel, once it
-/// has come; else its `alt` text's line in its own font, none without
-/// one (td-web/DESIGN.md §10, "Subresources"). Sorted by node index.
+/// Each image's intrinsic size: its picture's, its pixels over its
+/// density in CSS px (`Inline::intrinsic`), once it has come; else its
+/// `alt` text's line in its own font, none without one
+/// (td-web/DESIGN.md §10, "Subresources"). Sorted by node index.
 fn alt_sizes(
     styled: &Styled,
     measure: &mut Measure,
@@ -509,10 +510,7 @@ fn alt_sizes(
             continue;
         };
         if let Some(inline) = pictures.and_then(|set| set.get(b.node)) {
-            let (width, height) = inline.natural();
-            let width = u32::try_from(width).unwrap_or(u32::MAX);
-            let height = u32::try_from(height).unwrap_or(u32::MAX);
-            out.try_push((b.node.index(), IntrinsicSize::picture_px(width, height)))?;
+            out.try_push((b.node.index(), inline.intrinsic()))?;
             continue;
         }
         let alt = styled.tree().alt(b.node).unwrap_or("");

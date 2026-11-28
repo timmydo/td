@@ -39,8 +39,9 @@ pub struct Tree {
     /// `style` elements whose type is CSS's and `<link rel=stylesheet>`s
     /// with an `href`, in tree order.
     sheets: BudgetVec<NodeId>,
-    /// `img` elements with a `src` not blank, in tree order: the first
-    /// `MAX_PICTURES` of them, and how many more there are.
+    /// `img` elements with a `src` not blank or a `srcset`, in tree
+    /// order: the first `MAX_PICTURES` of them, and how many more there
+    /// are.
     pictures: BudgetVec<NodeId>,
     past: usize,
     base: Option<NodeId>,
@@ -111,12 +112,24 @@ fn linked(element: &td_html::document::Element) -> bool {
             .is_some_and(|href| !href.trim().is_empty())
 }
 
-/// Whether an `img` names a picture to fetch: a `src` that is not blank
-/// (td-web/DESIGN.md §10, "Subresources"); `srcset` is not read.
+/// Whether an `img` names a picture to fetch: a `src` that is not blank,
+/// or a `srcset` (td-web/DESIGN.md §10, "Subresources"). Which of them
+/// it shows is `sources::select`'s; td-mail reads its `src` alone.
 fn picture(element: &td_html::document::Element) -> bool {
     element.attribute("src").is_some_and(|src| {
         !src.trim_matches(|c: char| c.is_ascii_whitespace())
             .is_empty()
+    }) || srcset(element).is_some()
+}
+
+/// An `img`'s `srcset`: one not blank and within `MAX_SRCSET_BYTES`, a
+/// longer one counted absent.
+fn srcset(element: &td_html::document::Element) -> Option<&str> {
+    element.attribute("srcset").filter(|srcset| {
+        srcset.len() <= crate::sources::MAX_SRCSET_BYTES
+            && !srcset
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .is_empty()
     })
 }
 
@@ -312,21 +325,45 @@ impl Tree {
         self.sheets.as_slice()
     }
 
-    /// The `img` elements with a `src` fetched, in tree order, at most
-    /// `MAX_PICTURES`.
+    /// The `img` elements with a `src` or a `srcset` fetched, in tree
+    /// order, at most `MAX_PICTURES`.
     pub fn pictures(&self) -> &[NodeId] {
         self.pictures.as_slice()
     }
 
-    /// The `img` elements with a `src` past `MAX_PICTURES`.
+    /// The `img` elements with a `src` or a `srcset` past `MAX_PICTURES`.
     pub fn past(&self) -> usize {
         self.past
     }
 
-    /// An `img`'s `src`, as written, its ASCII white space trimmed.
+    /// An `img`'s `src`, as written, its ASCII white space trimmed: never
+    /// a `srcset` candidate, which td-mail does not take.
     pub fn src(&self, id: NodeId) -> Option<&str> {
         let src = html_element(&self.document, id)?.attribute("src")?;
         Some(src.trim_matches(|c: char| c.is_ascii_whitespace()))
+    }
+
+    /// An `img`'s `srcset`, as written: none blank or past
+    /// `MAX_SRCSET_BYTES`.
+    pub fn srcset(&self, id: NodeId) -> Option<&str> {
+        srcset(html_element(&self.document, id)?)
+    }
+
+    /// An `img`'s `sizes`, as written.
+    pub fn sizes(&self, id: NodeId) -> Option<&str> {
+        html_element(&self.document, id)?.attribute("sizes")
+    }
+
+    /// The URL a chosen candidate names, as written.
+    pub fn candidate(&self, chosen: crate::sources::Chosen) -> Option<&str> {
+        match chosen.attribute {
+            crate::sources::Attribute::Src => self.src(chosen.holder),
+            crate::sources::Attribute::Srcset => {
+                let (start, end) = chosen.span;
+                let srcset = self.srcset(chosen.holder)?;
+                srcset.get(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
+            }
+        }
     }
 
     /// A `style` element's text, or a `link`'s `href`, with its `media`.

@@ -997,7 +997,12 @@ dropped there.
   compile and cascade 1.1 s (td-layout/DESIGN.md §6), on the render
   thread while the window paints the old layout. Once td-css can say
   whether a change alters which of a set's rules apply (§11), only a
-  change that does cascades again.
+  change that does cascades again. The page's pictures keep the
+  candidates chosen when they were made (below, "Subresources"): no
+  width or scale change chooses again yet, so a picture shown keeps
+  its density and its CSS size, as a browser's does between
+  selections, where its `sizes` or a new scale would now choose
+  another.
 - A height alone lays the page out again at that height, which
   td-layout gives the root as its definite height, without compiling
   or cascading: height and orientation media queries keep answering
@@ -1209,6 +1214,13 @@ a progressive one to about 5.5 MP, a page's first. A
 page of 24 large PNGs, twelve 1600x1200 and twelve 800x600, shows 12
 and refuses 12 for room, the term holding 44.0 MiB, the process
 peaking at 77.6 MiB resident at 1920x1200 and 100.4 MiB at 3840x2160.
+A page's `srcset` candidates chosen at scale two to four press the
+term harder: a 2x candidate holds four times the pixels of the 1x it
+replaces and a 4x sixteen, so the 48 MiB term refuses more of such a
+page's pictures for room at those scales, each keeping its
+placeholder and counted not shown, where at scale one the same page
+fits. The term is not grown for them: those measurements predate
+`srcset`.
 
 A picture reached by navigation is a page of its own, charged the shared
 decoder's conservative 200 MiB peak before decoding, including the bounded
@@ -1404,8 +1416,38 @@ media, so what is fetched says nothing of the viewport. A `<link>`'s
 URL is joined against the page's `<base href>`, else the page's URL;
 an import's against the URL its sheet answered from, after redirects.
 Inline pictures (increment 9) are each `img` whose `src`, ASCII white
-space trimmed, is not blank, in tree order, at most `MAX_PICTURES`
-(128) a page, those past it keeping their placeholders.
+space trimmed, is not blank, or with a `srcset` not blank and within
+`MAX_SRCSET_BYTES` (64 KiB, a longer one counted absent), in tree
+order, at most `MAX_PICTURES` (128) a page, those past it keeping their
+placeholders. Each is one candidate (td-page's `sources`), chosen once,
+as the page's pictures are made, for the environment the page is laid
+for. HTML's "parse a srcset attribute" reads the `srcset`'s candidates,
+lazily and with no allocation, its first `MAX_CANDIDATES` (64)
+considered: an `x` candidate past `MAX_DENSITY` (1000) or a `w` past
+u32 is dropped as an error is. A `w` candidate's density is its width
+over the `sizes` attribute's size (td-css's `conditions::source_size`,
+its parse charged to the pictures term and returned; 100vw when absent
+or refused), and `src` joins the set at 1x unless a candidate is 1x or
+has a width, as "update the source set" has it. A candidate whose path,
+as written, names an SVG file counts as absent, `src` among them once a
+`srcset` is read. Of those left, the one chosen has the least density
+at least the window's scale, else the greatest, the first of equal
+densities. An `img` with no `srcset` is its `src`, chosen and fetched
+as before. A picture is laid at its pixels over its density, in 1/64
+CSS px (td-page's `Inline::intrinsic`), so a 2x candidate at scale two
+is laid at its own size in device pixels and drawn with no copy; a
+size of 0 makes a `w` candidate infinitely dense, laid 0x0 with no
+ratio, and a `0x` one is laid at 1x. An `img` in a `<picture>` takes its own `srcset` and
+`src`; `<source>` is not read yet. A `srcset` of commas alone, with no
+`src`, makes a picture that shows none, counted not shown. td-mail reads
+an `img`'s `src` alone (td-page/DESIGN.md §4). The rule is the spec's
+text, as Firefox has it, not Chrome's, which takes a lower density
+within a geometric-mean tolerance of the screen's; td does not take it.
+A candidate td-web's own bounds refuse (past `MAX_PICTURE_BODY`, or
+the pictures term had not the room) keeps its placeholder, though a
+lower one or the 1x `src` might have fit: no other is tried yet. A
+planned follow-up, with choosing again on a resize, falls back to the
+next lower candidate, else `src`, on such a refusal for room or body.
 
 **Requests.** Each is a GET sent `public`, following redirects as a
 navigation does (§4). A subresource from another site is taken, as
@@ -1581,8 +1623,9 @@ specification's, whose styling alone takes 0.8 s), so none came late at
 **Pictures** are fetched once their page is shown, a markup page on
 rung 1 or 2 (rung 3's text lays none), and asked for only while no
 navigation is out, so the next page's sheets come first; those already
-out are taken. Each `src` is joined against the page's `<base href>`,
-else its URL, as a link is; one whose path ends `.svg` or `.svgz`
+out are taken. Each candidate chosen is joined against the page's
+`<base href>`, else its URL, as a link is; one whose path ends
+`.svg` or `.svgz`
 (ASCII case-insensitively, before its query) is not fetched, td-web
 drawing no SVG, nor one of a scheme other than `http`, `https` and
 `data`. A `data:` one is known as such before it is joined, whatever
@@ -1688,9 +1731,10 @@ failed, or whose copy the layout shown refused (`the page's picture is
 not shown` when it names one); one with no box counts as shown. A page
 let go, overtaken, reloaded or stepped down to rung 3 lets its pictures
 go on the render thread, their fetches told first, as its layouts go
-(above, "Handover"). An unlinked picture opens its `src` on a click as
-its placeholder did (below, "Links"). `srcset`, `<picture>`'s sources,
-CSS background images and SVG are not fetched.
+(above, "Handover"). An unlinked picture opens its candidate chosen,
+else its `src`, on a click as its placeholder did, and the status row
+shows that address (below, "Links"). `<picture>`'s sources, CSS
+background images and SVG are not fetched.
 
 ### Places, find, selection and links
 
@@ -1902,8 +1946,8 @@ joined against the page's base: the first `<base href>` in tree order,
 joined against the page's URL, else that URL. A fragment's or replaced
 box's link is its nearest such ancestor, and a point's link that of
 the fragment or replaced box under it; an image with no link opens its
-`src` on a click, and the status row names it while the pointer is
-over it. `Tab` goes through the links
+candidate chosen (above, "Subresources"), else its `src`, on a click,
+and the status row names it while the pointer is over it. `Tab` goes through the links
 in tree order that laid a fragment or a replaced box, from the
 focused link, else from the screen: `Tab` the first link on a line
 shown or after it and `Shift+Tab` the last on a line shown or before
@@ -2583,7 +2627,9 @@ order; each is its own design amendment when it starts:
   pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.
-- **Pictures.** `srcset` and `<picture>`; an SVG subset.
+- **Pictures.** `<picture>`; a `srcset` chosen again on a resize or
+  scale change, and a lower candidate tried when td's bounds refuse
+  one; an SVG subset.
 - **Downloads past `MAX_DOCUMENT`.** The fetch service already streams
   a reply in frames to a `stream` request, `public` ones included, so a
   larger save needs no protocol: td-fetch-client's `get_stream` taking
