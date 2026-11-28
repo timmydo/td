@@ -40,6 +40,7 @@ mod host_login;
 pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;
+pub(crate) mod native_server;
 mod nocloud;
 pub(crate) mod recovery_screen;
 mod release_delivery;

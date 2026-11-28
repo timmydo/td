@@ -14,6 +14,7 @@ pub(crate) const GOAL: &str = "integration";
 
 pub(crate) const POSTGRES: &str = "postgres-integration";
 pub(crate) const POSTGRES_PACKAGE: &str = "postgresql-x86-64-test";
+const NATIVE_SERVER: &str = "native-boot-server";
 const VM_WORKSPACE: &str = "vm-workspace";
 const VM_LIFECYCLE: &str = "vm-lifecycle";
 
@@ -46,6 +47,11 @@ const STEPS: &[Step] = &[
         name: VM_LIFECYCLE,
         argv: &[],
         proves: "td-vm protects two hardware guests and their private disks through supervisor loss and independent force-stop",
+    },
+    Step {
+        name: NATIVE_SERVER,
+        argv: &[],
+        proves: "the server selector hands off to the expected deployment on KVM and its writable Btrfs state survives a cold boot",
     },
     Step {
         name: "warm",
@@ -230,7 +236,7 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
         .filter(|step| {
             !matches!(
                 step.name,
-                "warm" | VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE
+                "warm" | NATIVE_SERVER | VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE
             )
         })
         .all(|step| matches!(ask_memo(root, eval, step.name), Memo::Hit(_)));
@@ -241,7 +247,9 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
                 println!(">> {GOAL}: warm skipped — every image oracle answers from the memo");
                 continue;
             }
-            "warm" | VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE => Memo::Unasked,
+            "warm" | NATIVE_SERVER | VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE => {
+                Memo::Unasked
+            }
             name => ask_memo(root, eval, name),
         };
         match &memo {
@@ -297,7 +305,7 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
     println!("{line}");
     if code == td_engine::exit::EXIT_UNPROVISIONED {
         println!(
-            ">> {GOAL}: UNPROVISIONED — KVM unavailable for the VM lifecycle or no system boot oracle could run \
+            ">> {GOAL}: UNPROVISIONED — KVM unavailable for a native VM step or no system boot oracle could run \
              (qemu, /dev/kvm, or OVMF for the UEFI boots); a skip is not a pass"
         );
         // A caller reads a host gap by the code and the sentinel together.
@@ -315,8 +323,10 @@ fn run_step(root: &Path, eval: &str, step: &Step) -> Outcome {
                 return Outcome::Fail;
             }
         }
-    } else if matches!(step.name, VM_WORKSPACE | VM_LIFECYCLE) {
-        return run_vm_cases(root, step.name);
+    } else if matches!(step.name, VM_LIFECYCLE | NATIVE_SERVER) {
+        return run_kvm_step(root, eval, step.name);
+    } else if step.name == VM_WORKSPACE {
+        return run_vm_cases(root, None);
     } else {
         Command::new(eval)
     };
@@ -335,32 +345,38 @@ fn run_step(root: &Path, eval: &str, step: &Step) -> Outcome {
     run_command(root, step.name, cmd)
 }
 
-fn run_vm_cases(root: &Path, step: &str) -> Outcome {
-    let tool;
-    let cases: &[(&str, &str, &str)] = if step == VM_LIFECYCLE {
-        if let Err(error) = crate::sandbox::test_kvm_device() {
-            println!(">> {GOAL} {step}: open /dev/kvm: {error}");
-            return match error.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
-                    Outcome::HostGap
-                }
-                _ => Outcome::Fail,
-            };
-        }
-        tool = match crate::native_tests::build_tool(root, "td-vmm/Cargo.toml", "td-vmm") {
-            Ok(tool) => Some(tool),
+fn run_kvm_step(root: &Path, eval: &str, step: &str) -> Outcome {
+    if let Err(error) = crate::sandbox::test_kvm_device() {
+        println!(">> {GOAL} {step}: open /dev/kvm: {error}");
+        return match error.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => Outcome::HostGap,
+            _ => Outcome::Fail,
+        };
+    }
+    let (_scratch, binary) =
+        match crate::native_tests::build_tool(root, "td-vmm/Cargo.toml", "td-vmm") {
+            Ok(tool) => tool,
             Err(error) => {
                 eprintln!("{GOAL}: {error}");
                 return Outcome::Fail;
             }
         };
+    if step == NATIVE_SERVER {
+        let mut command = Command::new(eval);
+        command.arg(NATIVE_SERVER).arg(binary);
+        return run_command(root, step, command);
+    }
+    run_vm_cases(root, Some(&binary))
+}
+
+fn run_vm_cases(root: &Path, vmm: Option<&Path>) -> Outcome {
+    let cases: &[(&str, &str, &str)] = if vmm.is_some() {
         &[(
             "--test",
             "native_lifecycle",
             "vm_integration_supervisor_loss_and_independent_stop",
         )]
     } else {
-        tool = None;
         &[
             (
                 "--test",
@@ -391,7 +407,7 @@ fn run_vm_cases(root: &Path, step: &str) -> Outcome {
                 "--ignored",
             ])
             .stdout(std::process::Stdio::piped());
-        if let Some((_, binary)) = &tool {
+        if let Some(binary) = vmm {
             cmd.env(crate::test_root::ENV, "kvm")
                 .env("TD_TEST_VMM", binary);
         } else {
@@ -451,16 +467,16 @@ fn verdict(results: &[(&str, Outcome, Duration)]) -> (String, i32) {
         .filter(|r| {
             !matches!(
                 r.0,
-                VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE
+                NATIVE_SERVER | VM_WORKSPACE | VM_LIFECYCLE | POSTGRES | POSTGRES_PACKAGE
             )
         })
         .all(|r| r.1 == Outcome::HostGap)
         || results
             .iter()
-            .any(|r| r.0 == VM_LIFECYCLE && r.1 == Outcome::HostGap)
+            .any(|r| matches!(r.0, VM_LIFECYCLE | NATIVE_SERVER) && r.1 == Outcome::HostGap)
     {
         td_engine::exit::EXIT_UNPROVISIONED
-    } else if [POSTGRES, POSTGRES_PACKAGE, VM_WORKSPACE]
+    } else if [POSTGRES, POSTGRES_PACKAGE, VM_WORKSPACE, NATIVE_SERVER]
         .iter()
         .all(|name| results.iter().any(|r| r.0 == *name && r.1 == Outcome::Pass))
     {
@@ -522,6 +538,7 @@ mod tests {
             (POSTGRES, Outcome::Pass, s(3)),
             (POSTGRES_PACKAGE, Outcome::Pass, s(2)),
             (VM_WORKSPACE, Outcome::Pass, s(1)),
+            (NATIVE_SERVER, Outcome::Pass, s(1)),
             ("warm", Outcome::Pass, s(1)),
             ("qemu-boot-system", Outcome::Pass, s(600)),
             ("qemu-boot-live", gap, s(0)),
@@ -530,14 +547,14 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             line.contains(
-                "of 12 oracle(s), 4 passed (0 from the memo), 1 unprovisioned, 0 failed, 7 not run"
+                "of 13 oracle(s), 5 passed (0 from the memo), 1 unprovisioned, 0 failed, 7 not run"
             ),
             "{line}"
         );
         assert!(line.contains("qemu-boot-system pass 600.0s"), "{line}");
         assert_ne!(verdict(&[(POSTGRES, Outcome::Pass, s(1))]).1, 0);
         assert_ne!(verdict(&[("qemu-boot-system", Outcome::Pass, s(1))]).1, 0);
-        for missing in [POSTGRES, POSTGRES_PACKAGE, VM_WORKSPACE] {
+        for missing in [POSTGRES, POSTGRES_PACKAGE, VM_WORKSPACE, NATIVE_SERVER] {
             let available: Vec<_> = one_ran.iter().copied().filter(|r| r.0 != missing).collect();
             assert_ne!(verdict(&available).1, 0);
         }
@@ -548,7 +565,7 @@ mod tests {
         let (line, code) = verdict(&warm_gap);
         assert_eq!(code, td_engine::exit::EXIT_UNPROVISIONED);
         assert!(
-            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 12 not run"),
+            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 13 not run"),
             "{line}"
         );
         // Every oracle from the memo, warm skipped: a pass that booted nothing,
@@ -557,6 +574,7 @@ mod tests {
             (POSTGRES, Outcome::Pass, s(3)),
             (POSTGRES_PACKAGE, Outcome::Pass, s(2)),
             (VM_WORKSPACE, Outcome::Pass, s(1)),
+            (NATIVE_SERVER, Outcome::Pass, s(1)),
             ("qemu-boot-system", Outcome::Memo, s(0)),
             ("qemu-boot-server", Outcome::Memo, s(0)),
             ("qemu-boot-audio", Outcome::Memo, s(0)),
@@ -569,7 +587,7 @@ mod tests {
         let (line, code) = verdict(&all_memo);
         assert_eq!(code, 0);
         assert!(
-            line.contains("11 passed (8 from the memo), 0 unprovisioned"),
+            line.contains("12 passed (8 from the memo), 0 unprovisioned"),
             "{line}"
         );
         assert_eq!(Outcome::Memo.word(), "memo");

@@ -645,8 +645,12 @@ step warms its declared closure and bypasses its recipe verdict memo. The
 with native qcow2 creation and disk locking. `vm-lifecycle` builds td-vmm
 and boots two small x86 guests on KVM. Each reports execution on its serial
 port. The case kills one supervisor, verifies the guest retains both locks
-and stops the two instances independently. Both VM steps run before image
-warming and even when every image oracle answers from its memo.
+and stops the two instances independently. The `native-boot-server`
+step boots the server selector and checks a
+synced write across two cold boots of a private Btrfs disk. All three
+steps run before desktop image warming, including on a memo hit. To
+run just the native server oracle from a checkout, invoke
+`td-recipe-eval native-boot-server /absolute/path/to/td-vmm`.
 The tier then warms the system
 image's inputs and exports the declared Flathub refs into the host's feed (`warm
 --flathub`, APPLICATIONS.md §W.9), which the oracles' guests fetch
@@ -658,8 +662,9 @@ outcome and wall time, recorded in the check history as
 `integration:STEP` (`td-recipe-eval check-history integration`). On its
 own it runs only those steps; beside gate goals (`td-builder check check
 integration`), it runs after the gates pass and says so when they do
-not. The native lifecycle case needs read/write access to `/dev/kvm`.
-Both fixtures use the capped runner's private test root. In
+not. The native lifecycle and server cases need read/write access to
+`/dev/kvm`. The workspace and lifecycle cases use the capped runner's
+private test root. In
 `TD_TEST_TRUSTED_ROOT=kvm` mode it also binds the caller's accessible
 KVM character device (10:232), pinned before entering the namespace.
 Missing KVM access for the lifecycle case or an entirely unavailable image

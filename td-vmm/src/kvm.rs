@@ -86,11 +86,11 @@ impl Drop for Mapping {
 }
 pub(super) struct Ram(Mapping, File);
 impl Ram {
-    pub(super) fn new() -> io::Result<Self> {
+    pub(super) fn new(len: usize) -> io::Result<Self> {
         let name = c"td-vmm-ram";
         let file = fresh(syscall(319, [name.as_ptr() as usize, 1, 0, 0, 0, 0])?)?;
-        file.set_len(boot::RAM as u64)?;
-        Ok(Self(Mapping::map(boot::RAM, &file)?, file))
+        file.set_len(len as u64)?;
+        Ok(Self(Mapping::map(len, &file)?, file))
     }
     pub(super) fn bytes(&mut self) -> &mut [u8] {
         self.0.bytes()
@@ -267,7 +267,7 @@ pub(super) fn execute(
         KVM_SET_IDENTITY_MAP_ADDR,
         input::<KVM_SET_IDENTITY_MAP_ADDR, _>(&identity),
     )?;
-    let region = [0u64, 0, boot::RAM as u64, ram.0.address.as_ptr() as u64];
+    let region = [0u64, 0, ram.0.len as u64, ram.0.address.as_ptr() as u64];
     ioctl(
         &vm,
         KVM_SET_USER_MEMORY_REGION,

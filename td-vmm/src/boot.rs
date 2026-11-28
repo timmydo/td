@@ -5,7 +5,6 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
 };
 
-pub(super) const RAM: usize = 256 << 20;
 pub(super) const PARAMS: usize = 0x7000;
 pub(super) const GDT: usize = 0x500;
 const CMDLINE: usize = 0x20000;
@@ -80,7 +79,8 @@ pub(super) fn load(
     }
     let footprint = u32::from_le_bytes(field(&header, 0x260)?) as usize;
     let initrd_max = u32::from_le_bytes(field(&header, 0x22c)?) as usize;
-    let initrd_addr = RAM
+    let ram_len = ram.len();
+    let initrd_addr = ram_len
         .min(initrd_max + 1)
         .checked_sub(initrd_size)
         .ok_or_else(|| invalid("initramfs exceeds memory"))?
@@ -113,7 +113,13 @@ pub(super) fn load(
     for (i, (base, len, kind)) in [
         (0u64, 0x9fc00u64, 1u32),
         (0x9fc00, 0x60400, 2),
-        (HIGH_RAM as u64, (RAM - HIGH_RAM) as u64, 1),
+        (
+            HIGH_RAM as u64,
+            ram_len
+                .checked_sub(HIGH_RAM)
+                .ok_or_else(|| invalid("missing high RAM"))? as u64,
+            1,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -150,7 +156,7 @@ mod tests {
         put(&mut header, 0x206, &0x20cu16.to_le_bytes())?;
         put(&mut header, 0x211, &[1])?;
         put(&mut header, 0x214, &0x100000u32.to_le_bytes())?;
-        put(&mut header, 0x22c, &0x1fffffu32.to_le_bytes())?;
+        put(&mut header, 0x22c, &u32::MAX.to_le_bytes())?;
         put(&mut header, 0x236, &1u16.to_le_bytes())?;
         put(&mut header, 0x238, &32u32.to_le_bytes())?;
         put(&mut header, 0x260, &4096u32.to_le_bytes())?;
@@ -166,6 +172,11 @@ mod tests {
             )
         };
         assert_eq!(run(&mut memory)?, HIGH_RAM);
+        let high_length = PARAMS + 0x2d0 + 2 * 20 + 8;
+        assert_eq!(
+            u64::from_le_bytes(field(&memory, high_length)?),
+            (memory.len() - HIGH_RAM) as u64
+        );
         assert_eq!(
             memory.get(HIGH_RAM..HIGH_RAM + 7),
             Some(b"payload".as_slice())

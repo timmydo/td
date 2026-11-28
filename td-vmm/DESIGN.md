@@ -21,8 +21,10 @@ One vCPU starts in 32-bit protected mode with a flat GDT, paging off,
 the Linux boot parameters in ESI and the protected-mode payload at
 its preferred address (its linked address for a fixed kernel). The loader prepares a zeroed parameter page, a bounded command
 line, an E820 memory map and a page-aligned initramfs below the kernel's
-address limit in 256 MiB of anonymous RAM. Both input files are read
-only. The guest can address only its own memory. KVM supplies the PIC,
+address limit in guest RAM. The default is 256 MiB. `--memory-mib N` accepts 256
+through 2048 MiB. The E820 map, initramfs placement, KVM memory slot and
+virtio address checks all use that machine's RAM size. Both input files
+are read only. The guest can address only its own memory. KVM supplies the PIC,
 IOAPIC, local APIC and PIT. A read-only CMOS clock supplies UTC. COM1 provides transmit and its IRQ on line
 4. The machine terminates on a guest keyboard-controller reset. A KVM
 shutdown exit, including a triple fault, is an error.
@@ -73,6 +75,15 @@ two real KVM guests on
 private raw disks, kills one supervisor, proves lock retention and
 duplicate-launch and deletion refusal, then force-stops each guest
 through its own endpoint.
+
+The independent `native-boot-server` integration step builds the runner
+and the server image, provisions the selector with a fresh volume UUID
+and boots the same private writable disk twice with 2 GiB of RAM. Each
+boot must report the expected deployment manifest hash, the kexec
+handoff, a read-only EROFS root and writable Btrfs state. The first
+boot creates and syncs a marker under `/var`. After a power cut the
+second must report the retained identity and read that marker. Cloud
+metadata, SSH and firmware boots are covered by `qemu-boot-server`.
 
 With `--control SOCKET`, the initialized machine binds a mode-0600 Unix
 datagram socket in a private directory. The four bytes `stop` request a

@@ -1196,6 +1196,25 @@ pub fn qemu_boot_server_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::server::run(&runner)
 }
 
+/// Direct kernel boot of a headless deployment using the specified td-vmm.
+pub fn native_boot_server_cli(args: &[String]) -> Result<(), String> {
+    let [vmm] = args else {
+        return Err("usage: native-boot-server TD-VMM".into());
+    };
+    let targets = &[crate::checks::qemu_boot::server::STEM, "td-btrfs"];
+    ensure_targets_provenance(targets)?;
+    let root = env::current_dir().map_err(|e| {
+        td_engine::allocation::format(format_args!("current dir: {e}")).unwrap_or_default()
+    })?;
+    let name = scratch_name("qemu-boot", &["native-server"]);
+    let runner = RecipeCheckRunner::new(root, &name)?
+        .with_streamed_progress()
+        .with_allowed_builds(oracle_reach(targets)?);
+    crate::warm::preflight(&runner, targets)?;
+    let _lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::native_server::run(&runner, Path::new(vmm))
+}
+
 /// One offline graphical session, with the full system boot evidence contract.
 /// Host-side only: the gate sandbox does not supply a QEMU executable.
 pub fn qemu_boot_session_cli(args: &[String]) -> Result<(), String> {
@@ -10200,6 +10219,7 @@ chmod 755 '{}'
             "qemu_boot_erofs_cli",
             "qemu_boot_system_cli",
             "qemu_boot_server_cli",
+            "native_boot_server_cli",
             "qemu_boot_session_cli",
             "qemu_boot_net_cli",
             "qemu_boot_kexec_cli",
@@ -11655,6 +11675,7 @@ chmod 755 '{}'
             "qemu_boot_net_cli",
             "qemu_boot_session_cli",
             "qemu_boot_server_cli",
+            "native_boot_server_cli",
             "qemu_boot_system_cli",
             "qemu_boot_uefi_cli",
             "qemu_deploy_rollback_cli",

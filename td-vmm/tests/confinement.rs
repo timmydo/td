@@ -94,7 +94,7 @@ fn only_the_kvm_module_owns_raw_resources() {
                 "syscall(9,[0,len,3,1,file.as_raw_fd()asusize,0])",
                 "fresh(syscall(319,[name.as_ptr()asusize,1,0,0,0,0])?)",
                 "syscall(11,[self.address.as_ptr()asusize,self.len,0,0,0,0])",
-                "Mapping::map(boot::RAM,&file)",
+                "Mapping::map(len,&file)",
                 "Mapping::map(len,&cpu)",
                 "fresh(ioctl(&kvm,KVM_CREATE_VM,0)?)",
                 "fresh(ioctl(&vm,KVM_CREATE_VCPU,0)?)",

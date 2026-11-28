@@ -1,6 +1,6 @@
 //! A single legacy virtio-blk PCI function with one split virtqueue.
 //! Guest addresses are offsets in the VM's memory file, never host pointers.
-use crate::{boot, invalid};
+use crate::invalid;
 use std::{
     fs::{File, OpenOptions},
     io,
@@ -199,10 +199,15 @@ impl Block {
     }
 
     fn drain(&mut self, mem: &File) -> io::Result<()> {
+        let ram_size = mem.metadata()?.len();
         let table = u64::from(self.pfn) << 12;
         let avail = table + u64::from(QUEUE) * 16;
         let used = (avail + 6 + u64::from(QUEUE) * 2 + 4095) & !4095;
-        checked(table, (used - table) as usize + 4 + usize::from(QUEUE) * 8)?;
+        checked(
+            ram_size,
+            table,
+            (used - table) as usize + 4 + usize::from(QUEUE) * 8,
+        )?;
         let notify = u16::from_le_bytes(read_at(mem, avail)?) & 1 == 0;
         let end = u16::from_le_bytes(read_at(mem, avail + 2)?);
         if end.wrapping_sub(self.avail) > QUEUE {
@@ -224,7 +229,7 @@ impl Block {
                     len: u32::from_le_bytes(part(&raw, 8)?),
                     flags: u16::from_le_bytes(part(&raw, 12)?),
                 };
-                checked(desc.addr, desc.len as usize)?;
+                checked(ram_size, desc.addr, desc.len as usize)?;
                 if desc.flags & !3 != 0 {
                     return Err(invalid("unnegotiated descriptor flag"));
                 }
@@ -253,7 +258,7 @@ impl Block {
             let (status_byte, len) = self.transfer(mem, kind, sector, buffers)?;
             mem.write_all_at(&[status_byte], status.addr)?;
             let item = used + 4 + u64::from(self.used % QUEUE) * 8;
-            checked(item, 8)?;
+
             mem.write_all_at(&u32::from(head).to_le_bytes(), item)?;
             mem.write_all_at(&len.to_le_bytes(), item + 4)?;
             self.avail = self.avail.wrapping_add(1);
@@ -353,18 +358,14 @@ struct Descriptor {
     flags: u16,
 }
 
-fn checked(addr: u64, n: usize) -> io::Result<()> {
-    if addr
-        .checked_add(n as u64)
-        .is_none_or(|end| end > boot::RAM as u64)
-    {
+fn checked(ram_size: u64, addr: u64, n: usize) -> io::Result<()> {
+    if addr.checked_add(n as u64).is_none_or(|end| end > ram_size) {
         Err(invalid("virtio address outside guest RAM"))
     } else {
         Ok(())
     }
 }
 fn read_at<const N: usize>(mem: &File, addr: u64) -> io::Result<[u8; N]> {
-    checked(addr, N)?;
     let mut b = [0; N];
     mem.read_exact_at(&mut b, addr)?;
     Ok(b)
@@ -430,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn one_queue_request_reads_across_the_eight_mib_boundary() -> io::Result<()> {
+    fn large_queue_request_can_target_ram_above_the_default_machine_size() -> io::Result<()> {
         let dir = td_fs::TempDir::new("td-vmm-large-io")?;
         let disk = dir.path().join("disk");
         let size = (8 << 20) + 512u32;
@@ -438,7 +439,7 @@ mod tests {
         image.set_len(u64::from(size))?;
         image.write_all_at(b"last sector", u64::from(size) - 512)?;
         let mem = File::create_new(dir.path().join("ram"))?;
-        let data = 65536u64;
+        let data = 300u64 << 20;
         mem.set_len(data + u64::from(size))?;
         let mut device = Block::open(&disk, false)?;
         device.pfn = 1;

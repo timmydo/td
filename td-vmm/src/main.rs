@@ -41,7 +41,7 @@ fn run() -> io::Result<()> {
     let mut args = env::args_os().skip(1);
     let usage = || {
         invalid(
-            "usage: td-vmm KERNEL INITRAMFS 'kernel command line' [--disk-ro RAW | --disk-rw RAW] [--control SOCKET]",
+            "usage: td-vmm KERNEL INITRAMFS 'kernel command line' [--disk-ro RAW | --disk-rw RAW] [--control SOCKET] [--memory-mib 256..2048]",
         )
     };
     let kernel = args.next().ok_or_else(usage)?;
@@ -49,17 +49,25 @@ fn run() -> io::Result<()> {
     let append = args.next().ok_or_else(usage)?;
     let mut disk = None;
     let mut control = None;
+    let mut memory_mib = None;
     while let Some(flag) = args.next() {
         let path = args.next().ok_or_else(usage)?;
         if (flag == "--disk-rw" || flag == "--disk-ro") && disk.is_none() {
             disk = Some(block::Block::open(path.as_ref(), flag == "--disk-rw")?);
         } else if flag == "--control" && control.is_none() {
             control = Some(path);
+        } else if flag == "--memory-mib" && memory_mib.is_none() {
+            let mib = path
+                .to_str()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|mib| (256..=2048).contains(mib))
+                .ok_or_else(usage)?;
+            memory_mib = Some(mib);
         } else {
             return Err(usage());
         }
     }
-    let mut memory = kvm::Ram::new()?;
+    let mut memory = kvm::Ram::new(memory_mib.unwrap_or(256) << 20)?;
     let entry = boot::load(
         memory.bytes(),
         File::open(kernel)?,

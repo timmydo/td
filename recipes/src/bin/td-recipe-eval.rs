@@ -494,6 +494,11 @@ fn main() {
                 die(&error);
             }
         }
+        Some("native-boot-server") => {
+            if let Err(e) = check_runner::native_boot_server_cli(args.get(2..).unwrap_or(&[])) {
+                die_runner(&e);
+            }
+        }
         Some("qemu-boot-server") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::qemu_boot_server_cli(rest) {
