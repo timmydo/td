@@ -5,9 +5,12 @@ signing job is required. A non-expiring root policy keeps its selected image
 and installer signatures valid while the publisher is offline. Signatures
 establish authenticity, not that a release is newest or free of security bugs.
 
-Keep the local publisher repository, signing keys and upload credentials
-outside the checkout. Back up the repository after publication and keep the
-root private key offline. Retain the complete root rotation chain. Review
+Keep the publisher's local repository, signing keys and upload credentials
+outside the checkout. The bucket holds the release history; the local
+repository is a working copy each run brings up to it
+([Pull release history](S3.md#pull-release-history)). Back up the ISO
+catalog after publication and keep the root private key offline. Retain
+the complete root rotation chain. Review
 source changes regularly and publish tested images when useful or required
 for security fixes; missing a release date does not disable downloads.
 
@@ -25,7 +28,8 @@ From a clean, reviewed checkout, run:
 reset, or select a Git branch: update your checkout to the intended reviewed
 main revision first. The launcher rebuilds the host builder and evaluator,
 and the Rust command resolves a freshly built td-net through the existing
-provisioned host toolchain, warms pinned inputs, builds the ISO and
+provisioned host toolchain, pulls the bucket's release history into the
+local repository, warms pinned inputs, builds the ISO and
 retains the exact deployment it carries, warms every source and
 build-root pin and uploads them to the [source mirror](MIRROR.md), signs
 the image and ISO, promotes and uploads the update, publishes the ISO
@@ -88,15 +92,18 @@ with mode `0600`. The offline root private key is **not needed**. Keep it
 in the offline backup. Do not place private files in the checkout or in the
 served repository.
 
-When moving the existing publisher to Timmy, copy its **complete** repository,
-public root chain, release key, credentials and ISO catalog with every file
-that catalog references. Rewrite catalog paths that name the old account.
-The copy must be owned by Timmy and accessible to him; another checkout alone
-does not transfer these files. Stop publication from the old account before
-switching. Do not start a fresh repository against an existing bucket: it
-would lose sequence and retention history. The command refuses a missing
-repository or catalog. For an intentionally new, empty publisher, provision
-its root/repository first and explicitly create a header-only catalog:
+When moving the existing publisher to Timmy, copy its current public root,
+release key, credentials and ISO catalog with every file that catalog
+references; earlier root epochs come from the bucket. Rewrite catalog
+paths that name the old account. The copy must be owned by Timmy and
+accessible to him; another checkout alone does not transfer these files.
+The release repository need not be copied: a run creates it if absent and
+pulls the bucket's history into it. Keep the old repository until its own
+`gc-s3` has collected the objects it staged, which no other repository can
+([Storage retention](#storage-retention)). Stop publication from the old
+account before switching. The command refuses a
+missing catalog. For an intentionally new, empty publisher, provision its
+root first and explicitly create a header-only catalog:
 
 ```text
 td-iso-catalog-v1
@@ -113,9 +120,15 @@ incomplete ISO and deployment before retrying. Upload failures retain reusable
 signed objects. A different configuration or a superseding selected release
 refuses reuse rather than silently changing the publication target.
 
-A workflow lock serializes these commands sharing a repository. It does not
-coordinate separate copies on other hosts or lower-level operator commands;
-use one publisher at a time. Local selected heads can advance before upload,
+A workflow lock serializes these commands sharing a repository. Each run
+pulls the bucket's release history when it starts and again before it
+stages the index. An index another host staged meanwhile is numbered
+above. A release another host selected meanwhile refuses the run, since
+this commit would supersede it; the error names the release's
+`selected-head-before` file, and removing it (allowed while this run has
+staged nothing) publishes this commit over it anyway, keeping the build.
+Nothing excludes two hosts or lower-level operator commands running at
+once; use one publisher at a time. Local selected heads can advance before upload,
 and the local catalog records the intended listing before the page upload.
 A failed run is not a completed publication: retry it to reconcile a lost
 reply. Update discovery and the ISO listing are separate remote writes; a
@@ -125,7 +138,7 @@ Each artifact directory records the configuration, complete payload/ISO hashes,
 index hash, ISO signature path, original and selected signed heads, and
 successful completion.
 `tests-passed` exists only after both requested test commands pass. Keep these
-records and back up the publisher repository and catalog after publication.
+records and back up the catalog after publication.
 Only `./publish`'s retention step deletes remote files; nothing schedules
 periodic signing.
 
@@ -208,9 +221,11 @@ failure of signature verification. A suspended client may need the current
 release if its old objects were collected.
 
 The command reclaims exactly its planned local candidates after confirming
-remote deletion or absence. Do not run standalone local GC on this published
-repository: losing local history still present remotely blocks safe remote
-collection. Unknown remote indexes or differing heads require reconciliation.
-Keep the latest repository backup. [S3.md](S3.md#remote-collection) defines
+remote deletion or absence. Unknown remote indexes or differing heads
+refuse it, so run `release pull-s3` first, as `./publish` does. A pulled
+repository holds only the objects its host staged, and only those are
+candidates; another host's unreachable objects wait for that host's
+collection. Do not run standalone local GC on a published repository: its
+later cutoff could delete history still remote. [S3.md](S3.md#remote-collection) defines
 the bounds and exclusivity assumptions. This collector never deletes
 installer downloads or mirrored sources; `./publish`'s retention does.

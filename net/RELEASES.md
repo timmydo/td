@@ -289,7 +289,10 @@ These commands operate on a local repository and do not upload data.
 The explicit `upload-s3` command
 uploads the selected signed release to an S3-compatible static bucket;
 [S3.md](S3.md) specifies credentials, conditional writes, publication order,
-cache policy, and bounds.
+cache policy, and bounds. For a bucket that already holds releases, run
+its `pull-s3` before `publish-next`, so the sequence is chosen above the
+bucket's history rather than this host's alone
+([Pull release history](S3.md#pull-release-history)).
 
 `gc REPOSITORY ROOT` is a dry run; `--delete` performs deletion under the
 same lease as publication. It retains selected indexes indefinitely.

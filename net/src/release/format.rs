@@ -31,8 +31,11 @@ pub fn number(text: &str) -> Result<u64> {
     Ok(n)
 }
 
+/// Every release profile; collection and pulling walk each one's head.
+pub const PROFILES: &[&str] = &["system-x86-64", "server-x86-64"];
+
 pub fn profile(text: &str) -> Result<()> {
-    if !matches!(text, "system-x86-64" | "server-x86-64") {
+    if !PROFILES.contains(&text) {
         return Err("unsupported release profile".into());
     }
     Ok(())

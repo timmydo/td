@@ -1863,3 +1863,244 @@ fn static_collection_retains_selected_and_recently_superseded_indexes() {
     s3_upload(&args).unwrap();
     assert!(!publisher::garbage(&f.repo).unwrap().contains(&indexes[0]));
 }
+
+fn s3_pull(f: &Fixture, mock: &crate::s3::tests::Mock, cred: &Path, repo: &Path) -> Result<()> {
+    let words = [
+        repo.to_str().unwrap(),
+        f.root.to_str().unwrap(),
+        &mock.endpoint,
+        "auto",
+        "td-releases",
+        cred.to_str().unwrap(),
+        "test",
+    ];
+    pull::command(&words)
+}
+
+fn selected_head(repo: &Path, root: &Path) -> Head {
+    let root = Root::parse(&text(root, SMALL).unwrap(), None).unwrap();
+    Head::parse(
+        &text(&repo.join("heads/system-x86-64"), SMALL).unwrap(),
+        &root,
+        now().unwrap(),
+        "system-x86-64",
+    )
+    .unwrap()
+}
+
+fn latest_index(repo: &Path, root: &Path) -> (u64, String) {
+    let root = Root::parse(&text(root, SMALL).unwrap(), None).unwrap();
+    let mut latest = (0, String::new());
+    for entry in fs::read_dir(repo.join("releases")).unwrap() {
+        let entry = entry.unwrap();
+        let release = Release::parse(
+            &text(&entry.path(), INDEX_LIMIT).unwrap(),
+            &root,
+            now().unwrap(),
+            "system-x86-64",
+        )
+        .unwrap();
+        if release.sequence > latest.0 {
+            latest = (release.sequence, entry.file_name().into_string().unwrap());
+        }
+    }
+    latest
+}
+
+#[test]
+fn two_publishers_continue_one_history_through_the_bucket() {
+    let f = Fixture::new();
+    let mock = crate::s3::tests::Mock::new();
+    let cred = f.dir.join("credentials");
+    crate::s3::tests::write_credentials(&cred);
+    s3_upload(&s3_args(&f, &mock, &cred)).unwrap();
+
+    // A second publisher starts from nothing but the bucket.
+    let other = f.dir.join("other");
+    s3_pull(&f, &mock, &cred, &other).unwrap();
+    assert_eq!(
+        fs::read(other.join("heads/system-x86-64")).unwrap(),
+        fs::read(f.repo.join("heads/system-x86-64")).unwrap()
+    );
+    assert_eq!(fs::read_dir(other.join("objects")).unwrap().count(), 0);
+    let profile = "system-x86-64";
+    publisher::publish_next(
+        &other,
+        &f.root,
+        &f.key,
+        profile,
+        &"2".repeat(40),
+        &f.deployment,
+    )
+    .unwrap();
+    let (sequence, index) = latest_index(&other, &f.root);
+    assert_eq!(sequence, 2);
+    publisher::promote_next(&other, &f.root, &f.key, profile, &index).unwrap();
+    let mut args = s3_args(&f, &mock, &cred);
+    args[0] = other.to_str().unwrap().into();
+    s3_upload(&args).unwrap();
+
+    // The first publisher learns that release and numbers above it. The
+    // selection it loses keeps a collection grace, as a local promotion's,
+    // and a pull that fails part way replaces no head without that grace.
+    fs::write(f.repo.join("retention-hold-until"), "1\n").unwrap();
+    let before = fs::read(f.repo.join("heads/system-x86-64")).unwrap();
+    let server = "heads/server-x86-64".to_string();
+    mock.store.lock().unwrap().files.insert(
+        server.clone(),
+        crate::s3::tests::Stored {
+            bytes: b"not a head".to_vec(),
+            headers: Default::default(),
+        },
+    );
+    assert!(s3_pull(&f, &mock, &cred, &f.repo).is_err());
+    assert_eq!(
+        fs::read(f.repo.join("heads/system-x86-64")).unwrap(),
+        before
+    );
+    assert_eq!(publisher::retention_hold(&f.repo).unwrap(), Some(1));
+    mock.store.lock().unwrap().files.remove(&server);
+    s3_pull(&f, &mock, &cred, &f.repo).unwrap();
+    let hold = publisher::retention_hold(&f.repo).unwrap().unwrap();
+    assert!(hold > now().unwrap() + 6 * format::DAY);
+    s3_pull(&f, &mock, &cred, &f.repo).unwrap();
+    assert_eq!(publisher::retention_hold(&f.repo).unwrap(), Some(hold));
+    assert_eq!(selected_head(&f.repo, &f.root).release, index);
+    assert_eq!(selected_head(&f.repo, &f.root).version, 2);
+    publisher::publish_next(
+        &f.repo,
+        &f.root,
+        &f.key,
+        profile,
+        &"3".repeat(40),
+        &f.deployment,
+    )
+    .unwrap();
+    let (sequence, ours) = latest_index(&f.repo, &f.root);
+    assert_eq!(sequence, 3);
+    // A promotion not yet uploaded stays selected across a pull.
+    publisher::promote_next(&f.repo, &f.root, &f.key, profile, &ours).unwrap();
+    s3_pull(&f, &mock, &cred, &f.repo).unwrap();
+    assert_eq!(selected_head(&f.repo, &f.root).release, ours);
+    s3_upload(&s3_args(&f, &mock, &cred)).unwrap();
+    s3_pull(&f, &mock, &cred, &other).unwrap();
+    assert_eq!(selected_head(&other, &f.root).release, ours);
+}
+
+#[test]
+fn pull_refuses_tampered_history_and_a_root_this_publisher_lacks() {
+    let f = Fixture::new();
+    let mock = crate::s3::tests::Mock::new();
+    let cred = f.dir.join("credentials");
+    crate::s3::tests::write_credentials(&cred);
+    s3_upload(&s3_args(&f, &mock, &cred)).unwrap();
+    let fresh = f.dir.join("fresh");
+
+    let index = format!("releases/{}", f.release);
+    let original = mock.store.lock().unwrap().files[&index].clone();
+    let mut tampered = original.clone();
+    tampered.bytes.push(b'\n');
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .insert(index.clone(), tampered);
+    let error = s3_pull(&f, &mock, &cred, &fresh).unwrap_err();
+    assert!(error.contains("does not match its digest"), "{error}");
+    assert!(!fresh.join("heads/system-x86-64").exists());
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .insert(index.clone(), original);
+
+    // A head the configured root did not sign.
+    let head = "heads/system-x86-64".to_string();
+    let good = mock.store.lock().unwrap().files[&head].clone();
+    let mut forged = good.clone();
+    let digit = forged.bytes.len() - 2;
+    forged.bytes[digit] = if forged.bytes[digit] == b'0' {
+        b'1'
+    } else {
+        b'0'
+    };
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .insert(head.clone(), forged);
+    let error = s3_pull(&f, &mock, &cred, &fresh).unwrap_err();
+    assert!(error.contains("invalid release signature"), "{error}");
+    assert!(!fresh.join("heads/system-x86-64").exists());
+    mock.store.lock().unwrap().files.insert(head, good);
+
+    // Bytes at the next epoch that this root did not sign are named so;
+    // an authentic rotation means this publisher must be reconfigured.
+    let stored = |bytes: Vec<u8>| crate::s3::tests::Stored {
+        bytes,
+        headers: Default::default(),
+    };
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .insert("roots/2".into(), stored(b"td-release-root-v1\n".to_vec()));
+    let error = s3_pull(&f, &mock, &cred, &fresh).unwrap_err();
+    assert!(error.contains("did not sign"), "{error}");
+    let rotated = root_successor(&f);
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .insert("roots/2".into(), stored(rotated.clone()));
+    let error = s3_pull(&f, &mock, &cred, &fresh).unwrap_err();
+    assert!(error.contains("configure this publisher"), "{error}");
+
+    // Configured with that root, a fresh host takes epoch 1 from the bucket
+    // and authenticates the epoch-1 history under it.
+    let current = f.dir.join("root-2");
+    let rotated_host = f.dir.join("rotated");
+    let words = [
+        rotated_host.to_str().unwrap(),
+        current.to_str().unwrap(),
+        &mock.endpoint,
+        "auto",
+        "td-releases",
+        cred.to_str().unwrap(),
+        "test",
+    ];
+    pull::command(&words).unwrap();
+    assert_eq!(
+        fs::read(rotated_host.join("roots/1")).unwrap(),
+        fs::read(&f.root).unwrap()
+    );
+    assert_eq!(fs::read(rotated_host.join("roots/2")).unwrap(), rotated);
+    assert!(rotated_host.join(&index).exists());
+    assert_eq!(
+        fs::read(rotated_host.join("heads/system-x86-64")).unwrap(),
+        fs::read(f.repo.join("heads/system-x86-64")).unwrap()
+    );
+
+    mock.store.lock().unwrap().files.remove("roots/2");
+    s3_pull(&f, &mock, &cred, &fresh).unwrap();
+    assert!(fresh.join("heads/system-x86-64").exists());
+}
+
+fn root_successor(f: &Fixture) -> Vec<u8> {
+    let (secret, bytes) = sig::keygen().unwrap();
+    let private = f.dir.join("root-2.key");
+    fs::write(&private, secret).unwrap();
+    let public = f.dir.join("release-2.pub");
+    fs::write(&public, sig::to_hex(&bytes)).unwrap();
+    let output = f.dir.join("root-2");
+    publisher::root(
+        2,
+        now().unwrap() + 365 * format::DAY,
+        &private,
+        &public,
+        &f.private,
+        &output,
+    )
+    .unwrap();
+    fs::read(output).unwrap()
+}

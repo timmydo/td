@@ -523,7 +523,7 @@ pub(super) fn garbage(repo: &Path) -> Result<Vec<PathBuf>> {
     let grace = 7 * DAY;
     let mut selected = BTreeSet::new();
     let mut has_static_head = false;
-    for name in ["system-x86-64", "server-x86-64"] {
+    for name in format::PROFILES {
         let path = repo.join("heads").join(name);
         if io(path.try_exists())? {
             let text = text(&path, SMALL)?;

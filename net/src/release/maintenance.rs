@@ -8,7 +8,7 @@ const SCOPE: &[&str] = &["objects", "releases"];
 
 fn remote_heads(client: &s3::Client, repo: &Path) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
     let mut heads = BTreeMap::new();
-    for profile in ["system-x86-64", "server-x86-64"] {
+    for profile in format::PROFILES {
         let key = format!("heads/{profile}");
         let remote = client.get(&key, SMALL)?.map(|r| r.bytes);
         let local = match fs::symlink_metadata(repo.join(&key)) {

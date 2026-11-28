@@ -108,7 +108,7 @@ impl Plan {
         Ok(())
     }
 }
-fn issued(text: &str) -> Result<u64> {
+pub(super) fn issued(text: &str) -> Result<u64> {
     format::number(text.lines().nth(3).ok_or("truncated signed metadata")?)
 }
 

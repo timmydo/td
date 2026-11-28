@@ -274,6 +274,14 @@ fn capture(program: &Path, args: &[String]) -> Result<String, String> {
     Ok(text.trim().to_owned())
 }
 
+/// Bring the local repository up to the bucket's release history, which is
+/// authoritative: another host may have published since this one last did.
+fn pull(net: &Path, config: &Config) -> Result<(), String> {
+    let mut args = vec![path_text(&config.repository), path_text(&config.root)];
+    args.extend(config.upload_args());
+    run(net, &release_args("pull-s3", args))
+}
+
 fn release_args(verb: &str, args: Vec<String>) -> Vec<String> {
     let mut result = vec!["release".into(), verb.into()];
     result.extend(args);
@@ -684,16 +692,14 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
     if source.commit.len() != 40 {
         return Err("release protocol requires a SHA-1 Git commit".into());
     }
-    // Never silently initialize history against an already populated bucket.
-    if !config.repository.is_dir() {
-        return Err("publisher repository missing; restore its complete history first".into());
-    }
     read(&config.catalog, 1024 * 1024)?;
     // A malformed pending list must stop the run here, before promotion.
     read_retired(&retired_path(&config))?;
     File::open(&config.credentials).map_err(|e| format!("open upload credentials: {e}"))?;
     File::open(&config.key).map_err(|e| format!("open release signing key: {e}"))?;
     directory(&config.artifacts)?;
+    // A cache of the bucket's release history, created on first use.
+    directory(&config.repository)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -720,16 +726,38 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
     } else {
         atomic(&identity_file, &identity)?;
     }
+    // Share the builder's isolated compiler/target selection with source warming.
+    let builder = repo.join("target/release/td-builder");
+    let net = crate::warm::resolve_td_net(&builder)?;
+    let net = fs::canonicalize(net).map_err(|e| e.to_string())?;
+    let target = fs::canonicalize(repo.join("net/target")).map_err(|e| e.to_string())?;
+    if !net.starts_with(&target) {
+        return Err("publishing requires td-net built from this checkout, not the deployed fallback; use a host with a C toolchain".into());
+    }
+    pull(&net, &config)?;
     let head = config.repository.join("heads").join(PROFILE);
     let baseline = dir.join("selected-head-before");
     let index_path = dir.join("index");
     let promoted = dir.join("promoted-head");
+    // Removing the baseline before anything is staged is the operator's way
+    // to publish this commit over a release selected since; the build stays.
     if !baseline.exists() {
-        if index_path.exists() || promoted.exists() || dir.join("built").exists() {
+        if index_path.exists() || promoted.exists() {
             return Err("retained publication lacks its original selected-head baseline".into());
         }
         atomic(&baseline, &read_head(&head)?)?;
     }
+    let superseded = |error: String| {
+        if index_path.exists() || promoted.exists() {
+            error
+        } else {
+            format!(
+                "{error}; another release was selected since this one began. To publish {} over it anyway, remove {} and rerun",
+                source.commit,
+                baseline.display()
+            )
+        }
+    };
     let previous_head = read(&baseline, 16384)?;
     let saved_index = if index_path.exists() {
         Some(read(&index_path, 128)?)
@@ -740,7 +768,8 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
         &read_head(&head)?,
         &previous_head,
         saved_index.as_deref().map(str::trim),
-    )?;
+    )
+    .map_err(superseded)?;
     if promoted.exists() && read(&promoted, 16384)? != read_head(&head)? {
         return Err(
             "another release is selected; refusing to republish a superseded release".into(),
@@ -756,14 +785,6 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
             "not requested"
         }
     );
-    // Share the builder's isolated compiler/target selection with source warming.
-    let builder = repo.join("target/release/td-builder");
-    let net = crate::warm::resolve_td_net(&builder)?;
-    let net = fs::canonicalize(net).map_err(|e| e.to_string())?;
-    let target = fs::canonicalize(repo.join("net/target")).map_err(|e| e.to_string())?;
-    if !net.starts_with(&target) {
-        return Err("publishing requires td-net built from this checkout, not the deployed fallback; use a host with a C toolchain".into());
-    }
     let iso = dir.join(format!("td-install-x86-64-{}.iso", source.commit));
     let deployment = dir.join("deployment");
     let built = dir.join("built");
@@ -819,11 +840,15 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
         path_text(&config.key),
         PROFILE.into(),
     ];
+    // The build took hours. A release selected meanwhile refuses below rather
+    // than be superseded by this commit; one only staged is numbered above.
+    pull(&net, &config)?;
     check_selection(
         &read_head(&head)?,
         &previous_head,
         saved_index.as_deref().map(str::trim),
-    )?;
+    )
+    .map_err(superseded)?;
     if !index_path.exists() {
         let mut args = common.clone();
         args.extend([source.commit.clone(), path_text(&deployment)]);
