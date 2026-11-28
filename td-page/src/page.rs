@@ -327,13 +327,13 @@ pub struct Laid {
 }
 
 /// `painted`, in tree order with `parents` worked out over it, ordered
-/// by how many floats, inline-blocks and flex items each box lies in,
-/// the box's own counted, then by tree order: floats and inline-blocks
-/// after the in-flow boxes around them, and one within another after it
-/// (CSS 2.2 appendix E paints an inline-block as an inline, after the
-/// blocks' backgrounds; Flexbox 1 §5.4 paints a flex item as an
-/// inline-block). A parent stays before its children, as it lies in no
-/// more of them than they.
+/// by how many floats, inline-blocks and flex and grid items each box
+/// lies in, the box's own counted, then by tree order: floats and
+/// inline-blocks after the in-flow boxes around them, and one within
+/// another after it (CSS 2.2 appendix E paints an inline-block as an
+/// inline, after the blocks' backgrounds; Flexbox 1 §5.4 and Grid 2 §9
+/// paint a flex or grid item as an inline-block). A parent stays before
+/// its children, as it lies in no more of them than they.
 fn floats_last(
     layout: &Layout,
     styled: &StyledDocument<'static>,
@@ -352,11 +352,11 @@ fn floats_last(
             .and_then(|&up| depth.get(up as usize))
             .copied()
             .unwrap_or(0);
-        let item = styled.has_flex()
+        let item = (styled.has_flex() || styled.has_grid())
             && parents
                 .get(at as usize)
                 .and_then(|&up| layout.boxes.get(up as usize))
-                .is_some_and(|up| styled.is_flex_container(up));
+                .is_some_and(|up| styled.is_flex_container(up) || styled.is_grid_container(up));
         if let Some(slot) = depth.get_mut(at as usize) {
             let apart = item || styled.is_float(geometry) || styled.is_inline_block(geometry);
             *slot = parent.saturating_add(u32::from(apart));
@@ -735,7 +735,10 @@ impl Laid {
             || cancel.load(Ordering::SeqCst),
             memory,
         )?;
-        if styled.styled().has_nested_lines() || styled.styled().has_flex() {
+        if styled.styled().has_nested_lines()
+            || styled.styled().has_flex()
+            || styled.styled().has_grid()
+        {
             floats_last(
                 &layout,
                 styled.styled(),
@@ -1247,6 +1250,48 @@ pub(crate) mod tests {
              <div id=c style=background:yellow;margin-top:-10px>next</div>",
         );
         assert!(!page.styled().styled().has_flex());
+        let ranks: Vec<u32> = page
+            .painted()
+            .iter()
+            .map(|&at| page.tree().rank(page.geometry(at).unwrap().node))
+            .collect();
+        assert!(ranks.windows(2).all(|w| w[0] <= w[1]), "{ranks:?}");
+    }
+
+    /// A grid item paints as a flex item does (Grid 2 §9): after the
+    /// in-flow boxes around its container, items among themselves in tree
+    /// order whatever their placement.
+    #[test]
+    fn grid_items_paint_after_the_blocks_around_them() {
+        let page = laid(
+            "<body style=margin:0><div id=x style='display:grid;grid-template-columns:50px 50px;\
+             background:blue'><div id=b style='grid-column:2;background:green'>two</div>\
+             <div id=a style='grid-row:1;grid-column:1;background:red'><p id=p \
+             style=background:white>in</div></div>\
+             <div id=c style=background:yellow;margin-top:-10px>next</div>",
+        );
+        assert!(page.styled().styled().has_grid());
+        assert!(!page.styled().styled().has_flex());
+        let at = |id: &str| {
+            let node = page.tree().target(id).unwrap();
+            let geometry = page
+                .layout
+                .boxes
+                .iter()
+                .position(|g| g.node == node)
+                .unwrap() as u32;
+            page.painted().iter().position(|&p| p == geometry).unwrap()
+        };
+        assert!(at("x") < at("c"), "the container before the block after it");
+        assert!(at("c") < at("b") && at("b") < at("a") && at("a") < at("p"));
+        // Without grid, tree order.
+        let page = laid(
+            "<body style=margin:0><div id=x style=background:blue>\
+             <div id=b style=background:green>two</div><div id=a style=background:red>\
+             <p id=p style=background:white>in</div></div>\
+             <div id=c style=background:yellow;margin-top:-10px>next</div>",
+        );
+        assert!(!page.styled().styled().has_grid());
         let ranks: Vec<u32> = page
             .painted()
             .iter()

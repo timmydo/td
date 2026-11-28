@@ -1869,6 +1869,13 @@ mod cases {
                      <table><tr><td><div class=f style=align-items:center><b>p</b><b>q<br>r</b></div>\
                      <td>cell</table><p>clear",
                 );
+                // Grids in flex items and flex containers in grid items,
+                // placed out of order and stretched to rows.
+                html.push_str(
+                    "<div class=f><div style='display:grid;grid-template-columns:1fr 1fr;flex:1'>\
+                     <p style=grid-row:2>low<br>two<p>top<p class=f style=align-items:end>\
+                     <b>a</b><b>b<br>c</b></div><p>beside</div>",
+                );
             }
         }
         let doc = td_html::document::parse(&html).unwrap();

@@ -34,6 +34,8 @@ pub const MAX_FRAGMENTS: usize = 1_048_576;
 pub const MAX_COORDINATE: f64 = 1_000_000_000.0;
 /// Columns one table's grid may hold (DESIGN.md §5, "Tables").
 pub const MAX_TABLE_COLUMNS: usize = 4096;
+/// Cells, rows by columns, one grid may hold (DESIGN.md §5, "Grid").
+pub const MAX_GRID_CELLS: usize = 1 << 22;
 /// HTML's ceilings on a cell's `colspan` and `rowspan` (HTML §4.9.11).
 pub const MAX_COLSPAN: u32 = 1000;
 pub const MAX_ROWSPAN: u32 = 65534;
@@ -340,6 +342,9 @@ pub struct StyledDocument<'d> {
     /// Whether any block box is a flex container (`flex_container`);
     /// layout lays flex lines only then.
     flex: bool,
+    /// Whether any block box is a grid container (`grid_container`);
+    /// layout lays grids only then.
+    grid: bool,
 }
 enum DocumentOwner<'d> {
     Borrowed(&'d Document),
@@ -505,6 +510,7 @@ impl<'d> StyledDocument<'d> {
             floats: false,
             inline_blocks: false,
             flex: false,
+            grid: false,
         };
         let mut numbering = list::Numbering::new(memory)?;
         // List items are admitted while the index and scratch live.
@@ -580,6 +586,7 @@ impl<'d> StyledDocument<'d> {
                 out.floats |= parent.is_some() && float_side(computed, kind).is_some();
                 out.inline_blocks |= parent.is_some() && inline_block(computed, kind);
                 out.flex |= flex_container(computed, kind);
+                out.grid |= grid_container(computed, kind);
                 if let Some(element) = node.element() {
                     if kind == BoxKind::Block && keyword(computed, Property::Display) == "list-item"
                     {
@@ -736,6 +743,16 @@ impl<'d> StyledDocument<'d> {
                 .style(geometry.style)
                 .is_some_and(|style| flex_container(style, BoxKind::Block))
     }
+    /// Whether `geometry` was laid for a grid container (DESIGN.md §5,
+    /// "Grid"), whose items paint as flex items do: none on a page without
+    /// one.
+    pub fn is_grid_container(&self, geometry: &crate::block::BoxGeometry) -> bool {
+        self.grid
+            && !geometry.replaced
+            && self
+                .style(geometry.style)
+                .is_some_and(|style| grid_container(style, BoxKind::Block))
+    }
     pub fn style(&self, id: StyleId) -> Option<&ComputedStyle> {
         self.styles.get(id)
     }
@@ -813,6 +830,15 @@ impl<'d> StyledDocument<'d> {
     pub fn has_flex(&self) -> bool {
         self.flex
     }
+    /// Whether any box is a grid container (DESIGN.md §5, "Grid").
+    pub fn has_grid(&self) -> bool {
+        self.grid
+    }
+    /// Whether any box is a flex or grid container: one test where
+    /// layout gathers what their items' content wants.
+    pub(crate) fn lays_apart(&self) -> bool {
+        self.flex | self.grid
+    }
 }
 impl StyledDocument<'static> {
     /// Own the immutable document without a self-referential borrow.
@@ -840,6 +866,7 @@ impl StyledDocument<'static> {
             floats,
             inline_blocks,
             flex,
+            grid,
             ..
         } = built;
         Ok(Self {
@@ -859,6 +886,7 @@ impl StyledDocument<'static> {
             floats,
             inline_blocks,
             flex,
+            grid,
         })
     }
 }
@@ -899,6 +927,11 @@ pub(crate) fn inline_block(style: &ComputedStyle, kind: BoxKind) -> bool {
 /// (DESIGN.md §5, "Flex").
 pub(crate) fn flex_container(style: &ComputedStyle, kind: BoxKind) -> bool {
     kind == BoxKind::Block && matches!(keyword(style, Property::Display), "flex" | "inline-flex")
+}
+/// Whether a box of `kind` is a grid container: a block whose display is
+/// `grid` (DESIGN.md §5, "Grid").
+pub(crate) fn grid_container(style: &ComputedStyle, kind: BoxKind) -> bool {
+    kind == BoxKind::Block && keyword(style, Property::Display) == "grid"
 }
 /// The side a float is on, or a clear applies to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

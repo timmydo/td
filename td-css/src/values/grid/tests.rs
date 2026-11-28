@@ -961,13 +961,11 @@ mod cases {
     }
 
     #[test]
-    fn supports_reports_grid_properties_unsupported_until_display_grid() {
+    fn supports_reports_display_grid_and_the_grid_properties() {
         use crate::conditions::supports_matches;
-        // The cascade computes them, but a page gating its grid layout on
-        // one keeps its fallback until `display: grid` parses.
+        // td-layout lays `display: grid`, so its properties are supported.
         for query in [
             "(display: grid)",
-            "(display: inline-grid)",
             "(grid-template-columns: repeat(2, 1fr))",
             "(GRID-TEMPLATE-COLUMNS: 1fr)",
             "(grid-template-areas: 'a b')",
@@ -983,23 +981,28 @@ mod cases {
             "(grid-row-gap: 1px)",
             "(grid-column-gap: 1px)",
             "(display: flex) and (grid-area: a)",
-        ] {
-            assert_eq!(supports_matches(query), Ok(false), "{query}");
-        }
-        // Flex's alignment and gaps, and the one new shorthand of them
-        // alone, stay supported.
-        for query in [
             "(display: flex)",
             "(gap: 1px)",
-            "(row-gap: 1px)",
-            "(align-items: center)",
-            "(justify-content: space-evenly)",
             "(place-content: center)",
-            "not (grid-area: a)",
-            "(display: flex) or (grid-area: a)",
         ] {
             assert_eq!(supports_matches(query), Ok(true), "{query}");
         }
+        // `inline-grid` waits for inline grid layout; `subgrid` is invalid.
+        for query in [
+            "(display: inline-grid)",
+            "(grid-template-columns: subgrid)",
+            "not (grid-area: a)",
+        ] {
+            assert_eq!(supports_matches(query), Ok(false), "{query}");
+        }
+    }
+
+    #[test]
+    fn display_grid_parses_and_inline_grid_waits() {
+        let grid = child("display:grid");
+        assert_eq!(grid.get(Display), Some(&ComputedValue::Keyword("grid")));
+        let inline = child("display:inline-grid");
+        assert_eq!(inline.get(Display), Some(&ComputedValue::Keyword("inline")));
     }
 
     #[test]

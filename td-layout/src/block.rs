@@ -24,6 +24,9 @@ mod flex_tests;
 pub(crate) mod float;
 #[cfg(test)]
 mod float_tests;
+pub(crate) mod grid;
+#[cfg(test)]
+mod grid_tests;
 #[cfg(test)]
 mod inline_block_tests;
 #[cfg(test)]
@@ -279,6 +282,16 @@ pub fn layout_with_budget(
         flex_marks: BudgetVec::new(memory)?,
         flex_measure: false,
         flex_natural: false,
+        grid: BudgetVec::new(memory)?,
+        grid_tracks: BudgetVec::new(memory)?,
+        grid_cells: BudgetVec::new(memory)?,
+        grid_lanes: BudgetVec::new(memory)?,
+        grid_tree: BudgetVec::new(memory)?,
+        grid_order: BudgetVec::new(memory)?,
+        grid_names: (grid::Names::new(memory)?, grid::Names::new(memory)?),
+        grid_known: BudgetVec::new(memory)?,
+        inner: (0.0, 0.0, 0.0, 0.0),
+        grid_measured: BudgetVec::new(memory)?,
         left: 0.0,
         top: 0.0,
         right: request.width,
@@ -407,6 +420,33 @@ struct Engine<'s, 'd, 'm, 'r, M> {
     /// auto height is its automatic minimum's content height: a row
     /// laid in it lays its stretched items so first.
     flex_natural: bool,
+    /// The items of the grid containers being laid or measured, a stack
+    /// as `flex` is, and their tracks (§5, "Grid").
+    grid: BudgetVec<grid::GridItem>,
+    grid_tracks: BudgetVec<grid::Track>,
+    /// Scratch while a grid's items are placed: the cells they occupy, a
+    /// bitset, and each lane's cursor.
+    grid_cells: BudgetVec<u64>,
+    grid_lanes: BudgetVec<u32>,
+    /// The grids being laid's rows' floors, Fenwick trees, a stack.
+    grid_tree: BudgetVec<i64>,
+    /// Items by span as a grid's tracks are sized: scratch.
+    grid_order: BudgetVec<(u32, u32)>,
+    /// Scratch while a grid's items are placed: its rows' and columns'
+    /// line name indexes, emptied for each grid, so charged once at the
+    /// largest (§5, "Grid", "Bounds").
+    grid_names: (grid::Names<'s>, grid::Names<'s>),
+    /// Each grid's items' measured contributions, kept for the layout
+    /// once it is measured a second time, so a grid laid again or
+    /// measured again measures none more: by the box of its first item's
+    /// source, never measured, measured once, or where they start in
+    /// `grid_measured` (DESIGN.md §5, "Grid", "Bounds").
+    grid_known: BudgetVec<u32>,
+    grid_measured: BudgetVec<grid::Measured>,
+    /// On a page with grid containers, the bounds a block's content
+    /// reached before its own border box was taken in: what a grid item
+    /// stretched to another height overflows (§5, "Grid", "Alignment").
+    inner: (f64, f64, f64, f64),
     left: f64,
     top: f64,
     right: f64,
@@ -823,7 +863,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 }
                 BoxKind::Image => {
                     let style = self.styled.style(b.style).ok_or(Error::Invalid)?;
-                    if self.styled.has_flex() && flex::percent_height(style) {
+                    if self.styled.lays_apart() && flex::percent_height(style) {
                         self.flex_wants |= flex::HEIGHT | flex::PERCENT;
                     }
                     let dims = dimensions(
@@ -871,7 +911,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     }
     /// Whether `b` roots a block formatting context of its own, whose
     /// floats its lines alone see and its auto height holds: the root, a
-    /// float, an inline-block, a caption, a flex container or item, or a
+    /// float, an inline-block, a caption, a flex or grid container or
+    /// item, or a
     /// block whose overflow is neither visible nor clip (a table cell is
     /// one too, which its table opens).
     fn opens_context(&self, b: &BoxNode) -> Result<bool, Error> {
@@ -885,7 +926,14 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
                 )
                 || !matches!(keyword(style, Property::OverflowX), "visible" | "clip")
                 || !matches!(keyword(style, Property::OverflowY), "visible" | "clip")
-                || (self.styled.has_flex() && (self.flex_container(b)? || self.flex_item(b)?))))
+                || (self.styled.lays_apart() && self.apart(b)?)))
+    }
+    /// Whether `b` is a flex or grid container or item.
+    fn apart(&self, b: &BoxNode) -> Result<bool, Error> {
+        Ok(
+            (self.styled.has_flex() && (self.flex_container(b)? || self.flex_item(b)?))
+                || (self.styled.has_grid() && (self.grid_container(b)? || self.grid_item(b)?)),
+        )
     }
     /// A block met in a context with floats: below those it clears, and
     /// a context's root (not a table) or a picture beside those at its
@@ -1515,7 +1563,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
         // What this box's content gathers, and what its parent's had.
         let wants = self
             .styled
-            .has_flex()
+            .lays_apart()
             .then(|| std::mem::replace(&mut self.flex_wants, 0));
         // A flex item measured for its column lays its content as at an
         // auto height (§5, "Flex", "Laying again").
@@ -1540,24 +1588,25 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             content = Some(own);
             used
         } else {
-            self.children(
-                b.first_child,
-                None,
-                Place {
-                    container: Rect {
-                        x: content_x,
-                        y: content_y,
-                        width: dims.width,
-                        height: basis.unwrap_or(0.0),
-                    },
-                    definite: basis,
-                    offset,
-                    strut: b.style,
-                    block: Some(id),
+            let place = Place {
+                container: Rect {
+                    x: content_x,
+                    y: content_y,
+                    width: dims.width,
+                    height: basis.unwrap_or(0.0),
                 },
-                depth,
-                inside,
-            )?
+                definite: basis,
+                offset,
+                strut: b.style,
+                block: Some(id),
+            };
+            if self.styled.has_grid() {
+                let (used, own) = self.grid_or_children(&b, &dims, place, depth, inside)?;
+                content = own;
+                used
+            } else {
+                self.children(b.first_child, None, place, depth, inside)?
+            }
         };
         if root {
             // A context's root holds its floats (CSS 2.2 §10.6.7).
@@ -1614,6 +1663,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             margin: dims.margin,
             replaced: b.kind == BoxKind::Image,
         };
+        if self.styled.has_grid() {
+            self.inner = (self.left, self.top, self.right, self.bottom);
+        }
         self.bounds(geometry.border)?;
         self.counters.admit_growth(&mut self.boxes)?;
         self.boxes.try_push(geometry)?;

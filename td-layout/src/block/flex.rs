@@ -34,11 +34,11 @@ pub(super) const PERCENT: u8 = 2;
 /// The re-lays of items at their used sizes that may be open around what
 /// is laid: past them an item keeps the content it was laid with, as at
 /// its hypothetical size (DESIGN.md §5, "Flex", "Laying again").
-const MAX_RELAY: u32 = 2;
+pub(super) const MAX_RELAY: u32 = 2;
 
-/// What a flex item is laid from.
+/// What a flex or grid item is laid from.
 #[derive(Clone, Copy)]
-enum Source {
+pub(super) enum Source {
     /// An element child: a block, a table or a picture laid as a block.
     Element(BoxId),
     /// A run of text and breaks no element holds, from its first up to
@@ -136,7 +136,7 @@ enum Cross {
 /// table's, whose are its border box's, and, once laid, what it laid.
 #[derive(Clone, Copy)]
 pub(super) struct FlexItem {
-    source: Source,
+    pub(super) source: Source,
     /// Its flex base size, the bounds of its main size and its target.
     base: i64,
     min: i64,
@@ -188,7 +188,7 @@ pub(super) struct FlexItem {
 /// before: what a re-lay restores, then lays from the item again.
 #[derive(Clone, Copy)]
 pub(super) struct Mark {
-    at: u32,
+    pub(super) at: u32,
     lines: u32,
     boxes: u32,
     markers: u32,
@@ -225,7 +225,7 @@ pub(super) fn percent_height(style: &ComputedStyle) -> bool {
 }
 
 /// Whether `style`'s `p` is a percentage or a sum holding one.
-fn percentage(style: &ComputedStyle, p: Property) -> bool {
+pub(super) fn percentage(style: &ComputedStyle, p: Property) -> bool {
     matches!(
         style.get(p),
         Some(ComputedValue::Length(
@@ -325,7 +325,7 @@ pub(super) struct FlexLine {
 
 /// An index into the layout's output, which fits a u32 as `MAX_LINES`,
 /// `MAX_BOXES` and `MAX_FRAGMENTS` do.
-fn index(at: usize) -> Result<u32, Error> {
+pub(super) fn index(at: usize) -> Result<u32, Error> {
     u32::try_from(at).map_err(|_| Error::Invalid)
 }
 
@@ -361,7 +361,7 @@ fn cross(own: &str, container: &str) -> Cross {
 /// `free` laid by `justify-content` (§8.2), or the line `at` by
 /// `align-content` (§8.4): every share a floor of the cumulative one, so
 /// the shares sum exactly.
-fn justify(value: &str, free: i64, at: i64, count: i64) -> i64 {
+pub(super) fn justify(value: &str, free: i64, at: i64, count: i64) -> i64 {
     let share = |part: i64, whole: i64| -> i64 {
         if whole <= 0 {
             return 0;
@@ -395,7 +395,7 @@ fn main_justify(value: &str, lay: Lay) -> &str {
 
 /// 1/64 px rounded up, but for what lies within 1e-9 of a unit: a line
 /// or container that holds its tallest item.
-fn holding(v: f64) -> i64 {
+pub(super) fn holding(v: f64) -> i64 {
     let whole = units(v);
     if px(whole) + 1e-9 < v {
         whole + 1
@@ -439,6 +439,8 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
             if !lay.column {
                 return self.flex_intrinsic(b, lay.wrap, depth);
             }
+        } else if self.styled.has_grid() && self.grid_container(b)? {
+            return self.grid_intrinsic(b, depth);
         }
         self.content_with(b.first_child, None, b.style, lead, depth)
     }
@@ -1008,8 +1010,9 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     }
     /// The flex item from `next` on, which it moves past: an element
     /// child, or a run of other children up to the next element holding
-    /// more than white space; each child looked at a unit of work.
-    fn next_flex_item(
+    /// more than white space; each child looked at a unit of work. A grid
+    /// gathers its items so too (Grid 2 §6), taking their sources.
+    pub(super) fn next_flex_item(
         &mut self,
         next: &mut Option<BoxId>,
         align: &str,
@@ -1481,7 +1484,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// The state before the item `at` is laid, from which it and those
     /// after it may be laid again: none while an outside marker waits for
     /// the next line, which the item's first line would take.
-    fn mark(&self, at: usize) -> Option<Mark> {
+    pub(super) fn mark(&self, at: usize) -> Option<Mark> {
         if !self.waiting.is_empty() {
             return None;
         }
@@ -1514,7 +1517,7 @@ impl<M: FontMetrics> Engine<'_, '_, '_, '_, M> {
     /// a unit of work for each line, box and marker dropped: each item is
     /// laid whole, its floats, inline sequences and markers settled in it,
     /// so the stacks it used are as `mark` found them.
-    fn restore(&mut self, mark: &Mark) -> Result<(), Error> {
+    pub(super) fn restore(&mut self, mark: &Mark) -> Result<(), Error> {
         let n = |n: u32| n as usize;
         let (lines, boxes, markers) = (n(mark.lines), n(mark.boxes), n(mark.markers));
         if !self.waiting.is_empty() || self.nested.len() != n(mark.nested) {

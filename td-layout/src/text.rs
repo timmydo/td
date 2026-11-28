@@ -97,6 +97,7 @@ fn page_text(styled: &StyledDocument<'_>) -> Result<Option<(TextRun, BoxId)>, Er
     if styled.has_tables()
         || styled.has_nested_lines()
         || styled.has_flex()
+        || styled.has_grid()
         || styled.marker_count() != 0
     {
         return Err(Error::Invalid);

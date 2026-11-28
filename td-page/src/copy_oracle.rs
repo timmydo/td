@@ -1,6 +1,7 @@
 //! A generated oracle for copying (td-web/DESIGN.md §10, "Copying"):
-//! seeded pages of floats, inline-blocks, tables, inline tables, lists
-//! and flex rows, wrapping rows, columns and inline flex containers, and
+//! seeded pages of floats, inline-blocks, tables, inline tables, lists,
+//! flex rows, wrapping rows, columns and inline flex containers, and grids
+//! of items placed out of their source order, and
 //! what a copy of them holds, worked from the lines and the
 //! boxes they lie in rather than from what `copy` keeps as it walks; the
 //! marker checks alone read the walk, for the order lines begin in. A
@@ -795,6 +796,138 @@ mod cases {
                         wrapped(out, "<td>", "</td>", |out| flex(&mut r, 1, out));
                         wrapped(out, "<td>", "</td>", |out| words(&mut r, out));
                     });
+                }),
+                _ => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                    inline(&mut r, 0, out);
+                }),
+            }
+        }
+        out
+    }
+
+    // Grid pages: grids of the flex pages' items in fixed, `fr`, `auto`
+    // and content-sized tracks, auto-placed, spanning, or placed by
+    // explicit lines in a shuffled source order, so their lines lie out
+    // of tree order; rows of fixed, flexible and auto sizes, items
+    // aligned in them and laid again at their heights; in floats, cells,
+    // inline-blocks, list items and flex items, and nested.
+
+    fn grid_item(r: &mut Rng, depth: usize, out: &mut String, place: &str) {
+        let own = [
+            "",
+            "",
+            "align-self:center;",
+            "justify-self:start;",
+            "align-self:end;",
+        ][r.below(5) as usize];
+        let _ = write!(out, "<div style='{place}{own}'>");
+        for _ in 0..1 + r.below(2) {
+            if depth < 2 && r.below(8) == 0 {
+                grid(r, depth + 1, out);
+            } else {
+                flex_item(r, depth + 1, out);
+            }
+        }
+        out.push_str("</div>");
+    }
+
+    fn grid(r: &mut Rng, depth: usize, out: &mut String) {
+        let cols = 1 + r.below(4);
+        let sizes: Vec<&str> = (0..cols)
+            .map(|_| {
+                [
+                    "1fr",
+                    "auto",
+                    "40px",
+                    "minmax(30px,1fr)",
+                    "2fr",
+                    "max-content",
+                    "minmax(0,1fr)",
+                ][r.below(7) as usize]
+            })
+            .collect();
+        let rows = ["auto", "auto", "1fr", "30px", "minmax(20px,auto)"][r.below(5) as usize];
+        let align = ["normal", "center", "end", "start"][r.below(4) as usize];
+        let justify = ["normal", "center", "start", "end"][r.below(4) as usize];
+        let extra = [
+            "",
+            "",
+            "height:150px;",
+            "min-height:100px;align-content:center;",
+            "grid-auto-flow:column;grid-template-rows:auto auto;",
+            "row-gap:4px;column-gap:6px;",
+            "grid-template-columns:repeat(auto-fill,minmax(50px,1fr));",
+        ][r.below(7) as usize];
+        let _ = write!(
+            out,
+            "<div style='display:grid;grid-template-columns:{};grid-auto-rows:{rows};\
+             align-items:{align};justify-items:{justify};{extra}'>",
+            sizes.join(" ")
+        );
+        let n = 1 + r.below(6);
+        if r.below(3) == 0 {
+            // A row-major tiling's cells, in a shuffled source order.
+            let mut cells: Vec<(u64, u64)> = (0..n).map(|k| (k / cols + 1, k % cols + 1)).collect();
+            for at in (1..cells.len()).rev() {
+                cells.swap(at, r.below(at as u64 + 1) as usize);
+            }
+            for (row, col) in cells {
+                grid_item(r, depth, out, &format!("grid-row:{row};grid-column:{col};"));
+            }
+        } else {
+            for _ in 0..n {
+                let place = [
+                    "",
+                    "",
+                    "",
+                    "grid-column:span 2;",
+                    "grid-row:span 2;",
+                    "grid-row:1;",
+                    "grid-column:-2;",
+                ][r.below(7) as usize];
+                grid_item(r, depth, out, place);
+            }
+        }
+        out.push_str("</div>");
+    }
+
+    fn grid_page(seed: u64) -> String {
+        let mut r = Rng::new(seed, 0x6e1d_9a6e);
+        let mut out = body(&mut r, 60, 400);
+        for _ in 0..1 + r.below(3) {
+            match r.below(10) {
+                0..=3 => grid(&mut r, 0, &mut out),
+                4 => wrapped(&mut out, "<div style=float:left>", "</div>", |out| {
+                    grid(&mut r, 1, out);
+                }),
+                5 => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
+                    words(&mut r, out);
+                    wrapped(out, "<span style=display:inline-block>", "</span>", |out| {
+                        grid(&mut r, 1, out);
+                    });
+                    words(&mut r, out);
+                }),
+                6 => wrapped(&mut out, "<ul>", "</ul>", |out| {
+                    for _ in 0..1 + r.below(3) {
+                        wrapped(out, "<li>", "</li>", |out| {
+                            if r.below(2) == 0 {
+                                words(&mut r, out);
+                            }
+                            grid(&mut r, 1, out);
+                        });
+                    }
+                }),
+                7 => wrapped(&mut out, "<table>", "</table>", |out| {
+                    wrapped(out, "<tr>", "</tr>", |out| {
+                        wrapped(out, "<td>", "</td>", |out| grid(&mut r, 1, out));
+                        wrapped(out, "<td>", "</td>", |out| words(&mut r, out));
+                    });
+                }),
+                8 => wrapped(&mut out, "<div style=display:flex>", "</div>", |out| {
+                    wrapped(out, "<div style=flex:1>", "</div>", |out| {
+                        grid(&mut r, 1, out)
+                    });
+                    flex_item(&mut r, 1, out);
                 }),
                 _ => wrapped(&mut out, "<p style=margin:0>", "</p>", |out| {
                     inline(&mut r, 0, out);
@@ -1699,5 +1832,10 @@ mod cases {
     #[test]
     fn flex_pages_copy_as_they_are_painted() {
         run("flex", 4_000_000, flex_page);
+    }
+
+    #[test]
+    fn grid_pages_copy_as_they_are_painted() {
+        run("grid", 5_000_000, grid_page);
     }
 }

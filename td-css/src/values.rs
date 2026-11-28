@@ -979,17 +979,6 @@ pub(crate) fn parse_declaration(
         memory,
     )
 }
-/// The properties `@supports` reports unsupported though the cascade
-/// computes them, until `display: grid` parses (DESIGN.md §4, "Grid"):
-/// every `grid*` name, `justify-items` and `justify-self`, and
-/// `place-items` and `place-self` whole, conservatively: their align
-/// halves act in flex, but their justify halves await grid.
-pub(crate) fn awaits_grid_layout(name: &str) -> bool {
-    const JUSTIFY: &[&str] = &["justify-items", "justify-self", "place-items", "place-self"];
-    name.get(..4)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("grid"))
-        || JUSTIFY.iter().any(|j| name.eq_ignore_ascii_case(j))
-}
 fn parse_named(
     name: &str,
     values: &[Component],
@@ -1215,6 +1204,7 @@ fn parse_value(
                 "table-caption",
                 "flex",
                 "inline-flex",
+                "grid",
             ],
         ),
         Color | BackgroundColor | BorderTopColor | BorderRightColor | BorderBottomColor

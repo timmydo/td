@@ -781,6 +781,56 @@ mod tests {
         );
     }
 
+    /// Grid items placed out of source order keep their lines in tree
+    /// order: a place maps back to its line, a point finds the item drawn
+    /// there, the visually upper one above, and a copy reads them in tree
+    /// order, each item a paragraph.
+    #[test]
+    fn places_and_copies_across_grid_items() {
+        let laid = laid(
+            "<body style=margin:0><div style='display:grid;grid-template-columns:60px 60px;\
+             align-items:center'>\
+             <div style=grid-row:2>low<br>down</div><div style='grid-row:1;grid-column:2'>right</div>\
+             <div style=grid-row:1>top<br>two<br>three</div> text</div><p style=margin:0>after",
+        );
+        let lines = laid.lines();
+        let shown = |line: &td_layout::inline::Line| {
+            line.fragments
+                .iter()
+                .map(|f| text::fragment_text(&laid, f))
+                .collect::<String>()
+        };
+        let texts: Vec<String> = lines.iter().map(shown).collect();
+        assert_eq!(
+            texts,
+            ["low", "down", "right", "top", "two", "three", "text", "after"]
+        );
+        // The second row's lines lie below the first's, though laid first;
+        // "right" is centred beside the three-line item.
+        assert!(lines[0].y > lines[5].y);
+        assert!(lines[2].y > lines[3].y && lines[2].y < lines[5].y);
+        for (at, line) in lines.iter().enumerate() {
+            for item in text::items(&laid, line) {
+                assert_eq!(text::line_of(&laid, item.start), at, "{item:?}");
+                assert_eq!(text::line_of(&laid, item.end), at, "{item:?}");
+            }
+            assert_eq!(laid.outer(at), None);
+            // A point on a line finds it.
+            let (left, right) = text::horizontal(line);
+            let middle = line.y + line.height / 2.0;
+            assert_eq!(text::line_at(&laid, (left + right) / 2.0, middle), Some(at));
+        }
+        // Above everything, the visually upper item's first line.
+        assert_eq!(text::line_at(&laid, 10.0, -5.0), Some(3));
+        let mut out = String::new();
+        let (first, last) = text::page_bounds(&laid);
+        let _ = text::copy(&laid, first, last, &mut |t| {
+            out.push_str(t);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert_eq!(out, "low\ndown\nright\ntop\ntwo\nthree\ntext\nafter");
+    }
+
     /// A picture item is blockified, so it lays no fragment and has no
     /// place: its alt text is not copied, as a block picture's is not.
     #[test]

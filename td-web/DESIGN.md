@@ -1698,11 +1698,12 @@ CSS background images and SVG are not fetched.
 byte offset in its decoded text on a scalar boundary, or before or
 after a replaced element. Places are ordered by the tree-order table,
 four bytes a node (1 MiB at td-html's `MAX_NODES`). td-layout lays
-normal flow, tables and flex containers in tree order (a flex item's
-lines, as a table cell's, item by item and line by line whatever its
-alignment or baseline moved, a `row-reverse` row mirrored or `order`
-placed it; an anonymous item's naming its container and ending its
-paragraph, td-layout/DESIGN.md §5, "Flex"), puts a float's lines after
+normal flow, tables and flex and grid containers in tree order (a flex
+or grid item's lines, as a table cell's, item by item and line by line
+whatever its alignment or baseline moved, a `row-reverse` row mirrored,
+`order` or its grid lines placed it; an anonymous item's naming its
+container and ending its paragraph, td-layout/DESIGN.md §5, "Flex",
+"Grid"), puts a float's lines after
 the line it was met in (td-layout/DESIGN.md §5, "Floats") and an
 inline-block's after the line holding it ("Inline-blocks"; an inline
 table and an inline flex container are inline-blocks here and below,
@@ -2048,16 +2049,17 @@ order, then every glyph.
 2. Each box in tree order: its background colour over its border box,
    then each border side as a fill of its width, every style but `none`
    and `hidden` drawn solid. On a page with floats, inline-blocks or
-   flex containers, boxes are ordered by how many floats,
-   inline-blocks and flex items (`StyledDocument::is_float`,
+   flex or grid containers, boxes are ordered by how many floats,
+   inline-blocks and flex and grid items (`StyledDocument::is_float`,
    `is_inline_block`, and a box whose nearest ancestor with geometry
-   `is_flex_container`) each lies in, its own counted, then in tree
+   `is_flex_container` or `is_grid_container`) each lies in, its own counted, then in tree
    order, so an in-flow block's background after a float, an
    inline-block or a flex item does not cover it, nor a float's
    in-flow block a float within it (CSS 2.2 appendix E, floats after
    in-flow blocks' backgrounds, and inline-blocks with the inline
-   content after them; Flexbox 1 §5.4 paints a flex item as an
-   inline-block, in tree order here, not `order`'s); the count is
+   content after them; Flexbox 1 §5.4 and Grid 2 §9 paint a flex or
+   grid item as an inline-block, in tree order here, not `order`'s or
+   placement's); the count is
    worked out once down the tree order, from each box's nearest
    ancestor with geometry. Boxes that overlap paint by depth then tree
    order, not each float, inline-block or flex item whole in turn: two
@@ -2237,9 +2239,10 @@ and `sticky` stay in flow); flex layout's reversed lines and columns
 (`wrap-reverse` laid as `wrap`, `column-reverse` as `column`), a
 column's wrapping and shrinking, `order` in a row wrapping onto
 lines or a column
-and `last baseline` (td-layout/DESIGN.md §5, "Flex"), and grid
-until td-layout has it, laid in normal flow as td-layout specifies,
-nothing hidden by it; floats and inline-blocks, inline tables and inline
+and `last baseline` (td-layout/DESIGN.md §5, "Flex"); grid's `dense`
+packing (laid sparse), baseline alignment (laid at the start), `order`,
+subgrid and masonry, and `inline-grid`, which td-css does not parse yet
+(td-layout/DESIGN.md §5, "Grid", "Departures"); floats and inline-blocks, inline tables and inline
 flex containers among them, are
 td-layout's
 (td-layout/DESIGN.md §5, "Floats", "Inline-blocks"), their boxes
@@ -2575,7 +2578,8 @@ order; each is its own design amendment when it starts:
   of flexbox (`wrap-reverse` and `column-reverse`, a column's wrapping
   and shrinking, `order` in rows wrapping onto lines and columns,
   laying a grown or stretched item's content again past two nested
-  re-lays and at the line `align-content` grows) and grid;
+  re-lays and at the line `align-content` grows) and the rest of grid
+  (`inline-grid`, `dense`, baselines, `order`, subgrid);
   pseudo-elements and
   generated content; element state (`:hover`, `:focus`) reported to
   the cascade.

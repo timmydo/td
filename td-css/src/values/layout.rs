@@ -881,8 +881,9 @@ fn word(style: &ComputedStyle, p: Property) -> Option<&'static str> {
 }
 /// What computing a style ends with: border widths of invisible styles,
 /// overflow pairs, and blockification of the root, a float and a flex
-/// item, a child of a `flex` or `inline-flex` box (`parent` its computed
-/// style), whose `float` computes to `none` (Flexbox 1 §4).
+/// or grid item, a child of a `flex`, `inline-flex` or `grid` box
+/// (`parent` its computed style), whose `float` computes to `none`
+/// (Flexbox 1 §4, Grid 2 §6.1).
 pub(super) fn finish(
     style: &mut ComputedStyle,
     parent: Option<&ComputedStyle>,
@@ -907,7 +908,8 @@ pub(super) fn finish(
         }
     }
     let floated = matches!(word(style, Float), Some("left" | "right"));
-    let item = parent.is_some_and(|p| matches!(word(p, Display), Some("flex" | "inline-flex")));
+    let item =
+        parent.is_some_and(|p| matches!(word(p, Display), Some("flex" | "inline-flex" | "grid")));
     if item && floated {
         style.set(Float, ComputedValue::Keyword("none"))?;
     }

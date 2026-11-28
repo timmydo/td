@@ -373,7 +373,8 @@ mod cases {
             Some(ComputedValue::Keyword(k)) => *k,
             other => panic!("{other:?}"),
         };
-        for container in ["display:flex", "display:inline-flex"] {
+        // A grid container's are too (Grid 2 §6.1).
+        for container in ["display:flex", "display:inline-flex", "display:grid"] {
             let parent = child(container);
             for (own, want) in [
                 ("inline", "block"),
@@ -392,6 +393,7 @@ mod cases {
                 ("list-item", "list-item"),
                 ("table", "table"),
                 ("flex", "flex"),
+                ("grid", "grid"),
                 ("none", "none"),
             ] {
                 let s = style(&format!("display:{own}"), Some(&parent));
@@ -402,7 +404,7 @@ mod cases {
                 assert_eq!(float(&s), "none", "{container} {own} floated");
                 // Its own children are not flex items.
                 let grandchild = style("display:inline;float:none", Some(&s));
-                let blockified = matches!(want, "flex");
+                let blockified = matches!(want, "flex" | "grid");
                 assert_eq!(
                     display(&grandchild),
                     if blockified { "block" } else { "inline" },

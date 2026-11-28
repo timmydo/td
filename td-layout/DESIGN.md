@@ -455,6 +455,8 @@ scroll containers and stacking contexts are consumer/future work.
 Tables are laid as grids (below, "Tables"). Inline-blocks are laid
 whole in their lines (below, "Inline-blocks"). Flex containers lay
 their items in rows, wrapping or not, or in a column (below, "Flex").
+Grid containers place their items in rows and columns of sized tracks
+(below, "Grid").
 List items use block flow, with
 the markers below. visibility:hidden
 retains geometry and style so the eventual painter can suppress it.
@@ -1845,6 +1847,347 @@ the only one to lay a row at an auto height (2026-11-25, load average 3
 to 4, pinned to one CPU) lay every shape above as the build before them
 did, boxes, lines, markers and work, charging within 240 bytes of it.
 
+### Grid
+
+A block box whose computed display is `grid` is a **grid container**,
+laid by [CSS Grid 2][grid2] without subgrid or masonry, and Box
+Alignment 3's values; `inline-grid` is not yet parsed (td-css/DESIGN.md
+§4, "Grid"). `StyledDocument::has_grid` says whether any box is one,
+set while boxes are generated as `has_flex` is, so a page without one
+takes none of what follows: its geometry, lines, work and charges are
+those of a layout without grid. The code is `block/grid.rs`.
+
+[grid2]: https://www.w3.org/TR/css-grid-2/
+
+**Items** (§6). td-css blockifies a grid container's children as a
+flex container's (td-css/DESIGN.md §4) and computes their `float` to
+`none`. Each element child is an item, and each run of other children
+holding more than white space one anonymous item, laid in the
+container's style, as a flex container's (above, "Flex", "Items";
+`next_source` gathers both). The container and each item root a block
+formatting context.
+
+**Placement** (§8). Each item's lines are resolved from its four
+placement longhands (§8.3): a positive integer counts lines from the
+explicit grid's start, a negative one from its end; with a name, only
+lines of that name count, an area's edges naming lines `name-start` and
+`name-end` (§7.3.2) beside those the track lists name, and past those
+there are, every implicit line counts as named; a lone name is the area
+edge it names, else the first line of that name; `span` counts lines, of
+a name where given, from the opposite edge. Conflicts resolve as §8.3.1
+has them: lines swapped when reversed, an end equal to its start one
+past it, two spans the start's, a named span alone a span of one. Lines
+are clamped to ±MAX_GRID_LINE (10,000), as Gecko's are and td-css clamps
+their integers. Each of the last eight styles a grid's items had is
+resolved once and its placement kept, so an item sharing one is at most
+eight style comparisons. A name is looked up in an index of each axis's
+line names, made once a grid as an item first names one, from the track
+list as written, not as its repeats expand: each distinct name, sorted,
+with the lines it holds outside repeats, ascending and once, and for
+each repeat holding it a block, the repetitions' start, period and count
+and its offsets within one, so the lines below a line are a binary
+search of the names and arithmetic over the blocks, and the `k`th is a
+binary search over lines of that count; an area's edge is merged in
+among the lines of its name. The explicit grid is the template's tracks,
+an automatic repeat repeated (below, "Tracks"), or the areas' rows and
+columns, the more. Items are then auto-placed by §8.5's sparse algorithm
+in rows, or in columns for `grid-auto-flow: column` (`dense` is laid as
+sparse, below, "Departures"): those of definite lines in both axes
+first, those of a definite row (a column, flowing by columns) each past
+those placed in its row before it, then the rest by a cursor moving
+along the row and down, an item of a definite column only down. The
+cells occupied are a bitset, a row of 64-bit words for each row, grown
+as rows are and copied wider where a row-locked item passes the columns,
+each word probed or set a unit of work. A grid of more than
+MAX_GRID_CELLS (4,194,304) cells, rows by columns, is refused
+`Limit("MAX_GRID_CELLS")`, as placed and as the bitset grows rows or
+widens: 512 KiB of bitset at most and a word a row more, and a bound on
+the tracks a page can ask for with lines at the clamp, 20,000 rows by
+10,000 columns, whose items are few. The bitset and each row's cursor
+are scratch, dropped once the grid is placed. Implicit tracks take
+`grid-auto-rows` and `grid-auto-columns` in turn, forward from the
+template's last track and backward from its first (§7.6); tracks the
+areas add past the template take them as the implicit ones after it.
+
+**Tracks** (§7.2, §12). A size is a length, a percentage of the
+container's content width (a column) or its definite height (a row; auto
+where it has none, §7.2.1), `fr`, `auto`, `min-content`, `max-content`,
+`minmax()` or `fit-content()`: `1fr` is `minmax(auto, 1fr)`,
+`fit-content(L)` an auto minimum and a max-content maximum capped at L.
+An `auto-fill` or `auto-fit` repeat repeats as many times as its tracks
+fit the content width (§7.2.3.2), a row's its definite or greatest
+height, else as few as fill its least one, else once; each track at its
+maximum where that is fixed, floored by its minimum where that is too,
+else its minimum, at least 1 px, the gaps counted, and at most as many
+as keep the list within MAX_GRID_LINE tracks. An `auto-fit` repeat's
+columns no item occupies collapse to 0, their gaps with them, so `fr`
+columns share the whole width. Tracks are sized by §12: base sizes and
+growth limits from fixed functions (§12.4), then from the items (§12.5):
+those of one track not flexible set it (step 2), those spanning several
+and no flexible track distribute, smallest span first, each span's
+together (step 3, §12.5.1's six sub-steps, frozen at limits then past
+them as §12.5.1 has it), those crossing a flexible track distribute to
+its flexible tracks by their factors (step 4); an infinite limit is then
+its base (step 5). A track is maximized to its growth limit by equal
+shares of a definite free space, or, at an auto height, outright, but by
+equal shares of what a `max-height` leaves where its limits would pass
+it (§12.6); flexible tracks are expanded (§12.7) by the fr size definite
+space leaves, tracks whose base exceeds their share inflexible until
+none does, or at an auto height by the largest fr size any flexible
+track's base or item crossing one asks, worked again as definite space
+at a `min-height` that leaves the grid short of or a `max-height` it
+passes (§12.7.1), so a sticky footer's `auto 1fr auto` rows fill a least
+height through their `1fr`; `auto` tracks then share what a definite or
+least size leaves where the content alignment is `normal` or `stretch`
+(§12.8). Every size is whole 1/64 px; equal and `fr` shares are steps
+between floors of the cumulative ones, as flex's are, so a `repeat(n,
+1fr)` row lays as `flex: 1 1 0px` items do and columns sum exactly to
+the room they fill. An item's contributions are its min-content and
+max-content widths as block flow measures a child (above, "Tables",
+"Widths"), measured once a layout an item and only where a track it
+spans is intrinsic (an `auto`, `min-content` or `max-content` minimum or
+maximum, `fit-content()`, `1fr`'s auto minimum), and its minimum
+contribution (§6.6): its px width, its px `min-width`, else, no scroll
+container (`overflow-x` visible or clip) spanning an auto minimum, and
+no flexible track where it spans several, its min-content width; else
+its edges alone. So `repeat(auto-fill, minmax(200px, 1fr))` and
+`minmax(0, 1fr)` columns measure nothing, `1fr` measures every item it
+holds, and an item spanning `1fr` columns has no automatic minimum.
+Columns come first: the container's width is definite. Then
+`justify-content` places them in what they leave (Box Alignment 3 §5.3,
+unsafe, as flex's main axis), each gap the column gap.
+
+**Rows and bands.** Items are laid once each in tree order, so their
+lines stay in tree order, each at its columns' x and width and the
+least top its rows may take: the rows above it, each at its **floor**,
+and their gaps. A row's floor is its fixed minimum, and what §12.5
+step 2 gives its base size of the single-row items laid in it so far:
+their outer heights as laid, or their minimum contributions (a px
+`min-height`, a scroll container's edges); at an auto height without
+bounds, where rows reach their growth limits, a non-flexible row's
+floor is its growth limit's too, at least its fixed maximum. Base sizes
+and growth limits only grow, so a floor only grows and never passes
+the row's final size, and an item only moves down; items spanning
+rows are left out of it. The floors' sums are a Fenwick tree, each
+query and raise a unit of work a node. Where every row's size is fixed
+(px, a percentage of a definite height, or `minmax(px, fr)` at a
+definite height), the rows are sized before any item is laid, and each
+item is laid at its area directly, a stretched one at its height, so
+nothing moves but by an item's own alignment. Otherwise the items are
+laid in **bands**: a band of rows closes after an item where every item
+laid so far ends above a row every later item starts at or below (the
+least row start of the items after each, found once), and where
+nothing couples rows across the grid: `fr` rows, whose fr size is the
+largest any item asks or what a definite height leaves; a definite,
+least or greatest height, whose free space each row shares or whose
+bound a row's size is counted against (§12.6, §12.8). A coupled grid is
+one band.
+At each close the band's rows are sized by §12 from what its items laid,
+their offsets placed below the band before, the tree raised to their
+sizes, and each item moved down to its area, stretched or aligned there
+or laid again (below), and the outermost retained container keeps the
+window. So a row-major card grid closes a band every row, each row's
+items laid at their final tops, and an out-of-order grid, or one of
+`grid-auto-rows: 1fr`, is one band, every item moved once.
+
+**Alignment** (§11, Box Alignment 3 §6). An item's `justify-self` and
+`align-self` (`auto` its container's `justify-items` and `align-items`,
+`legacy` its position) are `normal` and `stretch`, `start` (and
+`self-start`, `flex-start`, `left`, the baselines), `center` and `end`
+(`self-end`, `flex-end`, `right`); `normal` is `start` for a picture
+and stretches anything else. Across, a stretched block of auto width
+and no auto horizontal margin takes its area's width less its margins,
+as block flow gives it; any other its own width or its shrink-to-fit one
+(above, "Floats"), placed by its auto margins, which take the free space
+first, else at its area's start, centre or end, never left of it; a
+table sizes itself and is placed so, as a flex column's table item.
+Down, a block of auto height and no auto vertical margin is stretched to
+its area's height less its margins, within its own min and max heights:
+its content and border heights are rewritten as a flex line's stretched
+item's are, or it is laid at that height where its rows are fixed;
+auto vertical margins share positive free space; `center` and `end` move
+it down; an item taller than its area stays at its top, as `safe`
+alignment has it. A table and a picture are not stretched. A stretched
+item overflows with its stretched box and what it holds, not the box it
+first laid: block flow notes what a box's content reached before its
+own border box, on a page with grid containers.
+`align-content` places rows in what a definite or least height leaves,
+safely: never up.
+
+**Laying again.** An item's area height is definite once its rows are
+sized, and what it holds is laid against it, as a stretched flex item's
+(above, "Flex", "Laying again"): a stretched item whose content holds
+percentages of its height, or wants its height and is stretched from
+the height it laid, and an item of percentage `height`, `min-height`,
+`max-height` or relative offset, laid first as at an auto height, are
+laid again at their area's height, with every item after them in the
+band, from the first such, once, at their final places; nothing then
+moves. The state before each is a `Mark`, `mark` and `restore` as a flex
+line's, on the same stack; one certain to be laid again (its own
+percentage, or percentages in it) is the band's last marked, as a flex
+line's `settled` one. Re-lays nest at most `MAX_RELAY` (2) deep with
+flex's: an item laid in two open re-lays is laid once. A grid's content
+wants its height (it lays otherwise at another definite height of it)
+where it has `fr` rows, `auto` rows its `align-content` stretches, or
+`align-content` other than a start, and its content holds percentages
+of it where a row or its row gap is a percentage.
+
+**Measured widths.** Measured for a cell, a float, an inline-block or
+an item, a grid's content is placed and its columns sized under a
+min-content and then a max-content constraint (§12.3), percentages auto:
+its min-content width the columns' sum and gaps under the first, its
+max-content width under the second. Under a constraint an auto minimum
+takes the item's min-content contribution limited by a fixed maximum,
+free space is 0 under the first and infinite under the second, and an
+`fr` column takes its base under the first and, under the second, the
+largest fr size its tracks' bases and its items' max-content
+contributions ask. An automatic repeat repeats as many times as a px
+`max-width` holds, else as few as fill a px `min-width`, else once.
+Each item is measured at most twice a layout, charged as measuring is
+(`MEASURE_BOX` and its scalars): its grid's second measure keeps its
+contributions, by the box of the grid's first item, for whatever lays
+the grid again or measures it; a grid measured once keeps none.
+
+**Painting.** A grid item paints as a flex item does, it and the boxes
+within it after the in-flow boxes around its container: td-page counts
+a box whose nearest ancestor with geometry is a grid container as laid
+apart (`StyledDocument::is_grid_container`), on a page with any.
+Items among themselves paint in tree order, not by placement.
+
+**Output and lines.** Geometry is in postorder: each item's, then the
+container's. Lines are in tree order, item by item, as a flex
+container's are, so line order is not y order where items are placed
+out of source order or moved by their alignment: an item placed in the
+first row after one in the second has its lines after the second's,
+above them. An anonymous item has no geometry, its lines naming the
+container. A grid's lines are no inline-block's last in flow, as a
+flex container's (`last_baseline` restored around it); a grid has no
+baseline of its own (below, "Departures").
+
+**Windows.** Lines laid in a grid may move down until their band
+closes, so where any may (rows not all fixed, or an item centred, at
+the end or with an auto vertical margin) a grid's lines and markers are
+kept whatever the window above its end while a band is open, as a
+table's are, and the outermost such container or table keeps the
+window's once each band closes; one starting at or below the window's
+end is dropped as laid, since lines only move down. A row-major grid
+holds at most a row of lines above its window; one band, a coupled or
+out-of-order grid, holds every line above its window until it ends,
+charged as laid, and is refused `MAX_PAGE_BYTES` past the page budget.
+What a re-lay drops is laid since the window was last kept and is laid
+again at its final place. A windowed layout equals the filtered whole
+one.
+
+**Bounds.** Each item is a 192-byte record and each track an 88-byte
+one, in budgeted stacks a nested grid extends after its ancestors' and
+truncates when done, charged with the layout's output as they grow; the
+floors' tree is 8 bytes a row, and sizing sorts its items' 8-byte span
+keys in a budgeted scratch vector. Gathering items charges a unit a
+child looked at, placement a unit an item and a word probed or marked.
+An axis's name index, the engine's scratch while a grid's items are
+placed, emptied for each grid and so charged once a layout at its
+largest, reserves up to some 100 bytes a name as the list is written,
+its entries and scratch grown by doubling (page bytes, counting twice
+what is reserved, 1.2 KB for a list of 4 names, 25.6 KB for 100 and 198
+KB for 1,000), charged a unit an item and a unit a name of the list, its
+sort's bound before it (n log n comparisons of the longest name, a unit
+each and one for each 64 bytes), and a unit a line or block each name is
+given: what the list spells, not its repeats expanded, so 400 names of
+2,503 bytes in an `auto-fill` repeat of 10,000 tracks cost 231,033 work
+and 0.5 ms. A lookup is charged a unit a probe of the names and one for
+each 64 bytes of the name, compared as byte slices, and a unit a block
+and a probe of its lines each time it counts them, some 15 times for a
+`k`th line. Sizing charges a unit a track, and three a track an item
+spans for each sub-step it distributes in, and a unit a track for each
+pass of a distribution or of finding an fr size, each pass freezing a
+track. Each item is measured at most twice a layout, its contributions
+kept from its grid's second measure in a 40-byte record, a unit of work
+an item to keep and one to take, found by a table of 4 bytes a box made,
+at its size, as a grid page first measures an item; laid once in each
+open lay of its ancestors and moved once a lay (its lines, boxes and
+markers a unit each), its floor's tree a unit a node. A band laid again
+lays its items from the first marked one again, so costs what flex's
+lines do: about twice laying it where that is its first item. As flex's,
+a box is laid at most 1 + m + m(m - 1)/2 times where m of its ancestors'
+bands and lines lay again, re-lays nesting at most `MAX_RELAY` deep. So
+20,000 paragraphs of three words in d grids of `height: 100%` each
+nested in the last, each grid's content wanting its height, cost 1.08
+million work at d = 0, 4.6 million (66 ms) at 2, 13.2 million (174 ms)
+at 4, 28.3 million (367 ms) at 6, 50.0 million (652 ms) at 8, and are
+refused `MAX_LAYOUT_WORK` at 12; a lone leaf in such a nest costs as the
+cube of the depth, 0.90 million work (30 ms) 60 deep, 7.0 million (236
+ms) 120 deep (2.3 KB of page), 32.4 million (1.1 s) 200 deep and 63.1
+million (2.2 s) 250 deep, a little short of the limit, which refuses
+some deeper, about 2.2 s and 34 ns a unit. Placement, sizing and laying
+cost what the items do, linearly, a Fenwick query and a name's searches
+aside (log rows, log names). Nested grids of auto width measure each
+item once, linear in depth: charged, and refused `MAX_LAYOUT_WORK` past
+it; a grid's items are laid one level below it, and `MAX_DEPTH` bounds
+the nesting. Every size is clamped to `MAX_COORDINATE` and every factor
+to 2^40 units of 2^-20, so shares and fr sizes are exact in i128.
+
+**Measured.** Release, the host of §6, a harness's deterministic
+metrics (advances of 5 to 9 px by scalar, 1.25 em lines), 2026-11-28
+under a load average of about 1.3, pinned to one CPU, medians of nine
+layouts, the build before built from `git archive` of its tree. Eleven
+2 MiB shapes without grid (prose, blocks, table rows, nested tables,
+floats, inline-blocks, nested lists, inline tables, navbars, flex cards,
+a wrapping row of `height: 100%` cards) and 300 generated pages of
+blocks, tables, floats, inline-blocks, lists, pictures and flex give
+identical boxes, lines, markers, height, overflow, cuts, work, page and
+output bytes and charges, whole and in three windows, at 1280, 832 and
+200 px (4,043 layouts), against the build before; three rounds
+interleaved with it lay them in the same time, -4.9% to +2.4%. Pages
+whose grids laid as blocks before now lay them (work against the
+blocks', at 1280 px): 2.0 MiB of `repeat(auto-fill, minmax(200px,
+1fr))` cards, a heading and a paragraph each with padding and a border,
+each row a band, in 61 to 73 ms, 4,751,034 work (1.14 times, 49 ms
+before); the same cards in `repeat(4, 1fr)`, whose `1fr` columns
+measure every card, 81 ms and 121 ms at 200 px, 6,590,118 work (1.6
+times); page shells of `grid-template-areas` (a header and a footer
+spanning a 150 px nav and a `1fr` main), 85 ms, 7,021,786 work (1.6
+times); 2.0 MiB of paragraphs in `1fr 1fr` columns of `grid-auto-rows:
+1fr` with the first item placed in row 20,000, one band of every item,
+moved once, 104 ms and 131 to 152 ms at 200 px, 9,449,618 work (1.9
+times), every line held until the grid ends. The worst found are grids
+whose items lay again: cards that are each a grid of `auto 1fr auto`
+rows, each laid at its auto height and again at its row's, 181 ms,
+11,994,303 work (3.1 times, 47 ms before), and cards holding a child of
+`height: 100%`, laid again so, 97 ms, 8,230,361 work (2.2 times). Line
+names cost their index and two searches an item: 150,000 items placing
+by four absent names each in 1,000-name lists of 28-byte names, in two
+styles in turn, lay in 137 ms, 2,404,401 work (4.3 s and 4,800,047 work
+before the index and kept placements); in nine, each searching again,
+197 ms, 28,804,049 work, 6.8 ns a unit.
+
+**Departures and later increments.** `dense` packing is laid as sparse.
+Baseline self-alignment is start alignment (§11.6's shim and `last
+baseline` with it), and a grid has no baseline: an inline-block holding
+one takes its bottom margin edge or a line after it. `order` does not
+reorder items for placement or painting (§8.5's order-modified document
+order is tree order). `inline-grid` (td-css parses it not yet), subgrid,
+masonry and writing modes other than horizontal left-to-right are not
+laid. §12.1 step 3, sizing the columns again once the rows' sizes are
+known for items whose min-content width depends on their height, is not
+run. Percentage rows of a grid of auto height are auto, not resolved
+again against the height that gives (§7.2.1): sizing its rows again
+would move items up. A row's `auto-fit` repeat is laid as `auto-fill`.
+Tracks an area adds past the template, beside implicit tracks, take the
+auto sizes from the first, not the cycle after the explicit grid. A
+spanning item's limited contribution under a constraint is not limited
+by its tracks' fixed maxima. Rows are aligned safely (never above the
+content box); columns are not. An item taller than its area moves
+nothing up for `center` or `end`. A table item is not stretched and is
+never narrower than its columns' minimum. A stretched item laid again
+keeps the row sizes the first lay measured, so content that grows when
+laid at its area's height overflows it. An item whose first line an
+outside list marker waits for is not laid again, as a flex item's is not
+(above, "Flex"): `<li>` holding a grid whose first item is `height: 50%`
+lays it at its auto height. A cell aligned on its baseline, or a flex
+item of a row of `align-items: baseline`, that holds a grid aligns to
+the first line of the grid's first item in tree order, not of its first
+row.
+
 ## 6. Work bounds, resize and validation
 
 All limits are named constants and tested at and beyond their edges.
@@ -1870,6 +2213,7 @@ The layout limits supplement, not weaken, td-html and td-css limits.
 | MAX_FRAGMENT_SCALARS | 1,024 | scalars one text fragment coalesces (§3) |
 | MAX_MARKER_BYTES | 17 | one list marker's text (§5, "List markers") |
 | MAX_TABLE_COLUMNS | 4,096 | one table's grid columns (§5, "Tables") |
+| MAX_GRID_CELLS | 4,194,304 | one grid container's rows by columns (§5, "Grid"); td-css clamps its lines to ±10,000 |
 | MAX_COLSPAN, MAX_ROWSPAN | 1,000, 65,534 | HTML's clamps on a cell's spans |
 | MAX_VIEWPORT | 1,000,000 px | viewport width and height |
 | MAX_COORDINATE | 1,000,000,000 px | absolute geometry extent |
@@ -2608,7 +2952,11 @@ blockified items, then wrapping, columns, `row-reverse` and
 `align-content` (§5, "Flex"), then inline-flex, items' paint order,
 baseline alignment and a row's `order`; re-laying a grown or stretched
 item's content, `wrap-reverse`, `column-reverse` and a column's
-wrapping and shrinking after. Open for
+wrapping and shrinking after. Grid lands in increments too: td-css's
+properties (a), then `display: grid` with placement, track sizing,
+bands of rows, alignment and grid items' paint order (b, §5, "Grid"),
+then `inline-grid` (d); `dense`, baselines, `order` and §12.1's rerun
+after. Open for
 tables: a windowed layout
 holds the lines above its window in the row being laid and in rows a
 rowspan holds open (§5, "Tables", "Windows"). A window past 524,288
