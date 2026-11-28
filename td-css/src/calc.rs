@@ -143,7 +143,7 @@ impl Expr {
 fn finite(n: f64) -> Option<f64> {
     n.is_finite().then_some(n)
 }
-fn validate(v: &[Component], depth: usize, count: &mut usize) -> Result<(), Error> {
+pub(crate) fn validate(v: &[Component], depth: usize, count: &mut usize) -> Result<(), Error> {
     for c in v {
         if *count == MAX_CALC_PARTS {
             return Err(Error::Limit("MAX_CALC_PARTS"));

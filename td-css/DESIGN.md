@@ -249,9 +249,10 @@ and/or level cannot mix operators; a media-type suffix cannot have a
 top-level or. Supports uses boolean logic and queries exactly one
 implemented property/value declaration; unknown/general-enclosed syntax
 is false, including selector() queries. It tests computation grammar,
-not whether a layout engine exists. Both public text entry points,
-`conditions::media_matches` and `supports_matches`, have the same bounds
-and syntax handling used for compiled groups.
+not whether a layout engine exists. The public text entry points,
+`conditions::media_matches`, `media_matches_with_budget` and
+`supports_matches`, have the same bounds and syntax handling used for
+compiled groups.
 
 A sheet given to `StyleSet::from_sheets` may carry media conditions, a
 slice of media query lists that must all match: the `media` attribute of
@@ -279,6 +280,60 @@ and values not compiled. It contributes no rule, and the other sheets
 keep their order. The conditions are no group level: the sheet's own
 groups may still nest MAX_GROUP_DEPTH deep. A sheet without any compiles
 as before.
+
+Two entry points answer the attributes of responsive images, which
+td-page and td-web use to choose a `srcset` candidate.
+`conditions::media_matches_with_budget` evaluates a `<source media>`
+list exactly as `media_matches` does, but charges the caller's budget,
+refuses text past MAX_MEDIA_BYTES and, as for a sheet's media lists,
+keeps a leading U+FEFF as text. `conditions::source_size` follows
+HTML's [parse a sizes attribute][sizes] and returns CSS px. Entries
+split at top-level commas; each is a `<media-condition>`, a query
+without a media type or `only`, then a `<source-size-value>`. The first
+entry whose condition is true, or that has none, gives the size;
+unknown is not true. An entry whose last component is no valid size is
+skipped: a percentage, a negative literal, a unit not listed below, a
+function other than `calc()`, `min()`, `max()` or `clamp()`, or
+trailing text after the size. A bare zero is a length. Every size,
+literal or calculated, clamps once into [0, MAX_ABSOLUTE_VALUE], with a
+negative zero made +0. Auto-sizes are allowed only for an img with
+`loading=lazy`, which td does not implement, so HTML skips an `auto`
+entry wherever it stands; the fallback is the spec's for an image with
+no last auto-sizes width. An empty or whitespace list, or one no entry
+matches, gives 100vw: the environment's width.
+
+[sizes]: https://html.spec.whatwg.org/multipage/images.html#parse-a-sizes-attribute
+
+Sizes have no element: px; em and rem at the initial 16px; ex and ch at
+8px, half the initial em (td-css computes neither unit elsewhere); pt,
+pc, in, cm, mm and q; vw, vh, vmin and vmax with their s, l and d forms,
+all against the one viewport the environment states. vi, vb, container,
+line-height and other units are unknown, making the entry invalid. The
+math functions take `+ - * /` over numbers and these lengths with
+calc()'s typing and whitespace rules, nested blocks and functions,
+resolved to px at once, not through the cascade's unresolved calc():
+`values::length` and its computed values are unchanged. As CSS clamps
+infinities, an overflow saturates rather than invalidating: a numeric
+token past f64 (`1e999px`) and each intermediate result saturate at
+f64's finite range, where a later term can still cancel them, so a
+literal and the same value in calc() agree and an entry's validity
+does not depend on the viewport. Division by a zero number is invalid,
+as in calc(). Not supported, each making its entry invalid: the
+constants `pi`, `e`, `infinity` and `NaN`; `clamp(none, ...)`; the other
+math functions (`abs()`, `round()`, `mod()` and the rest); and math
+functions in a media condition's feature values, which `@media` shares,
+so `(min-width: calc(0)) 1px` is skipped.
+
+Every entry is parsed whatever an earlier one answers, and each entry's
+condition and math function are bounded before either is evaluated, so
+a refusal depends on the text alone, never on the environment. An input
+past MAX_SIZES_BYTES, an entry past MAX_SIZES_ENTRIES, tokens or
+nesting past MAX_TOKENS or MAX_NESTING, a math function past
+MAX_CALC_PARTS or MAX_CALC_DEPTH, and conditions together past
+MAX_CONDITION_PARTS or nested past MAX_CONDITION_DEPTH are refused as
+an `Error`, not answered 100vw; the caller chooses what a refused
+attribute means. Tokens, components and condition scratch are charged
+to the caller's budget.
 
 Imports remain unfetched. A future fetch-owning caller may resolve an
 import under its own URL, depth and byte policy, then supply its sheets
@@ -803,6 +858,9 @@ MAX_STYLE_BYTES.
 | MAX_CONDITION_DEPTH | 16 nested blocks/functions per condition |
 | MAX_MEDIA_QUERIES | 64 comma-list members per media prelude or query |
 | MAX_RESOLUTION_DPPX | 1,000 supplied environment resolution |
+| MAX_SIZES_BYTES | 4 KiB per `sizes` attribute given to `source_size` |
+| MAX_SIZES_ENTRIES | 64 comma-separated entries per `sizes` attribute |
+| MAX_MEDIA_BYTES | 4 KiB per media attribute given to `media_matches_with_budget` |
 | MAX_DECLARATIONS | 32,768 declarations per list, expanded declarations per style set, and expanded inline declarations per compute call |
 | MAX_SELECTORS | 256 selector-list members, including nested lists |
 | MAX_SELECTOR_PARTS | 1,024 simple selectors and combinators per parsed list |
@@ -906,7 +964,9 @@ No filesystem, network, clock, global mutable state or thread is needed.
 td-web's styled pages (td-web/DESIGN.md §10) compile through
 `from_sheets`, and would use an answer to whether a changed environment
 changes which of a set's rules apply (td-web/DESIGN.md §11), which
-td-css does not give yet.
+td-css does not give yet. `conditions::source_size` and
+`media_matches_with_budget` (§3, "Conditional rules") answer an image's
+`sizes` and `<source media>` attributes for td-page and td-web.
 
 `cascade` exports `StyleSet`, `Sheet`, `Refused`, `Refusal`, `Origin`,
 `ComputeStats` and `HTML_UA_CSS`; these and

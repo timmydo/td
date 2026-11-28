@@ -7,6 +7,12 @@ pub const MAX_CONDITION_PARTS: usize = 2048;
 pub const MAX_CONDITION_DEPTH: usize = 16;
 pub const MAX_MEDIA_QUERIES: usize = 64;
 pub const MAX_RESOLUTION_DPPX: f64 = 1000.0;
+/// Bytes of a `sizes` attribute; longer ones are refused.
+pub const MAX_SIZES_BYTES: usize = 4 * 1024;
+/// Comma-separated entries of a `sizes` attribute.
+pub const MAX_SIZES_ENTRIES: usize = 64;
+/// Bytes of a media attribute given to `media_matches_with_budget`.
+pub const MAX_MEDIA_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaType {
@@ -101,6 +107,48 @@ pub fn media_matches(input: &str, environment: &Environment) -> Result<bool, Err
         &memory,
     )
 }
+/// A media query list given as an attribute, such as `<source media>`,
+/// charged to `memory`. As for a sheet's media lists, the text is no
+/// decoded sheet: a leading U+FEFF is part of an identifier. Text past
+/// MAX_MEDIA_BYTES is refused.
+pub fn media_matches_with_budget(
+    input: &str,
+    environment: &Environment,
+    memory: &Budget,
+) -> Result<bool, Error> {
+    if input.len() > MAX_MEDIA_BYTES {
+        return Err(Error::Limit("MAX_MEDIA_BYTES"));
+    }
+    media(
+        syntax::components(input, memory, syntax::Bom::Keep)?.value(),
+        environment,
+        memory,
+    )
+}
+
+/// HTML's "parse a sizes attribute": the CSS px of the first entry whose
+/// media condition matches, or that has none, else 100vw. See DESIGN.md.
+pub fn source_size(input: &str, environment: &Environment, memory: &Budget) -> Result<f64, Error> {
+    environment.validate()?;
+    if input.len() > MAX_SIZES_BYTES {
+        return Err(Error::Limit("MAX_SIZES_BYTES"));
+    }
+    let list = syntax::components(input, memory, syntax::Bom::Keep)?;
+    // Every entry is read, so each bound holds whatever an earlier one says.
+    let mut count = 0;
+    let mut size = None;
+    for (i, entry) in list.value().split(|v| v.delim(',')).enumerate() {
+        if i == MAX_SIZES_ENTRIES {
+            return Err(Error::Limit("MAX_SIZES_ENTRIES"));
+        }
+        let found = source_size_entry(entry, environment, &mut count, memory)?;
+        if size.is_none() {
+            size = found;
+        }
+    }
+    Ok(size.unwrap_or(environment.width))
+}
+
 /// Query the property/value grammar this crate implements, not layout support.
 pub fn supports_matches(input: &str) -> Result<bool, Error> {
     let memory = crate::memory()?;
@@ -534,6 +582,275 @@ fn range(p: &[&Component], env: &Environment) -> Option<Truth> {
     pos += 1;
     result = result.and(other.apply(actual, number(last, name)?));
     (pos == p.len()).then_some(result)
+}
+
+/// `<media-condition>? <source-size-value>`, or None when HTML skips it.
+fn source_size_entry(
+    entry: &[Component],
+    env: &Environment,
+    count: &mut usize,
+    memory: &Budget,
+) -> Result<Option<f64>, Error> {
+    let Some((last, rest)) = syntax::trim(entry).split_last() else {
+        return Ok(None);
+    };
+    let rest = syntax::trim(rest);
+    // Bound the condition and the value before evaluating either, so a
+    // refusal depends on the text alone, never on the environment.
+    let parsed = rest.is_empty() || validate(rest, 0, count)?;
+    if size_function(last) {
+        crate::calc::validate(std::slice::from_ref(last), 0, &mut 0)?;
+    }
+    // Only an img with loading=lazy allows auto-sizes, and td implements
+    // no lazy loading, so HTML skips a lone `auto`; nor is `auto` a
+    // <source-size-value> after a condition.
+    let Some(size) = source_size_value(last, env) else {
+        return Ok(None);
+    };
+    if rest.is_empty() {
+        return Ok(Some(size));
+    }
+    if !parsed {
+        return Ok(None);
+    }
+    let matched = condition(&compact(rest, memory)?, Some(env), true, memory)? == Some(Truth::True);
+    Ok(matched.then_some(size))
+}
+
+/// The math functions a `<source-size-value>` may be.
+const SIZE_FUNCTIONS: &[&str] = &["calc", "min", "max", "clamp"];
+
+fn size_function(value: &Component) -> bool {
+    matches!(value, Component::Function { name, .. }
+        if syntax::keyword(name, SIZE_FUNCTIONS).is_some())
+}
+
+/// A non-negative `<length>` or math function, never a percentage, in px.
+/// A math function's caller has bounded it with calc()'s limits.
+fn source_size_value(value: &Component, env: &Environment) -> Option<f64> {
+    let px = match value {
+        Component::Token(Token::Number(n)) => size_number(&n.representation).filter(|n| *n == 0.0),
+        Component::Token(Token::Dimension(n, unit)) => size_number(&n.representation)
+            .filter(|n| *n >= 0.0)
+            .zip(size_unit(unit, env))
+            .map(|(n, factor)| saturate(n * factor)),
+        Component::Function { .. } => match size_math(value, env)? {
+            Quantity::Length(px) => Some(px),
+            Quantity::Number(_) => None,
+        },
+        _ => None,
+    }?;
+    // The one range clamp, literal or calculated, into [0,
+    // MAX_ABSOLUTE_VALUE]; -0 (and NaN, never produced) become +0.
+    Some(if px > 0.0 {
+        px.min(values::MAX_ABSOLUTE_VALUE)
+    } else {
+        0.0
+    })
+}
+
+/// A number token's value, an overflow saturated as CSS saturates one.
+fn size_number(text: &str) -> Option<f64> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|n| !n.is_nan())
+        .map(saturate)
+}
+
+/// The px in one unit, against no element: font-relative units take the
+/// initial 16px font, ex and ch half of it, viewport units the viewport.
+fn size_unit(unit: &str, env: &Environment) -> Option<f64> {
+    let unit = syntax::keyword(unit, SIZE_UNITS)?;
+    Some(match unit {
+        "px" => 1.0,
+        "em" | "rem" => 16.0,
+        "ex" | "ch" => 8.0,
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        "in" => 96.0,
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "q" => 96.0 / 101.6,
+        "vw" | "svw" | "lvw" | "dvw" => env.width / 100.0,
+        "vh" | "svh" | "lvh" | "dvh" => env.height / 100.0,
+        "vmin" | "svmin" | "lvmin" | "dvmin" => env.width.min(env.height) / 100.0,
+        "vmax" | "svmax" | "lvmax" | "dvmax" => env.width.max(env.height) / 100.0,
+        _ => return None,
+    })
+}
+const SIZE_UNITS: &[&str] = &[
+    "px", "em", "rem", "ex", "ch", "pt", "pc", "in", "cm", "mm", "q", "vw", "svw", "lvw", "dvw",
+    "vh", "svh", "lvh", "dvh", "vmin", "svmin", "lvmin", "dvmin", "vmax", "svmax", "lvmax",
+    "dvmax",
+];
+
+/// A math function's value, every length resolved to px at once.
+#[derive(Clone, Copy)]
+enum Quantity {
+    Number(f64),
+    Length(f64),
+}
+impl Quantity {
+    fn add(self, other: Self, sign: f64) -> Option<Self> {
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => Some(Self::Number(saturate(a + sign * b))),
+            (Self::Length(a), Self::Length(b)) => Some(Self::Length(saturate(a + sign * b))),
+            _ => None,
+        }
+    }
+    fn multiply(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => Some(Self::Number(saturate(a * b))),
+            (Self::Number(n), Self::Length(v)) | (Self::Length(v), Self::Number(n)) => {
+                Some(Self::Length(saturate(v * n)))
+            }
+            _ => None,
+        }
+    }
+    fn divide(self, other: Self) -> Option<Self> {
+        let Self::Number(n) = other else {
+            return None;
+        };
+        if n == 0.0 {
+            return None;
+        }
+        match self {
+            Self::Number(v) => Some(Self::Number(saturate(v / n))),
+            Self::Length(v) => Some(Self::Length(saturate(v / n))),
+        }
+    }
+    /// The smaller (or larger) of two values of one type.
+    fn pick(self, other: Self, smaller: bool) -> Option<Self> {
+        let choose = |a: f64, b: f64| if smaller { a.min(b) } else { a.max(b) };
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => Some(Self::Number(choose(a, b))),
+            (Self::Length(a), Self::Length(b)) => Some(Self::Length(choose(a, b))),
+            _ => None,
+        }
+    }
+}
+/// Finite operands give a finite or infinite result, never NaN; an
+/// infinity saturates at f64's range, so a later term can still cancel it.
+fn saturate(n: f64) -> f64 {
+    n.clamp(-f64::MAX, f64::MAX)
+}
+
+/// calc(), min(), max() or clamp(). The caller has bounded its parts and
+/// depth with MAX_CALC_PARTS and MAX_CALC_DEPTH, so recursion is bounded.
+fn size_math(value: &Component, env: &Environment) -> Option<Quantity> {
+    let Component::Function { name, values } = value else {
+        return None;
+    };
+    let name = syntax::keyword(name, SIZE_FUNCTIONS)?;
+    if name == "calc" {
+        return size_sum(values, env);
+    }
+    let smaller = name == "min";
+    // clamp(MIN, VAL, MAX) is max(MIN, min(VAL, MAX)).
+    let mut clamp: [Option<Quantity>; 3] = [None; 3];
+    let mut picked: Option<Quantity> = None;
+    let mut arguments = 0usize;
+    for argument in values.split(|v| v.delim(',')) {
+        let q = size_sum(argument, env)?;
+        if let Some(slot) = clamp.get_mut(arguments) {
+            *slot = Some(q);
+        }
+        arguments += 1;
+        picked = Some(match picked {
+            None => q,
+            Some(p) => p.pick(q, smaller)?,
+        });
+    }
+    match (name, clamp) {
+        ("min" | "max", _) => picked,
+        ("clamp", [Some(low), Some(v), Some(high)]) if arguments == 3 => {
+            v.pick(high, true)?.pick(low, false)
+        }
+        _ => None,
+    }
+}
+fn size_sum(values: &[Component], env: &Environment) -> Option<Quantity> {
+    let mut parser = SizeParser {
+        values,
+        pos: 0,
+        env,
+    };
+    let result = parser.sum()?;
+    parser.space();
+    (parser.pos == values.len()).then_some(result)
+}
+/// calc.rs's grammar over px: + and - need whitespace on both sides.
+struct SizeParser<'a> {
+    values: &'a [Component],
+    pos: usize,
+    env: &'a Environment,
+}
+impl SizeParser<'_> {
+    fn space(&mut self) {
+        while self.values.get(self.pos).is_some_and(Component::whitespace) {
+            self.pos += 1;
+        }
+    }
+    fn sum(&mut self) -> Option<Quantity> {
+        let mut result = self.product()?;
+        loop {
+            self.space();
+            let sign = match self.values.get(self.pos) {
+                Some(v) if v.delim('+') => 1.0,
+                Some(v) if v.delim('-') => -1.0,
+                _ => return Some(result),
+            };
+            let before = self
+                .pos
+                .checked_sub(1)
+                .and_then(|i| self.values.get(i))
+                .is_some_and(Component::whitespace);
+            let after = self
+                .values
+                .get(self.pos + 1)
+                .is_some_and(Component::whitespace);
+            if !before || !after {
+                return None;
+            }
+            self.pos += 1;
+            result = result.add(self.product()?, sign)?;
+        }
+    }
+    fn product(&mut self) -> Option<Quantity> {
+        let mut result = self.value()?;
+        loop {
+            self.space();
+            let divide = match self.values.get(self.pos) {
+                Some(v) if v.delim('*') => false,
+                Some(v) if v.delim('/') => true,
+                _ => return Some(result),
+            };
+            self.pos += 1;
+            let right = self.value()?;
+            result = if divide {
+                result.divide(right)?
+            } else {
+                result.multiply(right)?
+            };
+        }
+    }
+    fn value(&mut self) -> Option<Quantity> {
+        self.space();
+        let c = self.values.get(self.pos)?;
+        self.pos += 1;
+        match c {
+            Component::Token(Token::Number(n)) => {
+                size_number(&n.representation).map(Quantity::Number)
+            }
+            Component::Token(Token::Dimension(n, unit)) => {
+                let n = size_number(&n.representation)?;
+                Some(Quantity::Length(saturate(n * size_unit(unit, self.env)?)))
+            }
+            Component::Block { kind: '(', values } => size_sum(values, self.env),
+            Component::Function { .. } => size_math(c, self.env),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
