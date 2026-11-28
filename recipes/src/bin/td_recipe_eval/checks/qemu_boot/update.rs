@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use td_recipe::{shared, td_boot_protocol};
 pub(crate) mod admin;
+pub(crate) mod desktop;
 
 use crate::atlas::{Slot, Style, PAGE_WIDTH};
 use crate::face::Face;
@@ -212,6 +213,17 @@ impl Guest {
         disk: &Path,
         extra: &str,
     ) -> Result<Self> {
+        Self::spawn_network(options, pass, deadline, disk, extra, "user,id=net0")
+    }
+
+    fn spawn_network(
+        options: &Options,
+        pass: u64,
+        deadline: Instant,
+        disk: &Path,
+        extra: &str,
+        netdev: &str,
+    ) -> Result<Self> {
         let socket = options.work.join(format!("qmp-{pass}.sock"));
         let log = private_file(&options.work.join(format!("serial-{pass}.log")))?;
         let mut error = private_file(&options.work.join(format!("qemu-{pass}.log")))?;
@@ -241,7 +253,7 @@ impl Guest {
                 "-vga",
                 "none",
                 "-netdev",
-                "user,id=net0",
+                netdev,
                 "-device",
                 "virtio-net-pci,netdev=net0",
                 "-device",

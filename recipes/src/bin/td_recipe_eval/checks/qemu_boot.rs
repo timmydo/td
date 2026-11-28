@@ -4337,6 +4337,7 @@ pub(crate) fn create_release_volume(
 }
 
 enum VolumeLayout {
+    Desktop(PathBuf),
     Basic,
     Admin(PathBuf),
     Transactional,
@@ -4401,7 +4402,7 @@ fn create_persistent_volume_layout(
     let deployment_id = crate::sha256::sha256_file(&manifest)
         .map_err(|e| format!("hash deployment manifest {}: {e}", manifest.display()))?;
     let copies: u64 = match layout {
-        VolumeLayout::Basic => 1,
+        VolumeLayout::Basic | VolumeLayout::Desktop(_) => 1,
         // Initial/current/previous, repository, verified cache and download.
         VolumeLayout::Admin(_) => 6,
         VolumeLayout::Transactional => 3,
@@ -4454,12 +4455,15 @@ fn create_persistent_volume_layout(
     if let Some(probe) = seccomp_probe {
         stage_td_jail_seccomp_probe(&seed, probe)?;
     }
+    if let VolumeLayout::Desktop(keys) = &layout {
+        update::desktop::stage(keys, &seed)?;
+    }
     let alternate_id = match layout {
         VolumeLayout::Admin(fixture) => {
             update::admin::stage(&fixture, &seed)?;
             deployment_id.clone()
         }
-        VolumeLayout::Basic => deployment_id.clone(),
+        VolumeLayout::Desktop(_) | VolumeLayout::Basic => deployment_id.clone(),
         VolumeLayout::Transactional => {
             let channel = seed.join(td_boot_protocol::VOLUME_CHANNEL_DIR);
             let candidate = channel.join(td_boot_protocol::CHANNEL_CANDIDATE);
@@ -4906,14 +4910,24 @@ fn append_selector_identity(initramfs: &Path, role: SelectorRole) -> Result<(), 
         kind: Kind::File(bytes),
     });
 
-    let mut appendix = vec![0u8; td_engine::cpio::alignment_padding(length)];
-    appendix.extend_from_slice(&td_engine::cpio::build(&entries)?);
+    append_initramfs(initramfs, length, &td_engine::cpio::build(&entries)?)
+}
 
+fn append_initramfs(path: &Path, length: usize, archive: &[u8]) -> Result<(), String> {
+    let padding = [0; 4]
+        .get(..td_engine::cpio::alignment_padding(length))
+        .ok_or("invalid newc alignment")?;
     OpenOptions::new()
         .append(true)
-        .open(initramfs)
-        .and_then(|mut f| f.write_all(&appendix))
-        .map_err(|e| format!("append identity archive to {}: {e}", initramfs.display()))
+        .open(path)
+        .and_then(|mut output| {
+            output.write_all(padding)?;
+            output.write_all(archive)
+        })
+        .map_err(|e| {
+            td_engine::allocation::format(format_args!("append archive to {}: {e}", path.display()))
+                .unwrap_or_default()
+        })
 }
 
 /// Every proper directory prefix of `path`, shallowest first.

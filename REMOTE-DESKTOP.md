@@ -87,6 +87,11 @@ and host-key errors through the existing td-remote error path.
 
 ## Acceptance criteria
 
+The integration tier runs `td-recipe-eval qemu-remote-desktop` against the
+installed system. It provisions a disposable enrolled guest and SSH keys,
+drives the native viewer on a separate headless compositor, and inspects
+guest scanout through QMP.
+
 - Boot an enrolled guest to its lock screen. Open the viewer over real SSH
   without local interaction. Type a fresh marker into an ordinary terminal
   behind the lock. Observe the marker in the viewer and inspect an independent

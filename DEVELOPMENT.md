@@ -656,7 +656,7 @@ image's inputs and exports the declared Flathub refs into the host's feed (`warm
 --flathub`, APPLICATIONS.md §W.9), which the oracles' guests fetch
 Firefox and its runtime from, then runs
 `qemu-boot-system`, `qemu-boot-server`, `qemu-boot-audio`,
-`qemu-boot-audio-hotplug`, `qemu-deploy-rollback`, `qemu-admin-update`,
+`qemu-boot-audio-hotplug`, `qemu-deploy-rollback`, `qemu-admin-update`, `qemu-remote-desktop`,
 `qemu-boot-live` and `qemu-install-system`, each with a banner saying what it proves, its
 outcome and wall time, recorded in the check history as
 `integration:STEP` (`td-recipe-eval check-history integration`). On its

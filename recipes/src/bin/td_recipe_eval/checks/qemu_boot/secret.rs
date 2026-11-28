@@ -763,6 +763,13 @@ fn attention(notice: &[&str]) -> Vec<(usize, String)> {
 
 const DAMAGED: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "DIRECTORY DAMAGED"];
 
+pub(in super::super) fn desktop_locked(pixels: &[u8]) -> Result<bool, String> {
+    chrome(
+        pixels,
+        &lock_surface_on("td", &["PRESS CTRL+ALT+ESC TO UNLOCK"]),
+    )
+}
+
 fn locked(pixels: &[u8], arguments: &[&str]) -> Result<bool, String> {
     bare(arguments)?;
     chrome(pixels, &lock_surface(&["PRESS CTRL+ALT+ESC TO UNLOCK"]))

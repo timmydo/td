@@ -469,10 +469,10 @@ recipes/src/bin/td_recipe_eval/checks/provisioned_account.rs	allocation-macro	17
 recipes/src/bin/td_recipe_eval/checks/provisioned_account.rs	unchecked-growth-or-clone	8
 recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	allocating-constructor	10
 recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	allocating-conversion	231
-recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	allocation-macro	358
+recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	allocation-macro	356
 recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	direct-reservation	2
 recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	heap-owner	8
-recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	unchecked-growth-or-clone	62
+recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs	unchecked-growth-or-clone	61
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/build_iso.rs	allocating-conversion	12
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/build_iso.rs	allocation-macro	28
 recipes/src/bin/td_recipe_eval/checks/qemu_boot/build_iso.rs	unchecked-growth-or-clone	2

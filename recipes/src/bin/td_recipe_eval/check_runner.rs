@@ -787,6 +787,10 @@ const ORACLES: &[(&str, &[&str])] = &[
         "qemu-boot-audio-hotplug",
         &["system-x86-64", "td-btrfs", "td-jail-seccomp-probe"],
     ),
+    (
+        "qemu-remote-desktop",
+        &["system-x86-64", "td-btrfs", "td-desktop", "td-compositor"],
+    ),
     ("qemu-deploy-rollback", &["system-x86-64", "td-btrfs"]),
     (
         "qemu-admin-update",
@@ -977,6 +981,17 @@ fn system_oracle(
     warm_operator_inputs(&runner, targets);
     let _lock = lock_ladder_for_run(&runner)?;
     run(&runner)
+}
+
+pub fn qemu_remote_desktop_cli(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: qemu-remote-desktop".into());
+    }
+    oracle_host(false)?;
+    system_oracle(
+        "qemu-remote-desktop",
+        crate::checks::qemu_boot::update::desktop::run,
+    )
 }
 
 pub fn qemu_admin_update_cli(args: &[String]) -> Result<(), String> {
@@ -11680,6 +11695,7 @@ chmod 755 '{}'
             "qemu_boot_uefi_cli",
             "qemu_deploy_rollback_cli",
             "qemu_admin_update_cli",
+            "qemu_remote_desktop_cli",
             "qemu_boot_audio_cli",
             "qemu_boot_audio_hotplug_cli",
             "qemu_install_cli",

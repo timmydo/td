@@ -90,6 +90,11 @@ const STEPS: &[Step] = &[
         proves: "an approved deploy-rollback selects the previous system, and an approved set-hostname names the system, at the next boot",
     },
     Step {
+        name: "qemu-remote-desktop",
+        argv: &["qemu-remote-desktop"],
+        proves: "a primary SSH viewer launches and edits behind an enrolled console lock, and pauses for physical secure attention",
+    },
+    Step {
         name: "qemu-admin-update",
         argv: &["qemu-admin-update"],
         proves: "the guest acquires signed releases through restricted SSH administration, refuses expired metadata and root rollback, resumes HTTP transfers, and rolls back failed boots",
@@ -547,7 +552,7 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             line.contains(
-                "of 13 oracle(s), 5 passed (0 from the memo), 1 unprovisioned, 0 failed, 7 not run"
+                "of 14 oracle(s), 5 passed (0 from the memo), 1 unprovisioned, 0 failed, 8 not run"
             ),
             "{line}"
         );
@@ -565,7 +570,7 @@ mod tests {
         let (line, code) = verdict(&warm_gap);
         assert_eq!(code, td_engine::exit::EXIT_UNPROVISIONED);
         assert!(
-            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 13 not run"),
+            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 14 not run"),
             "{line}"
         );
         // Every oracle from the memo, warm skipped: a pass that booted nothing,
@@ -581,13 +586,14 @@ mod tests {
             ("qemu-boot-audio-hotplug", Outcome::Memo, s(0)),
             ("qemu-deploy-rollback", Outcome::Memo, s(0)),
             ("qemu-admin-update", Outcome::Memo, s(0)),
+            ("qemu-remote-desktop", Outcome::Memo, s(0)),
             ("qemu-boot-live", Outcome::Memo, s(0)),
             ("qemu-install-system", Outcome::Memo, s(0)),
         ];
         let (line, code) = verdict(&all_memo);
         assert_eq!(code, 0);
         assert!(
-            line.contains("12 passed (8 from the memo), 0 unprovisioned"),
+            line.contains("13 passed (9 from the memo), 0 unprovisioned"),
             "{line}"
         );
         assert_eq!(Outcome::Memo.word(), "memo");
@@ -644,6 +650,7 @@ mod tests {
             "qemu-boot-audio",
             "qemu-boot-audio-hotplug",
             "qemu-deploy-rollback",
+            "qemu-remote-desktop",
             "qemu-boot-live",
             "qemu-install-system",
         ] {
